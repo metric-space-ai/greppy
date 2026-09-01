@@ -210,8 +210,80 @@ pub fn workspaces_root() -> PathBuf {
         .join(format!("v{STORE_FORMAT_VERSION}"))
 }
 
+/// Root that holds the user-shared inference artifacts (models, embedding and
+/// summary caches). Normally this is [`data_root`]. A child process that is
+/// given an isolated `GREPPY_STORE_DIR` (the immutable Base build for a linked
+/// worktree stages its graph in a private directory) must still share the
+/// user's inference cache and models, otherwise every worktree re-embeds the
+/// whole repository from scratch and re-materialises the model into its
+/// staging directory. The parent passes its own shared root through this
+/// variable; hermetic test and factory runs that set only `GREPPY_STORE_DIR`
+/// stay isolated because nothing sets it for them.
+pub const ENV_SHARED_INFERENCE_ROOT: &str = "GREPPY_SHARED_INFERENCE_ROOT";
+
+pub fn shared_inference_root() -> PathBuf {
+    if let Ok(p) = std::env::var(ENV_SHARED_INFERENCE_ROOT) {
+        let path = PathBuf::from(p);
+        return if path.is_absolute() {
+            path
+        } else {
+            std::path::absolute(&path).unwrap_or(path)
+        };
+    }
+    data_root()
+}
+
 pub fn models_root() -> PathBuf {
-    data_root().join("models").join("v1")
+    shared_inference_root().join("models").join("v1")
+}
+
+/// Staging directories the immutable Base build creates next to the managed
+/// stores. Both are `tempfile` directories that are removed when the build
+/// finishes normally; a build that dies (ENOSPC, OOM, SIGKILL) leaves them
+/// behind and nothing else ever looks at them again.
+pub const BASE_BUILD_STAGING_PREFIXES: [&str; 2] =
+    ["greppy-base-build-", "greppy-linked-base-checkout-"];
+
+/// Remove abandoned Base build staging directories under `shared_data_root`
+/// that were last modified more than `ttl` ago. Only the two well-known
+/// prefixes are touched; anything else under the root is left alone. Returns
+/// the number of directories removed.
+pub fn reap_stale_base_build_dirs(shared_data_root: &Path, ttl: Duration) -> io::Result<usize> {
+    let Ok(entries) = fs::read_dir(shared_data_root) else {
+        return Ok(0);
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !BASE_BUILD_STAGING_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= ttl);
+        if !stale {
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub fn agent_base_stores_root() -> PathBuf {
@@ -224,7 +296,7 @@ pub fn agent_base_stores_root() -> PathBuf {
 /// An explicit `GREPPY_STORE_DIR` deliberately creates an isolated cache root
 /// for hermetic factory and test runs.
 pub fn inference_cache_root() -> PathBuf {
-    data_root().join("inference-cache").join("v1")
+    shared_inference_root().join("inference-cache").join("v1")
 }
 
 pub fn write_agent_base_manifest(
@@ -533,8 +605,15 @@ pub fn run_gc(
     let Some(_gc_lock) = acquire_named_lock("global.gc", LockMode::Exclusive, false)? else {
         unreachable!("blocking lock acquisition returned no guard")
     };
+    if !dry_run {
+        let _ = reap_stale_base_build_dirs(&data_root(), BASE_BUILD_STAGING_TTL);
+    }
     gc_locked(policy, dry_run, current_workspace_root)
 }
+
+/// A Base build that has not touched its staging directory for this long is
+/// abandoned: a live build rewrites graph and cache files continuously.
+pub const BASE_BUILD_STAGING_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Explicitly remove verified cache objects. `workspace_root = Some` clears
 /// exactly that canonical worktree; `None` clears every verified workspace
@@ -1583,6 +1662,58 @@ mod tests {
         let m = read_store_manifest(&dir).unwrap();
         assert_eq!(m.canonical_root, repo.canonicalize().unwrap());
         std::env::remove_var("GREPPY_STORE_DIR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn shared_inference_root_follows_store_dir_unless_overridden() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("shared-inference");
+        let staging = base.join("staging");
+        let shared = base.join("shared");
+        std::env::set_var("GREPPY_STORE_DIR", &staging);
+        std::env::remove_var(ENV_SHARED_INFERENCE_ROOT);
+        // Without the override an isolated store keeps an isolated cache.
+        assert_eq!(
+            inference_cache_root(),
+            staging.join("inference-cache").join("v1")
+        );
+        assert_eq!(models_root(), staging.join("models").join("v1"));
+        // The Base build child gets the parent's shared root and must use it
+        // for models and inference caches while its graph stays in staging.
+        std::env::set_var(ENV_SHARED_INFERENCE_ROOT, &shared);
+        assert_eq!(data_root(), staging);
+        assert_eq!(
+            inference_cache_root(),
+            shared.join("inference-cache").join("v1")
+        );
+        assert_eq!(models_root(), shared.join("models").join("v1"));
+        std::env::remove_var(ENV_SHARED_INFERENCE_ROOT);
+        std::env::remove_var("GREPPY_STORE_DIR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reaper_removes_only_stale_base_build_staging() {
+        let base = tempdir("reaper");
+        let stale_build = base.join("greppy-base-build-abc123");
+        let stale_checkout = base.join("greppy-linked-base-checkout-def456");
+        let fresh_build = base.join("greppy-base-build-fresh");
+        let unrelated = base.join("do-not-delete-greppy-base-build-");
+        for dir in [&stale_build, &stale_checkout, &fresh_build, &unrelated] {
+            fs::create_dir_all(dir.join("data")).unwrap();
+            fs::write(dir.join("data").join("graph.db"), b"x").unwrap();
+        }
+        let old = SystemTime::now() - Duration::from_secs(7 * 60 * 60);
+        for dir in [&stale_build, &stale_checkout] {
+            File::open(dir).unwrap().set_modified(old).unwrap();
+        }
+        let removed = reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!stale_build.exists());
+        assert!(!stale_checkout.exists());
+        assert!(fresh_build.is_dir(), "a live build must survive");
+        assert!(unrelated.is_dir(), "only the exact prefixes are reaped");
         let _ = fs::remove_dir_all(base);
     }
 

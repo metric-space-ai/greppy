@@ -1126,6 +1126,12 @@ fn prepare_base_store_paths(
 
     std::fs::create_dir_all(shared_data_root)
         .map_err(|error| Error::io("create shared Base data root", error))?;
+    // Builds that died (ENOSPC, OOM, SIGKILL) leave their staging directory
+    // and temporary checkout behind; 44 of them held 23 GB on one machine.
+    let _ = greppy_core::cache::reap_stale_base_build_dirs(
+        shared_data_root,
+        greppy_core::cache::BASE_BUILD_STAGING_TTL,
+    );
     let staging = tempfile::Builder::new()
         .prefix("greppy-base-build-")
         .tempdir_in(shared_data_root)
@@ -1150,6 +1156,16 @@ fn prepare_base_store_paths(
     command
         .current_dir(worktree_path)
         .env("GREPPY_STORE_DIR", &staging_data)
+        // The staging store isolates the graph, not the inference artifacts:
+        // without this the child opened an empty content cache under the
+        // staging root, re-embedded every span of the repository for each
+        // linked worktree (41k spans, ~35 min on this Mac for a tree whose
+        // primary checkout was already fully embedded) and copied the model
+        // into the staging directory as well.
+        .env(
+            greppy_core::cache::ENV_SHARED_INFERENCE_ROOT,
+            greppy_core::cache::shared_inference_root(),
+        )
         // A published Base is not valid until every candidate has its vector;
         // never let the ordinary foreground-index lazy threshold hand this
         // build to a background process outside the publication lease.
