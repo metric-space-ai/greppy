@@ -318,6 +318,10 @@ jobs:
         run: cargo build --workspace --features greppy/ci-test-assets,greppy/cpu-only
 
       - name: Test Windows locks, portable agent fail-closed, and daemon transport
+        env:
+          # Rust's test harness runs each test on a fresh thread; match the
+          # 8 MiB PE stack stamped into the real Windows CLI by build.rs.
+          RUST_MIN_STACK: "8388608"
         run: cargo test -p greppy-core -p greppy-embed-native -p greppy-agent -p greppy --lib --features greppy/ci-test-assets,greppy/cpu-only -- --test-threads=1
 
       - name: Verify doctor registry
