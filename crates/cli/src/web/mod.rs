@@ -19,7 +19,7 @@ use clap::Subcommand;
 use greppy_core::error::Result;
 
 pub use act::ActCommand;
-pub use common::{shutdown_if_running, web_runtime_socket};
+pub use common::{prestart_unsandboxed, shutdown_if_running, web_runtime_socket};
 pub use nav::NavCommand;
 pub use results::ResultsCommand;
 pub use chain::ChainCommand;

@@ -703,6 +703,26 @@ pub(super) fn rpc_on_response(
     }
 }
 
+/// Start the browser runtime in THIS process, before any sandbox is applied.
+///
+/// The runtime sandboxes its own worker processes. macOS Seatbelt cannot be
+/// nested: a process that is already sandboxed gets EPERM from `sandbox_init`,
+/// so a runtime spawned by a sandboxed agent tool child dies immediately with
+/// "worker sandbox: Operation not permitted" -- and the caller only sees
+/// "web-runtime did not create its socket".
+///
+/// Starting it from the unsandboxed parent avoids that entirely: the tool
+/// children then only connect to a socket that already exists.
+pub fn prestart_unsandboxed() -> std::result::Result<(), String> {
+    let spawn = SupervisorSpawn {
+        fixture_url: None,
+        search_endpoint: None,
+    };
+    ensure_supervisor(None, &spawn)
+        .map(|_| ())
+        .map_err(|error| error.message.clone())
+}
+
 pub(super) fn ensure_supervisor(
     root: Option<&str>,
     spawn: &SupervisorSpawn,
