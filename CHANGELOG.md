@@ -316,6 +316,9 @@ not a Playwright-compatibility claim.
 - Pressing Enter in an eligible form field now performs the HTML implicit-submit
   action through the native input path. This is the distinct Fund 038 fix and
   is not attributed to the pointer-delivery retry above.
+- Cancelling the interactive agent during its visible startup phase now returns
+  exit 130 deterministically. The terminal UI's cancellation result is no
+  longer discarded in a race with a worker that can finish cleanly first.
 
 Local gates landed in this stream (exact tests, not inventory shrink):
 
@@ -418,11 +421,11 @@ Local runtime gates re-run after those fixes (exact, `--test-threads=1`):
 `observe_read_search_research_screenshot_and_policy` 32.30s,
 `twenty_independent_playwright_scripts` 186.39s (20 **repo fixtures**, not
 the DoD's 20 independent third-party Playwright scripts).
-`one_thousand_session_create_run_close_cycles` is the remaining leak gate:
-create+run+close of `launch-only.mjs` cannot finish under the 300s harness
-abort (`session-daemon supervisor exceeded 300s` then mozalloc SIGSEGV).
-The product 10s `web.run` deadline is unchanged; the leak harness uses a
-45-minute watchdog so 1000 cycles can complete.
+`one_thousand_session_create_run_close_cycles` is active and passes in the
+single-threaded session-daemon suite: 1000 create+run+close cycles complete
+without the former harness abort or mozalloc SIGSEGV. The product 10s
+`web.run` deadline is unchanged; the leak harness uses a 45-minute watchdog
+so the full lifecycle gate can complete.
 
 `web_doctor_json_does_not_spawn_runtime` 1/1 in 9.66s (bound 30s). The test
 now isolates `GREPPY_STORE_DIR` so a skip-GC miss cannot scan the real

@@ -12,12 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use greppy_agent::system_prompt;
 use greppy_agent::{
     run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
     AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
     SandboxMode, StreamEvent, Usage, WorkspaceError,
 };
-use greppy_agent::system_prompt;
 
 use crate::agent_tui::{
     bounded_pair, compact_messages, messages_from_protocol, new_session_id,
@@ -727,9 +727,9 @@ fn run_agent(
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
-        run_headless_session(&mut client, &mut env, &config, &task)
+        run_headless_session(&mut client, &mut env, &config, &task).map(|session| (session, false))
     };
-    let session = match session {
+    let (session, interactive_cancelled) = match session {
         Ok(session) => session,
         Err(error) => {
             eprintln!(
@@ -740,6 +740,9 @@ fn run_agent(
             return EXIT_AGENT;
         }
     };
+    if interactive_cancelled {
+        return EXIT_CANCELLED;
+    }
 
     eprintln!(
         "tokens: in {} out {} (cache read {}, write {}) over {} turns",
@@ -935,7 +938,7 @@ fn run_interactive_session(
     initial_task: String,
     bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     launch: InteractiveLaunch,
-) -> Result<SessionSummary, String> {
+) -> Result<(SessionSummary, bool), String> {
     let store = SessionStore::new(&launch.data_root, &launch.project);
     let mut record = if let Some(id) = launch.resume.as_deref() {
         store
@@ -1330,8 +1333,9 @@ fn run_interactive_session(
             let _ = index_monitor.join();
         }
     }
-    ui_result.map_err(|error| format!("terminal UI failed: {error}"))?;
-    worker_result
+    let ui_outcome = ui_result.map_err(|error| format!("terminal UI failed: {error}"))?;
+    let summary = worker_result?;
+    Ok((summary, ui_outcome.cancelled || ui_outcome.force_exit))
 }
 
 fn git_branch(path: &Path) -> String {
@@ -1739,10 +1743,7 @@ fn writable_roots_for(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &runtime_dir,
-                std::fs::Permissions::from_mode(0o700),
-            );
+            let _ = std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700));
         }
     }
     roots.push(runtime_dir);
