@@ -386,11 +386,17 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // semantic candidate set and forbids paraphrased semantic retry loops.
     // 24.08.2026: the 0.3.2 coding gate approved one precise Greppy edit with
     // verification and no redundant reread after a successful edit.
-    // 26.08.2026: the owner approved the 0.3.4 bash-smart execution contract:
-    // leading environment assignments are supported, shell expressions use
-    // pipefail on Unix, and unsafe Windows pipeline semantics are rejected.
+    // 30.08.2026: the BROWSER section was added, and it names the WHOLE
+    // browser surface, not only what ships today. That is deliberate: the
+    // prompt is the contract, and
+    // browser_section_names_only_existing_web_subcommands is the work list
+    // that fails until the last of those subcommands exists. Owner decision.
+    // Owner-approved 2026-08-31: the browser block moved out of the shipped
+    // prompt into assets/prompts/web-beta.md, so the web runtime can ship as
+    // beta without the default prompt advertising a surface that is still
+    // moving. AGENTS.md keeps a four-line pointer and nothing else.
     const APPROVED_SHA256: &str =
-        "9f95e74e9180185db92764353bd72e0553fca876deac03aad055c7faa448a3da";
+        "cbb60d37642425ce6396929dc6d5054a4efb62efebdd055100bfffe42086cdaa";
 
     let text = prompt();
     let digest = {
@@ -472,5 +478,142 @@ fn the_prompt_is_frozen_byte_for_byte() {
         "AGENTS.md changed. The system prompt is the product's contract and is \
          frozen: if this change is intended, the owner approves it by updating \
          APPROVED_SHA256 in this test. If it is not, revert the file."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BROWSER section guard.
+//
+// The BROWSER section is written first and is the contract: it names the whole
+// browser surface, and the CLI is finished when every line in it resolves to a
+// real subcommand. This test is therefore a WORK LIST, not a scolding — it
+// fails until the last verb ships, and it names exactly what is left.
+//
+// The direction is deliberate. `find-usages` once advertised behaviour the code
+// did not have and nobody noticed, because nothing compared prose to the binary.
+// Here the comparison is a test, so the gap is visible on every run instead of
+// being discovered by an agent in the field.
+
+/// Every `greppy web WORD` the prompt shows as a COMMAND, as the bare WORD.
+///
+/// Only indented command lines count — the house style writes commands
+/// indented under a heading. Prose like "use greppy web for every web step"
+/// must not be read as a subcommand named `for`.
+fn web_subcommands_named_in(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if line == trimmed || !trimmed.starts_with("greppy web ") {
+            continue;
+        }
+        let rest = &trimmed["greppy web ".len()..];
+        let word: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if !word.is_empty() {
+            out.insert(word);
+        }
+    }
+    out
+}
+
+/// The subcommand table the binary really has, read from its own help.
+fn web_subcommands_from_help() -> std::collections::BTreeSet<String> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_greppy"))
+        .args(["web", "--help"])
+        .output()
+        .expect("greppy web --help must run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = std::collections::BTreeSet::new();
+    let mut in_commands = false;
+    for line in text.lines() {
+        if line.starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands {
+            if line.trim().is_empty() || !line.starts_with("  ") {
+                break;
+            }
+            if let Some(word) = line.split_whitespace().next() {
+                out.insert(word.to_owned());
+            }
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "could not read the web subcommand table from --help:\n{text}"
+    );
+    out
+}
+
+/// The beta prompt block. It is not part of the shipped system prompt -- the
+/// browser surface is still moving -- but it is still a promise to whoever
+/// appends it, so it gets the same guard.
+fn beta_web_prompt() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/prompts/web-beta.md")
+        .canonicalize()
+        .ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
+#[test]
+fn browser_section_names_only_existing_web_subcommands() {
+    // The browser block lives in the beta prompt; AGENTS.md only points at it.
+    let Some(text) = beta_web_prompt() else {
+        return; // beta prompt not present; nothing to guard
+    };
+    if !text.contains("BROWSER") {
+        return; // section not written yet; nothing to guard
+    }
+    let named = web_subcommands_named_in(&text);
+    assert!(
+        !named.is_empty(),
+        "a BROWSER section that names no `greppy web` command is not a prompt"
+    );
+    let real = web_subcommands_from_help();
+    let invented: Vec<_> = named.difference(&real).cloned().collect();
+    assert!(
+        invented.is_empty(),
+        "BROWSER beta work list — {} of {} advertised commands are still missing.\n\
+         \n\
+         missing: {invented:?}\n\
+         \n\
+         shipped: {real:?}\n\
+         \n\
+         The prompt is the contract and was written first on purpose. This test\n\
+         goes green when the last of these subcommands exists in `greppy web\n\
+         --help`. Do not shorten the prompt to make it pass.",
+        invented.len(),
+        named.len()
+    );
+}
+
+#[test]
+fn browser_section_is_delimited_so_edits_are_visible() {
+    let text = prompt();
+    if !text.contains("BROWSER:") {
+        return;
+    }
+    assert!(
+        text.contains("BROWSER:") && text.contains("END BROWSER"),
+        "the BROWSER section must stay between its markers, so an accidental \
+         edit is visible in the diff instead of silently reshaping the prompt"
+    );
+}
+
+#[test]
+fn browser_section_marks_page_text_as_untrusted() {
+    let text = prompt();
+    if !text.contains("BROWSER:") {
+        return;
+    }
+    let lowered = text.to_lowercase();
+    assert!(
+        lowered.contains("untrusted"),
+        "the BROWSER section must tell the agent that page text is untrusted \
+         input; a browser prompt without that line is a prompt-injection hole"
     );
 }

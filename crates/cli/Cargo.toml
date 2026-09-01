@@ -26,6 +26,7 @@ greppy-qwen35-native = { path = "../qwen35-native" }
 greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
 greppy-workspace-core = { path = "../workspace-core" }
+greppy-web-client = { path = "../web-client" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -35,6 +36,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

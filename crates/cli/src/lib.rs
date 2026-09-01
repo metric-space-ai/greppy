@@ -58,8 +58,12 @@ macro_rules! println {
     }};
 }
 
+mod web;
+mod web_attach;
 mod cli_surface;
 pub use cli_surface::*;
+pub use web::{web_runtime_socket, WebCommand, SessionsCommand, ResultsCommand, NavCommand};
+pub use web_attach::{generate_attach_token, give_child_attach_token};
 mod nav;
 use nav::*;
 mod inference;
@@ -90,6 +94,7 @@ mod context;
 mod workspace_setup;
 use context::*;
 mod agent;
+mod agent_tui;
 mod store_cow;
 
 use clap::{Parser, Subcommand};
@@ -482,11 +487,13 @@ impl Cli {
 /// bytes, including non-UTF-8 patterns/paths, to real grep).
 const SUBCOMMANDS: &[&str] = &[
     "grep",
+    "agent",
     "index",
     "where-am-i",
     "cache",
     "agent",
     "workspace",
+    "web",
     "trial",
     "stats",
     "diagnostics",
@@ -656,7 +663,22 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
 /// `grep` passthrough and forward the original `OsString` argv to real
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
+pub fn startup_trace(phase: &str) {
+    if std::env::var_os("GREPPY_STARTUP_TRACE").is_none() {
+        return;
+    }
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static T0: OnceLock<Instant> = OnceLock::new();
+    let t0 = T0.get_or_init(Instant::now);
+    eprintln!(
+        "startup-trace +{:.3}ms {phase}",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
+    startup_trace("run_os.enter");
     // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool
     // spawns as `<exe> __agent-sandbox-landlock <spec> -- <real argv…>`. Intercept
     // before every other route — including grep-name argv0 and `-p` — so this
@@ -709,12 +731,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     }
     let argv = normalize_global_output_flags(argv);
     CLI_INVOCATION.with(|invocation| *invocation.borrow_mut() = argv.clone());
-    // `greppy -p` is a structured agent invocation. Intercept before
+    // `greppy -p` and `greppy agent` are structured agent invocations. Intercept before
     // unknown-verb / grep-passthrough so `-p` never becomes a real-grep
     // pattern, and so grep flags like `-p` (Perl regex on GNU grep) still
     // work for non-leading positions via ordinary passthrough.
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
+    }
+    if agent::is_agent_tui_invocation(&argv) {
+        return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
         println!("{message}");
@@ -750,16 +775,31 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     // invocation cannot touch Greppy state.
     // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
     // their own store + lock namespace, not trash/other workspaces that GC needs.
-    if !is_trial_invocation(&argv) && std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_none() {
+    // `web doctor` is facts-only: it must not spawn engines and must not scan
+    // the Greppy store. Other structured commands still run throttled GC.
+    let skip_gc = is_trial_invocation(&argv)
+        || is_web_doctor_invocation(&argv)
+        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
+    startup_trace(if skip_gc {
+        "run_os.gc_skipped"
+    } else {
+        "run_os.gc_begin"
+    });
+    if !skip_gc {
         maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+        startup_trace("run_os.gc_end");
     }
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
     // output — one short error line plus the affected subcommand's usage,
     // never a multi-KB dump. Explicit --help/--version keep clap's output.
+    startup_trace("run_os.clap_begin");
     let cli = match <Cli as Parser>::try_parse_from(argv.iter()) {
-        Ok(cli) => cli,
+        Ok(cli) => {
+            startup_trace("run_os.clap_ok");
+            cli
+        }
         Err(e) => {
             use clap::error::ErrorKind;
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -1040,6 +1080,9 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
         }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
+        "web" => {
+            "greppy web status|doctor|session|run|observe|screenshot|search|read|research|artifacts [--json]"
+        }
         _ => return None,
     })
 }
@@ -1350,7 +1393,7 @@ fn peek_root_arg(argv: &[std::ffi::OsString]) -> Option<String> {
 /// Trial arms own their complete cache/config namespace. Skip the normal
 /// structured-command cache maintenance pass so the parent process cannot
 /// touch an ambient Greppy store before those namespaces are installed.
-fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
+fn first_structured_verb(argv: &[std::ffi::OsString]) -> Option<&std::ffi::OsStr> {
     let mut i = 1;
     while i < argv.len() {
         let token = &argv[i];
@@ -1366,7 +1409,42 @@ fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
             i += 1;
             continue;
         }
-        return token == "trial";
+        return Some(token.as_os_str());
+    }
+    None
+}
+
+fn is_trial_invocation(argv: &[std::ffi::OsString]) -> bool {
+    first_structured_verb(argv).is_some_and(|verb| verb == "trial")
+}
+
+fn is_web_doctor_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let mut i = 1;
+    let mut seen_web = false;
+    while i < argv.len() {
+        let token = &argv[i];
+        if token == "--root" || token == "--device" {
+            i += 2;
+            continue;
+        }
+        let token_lossy = token.to_string_lossy();
+        if token_lossy.starts_with("--root=")
+            || token_lossy.starts_with("--device=")
+            || token == "--no-gpu"
+            || token_lossy.starts_with("--")
+        {
+            i += 1;
+            continue;
+        }
+        if !seen_web {
+            if token == "web" {
+                seen_web = true;
+                i += 1;
+                continue;
+            }
+            return false;
+        }
+        return token == "doctor";
     }
     false
 }
@@ -2031,6 +2109,7 @@ fn dispatch_subcommand(
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
+        Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
             path_opts,
@@ -3810,7 +3889,10 @@ struct BackgroundJobGuard {
     eta_seconds: Option<u64>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
+    indexing_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
+    last_index_stage: Option<greppy_indexer::IndexProgressStage>,
+    current_detail: Option<String>,
     complete: bool,
 }
 
@@ -3869,7 +3951,10 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_u64),
             rate_milli_documents_per_second: None,
             embedding_started: None,
+            indexing_started: None,
             last_progress_write: None,
+            last_index_stage: None,
+            current_detail: None,
             complete: false,
         }
     }
@@ -3878,7 +3963,57 @@ impl BackgroundJobGuard {
         self.path.is_some()
     }
 
+    fn indexing_progress(&mut self, progress: greppy_indexer::IndexProgress) {
+        let stage_changed = self.last_index_stage != Some(progress.stage);
+        let state = match progress.stage {
+            greppy_indexer::IndexProgressStage::Analyze => {
+                let started = *self
+                    .indexing_started
+                    .get_or_insert_with(std::time::Instant::now);
+                self.completed_documents = progress.completed_files;
+                self.total_documents = progress.total_files;
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.eta_seconds = observed_embedding_eta_seconds(
+                    self.completed_documents,
+                    self.total_documents,
+                    elapsed_ms,
+                );
+                self.rate_milli_documents_per_second =
+                    observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+                "analyzing"
+            }
+            greppy_indexer::IndexProgressStage::Store => {
+                self.completed_documents = 0;
+                self.total_documents = 0;
+                self.rate_milli_documents_per_second = None;
+                self.eta_seconds = None;
+                "storing"
+            }
+        };
+        let now = std::time::Instant::now();
+        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
+        let publish = background_progress_should_publish(
+            stage_changed,
+            finished,
+            self.last_progress_write,
+            now,
+        );
+        if publish {
+            self.write_state(state, None);
+            self.last_progress_write = Some(now);
+            self.last_index_stage = Some(progress.stage);
+        }
+    }
+
     fn embedding_loading(&mut self) {
+        self.completed_documents = 0;
+        self.total_documents = 0;
+        self.rate_milli_documents_per_second = None;
+        self.eta_seconds = None;
+        self.indexing_started = None;
+        self.current_detail = None;
         self.write_state("loading_model", None);
     }
 
@@ -3888,7 +4023,9 @@ impl BackgroundJobGuard {
         self.total_documents = total_documents;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
+        self.indexing_started = None;
         self.rate_milli_documents_per_second = None;
+        self.current_detail = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
@@ -3897,6 +4034,7 @@ impl BackgroundJobGuard {
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
+        self.current_detail = progress.current_symbol;
         if let Some(started) = self.embedding_started {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis())
                 .unwrap_or(u64::MAX)
@@ -3954,6 +4092,7 @@ impl BackgroundJobGuard {
             "eta_seconds": self.eta_seconds,
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
+            "current_detail": self.current_detail,
             "last_error": last_error,
         });
         let _ = write_background_job(path, &value);
@@ -3979,6 +4118,40 @@ impl BackgroundJobGuard {
     fn degraded(&mut self, reason: &str) {
         self.write_state("failed", Some(reason));
         self.complete = true;
+    }
+}
+
+fn background_progress_should_publish(
+    stage_changed: bool,
+    finished: bool,
+    last_progress_write: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    stage_changed
+        || finished
+        || last_progress_write
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
+}
+
+#[cfg(test)]
+mod background_progress_tests {
+    use super::background_progress_should_publish;
+
+    #[test]
+    fn phase_change_bypasses_progress_throttle() {
+        let now = std::time::Instant::now();
+        assert!(background_progress_should_publish(
+            true,
+            false,
+            Some(now),
+            now
+        ));
+        assert!(!background_progress_should_publish(
+            false,
+            false,
+            Some(now),
+            now
+        ));
     }
 }
 
@@ -4056,25 +4229,43 @@ fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
 /// Start at most one detached refresh for a worktree. A spawn lock closes the
 /// cross-process race and the atomically published job record is the public
 /// progress surface used by semantic-search.
-fn spawn_background_job(
+pub(crate) enum BackgroundJobLaunch {
+    Owned {
+        child: std::process::Child,
+        path: std::path::PathBuf,
+    },
+    Attached {
+        path: std::path::PathBuf,
+    },
+}
+
+impl BackgroundJobLaunch {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Owned { path, .. } | Self::Attached { path } => path,
+        }
+    }
+}
+
+fn spawn_background_job_handle(
     root: Option<&str>,
     cause: &str,
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
-) -> bool {
+) -> Option<BackgroundJobLaunch> {
     // Integration tests use short-lived stores and explicitly opt out of
     // inference. A detached child can outlive the fixture guard, recreate the
     // removed store, and extract hundreds of MiB of embedded model assets per
     // test process. Honour the test contract for the complete background
     // lifecycle, not just the foreground inference call.
     if test_inference_skipped() && kind == "embedding" {
-        return false;
+        return None;
     }
     let Ok(root) = resolve_root(root) else {
-        return false;
+        return None;
     };
     if greppy_core::cache::ensure_workspace_store(&root).is_err() {
-        return false;
+        return None;
     }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
@@ -4082,7 +4273,7 @@ fn spawn_background_job(
         greppy_core::cache::LockMode::Exclusive,
         false,
     ) else {
-        return false;
+        return None;
     };
     let job_path = background_job_path(&root);
     if let Some(job) = read_background_job(&job_path) {
@@ -4092,7 +4283,7 @@ fn spawn_background_job(
             .and_then(|pid| u32::try_from(pid).ok())
             .is_some_and(process_is_alive)
         {
-            return true;
+            return Some(BackgroundJobLaunch::Attached { path: job_path });
         }
     }
     let target_generation = greppy_store::Store::open_with(
@@ -4110,7 +4301,7 @@ fn spawn_background_job(
     .unwrap_or(0)
     .saturating_add(1);
     let Ok(exe) = std::env::current_exe() else {
-        return false;
+        return None;
     };
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
@@ -4141,8 +4332,9 @@ fn spawn_background_job(
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
-    let Ok(child) = command.spawn() else {
-        return false;
+    agent::scrub_credential_env(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return None;
     };
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
@@ -4166,11 +4358,46 @@ fn spawn_background_job(
         "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
-    write_background_job(&job_path, &value).is_ok()
+    if write_background_job(&job_path, &value).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    Some(BackgroundJobLaunch::Owned {
+        child,
+        path: job_path,
+    })
+}
+
+fn spawn_background_job(
+    root: Option<&str>,
+    cause: &str,
+    kind: &str,
+    embedding_cfg: Option<&EmbeddingModelConfig>,
+) -> bool {
+    let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
+        return false;
+    };
+    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+        // Detached refreshes still need a reaper in this long-lived process.
+        let _ = std::thread::Builder::new()
+            .name("greppy-index-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+    true
 }
 
 fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
     spawn_background_job(root, cause, "index", None)
+}
+
+pub(crate) fn spawn_agent_background_index(
+    root: Option<&str>,
+    cause: &str,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, cause, "index", None)
 }
 
 /// Kick off the complete atomic graph + embedding snapshot as a detached
@@ -7070,6 +7297,111 @@ fn embedded_asset_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Debug/test profile only: copy digest-verified files from the compile-time
+/// repo path. This is not a production one-binary or signed-release cold-start
+/// claim. Release builds still `include_bytes!` the same pinned assets.
+#[cfg(debug_assertions)]
+fn extract_repo_model_asset(
+    model_root: &std::path::Path,
+    expected_sha: &str,
+    name: &str,
+    src: &str,
+) -> Option<String> {
+    let src = std::path::Path::new(src);
+    let digest = embedded_asset_sha256_file(src).ok()?;
+    if digest != expected_sha {
+        return None;
+    }
+    let bytes = std::fs::read(src).ok()?;
+    extract_embedded_asset(model_root, expected_sha, name, &bytes)
+}
+
+#[cfg(all(test, debug_assertions))]
+mod debug_repo_model_asset_guards {
+    #[test]
+    fn extract_repo_model_asset_rejects_digest_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "greppy-debug-asset-mismatch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bogus.bin");
+        std::fs::write(&src, b"not a model").unwrap();
+        assert!(
+            super::extract_repo_model_asset(
+                std::path::Path::new("debug-asset-mismatch"),
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "asset.bin",
+                src.to_str().unwrap(),
+            )
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_time_repo_assets_match_pinned_digests() {
+        for (path, sha) in [
+            (
+                env!("GREPPY_EMBEDDED_GGUF_PATH"),
+                env!("GREPPY_EMBEDDED_GGUF_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_TOK_PATH"),
+                env!("GREPPY_EMBEDDED_TOK_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"),
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA"),
+            ),
+            (
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"),
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA"),
+            ),
+        ] {
+            let path = std::path::Path::new(path);
+            assert!(path.is_file(), "{}", path.display());
+            assert_eq!(
+                super::embedded_asset_sha256_file(path).unwrap(),
+                sha,
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+mod release_embedded_model_guards {
+    #[test]
+    fn release_include_bytes_match_pinned_digests() {
+        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
+        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
+        static QWEN: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
+        static QWEN_TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
+        assert_eq!(
+            super::embedded_asset_sha256(GGUF),
+            env!("GREPPY_EMBEDDED_GGUF_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(TOK),
+            env!("GREPPY_EMBEDDED_TOK_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(QWEN),
+            env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA")
+        );
+        assert_eq!(
+            super::embedded_asset_sha256(QWEN_TOK),
+            env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA")
+        );
+        assert!(
+            GGUF.len() > 1024 * 1024 && QWEN.len() > 1024 * 1024,
+            "release must bake the product models, not CI sentinels"
+        );
+    }
+}
+
 /// Built-in EmbeddingGemma: the Q4_K GGUF and
 /// tokenizer are baked into the binary at build time and extracted once
 /// to `<data>/greppy/models/embeddinggemma-300m-q4k/<sha>/` (mmap needs a real
@@ -7082,14 +7414,34 @@ mod embeddinggemma_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
-        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
-        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
-        let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
-        let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-        Some((gguf, tok))
+        #[cfg(not(debug_assertions))]
+        {
+            static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
+            static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
+            let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
+            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            return Some((gguf, tok));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let gguf = super::extract_repo_model_asset(
+                &root,
+                GGUF_SHA,
+                "embeddinggemma-300M-Q4_K.gguf",
+                env!("GREPPY_EMBEDDED_GGUF_PATH"),
+            )?;
+            let tok = super::extract_repo_model_asset(
+                &root,
+                TOK_SHA,
+                "tokenizer.json",
+                env!("GREPPY_EMBEDDED_TOK_PATH"),
+            )?;
+            Some((gguf, tok))
+        }
     }
 
+    #[cfg(not(debug_assertions))]
     fn extract(
         root: &std::path::Path,
         expected_sha: &str,
@@ -7101,7 +7453,14 @@ mod embeddinggemma_assets {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
+        fn extract(
+            root: &std::path::Path,
+            expected_sha: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Option<String> {
+            crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
 
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {
@@ -7162,14 +7521,34 @@ mod qwen35_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
-        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
-        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
-        let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
-        let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-        Some((gguf, tok))
+        #[cfg(not(debug_assertions))]
+        {
+            static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
+            static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
+            let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
+            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            return Some((gguf, tok));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let gguf = super::extract_repo_model_asset(
+                &root,
+                GGUF_SHA,
+                "Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
+                env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"),
+            )?;
+            let tok = super::extract_repo_model_asset(
+                &root,
+                TOK_SHA,
+                "tokenizer.json",
+                env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"),
+            )?;
+            Some((gguf, tok))
+        }
     }
 
+    #[cfg(not(debug_assertions))]
     fn extract(
         root: &std::path::Path,
         expected_sha: &str,
@@ -7181,7 +7560,14 @@ mod qwen35_assets {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
+        fn extract(
+            root: &std::path::Path,
+            expected_sha: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Option<String> {
+            crate::extract_embedded_asset(root, expected_sha, name, bytes)
+        }
 
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {

@@ -1,0 +1,15 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "frames.mjs",
+  "test": "frames_content_frame_and_describe",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.frames",
+    "Locator.frameLocator",
+    "Frame.childFrames",
+    "FrameLocator.frameLocator"
+  ],
+  "scope": "Named Greppy fixture proves same-origin FrameLocator path and nested frame/FrameLocator fail-closed (unsupported_playwright_operation). Not an oracle comparison against playwright@1.62.1 + Chromium.",
+  "behavior": "unverified"
+}

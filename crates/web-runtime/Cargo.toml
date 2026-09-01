@@ -1,0 +1,17 @@
+[workspace]
+members = ["phase1-probe", "runtime"]
+default-members = ["runtime"]
+resolver = "2"
+
+# Debug sha2 of the ~400MiB web-runtime image otherwise dominates worker spawn.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[patch.crates-io]
+servo = { path = "vendor/servo" }
+servo-embedder-traits = { path = "vendor/servo-embedder-traits" }
+# Forked for the inline-layout get_path fix: the released 0.5.0 walks the
+# whole token slice per line (Θ(N²) over a large document); the fork walks
+# ancestors instead. See vendor/servo-layout/flow/inline/inline_box.rs.
+servo-layout = { path = "vendor/servo-layout" }
+servo-net = { path = "vendor/servo-net" }

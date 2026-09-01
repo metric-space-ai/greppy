@@ -614,15 +614,29 @@ pub(crate) fn dispatch_index(
         }
     };
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
-        return index_overlay_snapshot(
+        let is_background = background_job.is_background();
+        let result = index_overlay_snapshot(
             &store_path,
             &target,
             &project,
             &overlay,
             embedding_config.as_ref(),
             &index_options,
-            true,
+            OverlayIndexRun {
+                announce: true,
+                background_job: if is_background {
+                    Some(&mut background_job)
+                } else {
+                    None
+                },
+            },
         );
+        match &result {
+            Ok(0) => background_job.complete(),
+            Ok(_) => background_job.complete(),
+            Err(error) => background_job.fail(error),
+        }
+        return result;
     }
     // Holding the writer lock, build a fresh snapshot in a temp DB, validate
     // it, then publish it with one filesystem rename. The indexer crate still
@@ -725,6 +739,20 @@ pub(crate) fn dispatch_index(
     Ok(0)
 }
 
+pub(crate) struct OverlayIndexRun<'a> {
+    announce: bool,
+    background_job: Option<&'a mut BackgroundJobGuard>,
+}
+
+impl OverlayIndexRun<'_> {
+    pub(crate) fn silent() -> Self {
+        Self {
+            announce: false,
+            background_job: None,
+        }
+    }
+}
+
 pub(crate) fn index_overlay_snapshot(
     active_path: &std::path::Path,
     target: &std::path::Path,
@@ -732,7 +760,7 @@ pub(crate) fn index_overlay_snapshot(
     overlay: &crate::store_cow::OverlaySpec,
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
-    announce: bool,
+    mut run: OverlayIndexRun<'_>,
 ) -> Result<i32> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
     let temp_path = unique_store_sibling(active_path, "delta-building");
@@ -776,7 +804,18 @@ pub(crate) fn index_overlay_snapshot(
             .map(ToOwned::to_owned)
             .collect(),
     );
-    let report = greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)?;
+    let report = if let Some(job) = run.background_job.as_deref_mut() {
+        let mut progress = |value| job.indexing_progress(value);
+        greppy_indexer::index_with_options_and_progress(
+            &mut store,
+            target,
+            project,
+            &overlay_options,
+            &mut progress,
+        )?
+    } else {
+        greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)?
+    };
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     let base_commit = std::env::var(crate::store_cow::ENV_BASE_COMMIT)
         .map_err(|_| Error::Invalid("overlay index missing pinned Base commit".into()))?;
@@ -789,7 +828,7 @@ pub(crate) fn index_overlay_snapshot(
             config,
             &report,
             active_path.parent().map(std::path::Path::to_path_buf),
-            None,
+            run.background_job,
         )?)
     } else {
         None
@@ -800,7 +839,7 @@ pub(crate) fn index_overlay_snapshot(
     publish_store_snapshot(&temp_path, active_path)?;
     cleanup_stale_snapshot_artifacts(active_path, false)?;
 
-    if announce {
+    if run.announce {
         println!(
             "indexed Delta generation {}: {} changed/deleted paths, {} private nodes (project: {project})",
             report.graph_generation,
@@ -851,7 +890,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
     allow_deferred_embeddings: bool,
-    background_job: Option<&mut BackgroundJobGuard>,
+    mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<Option<IndexSnapshotReport>> {
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
@@ -866,15 +905,27 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
     };
 
-    let report =
-        match greppy_indexer::index_with_options(&mut temp_store, target, project, index_options) {
+    let report = {
+        let mut progress = |value| {
+            if let Some(job) = background_job.as_deref_mut() {
+                job.indexing_progress(value);
+            }
+        };
+        match greppy_indexer::index_with_options_and_progress(
+            &mut temp_store,
+            target,
+            project,
+            index_options,
+            &mut progress,
+        ) {
             Ok(report) => report,
             Err(e) => {
                 drop(temp_store);
                 let _ = cleanup_sqlite_family(&temp_path);
                 return Err(e);
             }
-        };
+        }
+    };
 
     if !report.is_clean()
         || report.files_skipped_by_file_limit > 0

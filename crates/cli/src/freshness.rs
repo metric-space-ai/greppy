@@ -484,7 +484,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             overlay,
             embedding_cfg.as_ref(),
             &options,
-            false,
+            crate::indexing::OverlayIndexRun::silent(),
         )
         .map(|code| code == 0)
         .unwrap_or(false)

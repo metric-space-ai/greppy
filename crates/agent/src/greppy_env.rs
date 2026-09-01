@@ -13,6 +13,7 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,12 @@ pub const DEFAULT_GREPPY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default combined stdout+stderr cap (64 KiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
+
+/// Installs the parent-owned attach token onto an authorized `greppy web`
+/// child via inherited FD 4. The returned value must be held until after
+/// `spawn` so the CLOEXEC pipe end stays open through fork.
+pub static PREPARE_ATTACH_FD: OnceLock<fn(&mut Command) -> io::Result<Box<dyn Send>>> =
+    OnceLock::new();
 
 /// Credential / secret env vars stripped from every tool subprocess.
 ///
@@ -174,9 +181,39 @@ impl GreppyEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
+        // Register attach pre_exec AFTER sandbox::apply so callbacks run
+        // sandbox first, then child-local dup2 onto FD 4.
+        let attach_hold = if args.first().map(String::as_str) == Some("web") {
+            match PREPARE_ATTACH_FD.get() {
+                Some(prepare) => match prepare(&mut cmd) {
+                    Ok(hold) => Some(hold),
+                    Err(error) => {
+                        return ToolOutcome::err(format!("attach token fd: {error}"));
+                    }
+                },
+                None => {
+                    return ToolOutcome::err(
+                        "greppy web requires a parent-owned attach token on inherited fd 4",
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
-        match run_capture(&mut cmd, Some(timeout)) {
-            Ok(captured) => finalize_outcome(captured, self.max_output_bytes),
+        match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
+            Ok(captured) => {
+                let mut outcome = finalize_outcome(captured, self.max_output_bytes);
+                if args.first().map(String::as_str) == Some("web")
+                    && args.get(1).map(String::as_str) == Some("screenshot")
+                {
+                    if let Some(data) = extract_png_base64(&outcome.content) {
+                        outcome.image_png_base64 = Some(data);
+                        outcome.content = "screenshot attached as image for the model".to_owned();
+                    }
+                }
+                outcome
+            }
             Err(msg) => ToolOutcome::err(msg),
         }
     }
@@ -288,6 +325,14 @@ struct Captured {
 /// reaps grandchildren too (e.g. `sh` + `sleep`); otherwise grandchildren keep
 /// the pipes open and the drain threads block until they exit naturally.
 fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured, String> {
+    run_capture_held(cmd, timeout, None)
+}
+
+fn run_capture_held(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    attach_hold: Option<Box<dyn Send>>,
+) -> Result<Captured, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -310,6 +355,7 @@ fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured,
             Err(error) => return Err(format!("failed to spawn greppy binary: {error}")),
         }
     };
+    drop(attach_hold);
 
     let stdout_pipe = child
         .stdout
@@ -401,6 +447,16 @@ unsafe fn libc_kill_pg(pgid: i32, sig: i32) -> i32 {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
     unsafe { killpg(pgid, sig) }
+}
+
+fn extract_png_base64(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let result = value.get("result").unwrap_or(&value);
+    result
+        .get("png_base64")
+        .and_then(|value| value.as_str())
+        .filter(|data| !data.is_empty())
+        .map(str::to_owned)
 }
 
 fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome {

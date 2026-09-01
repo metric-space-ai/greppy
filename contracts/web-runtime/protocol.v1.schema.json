@@ -1,0 +1,620 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "greppy.web-runtime.protocol.v1",
+  "title": "Greppy web-runtime client/supervisor protocol v1",
+  "description": "Schema-versioned client/supervisor protocol for the Greppy web runtime. Transport: Unix domain sockets are preferred on Unix; named pipes are preferred on Windows. TCP loopback MUST NOT be the default local transport. Framing is length-delimited (unsigned 32-bit big-endian payload length followed by that many bytes of UTF-8 JSON). Newline-delimited ad hoc JSON MUST NOT be used for arbitrary script or artifact payloads. Secrets, cookies, authorization headers, script source, and page credentials MUST NOT appear in errors, logs, or protocol metadata by default.",
+  "$defs": {
+    "schema_id": {
+      "type": "string",
+      "const": "greppy.web-runtime.v1"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^wrq_[A-Za-z0-9._~-]+$",
+      "description": "Client-issued request identifier. Prefix wrq_ is required."
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^wrs_[A-Za-z0-9._~-]+$",
+      "description": "Supervisor-issued session identifier. Prefix wrs_ is required."
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Owning Greppy agent run identifier. Sessions are run-owned and MUST NOT be usable across runs."
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "handshake",
+        "heartbeat",
+        "cancel",
+        "progress",
+        "artifact.stream",
+        "backpressure",
+        "web.status",
+        "web.doctor",
+        "web.session.create",
+        "web.session.list",
+        "web.session.close",
+        "web.run",
+        "web.observe",
+        "web.screenshot",
+        "web.search",
+        "web.read",
+        "web.research",
+        "web.artifacts",
+        "web.shutdown",
+        "web.cancel",
+        "web.heartbeat"
+      ]
+    },
+    "public_operations": {
+      "description": "Operations corresponding to greppy web CLI commands in the implementation guide section 8.",
+      "type": "string",
+      "enum": [
+        "web.status",
+        "web.doctor",
+        "web.session.create",
+        "web.session.list",
+        "web.session.close",
+        "web.run",
+        "web.observe",
+        "web.screenshot",
+        "web.search",
+        "web.read",
+        "web.research",
+        "web.artifacts"
+      ]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "runtime_unavailable",
+        "runtime_incompatible",
+        "session_not_found",
+        "session_not_owned",
+        "controller_exception",
+        "controller_terminated",
+        "page_crashed",
+        "engine_error",
+        "navigation_failed",
+        "timeout",
+        "cancelled",
+        "policy_denied",
+        "resource_limit",
+        "artifact_integrity",
+        "unsupported_playwright_operation",
+        "browser_engine_not_available",
+        "protocol_violation"
+      ],
+      "description": "Authoritative terminal failure classes from the implementation guide section 24."
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+      "description": "CLI exit codes from the implementation guide section 8.1. 0 success; 30 invalid web-runtime request; 31 runtime unavailable or incompatible; 32 session not found or not owned by this run; 33 controller script error; 34 page/browser operation error; 35 timeout or cancellation; 36 policy or permission denial; 37 resource limit exceeded; 38 worker crash or protocol failure; 39 conformance or artifact-integrity failure."
+    },
+    "exit_code_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "success",
+        "protocol_violation",
+        "runtime_unavailable",
+        "runtime_incompatible",
+        "session_not_found",
+        "session_not_owned",
+        "controller_exception",
+        "controller_terminated",
+        "page_crashed",
+        "engine_error",
+        "navigation_failed",
+        "unsupported_playwright_operation",
+        "browser_engine_not_available",
+        "timeout",
+        "cancelled",
+        "policy_denied",
+        "resource_limit",
+        "artifact_integrity"
+      ],
+      "properties": {
+        "success": { "const": 0 },
+        "protocol_violation": { "const": 30 },
+        "runtime_unavailable": { "const": 31 },
+        "runtime_incompatible": { "const": 31 },
+        "session_not_found": { "const": 32 },
+        "session_not_owned": { "const": 32 },
+        "controller_exception": { "const": 33 },
+        "controller_terminated": { "const": 38 },
+        "page_crashed": { "const": 34 },
+        "engine_error": { "const": 34 },
+        "navigation_failed": { "const": 34 },
+        "unsupported_playwright_operation": { "const": 34 },
+        "browser_engine_not_available": { "const": 34 },
+        "timeout": { "const": 35 },
+        "cancelled": { "const": 35 },
+        "policy_denied": { "const": 36 },
+        "resource_limit": { "const": 37 },
+        "artifact_integrity": { "const": 39 }
+      },
+      "description": "Binding of terminal failure classes to greppy web CLI exit codes. Worker crash without a more specific class uses 38."
+    },
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compatibility_coverage_level": {
+      "type": "string",
+      "enum": ["schema", "source", "behavior", "product", "unverified", "unsupported"],
+      "description": "Advertised Playwright compatibility coverage. unknown is a failing release state and MUST NOT be used. Phase 0 MUST advertise unverified or unsupported, never passing or implemented."
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_ms",
+        "controller_cpu_ms",
+        "content_cpu_ms",
+        "peak_rss_bytes",
+        "network_bytes"
+      ],
+      "properties": {
+        "wall_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "controller_cpu_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "content_cpu_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "peak_rss_bytes": { "$ref": "#/$defs/non_negative_integer" },
+        "network_bytes": { "$ref": "#/$defs/non_negative_integer" }
+      }
+    },
+    "error_object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "operation_id",
+        "retryable",
+        "next_action",
+        "exit_code"
+      ],
+      "description": "Stable machine code, safe human message, operation ID, session ID when applicable, retryability, and a bounded next action. Secrets, cookies, authorization headers, script source, and page credentials MUST NOT appear.",
+      "properties": {
+        "code": { "$ref": "#/$defs/failure_class" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Safe human-readable message. MUST NOT contain secrets, cookies, authorization headers, script source, or page credentials."
+        },
+        "operation_id": { "$ref": "#/$defs/request_id" },
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "retryable": {
+          "type": "boolean",
+          "description": "Retries are permitted only for classified transient engine or transport failures and MUST preserve the operation's idempotency contract. Click, submission, upload, download, and script execution MUST NOT be retried automatically unless the operation is proven side-effect-free."
+        },
+        "next_action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Bounded next action the client or operator may take. MUST NOT include secret material."
+        },
+        "exit_code": { "$ref": "#/$defs/exit_code" }
+      }
+    },
+    "artifact_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_sha256", "byte_count", "media_type", "object_path"],
+      "properties": {
+        "digest_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "byte_count": { "$ref": "#/$defs/non_negative_integer" },
+        "media_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "object_path": {
+          "type": "string",
+          "pattern": "^objects/sha256/[a-f0-9]{64}$"
+        },
+        "sensitive": { "type": "boolean" }
+      }
+    },
+    "handshake_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "runtime_build_id",
+        "playwright_compatibility_version",
+        "servo_revision",
+        "v8_revision",
+        "platform",
+        "architecture",
+        "supported_capabilities",
+        "compatibility_coverage_level",
+        "max_message_bytes",
+        "max_artifact_bytes"
+      ],
+      "properties": {
+        "protocol_version": {
+          "type": "string",
+          "const": "greppy.web-runtime.v1"
+        },
+        "runtime_build_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "playwright_compatibility_version": {
+          "type": "string",
+          "const": "1.62.1"
+        },
+        "servo_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "v8_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "supported_capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "compatibility_coverage_level": {
+          "$ref": "#/$defs/compatibility_coverage_level"
+        },
+        "max_message_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_artifact_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "payload_handshake": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "client_protocol_version": { "type": "string", "const": "greppy.web-runtime.v1" },
+        "client_run_id": { "$ref": "#/$defs/run_id" },
+        "max_message_bytes": { "type": "integer", "minimum": 1 },
+        "max_artifact_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "payload_heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq"],
+      "properties": {
+        "seq": { "$ref": "#/$defs/non_negative_integer" },
+        "worker_identity": { "type": "string" },
+        "session_id": { "$ref": "#/$defs/session_id" }
+      }
+    },
+    "payload_cancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_request_id"],
+      "properties": {
+        "target_request_id": { "$ref": "#/$defs/request_id" },
+        "reason": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "payload_progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_request_id", "phase"],
+      "properties": {
+        "target_request_id": { "$ref": "#/$defs/request_id" },
+        "phase": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "message": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "payload_artifact_stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_sha256", "offset", "chunk_base64", "last"],
+      "properties": {
+        "digest_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "offset": { "$ref": "#/$defs/non_negative_integer" },
+        "chunk_base64": { "type": "string" },
+        "last": { "type": "boolean" },
+        "media_type": { "type": "string" }
+      }
+    },
+    "payload_backpressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pause"],
+      "properties": {
+        "pause": { "type": "boolean" },
+        "reason": { "type": "string", "enum": ["window_full", "resource_limit", "artifact_buffer"] },
+        "resume_after_ms": { "$ref": "#/$defs/non_negative_integer" }
+      }
+    },
+    "payload_web_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "payload_web_doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "payload_session_create": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": "string", "enum": ["research", "project"] }
+      }
+    },
+    "payload_session_list": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "payload_session_close": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" }
+      }
+    },
+    "payload_web_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "script_source"],
+      "description": "Controller script MUST be carried in the length-delimited payload, never in process arguments. --script-stdin consumes stdin without exposing the script in argv and MUST send that source as script_text. Inline script flags MUST NOT be added.",
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "script_source": {
+          "type": "string",
+          "enum": ["file", "stdin"]
+        },
+        "script_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace-relative path when script_source is file. MUST NOT be used to place script text in process arguments."
+        },
+        "script_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Controller source when script_source is stdin. MUST be carried in this length-delimited payload and MUST NOT appear in process arguments."
+        },
+        "timeout_seconds": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "script_source": { "const": "file" } }, "required": ["script_source"] },
+          "then": { "required": ["script_file"], "not": { "required": ["script_text"] } }
+        },
+        {
+          "if": { "properties": { "script_source": { "const": "stdin" } }, "required": ["script_source"] },
+          "then": { "required": ["script_text"], "not": { "required": ["script_file"] } }
+        }
+      ]
+    },
+    "payload_web_observe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "format": { "type": "string", "enum": ["agent-tree", "text", "html"] }
+      }
+    },
+    "payload_web_screenshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "output"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "output": { "type": "string", "minLength": 1 }
+      }
+    },
+    "payload_web_search": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1 },
+        "domain": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "payload_web_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "query": { "type": "string" }
+      }
+    },
+    "payload_web_research": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1 },
+        "max_sources": { "type": "integer", "minimum": 1 },
+        "depth": { "type": "string", "enum": ["shallow", "standard", "deep"] }
+      }
+    },
+    "payload_web_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "request_id",
+        "run_id",
+        "deadline_ms",
+        "operation",
+        "payload",
+        "capability"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema_id" },
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "run_id": { "$ref": "#/$defs/run_id" },
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "deadline_ms": { "type": "integer", "minimum": 0 },
+        "operation": { "$ref": "#/$defs/operation" },
+        "payload": { "type": "object" },
+        "capability": { "$ref": "#/$defs/capability" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "handshake" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_handshake" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "heartbeat" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_heartbeat" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "cancel" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_cancel" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "progress" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_progress" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "artifact.stream" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_artifact_stream" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "backpressure" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_backpressure" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.status" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_status" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.doctor" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_doctor" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.session.create" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_session_create" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.session.list" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_session_list" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.session.close" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_session_close" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.run" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_run" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.observe" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_observe" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.screenshot" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_screenshot" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.search" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_search" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.read" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_read" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.research" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_research" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "web.artifacts" } }, "required": ["operation"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/payload_web_artifacts" } } }
+        }
+      ]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "request_id",
+        "operation",
+        "status",
+        "result",
+        "artifacts",
+        "metrics"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema_id" },
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "operation": { "$ref": "#/$defs/operation" },
+        "status": { "type": "string", "enum": ["ok", "error", "cancelled"] },
+        "result": { "type": ["object", "null"] },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact_ref" }
+        },
+        "metrics": { "$ref": "#/$defs/metrics" },
+        "error": { "$ref": "#/$defs/error_object" },
+        "handshake": { "$ref": "#/$defs/handshake_fields" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "error" } }, "required": ["status"] },
+          "then": { "required": ["error"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+          "then": { "not": { "required": ["error"] } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "handshake" } }, "required": ["operation"] },
+          "then": {
+            "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+            "then": { "required": ["handshake"] }
+          },
+          "else": { "not": { "required": ["handshake"] } }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ]
+}

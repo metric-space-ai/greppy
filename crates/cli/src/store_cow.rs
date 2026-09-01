@@ -303,6 +303,33 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Reuse an already-published Base without ever building one synchronously.
+/// Interactive startup uses this fast path so a cold Base cannot hide a full
+/// embedding run behind an opaque pre-TUI phase.
+pub(crate) fn try_reuse_base_store(
+    workspace: &greppy_agent::workspace::AgentWorkspace,
+    shared_data_root: &Path,
+) -> Result<Option<PreparedBase>> {
+    let identity = base_identity(workspace)?;
+    let layout = BaseStoreLayout::new(shared_data_root, &identity)
+        .map_err(|error| Error::io("construct Base Store layout", error))?;
+    let Ok(manifest) = layout.read_verified_manifest() else {
+        return Ok(None);
+    };
+    if validate_base_contents(workspace.worktree_path(), &layout.graph, &identity).is_err()
+        || validate_base_summary_cache(
+            workspace.worktree_path(),
+            &layout.graph,
+            &layout.summary_cache,
+            &identity,
+        )
+        .is_err()
+    {
+        return Ok(None);
+    }
+    prepared_base_with_reader(&layout, manifest, true).map(Some)
+}
+
 pub(crate) fn prepare_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,

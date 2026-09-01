@@ -3,9 +3,11 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    greppy::startup_trace("main.enter");
     // Tracing initialisation is best-effort: a failure should not block
     // the binary from running.
     let _ = greppy_core::logging::init();
+    greppy::startup_trace("main.after_logging");
 
     // capture argv as `OsString` BEFORE clap consumes it
     // so a bare `grep` passthrough carrying a non-UTF-8 pattern/path

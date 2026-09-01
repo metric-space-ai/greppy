@@ -176,3 +176,10 @@ A question with an empty answer — a symbol that exists but has no callers — 
 form. A question that cannot be answered — a symbol or file that does not exist, an ambiguous
 name, a selector that matches nothing — says why and exits non-zero, and an edit in that
 situation writes nothing.
+
+BROWSER (beta, not enabled by default):
+greppy has a local browser runtime — no Chromium, no Node. Its command surface
+is still moving, so it is not described here. To let an agent drive a browser,
+append `assets/prompts/web-beta.md` to this prompt. Without it, nothing about
+greppy changes.
+

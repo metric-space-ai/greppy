@@ -50,6 +50,11 @@ pub enum ContentPart {
     Thinking {
         text: String,
     },
+    /// PNG (or other still image) shown to the model. Keep out of logs/traces.
+    Image {
+        media_type: String,
+        data: String,
+    },
 }
 
 /// Tool schema advertised to the model.

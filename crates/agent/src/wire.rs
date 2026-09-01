@@ -97,6 +97,14 @@ fn map_content(parts: &[ContentPart]) -> Vec<Value> {
                 "type": "thinking",
                 "thinking": text,
             }),
+            ContentPart::Image { media_type, data } => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            }),
         })
         .collect()
 }
@@ -796,6 +804,25 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             max_tokens: 1024,
         }
+    }
+
+    #[test]
+    fn screenshot_image_serializes_as_anthropic_image_block() {
+        let parts = map_content(&[ContentPart::Image {
+            media_type: "image/png".to_owned(),
+            data: "aaa".to_owned(),
+        }]);
+        assert_eq!(
+            parts,
+            vec![json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aaa",
+                },
+            })]
+        );
     }
 
     #[test]

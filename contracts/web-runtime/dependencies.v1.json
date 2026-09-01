@@ -1,0 +1,348 @@
+{
+  "contract": "greppy.web-runtime.dependencies.v1",
+  "contract_revision": "2026-08-26",
+  "phase": 0,
+  "implementation_status": "lock-only",
+  "playwright_javascript_library": {
+    "version": "1.62.1",
+    "public_import": "playwright",
+    "primary_browser_type": "chromium",
+    "controller_language": "JavaScript ES modules and CommonJS compatibility"
+  },
+  "verified_build_facts": {
+    "servo_crate_rust_version": "1.88.0",
+    "servo_crate_rust_version_applies_to": "servo crate 0.5.0, not the Greppy workspace toolchain",
+    "greppy_workspace_rust_toolchain": {
+      "channel": "1.95.0",
+      "inspection_path": "/Users/michaelwelsch/Documents/greppy/rust-toolchain.toml",
+      "verification": "locally-inspected",
+      "note": "Distinct from the Servo crate rust-version fact 1.88.0."
+    }
+  },
+  "update_owner": "Greppy web-runtime release owner",
+  "update_procedure": {
+    "playwright_baseline_change_requires": [
+      "a compatibility contract revision",
+      "a generated schema diff",
+      "passing old and new conformance corpora",
+      "documented breaking behavior",
+      "a versioned runtime capability advertisement"
+    ],
+    "servo_or_v8_change_requires": [
+      "revision of this dependency lock",
+      "re-verification of archive SHA-256",
+      "license and SBOM refresh",
+      "compatibility and size/RSS gate re-run before a production claim"
+    ]
+  },
+  "inspection_summary": {
+    "servo_0_5_0_crate_source": {
+      "verification": "unverified",
+      "present": false,
+      "paths_checked": [
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo-0.5.0",
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f",
+        "/Users/michaelwelsch/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f",
+        "/Users/michaelwelsch/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rv/servo",
+        "/Users/michaelwelsch/Documents/greppy/vendor"
+      ],
+      "found_instead": [
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo_arc-0.4.3"
+      ]
+    },
+    "deno_core_0_410_0_crate_source": {
+      "verification": "unverified",
+      "present": false,
+      "paths_checked": [
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deno_core-0.410.0",
+        "/Users/michaelwelsch/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/de/no/deno_core"
+      ]
+    },
+    "deno_v8_0_2_0_crate_source": {
+      "verification": "unverified",
+      "present": false,
+      "paths_checked": [
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deno_v8-0.2.0",
+        "/Users/michaelwelsch/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/de/no/deno_v8"
+      ]
+    },
+    "v8_150_4_0_crate_source": {
+      "verification": "unverified",
+      "present": false,
+      "paths_checked": [
+        "/Users/michaelwelsch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/v8-150.4.0",
+        "/Users/michaelwelsch/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/2/v8"
+      ]
+    },
+    "rusty_v8": {
+      "included": false,
+      "reason": "rusty_v8 is omitted because deno_core 0.410.0 was not present locally, so its lockfile could not be inspected. A version is not recorded rather than invented."
+    },
+    "playwright_1_62_1": {
+      "verification": "locally-inspected",
+      "package_json": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/package.json",
+      "license_file": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/LICENSE"
+    },
+    "playwright_core_1_62_1": {
+      "verification": "locally-inspected",
+      "package_json": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/package.json",
+      "license_file": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/LICENSE",
+      "browsers_json": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/browsers.json",
+      "types_d_ts": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/types/types.d.ts",
+      "also_inspected": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright-core/package.json"
+    }
+  },
+  "dependencies": [
+    {
+      "name": "servo",
+      "semantic_version": "0.5.0",
+      "exact_source_revision": "77fccacc1f1fdce10498d50173aafaa09d02879e",
+      "source_url": {
+        "locator": "https://crates.io/api/v1/crates/servo/0.5.0/download",
+        "derived_from": "crate name servo and verified semantic version 0.5.0",
+        "derivation": "crates.io crate download URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "verification": "unverified",
+        "reason": "No local Cargo.toml, crate source, or index metadata was present to evidence a git repository URL."
+      },
+      "archive_sha256": "331e15df72165ca15b3945970c6870c4b7367be116ded058fda4f41190b265b8",
+      "license": {
+        "spdx": "MPL-2.0",
+        "verification": "verified"
+      },
+      "rust_version": "1.88.0",
+      "role": "intended-production-linked",
+      "linkage_status": "not-yet-linked",
+      "phase_0_status": "Phase 0 lock only",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": false,
+      "supported_targets": {
+        "verification": "unverified",
+        "reason": "servo-0.5.0 crate source and Cargo.toml were not present locally."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Revise this lock, re-verify the archive SHA-256, refresh licenses and the Servo embedding-gap inventory, and re-run compatibility plus size/RSS gates. Prefer the released embedding API; if hooks are missing, document, implement the narrowest general-purpose Servo API, add Servo-level tests, upstream when practical, pin the accepted revision, and avoid a large untracked fork."
+    },
+    {
+      "name": "deno_core",
+      "semantic_version": "0.410.0",
+      "exact_source_revision": "5dfadcebf35d86f27e916a25c4109b5aa233ded7",
+      "source_url": {
+        "locator": "https://crates.io/api/v1/crates/deno_core/0.410.0/download",
+        "derived_from": "crate name deno_core and verified semantic version 0.410.0",
+        "derivation": "crates.io crate download URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "verification": "unverified",
+        "reason": "deno_core 0.410.0 crate source was not present locally, so a git repository URL was not evidenced."
+      },
+      "archive_sha256": "04d1a43a2716c6818a845f2449ae659da547687c0c4b27c34d242469dd5912bb",
+      "license": {
+        "spdx": null,
+        "verification": "unverified",
+        "reason": "LICENSE and Cargo.toml were not present in the local cargo registry."
+      },
+      "role": "intended-production-linked",
+      "linkage_status": "not-yet-linked",
+      "phase_0_status": "Phase 0 lock only",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": false,
+      "supported_targets": {
+        "verification": "unverified",
+        "reason": "deno_core-0.410.0 crate source was not present locally."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Revise this lock together with deno_v8 and the Rust v8 package, re-verify SHA-256, and re-run controller isolate, size, and security-negative gates."
+    },
+    {
+      "name": "deno_v8",
+      "semantic_version": "0.2.0",
+      "exact_source_revision": "5dfadcebf35d86f27e916a25c4109b5aa233ded7",
+      "source_revision_note": "Same git revision as deno_core 0.410.0 from the verified fact set.",
+      "source_url": {
+        "locator": "https://crates.io/api/v1/crates/deno_v8/0.2.0/download",
+        "derived_from": "crate name deno_v8 and verified semantic version 0.2.0",
+        "derivation": "crates.io crate download URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "verification": "unverified",
+        "reason": "deno_v8 0.2.0 crate source was not present locally, so a git repository URL was not evidenced."
+      },
+      "archive_sha256": "d6cc60d688463f27ab0ced89e6f22ffd1a41633024c43bc34c93a274f2801037",
+      "license": {
+        "spdx": null,
+        "verification": "unverified",
+        "reason": "LICENSE and Cargo.toml were not present in the local cargo registry."
+      },
+      "role": "intended-production-linked",
+      "linkage_status": "not-yet-linked",
+      "phase_0_status": "Phase 0 lock only",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": false,
+      "supported_targets": {
+        "verification": "unverified",
+        "reason": "deno_v8-0.2.0 crate source was not present locally."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Keep locked with the selected deno_core release. Revise this lock, re-verify SHA-256, and re-run controller isolate gates."
+    },
+    {
+      "name": "v8",
+      "semantic_version": "150.4.0",
+      "package_ecosystem": "crates.io Rust package",
+      "exact_source_revision": {
+        "verification": "unverified",
+        "reason": "No source revision was supplied in the verified fact set for the Rust v8 package 150.4.0, and the crate was not present locally."
+      },
+      "source_url": {
+        "locator": "https://crates.io/api/v1/crates/v8/150.4.0/download",
+        "derived_from": "crate name v8 and verified semantic version 150.4.0",
+        "derivation": "crates.io crate download URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "verification": "unverified",
+        "reason": "v8 150.4.0 crate source was not present locally."
+      },
+      "archive_sha256": "42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49",
+      "license": {
+        "spdx": null,
+        "verification": "unverified",
+        "reason": "LICENSE and Cargo.toml were not present in the local cargo registry."
+      },
+      "role": "intended-production-linked",
+      "linkage_status": "not-yet-linked",
+      "phase_0_status": "Phase 0 lock only",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": false,
+      "supported_targets": {
+        "verification": "unverified",
+        "reason": "v8-150.4.0 crate source was not present locally."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Lock with the selected deno_core/deno_v8 pair. If prebuilt archives are used later, mirror and verify them by digest. Revise this lock before any production link."
+    },
+    {
+      "name": "playwright",
+      "semantic_version": "1.62.1",
+      "exact_source_revision": "26a9e470a7b3c7822084b09fb7f13902c5f37b51",
+      "source_url": {
+        "locator": "https://registry.npmjs.org/playwright/-/playwright-1.62.1.tgz",
+        "derived_from": "npm package name playwright and verified semantic version 1.62.1",
+        "derivation": "npm tarball URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "type": "git",
+        "url": "git+https://github.com/microsoft/playwright.git",
+        "inspection_path": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/package.json",
+        "verification": "locally-inspected"
+      },
+      "archive_sha256": "1982556a882b246ccb7c16337fab5e4e790292b69f835a2db1011dddc440ed98",
+      "archive_sha1": "8447b6755e8aec85a3cb7207c823e3ed2fc66700",
+      "license": {
+        "spdx": "Apache-2.0",
+        "verification": "locally-inspected",
+        "inspection_paths": [
+          "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/package.json",
+          "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/LICENSE"
+        ]
+      },
+      "role": "test-oracle-only",
+      "linkage_status": "must-not-link",
+      "production_runtime": "MUST NOT be linked, bundled, invoked, downloaded, or required by the production runtime.",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": true,
+      "package_json_engines": {
+        "node": ">=20",
+        "inspection_path": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/package.json"
+      },
+      "supported_targets": {
+        "os": {
+          "verification": "unverified",
+          "reason": "package.json os field is absent."
+        },
+        "cpu": {
+          "verification": "unverified",
+          "reason": "package.json cpu field is absent."
+        },
+        "note": "Oracle package engines.node >=20 is not a production-runtime target. Production MUST NOT require Node.js."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Changing the Playwright baseline requires a compatibility contract revision, a generated schema diff, passing old and new conformance corpora, documented breaking behavior, and a versioned runtime capability advertisement."
+    },
+    {
+      "name": "playwright-core",
+      "semantic_version": "1.62.1",
+      "exact_source_revision": "26a9e470a7b3c7822084b09fb7f13902c5f37b51",
+      "source_url": {
+        "locator": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.62.1.tgz",
+        "derived_from": "npm package name playwright-core and verified semantic version 1.62.1",
+        "derivation": "npm tarball URL convention from package name plus version",
+        "verification": "constructed-locator"
+      },
+      "source_repository": {
+        "type": "git",
+        "url": "git+https://github.com/microsoft/playwright.git",
+        "inspection_path": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/package.json",
+        "verification": "locally-inspected"
+      },
+      "archive_sha256": "954be1e183d0ddb9748fe0d2d08b0b66a9210c74dd75c397aeb70303b9f08a00",
+      "license": {
+        "spdx": "Apache-2.0",
+        "verification": "locally-inspected",
+        "inspection_paths": [
+          "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/package.json",
+          "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/LICENSE"
+        ]
+      },
+      "role": "test-oracle-only",
+      "linkage_status": "must-not-link",
+      "production_runtime": "MUST NOT be linked, bundled, invoked, downloaded, or required by the production runtime.",
+      "vendored": false,
+      "generated": false,
+      "test_oracle": true,
+      "package_json_engines": {
+        "node": ">=20",
+        "inspection_path": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/package.json"
+      },
+      "supported_targets": {
+        "os": {
+          "verification": "unverified",
+          "reason": "package.json os field is absent."
+        },
+        "cpu": {
+          "verification": "unverified",
+          "reason": "package.json cpu field is absent."
+        },
+        "note": "Oracle package engines.node >=20 is not a production-runtime target. Production MUST NOT require Node.js."
+      },
+      "pinned_reference_browser_from_browsers_json": {
+        "role": "test-oracle-only",
+        "inspection_path": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/browsers.json",
+        "name": "chromium",
+        "playwright_browser_revision": "1234",
+        "browser_version": "151.0.7922.34",
+        "title": "Chrome for Testing",
+        "production_runtime": "MUST NOT be linked, bundled, invoked, downloaded, or required by the production runtime."
+      },
+      "update_owner": "Greppy web-runtime release owner",
+      "update_procedure": "Keep locked with playwright 1.62.1. Changing either package is a Playwright baseline change and requires the full baseline-update procedure in this contract."
+    }
+  ],
+  "intentionally_omitted": [
+    {
+      "name": "rusty_v8",
+      "reason": "The guide names rusty_v8 as the Rust V8 binding to lock with the selected deno_core release. deno_core 0.410.0 was not present locally, so its lock could not be inspected. rusty_v8 is omitted rather than recorded with an invented version."
+    }
+  ]
+}

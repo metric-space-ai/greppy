@@ -5,6 +5,7 @@
 
 use super::*;
 use clap::{Parser, Subcommand};
+use crate::web::WebCommand;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -13,6 +14,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Code navigation for coding agents, with byte-exact real-grep passthrough for ordinary grep invocations.",
     long_about = None,
+    after_help = "Agent modes:\n  greppy agent [\"INITIAL TASK\"] --model MODEL   Interactive TUI\n  greppy -p \"TASK\" --model MODEL                Headless one-shot",
     allow_external_subcommands = true,
     disable_help_subcommand = true,
     trailing_var_arg = true,
@@ -727,6 +729,11 @@ pub enum Command {
         /// of on the first request.
         #[arg(long)]
         prewarm: bool,
+    },
+    /// Experimental web runtime. Not a production Playwright compatibility claim.
+    Web {
+        #[command(subcommand)]
+        command: WebCommand,
     },
     /// Internal: warm Qwen3.5 summarization daemon for `brief`.
     #[cfg(any(unix, windows))]

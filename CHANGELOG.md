@@ -98,6 +98,174 @@ from a missing index before the first atomic snapshot is published. It reports
 exit 75 instead of the contradictory `no_index` response that told agents to
 start a second indexer.
 
+### Web runtime (0.3.5)
+
+Interactive web-runtime work on `codex/grok-web-runtime-prototype` is **0.3.5**.
+It is not part of the 0.3.4 TUI surface. The product label remains an
+experimental web-runtime spike; this is not a Playwright-compatibility claim.
+
+Local gates landed in this stream (exact tests, not inventory shrink):
+
+- Layout actionability pumps the Servo event loop between samples. A moving
+  locator target times out with `failed_check=stable` and is not clicked;
+  a later-stable target is clicked only after two matching samples. Pump
+  tokens are worker-owned monotonic nonces. Leftovers are reclaimed on the
+  next engine call and after a successful wait. Repeated timeout cycles then
+  recovery must leave `window.__greppyPump*` empty (`locator_click_waits_for_actionable_target`).
+- The requested action timeout is preserved. Controller RPC adds explicit
+  watchdog headroom so the engine can return the named actionability error.
+- Closed Page, Context, and Browser throw `object_disposed`. `context.close`
+  disposes descendant pages; sibling contexts stay live. Server-side
+  `params.generation` is compared against stored Live/Disposed generation
+  (`closed_page_and_browser_throw_object_disposed`).
+
+Keyboard `type` / `insertText` / `press` follow a measured Chromium oracle
+(isolated from fill/click setup): `insertText` is
+`beforeinput` → `textInput` → `input` (no key events); `beforeinput.preventDefault`
+blocks mutation; `keydown.preventDefault` still emits keyup on `type`. Remaining
+gaps (IME, `isTrusted`, full layout, repeat, mac editing commands) stay
+unsupported rather than claimed (`keyboard_down_and_up_are_separate_events`).
+`Page.setViewportSize` stays fail-closed, including the current 800×600 size,
+because the Servo renderer does not resize (`set_viewport_size_is_unsupported`).
+Nested `frameLocator` / `childFrames` stay fail-closed. Child `Frame.tap` stays
+on the touch path, not click.
+`GREPPY_WEB_FIXTURE_URL` is no longer a silent CLI production path.
+`Page.waitForFunction` / `Frame.waitForFunction` / `Locator.waitForFunction`
+wait inside the content worker while pumping Servo (no 20ms controller poll).
+`hydrated_spa_wait_for_function_sees_async_dom_update` requires the wait to
+outlast an 80ms page timer and to run script-interval ticks.
+Non-macOS workers refuse to start unsandboxed instead of `Ok(())` with no profile.
+Engine RPC and content-worker action timeouts parse JSON integers and V8
+`f64` numbers (`timeout_ms_from_json`); invalid values use the default and
+the result is clamped. `page.waitForFunction({ timeout: 250 })` therefore
+returns `timeout: waitForFunction` instead of racing the controller watchdog
+(`timed out after 250ms`). Default `polling: 'raf'` follows pure JS heap
+state (no DOM mutation required); the waiter is a chained rAF plus one
+completion nonce, one slot-read, and cleanup on every path.
+Relative ESM modules are a supervisor-mediated capability: the canonical
+entry file's parent is a bounded script root, staged into an isolated
+per-request temp path, with symlink and parent-directory escapes skipped
+and deleted after the run. Host filesystem and Node builtins stay denied.
+CommonJS `require("playwright")` is granted; `require("fs")` stays denied
+(`relative_esm_inside_script_root_is_granted`).
+JSON modules under the staged script root are granted only with
+`with { type: "json" }` (`json_module_inside_script_root_is_granted`);
+absolute `file://` JSON imports stay denied.
+`Page.waitForEvent` for `pageerror` / frame / `requestfailed` /
+`requestfinished` / `request` is controller-side `once` plus a one-shot
+timeout, not a 20ms poll. After `goto`, network settlement waits on the
+content-worker Condvar (`page.waitForRequest`) instead of raster-polling.
+Sensitive artifact manifests omit model-facing `text`/`html`/`bytes` and
+keep digest/path/label (`sensitive_model_facing_ref_omits_raw_bytes_and_keeps_digest_path_label`).
+Claimed-entry source receipts live under `contracts/web-runtime/receipts/`
+and must not set inventory `behavior:passing`.
+Linux Landlock live deny and same-image `fexecve` stay OPEN until an
+ubuntu-latest job log shows the deny/fexecve path. The reproducible gate is
+`.github/workflows/web-runtime-linux-sandbox.yml`. Preliminary Linux
+container evidence uses `rust:1.93-bookworm`; the pinned 1.95/Ubuntu-CI
+receipt remains OPEN.
+
+Debug `cargo test` / `cargo build` copies digest-verified GGUF/tokenizer
+files from compile-time repo paths instead of `include_bytes!` into
+`__TEXT`. That is a **dev/test profile optimization only**. It does not
+close a production one-binary or signed/notarized-release cold-start gate.
+Release still bakes the product models. `ci-test-assets` stays debug+CI
+only. Signed/notarized release first-exec remains OPEN until measured.
+Workspace `[profile.dev.package.sha2] opt-level = 3` speeds debug SHA-256
+of the GGUF in `build.rs` (the `sha2` crate only). It is not a blanket
+`build-override` (that would rebuild every proc-macro/build script at
+opt-level 3). Other debug crates and release profiles are unchanged.
+Digest verification is not skipped.
+
+`setExtraHTTPHeaders` extra-header matrix passed `extra_http_headers_are_sent_on_goto`
+(1/1, 53.66s) with extras on the wire for HTTP and HTTPS document, `/sub.js`
+subresources, 302 `/jump` → `/landed`, and isolation (`tagged=false` on a
+sibling context). Engine path is vendored `WebResourceLoad::continue_with_headers`
+in `main_fetch` above TLS; PolicyProxy is pin/deny only. `spin_until` pumps the
+Servo event loop so Continue loads can leave `LoadStatus::Started`. Goto no
+longer sleeps 20ms after `Complete`; scripts are waited by `waitForFunction`.
+`Deno.core.print` is not a controller logging channel (it is the engine IPC
+stdout). Product label stays experimental web-runtime spike.
+
+`Route.continue({ headers })` passed `route_continue_sends_extra_headers_on_http_and_https`
+(1/1, 24.00s) with TLS `/continued` and `/sub.js` tagged. `url` / `method` /
+`postData` stay fail-closed. The JS handler still runs at `page.route()`
+registration and stores a static `RouteRule` (not per-request Playwright
+callbacks).
+
+`one_thousand_session_create_close_cycles` passed (1/1, 28.03s). Session ids
+include a monotonic sequence so two creates in the same nanosecond cannot
+collide. `web.session.close` publishes the session snapshot after remove.
+
+Local runtime gates re-run after those fixes (exact, `--test-threads=1`):
+`idle_supervisor_workers_are_not_cpu_hot` 20.89s, `idle_sessions_are_reaped`
+19.29s, `worker_sandbox_denies_host_secret_paths` 23.64s,
+`content_worker_crash_is_recovered_without_hanging` 17.50s,
+`compatibility-inventory` 3/3 in 0.16s, `process-boundary` 7/7 in 29.79s,
+`observe_read_search_research_screenshot_and_policy` 32.30s,
+`twenty_independent_playwright_scripts` 186.39s (20 **repo fixtures**, not
+the DoD's 20 independent third-party Playwright scripts).
+`one_thousand_session_create_run_close_cycles` is the remaining leak gate:
+create+run+close of `launch-only.mjs` cannot finish under the 300s harness
+abort (`session-daemon supervisor exceeded 300s` then mozalloc SIGSEGV).
+The product 10s `web.run` deadline is unchanged; the leak harness uses a
+45-minute watchdog so 1000 cycles can complete.
+
+`web_doctor_json_does_not_spawn_runtime` 1/1 in 9.66s (bound 30s). The test
+now isolates `GREPPY_STORE_DIR` so a skip-GC miss cannot scan the real
+store. Doctor remains facts-only and does not spawn workers.
+
+External blockers (codesign/notary, Windows-Linux CI, 8h soak, SBOM signatures,
+human security review, 20 independent third-party Playwright scripts, size/RSS
+vs Playwright+Chromium, macOS fexecve, `web-engine-servo` crate split) stay
+unchecked.
+
+### Interactive agent TUI (0.3.4)
+
+`greppy agent` is a production interactive TUI on the same isolated
+CoW/native worktree, sandbox, and `refs/greppy/agent/<run-id>` proposal as
+`greppy -p`. The terminal event loop stays on the main thread; model
+streaming and tools run on a worker. Token and thinking deltas are coalesced
+through a capped buffer so a slow renderer cannot grow memory without bound.
+Conversation history is preserved across prompts without cloning it on every
+streamed token.
+
+The surface is a one-line header (agent, repository, branch/worktree, model,
+sandbox), a Markdown transcript with tool rows and collapsed thinking, a
+grapheme-aware multiline composer, and a status footer with activity, tokens,
+turns, and queued follow-ups. Submissions while the agent is busy become
+visible queued follow-ups. Enter submits; Shift+Enter / Alt+Enter insert a
+newline when the terminal reports those modifiers. PageUp/PageDown scroll by
+the viewport. Follow-tail is automatic only at the bottom; End or a new
+prompt restores it.
+
+Slash commands: `/help`, `/clear` (confirms before discarding visible
+context), `/model`, `/usage`, `/tools`, `/copy` (OSC 52 with a fallback
+message), `/sessions`, `/name TITLE`, `/compact`, `/exit` `/quit` `/q`.
+Ctrl+C cancels at a safe tool boundary and never interrupts an in-flight
+edit; a second Ctrl+C exits after RAII terminal restoration (raw mode,
+alternate screen, mouse, bracketed paste, cursor, title). Non-TTY stdin or
+stdout refuse full-screen mode without emitting control sequences. `NO_COLOR`
+and an ASCII fallback are honoured. Below 60×18 the UI shows a stable
+"terminal too small" view and recovers on resize.
+
+Sessions persist as versioned append-only JSONL under the Greppy data root
+(`agent-sessions/<project>/`). `--continue` restores the latest project
+session; `--resume SESSION_ID` restores a named one. A truncated tail
+recovers the valid prefix. Persistence failure warns and keeps the in-memory
+conversation. `/compact` retains recent messages plus an extractive summary.
+Secrets and authorization headers are redacted from display and disk.
+
+`--apply`, `--diff`, `--keep-worktree`, `--fresh`, `--workspace-backend`,
+`--no-sandbox`, `--skip-selfcheck`, deadline, and token/turn limits remain
+valid in interactive mode. `greppy -p` stdout/stderr/exit-code, sandbox,
+workspace, proposal-ref, and apply behaviour are unchanged; `greppy -e -p`
+still reaches grep passthrough.
+
+The agent loop honours a cooperative cancel flag at the same safe boundaries
+as the wall-clock deadline (between turns, after a stream, after a tool
+returns) and exposes `LoopStop::Cancelled`.
+
 ## [0.3.3] — 2026-08-25
 
 ### Filesystem-CoW agent workspaces

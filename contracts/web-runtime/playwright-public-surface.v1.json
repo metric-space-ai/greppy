@@ -1,0 +1,7451 @@
+{
+  "contract": "greppy.web-runtime.playwright-public-surface.v1",
+  "contract_revision": "2026-08-26",
+  "phase": 0,
+  "playwright_version": "1.62.1",
+  "git_revision": "26a9e470a7b3c7822084b09fb7f13902c5f37b51",
+  "hashes": {
+    "playwright": {
+      "sha256": "1982556a882b246ccb7c16337fab5e4e790292b69f835a2db1011dddc440ed98",
+      "sha1": "8447b6755e8aec85a3cb7207c823e3ed2fc66700",
+      "verification": "provided-verified-fact"
+    },
+    "playwright-core": {
+      "sha256": "954be1e183d0ddb9748fe0d2d08b0b66a9210c74dd75c397aeb70303b9f08a00",
+      "verification": "provided-verified-fact"
+    },
+    "types.d.ts": {
+      "sha256": "6c688250f2b7061cec3a17ab8797671137b653f8c4e81a6df3190cb112a7579a",
+      "verification": "locally-hashed",
+      "path": "/tmp/greppy-web-runtime-phase0/types.d.ts",
+      "identical_local_path": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright-core/types/types.d.ts"
+    },
+    "parsed_entries.json": {
+      "sha256": "a656ad9f15064a26da4873c6e44b7b0e1ef978ed0941da07d711c0409d24d8bd",
+      "path": "/tmp/greppy-web-runtime-phase0/parsed_entries.json",
+      "bytes": 100391
+    }
+  },
+  "inspection": {
+    "playwright_package_json": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/package.json",
+    "playwright_core_package_json": "/Users/michaelwelsch/.npm/_npx/e058441c325e062a/node_modules/playwright-core/package.json",
+    "playwright_license": "Apache-2.0",
+    "playwright_license_verification": "locally-inspected-package.json-and-LICENSE"
+  },
+  "parser_provenance": {
+    "path": "/tmp/greppy-web-runtime-phase0/parsed_entries.json",
+    "sha256": "a656ad9f15064a26da4873c6e44b7b0e1ef978ed0941da07d711c0409d24d8bd",
+    "emitted": {
+      "exports": 74,
+      "entries": 1250,
+      "export_kinds": {
+        "interface": 62,
+        "namespace": 1,
+        "const": 8,
+        "type": 3
+      },
+      "entry_kinds": {
+        "method": 609,
+        "property": 585,
+        "event": 56
+      }
+    },
+    "complete": false,
+    "limitations": [
+      "The original parser emitted no BrowserType.* member entries. BrowserType appears as an export interface, but its methods and properties are missing from entries.",
+      "Recovered from types.d.ts (comment-stripped declaration parse): connectOverCDP, connect, executablePath, launch, launchPersistentContext, launchServer, name. Overloads were collapsed to one inventory row per member name.",
+      "Electron, Android, and nested option-object members may also be incomplete in the original parser output.",
+      "The original parser attached some nested option fields to parent types (for example Page.trial, Page.waitUntil, Browser.viewport). Those rows are preserved as parser output and are not treated as proof that the parent object has those fields.",
+      "EventEmitter overloads (on/once/off and related) are represented as events plus Page.addListener-style methods where the parser emitted them; types.d.ts recovery does not re-emit every overload.",
+      "Type-level inventory is necessary but not sufficient for compatibility. Schema presence does not imply source or behavior compatibility."
+    ]
+  },
+  "types_dts_provenance": {
+    "path": "/tmp/greppy-web-runtime-phase0/types.d.ts",
+    "sha256": "6c688250f2b7061cec3a17ab8797671137b653f8c4e81a6df3190cb112a7579a",
+    "bytes": 1110840,
+    "line_count": 26188,
+    "identical_to_inspected_playwright_core_1_62_1": true,
+    "inspected_path": "/Users/michaelwelsch/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright-core/types/types.d.ts",
+    "recovery_method": "Strip block and line comments from Playwright 1.62.1 types.d.ts, then parse export interface, export type, export const, and export namespace declarations with brace matching. Interface members are split on top-level semicolons. Events are taken from on(event: 'name') overloads and inventoried as Type.event.name. BrowserType generic syntax (BrowserType<Unused = {}>) is handled by skipping generic parameters before the body brace. Nested inline option object fields inside method parameters are not exploded into additional member rows."
+  },
+  "virtual_module_required_exports": [
+    "chromium",
+    "firefox",
+    "webkit",
+    "request",
+    "selectors",
+    "devices",
+    "errors"
+  ],
+  "virtual_module_required_exports_present_in_parser_exports": [
+    "chromium",
+    "firefox",
+    "webkit",
+    "request",
+    "selectors",
+    "devices",
+    "errors"
+  ],
+  "virtual_module_required_exports_missing_from_parser_exports": [],
+  "required_early_event_families_section_11_4": [
+    "Browser.event.disconnected",
+    "BrowserContext.event.page",
+    "BrowserContext.event.request",
+    "BrowserContext.event.response",
+    "BrowserContext.event.requestfailed",
+    "BrowserContext.event.close",
+    "Page.event.console",
+    "Page.event.dialog",
+    "Page.event.download",
+    "Page.event.filechooser",
+    "Page.event.frameattached",
+    "Page.event.framedetached",
+    "Page.event.framenavigated",
+    "Page.event.load",
+    "Page.event.domcontentloaded",
+    "Page.event.popup",
+    "Page.event.request",
+    "Page.event.response",
+    "Page.event.requestfailed",
+    "Page.event.worker",
+    "Page.event.close",
+    "Page.event.crash",
+    "Worker.event.close"
+  ],
+  "required_early_event_families_missing": [],
+  "compatibility_sufficiency": "Type-level inventory is necessary but not sufficient for compatibility. No schema, source, or behavior result in this Phase 0 contract is passing or implemented. Compatibility remains unverified or unsupported until a later phase records conformance evidence.",
+  "parser_complete": false,
+  "exports": [
+    {
+      "kind": "interface",
+      "name": "Page"
+    },
+    {
+      "kind": "interface",
+      "name": "Frame"
+    },
+    {
+      "kind": "interface",
+      "name": "BrowserContext"
+    },
+    {
+      "kind": "interface",
+      "name": "Browser"
+    },
+    {
+      "kind": "interface",
+      "name": "Worker"
+    },
+    {
+      "kind": "interface",
+      "name": "JSHandle"
+    },
+    {
+      "kind": "interface",
+      "name": "ElementHandle"
+    },
+    {
+      "kind": "interface",
+      "name": "Locator"
+    },
+    {
+      "kind": "interface",
+      "name": "BrowserType"
+    },
+    {
+      "kind": "interface",
+      "name": "ConnectOverCDPTransport"
+    },
+    {
+      "kind": "interface",
+      "name": "CDPSession"
+    },
+    {
+      "kind": "interface",
+      "name": "WebSocketRoute"
+    },
+    {
+      "kind": "interface",
+      "name": "Screencast"
+    },
+    {
+      "kind": "namespace",
+      "name": "errors"
+    },
+    {
+      "kind": "const",
+      "name": "devices"
+    },
+    {
+      "kind": "interface",
+      "name": "ElectronApplication"
+    },
+    {
+      "kind": "type",
+      "name": "AndroidElementInfo"
+    },
+    {
+      "kind": "type",
+      "name": "AndroidSelector"
+    },
+    {
+      "kind": "type",
+      "name": "AndroidKey"
+    },
+    {
+      "kind": "const",
+      "name": "_electron"
+    },
+    {
+      "kind": "const",
+      "name": "_android"
+    },
+    {
+      "kind": "interface",
+      "name": "APIRequest"
+    },
+    {
+      "kind": "interface",
+      "name": "APIRequestContext"
+    },
+    {
+      "kind": "interface",
+      "name": "APIResponse"
+    },
+    {
+      "kind": "interface",
+      "name": "BrowserServer"
+    },
+    {
+      "kind": "interface",
+      "name": "Clock"
+    },
+    {
+      "kind": "interface",
+      "name": "ConsoleMessage"
+    },
+    {
+      "kind": "interface",
+      "name": "Coverage"
+    },
+    {
+      "kind": "interface",
+      "name": "Credentials"
+    },
+    {
+      "kind": "interface",
+      "name": "Debugger"
+    },
+    {
+      "kind": "interface",
+      "name": "Dialog"
+    },
+    {
+      "kind": "interface",
+      "name": "Disposable"
+    },
+    {
+      "kind": "interface",
+      "name": "Download"
+    },
+    {
+      "kind": "interface",
+      "name": "FileChooser"
+    },
+    {
+      "kind": "interface",
+      "name": "FrameLocator"
+    },
+    {
+      "kind": "interface",
+      "name": "Keyboard"
+    },
+    {
+      "kind": "interface",
+      "name": "Logger"
+    },
+    {
+      "kind": "interface",
+      "name": "Mouse"
+    },
+    {
+      "kind": "const",
+      "name": "chromium"
+    },
+    {
+      "kind": "const",
+      "name": "firefox"
+    },
+    {
+      "kind": "const",
+      "name": "request"
+    },
+    {
+      "kind": "const",
+      "name": "selectors"
+    },
+    {
+      "kind": "const",
+      "name": "webkit"
+    },
+    {
+      "kind": "interface",
+      "name": "Request"
+    },
+    {
+      "kind": "interface",
+      "name": "Response"
+    },
+    {
+      "kind": "interface",
+      "name": "Route"
+    },
+    {
+      "kind": "interface",
+      "name": "Selectors"
+    },
+    {
+      "kind": "interface",
+      "name": "Touchscreen"
+    },
+    {
+      "kind": "interface",
+      "name": "Tracing"
+    },
+    {
+      "kind": "interface",
+      "name": "Video"
+    },
+    {
+      "kind": "interface",
+      "name": "WebError"
+    },
+    {
+      "kind": "interface",
+      "name": "WebSocket"
+    },
+    {
+      "kind": "interface",
+      "name": "WebStorage"
+    },
+    {
+      "kind": "interface",
+      "name": "Electron"
+    },
+    {
+      "kind": "interface",
+      "name": "Android"
+    },
+    {
+      "kind": "interface",
+      "name": "AndroidDevice"
+    },
+    {
+      "kind": "interface",
+      "name": "AndroidInput"
+    },
+    {
+      "kind": "interface",
+      "name": "AndroidSocket"
+    },
+    {
+      "kind": "interface",
+      "name": "AndroidWebView"
+    },
+    {
+      "kind": "interface",
+      "name": "LaunchOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "ConnectOverCDPOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "ConnectOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "LocatorScreenshotOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "BrowserContextOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "ViewportSize"
+    },
+    {
+      "kind": "interface",
+      "name": "HTTPCredentials"
+    },
+    {
+      "kind": "interface",
+      "name": "Geolocation"
+    },
+    {
+      "kind": "interface",
+      "name": "Cookie"
+    },
+    {
+      "kind": "interface",
+      "name": "PageScreenshotOptions"
+    },
+    {
+      "kind": "interface",
+      "name": "ChromiumBrowserContext"
+    },
+    {
+      "kind": "interface",
+      "name": "ChromiumBrowser"
+    },
+    {
+      "kind": "interface",
+      "name": "FirefoxBrowser"
+    },
+    {
+      "kind": "interface",
+      "name": "WebKitBrowser"
+    },
+    {
+      "kind": "interface",
+      "name": "ChromiumCoverage"
+    }
+  ],
+  "entries": [
+    {
+      "symbol": "Page.addInitScript",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.addLocatorHandler",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.addScriptTag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.addStyleTag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.ariaSnapshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.bringToFront",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.cancelPickLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.check",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.clearConsoleMessages",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.clearPageErrors",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.click",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.consoleMessages",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.content",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.context",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.dblclick",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.dispatchEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.dragAndDrop",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.emulateMedia",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.exposeBinding",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.exposeFunction",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.fill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.focus",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.frame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.frameLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.frames",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getAttribute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByAltText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByLabel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByPlaceholder",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByRole",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByTestId",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.getByTitle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.goBack",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.goForward",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.goto",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.hideHighlight",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.hover",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.innerHTML",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.innerText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.inputValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isClosed",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isDisabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isEditable",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isEnabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isHidden",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.isVisible",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.locator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.mainFrame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.opener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pageErrors",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pause",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pdf",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pickLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.reload",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.removeAllListeners",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.removeLocatorHandler",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.requestGC",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.requests",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.route",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.routeFromHAR",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.routeWebSocket",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.screenshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.selectOption",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setDefaultNavigationTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setDefaultTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setExtraHTTPHeaders",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setInputFiles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.setViewportSize",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.textContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.title",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.uncheck",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.unroute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.unrouteAll",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.video",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.viewportSize",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForFunction",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForLoadState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForNavigation",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForRequest",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForResponse",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForSelector",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitForURL",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.workers",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.behavior",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.bottom",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.boxes",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.button",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.checked",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.clickCount",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.colorScheme",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.contrast",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.depth",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.description",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.disabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.displayHeaderFooter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.exact",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.expanded",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.filter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.footerTemplate",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.force",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.forcedColors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.format",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.has",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.hasNot",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.hasNotText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.hasText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.headerTemplate",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.height",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.includeHidden",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.index",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.label",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.landscape",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.left",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.level",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.margin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.media",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.modifiers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.name",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.noWaitAfter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.notFound",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.outline",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pageRanges",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.preferCSSPageSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.pressed",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.printBackground",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.reason",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.reducedMotion",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.referer",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.right",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.runBeforeUnload",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.scale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.scroll",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.selected",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.sourcePosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.steps",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.strict",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.tagged",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.targetPosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.times",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.top",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.trial",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.update",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.updateContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.updateMode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.value",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.waitUntil",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.width",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.console",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.crash",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.dialog",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.domcontentloaded",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.download",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.filechooser",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.frameattached",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.framedetached",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.framenavigated",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.load",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.pageerror",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.popup",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.request",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.requestfailed",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.requestfinished",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.response",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.websocket",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.event.worker",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.addScriptTag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.addStyleTag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.check",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.childFrames",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.click",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.content",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.dblclick",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.dispatchEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.dragAndDrop",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.fill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.focus",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.frameElement",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.frameLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getAttribute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByAltText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByLabel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByPlaceholder",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByRole",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByTestId",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.getByTitle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.goto",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.hover",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.innerHTML",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.innerText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.inputValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isDetached",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isDisabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isEditable",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isEnabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isHidden",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.isVisible",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.locator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.name",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.parentFrame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.selectOption",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.setChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.setContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.setInputFiles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.textContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.title",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.uncheck",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForFunction",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForLoadState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForNavigation",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForSelector",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitForURL",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.button",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.checked",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.clickCount",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.description",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.disabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.exact",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.expanded",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.force",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.has",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.hasNot",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.hasNotText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.hasText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.includeHidden",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.index",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.label",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.level",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.modifiers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.noWaitAfter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.pressed",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.referer",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.scroll",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.selected",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.sourcePosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.steps",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.strict",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.targetPosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.trial",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.value",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Frame.waitUntil",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.addCookies",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.addInitScript",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.backgroundPages",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.browser",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.clearCookies",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.clearPermissions",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.cookies",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.exposeBinding",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.exposeFunction",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.grantPermissions",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.isClosed",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.newCDPSession",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.newPage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.pages",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.removeAllListeners",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.route",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.routeFromHAR",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.routeWebSocket",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.serviceWorkers",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setDefaultNavigationTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setDefaultTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setExtraHTTPHeaders",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setGeolocation",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setHTTPCredentials",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setOffline",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.setStorageState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.storageState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.unroute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.unrouteAll",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.accuracy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.behavior",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.credentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.domain",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.expires",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.httpOnly",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.indexedDB",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.name",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.notFound",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.partitionKey",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.reason",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.sameSite",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.secure",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.times",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.update",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.updateContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.updateMode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.url",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.backgroundpage",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.console",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.dialog",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.download",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.frameattached",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.framedetached",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.framenavigated",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.page",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.pageclose",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.pageload",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.request",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.requestfailed",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.requestfinished",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.response",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.serviceworker",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContext.event.weberror",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.bind",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.browserType",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.contexts",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.isConnected",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.newBrowserCDPSession",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.newContext",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.newPage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.removeAllListeners",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.startTracing",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.stopTracing",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.unbind",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.version",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.acceptDownloads",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.accuracy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.baseURL",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.behavior",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.bypass",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.bypassCSP",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.categories",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.cert",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.certPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.clientCertificates",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.colorScheme",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.contrast",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.cursor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.deviceScaleFactor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.dir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.duration",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.extraHTTPHeaders",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.fontSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.forcedColors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.geolocation",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.hasTouch",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.host",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.httpCredentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.isMobile",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.javaScriptEnabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.key",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.keyPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.locale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.logger",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.metadata",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.offline",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.omitContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.passphrase",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.password",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.permissions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.pfx",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.pfxPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.port",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.proxy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.reason",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.recordHar",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.recordVideo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.reducedMotion",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.screen",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.screenshots",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.send",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.serviceWorkers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.showActions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.size",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.storageState",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.strictSelectors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.timezoneId",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.urlFilter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.userAgent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.username",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.viewport",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.workspaceDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.event.context",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Browser.event.disconnected",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Worker.event.console",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.asElement",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.dispose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.getProperties",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.getProperty",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "JSHandle.jsonValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.boundingBox",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.check",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.click",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.contentFrame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.dblclick",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.dispatchEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.fill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.focus",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.getAttribute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.hover",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.innerHTML",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.innerText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.inputValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isDisabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isEditable",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isEnabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isHidden",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.isVisible",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.ownerFrame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.screenshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.scrollIntoViewIfNeeded",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.selectOption",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.selectText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.setChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.setInputFiles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.textContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.uncheck",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.waitForElementState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.waitForSelector",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.animations",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.button",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.caret",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.clickCount",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.force",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.index",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.label",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.mask",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.maskColor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.modifiers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.noWaitAfter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.omitBackground",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.quality",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.scale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.scroll",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.steps",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.style",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.trial",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElementHandle.value",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.all",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.allInnerTexts",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.allTextContents",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.and",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.ariaSnapshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.blur",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.boundingBox",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.check",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.clear",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.click",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.contentFrame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.count",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.dblclick",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.describe",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.description",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.dispatchEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.dragTo",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.drop",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.elementHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.elementHandles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.evaluateAll",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.fill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.filter",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.first",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.focus",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.frameLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getAttribute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByAltText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByLabel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByPlaceholder",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByRole",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByTestId",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.getByTitle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.hideHighlight",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.highlight",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.hover",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.innerHTML",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.innerText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.inputValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isDisabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isEditable",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isEnabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isHidden",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.isVisible",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.last",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.locator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.normalize",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.nth",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.or",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.pressSequentially",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.screenshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.scrollIntoViewIfNeeded",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.selectOption",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.selectText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.setChecked",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.setInputFiles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.textContent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.toString",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.uncheck",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.waitFor",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.waitForFunction",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.boxes",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.button",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.checked",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.clickCount",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.data",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.depth",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.disabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.exact",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.expanded",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.files",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.force",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.has",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.hasNot",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.hasNotText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.hasText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.includeHidden",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.index",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.label",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.level",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.modifiers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.name",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.noWaitAfter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.pressed",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.scroll",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.selected",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.sourcePosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.state",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.steps",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.targetPosition",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.trial",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.value",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Locator.visible",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPTransport.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPTransport.send",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPTransport.onclose",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPTransport.onmessage",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.detach",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.send",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.params",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "CDPSession.event.event",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.connectToServer",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.onClose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.onMessage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.protocols",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.send",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.code",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocketRoute.reason",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.hideActions",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.hideOverlays",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.showActions",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.showChapter",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.showOverlay",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.showOverlays",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.start",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.stop",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.annotate",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.cursor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.description",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.duration",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.fontSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.onFrame",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.quality",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Screencast.size",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.browserWindow",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.context",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.evaluate",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.evaluateHandle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.firstWindow",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.process",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.windows",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.event.console",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ElectronApplication.event.window",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.newContext",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.baseURL",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.bypass",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.cert",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.certPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.clientCertificates",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.extraHTTPHeaders",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.failOnStatusCode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.httpCredentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.key",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.keyPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.maxRedirects",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.passphrase",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.password",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.pfx",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.pfxPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.proxy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.send",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.storageState",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.userAgent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequest.username",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.delete",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.dispose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.fetch",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.head",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.patch",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.post",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.put",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.storageState",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.data",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.failOnStatusCode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.form",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.headers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.indexedDB",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.maxRedirects",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.maxRetries",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.method",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.multipart",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.params",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.reason",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIRequestContext.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.body",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.dispose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.headers",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.headersArray",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.json",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.ok",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.securityDetails",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.serverAddr",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.status",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.statusText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.text",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.timing",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.issuer",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.protocol",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.subjectName",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.validFrom",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "APIResponse.validTo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.kill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.process",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.wsEndpoint",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserServer.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.fastForward",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.install",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.pauseAt",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.resume",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.runFor",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.setFixedTime",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.setSystemTime",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Clock.time",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.args",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.location",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.text",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.timestamp",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConsoleMessage.worker",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.startCSSCoverage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.startJSCoverage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.stopCSSCoverage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.stopJSCoverage",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.reportAnonymousScripts",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.resetOnNavigation",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.source",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Coverage.text",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.create",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.delete",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.install",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.id",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.privateKey",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.publicKey",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.rpId",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Credentials.userHandle",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.next",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.pausedDetails",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.requestPause",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.resume",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.runTo",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.column",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.line",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Debugger.event.pausedstatechanged",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Dialog.accept",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Dialog.defaultValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Dialog.dismiss",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Dialog.message",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Dialog.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Disposable.dispose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.cancel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.createReadStream",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.delete",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.failure",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.path",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.saveAs",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.suggestedFilename",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Download.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.element",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.isMultiple",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.setFiles",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.noWaitAfter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FileChooser.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.first",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.frameLocator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByAltText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByLabel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByPlaceholder",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByRole",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByTestId",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.getByTitle",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.last",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.locator",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.nth",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.owner",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.checked",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.description",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.disabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.exact",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.expanded",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.has",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.hasNot",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.hasNotText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.hasText",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.includeHidden",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.level",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.name",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.pressed",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "FrameLocator.selected",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Keyboard.down",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Keyboard.insertText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Keyboard.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Keyboard.up",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Keyboard.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Logger.isEnabled",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Logger.log",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Logger.color",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.click",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.dblclick",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.down",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.move",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.up",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.wheel",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.button",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.clickCount",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.delay",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Mouse.steps",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.allHeaders",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.existingResponse",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.failure",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.frame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.headerValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.headers",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.headersArray",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.isNavigationRequest",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.method",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.postData",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.postDataBuffer",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.postDataJSON",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.redirectedFrom",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.redirectedTo",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.resourceType",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.response",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.serviceWorker",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.sizes",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.timing",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Request.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.allHeaders",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.body",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.finished",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.frame",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.fromServiceWorker",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.headerValue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.headerValues",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.headers",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.headersArray",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.httpVersion",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.json",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.ok",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.request",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.securityDetails",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.serverAddr",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.status",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.statusText",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.text",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.issuer",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.protocol",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.subjectName",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.validFrom",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Response.validTo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.abort",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.continue",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.fallback",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.fetch",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.fulfill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.request",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.body",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.contentType",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.headers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.json",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.maxRedirects",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.maxRetries",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.method",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.postData",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.response",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.status",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Route.url",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Selectors.register",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Selectors.setTestIdAttribute",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Selectors.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Selectors.contentScript",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Selectors.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Touchscreen.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.group",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.groupEnd",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.start",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.startChunk",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.startHar",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.stop",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.stopChunk",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.stopHar",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.column",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.line",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.live",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.location",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.name",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.resourcesDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.screenshots",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.snapshots",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.sources",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.title",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Tracing.urlFilter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Video.delete",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Video.path",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Video.saveAs",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebError.error",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebError.location",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebError.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.isClosed",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.url",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.event.framereceived",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.event.framesent",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebSocket.event.socketerror",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebStorage.clear",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebStorage.getItem",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebStorage.items",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebStorage.removeItem",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "WebStorage.setItem",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.launch",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.acceptDownloads",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.accuracy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.args",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.artifactsDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.bypassCSP",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.chromiumSandbox",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.colorScheme",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.cursor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.cwd",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.dir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.duration",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.env",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.executablePath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.extraHTTPHeaders",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.fontSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.geolocation",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.httpCredentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.locale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.offline",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.omitContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.recordHar",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.recordVideo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.send",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.showActions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.size",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.timezoneId",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.tracesDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Electron.urlFilter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.connect",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.devices",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.launchServer",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.setDefaultTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.adbHost",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.adbPort",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.deviceSerialNumber",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.headers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.host",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.omitDriverInstall",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.port",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.slowMo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Android.wsPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.drag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.fill",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.fling",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.info",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.installApk",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.launchBrowser",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.longTap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.model",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.open",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.pinchClose",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.pinchOpen",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.push",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.screenshot",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.scroll",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.serial",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.setDefaultTimeout",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.shell",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.swipe",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.wait",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.waitForEvent",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.webView",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.webViews",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.acceptDownloads",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.accuracy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.args",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.baseURL",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.bypass",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.bypassCSP",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.colorScheme",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.contrast",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.cursor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.deviceScaleFactor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.dir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.duration",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.extraHTTPHeaders",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.fontSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.forcedColors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.geolocation",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.hasTouch",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.httpCredentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.isMobile",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.javaScriptEnabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.locale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.logger",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.offline",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.omitContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.password",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.permissions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.pkg",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.proxy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.recordHar",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.recordVideo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.reducedMotion",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.screen",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.send",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.serviceWorkers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.showActions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.size",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.socketName",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.speed",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.state",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.strictSelectors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.timezoneId",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.urlFilter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.userAgent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.username",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.viewport",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidDevice.event.webview",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidInput.drag",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidInput.press",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidInput.swipe",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidInput.tap",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.close",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.write",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidSocket.event.data",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.addListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.off",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.on",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.once",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.page",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.pid",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.pkg",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.prependListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.removeListener",
+      "kind": "method",
+      "origin": "parser"
+    },
+    {
+      "symbol": "AndroidWebView.event.close",
+      "kind": "event",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.args",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.artifactsDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.bypass",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.channel",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.chromiumSandbox",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.downloadsPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.env",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.executablePath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.firefoxUserPrefs",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.handleSIGHUP",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.handleSIGINT",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.handleSIGTERM",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.headless",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.ignoreDefaultArgs",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.logger",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.password",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.proxy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.slowMo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.tracesDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LaunchOptions.username",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.artifactsDir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.endpointURL",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.headers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.isLocal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.noDefaults",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.slowMo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOverCDPOptions.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOptions.exposeNetwork",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOptions.headers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOptions.slowMo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "ConnectOptions.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.animations",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.caret",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.mask",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.maskColor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.omitBackground",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.quality",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.scale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.style",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.acceptDownloads",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.baseURL",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.bypass",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.bypassCSP",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.cert",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.certPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.clientCertificates",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.colorScheme",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.content",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.contrast",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.cursor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.deviceScaleFactor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.dir",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.duration",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.extraHTTPHeaders",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.fontSize",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.forcedColors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.geolocation",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.hasTouch",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.httpCredentials",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.ignoreHTTPSErrors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.isMobile",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.javaScriptEnabled",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.key",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.keyPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.locale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.logger",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.mode",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.offline",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.omitContent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.passphrase",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.password",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.permissions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.pfx",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.pfxPath",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.position",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.proxy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.recordHar",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.recordVideo",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.reducedMotion",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.screen",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.serviceWorkers",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.showActions",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.size",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.storageState",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.strictSelectors",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.timezoneId",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.urlFilter",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.userAgent",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.username",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "BrowserContextOptions.viewport",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "HTTPCredentials.origin",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "HTTPCredentials.send",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Geolocation.accuracy",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Cookie.partitionKey",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.animations",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.caret",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.clip",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.fullPage",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.mask",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.maskColor",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.omitBackground",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.path",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.quality",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.scale",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.signal",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.style",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "PageScreenshotOptions.timeout",
+      "kind": "property",
+      "origin": "parser"
+    },
+    {
+      "symbol": "Page.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(selector: string, text: string, options?: { delay?: number; noWaitAfter?: boolean; signal?: AbortSignal; strict?: boolean; timeout?: number; }): Promise<void>"
+    },
+    {
+      "symbol": "Page.clock",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "clock: Clock"
+    },
+    {
+      "symbol": "Page.coverage",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "coverage: Coverage"
+    },
+    {
+      "symbol": "Page.keyboard",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "keyboard: Keyboard"
+    },
+    {
+      "symbol": "Page.localStorage",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "localStorage: WebStorage"
+    },
+    {
+      "symbol": "Page.mouse",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "mouse: Mouse"
+    },
+    {
+      "symbol": "Page.request",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "request: APIRequestContext"
+    },
+    {
+      "symbol": "Page.screencast",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "screencast: Screencast"
+    },
+    {
+      "symbol": "Page.sessionStorage",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "sessionStorage: WebStorage"
+    },
+    {
+      "symbol": "Page.touchscreen",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "touchscreen: Touchscreen"
+    },
+    {
+      "symbol": "Frame.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(selector: string, text: string, options?: { delay?: number; noWaitAfter?: boolean; signal?: AbortSignal; strict?: boolean; timeout?: number; }): Promise<void>"
+    },
+    {
+      "symbol": "BrowserContext.clock",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "clock: Clock"
+    },
+    {
+      "symbol": "BrowserContext.debugger",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "debugger: Debugger"
+    },
+    {
+      "symbol": "BrowserContext.request",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "request: APIRequestContext"
+    },
+    {
+      "symbol": "BrowserContext.tracing",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "tracing: Tracing"
+    },
+    {
+      "symbol": "ElementHandle.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(text: string, options?: { delay?: number; noWaitAfter?: boolean; signal?: AbortSignal; timeout?: number; }): Promise<void>"
+    },
+    {
+      "symbol": "Locator.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(text: string, options?: { delay?: number; noWaitAfter?: boolean; signal?: AbortSignal; timeout?: number; }): Promise<void>"
+    },
+    {
+      "symbol": "BrowserType.connectOverCDP",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.connect",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.executablePath",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "executablePath(): string"
+    },
+    {
+      "symbol": "BrowserType.launch",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launch(options?: LaunchOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.launchPersistentContext",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchPersistentContext(userDataDir: string, options?: { acceptDownloads?: boolean; args?: Array<string>; artifactsDir?: string; baseURL?: string; bypassCSP?: boolean; channel?: string; chromiumSandbox?: boolean; clientCertificates?: Arr..."
+    },
+    {
+      "symbol": "BrowserType.launchServer",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchServer(options?: { args?: Array<string>; artifactsDir?: string; channel?: string; chromiumSandbox?: boolean; downloadsPath?: string; env?: { [key: string]: string|undefined; }; executablePath?: string; firefoxUserPrefs?: { [key: st..."
+    },
+    {
+      "symbol": "BrowserType.name",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name(): string"
+    },
+    {
+      "symbol": "ConnectOverCDPTransport.open",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "open?(): void"
+    },
+    {
+      "symbol": "APIRequestContext.get",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "get(url: string, options?: { data?: string|Buffer|Serializable; failOnStatusCode?: boolean; form?: { [key: string]: string|number|boolean; }|FormData; headers?: { [key: string]: string; }; ignoreHTTPSErrors?: boolean; maxRedirects?: numb..."
+    },
+    {
+      "symbol": "APIRequestContext.tracing",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "tracing: Tracing"
+    },
+    {
+      "symbol": "ConsoleMessage.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(): \"log\"|\"debug\"|\"info\"|\"error\"|\"warning\"|\"dir\"|\"dirxml\"|\"table\"|\"trace\"|\"clear\"|\"startGroup\"|\"startGroupCollapsed\"|\"endGroup\"|\"assert\"|\"profile\"|\"profileEnd\"|\"count\"|\"time\"|\"timeEnd\""
+    },
+    {
+      "symbol": "Credentials.get",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "get(options?: { id?: string; rpId?: string; }): Promise<Array<{ id: string; rpId: string; userHandle: string; privateKey: string; publicKey: string; }>>"
+    },
+    {
+      "symbol": "Dialog.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(): string"
+    },
+    {
+      "symbol": "Keyboard.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(text: string, options?: { delay?: number; }): Promise<void>"
+    },
+    {
+      "symbol": "AndroidDevice.input",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "input: AndroidInput"
+    },
+    {
+      "symbol": "AndroidInput.type",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type(text: string): Promise<void>"
+    },
+    {
+      "symbol": "LocatorScreenshotOptions.type",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type?: \"png\"|\"jpeg\"|\"webp\""
+    },
+    {
+      "symbol": "ViewportSize.width",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "width: number"
+    },
+    {
+      "symbol": "ViewportSize.height",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "height: number"
+    },
+    {
+      "symbol": "HTTPCredentials.username",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "username: string"
+    },
+    {
+      "symbol": "HTTPCredentials.password",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "password: string"
+    },
+    {
+      "symbol": "Geolocation.latitude",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "latitude: number"
+    },
+    {
+      "symbol": "Geolocation.longitude",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "longitude: number"
+    },
+    {
+      "symbol": "Cookie.name",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name: string"
+    },
+    {
+      "symbol": "Cookie.value",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "value: string"
+    },
+    {
+      "symbol": "Cookie.domain",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "domain: string"
+    },
+    {
+      "symbol": "Cookie.path",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "path: string"
+    },
+    {
+      "symbol": "Cookie.expires",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "expires: number"
+    },
+    {
+      "symbol": "Cookie.httpOnly",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "httpOnly: boolean"
+    },
+    {
+      "symbol": "Cookie.secure",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "secure: boolean"
+    },
+    {
+      "symbol": "Cookie.sameSite",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "sameSite: \"Strict\"|\"Lax\"|\"None\""
+    },
+    {
+      "symbol": "PageScreenshotOptions.type",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "type?: \"png\"|\"jpeg\"|\"webp\""
+    },
+    {
+      "symbol": "AndroidElementInfo.clazz",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "clazz: string"
+    },
+    {
+      "symbol": "AndroidElementInfo.desc",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "desc: string"
+    },
+    {
+      "symbol": "AndroidElementInfo.res",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "res: string"
+    },
+    {
+      "symbol": "AndroidElementInfo.pkg",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "pkg: string"
+    },
+    {
+      "symbol": "AndroidElementInfo.text",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "text: string"
+    },
+    {
+      "symbol": "AndroidElementInfo.bounds",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "bounds: { x: number, y: number, width: number, height: number }"
+    },
+    {
+      "symbol": "AndroidElementInfo.checkable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "checkable: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.checked",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "checked: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.clickable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "clickable: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.enabled",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "enabled: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.focusable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "focusable: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.focused",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "focused: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.longClickable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "longClickable: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.scrollable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "scrollable: boolean"
+    },
+    {
+      "symbol": "AndroidElementInfo.selected",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "selected: boolean"
+    },
+    {
+      "symbol": "AndroidSelector.checkable",
+      "kind": "property",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "checkable?: boolean, checked?: boolean, clazz?: string | RegExp, clickable?: boolean, depth?: number, desc?: string | RegExp, enabled?: boolean, focusable?: boolean, focused?: boolean, hasChild?: { selector: AndroidSelector }, hasDescend..."
+    },
+    {
+      "symbol": "errors.TimeoutError",
+      "kind": "error_family",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "class TimeoutError extends Error"
+    },
+    {
+      "symbol": "chromium.connectOverCDP",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "chromium.connect",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "chromium.executablePath",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "executablePath(): string"
+    },
+    {
+      "symbol": "chromium.launch",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launch(options?: LaunchOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "chromium.launchPersistentContext",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchPersistentContext(userDataDir: string, options?: { acceptDownloads?: boolean; args?: Array<string>; artifactsDir?: string; baseURL?: string; bypassCSP?: boolean; channel?: string; chromiumSandbox?: boolean; clientCertificates?: Arr..."
+    },
+    {
+      "symbol": "chromium.launchServer",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchServer(options?: { args?: Array<string>; artifactsDir?: string; channel?: string; chromiumSandbox?: boolean; downloadsPath?: string; env?: { [key: string]: string|undefined; }; executablePath?: string; firefoxUserPrefs?: { [key: st..."
+    },
+    {
+      "symbol": "chromium.name",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name(): string"
+    },
+    {
+      "symbol": "firefox.connectOverCDP",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "firefox.connect",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "firefox.executablePath",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "executablePath(): string"
+    },
+    {
+      "symbol": "firefox.launch",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launch(options?: LaunchOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "firefox.launchPersistentContext",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchPersistentContext(userDataDir: string, options?: { acceptDownloads?: boolean; args?: Array<string>; artifactsDir?: string; baseURL?: string; bypassCSP?: boolean; channel?: string; chromiumSandbox?: boolean; clientCertificates?: Arr..."
+    },
+    {
+      "symbol": "firefox.launchServer",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchServer(options?: { args?: Array<string>; artifactsDir?: string; channel?: string; chromiumSandbox?: boolean; downloadsPath?: string; env?: { [key: string]: string|undefined; }; executablePath?: string; firefoxUserPrefs?: { [key: st..."
+    },
+    {
+      "symbol": "firefox.name",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name(): string"
+    },
+    {
+      "symbol": "webkit.connectOverCDP",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "webkit.connect",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "webkit.executablePath",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "executablePath(): string"
+    },
+    {
+      "symbol": "webkit.launch",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launch(options?: LaunchOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "webkit.launchPersistentContext",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchPersistentContext(userDataDir: string, options?: { acceptDownloads?: boolean; args?: Array<string>; artifactsDir?: string; baseURL?: string; bypassCSP?: boolean; channel?: string; chromiumSandbox?: boolean; clientCertificates?: Arr..."
+    },
+    {
+      "symbol": "webkit.launchServer",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchServer(options?: { args?: Array<string>; artifactsDir?: string; channel?: string; chromiumSandbox?: boolean; downloadsPath?: string; env?: { [key: string]: string|undefined; }; executablePath?: string; firefoxUserPrefs?: { [key: st..."
+    },
+    {
+      "symbol": "webkit.name",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name(): string"
+    },
+    {
+      "symbol": "errors",
+      "kind": "namespace",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "devices",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "AndroidElementInfo",
+      "kind": "type",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "AndroidSelector",
+      "kind": "type",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "AndroidKey",
+      "kind": "type",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "_electron",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "_android",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "chromium",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "firefox",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "request",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "selectors",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "webkit",
+      "kind": "const",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "ChromiumBrowserContext",
+      "kind": "interface",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "ChromiumBrowser",
+      "kind": "interface",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "FirefoxBrowser",
+      "kind": "interface",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "WebKitBrowser",
+      "kind": "interface",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    },
+    {
+      "symbol": "ChromiumCoverage",
+      "kind": "interface",
+      "origin": "parser export / types.d.ts",
+      "parser_omitted": true,
+      "export": true
+    }
+  ],
+  "recovered_browser_type_members": [
+    {
+      "symbol": "BrowserType.connectOverCDP",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.connect",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.executablePath",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "executablePath(): string"
+    },
+    {
+      "symbol": "BrowserType.launch",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launch(options?: LaunchOptions): Promise<Browser>"
+    },
+    {
+      "symbol": "BrowserType.launchPersistentContext",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchPersistentContext(userDataDir: string, options?: { acceptDownloads?: boolean; args?: Array<string>; artifactsDir?: string; baseURL?: string; bypassCSP?: boolean; channel?: string; chromiumSandbox?: boolean; clientCertificates?: Arr..."
+    },
+    {
+      "symbol": "BrowserType.launchServer",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "launchServer(options?: { args?: Array<string>; artifactsDir?: string; channel?: string; chromiumSandbox?: boolean; downloadsPath?: string; env?: { [key: string]: string|undefined; }; executablePath?: string; firefoxUserPrefs?: { [key: st..."
+    },
+    {
+      "symbol": "BrowserType.name",
+      "kind": "method",
+      "origin": "types.d.ts recovery",
+      "parser_omitted": true,
+      "signature": "name(): string"
+    }
+  ],
+  "recovered_entry_count": 104,
+  "parser_entry_count": 1250,
+  "combined_entry_count": 1354
+}

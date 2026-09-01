@@ -1,4 +1,5 @@
-//! `greppy -p` — one-shot coding agent over an isolated git worktree.
+//! `greppy agent` / `greppy -p` — interactive and one-shot coding agents over
+//! an isolated git worktree.
 //!
 //! Intercepted in [`crate::run_os`] before grep-passthrough routing so that
 //! ordinary `greppy -R …` / pattern invocations remain byte-exact real-grep.
@@ -6,14 +7,24 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client, GreppyEnv,
-    LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
-    WorkspaceError, SYSTEM_PROMPT,
+    run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
+    AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
+    SandboxMode, StreamEvent, Usage, WorkspaceError, SYSTEM_PROMPT,
 };
+
+use crate::agent_tui::{
+    bounded_pair, compact_messages, messages_from_protocol, new_session_id,
+    protocol_from_persisted, redact_json, SessionCommand, SessionEvent, SessionRecord,
+    SessionStore, TuiConfig,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Exit: success (clean, proposal, or applied).
 pub const EXIT_OK: u8 = 0;
@@ -23,18 +34,22 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_AGENT: u8 = 3;
 /// Exit: `--apply` cherry-pick conflict.
 pub const EXIT_CONFLICT: u8 = 4;
+/// Exit: user cancelled interactive startup.
+pub const EXIT_CANCELLED: u8 = 130;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-One-shot coding agent. Uses the installed portable Chunk-CoW provider and
-fails before the first model request when its adapter or persistent mount is
-not healthy. The immutable baseline includes the pinned commit plus visible
-staged, unstaged and untracked state; ignored files are excluded. It delivers
-a baseline-bound proposal ref (refs/greppy/agent/<run_id>); inspect it with
-`git show` or apply it with `greppy agent apply REF`. The agent has exactly one tool — `greppy` — covering
+Coding agent with interactive and one-shot modes. Uses the installed portable
+Chunk-CoW provider and fails before the first model request when its adapter
+or persistent mount is not healthy. The immutable baseline includes the pinned
+commit plus visible staged, unstaged and untracked state; ignored files are
+excluded, and ignored build caches are kept deliberately for speed unless
+--fresh is passed. It delivers a baseline-bound proposal ref
+(refs/greppy/agent/<run_id>); inspect it with `git show` or apply it with
+`greppy agent apply REF`. The agent has exactly one tool — `greppy` — covering
 search/navigate/read/edit; commands run through that tool as
 `bash-smart -- CMD`. The tool is write-confined to the worktree, a per-run
 scratch dir (TMPDIR), the worktree's greppy store + lock namespace, and
@@ -56,13 +71,15 @@ Leading `-p` is reserved for the agent; to grep for the literal pattern `-p`,
 use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
+  greppy agent [\"INITIAL TASK\"]
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
   greppy -p --help
 
 Flags:
-  --model M           Model id (required; env GREPPY_MODEL if flag omitted)
+  --model M           One-shot model override (`greppy agent` can configure
+                      and persist this through /setup)
   --endpoint URL      Gateway base URL (env GREPPY_ENDPOINT, else
                       http://127.0.0.1:8317)
   --max-turns N       Cap on assistant turns (default 40)
@@ -75,6 +92,25 @@ Flags:
   --keep-worktree     Preserve the portable namespace and private delta
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
+
+Interactive keys and commands (`greppy agent`):
+  Enter               Send the prompt
+  Shift/Alt+Enter     Insert a newline (when the terminal reports it)
+  PageUp/PageDown     Scroll by a viewport page
+  Mouse wheel         Scroll the transcript (Shift+drag still selects)
+  End                 Resume follow-tail
+  Tab / Shift+Tab     Completions and overlay choices
+  Esc                 Close overlay, then completions
+  Ctrl+C              Cancel a run at a safe tool boundary; idle exit;
+                      twice to exit after the current non-interruptible tool
+  /setup              Configure gateway, model, language, storage, sandbox,
+                      acceleration, self-check, and workspace backend
+  /help /clear /model /endpoint /usage /tools /copy /sessions /name /compact
+  /exit /quit /q      Finish, restore the terminal, publish the proposal
+
+Session flags:
+  --continue          Restore this project's most recent interactive session
+  --resume ID         Restore a specific session id
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
@@ -95,7 +131,7 @@ pub struct AgentArgs {
     #[arg(value_name = "TASK")]
     pub task: Option<String>,
 
-    /// Model id (required unless GREPPY_MODEL is set).
+    /// Model id (required in one-shot mode; interactive mode can configure it).
     #[arg(long, env = "GREPPY_MODEL")]
     pub model: Option<String>,
 
@@ -140,7 +176,7 @@ pub struct AgentArgs {
         default_value_t = false,
         num_args = 0..=1,
         default_missing_value = "true",
-        require_equals = false,
+        require_equals = true,
     )]
     pub no_sandbox: bool,
 
@@ -156,9 +192,17 @@ pub struct AgentArgs {
         default_value_t = false,
         num_args = 0..=1,
         default_missing_value = "true",
-        require_equals = false,
+        require_equals = true,
     )]
     pub skip_selfcheck: bool,
+
+    /// Restore the most recent interactive session for this project.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+
+    /// Restore a specific interactive session by id.
+    #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
+    pub resume: Option<String>,
 }
 
 /// True when argv (after greppy-owned globals) starts with `-p`.
@@ -167,8 +211,23 @@ pub fn is_agent_p_invocation(argv: &[std::ffi::OsString]) -> bool {
     rest.first().is_some_and(|t| t == "-p")
 }
 
+/// True when argv (after greppy-owned globals) starts with `agent`.
+pub fn is_agent_tui_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = super::grep_passthrough_args(argv);
+    rest.first().is_some_and(|token| token == "agent")
+}
+
 /// Parse and run `greppy -p …`. Caller must have verified [`is_agent_p_invocation`].
 pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
+    run_agent_invocation(argv, false)
+}
+
+/// Parse and run `greppy agent …` in the full-screen interactive UI.
+pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
+    run_agent_invocation(argv, true)
+}
+
+fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
     // Set for every tool subprocess of a running agent: refuse nesting on
     // every path (plain greppy argv and bash-smart).
     if std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() {
@@ -179,15 +238,21 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
         return EXIT_USAGE;
     }
     let rest = super::grep_passthrough_args(argv);
-    debug_assert!(rest.first().is_some_and(|t| t == "-p"));
+    debug_assert!(rest
+        .first()
+        .is_some_and(|token| { token == if interactive { "agent" } else { "-p" } }));
     let after_p: Vec<std::ffi::OsString> = rest.iter().skip(1).cloned().collect();
 
     // Build a synthetic argv for clap: program name + flags/task after -p.
     let mut clap_argv: Vec<std::ffi::OsString> = Vec::with_capacity(after_p.len() + 1);
-    clap_argv.push(std::ffi::OsString::from("greppy -p"));
-    clap_argv.extend(after_p);
+    clap_argv.push(std::ffi::OsString::from(if interactive {
+        "greppy agent"
+    } else {
+        "greppy -p"
+    }));
+    clap_argv.extend(after_p.iter().cloned());
 
-    let args = match AgentArgs::try_parse_from(&clap_argv) {
+    let mut args = match AgentArgs::try_parse_from(&clap_argv) {
         Ok(a) => a,
         Err(e) => {
             use clap::error::ErrorKind;
@@ -204,32 +269,115 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
         }
     };
 
-    if let Err(code) = validate_args(&args) {
-        return code;
+    let mut settings = crate::agent_tui::AgentSettings::default();
+    if interactive {
+        settings = crate::agent_tui::AgentSettings::load();
+        apply_interactive_settings(&mut args, &after_p, &settings);
     }
 
-    run_agent(args)
+    if let Err(code) = validate_args(&args, interactive) {
+        return code;
+    }
+    if interactive && !crate::agent_tui::tty_suitable() {
+        return crate::agent_tui::refuse_nontty();
+    }
+
+    let bootstrap = if interactive {
+        match crate::agent_tui::BootstrapScreen::enter() {
+            Ok(screen) => Some(screen),
+            Err(error) => {
+                eprintln!("greppy agent: cannot initialize startup screen: {error}");
+                return EXIT_AGENT;
+            }
+        }
+    } else {
+        None
+    };
+
+    run_agent(args, interactive, bootstrap, settings)
 }
 
-fn validate_args(args: &AgentArgs) -> Result<(), u8> {
+fn has_long_option(argv: &[std::ffi::OsString], name: &str) -> bool {
+    argv.iter().any(|value| {
+        let value = value.to_string_lossy();
+        value == name || value.starts_with(&format!("{name}="))
+    })
+}
+
+fn apply_interactive_settings(
+    args: &mut AgentArgs,
+    argv: &[std::ffi::OsString],
+    settings: &crate::agent_tui::AgentSettings,
+) {
+    if args.model.is_none() {
+        args.model = settings.model.clone();
+    }
+    if !has_long_option(argv, "--endpoint") && std::env::var_os("GREPPY_ENDPOINT").is_none() {
+        if let Some(endpoint) = settings
+            .endpoint
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.endpoint = endpoint.clone();
+        }
+    }
+    if !has_long_option(argv, "--private-store") {
+        args.private_store |= settings.private_store;
+    }
+    if !has_long_option(argv, "--no-sandbox") && std::env::var_os("GREPPY_NO_SANDBOX").is_none() {
+        args.no_sandbox = settings.no_sandbox;
+    }
+    if !has_long_option(argv, "--skip-selfcheck")
+        && std::env::var_os("GREPPY_SKIP_SELFCHECK").is_none()
+    {
+        args.skip_selfcheck = settings.skip_selfcheck;
+    }
+    if !has_long_option(argv, "--workspace-backend")
+        && std::env::var_os("GREPPY_WORKSPACE_BACKEND").is_none()
+    {
+        args.workspace_backend = match settings.workspace_backend.as_str() {
+            "native" => WorkspaceBackendArg::Native,
+            "cow" => WorkspaceBackendArg::Cow,
+            _ => WorkspaceBackendArg::Auto,
+        };
+    }
+    if std::env::var_os("GREPPY_DEVICE").is_none()
+        && std::env::var_os("GREPPY_NO_GPU").is_none()
+        && settings.acceleration == "cpu"
+    {
+        // This runs before workspace/index threads are created.
+        unsafe { std::env::set_var("GREPPY_NO_GPU", "1") };
+    }
+}
+
+fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
     let task = args.task.as_deref().map(str::trim).unwrap_or("");
-    if task.is_empty() {
+    if !interactive && task.is_empty() {
         eprintln!("error: missing TASK");
         eprintln!("usage: greppy -p \"TASK\" [--model M] …  (details: greppy -p --help)");
         return Err(EXIT_USAGE);
     }
     let model = args.model.as_deref().map(str::trim).unwrap_or("");
-    if model.is_empty() {
+    if model.is_empty() && !interactive {
         eprintln!("error: --model is required (or set GREPPY_MODEL)");
         eprintln!("details: greppy -p --help");
+        return Err(EXIT_USAGE);
+    }
+    if !interactive && (args.continue_session || args.resume.is_some()) {
+        eprintln!("error: --continue / --resume are only valid with `greppy agent`");
         return Err(EXIT_USAGE);
     }
     Ok(())
 }
 
-fn run_agent(args: AgentArgs) -> u8 {
+fn run_agent(
+    args: AgentArgs,
+    interactive: bool,
+    mut bootstrap: Option<crate::agent_tui::BootstrapScreen>,
+    settings: crate::agent_tui::AgentSettings,
+) -> u8 {
     let task = args.task.as_deref().unwrap_or("").trim().to_string();
-    let model = args.model.as_deref().unwrap_or("").trim().to_string();
+    let mut model = args.model.as_deref().unwrap_or("").trim().to_string();
     let endpoint = args.endpoint.trim().to_string();
 
     let cwd = match std::env::current_dir() {
@@ -246,7 +394,7 @@ fn run_agent(args: AgentArgs) -> u8 {
     // Base and Delta rows resolve identically in every worktree.
     std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
     let logical_project = greppy_core::project_identity(&cwd);
-    std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, logical_project);
+    std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, &logical_project);
 
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
@@ -284,32 +432,49 @@ fn run_agent(args: AgentArgs) -> u8 {
             return EXIT_AGENT;
         }
     };
+    if bootstrap
+        .as_ref()
+        .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
+    {
+        return EXIT_CANCELLED;
+    }
+    if let Some(screen) = bootstrap.as_mut() {
+        screen.advance(1, "Preparing persistent data store");
+    }
 
     let mut client = Client::new(&endpoint, &model);
     if let Ok(key) = std::env::var("GREPPY_API_KEY") {
         client = client.with_api_key(key);
     }
-    match client.probe() {
-        Ok(()) => {}
-        Err(ProbeError::Unreachable(_)) => {
-            eprintln!(
-                "greppy -p needs a local model gateway and found none at {endpoint}.\n\
+    if !interactive {
+        match client.probe() {
+            Ok(()) => {}
+            Err(ProbeError::Unreachable(_)) => {
+                eprintln!(
+                    "greppy -p needs a local model gateway and found none at {endpoint}.\n\
                  Start one (standard: CLIProxyAPI on 127.0.0.1:8317) or set\n\
                  GREPPY_ENDPOINT / --endpoint. Details: greppy -p --help"
-            );
-            keep_worktree_on_error(&workspace);
-            return EXIT_USAGE;
-        }
-        Err(ProbeError::BadResponse(detail)) => {
-            eprintln!(
-                "greppy -p reached {endpoint}, but the gateway rejected the probe:\n\
+                );
+                keep_worktree_on_error(&workspace);
+                return EXIT_USAGE;
+            }
+            Err(ProbeError::BadResponse(detail)) => {
+                eprintln!(
+                    "greppy -p reached {endpoint}, but the gateway rejected the probe:\n\
                  {detail}\n\
                  If it requires an API key, set GREPPY_API_KEY. Details: greppy -p --help"
-            );
-            keep_worktree_on_error(&workspace);
-            return EXIT_USAGE;
+                );
+                keep_worktree_on_error(&workspace);
+                return EXIT_USAGE;
+            }
         }
-    };
+    } else if model.is_empty() {
+        model = "auto".into();
+        client = Client::new(&endpoint, &model);
+        if let Ok(key) = std::env::var("GREPPY_API_KEY") {
+            client = client.with_api_key(key);
+        }
+    }
 
     // Isolate greppy's on-disk store for this agent run into a dedicated data
     // root (not the operator's global greppy data). Prewarm + tool children
@@ -324,8 +489,24 @@ fn run_agent(args: AgentArgs) -> u8 {
 
     let prepared_base = if args.private_store {
         crate::store_cow::configure_private_environment("explicit --private-store");
-        eprintln!("store mode: private (--private-store)");
+        if !interactive {
+            eprintln!("store mode: private (--private-store)");
+        }
         None
+    } else if interactive {
+        match crate::store_cow::try_reuse_base_store(&workspace, &shared_data_root) {
+            Ok(Some(prepared)) => Some(prepared),
+            Ok(None) => {
+                crate::store_cow::configure_private_environment(
+                    "shared Base not ready; using persistent interactive index",
+                );
+                None
+            }
+            Err(error) => {
+                crate::store_cow::configure_private_environment(&error.to_string());
+                None
+            }
+        }
     } else {
         match crate::store_cow::prepare_base_store(
             &workspace,
@@ -336,15 +517,17 @@ fn run_agent(args: AgentArgs) -> u8 {
             },
         ) {
             Ok(prepared) => {
-                eprintln!(
-                    "store mode: overlay (Base {}, {})",
-                    &prepared.identity_hash[..12],
-                    if prepared.reused {
-                        "reused"
-                    } else {
-                        "published"
-                    }
-                );
+                if !interactive {
+                    eprintln!(
+                        "store mode: overlay (Base {}, {})",
+                        &prepared.identity_hash[..12],
+                        if prepared.reused {
+                            "reused"
+                        } else {
+                            "published"
+                        }
+                    );
+                }
                 Some(prepared)
             }
             Err(error) => {
@@ -362,15 +545,34 @@ fn run_agent(args: AgentArgs) -> u8 {
             }
         }
     };
+    if bootstrap
+        .as_ref()
+        .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
+    {
+        return EXIT_CANCELLED;
+    }
+    if let Some(screen) = bootstrap.as_mut() {
+        screen.advance(2, "Starting background services");
+    }
     std::env::set_var("GREPPY_STORE_DIR", &agent_data);
     if let Some(prepared) = &prepared_base {
         crate::store_cow::configure_overlay_environment(prepared, workspace.base_commit());
     }
 
-    // Prewarm: build/refresh the worktree's own greppy index before the first
-    // model turn so search/where-am-i do not open empty. Runs unsandboxed in the
-    // trusted parent under the isolated GREPPY_STORE_DIR above.
-    ensure_semantic_index(workspace.worktree_path());
+    // Headless runs still prewarm synchronously. Interactive runs launch and
+    // monitor the same index job only after the full TUI is visible.
+    if !interactive {
+        ensure_semantic_index(workspace.worktree_path());
+    }
+    if bootstrap
+        .as_ref()
+        .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
+    {
+        return EXIT_CANCELLED;
+    }
+    if let Some(screen) = bootstrap.as_mut() {
+        screen.advance(3, "Checking execution environment");
+    }
 
     // Per-run scratch (TMPDIR for tool children). Outside the stable-worktree
     // parent and lock sibling so those stay non-writable to tools.
@@ -405,17 +607,20 @@ fn run_agent(args: AgentArgs) -> u8 {
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env.with_sandbox(sandbox_mode),
+        Ok(env) => env.with_sandbox(sandbox_mode.clone()),
         Err(e) => {
             eprintln!("greppy -p: cannot build greppy env: {e}");
             keep_worktree_on_error(&workspace);
             return EXIT_AGENT;
         }
     };
+    if let Some(screen) = bootstrap.as_mut() {
+        screen.advance(4, "Opening interactive session");
+    }
 
     // Capability self-check: fail loudly before the model loop rather than
     // silently degrading to a shell-only agent when index or sandbox is broken.
-    if !args.skip_selfcheck {
+    if !interactive && !args.skip_selfcheck {
         match env.startup_self_check() {
             Ok(ok) => {
                 if ok.unrecognized_census_shape {
@@ -455,79 +660,78 @@ fn run_agent(args: AgentArgs) -> u8 {
         ..AgentConfig::default()
     };
 
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
-    let mut tool_line_open = false;
-    let mut turns: u64 = 0;
-
-    let loop_result = run_agent_loop(&mut client, &mut env, &config, &task, &mut |event| {
-        if matches!(event, LoopEvent::TurnComplete { .. }) {
-            turns = turns.saturating_add(1);
-        }
-        handle_loop_event(event, &mut stdout, &mut stderr, &mut tool_line_open);
-    });
-
-    if tool_line_open {
-        let _ = writeln!(stderr);
-    }
-
-    let loop_result = match loop_result {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = writeln!(stderr, "greppy -p: agent error: {e}");
+    let repository = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repository")
+        .to_string();
+    let session = if interactive {
+        // Gateway discovery belongs to the visible setup phase in the worker;
+        // never block before entering the alternate-screen UI.
+        let models = (model != "auto")
+            .then(|| model.clone())
+            .into_iter()
+            .collect();
+        run_interactive_session(
+            client,
+            env,
+            config.clone(),
+            task.clone(),
+            bootstrap.take(),
+            InteractiveLaunch {
+                model,
+                repository,
+                branch: git_branch(&cwd),
+                worktree: workspace.worktree_path().display().to_string(),
+                sandbox: sandbox_label(&sandbox_mode),
+                run_id: workspace.run_id().to_string(),
+                data_root: shared_data_root.clone(),
+                project: logical_project.clone(),
+                continue_session: args.continue_session,
+                resume: args.resume.clone(),
+                known_models: models,
+                endpoint: endpoint.clone(),
+                settings,
+            },
+        )
+    } else {
+        run_headless_session(&mut client, &mut env, &config, &task)
+    };
+    let session = match session {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!(
+                "greppy {}: agent error: {error}",
+                if interactive { "agent" } else { "-p" }
+            );
             keep_worktree_on_error(&workspace);
             return EXIT_AGENT;
         }
     };
 
-    // Token accounting (stderr only; zero values print as zero).
-    let usage = &loop_result.usage;
-    let _ = writeln!(
-        stderr,
+    eprintln!(
         "tokens: in {} out {} (cache read {}, write {}) over {} turns",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_input_tokens,
-        usage.cache_creation_input_tokens,
-        turns
+        session.usage.input_tokens,
+        session.usage.output_tokens,
+        session.usage.cache_read_input_tokens,
+        session.usage.cache_creation_input_tokens,
+        session.turns
+    );
+    report_stop(
+        session.last_stop.as_ref(),
+        &args,
+        &config,
+        &mut io::stderr().lock(),
     );
 
-    // Ensure a trailing newline after streamed assistant text.
-    if !loop_result.final_text.is_empty() && !loop_result.final_text.ends_with('\n') {
-        let _ = writeln!(stdout);
-    }
-    let _ = stdout.flush();
-
-    // Stop reason reaches the user BEFORE the proposal block so it is not lost.
-    // MaxTurns / Stuck / Deadline still produce the proposal (or clean)
-    // outcome; exit 0 when a proposal or clean state exists — exit 3 stays
-    // for real errors.
-    match &loop_result.stop {
-        LoopStop::MaxTurns => {
-            let _ = writeln!(
-                stderr,
-                "stopped: turn limit reached ({}) — the result may be incomplete",
-                args.max_turns
-            );
-        }
-        LoopStop::Stuck => {
-            let n = config.consecutive_failure_stop;
-            let _ = writeln!(
-                stderr,
-                "stopped: {n} consecutive tool failures — the agent could not make progress"
-            );
-        }
-        LoopStop::Deadline => {
-            let secs = args.deadline_secs.unwrap_or(0);
-            let _ = writeln!(
-                stderr,
-                "stopped: wall-clock deadline reached ({secs}s) — the result may be incomplete"
-            );
-        }
-        LoopStop::EndTurn | LoopStop::MaxTokens => {}
-    }
-
-    let commit_message = truncate_chars(&task, 72);
+    let commit_subject = if task.is_empty() {
+        "interactive agent session"
+    } else {
+        &task
+    };
+    let commit_message = truncate_chars(commit_subject, 72);
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
     let outcome = match workspace.finish(&commit_message) {
         Ok(o) => o,
         Err(e @ WorkspaceError::Tampered { .. }) => {
@@ -636,6 +840,553 @@ fn run_agent(args: AgentArgs) -> u8 {
     exit
 }
 
+#[derive(Debug, Default)]
+struct SessionSummary {
+    usage: Usage,
+    turns: u64,
+    last_stop: Option<LoopStop>,
+}
+
+fn run_headless_session(
+    client: &mut Client,
+    env: &mut GreppyEnv,
+    config: &AgentConfig,
+    task: &str,
+) -> Result<SessionSummary, String> {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let mut tool_line_open = false;
+    let mut turns = 0u64;
+    let result = run_agent_loop(client, env, config, task, &mut |event| {
+        if matches!(event, LoopEvent::TurnComplete { .. }) {
+            turns = turns.saturating_add(1);
+        }
+        handle_loop_event(event, &mut stdout, &mut stderr, &mut tool_line_open);
+    })
+    .map_err(|error| error.to_string())?;
+
+    if tool_line_open {
+        let _ = writeln!(stderr);
+    }
+    if !result.final_text.is_empty() && !result.final_text.ends_with('\n') {
+        let _ = writeln!(stdout);
+    }
+    let _ = stdout.flush();
+
+    Ok(SessionSummary {
+        usage: result.usage,
+        turns,
+        last_stop: Some(result.stop),
+    })
+}
+
+struct InteractiveLaunch {
+    model: String,
+    endpoint: String,
+    repository: String,
+    branch: String,
+    worktree: String,
+    sandbox: String,
+    run_id: String,
+    data_root: PathBuf,
+    project: String,
+    continue_session: bool,
+    resume: Option<String>,
+    known_models: Vec<String>,
+    settings: crate::agent_tui::AgentSettings,
+}
+
+fn run_interactive_session(
+    mut client: Client,
+    mut env: GreppyEnv,
+    mut config: AgentConfig,
+    initial_task: String,
+    bootstrap: Option<crate::agent_tui::BootstrapScreen>,
+    launch: InteractiveLaunch,
+) -> Result<SessionSummary, String> {
+    let store = SessionStore::new(&launch.data_root, &launch.project);
+    let mut record = if let Some(id) = launch.resume.as_deref() {
+        store
+            .load(id)
+            .map_err(|error| format!("cannot resume session {id}: {error}"))?
+    } else if launch.continue_session {
+        store
+            .latest()
+            .map_err(|error| format!("cannot continue session: {error}"))?
+            .ok_or_else(|| "no previous interactive session for this project".to_string())?
+    } else {
+        SessionRecord::new(
+            new_session_id(),
+            launch.project.clone(),
+            launch.model.clone(),
+            launch.run_id.clone(),
+        )
+    };
+    record.model = launch.model.clone();
+    record.run_id = launch.run_id.clone();
+    // Same run_id for every greppy web subprocess in this interactive session
+    // so the supervisor socket and sessions persist across tool calls.
+    std::env::set_var("GREPPY_RUN_ID", &launch.run_id);
+    crate::web_attach::claim_persistent_parent()
+        .map_err(|error| format!("failed to create parent-owned web attach token: {error}"))?;
+    let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
+        .set(crate::web_attach::inherit_attach_for_agent);
+    struct ShutdownWebOnDrop;
+    impl Drop for ShutdownWebOnDrop {
+        fn drop(&mut self) {
+            crate::web::shutdown_if_running();
+        }
+    }
+    let _shutdown_web = ShutdownWebOnDrop;
+    record.worktree = launch.worktree.clone();
+    record.branch = launch.branch.clone();
+    if let Err(error) = store.create(&record) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            eprintln!("greppy agent: session save failed: {error}");
+        }
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    config.cancel = Some(Arc::clone(&cancel));
+    config.model = launch.model.clone();
+    let ui_cancel = Arc::clone(&cancel);
+    let history = protocol_from_persisted(&record.messages);
+    let restored_usage = record.usage;
+    let restored_turns = record.turns;
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let (bridge, intake) = bounded_pair();
+    let store_for_worker = store.clone();
+    let mut session_id = record.id.clone();
+    let startup_worktree = PathBuf::from(&launch.worktree);
+    // Gateway/model discovery also runs in the visible setup phase, even when
+    // the index is already warm.
+    let initializing = true;
+    let mut current_endpoint = launch.endpoint.clone();
+    let gateway_api_key = std::env::var("GREPPY_API_KEY").ok();
+
+    let index_monitor_cancel = Arc::new(AtomicBool::new(false));
+    let monitor_bridge = bridge.clone();
+    let monitor_cancel = Arc::clone(&index_monitor_cancel);
+    let index_monitor = Some(
+        thread::Builder::new()
+            .name("greppy-agent-index-monitor".to_string())
+            .spawn(move || {
+                let ready = if let Some(mut job) = start_semantic_index(&startup_worktree) {
+                    match monitor_index_startup(
+                        &mut job,
+                        &startup_worktree,
+                        &monitor_bridge,
+                        &monitor_cancel,
+                    ) {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            monitor_bridge.send_discrete(SessionEvent::Warning(format!(
+                                "Index monitoring failed: {error}"
+                            )));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if ready || std::env::var_os("GREPPY_TEST_SKIP_INFERENCE").is_some() {
+                    monitor_bridge.send_discrete(SessionEvent::BackgroundReady);
+                } else if !monitor_cancel.load(Ordering::Relaxed) {
+                    monitor_bridge.send_discrete(SessionEvent::SetupBlocked(
+                        "The repository's one-time code analysis did not complete. Retry the index before running the agent."
+                            .into(),
+                    ));
+                }
+            })
+            .map_err(|error| format!("cannot start index monitor: {error}"))?,
+    );
+
+    let worker = thread::Builder::new()
+        .name("greppy-agent-session".to_string())
+        .spawn(move || {
+            let mut history = history;
+            let mut summary = SessionSummary {
+                usage: restored_usage,
+                turns: restored_turns,
+                last_stop: None,
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(summary);
+            }
+            bridge.send_setup_progress(SessionEvent::SetupProgress {
+                phase: "Connecting model gateway".into(),
+                detail: None,
+                unit: "steps".into(),
+                completed: 0,
+                total: 0,
+                rate_milli_per_second: None,
+                eta_seconds: None,
+                elapsed_seconds: 0,
+            });
+            let gateway_ready = match client.list_models() {
+                Ok(models) if !models.is_empty() => {
+                    if config.model == "auto" {
+                        config.model = models[0].clone();
+                        if let Err(error) = store_for_worker.set_model(&session_id, &config.model) {
+                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                        client = client_for_endpoint(
+                            &current_endpoint,
+                            &config.model,
+                            gateway_api_key.as_deref(),
+                        );
+                    }
+                    bridge.send_discrete(SessionEvent::Configuration {
+                        endpoint: current_endpoint.clone(),
+                        model: config.model.clone(),
+                        models,
+                    });
+                    true
+                }
+                Ok(_) => {
+                    bridge.send_discrete(SessionEvent::GatewayRequired(
+                        "The gateway reports no available models. Enter another gateway URL below."
+                            .into(),
+                    ));
+                    false
+                }
+                Err(_) => {
+                    bridge.send_discrete(SessionEvent::GatewayRequired(
+                        "No model gateway detected. Enter its URL below.".into(),
+                    ));
+                    false
+                }
+            };
+            if gateway_ready {
+                bridge.send_discrete(SessionEvent::SetupReady);
+            }
+            let mut tool_started = std::collections::HashMap::<String, Instant>::new();
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    SessionCommand::Quit => break,
+                    SessionCommand::Cancel => {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    SessionCommand::SetModel(model) => {
+                        config.model = model.clone();
+                        if let Err(error) = store_for_worker.set_model(&session_id, &model) {
+                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                    }
+                    SessionCommand::SetEndpoint(endpoint) => {
+                        let candidate = client_for_endpoint(
+                            &endpoint,
+                            &config.model,
+                            gateway_api_key.as_deref(),
+                        );
+                        match candidate.list_models() {
+                            Ok(models) if !models.is_empty() => {
+                                current_endpoint = endpoint;
+                                if config.model == "auto"
+                                    || !models.iter().any(|model| model == &config.model)
+                                {
+                                    config.model = models[0].clone();
+                                }
+                                client = client_for_endpoint(
+                                    &current_endpoint,
+                                    &config.model,
+                                    gateway_api_key.as_deref(),
+                                );
+                                bridge.send_discrete(SessionEvent::Configuration {
+                                    endpoint: current_endpoint.clone(),
+                                    model: config.model.clone(),
+                                    models,
+                                });
+                                bridge.send_discrete(SessionEvent::SetupReady);
+                            }
+                            Ok(_) => bridge.send_discrete(SessionEvent::EndpointRejected {
+                                endpoint,
+                                message: "The gateway reports no available models. Enter another gateway URL below."
+                                    .into(),
+                            }),
+                            Err(_) => bridge.send_discrete(SessionEvent::EndpointRejected {
+                                endpoint,
+                                message: "That gateway is unreachable. Check the URL and GREPPY_API_KEY, then try again."
+                                    .into(),
+                            }),
+                        }
+                    }
+                    SessionCommand::Resume(next_session_id) => {
+                        match store_for_worker.load(&next_session_id) {
+                            Ok(next) => {
+                                history = protocol_from_persisted(&next.messages);
+                                summary.usage = next.usage;
+                                summary.turns = next.turns;
+                                summary.last_stop = None;
+                                config.model = next.model;
+                                session_id = next.id;
+                                cancel.store(false, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                bridge.send_discrete(SessionEvent::Error(format!(
+                                    "cannot resume session {next_session_id}: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    SessionCommand::Compact => {
+                        let compacted = compact_messages(&messages_from_protocol(&history), 8);
+                        history = protocol_from_persisted(&compacted);
+                        if let Err(error) =
+                            store_for_worker.append_message_checkpoint(&session_id, &compacted)
+                        {
+                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                        bridge.send_discrete(SessionEvent::Compacted {
+                            messages: compacted,
+                        });
+                    }
+                    SessionCommand::Prompt(prompt) => {
+                        cancel.store(false, Ordering::Relaxed);
+                        let mut prompt_turns = 0u64;
+                        let previous_message_count = history.len();
+                        let result = run_agent_loop_with_history(
+                            &mut client,
+                            &mut env,
+                            &config,
+                            &history,
+                            &prompt,
+                            &mut |event| {
+                                if matches!(event, LoopEvent::TurnComplete { .. }) {
+                                    prompt_turns = prompt_turns.saturating_add(1);
+                                }
+                                match event {
+                                    LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
+                                        bridge.send_text(&text);
+                                    }
+                                    LoopEvent::Stream(StreamEvent::ThinkingDelta { text }) => {
+                                        bridge.send_thinking(&text);
+                                    }
+                                    LoopEvent::ToolStart {
+                                        call_id,
+                                        name,
+                                        arguments,
+                                    } => {
+                                        tool_started.insert(call_id.clone(), Instant::now());
+                                        let summary =
+                                            format_tool_start(&name, &redact_json(&arguments));
+                                        bridge.send_discrete(SessionEvent::ToolStart {
+                                            id: call_id,
+                                            summary,
+                                        });
+                                    }
+                                    LoopEvent::ToolFinish {
+                                        call_id, outcome, ..
+                                    } => {
+                                        let elapsed_ms = tool_started
+                                            .remove(&call_id)
+                                            .map(|started| started.elapsed().as_millis() as u64)
+                                            .unwrap_or(0);
+                                        bridge.send_discrete(SessionEvent::ToolFinish {
+                                            id: call_id,
+                                            failed: outcome.is_error,
+                                            elapsed_ms,
+                                            preview: truncate_chars(&outcome.content, 400),
+                                        });
+                                    }
+                                    LoopEvent::Stream(_) | LoopEvent::TurnComplete { .. } => {}
+                                }
+                            },
+                        );
+
+                        match result {
+                            Ok(result) => {
+                                history = result.messages;
+                                add_usage(&mut summary.usage, &result.usage);
+                                summary.turns = summary.turns.saturating_add(prompt_turns);
+                                summary.last_stop = Some(result.stop.clone());
+                                let persisted = messages_from_protocol(&history);
+                                let new_messages = messages_from_protocol(
+                                    &history[previous_message_count.min(history.len())..],
+                                );
+                                if let Err(error) =
+                                    store_for_worker.append_messages(&session_id, &new_messages)
+                                {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
+                                if let Err(error) = store_for_worker.append_usage(
+                                    &session_id,
+                                    &summary.usage,
+                                    summary.turns,
+                                    stop_label(&result.stop),
+                                ) {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
+                                bridge.send_discrete(SessionEvent::Done {
+                                    input_tokens: result.usage.input_tokens,
+                                    output_tokens: result.usage.output_tokens,
+                                    cache_read: result.usage.cache_read_input_tokens,
+                                    cache_write: result.usage.cache_creation_input_tokens,
+                                    turns: prompt_turns,
+                                    stop: stop_label(&result.stop).to_string(),
+                                    messages: persisted,
+                                });
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                bridge.send_discrete(SessionEvent::Error(message.clone()));
+                                return Err(message);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(summary)
+        })
+        .map_err(|error| format!("cannot start session worker: {error}"))?;
+
+    let mut initial_prompts = Vec::new();
+    if !initial_task.trim().is_empty() {
+        initial_prompts.push(initial_task);
+    }
+    let mut initial_draft = String::new();
+    // Keep bootstrap cleanup ownership through every fallible session setup
+    // operation. Transfer only when TerminalGuard is about to adopt the same
+    // terminal; any earlier return still restores raw mode and the alt screen.
+    if let Some(screen) = bootstrap {
+        let handoff = screen.handoff();
+        initial_prompts.extend(handoff.queued);
+        initial_draft = handoff.draft;
+    }
+    let ui_result = crate::agent_tui::run(
+        TuiConfig {
+            model: launch.model,
+            endpoint: launch.endpoint,
+            repository: launch.repository,
+            branch: launch.branch,
+            worktree: launch.worktree,
+            sandbox: launch.sandbox,
+            known_models: launch.known_models,
+            cancel: ui_cancel,
+            initializing,
+            settings: launch.settings,
+        },
+        record,
+        store,
+        initial_prompts,
+        initial_draft,
+        command_tx.clone(),
+        intake,
+    );
+    let _ = command_tx.send(SessionCommand::Quit);
+    index_monitor_cancel.store(true, Ordering::Relaxed);
+    let worker_result = worker
+        .join()
+        .map_err(|_| "session worker panicked".to_string())?;
+    if let Some(index_monitor) = index_monitor {
+        // `/exit` must restore the terminal immediately. A cold-start indexer
+        // can be inside model inference or database publication and may not
+        // observe cancellation promptly, so only join work that is already
+        // complete; dropping the handle detaches the background cleanup.
+        if index_monitor.is_finished() {
+            let _ = index_monitor.join();
+        }
+    }
+    ui_result.map_err(|error| format!("terminal UI failed: {error}"))?;
+    worker_result
+}
+
+fn git_branch(path: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "detached".to_string(),
+    }
+}
+
+fn sandbox_label(mode: &SandboxMode) -> String {
+    match mode {
+        SandboxMode::Off => "sandbox off".to_string(),
+        SandboxMode::Enforce(_) => {
+            if cfg!(target_os = "macos") {
+                "sandbox seatbelt".to_string()
+            } else if cfg!(target_os = "linux") {
+                "sandbox landlock".to_string()
+            } else {
+                "sandbox on".to_string()
+            }
+        }
+    }
+}
+
+fn add_usage(total: &mut Usage, next: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(next.cache_read_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(next.cache_creation_input_tokens);
+}
+
+fn stop_label(stop: &LoopStop) -> &'static str {
+    match stop {
+        LoopStop::EndTurn => "ready",
+        LoopStop::MaxTokens => "token limit reached",
+        LoopStop::MaxTurns => "turn limit reached",
+        LoopStop::Stuck => "stopped after repeated tool failures",
+        LoopStop::Deadline => "deadline reached",
+        LoopStop::Cancelled => "cancelled",
+    }
+}
+
+fn report_stop(
+    stop: Option<&LoopStop>,
+    args: &AgentArgs,
+    config: &AgentConfig,
+    stderr: &mut impl Write,
+) {
+    match stop {
+        Some(LoopStop::MaxTurns) => {
+            let _ = writeln!(
+                stderr,
+                "stopped: turn limit reached ({}) — the result may be incomplete",
+                args.max_turns
+            );
+        }
+        Some(LoopStop::Stuck) => {
+            let n = config.consecutive_failure_stop;
+            let _ = writeln!(
+                stderr,
+                "stopped: {n} consecutive tool failures — the agent could not make progress"
+            );
+        }
+        Some(LoopStop::Deadline) => {
+            let secs = args.deadline_secs.unwrap_or(0);
+            let _ = writeln!(
+                stderr,
+                "stopped: wall-clock deadline reached ({secs}s) — the result may be incomplete"
+            );
+        }
+        Some(LoopStop::Cancelled) => {
+            let _ = writeln!(stderr, "stopped: cancelled by user");
+        }
+        Some(LoopStop::EndTurn | LoopStop::MaxTokens) | None => {}
+    }
+}
+
 fn handle_loop_event(
     event: LoopEvent,
     stdout: &mut impl Write,
@@ -677,9 +1428,37 @@ fn handle_loop_event(
 }
 
 fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
+    // Tool arguments are model-controlled and are written directly into a
+    // terminal transcript. Keep the useful first line while dropping escape
+    // and other control characters before the outer line cap is applied.
+    fn clip(text: &str, max: usize) -> String {
+        let text = text.trim();
+        let first_line = text.lines().next().unwrap_or("").trim_end();
+        let mut out: String = first_line
+            .chars()
+            .filter(|ch| !ch.is_control() || *ch == '\t')
+            .take(max)
+            .collect();
+        if first_line.chars().count() > max || text.lines().count() > 1 {
+            out.push('…');
+        }
+        out
+    }
+
+    fn nonblank_field<'a>(arguments: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+        arguments
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    // The production surface currently has exactly one tool. Preserve its
+    // argv-oriented summary (which is also the most useful command/path/
+    // pattern summary) while redacting values for headless callers too.
+    let redacted = redact_json(arguments);
     let body = match name {
         "greppy" => {
-            let joined = arguments
+            let joined = redacted
                 .get("args")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -689,11 +1468,25 @@ fn format_tool_start(name: &str, arguments: &serde_json::Value) -> String {
                         .join(" ")
                 })
                 .unwrap_or_default();
-            format!("→ greppy {joined}")
+            format!("→ greppy {}", clip(&joined, TOOL_LINE_MAX))
         }
         other => {
-            let raw = arguments.to_string();
-            format!("→ {other} {raw}")
+            // Keep meaningful invocation fields readable if an extension or
+            // future caller supplies a tool-shaped object; raw JSON remains a
+            // safe last resort for malformed/opaque arguments.
+            let summary = nonblank_field(&redacted, "command")
+                .map(str::to_string)
+                .or_else(|| {
+                    nonblank_field(&redacted, "pattern").map(|pattern| {
+                        nonblank_field(&redacted, "path").map_or_else(
+                            || pattern.to_string(),
+                            |path| format!("{pattern} in {path}"),
+                        )
+                    })
+                })
+                .or_else(|| nonblank_field(&redacted, "path").map(str::to_string));
+            let summary = summary.unwrap_or_else(|| redacted.to_string());
+            format!("→ {other} {}", clip(&summary, TOOL_LINE_MAX))
         }
     };
     truncate_chars(&body, TOOL_LINE_MAX)
@@ -954,6 +1747,163 @@ fn ensure_semantic_index(worktree_path: &Path) {
     }
 }
 
+/// Start the existing index command as its normal observable background job.
+/// The interactive worker monitors the same JSON record used by `index status`
+/// and renders it in the TUI; no indexing or embedding logic is duplicated.
+fn start_semantic_index(worktree_path: &Path) -> Option<crate::BackgroundJobLaunch> {
+    if doctor_reports_embedding_complete(worktree_path) {
+        return None;
+    }
+    let root = worktree_path.to_string_lossy().into_owned();
+    crate::spawn_agent_background_index(Some(&root), "agent-startup")
+}
+
+fn client_for_endpoint(endpoint: &str, model: &str, api_key: Option<&str>) -> Client {
+    let client = Client::new(endpoint, model);
+    match api_key {
+        Some(key) => client.with_api_key(key),
+        None => client,
+    }
+}
+
+fn monitor_index_startup(
+    launch: &mut crate::BackgroundJobLaunch,
+    worktree_path: &Path,
+    bridge: &crate::agent_tui::EventBridge,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let mut missing_ticks = 0usize;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let owned = matches!(launch, crate::BackgroundJobLaunch::Owned { .. });
+            cancel_background_job(launch);
+            bridge.send_discrete(SessionEvent::Warning(
+                if owned {
+                    "Indexing cancelled."
+                } else {
+                    "Startup monitoring stopped; the shared index job continues."
+                }
+                .into(),
+            ));
+            return Ok(false);
+        }
+
+        if let Some(job) = crate::read_background_job(launch.path()) {
+            missing_ticks = 0;
+            let state = job
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("starting");
+            if state == "failed" {
+                let detail = job
+                    .get("last_error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown error");
+                bridge.send_discrete(SessionEvent::Warning(format!("Indexing failed: {detail}")));
+                reap_owned_background_job(launch);
+                return Ok(false);
+            }
+            let completed = job
+                .get("completed_spans")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0);
+            let total = job
+                .get("total_spans")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0);
+            let backend = job
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let embedding_phase = match backend {
+                "metal" => "Generating embeddings (Metal GPU)",
+                "cuda" => "Generating embeddings (CUDA GPU)",
+                "cpu" => "Generating embeddings (CPU)",
+                _ => "Generating embeddings",
+            };
+            let phase = match state {
+                "analyzing" => "Analyzing source code",
+                "storing" | "indexing" => "Writing code index",
+                "loading_model" => "Loading embedding model",
+                "embedding" => embedding_phase,
+                "refreshing" | "starting" => "Preparing code index",
+                _ => "Preparing workspace",
+            };
+            let show_counters = matches!(state, "analyzing" | "embedding");
+            let rate_milli_per_second = show_counters
+                .then(|| {
+                    job.get("rate_milli_spans_per_second")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .flatten();
+            let eta_seconds = show_counters
+                .then(|| job.get("eta_seconds").and_then(serde_json::Value::as_u64))
+                .flatten();
+            let detail = job
+                .get("current_detail")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            bridge.send_setup_progress(SessionEvent::BackgroundProgress {
+                phase: phase.into(),
+                detail,
+                unit: if state == "embedding" {
+                    "spans".into()
+                } else if state == "analyzing" {
+                    "files".into()
+                } else {
+                    "items".into()
+                },
+                completed: if show_counters { completed } else { 0 },
+                total: if show_counters { total } else { 0 },
+                rate_milli_per_second,
+                eta_seconds,
+            });
+        } else if doctor_reports_embedding_complete(worktree_path) {
+            reap_owned_background_job(launch);
+            return Ok(true);
+        } else {
+            if !owned_background_job_is_running(launch) {
+                missing_ticks = missing_ticks.saturating_add(1);
+            }
+            if missing_ticks >= 20 {
+                if std::env::var_os("GREPPY_TEST_SKIP_INFERENCE").is_none() {
+                    bridge.send_discrete(SessionEvent::Warning(
+                        "The index job ended before embeddings were complete.".into(),
+                    ));
+                }
+                reap_owned_background_job(launch);
+                return Ok(false);
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn cancel_background_job(launch: &mut crate::BackgroundJobLaunch) {
+    if let crate::BackgroundJobLaunch::Owned { child, path } = launch {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn reap_owned_background_job(launch: &mut crate::BackgroundJobLaunch) {
+    if let crate::BackgroundJobLaunch::Owned { child, .. } = launch {
+        let _ = child.wait();
+    }
+}
+
+fn owned_background_job_is_running(launch: &mut crate::BackgroundJobLaunch) -> bool {
+    match launch {
+        crate::BackgroundJobLaunch::Owned { child, .. } => {
+            matches!(child.try_wait(), Ok(None) | Err(_))
+        }
+        crate::BackgroundJobLaunch::Attached { .. } => false,
+    }
+}
+
 /// Cheap completeness signal: `doctor --json` → `embedding_complete == true`.
 ///
 /// Any spawn/parse failure means "not known complete" so the caller runs index.
@@ -999,7 +1949,7 @@ const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-fn scrub_credential_env(cmd: &mut Command) {
+pub(crate) fn scrub_credential_env(cmd: &mut Command) {
     for key in CREDENTIAL_ENV_BLOCKLIST {
         cmd.env_remove(key);
     }
@@ -1033,6 +1983,27 @@ mod tests {
         let mut full: Vec<OsString> = vec![OsString::from("greppy -p")];
         full.extend(args.iter().map(OsString::from));
         AgentArgs::try_parse_from(full)
+    }
+
+    #[test]
+    fn interactive_settings_supply_flag_free_startup_defaults() {
+        let mut args = parse(&[]).expect("parse");
+        let settings = crate::agent_tui::AgentSettings {
+            endpoint: Some("http://127.0.0.1:18318".into()),
+            model: Some("configured-model".into()),
+            private_store: true,
+            no_sandbox: true,
+            skip_selfcheck: true,
+            workspace_backend: "native".into(),
+            ..crate::agent_tui::AgentSettings::default()
+        };
+        apply_interactive_settings(&mut args, &[], &settings);
+        assert_eq!(args.endpoint, "http://127.0.0.1:18318");
+        assert_eq!(args.model.as_deref(), Some("configured-model"));
+        assert!(args.private_store);
+        assert!(args.no_sandbox);
+        assert!(args.skip_selfcheck);
+        assert_eq!(args.workspace_backend, WorkspaceBackendArg::Native);
     }
 
     #[test]
@@ -1143,7 +2114,8 @@ mod tests {
     fn validate_missing_task_errors() {
         let a = parse(&["--model", "m"]).expect("parse allows absent task");
         assert!(a.task.is_none());
-        assert_eq!(validate_args(&a), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&a, true), Ok(()));
     }
 
     #[test]
@@ -1161,8 +2133,10 @@ mod tests {
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
+            continue_session: false,
+            resume: None,
         };
-        assert_eq!(validate_args(&a), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
 
     #[test]
@@ -1179,8 +2153,10 @@ mod tests {
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
+            continue_session: false,
+            resume: None,
         };
-        assert_eq!(validate_args(&a), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
 
     #[test]
@@ -1226,6 +2202,23 @@ mod tests {
         assert!(
             help.contains("ignored files are excluded"),
             "help must document ignored-file exclusion: {help}"
+        );
+        assert!(
+            help.contains("--fresh") || help.contains("fresh"),
+            "help must mention --fresh: {help}"
+        );
+        assert!(help.contains("/model"), "help must mention /model: {help}");
+        assert!(
+            help.contains("--continue"),
+            "help must mention --continue: {help}"
+        );
+        assert!(
+            help.contains("--resume"),
+            "help must mention --resume: {help}"
+        );
+        assert!(
+            help.contains("ignored build caches") || help.contains("ignored files"),
+            "help must document ignored-cache default: {help}"
         );
         assert!(!help.contains("--workspace-backend"), "help={help}");
         assert!(!help.contains("--fresh"), "help={help}");
@@ -1373,6 +2366,8 @@ mod tests {
             private_store: false,
             no_sandbox: true,
             skip_selfcheck: false,
+            continue_session: false,
+            resume: None,
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
@@ -1406,6 +2401,8 @@ mod tests {
             private_store: false,
             no_sandbox: false,
             skip_selfcheck: false,
+            continue_session: false,
+            resume: None,
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
@@ -1475,6 +2472,11 @@ mod tests {
         // F9: `-e -p` is a grep passthrough spelling, not the agent.
         assert!(!is_agent_p_invocation(&mk(&["greppy", "-e", "-p", "X"])));
         assert!(!is_agent_p_invocation(&mk(&["greppy", "foo", "-p"])));
+        assert!(is_agent_tui_invocation(&mk(&["greppy", "agent"])));
+        assert!(is_agent_tui_invocation(&mk(&[
+            "greppy", "--root", "/tmp", "agent"
+        ])));
+        assert!(!is_agent_tui_invocation(&mk(&["greppy", "agent.rs"])));
     }
 
     #[test]
@@ -1491,6 +2493,35 @@ mod tests {
     fn format_greppy_tool_line() {
         let args = serde_json::json!({"args": ["who-calls", "foo"]});
         assert_eq!(format_tool_start("greppy", &args), "→ greppy who-calls foo");
+    }
+
+    #[test]
+    fn format_tool_start_drops_terminal_controls() {
+        let args = serde_json::json!({
+            "args": ["bash-smart", "--", "echo", "\u{1b}[31mred\u{7f}"]
+        });
+        let line = format_tool_start("greppy", &args);
+        assert!(!line.contains('\u{1b}'));
+        assert!(!line.contains('\u{7f}'));
+        assert!(line.contains("[31mred"), "line={line}");
+    }
+
+    #[test]
+    fn format_tool_start_prefers_meaningful_fields_to_raw_json() {
+        assert_eq!(
+            format_tool_start(
+                "extension-tool",
+                &serde_json::json!({"pattern": "TODO", "path": "src"})
+            ),
+            "→ extension-tool TODO in src"
+        );
+        assert_eq!(
+            format_tool_start(
+                "extension-tool",
+                &serde_json::json!({"command": "cargo test", "path": "ignored"})
+            ),
+            "→ extension-tool cargo test"
+        );
     }
 
     #[test]
@@ -1640,6 +2671,61 @@ mod tests {
         let msg = String::from_utf8_lossy(&stderr);
         assert!(msg.contains("worktree cleanup failed"), "msg={msg}");
         assert!(msg.contains("worktree kept"), "msg={msg}");
+    }
+
+    #[test]
+    fn parse_continue_and_resume_flags() {
+        let a = parse(&["--model", "m", "--continue"]).expect("parse");
+        assert!(a.continue_session);
+        assert!(a.task.is_none());
+        let b = parse(&["--model", "m", "--resume", "sess-1"]).expect("parse");
+        assert_eq!(b.resume.as_deref(), Some("sess-1"));
+        assert!(parse(&["--model", "m", "--continue", "--resume", "x"]).is_err());
+        let headless = parse(&["task", "--model", "m", "--continue"]).expect("parse");
+        assert_eq!(validate_args(&headless, false), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&headless, true), Ok(()));
+    }
+
+    #[test]
+    fn interactive_agent_needs_neither_task_nor_model_flags() {
+        let args = parse(&[]).expect("parse flagless interactive invocation");
+        assert_eq!(validate_args(&args, true), Ok(()));
+        assert_eq!(validate_args(&args, false), Err(EXIT_USAGE));
+    }
+
+    #[test]
+    fn cancelling_attached_index_job_never_touches_foreign_job_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("foreign-index-job.json");
+        fs::write(&path, "{}\n").expect("write job marker");
+        let mut launch = crate::BackgroundJobLaunch::Attached { path: path.clone() };
+
+        cancel_background_job(&mut launch);
+
+        assert!(path.exists(), "attached job belongs to another process");
+    }
+
+    #[test]
+    fn cancelling_owned_index_job_reaps_child_and_removes_its_job_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("owned-index-job.json");
+        fs::write(&path, "{}\n").expect("write job marker");
+        let child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn child");
+        let mut launch = crate::BackgroundJobLaunch::Owned {
+            child,
+            path: path.clone(),
+        };
+
+        cancel_background_job(&mut launch);
+
+        assert!(!path.exists());
+        let crate::BackgroundJobLaunch::Owned { child, .. } = &mut launch else {
+            panic!("expected owned launch");
+        };
+        assert!(child.try_wait().expect("query child").is_some());
     }
 
     #[test]

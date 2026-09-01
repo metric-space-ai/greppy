@@ -160,6 +160,33 @@ impl Client {
         format!("{}/v1/messages", self.base_url)
     }
 
+    /// List model ids advertised by `GET {base}/v1/models`.
+    ///
+    /// Unknown JSON shapes return an empty list rather than failing; the
+    /// interactive UI then falls back to the currently selected model.
+    pub fn list_models(&self) -> Result<Vec<String>, ProbeError> {
+        let url = self.models_url();
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout(Duration::from_secs(2))
+            .build();
+
+        match self.authed(agent.get(&url)).call() {
+            Ok(resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                Ok(parse_model_ids(&body))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(ProbeError::BadResponse(format!(
+                    "HTTP {code}: {}",
+                    truncate(&body, 200)
+                )))
+            }
+            Err(ureq::Error::Transport(t)) => Err(ProbeError::Unreachable(t.to_string())),
+        }
+    }
+
     /// Probe the gateway: `GET {base}/v1/models` with a 2 s timeout.
     ///
     /// Distinguishes connect failures ([`ProbeError::Unreachable`]) from
@@ -337,6 +364,38 @@ fn handle_sse_item(
 /// Strip trailing `/` characters from a base URL.
 pub(crate) fn normalize_base_url(base: &str) -> String {
     base.trim().trim_end_matches('/').to_string()
+}
+
+pub(crate) fn parse_model_ids(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let push_id = |ids: &mut Vec<String>, raw: &Value| {
+        if let Some(id) = raw.as_str() {
+            if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        } else if let Some(id) = raw.get("id").and_then(Value::as_str) {
+            if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    };
+    if let Some(arr) = value.get("data").and_then(Value::as_array) {
+        for item in arr {
+            push_id(&mut ids, item);
+        }
+    } else if let Some(arr) = value.get("models").and_then(Value::as_array) {
+        for item in arr {
+            push_id(&mut ids, item);
+        }
+    } else if let Some(arr) = value.as_array() {
+        for item in arr {
+            push_id(&mut ids, item);
+        }
+    }
+    ids
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -689,6 +748,20 @@ mod tests {
         assert_eq!(c.models_url(), "http://127.0.0.1:8317/v1/models");
         assert_eq!(c.messages_url(), "http://127.0.0.1:8317/v1/messages");
         assert_eq!(c.model(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn parse_model_ids_accepts_openai_and_anthropic_shapes() {
+        assert_eq!(
+            parse_model_ids(r#"{"data":[{"id":"test"},{"id":"other"}]}"#),
+            vec!["test".to_string(), "other".to_string()]
+        );
+        assert_eq!(
+            parse_model_ids(r#"{"models":["alpha",{"id":"beta"}]}"#),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(parse_model_ids("not json"), Vec::<String>::new());
+        assert_eq!(parse_model_ids("{}"), Vec::<String>::new());
     }
 
     #[test]

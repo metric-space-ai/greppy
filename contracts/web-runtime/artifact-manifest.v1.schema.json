@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "greppy.web-runtime.artifact-manifest.v1",
+  "title": "Greppy web-runtime artifact manifest v1",
+  "description": "Manifest for content-addressed web-runtime artifacts. Large immutable objects live at objects/sha256/<digest> under the run-scoped root <agent-data>/web-runtime/<run-id>/. Runtime state MUST live under the current Greppy agent data/scratch root, not inside source directories. Raw artifacts containing credentials require explicit operator access and MUST be marked sensitive.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "digest",
+    "byte_count",
+    "media_type",
+    "producing_operation",
+    "session_id",
+    "timestamp",
+    "redaction_status",
+    "sensitive",
+    "credential_labeled",
+    "object_path",
+    "run_layout"
+  ],
+  "properties": {
+    "contract": {
+      "type": "string",
+      "const": "greppy.web-runtime.artifact-manifest.v1"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "description": "Artifact digest. SHA-256 is required.",
+      "properties": {
+        "algorithm": { "type": "string", "const": "sha256" },
+        "hex": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "byte_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "media_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "IANA media type of the stored object."
+    },
+    "producing_operation": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Operation that produced the artifact (protocol request_id or public operation name plus request_id)."
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^wrs_[A-Za-z0-9._~-]+$"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp of artifact production."
+    },
+    "redaction_status": {
+      "type": "string",
+      "enum": [
+        "not_redacted",
+        "redacted_for_model",
+        "redacted_for_logs",
+        "unredacted_operator_only"
+      ],
+      "description": "Logs, traces, screenshots, request headers, and page content MUST pass a redaction layer before becoming model-visible."
+    },
+    "sensitive": {
+      "type": "boolean",
+      "description": "True when the object may contain credentials or other sensitive material."
+    },
+    "credential_labeled": {
+      "type": "boolean",
+      "description": "True when the artifact is labeled as containing credentials not representable by Playwright storage-state semantics, or any injected credential material."
+    },
+    "object_path": {
+      "type": "string",
+      "pattern": "^objects/sha256/[a-f0-9]{64}$",
+      "description": "Content-addressed object path convention objects/sha256/<digest> relative to the run root."
+    },
+    "run_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["convention", "run_root"],
+      "properties": {
+        "convention": {
+          "type": "string",
+          "const": "<agent-data>/web-runtime/<run-id>/"
+        },
+        "run_root": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute or agent-data-relative directory for this run. MUST be under the Greppy agent data/scratch root."
+        },
+        "session_subdir": {
+          "type": "string",
+          "description": "sessions/<session-id>/ relative to the run root when the artifact is session-scoped."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Evidence fields used by web research. Page content is untrusted and MUST be wrapped in an explicit untrusted-content boundary in model-facing output.",
+      "required": [
+        "requested_url",
+        "final_url",
+        "redirect_chain",
+        "retrieval_timestamp",
+        "source_classification",
+        "session_id",
+        "operation_id"
+      ],
+      "properties": {
+        "requested_url": { "type": "string", "minLength": 1 },
+        "final_url": { "type": "string", "minLength": 1 },
+        "redirect_chain": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "retrieval_timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "http_status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "title": { "type": "string" },
+        "media_type": { "type": "string" },
+        "extracted_evidence_digest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "hex"],
+          "properties": {
+            "algorithm": { "type": "string", "const": "sha256" },
+            "hex": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          }
+        },
+        "query": { "type": "string" },
+        "relevance": { "type": "string" },
+        "rejection_reason": { "type": "string" },
+        "source_classification": {
+          "type": "string",
+          "enum": [
+            "original",
+            "primary",
+            "secondary",
+            "aggregator",
+            "metadata-only"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "pattern": "^wrs_[A-Za-z0-9._~-]+$"
+        },
+        "operation_id": {
+          "type": "string",
+          "pattern": "^wrq_[A-Za-z0-9._~-]+$"
+        }
+      }
+    },
+    "continuation_token": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Present when more evidence exists beyond this compact answer pack."
+    },
+    "omitted_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of sources or snippets omitted from model-facing output."
+    },
+    "truncated_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of payloads truncated to satisfy output or artifact budgets."
+    }
+  }
+}

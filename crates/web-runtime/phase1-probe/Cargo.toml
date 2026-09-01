@@ -1,0 +1,9 @@
+[package]
+name = "phase1-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+deno_core = "=0.410.0"
+servo = "=0.5.0"

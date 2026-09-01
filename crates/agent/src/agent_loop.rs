@@ -26,10 +26,12 @@ use crate::model::ModelStream;
 use crate::protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, Usage,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Configuration for [`run_agent_loop`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Hard cap on assistant turns (each model response counts as one).
     /// Default: 40.
@@ -56,7 +58,28 @@ pub struct AgentConfig {
     /// (when remaining < 20% of this total). When `None`, the advisory is
     /// skipped even if [`Self::deadline`] is set. Default: `None`.
     pub deadline_total: Option<Duration>,
+    /// Cooperative cancel flag. Checked only at safe boundaries: between
+    /// turns, after a model stream finishes (before any tool starts), and
+    /// after a tool returns. A running tool is never interrupted, so an
+    /// in-flight edit cannot be left half-applied. Default: `None`.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
+
+impl PartialEq for AgentConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_turns == other.max_turns
+            && self.system == other.system
+            && self.model == other.model
+            && self.max_tokens == other.max_tokens
+            && self.tool_choice == other.tool_choice
+            && self.consecutive_failure_advisory == other.consecutive_failure_advisory
+            && self.consecutive_failure_stop == other.consecutive_failure_stop
+            && self.deadline == other.deadline
+            && self.deadline_total == other.deadline_total
+    }
+}
+
+impl Eq for AgentConfig {}
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -70,6 +93,7 @@ impl Default for AgentConfig {
             consecutive_failure_stop: 8,
             deadline: None,
             deadline_total: None,
+            cancel: None,
         }
     }
 }
@@ -126,6 +150,8 @@ pub enum LoopStop {
     Stuck,
     /// Hit [`AgentConfig::deadline`] between turns (never mid-turn / mid-tool).
     Deadline,
+    /// Cooperative cancel requested at a safe boundary (never mid-tool).
+    Cancelled,
 }
 
 /// Successful loop outcome.
@@ -210,6 +236,28 @@ pub enum LoopEvent {
 /// Run the agent loop to completion.
 ///
 /// See the module docs for turn / tool / error semantics.
+fn cancel_requested(config: &AgentConfig) -> bool {
+    config
+        .cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn cancelled_tool_result(call_id: String) -> ContentPart {
+    ContentPart::ToolResult {
+        call_id,
+        content: "cancelled before execution".to_string(),
+        is_error: true,
+    }
+}
+
+fn cancelled_tool_results(tool_calls: &[(String, String, serde_json::Value)]) -> Vec<ContentPart> {
+    tool_calls
+        .iter()
+        .map(|(id, _, _)| cancelled_tool_result(id.clone()))
+        .collect()
+}
+
 pub fn run_agent_loop(
     model: &mut dyn ModelStream,
     env: &mut dyn ExecutionEnv,
@@ -217,7 +265,23 @@ pub fn run_agent_loop(
     prompt: &str,
     on_event: &mut dyn FnMut(LoopEvent),
 ) -> Result<LoopResult, LoopError> {
-    let mut messages: Vec<Message> = Vec::new();
+    run_agent_loop_with_history(model, env, config, &[], prompt, on_event)
+}
+
+/// Continue an agent conversation from an existing message history.
+///
+/// The supplied history is never mutated. The returned [`LoopResult`] owns
+/// the complete updated history, so interactive clients can feed its
+/// `messages` field into the next call.
+pub fn run_agent_loop_with_history(
+    model: &mut dyn ModelStream,
+    env: &mut dyn ExecutionEnv,
+    config: &AgentConfig,
+    history: &[Message],
+    prompt: &str,
+    on_event: &mut dyn FnMut(LoopEvent),
+) -> Result<LoopResult, LoopError> {
+    let mut messages: Vec<Message> = history.to_vec();
     messages.push(Message {
         role: Role::User,
         content: vec![ContentPart::Text {
@@ -243,6 +307,10 @@ pub fn run_agent_loop(
                 last_stop = LoopStop::Deadline;
                 break;
             }
+        }
+        if cancel_requested(config) {
+            last_stop = LoopStop::Cancelled;
+            break;
         }
 
         let tools = env.tool_definitions();
@@ -275,9 +343,25 @@ pub fn run_agent_loop(
                     break;
                 }
 
+                // Stream finished and no tool has started: safe to honour cancel
+                // without leaving an edit half-applied.
+                if cancel_requested(config) {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: cancelled_tool_results(&tool_calls),
+                    });
+                    last_stop = LoopStop::Cancelled;
+                    break;
+                }
+
                 let mut result_parts: Vec<ContentPart> = Vec::with_capacity(tool_calls.len());
                 let mut stuck = false;
+                let mut cancel_remaining = false;
                 for (id, name, arguments) in tool_calls {
+                    if cancel_remaining {
+                        result_parts.push(cancelled_tool_result(id));
+                        continue;
+                    }
                     on_event(LoopEvent::ToolStart {
                         call_id: id.clone(),
                         name: name.clone(),
@@ -352,6 +436,12 @@ verifiable and report the rest."
                         name: name.clone(),
                         outcome: outcome.clone(),
                     });
+                    if let Some(data) = outcome.image_png_base64.clone() {
+                        result_parts.push(ContentPart::Image {
+                            media_type: "image/png".to_owned(),
+                            data,
+                        });
+                    }
                     result_parts.push(ContentPart::ToolResult {
                         call_id: id,
                         content: outcome.content,
@@ -364,6 +454,11 @@ verifiable and report the rest."
                         stuck = true;
                         break;
                     }
+                    // After a tool returns is a safe boundary. Remaining calls
+                    // are recorded as cancelled results so history stays valid.
+                    if cancel_requested(config) {
+                        cancel_remaining = true;
+                    }
                 }
 
                 // One user message carrying every tool_result block, in order.
@@ -374,6 +469,10 @@ verifiable and report the rest."
 
                 if stuck {
                     last_stop = LoopStop::Stuck;
+                    break;
+                }
+                if cancel_remaining || cancel_requested(config) {
+                    last_stop = LoopStop::Cancelled;
                     break;
                 }
 
@@ -404,7 +503,7 @@ verifiable and report the rest."
     // or always-tools exhaustion), the provisional MaxTurns stands. When the
     // final turn *did* end cleanly on the last allowed turn, honor that stop.
     // Stuck / Deadline already set last_stop and must not be overwritten.
-    if turns == 0 && !matches!(last_stop, LoopStop::Deadline) {
+    if turns == 0 && !matches!(last_stop, LoopStop::Deadline | LoopStop::Cancelled) {
         last_stop = LoopStop::MaxTurns;
     }
 
@@ -546,6 +645,9 @@ mod tests {
     use crate::protocol::ToolDefinition;
     use serde_json::json;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     // --- fakes ----------------------------------------------------------------
 
@@ -560,6 +662,7 @@ mod tests {
         turns: VecDeque<ScriptedTurn>,
         /// How many times `stream_turn` was invoked (includes retries).
         calls: usize,
+        requests: Vec<ModelRequest>,
     }
 
     impl FakeModel {
@@ -567,6 +670,7 @@ mod tests {
             Self {
                 turns: turns.into(),
                 calls: 0,
+                requests: Vec::new(),
             }
         }
     }
@@ -574,10 +678,11 @@ mod tests {
     impl ModelStream for FakeModel {
         fn stream_turn(
             &mut self,
-            _req: &ModelRequest,
+            req: &ModelRequest,
             on_event: &mut dyn FnMut(StreamEvent),
         ) -> Result<TurnResult, ClientError> {
             self.calls += 1;
+            self.requests.push(req.clone());
             let scripted = self
                 .turns
                 .pop_front()
@@ -709,7 +814,7 @@ mod tests {
     }
 
     fn run(
-        model: &mut FakeModel,
+        model: &mut dyn ModelStream,
         env: &mut FakeEnv,
         config: &AgentConfig,
         prompt: &str,
@@ -736,6 +841,44 @@ mod tests {
         assert_eq!(result.messages[0].role, Role::User);
         assert_eq!(result.messages[1].role, Role::Assistant);
         assert_eq!(model.calls, 1);
+    }
+
+    #[test]
+    fn continued_loop_preserves_history_and_appends_prompt() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: "first question".to_string(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::Text {
+                    text: "first answer".to_string(),
+                }],
+            },
+        ];
+        let mut model = FakeModel::new(vec![text_turn("second answer", usage(12, 4))]);
+        let mut env = FakeEnv::new(vec![]);
+        let config = AgentConfig::default().with_model("mock");
+
+        let result = run_agent_loop_with_history(
+            &mut model,
+            &mut env,
+            &config,
+            &history,
+            "second question",
+            &mut |_| {},
+        )
+        .expect("continued loop");
+
+        assert_eq!(model.requests.len(), 1);
+        assert_eq!(model.requests[0].messages.len(), 3);
+        assert_eq!(model.requests[0].messages[..2], history);
+        assert_eq!(result.messages.len(), 4);
+        assert_eq!(result.messages[..2], history);
+        assert_eq!(result.final_text, "second answer");
     }
 
     #[test]
@@ -1709,5 +1852,112 @@ mod tests {
         assert_eq!(model.calls, 2);
         assert_eq!(env.calls.len(), 1);
         assert_eq!(result.messages.len(), 4);
+    }
+
+    #[test]
+    fn cancel_before_first_turn_does_not_call_model() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut model = FakeModel::new(vec![text_turn("must not run", usage(1, 1))]);
+        let mut env = FakeEnv::new(vec![bash_tool()]);
+        let config = AgentConfig {
+            model: "mock".into(),
+            cancel: Some(Arc::clone(&flag)),
+            ..AgentConfig::default()
+        };
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        assert_eq!(result.stop, LoopStop::Cancelled);
+        assert_eq!(model.calls, 0);
+        assert!(env.calls.is_empty());
+    }
+
+    #[test]
+    fn cancel_after_stream_skips_tools() {
+        let flag = Arc::new(AtomicBool::new(false));
+        struct CancelAfterStream {
+            inner: FakeModel,
+            flag: Arc<AtomicBool>,
+        }
+        impl ModelStream for CancelAfterStream {
+            fn stream_turn(
+                &mut self,
+                req: &ModelRequest,
+                on_event: &mut dyn FnMut(StreamEvent),
+            ) -> Result<TurnResult, ClientError> {
+                let result = self.inner.stream_turn(req, on_event)?;
+                self.flag.store(true, Ordering::Relaxed);
+                Ok(result)
+            }
+        }
+        let mut model = CancelAfterStream {
+            inner: FakeModel::new(vec![tool_turn(
+                Some("calling"),
+                vec![("c1", "bash", json!({"command": "rm"}))],
+                usage(1, 1),
+            )]),
+            flag: Arc::clone(&flag),
+        };
+        let mut env = FakeEnv::new(vec![bash_tool()]).with_outcome("bash", ToolOutcome::ok("ran"));
+        let config = AgentConfig {
+            model: "mock".into(),
+            cancel: Some(Arc::clone(&flag)),
+            ..AgentConfig::default()
+        };
+        let (result, _) = run(&mut model, &mut env, &config, "hi").expect("loop");
+        assert_eq!(result.stop, LoopStop::Cancelled);
+        assert!(env.calls.is_empty(), "tool must not start after cancel");
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 1);
+        assert!(contents[0].0);
+        assert!(contents[0].1.contains("cancelled before execution"));
+    }
+
+    #[test]
+    fn running_tool_is_not_interrupted_by_cancel() {
+        let flag = Arc::new(AtomicBool::new(false));
+        struct SlowEnv {
+            tools: Vec<ToolDefinition>,
+            calls: usize,
+            sleep_for: Duration,
+            flag: Arc<AtomicBool>,
+        }
+        impl ExecutionEnv for SlowEnv {
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.tools.clone()
+            }
+            fn call_tool(&mut self, _name: &str, _arguments: &serde_json::Value) -> ToolOutcome {
+                self.calls += 1;
+                self.flag.store(true, Ordering::Relaxed);
+                std::thread::sleep(self.sleep_for);
+                ToolOutcome::ok("tool finished fully")
+            }
+        }
+        let mut model = FakeModel::new(vec![
+            tool_turn(
+                Some("calling tool"),
+                vec![("c1", "bash", json!({"command": "slow"}))],
+                usage(1, 1),
+            ),
+            text_turn("must not run", usage(1, 1)),
+        ]);
+        let mut env = SlowEnv {
+            tools: vec![bash_tool()],
+            calls: 0,
+            sleep_for: Duration::from_millis(50),
+            flag: Arc::clone(&flag),
+        };
+        let config = AgentConfig {
+            model: "mock".into(),
+            max_turns: 10,
+            cancel: Some(Arc::clone(&flag)),
+            ..AgentConfig::default()
+        };
+        let result =
+            run_agent_loop(&mut model, &mut env, &config, "hi", &mut |_| {}).expect("loop");
+        assert_eq!(result.stop, LoopStop::Cancelled);
+        assert_eq!(model.calls, 1, "no second model turn");
+        assert_eq!(env.calls, 1, "tool must complete");
+        let contents = tool_result_contents(&result);
+        assert_eq!(contents.len(), 1);
+        assert!(contents[0].1.starts_with("tool finished fully"));
     }
 }

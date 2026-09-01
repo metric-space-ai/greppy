@@ -1,21 +1,36 @@
 //! Build-time embedding of the EmbeddingGemma-300M and Qwen3.5-0.8B Q4_K models.
 //!
 //! Owner rule: greppy works OUT OF THE BOX — semantic search must ALWAYS
-//! work, so the model ships INSIDE the binary. The asset BYTES are hosted as
-//! GitHub release assets (free and unlimited for public repos; Git LFS storage
-//! and bandwidth were the org's dominant cost). WHAT ships stays pinned in
-//! this repo: `crates/cli/assets/MODEL_ASSETS.json` plus `*.sha256` sidecars,
-//! materialized and digest-verified by `tools/fetch_model_assets.sh` before
-//! any build. The shipped binary is unchanged: no download, external path,
-//! feature switch, or environment variable is required at runtime. The
-//! sole exception is the compile-guarded `ci-test-assets` debug feature used by
-//! non-inference tests; release builds cannot enable it.
+//! work, so the **shipped release binary** contains the models. The asset
+//! BYTES are hosted as GitHub release assets (free and unlimited for public
+//! repos; Git LFS storage and bandwidth were the org's dominant cost). WHAT
+//! ships stays pinned in this repo: `crates/cli/assets/MODEL_ASSETS.json`
+//! plus `*.sha256` sidecars, materialized and digest-verified by
+//! `tools/fetch_model_assets.sh` before any build.
 //!
-//! A plain `cargo build` verifies the in-repo assets before passing their
-//! absolute paths to `lib.rs` for `include_bytes!`. The compiler therefore
-//! embeds the verified repo files directly without creating another ~1 GiB
-//! copy per Cargo build fingerprint. A binary without either model is not
-//! buildable.
+//! Profile split (must not be collapsed into one claim):
+//! - **Release** (`cargo build --release`): `include_bytes!` of the digest-
+//!   verified repo GGUF/tokenizer files. Self-contained: no download, extra
+//!   runtime path, feature switch, or environment variable. A release
+//!   binary without either product model is not buildable.
+//! - **Debug** (default `cargo test` / `cargo build`): does **not** bake the
+//!   ~730MiB GGUF blobs into `__TEXT`. `lib.rs` copies digest-verified files
+//!   from the compile-time `GREPPY_EMBEDDED_*_PATH` repo locations. This is a
+//!   dev/test profile optimization only. It is not a production one-binary
+//!   cold-start claim; signed/notarized release first-exec remains a separate
+//!   OPEN gate until measured.
+//! - **`ci-test-assets`**: tiny sentinel files for non-inference CI. Debug
+//!   plus `CI=true` only; `build.rs` and `lib.rs` refuse it in release.
+//!
+//! A plain build verifies the in-repo assets before exporting their absolute
+//! paths. Release then embeds those files; debug keeps the paths for a
+//! digest-checked copy at first inference. The compiler does not create
+//! another ~1 GiB copy per Cargo build fingerprint.
+//!
+//! Digest verification is never skipped. Debug GGUF hashing is sped up by
+//! workspace `[profile.dev.package.sha2] opt-level = 3` (the `sha2` crate
+//! only, including this build script). Other debug crates, build scripts,
+//! and all release profiles are unchanged.
 
 use std::path::{Path, PathBuf};
 

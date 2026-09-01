@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23071013'/%3E%3Cpath d='M8 9h16v4H13v3h9v4h-9v3h11v4H8z' fill='%234de4d1'/%3E%3C/svg%3E">
+  <title>CTOX vs. Greppy Native Web Runtime — Fähigkeitsvergleich</title>
+  <style>
+    :root {
+      --bg: #071013;
+      --surface: #0b161a;
+      --surface-2: #0f1d21;
+      --ink: #e8f2f1;
+      --muted: #90a5a5;
+      --line: #223438;
+      --accent: #4de4d1;
+      --good: #75e29b;
+      --warn: #ffd166;
+      --bad: #ff7a8a;
+      --quiet: #8ea1ad;
+      --max: 1540px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(rgba(77, 228, 209, .025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(77, 228, 209, .025) 1px, transparent 1px),
+        var(--bg);
+      background-size: 32px 32px;
+      color: var(--ink);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button, input { font: inherit; }
+    .shell { width: min(calc(100% - 40px), var(--max)); margin: 0 auto; }
+
+    header {
+      min-height: 43vh;
+      display: grid;
+      align-items: end;
+      padding: 72px 0 52px;
+      border-bottom: 1px solid var(--line);
+      background: radial-gradient(circle at 78% 15%, rgba(77, 228, 209, .14), transparent 34%);
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--accent);
+      font: 700 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 1050px;
+      margin: 0;
+      font-size: clamp(38px, 6vw, 88px);
+      line-height: .98;
+      letter-spacing: -.055em;
+      text-wrap: balance;
+    }
+
+    .lede {
+      max-width: 850px;
+      margin: 28px 0 0;
+      color: var(--muted);
+      font-size: clamp(16px, 1.5vw, 21px);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 42px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .metric { padding: 20px 24px 20px 0; }
+    .metric + .metric { padding-left: 24px; border-left: 1px solid var(--line); }
+    .metric strong { display: block; color: var(--accent); font: 650 clamp(24px, 3vw, 40px)/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .metric span { display: block; margin-top: 8px; color: var(--muted); font-size: 13px; }
+
+    main { padding: 38px 0 80px; }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; }
+    .filter {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 13px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color .18s ease, border-color .18s ease, background .18s ease;
+    }
+    .filter:hover, .filter[aria-pressed="true"] { color: var(--ink); border-color: var(--accent); background: rgba(77, 228, 209, .08); }
+
+    .search {
+      width: min(100%, 350px);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 12px;
+      outline: none;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77, 228, 209, .09); }
+
+    .table-wrap { overflow: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    table { width: 100%; min-width: 1040px; border-collapse: collapse; }
+    col.capability { width: 20%; }
+    col.ctox { width: 28%; }
+    col.native { width: 28%; }
+    col.gate { width: 24%; }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      padding: 15px 16px;
+      background: rgba(7, 16, 19, .96);
+      color: var(--muted);
+      text-align: left;
+      font: 700 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      backdrop-filter: blur(12px);
+    }
+
+    td { padding: 17px 16px; border-top: 1px solid var(--line); vertical-align: top; }
+    tbody tr { transition: background .15s ease, opacity .25s ease; }
+    tbody tr:hover { background: rgba(77, 228, 209, .045); }
+    tbody tr[hidden] { display: none; }
+    .group td {
+      padding: 25px 16px 10px;
+      color: var(--accent);
+      background: var(--bg);
+      font: 700 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+
+    .cap { font-weight: 680; color: #f4fbfa; }
+    .detail { display: block; margin-top: 5px; color: var(--muted); font-size: 13px; }
+    .state {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 7px;
+      font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 12px currentColor; }
+    .ready { color: var(--good); }
+    .partial { color: var(--warn); }
+    .gap { color: var(--bad); }
+    .scoped { color: var(--quiet); }
+
+    .notes {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      margin-top: 44px;
+      border-top: 1px solid var(--line);
+    }
+    .note { padding: 25px 34px 0 0; }
+    .note + .note { padding-left: 34px; border-left: 1px solid var(--line); }
+    .note h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: -.02em; }
+    .note p, .note li { color: var(--muted); }
+    .note ul { margin: 10px 0 0; padding-left: 18px; }
+    code { color: #b5fff6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+
+    footer { padding: 25px 0 45px; color: var(--muted); font-size: 12px; }
+
+    @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+    header .shell > * { animation: rise .55s both cubic-bezier(.2,.8,.2,1); }
+    header .shell > :nth-child(2) { animation-delay: .06s; }
+    header .shell > :nth-child(3) { animation-delay: .12s; }
+    header .shell > :nth-child(4) { animation-delay: .18s; }
+
+    @media (max-width: 820px) {
+      .shell { width: min(calc(100% - 24px), var(--max)); }
+      header { min-height: auto; padding: 54px 0 34px; }
+      .metrics { grid-template-columns: 1fr 1fr; }
+      .metric:nth-child(3) { border-left: 0; padding-left: 0; border-top: 1px solid var(--line); }
+      .metric:nth-child(4) { border-top: 1px solid var(--line); }
+      .toolbar { align-items: stretch; }
+      .search { width: 100%; }
+      .notes { grid-template-columns: 1fr; }
+      .note + .note { padding-left: 0; border-left: 0; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="shell">
+      <p class="eyebrow">Web Runtime Capability Audit · 28.08.2026</p>
+      <h1>CTOX Web Stack vs. native Rust Runtime</h1>
+      <p class="lede">Funktionsvergleich des etablierten CTOX-Stacks mit dem aktuellen Greppy-Prototyp. „Implementiert“ bedeutet hier nicht automatisch Playwright-kompatibel: maßgeblich sind beobachtbares Verhalten und Oracle-Belege.</p>
+      <div class="metrics" aria-label="Aktuelle Kennzahlen">
+        <div class="metric"><strong>1</strong><span>verpacktes natives Executable</span></div>
+        <div class="metric"><strong>347</strong><span>native Playwright-Symbole gebunden</span></div>
+        <div class="metric"><strong>17</strong><span>native Symbole mit Behavior-Oracle</span></div>
+        <div class="metric"><strong>1.354</strong><span>inventarisierte Playwright-Symbole</span></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <div class="toolbar">
+      <div class="filters" role="group" aria-label="Tabelle filtern">
+        <button class="filter" data-filter="all" aria-pressed="true">Alle</button>
+        <button class="filter" data-filter="ready" aria-pressed="false">Native vorhanden</button>
+        <button class="filter" data-filter="partial" aria-pressed="false">Native teilweise</button>
+        <button class="filter" data-filter="gap" aria-pressed="false">Native Lücke</button>
+        <button class="filter" data-filter="scoped" aria-pressed="false">Außer Scope</button>
+      </div>
+      <input class="search" id="search" type="search" placeholder="Fähigkeit oder Begriff suchen …" aria-label="Vergleich durchsuchen">
+    </div>
+
+    <div class="table-wrap" role="region" aria-label="Fähigkeitsvergleich" tabindex="0">
+      <table>
+        <colgroup><col class="capability"><col class="ctox"><col class="native"><col class="gate"></colgroup>
+        <thead>
+          <tr><th>Fähigkeit</th><th>CTOX Web Stack</th><th>Greppy Native Runtime</th><th>Differenz / nächster Nachweis</th></tr>
+        </thead>
+        <tbody>
+          <tr class="group"><td colspan="4">Architektur & Auslieferung</td></tr>
+          <tr data-status="ready"><td><span class="cap">Auslieferungsform</span></td><td><span class="state partial">Komponentenstack</span><span class="detail">Rust-Crate und fokussiertes <code>ctox-web-stack</code>-Binary; Browserpfad benötigt zusätzlich Node, Playwright/Patchright und Chromium.</span></td><td><span class="state ready">Vorhanden</span><span class="detail">Genau ein verpacktes <code>bin/web-runtime</code>. Supervisor, Controller und Content laufen als getrennte Prozesse desselben Images.</span></td><td><span class="detail">Ziel „ein Artefakt“ erreicht; Ziel „ein Prozess/Adressraum“ bewusst noch nicht erreicht.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Render- und JS-Engines</span></td><td><span class="state ready">Bewährt</span><span class="detail">Chromium rendert Seiten; Node führt Playwright-Steuercode aus.</span></td><td><span class="state partial">Prozessisoliert</span><span class="detail">Servo/SpiderMonkey rendert; <code>deno_core</code>/V8 führt Controller-JavaScript aus. Beide Engines dürfen wegen Symbolkollision aktuell nicht in denselben Prozess.</span></td><td><span class="detail">Packaged Multi-Process ist funktionsfähig. In-Process-Konstruktion und sauberer Drop bleiben ein separates Engine-Gate.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Plattform-Reife</span></td><td><span class="state ready">Produktiv genutzt</span><span class="detail">Realer Chromium-Pfad mit vorhandenen Browser-Ökosystemen und Diagnosewerkzeugen.</span></td><td><span class="state partial">macOS-Prototyp</span><span class="detail">Lokale macOS-Smokes bestehen; Linux/Windows-Releasebelege und signiertes Endartefakt sind noch nicht vollständig.</span></td><td><span class="detail">CI-Matrix, reproduzierbare Pakete, Signaturprüfung, Upgrade/Rollback und Lasttests vollständig schließen.</span></td></tr>
+
+          <tr class="group"><td colspan="4">Discovery, Lesen & Research</td></tr>
+          <tr data-status="gap"><td><span class="cap">WebSearch</span><span class="detail">Aktuelle Discovery</span></td><td><span class="state ready">Vollständig</span><span class="detail">Auto-Kaskade Google → Brave → DuckDuckGo → Bing, zusätzlich SearXNG und Mock; Cooldowns, Qualitätsgate, Locale, Safe Search und Cache.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail">Eine Seite kann manuell navigiert werden; es gibt noch keinen nativen Suchprovider- oder SERP-Aggregationspfad.</span></td><td><span class="detail">Native Provider-Schnittstelle, Ergebnisnormalisierung, Fallback-Kaskade, Cache und Quellenmetadaten.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">WebRead</span><span class="detail">Quellen lesen</span></td><td><span class="state ready">Vollständig</span><span class="detail">Direkter typisierter Read, Inhaltsklassifizierung, Text-/PDF-/Datenpfade, Relevanzbewertung, Snapshots und Receipts.</span></td><td><span class="state partial">Browser-Bausteine</span><span class="detail"><code>goto</code>, <code>content</code>, <code>innerText</code> und <code>evaluate</code> funktionieren teilweise; kein eigenständiger Reader.</span></td><td><span class="detail">Reader-Pipeline oberhalb Servo ergänzen: Canonical URL, Content-Type, Extraktion, Größenlimits, Redirect- und Receipt-Semantik.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">PDF & Datendateien</span></td><td><span class="state ready">Vollständig</span><span class="detail">PDF-Seitenlimits, Open-Access-Auflösung, signaturgeprüfte Datendateien, SHA-256-Cache und sichere ZIP-Manifeste.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail"><code>Page.pdf</code> ist explizit unsupported; keine PDF-Lese- oder Datenartefakt-Pipeline.</span></td><td><span class="detail">Nicht zwingend Browserkern: als native Reader-/Artifact-Module neben der Runtime implementieren.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Deep Research</span></td><td><span class="state ready">Vollständig</span><span class="detail">Multi-Query-Workflow, Kandidatenqueue, Deduplizierung, Evidenzpromotion, Workspace, Fortsetzung und Claim→Evidence-Lineage.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail">Die Runtime führt Browserskripte aus, orchestriert aber keine mehrstufige Recherche.</span></td><td><span class="detail">Gehört primär in Greppys Agent-/Research-Layer; Runtime muss stabile Search/Read/Browser-Primitiven liefern.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Scholarly Search</span></td><td><span class="state ready">Vollständig</span><span class="detail">Crossref, OpenAlex und Semantic Scholar mit Teilausfalltoleranz und DOI-/URL-Deduplizierung.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail">Keine wissenschaftlichen Provider oder normalisierten Metadatentypen.</span></td><td><span class="detail">Separates Greppy-Research-Modul; nicht in Playwright emulieren.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Dauerhaftes WebScrape</span></td><td><span class="state ready">Vollständig</span><span class="detail">Registry, Revisionen, Latest-State-Materialisierung, geplante Wiederholungen und ein begrenzter Browser-Warm-up-Fallback.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail">Sessions und einzelne Skriptläufe existieren; kein Scrape-Registry-/Scheduler-/Revision-Modell.</span></td><td><span class="detail">Greppy-Orchestrierung auf den nativen Web-Läufen aufbauen; Artefakt- und Wiederholungsvertrag definieren.</span></td></tr>
+
+          <tr class="group"><td colspan="4">Interaktive Browserfähigkeit</td></tr>
+          <tr data-status="partial"><td><span class="cap">Echter Playwright-JS-Code</span></td><td><span class="state ready">Vollständig</span><span class="detail">Beliebiger JavaScript-Quelltext läuft gegen den realen Playwright/Patchright-Chromium-Stack; zusätzlich <code>ctoxBrowser</code>-Helper.</span></td><td><span class="state partial">Vertikaler Spike</span><span class="detail">Virtuelles <code>playwright</code>-Modul in V8; unverändertes Kernskript läuft über die Prozessgrenze gegen Servo.</span></td><td><span class="detail">Quellkompatibilität ist begonnen, aber nur 17/1.354 Symbole haben Behavior-Oracles.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Navigation & Seitenzustand</span></td><td><span class="state ready">Vollständig</span><span class="detail">Chromium-Semantik für Navigation, History, Load States, DOM und Client-JavaScript.</span></td><td><span class="state partial">Breit gebunden</span><span class="detail"><code>goto</code>, <code>goBack</code>, <code>goForward</code>, <code>setContent</code>, Titel, URL, Content und Evaluate sind vorhanden; Optionen und Response-Objekte weichen ab.</span></td><td><span class="detail">Load-State-, Redirect-, Response- und Fehler-Oracles gegen Playwright 1.62.1 ausbauen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Locator & Selektoren</span></td><td><span class="state ready">Vollständig</span><span class="detail">CSS, Text, Role, Label, TestId, Filter, verschachtelte Locator und Accessibility-Semantik aus Playwright.</span></td><td><span class="state partial">Grundfläche</span><span class="detail">CSS sowie mehrere <code>getBy*</code>-Familien funktionieren. Viele Optionen sind eingeschränkt; Textmatching ist teils exakte Gleichheit statt Playwright-Substring.</span></td><td><span class="detail">Selector-Engine und Accessibility-Namensberechnung brauchen eine systematische Oracle-Matrix.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Auto-Wait & Actionability</span></td><td><span class="state ready">Vollständig</span><span class="detail">Playwright wartet auf sichtbar, stabil, enabled und empfangsbereit.</span></td><td><span class="state partial">Echter Fortschritt</span><span class="detail">Reales Servo-Layout wird gepumpt; stabile Position und Timeout-Diagnose sind getestet. Pump-Token-Cleanup wird gerade gegen 50 Timeout-Zyklen gehärtet.</span></td><td><span class="detail">Cleanup-/Recovery-Test akzeptieren, dann vollständige Check-Reihenfolge, Obscuring, Scroll und Navigation-Races prüfen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Maus & Scrollen</span></td><td><span class="state ready">Vollständig</span><span class="detail">Native Chromium-Eingaben inklusive Buttons, Click-Count, Steps, Wheel und Drag-Verhalten.</span></td><td><span class="state partial">Grundaktionen</span><span class="detail">Move, Down, Up, Click, Dblclick und Wheel sind an Servo-Eingaben gebunden; Button-/Steps-/Delay-Optionen fehlen.</span></td><td><span class="detail">Ereignisreihenfolge, Pointer-/Mouse-Events, Drag-and-drop und Optionsmatrix per Oracle belegen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Tastatur</span></td><td><span class="state ready">Vollständig</span><span class="detail">Chromium-Keymap, Modifiers, Sondertasten, Repeat, Selection, BeforeInput/TextInput/Input und Cancellation.</span></td><td><span class="state partial">In Arbeit</span><span class="detail"><code>down</code>, <code>up</code>, <code>press</code>, <code>type</code> und <code>insertText</code> existieren, bisher aber mit vereinfachter DOM-Synthese.</span></td><td><span class="detail">Aktuelles Oracle verlangt u. a. <code>insertText: beforeinput → textInput → input</code> sowie korrekte Cancellation und Modifiers.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Touch / Tap</span></td><td><span class="state ready">Vollständig</span><span class="detail">Chromium-Touchscreen und Playwright-Tap-Semantik.</span></td><td><span class="state partial">Einzeltap</span><span class="detail"><code>Touchscreen.tap</code> sendet Servo Touch Down/Up; keine Multi-Touch-IDs und noch keine breite Tap-Actionability.</span></td><td><span class="detail">Touch→Pointer→Mouse-Kompatibilität, Cancel und Locator-Tap testen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Frames</span></td><td><span class="state ready">Vollständig</span><span class="detail">Mehrere Origins, verschachtelte Frames und vollständige FrameLocator-Semantik.</span></td><td><span class="state partial">Same-Origin</span><span class="detail"><code>frame</code>, <code>frames</code> und <code>frameLocator</code> sind gebunden; Cross-Origin ist leer, verschachtelte Frames bleiben fail-closed.</span></td><td><span class="detail">Frame-Welten, Navigation, Lifecycle, verschachtelte und Cross-Origin-Fälle sind ein Hauptblocker.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Viewport & Devices</span></td><td><span class="state ready">Vollständig</span><span class="detail">Viewportwechsel, Device Descriptors, Media-/Color-Scheme-Emulation.</span></td><td><span class="state gap">Explizit unsupported</span><span class="detail"><code>setViewportSize</code> darf nicht nur Metadaten ändern; Renderer bleibt aktuell 800×600. Device-Tabelle ist leer.</span></td><td><span class="detail">SoftwareRenderingContext wirklich resizen und Layout/Paint/Media Queries neu auslösen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Screenshots & PDF-Ausgabe</span></td><td><span class="state ready">Vollständig</span><span class="detail">Screenshots, Clips, Full Page und Chromium-PDF.</span></td><td><span class="state partial">PNG vorhanden</span><span class="detail"><code>screenshot</code> liefert PNG und akzeptiert Clip; <code>Page.pdf</code> ist unsupported.</span></td><td><span class="detail">Screenshot-Optionen und Pixel-Oracles erweitern; PDF bewusst als separates Modul behandeln.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">BrowserContext, Cookies & Storage</span></td><td><span class="state ready">Vollständig</span><span class="detail">Isolierte Kontexte, persistente Profile, Cookies inkl. HttpOnly, Storage State und IndexedDB.</span></td><td><span class="state partial">Basismodell</span><span class="detail">Context/Page-Lifecycle und Generationen sind serverseitig abgesichert. Cookies beruhen auf <code>document.cookie</code>; IndexedDB und Persistent Context fehlen.</span></td><td><span class="detail">Echte Cookie-Jar-/Origin-Isolation, HttpOnly, StorageState-Roundtrip und Profile aufbauen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Downloads & FileChooser</span></td><td><span class="state ready">Vollständig</span><span class="detail">Native Browserereignisse, Streams, temporäre Pfade, Cancel/Delete und reale Dateiauswahl.</span></td><td><span class="state partial">Teilpfad</span><span class="detail">FileChooser wird gepollt; <code>setFiles</code> nutzt File/DataTransfer. Downloads funktionieren nur für Route-Fulfill-Octet-Streams; Stream/Cancel/Delete fehlen.</span></td><td><span class="detail">Reale Netzwerkdownloads, Temp-Lifecycle, Event-Timing und Binär-Oracles ergänzen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Netzwerk, Routing & Events</span></td><td><span class="state ready">Vollständig</span><span class="detail">Live Request/Response, Routing, HAR, WebSockets, Header, Auth und Netzwerkdiagnostik.</span></td><td><span class="state partial">Interception-Grundlage</span><span class="detail"><code>route</code> kann Abort/Fulfill/Continue-Muster registrieren. Events beruhen teils auf gespeicherten Ressourcen; HAR und WebSocket-Routing fehlen.</span></td><td><span class="detail">Live Eventreihenfolge, Redirectketten, Bodies, Failure und echte Route-Semantik schließen.</span></td></tr>
+          <tr data-status="partial"><td><span class="cap">Dialoge, Popups & Tabs</span></td><td><span class="state ready">Vollständig</span><span class="detail">Reale Dialogobjekte, Ereignisse, Popup-/Tab-Lifecycle.</span></td><td><span class="state partial">Teilweise</span><span class="detail">Native Servo-Dialoge werden aufgezeichnet und policy-gesteuert; Popups werden aus auxiliary WebViews übernommen. Timing weicht von Chromium ab.</span></td><td><span class="detail">Warten-vor-Auslösung, Live-Objekte, Accept/Dismiss/Prompt und Opener/Lifecycle per Oracle prüfen.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Persistente Auth-Profile</span></td><td><span class="state ready">Vollständig</span><span class="detail">Persistenter Chromium Context, wiederverwendbare Sessions und optionaler operatorgestützter Login.</span></td><td><span class="state gap">Nicht vorhanden</span><span class="detail"><code>launchPersistentContext</code> ist explizit unsupported.</span></td><td><span class="detail">Profilformat, Secret-Grenzen, Locks, Crash-Recovery und reproduzierbare Auth-Tests definieren.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">APIRequestContext</span></td><td><span class="state ready">Über Playwright</span><span class="detail">Separater HTTP-Client für GET/POST/etc. und Storage-State-Integration.</span></td><td><span class="state gap">Explizit unsupported</span><span class="detail">Kein eigenständiger Playwright-HTTP-Client.</span></td><td><span class="detail">Entscheiden, ob volle Playwright-Kompatibilität dies im ersten Release einschließt; andernfalls als klaren separaten Track dokumentieren.</span></td></tr>
+
+          <tr class="group"><td colspan="4">Agentenbetrieb, Sicherheit & Evidenz</td></tr>
+          <tr data-status="partial"><td><span class="cap">SSRF / Egress Policy</span></td><td><span class="state ready">Reif</span><span class="detail">DNS-Auflösung am Connect, Redirect-/Rebinding-Schutz, Block für Loopback/RFC1918/Metadata und explizite Allowlist.</span></td><td><span class="state partial">Policy-Proxy vorhanden</span><span class="detail">Servo HTTP/HTTPS wird über einen Rust PolicyProxy geführt; Profile und Fail-Closed-Grenzen existieren.</span></td><td><span class="detail">Komplette Redirect-, DNS-, IPv6-, Proxy-Bypass- und WebSocket-Testmatrix gegen CTOX-Parität prüfen.</span></td></tr>
+          <tr data-status="gap"><td><span class="cap">Evidenz & Provenienz</span></td><td><span class="state ready">Vollständig</span><span class="detail">Receipts, Snapshots, SHA-256, Content-addressed Cache, Research Workspace und Claim-Lineage.</span></td><td><span class="state gap">Nur Laufartefakte</span><span class="detail">Run-/Session-Protokoll und Artefaktstruktur existieren, aber kein WebRead-Evidenzvertrag auf CTOX-Niveau.</span></td><td><span class="detail">Greppy-spezifischen Evidence-v1-Vertrag über Search/Read/Browser-Ausgaben definieren.</span></td></tr>
+          <tr data-status="ready"><td><span class="cap">Session-Daemon & CLI</span></td><td><span class="state ready">Vollständig</span><span class="detail">CTOX CLI, persistente Browserkanäle, Skills und Business-OS-Anbindung.</span></td><td><span class="state ready">Vorhanden</span><span class="detail"><code>web.session.create</code>, <code>web.run</code>, <code>web.session.close</code> über längencodiertes IPC; Greppy-CLI spricht über <code>web-client</code>.</span></td><td><span class="detail">Reconnect, Backpressure, Quoten, Cancel, Parallelität und Prozess-Crash-Recovery unter Last beweisen.</span></td></tr>
+          <tr data-status="scoped"><td><span class="cap">Firefox, WebKit, Electron, Android, CDP</span></td><td><span class="state partial">Chromium-fokussiert</span><span class="detail">CTOX nutzt den Chromium-Pfad; Standard-Playwright kann weitere Browserflächen bereitstellen, sie sind nicht Kern des CTOX-Agentenstacks.</span></td><td><span class="state scoped">Separater Track</span><span class="detail">Firefox/WebKit dürfen Servo nicht stillschweigend starten; Electron, Android und CDP sind explizit außerhalb des ersten Releases.</span></td><td><span class="detail">Kein Blocker für den Agent-Research-Kern, aber inkompatibel mit dem absoluten Anspruch „volle Playwright-Kompatibilität“.</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <section class="notes">
+      <div class="note">
+        <h2>Bewertung des Fortschritts</h2>
+        <p>Der native Webstack ist kein Mock mehr: Ein unverändertes Playwright-Kernskript steuert Servo über die V8↔IPC↔SpiderMonkey-Prozessgrenze, und Lifecycle, Actionability, Screenshots, Routing, Frames sowie Eingabefamilien besitzen reale Bindings. Der Fortschritt ist substanziell.</p>
+        <p>Er ist dennoch weit von funktionaler CTOX-Parität entfernt. Die größten Lücken liegen nicht nur in einzelnen Playwright-Methoden, sondern in den darüberliegenden Agentenfähigkeiten: Search, Read, Deep Research, Scholarly Search, dauerhafter Scrape und Evidence Lineage.</p>
+      </div>
+      <div class="note">
+        <h2>Evidenzbasis & Leseregel</h2>
+        <ul>
+          <li>CTOX: aktueller <a href="https://github.com/metric-space-ai/ctox">öffentlicher Quellstand</a>, insbesondere <code>src/tools/web-stack/README.md</code> und Interactive-Browser-Skill.</li>
+          <li>Native: <code>contracts/web-runtime/compatibility.v1.json</code>, <code>crates/web-runtime/README.md</code> und aktuell laufende Grok-Änderungen.</li>
+          <li><strong>Gebunden</strong> heißt: API-Oberfläche existiert. <strong>Passing</strong> heißt: ein Greppy-Test lief. Erst <strong>Behavior-Oracle</strong> vergleicht beobachtbares Verhalten mit Playwright 1.62.1 + Chromium.</li>
+          <li>Aktueller Contract: 347 implementiert, 501 unsupported, 506 unverified; Behavior: 17 passing, 501 unsupported, 836 unverified.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="shell">Standalone-Artefakt · keine externen Assets oder Laufzeitabhängigkeiten · Stand 28.08.2026</footer>
+
+  <script>
+    const buttons = [...document.querySelectorAll('.filter')];
+    const rows = [...document.querySelectorAll('tbody tr[data-status]')];
+    const groups = [...document.querySelectorAll('tbody .group')];
+    const search = document.querySelector('#search');
+    let active = 'all';
+
+    function applyFilters() {
+      const query = search.value.trim().toLocaleLowerCase('de');
+      rows.forEach(row => {
+        const statusMatch = active === 'all' || row.dataset.status === active;
+        const textMatch = !query || row.textContent.toLocaleLowerCase('de').includes(query);
+        row.hidden = !(statusMatch && textMatch);
+      });
+      groups.forEach(group => {
+        let next = group.nextElementSibling;
+        let hasVisible = false;
+        while (next && !next.classList.contains('group')) {
+          if (!next.hidden) hasVisible = true;
+          next = next.nextElementSibling;
+        }
+        group.hidden = !hasVisible;
+      });
+    }
+
+    buttons.forEach(button => button.addEventListener('click', () => {
+      active = button.dataset.filter;
+      buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+      applyFilters();
+    }));
+    search.addEventListener('input', applyFilters);
+  </script>
+</body>
+</html>

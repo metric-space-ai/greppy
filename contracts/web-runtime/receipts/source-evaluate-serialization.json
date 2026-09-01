@@ -1,0 +1,12 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "evaluate-arg.mjs",
+  "test": "evaluate_serializes_special_values_not_json_null",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.evaluate"
+  ],
+  "scope": "Named Greppy fixture proves evaluate arg/result serialization for undefined/NaN/Infinity/-0/Date (not JSON null collapse). Numeric 1+1 may also have oracle-setcontent behavior:passing. This receipt is source-only.",
+  "behavior": "unverified"
+}

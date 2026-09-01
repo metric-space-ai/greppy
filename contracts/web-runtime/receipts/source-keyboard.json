@@ -1,0 +1,17 @@
+{
+  "kind": "source",
+  "status": "passing",
+  "fixture": "keyboard.mjs",
+  "test": "keyboard_down_and_up_are_separate_events",
+  "engine": "greppy-web-runtime+servo-0.5.0",
+  "symbols": [
+    "Page.keyboard",
+    "Keyboard.type",
+    "Keyboard.press",
+    "Keyboard.down",
+    "Keyboard.up",
+    "Keyboard.insertText"
+  ],
+  "scope": "Named Greppy fixture exercises DOM-level keyboard type/press/down/up/insertText. Not an oracle comparison against playwright@1.62.1 + Chromium.",
+  "behavior": "unverified"
+}

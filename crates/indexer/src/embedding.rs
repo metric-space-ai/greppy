@@ -171,10 +171,13 @@ impl EmbeddingIndexReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingIndexProgress {
     pub completed_documents: usize,
     pub total_documents: usize,
+    /// Symbol whose document most recently completed. Interactive clients
+    /// may display this as a coalesced detail line; it is not a log stream.
+    pub current_symbol: Option<String>,
 }
 
 /// Count definitions that can contribute one or more embedding documents.
@@ -300,6 +303,7 @@ pub fn index_code_embeddings_for_project_with_progress(
     progress(EmbeddingIndexProgress {
         completed_documents: 0,
         total_documents,
+        current_symbol: None,
     });
 
     loop {
@@ -388,6 +392,7 @@ pub fn index_code_embeddings_for_project_with_progress(
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        current_symbol: Some(node.qualified_name.clone()),
                     });
                     continue;
                 }
@@ -410,6 +415,7 @@ pub fn index_code_embeddings_for_project_with_progress(
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        current_symbol: Some(node.qualified_name.clone()),
                     });
                 }
             }
@@ -417,6 +423,7 @@ pub fn index_code_embeddings_for_project_with_progress(
     }
 
     if !pending.is_empty() {
+        let current_symbol = pending.last().map(|doc| doc.node.qualified_name.clone());
         let flush = flush_embedding_batch(
             store,
             provider,
@@ -429,6 +436,7 @@ pub fn index_code_embeddings_for_project_with_progress(
         progress(EmbeddingIndexProgress {
             completed_documents: report.nodes_embedded,
             total_documents,
+            current_symbol,
         });
     }
 
@@ -1500,15 +1508,13 @@ mod tests {
             Some(&EmbeddingIndexProgress {
                 completed_documents: 0,
                 total_documents: chunks.len(),
+                current_symbol: None,
             })
         );
-        assert_eq!(
-            progress.last(),
-            Some(&EmbeddingIndexProgress {
-                completed_documents: chunks.len(),
-                total_documents: chunks.len(),
-            })
-        );
+        let last = progress.last().expect("final embedding progress");
+        assert_eq!(last.completed_documents, chunks.len());
+        assert_eq!(last.total_documents, chunks.len());
+        assert!(last.current_symbol.is_some());
         assert_eq!(
             store
                 .count_vector_embeddings(
