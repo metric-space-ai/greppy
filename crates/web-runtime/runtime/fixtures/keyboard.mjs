@@ -415,5 +415,21 @@ if (!unknown.includes("Unknown key")) {
   throw new Error("unknown key must throw: " + unknown);
 }
 
+await page.setContent(`<!DOCTYPE html><html><body>
+<form id="f" action="/ziel.html"><input id="q" name="q"></form>
+</body></html>`);
+await page.evaluate(() => {
+  document.getElementById("f").addEventListener("submit", (event) => {
+    event.preventDefault();
+    window.__greppySubmitted = true;
+  });
+});
+await page.locator("#q").focus();
+await page.keyboard.press("Enter");
+const submitted = await page.evaluate(() => !!window.__greppySubmitted);
+if (!submitted) {
+  throw new Error("press Enter must implicitly submit the nearest form");
+}
+
 await page.close();
 await browser.close();
