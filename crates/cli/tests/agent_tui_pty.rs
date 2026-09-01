@@ -9,6 +9,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/portable_provider.rs"]
+mod portable_provider;
+use portable_provider::{spawn_fake_provider, FakeProvider};
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
 }
@@ -186,6 +190,7 @@ mod pty {
     struct Pty {
         master: File,
         child: Child,
+        _provider: FakeProvider,
     }
 
     impl Pty {
@@ -214,10 +219,13 @@ mod pty {
                 let slave_err = libc::dup(slave);
                 libc::close(slave);
                 let store = super::unique_temp("pty-store");
+                let provider_root = super::unique_temp("pty-provider");
+                let provider = spawn_fake_provider(&provider_root, repo);
                 let mut cmd = Command::new(super::binary_path());
                 cmd.current_dir(repo)
                     .env("GREPPY_STORE_DIR", &store)
                     .env("GREPPY_CONFIG_DIR", store.join("config"))
+                    .env("GREPPY_WORKSPACE_DIR", &provider.data)
                     .env("GREPPY_TEST_SKIP_INFERENCE", "1")
                     .env("GREPPY_ASCII", "1")
                     .env("TERM", "xterm")
@@ -246,7 +254,11 @@ mod pty {
                 let child = cmd.spawn().expect("spawn greppy agent");
                 let master = File::from_raw_fd(master);
                 let _ = libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
-                Self { master, child }
+                Self {
+                    master,
+                    child,
+                    _provider: provider,
+                }
             }
         }
 
@@ -669,10 +681,13 @@ fn greppy_p_still_streams_to_stdout() {
     let repo = unique_temp("p-regression");
     init_repo(&repo);
     let store = unique_temp("p-regression-store");
+    let provider_root = unique_temp("p-regression-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
     let (endpoint, stop, handle) = spawn_stub_gateway(0);
     let output = Command::new(binary_path())
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")

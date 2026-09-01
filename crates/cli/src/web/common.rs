@@ -3,9 +3,11 @@
 use greppy_core::error::{Error, Result};
 use greppy_web_client::{new_request_id, ErrorObject, Handshake, Request, Response, SCHEMA};
 use serde_json::json;
+#[cfg(unix)]
 use std::cell::RefCell;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
@@ -573,6 +575,7 @@ pub(super) fn export_regular_file(
         let _ = bytes;
         return Err(unavailable("web screenshot --output requires Unix"));
     }
+    #[cfg(unix)]
     Ok(())
 }
 
@@ -905,12 +908,20 @@ pub(super) fn not_owned(message: &str) -> ErrorObject {
 }
 
 pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
-    if !socket.exists() {
-        return false;
+    #[cfg(unix)]
+    {
+        if !socket.exists() {
+            return false;
+        }
+        let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
+        probe.capability = capability.to_owned();
+        greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).is_ok()
     }
-    let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
-    probe.capability = capability.to_owned();
-    greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).is_ok()
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, run_id, capability);
+        false
+    }
 }
 
 pub fn shutdown_if_running() {
@@ -960,10 +971,17 @@ pub(super) fn reap_detached_runtime(
     capability: &str,
 ) {
     // Supervisor owns worker Children/PGIDs. Ask it to shut them down; do not pgrep.
-    if socket.exists() {
-        let mut request = Request::new(run_id, "web.shutdown", json!({}));
-        request.capability = capability.to_owned();
-        let _ = greppy_web_client::unix_request(socket, &request, Duration::from_secs(2));
+    #[cfg(unix)]
+    {
+        if socket.exists() {
+            let mut request = Request::new(run_id, "web.shutdown", json!({}));
+            request.capability = capability.to_owned();
+            let _ = greppy_web_client::unix_request(socket, &request, Duration::from_secs(2));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, run_id, capability);
     }
     if wait_child_exit(child, Duration::from_secs(3)) {
         return;

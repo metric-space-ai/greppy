@@ -1970,6 +1970,7 @@ pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
     }
 }
 
+#[cfg(unix)]
 fn home_dir() -> Result<PathBuf, WorkspaceError> {
     std::env::var_os("HOME")
         .map(PathBuf::from)

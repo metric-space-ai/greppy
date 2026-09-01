@@ -268,7 +268,10 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         std::time::Duration::from_millis(heartbeat_override_ms.unwrap_or(INITIAL_HEARTBEAT_MS));
     let started = std::time::Instant::now();
     let mut timed_out = false;
+    #[cfg(unix)]
     let mut forwarded_signal = None;
+    #[cfg(not(unix))]
+    let forwarded_signal: Option<i32> = None;
     let status = loop {
         #[cfg(unix)]
         if let Some(signal) = SignalGuard::take() {
