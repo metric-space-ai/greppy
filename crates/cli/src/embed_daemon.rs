@@ -157,6 +157,8 @@ pub(super) struct DaemonCodeEmbeddingProvider<'a> {
     // span made first-use indexing issue tens of thousands of serialized
     // requests before the first embedding batch could run.
     tokenizer: Option<greppy_embed_native::PromptTokenizer>,
+    content_cache_hits: usize,
+    content_cache_misses: usize,
 }
 
 impl<'a> DaemonCodeEmbeddingProvider<'a> {
@@ -180,6 +182,8 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             model_key: super::embedding_query_cache_key(cfg),
             cache: greppy_store::EmbeddingContentCache::open_global().ok(),
             tokenizer,
+            content_cache_hits: 0,
+            content_cache_misses: 0,
         }
     }
 
@@ -193,6 +197,8 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             model_key: super::embedding_query_cache_key(cfg),
             cache: Some(cache),
             tokenizer: None,
+            content_cache_hits: 0,
+            content_cache_misses: 0,
         }
     }
 
@@ -312,22 +318,30 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
     ) -> greppy_core::Result<Vec<Vec<f32>>> {
         let mut output = vec![None; docs.len()];
         let mut missing = Vec::new();
-        for (index, (title, content)) in docs.iter().enumerate() {
-            let key = Self::cache_key(*title, content);
-            let hit = self.cache.as_ref().and_then(|cache| {
-                cache
-                    .get(
-                        &self.model_key,
-                        self.prompt_version(),
-                        self.task_profile(),
-                        &key,
-                    )
-                    .ok()
-                    .flatten()
-            });
+        let keys = docs
+            .iter()
+            .map(|(title, content)| Self::cache_key(*title, content))
+            .collect::<Vec<_>>();
+        let cached = if let Some(cache) = &mut self.cache {
+            cache
+                .get_many(
+                    &self.model_key,
+                    greppy_embed_native::PROMPT_VERSION,
+                    greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+                    &keys,
+                )
+                .unwrap_or_else(|_| vec![None; docs.len()])
+        } else {
+            vec![None; docs.len()]
+        };
+        for (index, ((title, content), (key, hit))) in
+            docs.iter().zip(keys.into_iter().zip(cached)).enumerate()
+        {
             if let Some(vector) = hit.and_then(|hit| hit.vector) {
                 output[index] = Some(vector);
+                self.content_cache_hits = self.content_cache_hits.saturating_add(1);
             } else {
+                self.content_cache_misses = self.content_cache_misses.saturating_add(1);
                 missing.push((index, key, *title, *content));
             }
         }
@@ -357,6 +371,7 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
             if vectors.len() != missing.len() || token_lens.len() != missing.len() {
                 return Err(self.daemon_error(RequestOutcome::<()>::Failed));
             }
+            let mut cache_entries = Vec::with_capacity(missing.len());
             for (((index, key, _, _), vector), token_len) in
                 missing.into_iter().zip(vectors).zip(token_lens)
             {
@@ -366,17 +381,16 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
                     .as_u64()
                     .and_then(|value| usize::try_from(value).ok())
                     .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
-                if let Some(cache) = &self.cache {
-                    let _ = cache.put_vector(
-                        &self.model_key,
-                        self.prompt_version(),
-                        self.task_profile(),
-                        &key,
-                        token_len,
-                        &vector,
-                    );
-                }
+                cache_entries.push((key, token_len, vector.clone()));
                 output[index] = Some(vector);
+            }
+            if let Some(cache) = &self.cache {
+                let _ = cache.put_vectors(
+                    &self.model_key,
+                    self.prompt_version(),
+                    self.task_profile(),
+                    &cache_entries,
+                );
             }
         }
         output
@@ -387,6 +401,13 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
                 })
             })
             .collect()
+    }
+
+    fn content_cache_stats(&self) -> greppy_indexer::EmbeddingProviderCacheStats {
+        greppy_indexer::EmbeddingProviderCacheStats {
+            hits: self.content_cache_hits,
+            misses: self.content_cache_misses,
+        }
     }
 }
 
@@ -692,6 +713,10 @@ mod tests {
         assert_eq!(
             provider.document_token_len(Some(title), content).unwrap(),
             7
+        );
+        assert_eq!(
+            provider.content_cache_stats(),
+            greppy_indexer::EmbeddingProviderCacheStats { hits: 1, misses: 0 }
         );
     }
 

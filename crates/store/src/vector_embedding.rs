@@ -95,19 +95,27 @@ impl Store {
     /// a new row, while query paths filter by `graph_generation` so stale rows
     /// cannot surface. Cleanup is handled by `prune_vector_embeddings_before_generation`.
     pub fn upsert_vector_embedding(&mut self, e: &NewVectorEmbedding) -> Result<i64> {
-        validate_embedding_input(e)?;
-        let dim = e.vector.len();
-        let norm = vector_norm(&e.vector);
-        let blob = encode_f32_le(&e.vector);
-        // int8 candidate copy (see migration 0011): 4x smaller, used for
-        // candidate SELECTION in large scans; winners are re-scored from
-        // the exact f32 blob.
-        let (i8_blob, i8_scale) = quantize_i8(&e.vector);
-        let created_at = now_iso8601();
+        let mut ids = self.upsert_vector_embeddings(std::slice::from_ref(e))?;
+        Ok(ids.remove(0))
+    }
+
+    /// Insert or update a batch of embedding rows in one SQLite transaction.
+    ///
+    /// Base snapshots commonly import thousands of vectors from the global
+    /// content cache. Committing each hit separately made a fully warm build
+    /// take minutes despite performing no inference.
+    pub fn upsert_vector_embeddings(
+        &mut self,
+        embeddings: &[NewVectorEmbedding],
+    ) -> Result<Vec<i64>> {
+        for embedding in embeddings {
+            validate_embedding_input(embedding)?;
+        }
+        if embeddings.is_empty() {
+            return Ok(Vec::new());
+        }
         let tx = self.transaction()?;
-        let id = tx
-            .raw()
-            .prepare_cached(
+        let mut statement = tx.raw().prepare_cached(
                 "INSERT INTO main.vector_embeddings
                    (project, model_id, prompt_version, task, node_id, chunk_idx,
                     qualified_name, file_path, start_line, end_line,
@@ -129,8 +137,18 @@ impl Store {
                     vector_i8 = excluded.vector_i8,
                     i8_scale = excluded.i8_scale
                  RETURNING id",
-            )?
-            .query_row(
+            )?;
+        let mut ids = Vec::with_capacity(embeddings.len());
+        for e in embeddings {
+            let dim = e.vector.len();
+            let norm = vector_norm(&e.vector);
+            let blob = encode_f32_le(&e.vector);
+            // int8 candidate copy (see migration 0011): 4x smaller, used for
+            // candidate SELECTION in large scans; winners are re-scored from
+            // the exact f32 blob.
+            let (i8_blob, i8_scale) = quantize_i8(&e.vector);
+            let created_at = now_iso8601();
+            let id = statement.query_row(
                 params![
                     e.project,
                     e.model_id,
@@ -153,8 +171,11 @@ impl Store {
                 ],
                 |row| row.get(0),
             )?;
+            ids.push(id);
+        }
+        drop(statement);
         tx.commit()?;
-        Ok(id)
+        Ok(ids)
     }
 
     /// Fetch an embedding by primary key.
@@ -879,6 +900,43 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn batch_upsert_commits_all_vectors() {
+        let mut store = store_with_project("p");
+        let first = embedding(
+            "p",
+            None,
+            "p.first",
+            "src/first.rs",
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![1.0, 0.0],
+        );
+        let second = embedding(
+            "p",
+            None,
+            "p.second",
+            "src/second.rs",
+            1,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            vec![0.0, 1.0],
+        );
+        let ids = store.upsert_vector_embeddings(&[first, second]).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "google/embeddinggemma-300m-q4",
+                    "embeddinggemma-code-retrieval-st-v2",
+                    "retrieval_document",
+                    Some(1),
+                )
+                .unwrap(),
+            2
         );
     }
 

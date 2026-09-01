@@ -76,6 +76,17 @@ pub trait CodeEmbeddingProvider {
             .map(|(title, content)| self.embed_code_document(*title, content))
             .collect()
     }
+
+    /// Cumulative user-global content-cache results for this provider.
+    fn content_cache_stats(&self) -> EmbeddingProviderCacheStats {
+        EmbeddingProviderCacheStats::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingProviderCacheStats {
+    pub hits: usize,
+    pub misses: usize,
 }
 
 /// Production provider backed by native EmbeddingGemma inference.
@@ -151,6 +162,8 @@ pub struct EmbeddingIndexReport {
     pub nodes_considered: usize,
     pub nodes_embedded: usize,
     pub nodes_reused: usize,
+    pub global_cache_hits: usize,
+    pub global_cache_misses: usize,
     pub nodes_skipped_non_definition: usize,
     pub nodes_skipped_missing_file: usize,
     pub nodes_skipped_invalid_span: usize,
@@ -175,6 +188,9 @@ impl EmbeddingIndexReport {
 pub struct EmbeddingIndexProgress {
     pub completed_documents: usize,
     pub total_documents: usize,
+    pub local_store_reuse: usize,
+    pub global_cache_hits: usize,
+    pub global_cache_misses: usize,
     /// Symbol whose document most recently completed. Interactive clients
     /// may display this as a coalesced detail line; it is not a log stream.
     pub current_symbol: Option<String>,
@@ -303,6 +319,9 @@ pub fn index_code_embeddings_for_project_with_progress(
     progress(EmbeddingIndexProgress {
         completed_documents: 0,
         total_documents,
+        local_store_reuse: 0,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
         current_symbol: None,
     });
 
@@ -392,6 +411,9 @@ pub fn index_code_embeddings_for_project_with_progress(
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        local_store_reuse: report.nodes_reused,
+                        global_cache_hits: provider.content_cache_stats().hits,
+                        global_cache_misses: provider.content_cache_stats().misses,
                         current_symbol: Some(node.qualified_name.clone()),
                     });
                     continue;
@@ -412,9 +434,15 @@ pub fn index_code_embeddings_for_project_with_progress(
                     )?;
                     report.nodes_embedded += flush.written;
                     report.nodes_failed += flush.failed_documents;
+                    let cache_stats = provider.content_cache_stats();
+                    report.global_cache_hits = cache_stats.hits;
+                    report.global_cache_misses = cache_stats.misses;
                     progress(EmbeddingIndexProgress {
                         completed_documents: report.nodes_embedded,
                         total_documents,
+                        local_store_reuse: report.nodes_reused,
+                        global_cache_hits: cache_stats.hits,
+                        global_cache_misses: cache_stats.misses,
                         current_symbol: Some(node.qualified_name.clone()),
                     });
                 }
@@ -433,9 +461,15 @@ pub fn index_code_embeddings_for_project_with_progress(
         )?;
         report.nodes_embedded += flush.written;
         report.nodes_failed += flush.failed_documents;
+        let cache_stats = provider.content_cache_stats();
+        report.global_cache_hits = cache_stats.hits;
+        report.global_cache_misses = cache_stats.misses;
         progress(EmbeddingIndexProgress {
             completed_documents: report.nodes_embedded,
             total_documents,
+            local_store_reuse: report.nodes_reused,
+            global_cache_hits: cache_stats.hits,
+            global_cache_misses: cache_stats.misses,
             current_symbol,
         });
     }
@@ -590,10 +624,10 @@ fn flush_length_sorted_batch(
     let model_id = provider.model_id().to_string();
     let prompt_version = provider.prompt_version().to_string();
     let task = provider.task_profile().to_string();
-    let mut written = 0usize;
+    let mut embeddings = Vec::with_capacity(pending.len());
     for (doc, vector) in pending.drain(..).zip(vectors) {
         let node = doc.node;
-        store.upsert_vector_embedding(&NewVectorEmbedding {
+        embeddings.push(NewVectorEmbedding {
             project: node.project,
             model_id: model_id.clone(),
             prompt_version: prompt_version.clone(),
@@ -607,9 +641,9 @@ fn flush_length_sorted_batch(
             content_sha256: sha256_hex(doc.chunk.text.as_bytes()),
             graph_generation,
             vector,
-        })?;
-        written += 1;
+        });
     }
+    let written = store.upsert_vector_embeddings(&embeddings)?.len();
     Ok(FlushEmbeddingBatchReport {
         written,
         failed_documents: 0,
@@ -1508,6 +1542,9 @@ mod tests {
             Some(&EmbeddingIndexProgress {
                 completed_documents: 0,
                 total_documents: chunks.len(),
+                local_store_reuse: 0,
+                global_cache_hits: 0,
+                global_cache_misses: 0,
                 current_symbol: None,
             })
         );

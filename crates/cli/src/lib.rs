@@ -3972,6 +3972,9 @@ struct BackgroundJobGuard {
     device: Option<String>,
     completed_documents: usize,
     total_documents: usize,
+    local_store_reuse: usize,
+    global_cache_hits: usize,
+    global_cache_misses: usize,
     eta_seconds: Option<u64>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
@@ -4040,6 +4043,9 @@ impl BackgroundJobGuard {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned),
             completed_documents: 0,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 0,
             total_documents: published
                 .as_ref()
                 .and_then(|job| job.get("total_spans"))
@@ -4087,6 +4093,9 @@ impl BackgroundJobGuard {
         self.backend = Some(backend.to_string());
         self.completed_documents = 0;
         self.total_documents = total_documents;
+        self.local_store_reuse = 0;
+        self.global_cache_hits = 0;
+        self.global_cache_misses = 0;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
         self.progress_phase = Some("embedding");
@@ -4102,6 +4111,9 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
         self.total_documents = progress.total_files;
+        self.local_store_reuse = 0;
+        self.global_cache_hits = 0;
+        self.global_cache_misses = 0;
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
@@ -4125,6 +4137,9 @@ impl BackgroundJobGuard {
         self.progress_phase = Some(phase);
         self.completed_documents = 0;
         self.total_documents = 0;
+        self.local_store_reuse = 0;
+        self.global_cache_hits = 0;
+        self.global_cache_misses = 0;
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
@@ -4137,6 +4152,9 @@ impl BackgroundJobGuard {
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
+        self.local_store_reuse = progress.local_store_reuse;
+        self.global_cache_hits = progress.global_cache_hits;
+        self.global_cache_misses = progress.global_cache_misses;
         self.current_detail = progress.current_symbol;
         if let Some(started) = self.embedding_started {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis())
@@ -4202,6 +4220,9 @@ impl BackgroundJobGuard {
             "device": self.device,
             "completed_spans": self.completed_documents,
             "total_spans": self.total_documents,
+            "local_store_reuse": self.local_store_reuse,
+            "global_cache_hits": self.global_cache_hits,
+            "global_cache_misses": self.global_cache_misses,
             "progress_milli_percent": progress_milli_percent,
             "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,

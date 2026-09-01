@@ -10,6 +10,12 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   model/prompt/task/input contract. Linked worktrees and portable CoW agents
   reuse exact content instead of re-embedding it in each private Store; only
   changed Delta documents consume inference.
+- Warm embedding reuse now reads and touches the user-global cache in bounded
+  transactions and imports each vector batch into a new Base with one Store
+  transaction. Token-length-only rows are evicted before expensive vectors,
+  and concurrent cache-writer contention cannot turn a valid hit into a new
+  inference request. Live index status reports local reuse, global hits and
+  genuine inference misses separately.
 - Exact token sizing uses the lightweight tokenizer in the indexing client
   while all heavyweight model inference remains in the shared supervisor.
   First-use indexing no longer serializes one daemon request per candidate

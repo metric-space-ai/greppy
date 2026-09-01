@@ -115,22 +115,92 @@ impl EmbeddingContentCache {
             (None, None) => None,
             _ => return Err(Error::Store("embedding cache row is inconsistent".into())),
         };
-        let _ = self.conn.execute(
-            "UPDATE document_embeddings SET last_accessed=?5
-             WHERE model_id=?1 AND prompt_version=?2 AND task_profile=?3 AND input_sha256=?4",
-            params![
-                model_id,
-                prompt_version,
-                task_profile,
-                input_sha256,
-                unix_now_secs()
-            ],
-        );
         Ok(Some(CachedDocumentEmbedding {
             token_len: usize::try_from(token_len)
                 .map_err(|_| Error::Store("embedding cache token length is invalid".into()))?,
             vector,
         }))
+    }
+
+    /// Fetch a batch of exact prompt inputs and refresh their LRU timestamps
+    /// in one transaction. The returned vector preserves `input_sha256s`
+    /// order. This is the hot path for warm Base imports.
+    pub fn get_many(
+        &self,
+        model_id: &str,
+        prompt_version: &str,
+        task_profile: &str,
+        input_sha256s: &[String],
+    ) -> Result<Vec<Option<CachedDocumentEmbedding>>> {
+        if input_sha256s.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut select = self
+            .conn
+            .prepare_cached(
+                "SELECT token_len, vector, vector_dim
+                 FROM document_embeddings
+                 WHERE model_id=?1 AND prompt_version=?2 AND task_profile=?3 AND input_sha256=?4",
+            )
+            .map_err(|error| Error::Store(format!("embedding cache prepare batch get: {error}")))?;
+        let mut output = Vec::with_capacity(input_sha256s.len());
+        let mut hits = Vec::new();
+        for input_sha256 in input_sha256s {
+            let row = select
+                .query_row(
+                    params![model_id, prompt_version, task_profile, input_sha256],
+                    |row| {
+                        let token_len: i64 = row.get(0)?;
+                        let blob: Option<Vec<u8>> = row.get(1)?;
+                        let dim: Option<i64> = row.get(2)?;
+                        Ok((token_len, blob, dim))
+                    },
+                )
+                .optional()
+                .map_err(|error| Error::Store(format!("embedding cache batch get: {error}")))?;
+            let Some((token_len, blob, dim)) = row else {
+                output.push(None);
+                continue;
+            };
+            let vector = match (blob, dim) {
+                (Some(blob), Some(dim)) => Some(decode_vector(&blob, dim)?),
+                (None, None) => None,
+                _ => return Err(Error::Store("embedding cache row is inconsistent".into())),
+            };
+            output.push(Some(CachedDocumentEmbedding {
+                token_len: usize::try_from(token_len)
+                    .map_err(|_| Error::Store("embedding cache token length is invalid".into()))?,
+                vector,
+            }));
+            hits.push(input_sha256.clone());
+        }
+        drop(select);
+        if !hits.is_empty() {
+            let now = unix_now_secs();
+            // LRU maintenance is advisory. Never turn valid cached vectors
+            // into expensive inference misses merely because another Greppy
+            // process currently owns the cache writer lock.
+            if let Ok(tx) = self.conn.unchecked_transaction() {
+                {
+                    if let Ok(mut touch) = tx.prepare_cached(
+                        "UPDATE document_embeddings SET last_accessed=?5
+                         WHERE model_id=?1 AND prompt_version=?2 AND task_profile=?3 AND input_sha256=?4",
+                    ) {
+                        for input_sha256 in hits {
+                            let _ = touch.execute(params![
+                                model_id,
+                                prompt_version,
+                                task_profile,
+                                input_sha256,
+                                now
+                            ]);
+                        }
+                    }
+                }
+                let _ = tx.commit();
+            }
+        }
+        Ok(output)
     }
 
     pub fn put_token_len(
@@ -170,41 +240,69 @@ impl EmbeddingContentCache {
         token_len: usize,
         vector: &[f32],
     ) -> Result<()> {
-        if vector.is_empty() {
+        self.put_vectors(
+            model_id,
+            prompt_version,
+            task_profile,
+            &[(input_sha256.to_string(), token_len, vector.to_vec())],
+        )
+    }
+
+    /// Persist one inference batch with a single writer transaction.
+    pub fn put_vectors(
+        &self,
+        model_id: &str,
+        prompt_version: &str,
+        task_profile: &str,
+        entries: &[(String, usize, Vec<f32>)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if entries.iter().any(|(_, _, vector)| vector.is_empty()) {
             return Err(Error::Store("refuse to cache an empty embedding".into()));
         }
-        let blob = vector
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
         let now = unix_now_secs();
-        self.conn
-            .execute(
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| Error::Store(format!("embedding cache begin batch put: {error}")))?;
+        let mut insert = tx
+            .prepare_cached(
                 "INSERT OR REPLACE INTO document_embeddings
                  (model_id,prompt_version,task_profile,input_sha256,token_len,vector,vector_dim,created_at,last_accessed)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
-                params![
+            )
+            .map_err(|error| Error::Store(format!("embedding cache prepare batch put: {error}")))?;
+        for (input_sha256, token_len, vector) in entries {
+            let blob = vector
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            insert
+                .execute(params![
                     model_id,
                     prompt_version,
                     task_profile,
                     input_sha256,
-                    i64::try_from(token_len).unwrap_or(i64::MAX),
+                    i64::try_from(*token_len).unwrap_or(i64::MAX),
                     blob,
                     i64::try_from(vector.len()).unwrap_or(i64::MAX),
                     now
-                ],
-            )
-            .map_err(|error| Error::Store(format!("embedding cache put vector: {error}")))?;
-        self.prune_to_budget()
+                ])
+                .map_err(|error| Error::Store(format!("embedding cache batch put: {error}")))?;
+        }
+        drop(insert);
+        tx.commit()
+            .map_err(|error| Error::Store(format!("embedding cache commit batch put: {error}")))?;
+        self.prune_to_budget(entries.len())
     }
 
-    fn prune_to_budget(&self) -> Result<()> {
+    fn prune_to_budget(&self, writes: usize) -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PUTS_SINCE_PROCESS_START: AtomicUsize = AtomicUsize::new(0);
-        if !PUTS_SINCE_PROCESS_START
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(256)
-        {
+        let previous = PUTS_SINCE_PROCESS_START.fetch_add(writes, Ordering::Relaxed);
+        if previous / 256 == previous.saturating_add(writes) / 256 {
             return Ok(());
         }
         let count: i64 = self
@@ -245,7 +343,7 @@ impl EmbeddingContentCache {
             .execute(
                 "DELETE FROM document_embeddings WHERE rowid IN (
                     SELECT rowid FROM document_embeddings
-                    ORDER BY last_accessed ASC, rowid ASC LIMIT ?1
+                    ORDER BY (vector IS NOT NULL) ASC, last_accessed ASC, rowid ASC LIMIT ?1
                  )",
                 params![count.saturating_sub(keep)],
             )
@@ -299,5 +397,153 @@ mod tests {
             Some(vec![1.0, -2.5])
         );
         assert!(cache.get("other", "p", "t", &input).unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_round_trip_preserves_order_and_misses() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = EmbeddingContentCache::open(temp.path()).unwrap();
+        cache
+            .put_vectors(
+                "m",
+                "p",
+                "t",
+                &[
+                    ("a".into(), 3, vec![1.0, 2.0]),
+                    ("b".into(), 4, vec![3.0, 4.0]),
+                ],
+            )
+            .unwrap();
+        let rows = cache
+            .get_many("m", "p", "t", &["b".into(), "missing".into(), "a".into()])
+            .unwrap();
+        assert_eq!(rows[0].as_ref().unwrap().vector, Some(vec![3.0, 4.0]));
+        assert!(rows[1].is_none());
+        assert_eq!(rows[2].as_ref().unwrap().vector, Some(vec![1.0, 2.0]));
+    }
+
+    #[test]
+    fn concurrent_writer_cannot_turn_a_vector_hit_into_a_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = EmbeddingContentCache::open(temp.path()).unwrap();
+        writer
+            .put_vector("m", "p", "t", "a", 3, &[1.0, 2.0])
+            .unwrap();
+        let reader = EmbeddingContentCache::open(temp.path()).unwrap();
+        reader
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let rows = reader.get_many("m", "p", "t", &["a".into()]).unwrap();
+        writer.conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(rows[0].as_ref().unwrap().vector, Some(vec![1.0, 2.0]));
+    }
+
+    #[test]
+    fn ten_thousand_warm_vectors_are_read_in_bounded_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = EmbeddingContentCache::open(temp.path()).unwrap();
+        let entries = (0..10_000)
+            .map(|index| (format!("key-{index}"), 8, vec![index as f32; 8]))
+            .collect::<Vec<_>>();
+        cache.put_vectors("m", "p", "t", &entries).unwrap();
+        let keys = entries
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut hits = 0usize;
+        for batch in keys.chunks(16) {
+            hits += cache
+                .get_many("m", "p", "t", batch)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.as_ref().is_some_and(|row| row.vector.is_some()))
+                .count();
+        }
+        let elapsed = started.elapsed();
+        eprintln!("10k warm embedding-cache hits in {elapsed:?}");
+        assert_eq!(hits, 10_000);
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn ten_concurrent_clients_reuse_one_cached_vector_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = EmbeddingContentCache::open(temp.path()).unwrap();
+        let entries = (0..256)
+            .map(|index| (format!("key-{index}"), 8, vec![index as f32; 8]))
+            .collect::<Vec<_>>();
+        cache.put_vectors("m", "p", "t", &entries).unwrap();
+        drop(cache);
+        let keys = std::sync::Arc::new(
+            entries
+                .iter()
+                .map(|(key, _, _)| key.clone())
+                .collect::<Vec<_>>(),
+        );
+        let root = std::sync::Arc::new(temp.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(10));
+        let clients = (0..10)
+            .map(|_| {
+                let keys = keys.clone();
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let cache = EmbeddingContentCache::open(root.as_path()).unwrap();
+                    barrier.wait();
+                    cache
+                        .get_many("m", "p", "t", keys.as_slice())
+                        .unwrap()
+                        .into_iter()
+                        .filter(|row| row.as_ref().is_some_and(|row| row.vector.is_some()))
+                        .count()
+                })
+            })
+            .collect::<Vec<_>>();
+        for client in clients {
+            assert_eq!(client.join().unwrap(), 256);
+        }
+    }
+
+    #[test]
+    fn pruning_discards_token_only_rows_before_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = EmbeddingContentCache::open(temp.path()).unwrap();
+        cache
+            .conn
+            .execute_batch(
+                "WITH RECURSIVE hundreds(x) AS (
+                    VALUES(0) UNION ALL SELECT x+1 FROM hundreds WHERE x<99
+                 ), thousands(y) AS (
+                    VALUES(0) UNION ALL SELECT y+1 FROM thousands WHERE y<999
+                 )
+                 INSERT INTO document_embeddings
+                    (model_id,prompt_version,task_profile,input_sha256,token_len,vector,vector_dim,created_at,last_accessed)
+                 SELECT 'm','p','t',printf('token-%d',x*1000+y),8,NULL,NULL,1,1
+                 FROM hundreds CROSS JOIN thousands;",
+            )
+            .unwrap();
+        let vectors = (0..256)
+            .map(|index| (format!("vector-{index}"), 8, vec![index as f32; 8]))
+            .collect::<Vec<_>>();
+        cache.put_vectors("m", "p", "t", &vectors).unwrap();
+        let retained_vectors: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM document_embeddings WHERE vector IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let total: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_vectors, 256);
+        assert!(total <= 90_000);
     }
 }

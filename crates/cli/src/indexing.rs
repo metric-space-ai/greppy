@@ -1091,9 +1091,11 @@ pub(crate) fn dispatch_index(
     }
     if let Some(embedding_report) = &snapshot.embeddings {
         println!(
-            "embedded {} code spans ({} reused, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} failed, {} stale pruned)",
+            "embedded {} code spans ({} local-store reused, {} global-cache hits, {} inference misses, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} failed, {} stale pruned)",
             embedding_report.nodes_embedded,
             embedding_report.nodes_reused,
+            embedding_report.global_cache_hits,
+            embedding_report.global_cache_misses,
             embedding_report.nodes_considered,
             embedding_report.nodes_skipped_non_definition,
             embedding_report.nodes_skipped_missing_file,
@@ -1463,6 +1465,8 @@ pub(crate) fn index_embeddings_into_temp_store(
                 nodes_considered: 0,
                 nodes_embedded: 0,
                 nodes_reused: 0,
+                global_cache_hits: 0,
+                global_cache_misses: 0,
                 nodes_skipped_non_definition: 0,
                 nodes_skipped_missing_file: 0,
                 nodes_skipped_invalid_span: 0,

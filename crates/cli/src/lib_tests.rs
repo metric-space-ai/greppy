@@ -1396,6 +1396,9 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
         current_symbol: None,
         completed_documents: 4,
         total_documents: 10,
+        local_store_reuse: 1,
+        global_cache_hits: 2,
+        global_cache_misses: 1,
     });
     guard.complete();
 
@@ -1404,6 +1407,9 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     assert_eq!(job["state"], "base_graph_ready");
     assert_eq!(job["completed_spans"], 4);
     assert_eq!(job["total_spans"], 10);
+    assert_eq!(job["local_store_reuse"], 1);
+    assert_eq!(job["global_cache_hits"], 2);
+    assert_eq!(job["global_cache_misses"], 1);
     let _ = std::fs::remove_dir_all(root);
 }
 
