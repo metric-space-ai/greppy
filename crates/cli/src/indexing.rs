@@ -1124,7 +1124,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
-    if let Some(job) = background_job.as_deref_mut() {
+    if let Some(job) = background_job {
         job.finalization_phase("publishing_snapshot");
     }
     publish_store_snapshot(&temp_path, active_path)?;
