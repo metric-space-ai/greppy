@@ -76,8 +76,10 @@ pub enum Command {
     Passthrough(Vec<String>),
     /// Index a repository.
     Index {
-        /// Path to the repository root (default: cwd).
+        /// Path to the repository root (default: cwd), or `status`/`recover`.
         path: Option<String>,
+        /// Repository path used by `index recover` (default: cwd).
+        recovery_path: Option<String>,
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,

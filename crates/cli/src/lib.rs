@@ -1794,15 +1794,33 @@ fn dispatch_subcommand(
         }
         Command::Index {
             path,
+            recovery_path,
             json,
             agent_worktree,
         } => {
             if path.as_deref() == Some("status") {
+                if recovery_path.is_some() {
+                    return Err(Error::Invalid(
+                        "index status takes no repository path; use `--root PATH`".into(),
+                    ));
+                }
                 dispatch_index_status(json, root)
+            } else if path.as_deref() == Some("recover") {
+                if agent_worktree {
+                    return Err(Error::Invalid(
+                        "index recover cannot be combined with --agent-worktree".into(),
+                    ));
+                }
+                dispatch_index_recover(recovery_path.as_deref(), json, root)
             } else {
+                if let Some(extra) = recovery_path {
+                    return Err(Error::Invalid(format!(
+                        "index takes one repository path, got an unexpected second operand `{extra}`"
+                    )));
+                }
                 if json {
                     return Err(Error::Invalid(
-                        "index --json is only supported for `grep index status --json`".into(),
+                        "index --json is supported for `greppy index status --json` and `greppy index recover [PATH] --json`".into(),
                     ));
                 }
                 let embedding_args = EmbeddingCliArgs { device, no_gpu };
