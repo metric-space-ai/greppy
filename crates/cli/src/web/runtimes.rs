@@ -107,8 +107,21 @@ fn pw(
     let trimmed = snippet.trim().trim_end_matches(';').trim();
     let statement_like = trimmed.contains(';')
         || [
-            "return ", "throw ", "const ", "let ", "var ", "if ", "for ", "for(",
-            "while ", "while(", "try ", "try{", "switch ", "function ", "class ",
+            "return ",
+            "throw ",
+            "const ",
+            "let ",
+            "var ",
+            "if ",
+            "for ",
+            "for(",
+            "while ",
+            "while(",
+            "try ",
+            "try{",
+            "switch ",
+            "function ",
+            "class ",
         ]
         .iter()
         .any(|keyword| trimmed.starts_with(keyword));
@@ -198,12 +211,15 @@ fn pw(
                 None => match response.error {
                     Some(error) => emit_error(json_out, error),
                     None => {
-                        emit_web(json_out, &json!({
-                            "schema": "greppy.web-runtime.v1",
-                            "status": "ok",
-                            "operation": "web.pw",
-                            "result": { "value": null },
-                        }))?;
+                        emit_web(
+                            json_out,
+                            &json!({
+                                "schema": "greppy.web-runtime.v1",
+                                "status": "ok",
+                                "operation": "web.pw",
+                                "result": { "value": null },
+                            }),
+                        )?;
                         Ok(0)
                     }
                 },

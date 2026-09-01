@@ -70,21 +70,13 @@ pub(super) fn dispatch(command: NavCommand, root: Option<&str>) -> Result<i32> {
             tab,
             json,
         } => goto_url(root, url, session, tab, json, true),
-        NavCommand::Back {
-            session,
-            tab,
-            json,
-        } => history(root, session, tab, json, "web.back"),
-        NavCommand::Forward {
-            session,
-            tab,
-            json,
-        } => history(root, session, tab, json, "web.forward"),
-        NavCommand::Reload {
-            session,
-            tab,
-            json,
-        } => history(root, session, tab, json, "web.reload"),
+        NavCommand::Back { session, tab, json } => history(root, session, tab, json, "web.back"),
+        NavCommand::Forward { session, tab, json } => {
+            history(root, session, tab, json, "web.forward")
+        }
+        NavCommand::Reload { session, tab, json } => {
+            history(root, session, tab, json, "web.reload")
+        }
     }
 }
 
@@ -113,20 +105,9 @@ fn goto_url(
     // says the session is unknown, forget it and open a fresh one. Without
     // this a single stale entry paralyses the whole CLI until someone deletes
     // the file by hand -- and nothing tells them that is the cure.
-    let response = rpc_response(
-        root,
-        "web.goto",
-        payload.clone(),
-        Some(session.clone()),
-    );
+    let response = rpc_response(root, "web.goto", payload.clone(), Some(session.clone()));
     let (session, response) = match response {
-        Ok(ref answer)
-            if create
-                && answer
-                    .error
-                    .as_ref()
-                    .is_some_and(is_missing_session) =>
-        {
+        Ok(ref answer) if create && answer.error.as_ref().is_some_and(is_missing_session) => {
             forget_current_session(root);
             let fresh = match resolve_or_create_session(root, None, json, true) {
                 Ok(fresh) => fresh,

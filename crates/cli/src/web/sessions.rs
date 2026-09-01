@@ -165,16 +165,8 @@ pub(super) fn dispatch_tab(command: TabCommand, root: Option<&str>) -> Result<i3
     let (operation, tab, session, json_out) = match command {
         TabCommand::New { session, json } => ("web.tab.new", None, session, json),
         TabCommand::List { session, json } => ("web.tab.list", None, session, json),
-        TabCommand::Switch {
-            tab,
-            session,
-            json,
-        } => ("web.tab.switch", Some(tab), session, json),
-        TabCommand::Close {
-            tab,
-            session,
-            json,
-        } => ("web.tab.close", tab, session, json),
+        TabCommand::Switch { tab, session, json } => ("web.tab.switch", Some(tab), session, json),
+        TabCommand::Close { tab, session, json } => ("web.tab.close", tab, session, json),
     };
     let session = match resolve_session(root, session) {
         Ok(session) => session,

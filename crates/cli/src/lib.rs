@@ -58,11 +58,11 @@ macro_rules! println {
     }};
 }
 
+mod cli_surface;
 mod web;
 mod web_attach;
-mod cli_surface;
 pub use cli_surface::*;
-pub use web::{web_runtime_socket, WebCommand, SessionsCommand, ResultsCommand, NavCommand};
+pub use web::{web_runtime_socket, NavCommand, ResultsCommand, SessionsCommand, WebCommand};
 pub use web_attach::{generate_attach_token, give_child_attach_token};
 mod nav;
 use nav::*;
@@ -7517,15 +7517,13 @@ mod debug_repo_model_asset_guards {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("bogus.bin");
         std::fs::write(&src, b"not a model").unwrap();
-        assert!(
-            super::extract_repo_model_asset(
-                std::path::Path::new("debug-asset-mismatch"),
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                "asset.bin",
-                src.to_str().unwrap(),
-            )
-            .is_none()
-        );
+        assert!(super::extract_repo_model_asset(
+            std::path::Path::new("debug-asset-mismatch"),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "asset.bin",
+            src.to_str().unwrap(),
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

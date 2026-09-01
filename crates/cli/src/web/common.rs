@@ -150,9 +150,8 @@ pub(super) fn write_current_scope(
 ) -> std::result::Result<(), ErrorObject> {
     let path = current_scope_path(root);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            invalid(&format!("cannot create {}: {error}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| invalid(&format!("cannot create {}: {error}", parent.display())))?;
     }
     let mut body = json!({ "session": session });
     if let Some(tab) = tab.filter(|tab| !tab.is_empty()) {
@@ -226,9 +225,7 @@ pub(super) fn inject_agent_id(mut payload: serde_json::Value) -> serde_json::Val
         let agent = agent.trim();
         if !agent.is_empty() {
             if let Some(object) = payload.as_object_mut() {
-                object
-                    .entry("agent_id")
-                    .or_insert_with(|| json!(agent));
+                object.entry("agent_id").or_insert_with(|| json!(agent));
             }
         }
     }
@@ -520,7 +517,10 @@ pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, E
     Ok(out)
 }
 
-pub(super) fn export_regular_file(dest: &Path, bytes: &[u8]) -> std::result::Result<(), ErrorObject> {
+pub(super) fn export_regular_file(
+    dest: &Path,
+    bytes: &[u8],
+) -> std::result::Result<(), ErrorObject> {
     let dest = lexical_output_path(dest)?;
     let mut cursor = dest.clone();
     loop {
@@ -864,11 +864,7 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
-fn wait_live_supervisor(
-    socket: &Path,
-    run_id: &str,
-    capability: &str,
-) -> Option<SupervisorCtx> {
+fn wait_live_supervisor(socket: &Path, run_id: &str, capability: &str) -> Option<SupervisorCtx> {
     let started = Instant::now();
     let budget = Duration::from_secs(60);
     loop {
@@ -1090,7 +1086,9 @@ pub(super) fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObj
     images_from_path_env().ok_or_else(|| unavailable("web-runtime distributable is not installed"))
 }
 
-pub(super) fn images_from_dist(dist: &std::path::Path) -> std::result::Result<ResolvedRuntime, ErrorObject> {
+pub(super) fn images_from_dist(
+    dist: &std::path::Path,
+) -> std::result::Result<ResolvedRuntime, ErrorObject> {
     if is_symlink(dist) {
         return Err(unavailable("refusing symlink web-runtime dist"));
     }
@@ -1127,7 +1125,10 @@ pub(super) fn images_from_dist(dist: &std::path::Path) -> std::result::Result<Re
     })
 }
 
-pub(super) fn runtime_from_file(path: &std::path::Path, dist: Option<PathBuf>) -> Option<ResolvedRuntime> {
+pub(super) fn runtime_from_file(
+    path: &std::path::Path,
+    dist: Option<PathBuf>,
+) -> Option<ResolvedRuntime> {
     if is_symlink(path) || !path.is_file() {
         return None;
     }
@@ -1198,9 +1199,7 @@ pub(super) fn parse_target(
         .filter(|flag| *flag)
         .count();
     if nth_count > 1 {
-        return Err(query_syntax(
-            "use only one of --first, --last, or --nth",
-        ));
+        return Err(query_syntax("use only one of --first, --last, or --nth"));
     }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1232,10 +1231,15 @@ pub(super) fn parse_target(
         }
         rest = next.trim_start();
     }
-    let kinds = [css.is_some(), xpath.is_some(), text.is_some(), role.is_some()]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count();
+    let kinds = [
+        css.is_some(),
+        xpath.is_some(),
+        text.is_some(),
+        role.is_some(),
+    ]
+    .into_iter()
+    .filter(|flag| *flag)
+    .count();
     if kinds != 1 {
         return Err(query_syntax(
             "target must be one of css=, xpath=, text=, or role=",
@@ -1432,7 +1436,10 @@ mod scope_tests {
             assert_eq!(resolve_session(Some(root), None).unwrap(), "env_sess");
             std::env::remove_var("GREPPY_WEB_SESSION");
             assert_eq!(resolve_session(Some(root), None).unwrap(), "file_sess");
-            assert_eq!(resolve_tab(Some(root), Some("t_flag".into())).as_deref(), Some("t_flag"));
+            assert_eq!(
+                resolve_tab(Some(root), Some("t_flag".into())).as_deref(),
+                Some("t_flag")
+            );
             assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_env"));
             std::env::remove_var("GREPPY_WEB_TAB");
             assert_eq!(resolve_tab(Some(root), None).as_deref(), Some("t_file"));
@@ -1455,4 +1462,3 @@ mod scope_tests {
         });
     }
 }
-

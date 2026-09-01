@@ -4,27 +4,27 @@
 //! parallel without rewriting this file. `#[command(flatten)]` keeps the
 //! CLI flat (`greppy web goto`, not `greppy web nav goto`).
 
-mod common;
-mod sessions;
-mod results;
-mod nav;
 mod act;
-mod see;
-mod expect;
-mod diagnose;
-mod runtimes;
 mod chain;
+mod common;
+mod diagnose;
+mod expect;
+mod nav;
+mod results;
+mod runtimes;
+mod see;
+mod sessions;
 
 use clap::Subcommand;
 use greppy_core::error::Result;
 
 pub use act::ActCommand;
-pub use common::{shutdown_if_running, web_runtime_socket};
-pub use nav::NavCommand;
-pub use results::ResultsCommand;
 pub use chain::ChainCommand;
+pub use common::{shutdown_if_running, web_runtime_socket};
 pub use diagnose::DiagnoseCommand;
 pub use expect::ExpectCommand;
+pub use nav::NavCommand;
+pub use results::ResultsCommand;
 pub use runtimes::RuntimesCommand;
 pub use see::SeeCommand;
 pub use sessions::SessionsCommand;
@@ -85,10 +85,10 @@ pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::sessions::SessionCommand;
-    use crate::{Cli, Command};
     use super::common::{export_regular_file, find_binary, images_from_dist};
+    use super::sessions::SessionCommand;
+    use super::*;
+    use crate::{Cli, Command};
     use clap::Parser;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -138,7 +138,9 @@ mod tests {
                 })
             }) if url == "http://example.com/" && session == "wrs_1"
         ));
-        assert!(Cli::try_parse_from(["greppy", "web", "nav", "goto", "http://example.com/"]).is_err());
+        assert!(
+            Cli::try_parse_from(["greppy", "web", "nav", "goto", "http://example.com/"]).is_err()
+        );
     }
 
     #[test]

@@ -141,9 +141,16 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             if let Err(message) = validate_query(&query) {
                 return emit_error(json, invalid(&format!("web extract: {message}")));
             }
-            let wanted: Vec<&str> = fields.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+            let wanted: Vec<&str> = fields
+                .split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .collect();
             if wanted.is_empty() {
-                return emit_error(json, invalid("web extract: --fields must name at least one field"));
+                return emit_error(
+                    json,
+                    invalid("web extract: --fields must name at least one field"),
+                );
             }
             // `attr:` without a name silently produced a column of nulls; an
             // unknown field did the same. Both read as "the page has nothing

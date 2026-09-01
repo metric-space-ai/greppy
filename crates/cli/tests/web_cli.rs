@@ -165,8 +165,8 @@ fn web_act_verbs_are_listed_flat() {
     let (code, stdout, stderr) = run(&["web", "--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     for verb in [
-        "click", "fill", "type", "clear", "select", "check", "uncheck", "press", "hover",
-        "scroll", "upload",
+        "click", "fill", "type", "clear", "select", "check", "uncheck", "press", "hover", "scroll",
+        "upload",
     ] {
         assert!(stdout.contains(verb), "missing {verb} in {stdout}");
     }
@@ -192,14 +192,7 @@ fn web_fill_requires_session() {
 
 #[test]
 fn web_click_rejects_unknown_target_syntax() {
-    let (code, stdout, _stderr) = run(&[
-        "web",
-        "click",
-        "button",
-        "--session",
-        "wrs_1",
-        "--json",
-    ]);
+    let (code, stdout, _stderr) = run(&["web", "click", "button", "--session", "wrs_1", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
     assert!(stdout.contains("QUERY_SYNTAX") || stdout.contains("css="));
 }
@@ -248,8 +241,7 @@ fn web_search_requires_session() {
 
 #[test]
 fn web_read_requires_session() {
-    let (code, stdout, _stderr) =
-        run(&["web", "read", "--url", "https://example.com", "--json"]);
+    let (code, stdout, _stderr) = run(&["web", "read", "--url", "https://example.com", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
     assert!(stdout.contains("session"));
 }
@@ -276,7 +268,10 @@ fn web_search_accepts_fixture_url_and_search_endpoint_flags() {
         "http://127.0.0.1:9/search",
         "--json",
     ]);
-    assert_ne!(code, 2, "must not be unknown clap usage: stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 2,
+        "must not be unknown clap usage: stdout={stdout} stderr={stderr}"
+    );
     assert!(
         !stderr.contains("panicked") && !stdout.contains("panicked"),
         "stdout={stdout} stderr={stderr}"
@@ -304,7 +299,10 @@ fn web_search_limit_does_not_panic() {
         !stderr.contains("panicked") && !stdout.contains("panicked"),
         "web search --limit panicked: stdout={stdout} stderr={stderr}"
     );
-    assert_ne!(code, 2, "web search --limit must parse: stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 2,
+        "web search --limit must parse: stdout={stdout} stderr={stderr}"
+    );
 }
 
 #[test]
@@ -530,7 +528,6 @@ fn web_doctor_json_does_not_spawn_runtime() {
     }
 }
 
-
 #[cfg(unix)]
 fn locate_web_runtime() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("GREPPY_WEB_RUNTIME") {
@@ -558,9 +555,7 @@ fn locate_web_runtime() -> std::path::PathBuf {
             return candidate;
         }
     }
-    panic!(
-        "web-runtime binary not found for attach CLI proof; build crates/web-runtime/runtime"
-    );
+    panic!("web-runtime binary not found for attach CLI proof; build crates/web-runtime/runtime");
 }
 
 #[cfg(unix)]
@@ -585,7 +580,11 @@ fn wait_unix_socket(path: &std::path::Path, child: &mut std::process::Child, bud
 }
 
 #[cfg(unix)]
-fn greppy_web_status(run_id: &str, runtime: &std::path::Path, token: Option<&str>) -> (i32, String, String) {
+fn greppy_web_status(
+    run_id: &str,
+    runtime: &std::path::Path,
+    token: Option<&str>,
+) -> (i32, String, String) {
     use greppy::give_child_attach_token;
     let mut cmd = Command::new(bin());
     cmd.args(["web", "status", "--json"])
@@ -596,9 +595,8 @@ fn greppy_web_status(run_id: &str, runtime: &std::path::Path, token: Option<&str
         .env_remove("GREPPY_WEB_RUNTIME_DIST")
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null());
-    let hold = token.map(|token| {
-        give_child_attach_token(&mut cmd, token).expect("inherit attach token fd")
-    });
+    let hold = token
+        .map(|token| give_child_attach_token(&mut cmd, token).expect("inherit attach token fd"));
     let output = cmd.output().expect("greppy web status child");
     drop(hold);
     (
@@ -625,9 +623,14 @@ fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let token = generate_attach_token().expect("urandom must fail-closed, not yield zeros silently");
+    let token =
+        generate_attach_token().expect("urandom must fail-closed, not yield zeros silently");
     assert!(token.len() >= 16, "token={token}");
-    assert_ne!(token, "0".repeat(token.len()), "entropy must not be silent zeros");
+    assert_ne!(
+        token,
+        "0".repeat(token.len()),
+        "entropy must not be silent zeros"
+    );
     let socket = web_runtime_socket(&run_id).expect("web-runtime socket path");
     let _ = std::fs::remove_file(&socket);
 
@@ -663,7 +666,10 @@ fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
     );
 
     let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, None);
-    assert_ne!(code, 0, "missing fd must fail-closed, stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 0,
+        "missing fd must fail-closed, stdout={stdout} stderr={stderr}"
+    );
     assert!(
         stdout.contains("session_not_owned") || stderr.contains("session_not_owned"),
         "missing attach must be session_not_owned, stdout={stdout} stderr={stderr}"
@@ -671,7 +677,10 @@ fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
 
     let wrong = "00".repeat(16);
     let (code, stdout, stderr) = greppy_web_status(&run_id, &runtime, Some(&wrong));
-    assert_ne!(code, 0, "wrong token must fail-closed, stdout={stdout} stderr={stderr}");
+    assert_ne!(
+        code, 0,
+        "wrong token must fail-closed, stdout={stdout} stderr={stderr}"
+    );
     assert!(
         stdout.contains("session_not_owned") || stderr.contains("session_not_owned"),
         "wrong attach must be session_not_owned, stdout={stdout} stderr={stderr}"
@@ -705,7 +714,6 @@ fn parent_owned_attach_authorizes_separate_cli_children_and_denies_others() {
         }
     }
 }
-
 
 #[cfg(unix)]
 fn unrelated_child_must_not_see_token(token: &str) -> (i32, String, String) {
@@ -752,13 +760,18 @@ fn concurrent_unrelated_children_do_not_inherit_attach_token_fd() {
 
     let token = generate_attach_token().expect("urandom");
     let mut holder = Command::new("/usr/bin/true");
-    holder.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    holder
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let pass = give_child_attach_token(&mut holder, &token).expect("atomic cloexec token fd");
 
     let mut joins = Vec::new();
     for _ in 0..12 {
         let token = token.clone();
-        joins.push(thread::spawn(move || unrelated_child_must_not_see_token(&token)));
+        joins.push(thread::spawn(move || {
+            unrelated_child_must_not_see_token(&token)
+        }));
     }
     for join in joins {
         let (code, stdout, stderr) = join.join().expect("thread");
@@ -870,9 +883,19 @@ fn web_open_observe_goto_observe_share_session_without_flag() {
     let fx = format!("{base}/_fx/index.html");
     let page = format!("{base}/001/index.html");
 
-    let (code, stdout, stderr) = run_scoped(&workspace, &runtime, &run_id, &["web", "open", &fx, "--json"]);
+    let (code, stdout, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "open", &fx, "--json"],
+    );
     if code != 0 {
-        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = run_scoped(
+            &workspace,
+            &runtime,
+            &run_id,
+            &["web", "runtime", "stop", "--json"],
+        );
         let _ = std::fs::remove_dir_all(&workspace);
         panic!("open failed code={code} stdout={stdout} stderr={stderr}");
     }
@@ -886,24 +909,46 @@ fn web_open_observe_goto_observe_share_session_without_flag() {
     let (code, stdout, stderr) =
         run_scoped(&workspace, &runtime, &run_id, &["web", "observe", "--json"]);
     if code != 0 || !stdout.contains("Kopf") {
-        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = run_scoped(
+            &workspace,
+            &runtime,
+            &run_id,
+            &["web", "runtime", "stop", "--json"],
+        );
         let _ = std::fs::remove_dir_all(&workspace);
         panic!("observe after open must show Kopf without --session code={code} stdout={stdout} stderr={stderr}");
     }
 
-    let (code, stdout, stderr) =
-        run_scoped(&workspace, &runtime, &run_id, &["web", "goto", &page, "--json"]);
+    let (code, stdout, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "goto", &page, "--json"],
+    );
     if code != 0 {
-        let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+        let _ = run_scoped(
+            &workspace,
+            &runtime,
+            &run_id,
+            &["web", "runtime", "stop", "--json"],
+        );
         let _ = std::fs::remove_dir_all(&workspace);
         panic!("goto without --session failed code={code} stdout={stdout} stderr={stderr}");
     }
 
     let (code, stdout, stderr) =
         run_scoped(&workspace, &runtime, &run_id, &["web", "observe", "--json"]);
-    let _ = run_scoped(&workspace, &runtime, &run_id, &["web", "runtime", "stop", "--json"]);
+    let _ = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "runtime", "stop", "--json"],
+    );
     let _ = std::fs::remove_dir_all(&workspace);
-    assert_eq!(code, 0, "second observe failed stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "second observe failed stdout={stdout} stderr={stderr}"
+    );
     assert!(
         stdout.contains("Seite-001"),
         "observe after goto must show the new page, stdout={stdout}"
@@ -914,5 +959,8 @@ fn web_open_observe_goto_observe_share_session_without_flag() {
 fn web_goto_without_scope_is_no_session() {
     let (code, stdout, _stderr) = run(&["web", "goto", "http://example.com/", "--json"]);
     assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("NO_SESSION") || stdout.contains("session"), "stdout={stdout}");
+    assert!(
+        stdout.contains("NO_SESSION") || stdout.contains("session"),
+        "stdout={stdout}"
+    );
 }

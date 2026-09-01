@@ -4,8 +4,8 @@
 //! same file as the code that answers the commands.
 
 use super::*;
-use clap::{Parser, Subcommand};
 use crate::web::WebCommand;
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(

@@ -130,12 +130,24 @@ pub(super) fn dispatch(command: DiagnoseCommand, root: Option<&str>) -> Result<i
             errors,
             session,
             json,
-        } => records(root, json, session, "web.console", errors.then_some("error")),
+        } => records(
+            root,
+            json,
+            session,
+            "web.console",
+            errors.then_some("error"),
+        ),
         DiagnoseCommand::Network {
             failed,
             session,
             json,
-        } => records(root, json, session, "web.network", failed.then_some("failed")),
+        } => records(
+            root,
+            json,
+            session,
+            "web.network",
+            failed.then_some("failed"),
+        ),
         DiagnoseCommand::Events { session, json } => {
             records(root, json, session, "web.events", None)
         }

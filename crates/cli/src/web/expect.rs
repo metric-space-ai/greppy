@@ -107,7 +107,9 @@ fn text_check(accessor: &str, pattern: &str) -> std::result::Result<String, Stri
     let pattern = pattern.trim();
     let expr = if let Some(rest) = pattern.strip_prefix('~') {
         let rest = rest.trim();
-        let body = rest.strip_prefix('/').ok_or("regex must be ~/pattern/flags")?;
+        let body = rest
+            .strip_prefix('/')
+            .ok_or("regex must be ~/pattern/flags")?;
         let close = body.rfind('/').ok_or("regex must be ~/pattern/flags")?;
         let (re, flags) = body.split_at(close);
         let flags = &flags[1..];
@@ -167,7 +169,9 @@ fn evaluate_condition(
 fn wait(root: Option<&str>, condition: Condition, timeout: u64, interval: u64) -> Result<i32> {
     let source = match condition_expression(&condition) {
         Ok(source) => source,
-        Err(message) => return emit_error(condition.json, invalid(&format!("web wait: {message}"))),
+        Err(message) => {
+            return emit_error(condition.json, invalid(&format!("web wait: {message}")))
+        }
     };
     let deadline = Instant::now() + Duration::from_millis(timeout);
     let started = Instant::now();

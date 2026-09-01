@@ -441,7 +441,10 @@ fn artifact_export(
         Err(error) => return emit_error(false, error),
     };
     if id.trim().is_empty() {
-        return emit_error(false, invalid("web artifact export requires an artifact id"));
+        return emit_error(
+            false,
+            invalid("web artifact export requires an artifact id"),
+        );
     }
     let Some(to) = to.filter(|path| !path.trim().is_empty()) else {
         return emit_error(false, invalid("web artifact export requires --to FILE"));

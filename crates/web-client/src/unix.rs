@@ -111,10 +111,8 @@ mod tests {
 
     #[test]
     fn request_timeout_is_not_would_block() {
-        let path = std::env::temp_dir().join(format!(
-            "greppy-unix-timeout-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("greppy-unix-timeout-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -134,7 +132,9 @@ mod tests {
             "{error}"
         );
         assert!(
-            !error.to_string().contains("Resource temporarily unavailable"),
+            !error
+                .to_string()
+                .contains("Resource temporarily unavailable"),
             "{error}"
         );
         let _ = server.join();

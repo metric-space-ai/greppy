@@ -394,7 +394,9 @@ fn fill_value(
 fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>, String> {
     /// Refuse anything unreasonably large before it is copied twice.
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
-    let area = std::env::temp_dir().join("greppy-web-runtime").join("uploads");
+    let area = std::env::temp_dir()
+        .join("greppy-web-runtime")
+        .join("uploads");
     let mut staged = Vec::with_capacity(paths.len());
     for path in paths {
         let source = std::path::Path::new(path);
