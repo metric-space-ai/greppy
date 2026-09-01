@@ -9,11 +9,15 @@ await page.setContent(`<!DOCTYPE html><html><body>
 <button id="b">Go</button>
 <input type="checkbox" id="c">
 <p id="t">idle</p>
+<p class="visibility-probe">shown</p>
+<p class="visibility-probe" style="display:none">hidden</p>
 </body></html>`);
 if ((await page.getByPlaceholder("search").count()) !== 1) throw new Error("placeholder");
 if ((await page.getByAltText("logo").count()) !== 1) throw new Error("alt");
 if ((await page.getByTitle("brand").count()) !== 1) throw new Error("title");
 if ((await page.getByTestId("hero").count()) !== 1) throw new Error("testid");
+if ((await page.locator(".visibility-probe:visible").count()) !== 1) throw new Error(":visible");
+if ((await page.locator(".visibility-probe:hidden").count()) !== 1) throw new Error(":hidden");
 const snap = await page.locator("#b").ariaSnapshot();
 if (!String(snap).includes("button") || !String(snap).includes("Go")) {
   throw new Error("ariaSnapshot " + snap);
