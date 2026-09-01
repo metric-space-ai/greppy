@@ -83,6 +83,8 @@ impl Session {
                 | (SessionState::Busy, SessionState::Failed)
                 | (SessionState::Ready, SessionState::Failed)
                 | (SessionState::Creating, SessionState::Failed)
+                | (SessionState::Failed, SessionState::Ready)
+                | (SessionState::Failed, SessionState::Busy)
                 | (SessionState::Ready, SessionState::Closing)
                 | (SessionState::Busy, SessionState::Closing)
                 | (SessionState::Failed, SessionState::Closing)
@@ -134,5 +136,18 @@ mod tests {
         session.transition(SessionState::Closing).unwrap();
         session.transition(SessionState::Closed).unwrap();
         assert!(session.transition(SessionState::Ready).is_err());
+    }
+
+    #[test]
+    fn failed_session_accepts_the_next_operation() {
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
+        session.transition(SessionState::Ready).unwrap();
+        session.begin_operation("wrq_1").unwrap();
+        session.transition(SessionState::Failed).unwrap();
+        session.begin_operation("wrq_2").unwrap();
+        assert_eq!(session.state, SessionState::Busy);
+        assert_eq!(session.operation_id.as_deref(), Some("wrq_2"));
+        session.transition(SessionState::Ready).unwrap();
+        assert_eq!(session.state, SessionState::Ready);
     }
 }
