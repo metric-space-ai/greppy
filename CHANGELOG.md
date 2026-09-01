@@ -2,6 +2,84 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
+## [0.4.0] — 2026-09-02
+
+### Web tool for the agent, and worktrees that reuse the shared inference cache
+
+0.4.0 is where the web-runtime line and the 0.3.x stability line converge.
+Two things had to be true for this release: the built-in agent can drive a
+browser through its own `greppy web` verbs, and a linked Git worktree never
+re-embeds a repository the primary checkout has already embedded.
+
+**Web tool (beta).** `greppy -p` and `greppy agent` receive the browser prompt
+block from `assets/prompts/web-beta.md` via `include_str!`; the headless path
+installs the attach token like the interactive one, and the runtime is started
+by the unsandboxed parent before the tool children are sandboxed (macOS forbids
+a nested sandbox). External agents still get only the pointer in AGENTS.md; the
+verb surface is beta and may change.
+
+Measured on the fourteen-task set `greppy-web-tasks-v1` (five repetitions each,
+one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
+78 % and 64 % at the start of the campaign. The findings behind that climb:
+
+- Synthetic input has a delivery receipt for every move, press, release, wheel
+  and touch leg. A fresh WebView whose display list is not committed is
+  repainted and the event resent (up to eight times); exhausted retries fail
+  the verb instead of reporting success (findings 019, 034).
+- `check` / `uncheck` are real confirmed clicks verified against the resulting
+  state, so framework apps that bind checkbox state to native clicks see the
+  change; the property-and-events path stays as fallback (finding 033).
+- Enter in an eligible form field performs the HTML implicit submit (038).
+- Action and read verbs accept the same selector forms: unquoted descendant
+  CSS (`css=body a`) and the quoted wrapper (`css="body a"`) both work in
+  `click`, `hover`, `wait`, `extract` and `find` (032).
+- `:visible` / `:hidden` are stripped before `querySelectorAll` and applied
+  as a box-size filter instead of silently returning an empty list (031).
+- The session CPU budget is a delta from the session's own baseline instead
+  of the worker lifetime, checked before and after each operation; a
+  respawned worker resets the baseline (039, and the release-suite limit
+  tests that only the after-check can satisfy).
+- The controller waits for the next script instead of a 120 s idle clock
+  that killed a live controller during session create/close cycles; the
+  1000-cycle gate finishes with a `test result:` line again (027).
+- The runtime removes its socket and attach token on shutdown and heals a
+  stale endpoint on bind only after a connect proves nobody listens; a live
+  runtime keeps its socket and the caller gets a real address-in-use error
+  (040).
+- A content-worker crash answers the in-flight call with the typed error
+  `worker_restarted` (`retryable: true`, `next_action` set) instead of prose;
+  the CLI forgets the poisoned session and reopens (030). A plain timeout no
+  longer poisons every session.
+- Same-URL navigation returns the fresh document, not the one it replaced.
+- `greppy web screenshot --render-complete` waits for a complete render;
+  the default returns the framebuffer immediately.
+- Document-bound `@N` refs from `observe` resolve locators and expire with
+  `STALE_REF` after navigation or DOM loss.
+
+**Worktrees and the shared inference cache.** The immutable Base build for a
+linked worktree runs `greppy index` as a child with `GREPPY_STORE_DIR` pointed
+at a private staging directory. Models and the inference cache derived from
+that root, so the child embedded every span again with an empty cache and
+copied the embedding model into staging: 41 012 spans, 1 520 s on an M-series
+Mac for a tree the primary checkout had fully embedded. The parent now passes
+its shared root through `GREPPY_SHARED_INFERENCE_ROOT`; the same worktree
+build takes 161 s and touches no model file. Abandoned staging directories
+(`greppy-base-build-*`, `greppy-linked-base-checkout-*`, 44 of them holding
+23 GB on one machine, reported by `cache status` as unmanaged) are reaped
+after six hours at build start and by `greppy cache gc`.
+
+**Store-CoW freshness.** Hidden and filtered Delta files carry a content
+identity, so a metadata-only change no longer loops `graph refresh`; the
+background refresh no longer reports an old snapshot as newly published;
+overlay navigation uses indexed Base/Delta queries (`path` from >120 s to
+under 6 s); a detached HEAD reports only the paths that actually drift.
+
+**Known limits.** A JavaScript search component that intercepts Enter (for
+example Wikipedia's) still needs the button; the agent finds it, at roughly
+five times the turns. `greppy web` on a binary built without the web feature
+falls through to the grep passthrough and prints grep usage. The HTTPS
+extra-header tests trust the fixture certificate only in debug builds.
+
 ## [0.3.4] — 2026-08-30
 
 ### Worktree indexing and agent feedback fixes
