@@ -1962,6 +1962,19 @@ impl ContentEngine {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
+                let probe = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    CLICK_PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+                );
+                let encoded_probe =
+                    serde_json::to_string(&probe).expect("click probe serializes");
+                self.locator_eval(
+                    &params,
+                    &format!(
+                        "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var pending = 'pending:' + token; node.setAttribute(attr, pending); var mark = function() {{ if (node.getAttribute(attr) === pending) node.setAttribute(attr, 'seen:' + token); node.removeEventListener('click', mark, true); }}; node.addEventListener('click', mark, true); return true"
+                    ),
+                )?;
                 click_at(
                     &webview,
                     resolved.x,
@@ -1971,6 +1984,19 @@ impl ContentEngine {
                     || self.servo.spin_event_loop(),
                 );
                 self.servo.spin_event_loop();
+                let dispatch = match self.locator_eval(
+                    &params,
+                    &format!(
+                        "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var state = node.getAttribute(attr); if (state === 'seen:' + token) {{ node.removeAttribute(attr); return 'native'; }} if (state === 'pending:' + token) {{ node.click(); node.removeAttribute(attr); return 'dom-fallback'; }} return 'document-changed'"
+                    ),
+                ) {
+                    Ok(JSValue::String(dispatch)) => dispatch,
+                    // A successful click may navigate or replace its own node,
+                    // making the old locator intentionally unresolvable. Never
+                    // issue a second click in that case.
+                    Err(_) => "document-changed".to_owned(),
+                    Ok(_) => "unknown".to_owned(),
+                };
                 if let Some(selector) = params
                     .get("selector")
                     .and_then(|value| value.get("value"))
@@ -1978,7 +2004,7 @@ impl ContentEngine {
                 {
                     let _ = self.assign_pending_files(&page_id, selector);
                 }
-                Ok(json!({}))
+                Ok(json!({ "dispatch": dispatch }))
             }
             "locator.tap" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -4663,6 +4689,7 @@ fn observe_script(snapshot: &str) -> String {
     OBSERVE_JS.replace("__GREPPY_SNAPSHOT__", &encoded)
 }
 
+static CLICK_PROBE_SEQ: AtomicU64 = AtomicU64::new(1);
 static SCREENSHOT_SIDECAR_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn engine_result_frame_len(result: &serde_json::Value) -> usize {

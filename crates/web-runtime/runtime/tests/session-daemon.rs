@@ -3338,6 +3338,13 @@ document.getElementById('go').addEventListener('click', function() {\
     )
     .expect("click");
     assert_eq!(clicked.status, "ok", "{clicked:?}");
+    assert!(
+        matches!(
+            clicked.result.as_ref().unwrap()["dispatch"].as_str(),
+            Some("native" | "dom-fallback")
+        ),
+        "successful click must report how it reached the DOM: {clicked:?}"
+    );
     let observed = unix_request(
         &socket,
         &Request::new(
@@ -3368,7 +3375,7 @@ document.getElementById('go').addEventListener('click', function() {\
 #[test]
 fn observed_refs_drive_locators_and_expire_on_navigation() {
     let fixture = serve_fixture(
-        "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button>go</button></body></html>",
+        "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button onclick=\"document.body.setAttribute('data-clicked','yes')\">go</button></body></html>",
     );
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-refs-{}.sock",
@@ -3438,6 +3445,27 @@ fn observed_refs_drive_locators_and_expire_on_navigation() {
     )
     .expect("fill by ref");
     assert_eq!(filled.status, "ok", "{filled:?}");
+    let clicked = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.click",
+            json!({
+                "session_id": session_id,
+                "selector": { "type": "ref", "value": 2 }
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("click by ref");
+    assert_eq!(clicked.status, "ok", "{clicked:?}");
+    assert!(
+        matches!(
+            clicked.result.as_ref().unwrap()["dispatch"].as_str(),
+            Some("native" | "dom-fallback")
+        ),
+        "successful click must report how it reached the DOM: {clicked:?}"
+    );
     let value = unix_request(
         &socket,
         &Request::new(
@@ -3445,13 +3473,17 @@ fn observed_refs_drive_locators_and_expire_on_navigation() {
             "web.evaluate",
             json!({
                 "session_id": session_id,
-                "source": "document.getElementById('name').value"
+                "source": "document.getElementById('name').value + ':' + document.body.getAttribute('data-clicked')"
             }),
         ),
         Duration::from_secs(10),
     )
     .expect("inspect filled value");
-    assert_eq!(value.result.as_ref().unwrap()["value"], "Ada", "{value:?}");
+    assert_eq!(
+        value.result.as_ref().unwrap()["value"],
+        "Ada:yes",
+        "{value:?}"
+    );
     let reloaded = unix_request(
         &socket,
         &Request::new(

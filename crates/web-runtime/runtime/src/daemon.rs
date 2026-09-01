@@ -2657,16 +2657,18 @@ impl Daemon {
                     }
                 }
                 match self.engine_call(method, params) {
-                    Ok(_) => {
+                    Ok(result) => {
                         self.finish_session(&session_id);
-                        Response::ok(
-                            request,
-                            json!({
-                                "session_id": session_id,
-                                "ok": true,
-                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
-                            }),
-                        )
+                        let dispatch = result.get("dispatch").cloned();
+                        let mut response = json!({
+                            "session_id": session_id,
+                            "ok": true,
+                            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                        });
+                        if let (Some(dispatch), Some(object)) = (dispatch, response.as_object_mut()) {
+                            object.insert("dispatch".into(), dispatch);
+                        }
+                        Response::ok(request, response)
                     }
                     Err(error) => {
                         self.finish_session(&session_id);
