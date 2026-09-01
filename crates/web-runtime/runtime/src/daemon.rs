@@ -774,6 +774,28 @@ impl Daemon {
         let dispatch_started = Instant::now();
         let content_before = sample_cpu_ms(self.content.pid());
         let controller_before = sample_cpu_ms(self.controller.pid());
+        let session_id = request
+            .payload
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| request.session_id.clone());
+        if let Some(session) = session_id
+            .as_ref()
+            .and_then(|session_id| self.sessions.get_mut(session_id))
+        {
+            // Start a new session's CPU accounting before any supervisor
+            // preflight. `session.networkBytes` below is real controller work
+            // performed for this request and must not sit outside the budget.
+            let _ = session_cpu_delta_ms(
+                &mut session.content_cpu_baseline,
+                self.content.pid(),
+            );
+            let _ = session_cpu_delta_ms(
+                &mut session.controller_cpu_baseline,
+                self.controller.pid(),
+            );
+        }
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
@@ -785,6 +807,7 @@ impl Daemon {
             .then(|| self.engine_call("session.networkBytes", json!({})).ok())
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
+        let limit_request = request.clone();
         let mut response = self.dispatch_operation(request);
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -808,6 +831,50 @@ impl Daemon {
                     .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
                 {
                     response.metrics.network_bytes = after.saturating_sub(before);
+                }
+            }
+        }
+        // The pre-dispatch check in `with_session_page` protects every later
+        // operation from CPU already consumed by this session. The first
+        // operation starts the per-worker baseline, though, so its actual CPU
+        // can only be judged here. Enforce the same cumulative session budget
+        // before returning success; otherwise a one-shot request can exceed a
+        // 1 ms limit while reporting the overage only in metrics.
+        if response.status == "ok" {
+            if let Some(session_id) = session_id {
+                let content_pid = self.content.pid();
+                let controller_pid = self.controller.pid();
+                let measured_content_cpu_ms = response.metrics.content_cpu_ms;
+                let measured_controller_cpu_ms = response.metrics.controller_cpu_ms;
+                let cpu_limit_error = self.sessions.get_mut(&session_id).and_then(|session| {
+                    let content_cpu = Duration::from_millis(
+                        session_cpu_delta_ms(&mut session.content_cpu_baseline, content_pid)
+                            .max(measured_content_cpu_ms),
+                    );
+                    let controller_cpu = Duration::from_millis(
+                        session_cpu_delta_ms(&mut session.controller_cpu_baseline, controller_pid)
+                            .max(measured_controller_cpu_ms),
+                    );
+                    let error = session
+                        .limits
+                        .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
+                        .and_then(|_| {
+                            session.limits.check_cpu_time(
+                                controller_cpu,
+                                session.limits.controller_cpu_time,
+                                "controller",
+                            )
+                        })
+                        .err();
+                    if error.is_some() {
+                        let _ = session.transition(SessionState::Failed);
+                    }
+                    error
+                });
+                if let Some(message) = cpu_limit_error {
+                    let metrics = response.metrics.clone();
+                    response = limit_error(&limit_request, message);
+                    response.metrics = metrics;
                 }
             }
         }
