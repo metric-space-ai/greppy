@@ -2163,8 +2163,9 @@ impl ContentEngine {
             }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
+                let snapshot = required_str(&params, "snapshot")?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(webview, OBSERVE_JS)? {
+                match self.evaluate(webview, &observe_script(&snapshot))? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -3284,6 +3285,11 @@ impl ContentEngine {
             };
             match sampled {
                 JSValue::Object(values) => {
+                    if bool_field(&values, "staleRef").unwrap_or(false) {
+                        return Err(io::Error::other(
+                            "STALE_REF: observed node no longer belongs to the active document",
+                        ));
+                    }
                     let count = number_field(&values, "count")? as usize;
                     let width = number_field(&values, "width").unwrap_or(0.0);
                     let height = number_field(&values, "height").unwrap_or(0.0);
@@ -3680,7 +3686,15 @@ fn resolve_script(selector: &serde_json::Value) -> String {
             if (!top) return false;
             return el === top || el.contains(top);
           }}
+          if (selector.snapshot != null &&
+              (!document.documentElement ||
+               document.documentElement.getAttribute('data-greppy-ref-snapshot') !== selector.snapshot)) {{
+            return {{ staleRef: true, count: 0 }};
+          }}
           const nodes = greppyResolveNodes(selector);
+          if (selector.snapshot != null && nodes.length !== 1) {{
+            return {{ staleRef: true, count: nodes.length }};
+          }}
           if (nodes.length !== 1) {{
             return {{ count: nodes.length, x: 0, y: 0, width: 0, height: 0, disabled: false, readonly: false, visible: false, hit: false }};
           }}
@@ -4599,17 +4613,55 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"JSON.stringify({
-  url: location.href,
-  title: document.title,
-  text: ((document.body && document.body.innerText) || '').slice(0, 8000),
-  headings: Array.from(document.querySelectorAll('h1,h2,h3,h4')).map(function(h) {
-    return (h.innerText || '').trim();
-  }).filter(Boolean).slice(0, 20),
-  links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
-    return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
-  })
-})"#;
+const OBSERVE_JS: &str = r#"(function(snapshot) {
+  const refAttr = 'data-greppy-ref';
+  const snapshotAttr = 'data-greppy-ref-snapshot';
+  Array.from(document.querySelectorAll('[' + refAttr + ']')).forEach(function(node) {
+    node.removeAttribute(refAttr);
+  });
+  if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
+  const candidates = Array.from(document.querySelectorAll(
+    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[contenteditable="true"]'
+  )).filter(function(node) {
+    const style = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  });
+  const capped = candidates.slice(0, 200);
+  const actionables = capped.map(function(node, index) {
+    const ref = index + 1;
+    node.setAttribute(refAttr, snapshot + ':' + ref);
+    const text = ((node.innerText || node.textContent || node.value || '') + '').trim().slice(0, 160);
+    return {
+      ref: '@' + ref,
+      tag: node.tagName.toLowerCase(),
+      role: node.getAttribute('role') || null,
+      name: (node.getAttribute('aria-label') || '').trim() || null,
+      text: text,
+      href: node.href || null,
+      disabled: !!(node.disabled || node.getAttribute('aria-disabled') === 'true')
+    };
+  });
+  return JSON.stringify({
+    url: location.href,
+    title: document.title,
+    text: ((document.body && document.body.innerText) || '').slice(0, 8000),
+    headings: Array.from(document.querySelectorAll('h1,h2,h3,h4')).map(function(h) {
+      return (h.innerText || '').trim();
+    }).filter(Boolean).slice(0, 20),
+    links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
+      return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
+    }),
+    actionables: actionables,
+    ref_count: actionables.length,
+    refs_truncated: candidates.length > capped.length
+  });
+})(__GREPPY_SNAPSHOT__)"#;
+
+fn observe_script(snapshot: &str) -> String {
+    let encoded = serde_json::to_string(snapshot).expect("snapshot token serializes");
+    OBSERVE_JS.replace("__GREPPY_SNAPSHOT__", &encoded)
+}
 
 static SCREENSHOT_SIDECAR_SEQ: AtomicU64 = AtomicU64::new(1);
 

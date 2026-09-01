@@ -3,7 +3,7 @@
 use crate::artifacts::ArtifactStore;
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
-use crate::session::{Session, SessionState};
+use crate::session::{LocatorSnapshot, Session, SessionState};
 use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
     new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
@@ -1652,8 +1652,30 @@ impl Daemon {
         match self.with_session_page(request, "web.observe") {
             Err(response) => response,
             Ok((session_id, page)) => {
-                match self.engine_call("page.observe", json!({ "page": page })) {
+                let snapshot = format!(
+                    "gref-{}-{}",
+                    std::process::id(),
+                    self.next_engine_id.fetch_add(1, Ordering::Relaxed)
+                );
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.locator_snapshot = None;
+                }
+                match self.engine_call(
+                    "page.observe",
+                    json!({ "page": page, "snapshot": snapshot }),
+                ) {
                     Ok(mut tree) => {
+                        let ref_count = tree
+                            .get("ref_count")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0);
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.locator_snapshot = Some(LocatorSnapshot {
+                                token: snapshot,
+                                page_id: page.clone(),
+                                ref_count,
+                            });
+                        }
                         if let Some(object) = tree.as_object_mut() {
                             if let Some(url) = object.get("url").and_then(|value| value.as_str()) {
                                 let redacted = redact_secrets(url);
@@ -2578,7 +2600,7 @@ impl Daemon {
         method: &str,
         extra: serde_json::Value,
     ) -> Response {
-        let Some(selector) = request.payload.get("selector").cloned() else {
+        let Some(mut selector) = request.payload.get("selector").cloned() else {
             return protocol_error(
                 request,
                 &format!("{} requires selector", request.operation),
@@ -2587,6 +2609,36 @@ impl Daemon {
         match self.with_session_page(request, &request.operation) {
             Err(response) => response,
             Ok((session_id, page)) => {
+                if selector.get("type").and_then(|value| value.as_str()) == Some("ref") {
+                    let Some(ref_number) = selector.get("value").and_then(|value| value.as_u64())
+                    else {
+                        self.finish_session(&session_id);
+                        return protocol_error(request, "ref selector requires a positive integer value");
+                    };
+                    let snapshot = self.sessions.get(&session_id).and_then(|session| {
+                        session.locator_snapshot.as_ref().and_then(|snapshot| {
+                            (snapshot.page_id == page
+                                && ref_number > 0
+                                && ref_number <= snapshot.ref_count)
+                                .then(|| snapshot.token.clone())
+                        })
+                    });
+                    let Some(snapshot) = snapshot else {
+                        self.finish_session(&session_id);
+                        return locator_error(
+                            request,
+                            "STALE_REF: run web.observe and use a ref from its current page snapshot",
+                        );
+                    };
+                    selector = json!({
+                        "type": "css",
+                        "value": format!(
+                            "[data-greppy-ref=\"{}:{}\"]",
+                            snapshot, ref_number
+                        ),
+                        "snapshot": snapshot,
+                    });
+                }
                 let timeout = request
                     .payload
                     .get("timeout")
@@ -2878,6 +2930,12 @@ impl Daemon {
         let content_cpu = Duration::from_millis(sample_cpu_ms(self.content.pid()));
         let controller_cpu = Duration::from_millis(sample_cpu_ms(self.controller.pid()));
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
+            if matches!(
+                operation,
+                "web.goto" | "web.back" | "web.forward" | "web.reload"
+            ) {
+                session.locator_snapshot = None;
+            }
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
@@ -3637,7 +3695,12 @@ fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -
 
 fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     let message = redact_secrets(&message.into());
-    let (code, next_action) = if message.contains("strict mode") {
+    let (code, next_action) = if message.contains("STALE_REF") {
+        (
+            "STALE_REF",
+            "run greppy web observe again and use a ref from the new snapshot",
+        )
+    } else if message.contains("strict mode") {
         (
             "AMBIGUOUS_TARGET",
             "add --first, --nth N, or narrow the query",

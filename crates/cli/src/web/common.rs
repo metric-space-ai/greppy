@@ -1231,9 +1231,20 @@ pub(super) fn parse_target(
     }
     if let Some(rest) = trimmed.strip_prefix('@') {
         if rest.bytes().all(|b| b.is_ascii_digit()) && !rest.is_empty() {
-            return Err(query_syntax(
-                "ref @N requires an observe snapshot that stores locator recipes",
-            ));
+            if first || last || nth.is_some() {
+                return Err(query_syntax(
+                    "ref @N already identifies one observed node; do not add --first, --last, or --nth",
+                ));
+            }
+            let value = rest
+                .parse::<u64>()
+                .map_err(|_| query_syntax("ref @N is outside the supported integer range"))?;
+            if value == 0 {
+                return Err(query_syntax("ref numbering starts at @1"));
+            }
+            return Ok(ParsedTarget {
+                selector: json!({ "type": "ref", "value": value }),
+            });
         }
         return Err(query_syntax("ref must be @ followed by digits"));
     }
@@ -1399,10 +1410,21 @@ mod target_tests {
     }
 
     #[test]
-    fn parse_ref_is_query_syntax_until_observe_stores_recipes() {
+    fn parse_ref_is_a_document_bound_locator() {
+        let parsed = parse_target("@12", false, false, None).unwrap();
+        assert_eq!(parsed.selector, json!({ "type": "ref", "value": 12 }));
+
         let error = parse_target("@12", false, true, None).unwrap_err();
         assert_eq!(error.code, "QUERY_SYNTAX");
-        assert!(error.message.contains("observe"), "{}", error.message);
+        assert!(
+            error.message.contains("already identifies"),
+            "{}",
+            error.message
+        );
+
+        let error = parse_target("@0", false, false, None).unwrap_err();
+        assert_eq!(error.code, "QUERY_SYNTAX");
+        assert!(error.message.contains("starts at @1"), "{}", error.message);
     }
 
     #[test]

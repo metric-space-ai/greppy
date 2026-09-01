@@ -2828,7 +2828,7 @@ fn native_alert_does_not_corrupt_protocol() {
     assert!(
         ran.error
             .as_ref()
-            .map(|e| e.message.as_str())
+            .map(|e| e.message.as_ref())
             .unwrap_or("")
             .contains("frame length")
             == false
@@ -2853,7 +2853,7 @@ fn script_console_log_does_not_corrupt_protocol() {
     let error = ran
         .error
         .as_ref()
-        .map(|error| error.message.as_str())
+        .map(|error| error.message.as_ref())
         .unwrap_or("");
     assert!(
         !error.contains("frame length"),
@@ -2938,7 +2938,7 @@ await browser.close();
     let error = second_ran
         .error
         .as_ref()
-        .map(|error| error.message.as_str())
+        .map(|error| error.message.as_ref())
         .unwrap_or("");
     assert!(
         !error.contains("unexpected content message"),
@@ -3358,6 +3358,131 @@ document.getElementById('go').addEventListener('click', function() {\
         &socket,
         &Request::new(
             "run_act",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn observed_refs_drive_locators_and_expire_on_navigation() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button>go</button></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-refs-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_refs", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.goto",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("goto");
+    assert_eq!(went.status, "ok", "{went:?}");
+    let observed = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.observe",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("observe");
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let actionables = observed.result.as_ref().unwrap()["actionables"]
+        .as_array()
+        .expect("actionables");
+    assert_eq!(actionables.len(), 2, "{observed:?}");
+    assert_eq!(actionables[0]["ref"], "@1");
+    assert_eq!(actionables[0]["tag"], "input");
+    assert_eq!(actionables[1]["ref"], "@2");
+    assert_eq!(actionables[1]["tag"], "button");
+    let filled = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.fill",
+            json!({
+                "session_id": session_id,
+                "selector": { "type": "ref", "value": 1 },
+                "value": "Ada"
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("fill by ref");
+    assert_eq!(filled.status, "ok", "{filled:?}");
+    let value = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.evaluate",
+            json!({
+                "session_id": session_id,
+                "source": "document.getElementById('name').value"
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("inspect filled value");
+    assert_eq!(value.result.as_ref().unwrap()["value"], "Ada", "{value:?}");
+    let reloaded = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.reload",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("reload");
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    let stale = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
+            "web.fill",
+            json!({
+                "session_id": session_id,
+                "selector": { "type": "ref", "value": 1 },
+                "value": "Grace"
+            }),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("stale ref response");
+    assert_eq!(stale.status, "error", "{stale:?}");
+    assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_refs",
             "web.session.close",
             json!({ "session_id": session_id }),
         ),
