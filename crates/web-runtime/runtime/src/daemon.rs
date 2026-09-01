@@ -2895,10 +2895,20 @@ impl Daemon {
         }
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
-        let content_cpu = Duration::from_millis(sample_cpu_ms(self.content.pid()));
-        let controller_cpu = Duration::from_millis(sample_cpu_ms(self.controller.pid()));
+        let content_pid = self.content.pid();
+        let controller_pid = self.controller.pid();
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
+            // Budget the CPU this SESSION used, not the worker lifetime
+            // (finding 039); a respawned worker resets the baseline.
+            let content_cpu = Duration::from_millis(session_cpu_delta_ms(
+                &mut session.content_cpu_baseline,
+                content_pid,
+            ));
+            let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
+                &mut session.controller_cpu_baseline,
+                controller_pid,
+            ));
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
@@ -4005,6 +4015,22 @@ fn sample_rss_bytes(pid: u32) -> u64 {
         .parse::<u64>()
         .unwrap_or(0);
     kb.saturating_mul(1024)
+}
+
+/// CPU spent since this session's baseline for the given worker, resetting
+/// the baseline when the worker was respawned (pid changed) so a fresh
+/// process never inherits or wrongly credits another lifetime (finding 039).
+fn session_cpu_delta_ms(baseline: &mut Option<(u32, u64)>, pid: u32) -> u64 {
+    let now_ns = sample_cpu_ns(pid);
+    match baseline {
+        Some((base_pid, base_ns)) if *base_pid == pid => {
+            now_ns.saturating_sub(*base_ns) / 1_000_000
+        }
+        _ => {
+            *baseline = Some((pid, now_ns));
+            0
+        }
+    }
 }
 
 fn sample_cpu_ms(pid: u32) -> u64 {
