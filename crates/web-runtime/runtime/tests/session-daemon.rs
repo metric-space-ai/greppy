@@ -4572,7 +4572,7 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             "web.run",
             json!({
                 "session_id": session_for_run,
-                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.evaluate(() => new Promise(() => {}));\nawait browser.close();\n"
+                "script_text": "import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForFunction(() => false, { timeout: 30000 });\nawait browser.close();\n"
             }),
         );
         run.deadline_ms = 30_000;
@@ -4625,7 +4625,7 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             .find(|row| row["session_id"] == session_id)
             .expect("session");
         if row["state"] == "busy"
-            && row["inflight_engine_method"] == "page.evaluate"
+            && row["inflight_engine_method"] == "page.waitForFunction"
             && row["inflight_engine_request_id"].as_u64().is_some()
         {
             inflight_id = row["inflight_engine_request_id"].as_u64();
@@ -4636,10 +4636,12 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
             break;
         }
         if let Some(response) = early_run_result.lock().unwrap().clone() {
-            panic!("web.run completed before publishing page.evaluate: {response:?}; row={row:?}");
+            panic!(
+                "web.run completed before publishing page.waitForFunction: {response:?}; row={row:?}"
+            );
         }
         if Instant::now() >= barrier {
-            panic!("page.evaluate engine call was not published: {row:?}");
+            panic!("page.waitForFunction engine call was not published: {row:?}");
         }
         thread::sleep(Duration::from_millis(20));
     }
