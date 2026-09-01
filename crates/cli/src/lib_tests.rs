@@ -1359,6 +1359,7 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     let mut guard = BackgroundJobGuard::from_env();
     guard.embedding_started("cpu", 10);
     guard.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        current_symbol: None,
         completed_documents: 4,
         total_documents: 10,
     });
