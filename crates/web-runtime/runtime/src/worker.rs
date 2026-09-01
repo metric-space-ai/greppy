@@ -1034,7 +1034,12 @@ exit 0;
         let image = PinnedSupervisorImage::open_path(&probe).unwrap();
         assert_eq!(image.exec_kind(), ImageExecKind::Fexecve);
         assert!(image.is_fd_backed());
-        std::fs::copy(&true_bin, &probe).unwrap();
+        // Replace the directory entry with a different inode. Copying directly
+        // to `probe` would truncate and rewrite the already pinned inode, which
+        // is not a path-lookup TOCTOU and necessarily changes what the FD sees.
+        let replacement = root.join("replacement");
+        std::fs::copy(&true_bin, &replacement).unwrap();
+        std::fs::rename(&replacement, &probe).unwrap();
         let mut command = Command::new(&probe);
         command
             .arg("30")
