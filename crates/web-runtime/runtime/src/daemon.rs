@@ -259,7 +259,6 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if let Some(parent) = config.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(&config.socket);
     #[allow(fn_to_numeric_cast)]
     unsafe {
         libc::signal(
@@ -4516,11 +4515,13 @@ pub fn socket_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod script_stage_tests {
     use super::{
-        copy_granted_modules, isolated_id, path_is_within_root, refuse_unbounded_script_root,
-        remove_script_stage, script_stage_dir, stage_script_for_controller,
+        bind_socket_healing_stale, copy_granted_modules, isolated_id, path_is_within_root,
+        refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
+        stage_script_for_controller,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
 
     fn unique_root(tag: &str) -> PathBuf {
@@ -4622,6 +4623,29 @@ mod script_stage_tests {
         let _ = fs::remove_dir_all(outside);
         let _ = fs::remove_dir_all(dest);
     }
+
+    #[test]
+    fn socket_bind_heals_only_a_stale_path() {
+        let root = unique_root("socket");
+        let path = root.join("runtime.sock");
+
+        let live = UnixListener::bind(&path).unwrap();
+        let error = bind_socket_healing_stale(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "live listener was displaced"
+        );
+
+        drop(live);
+        let healed = bind_socket_healing_stale(&path).expect("stale socket should be replaced");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "healed listener is not live"
+        );
+        drop(healed);
+        let _ = fs::remove_dir_all(root);
+    }
 }
 #[cfg(test)]
 mod redirect_chain_tests {
@@ -4653,6 +4677,25 @@ mod redirect_chain_tests {
         );
         let ms = super::sample_cpu_ms(std::process::id());
         assert!(ms > 0, "this process should have nonzero CPU, got {ms}");
+    }
+
+    #[test]
+    fn session_cpu_delta_starts_at_zero_and_resets_for_a_new_worker() {
+        let pid = std::process::id();
+        let mut baseline = None;
+        assert_eq!(super::session_cpu_delta_ms(&mut baseline, pid), 0);
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(20) {
+            std::hint::black_box((0..10_000_u64).sum::<u64>());
+        }
+        assert!(super::session_cpu_delta_ms(&mut baseline, pid) > 0);
+        let replacement_pid = pid.saturating_add(1);
+        assert_eq!(
+            super::session_cpu_delta_ms(&mut baseline, replacement_pid),
+            0,
+            "a replacement worker must not inherit its predecessor's CPU"
+        );
+        assert_eq!(baseline.map(|entry| entry.0), Some(replacement_pid));
     }
 
     #[test]
