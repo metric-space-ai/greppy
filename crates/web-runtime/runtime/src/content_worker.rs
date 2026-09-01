@@ -2189,9 +2189,9 @@ impl ContentEngine {
             }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
-                let snapshot = required_str(&params, "snapshot")?;
+                let snapshot = params.get("snapshot").and_then(|value| value.as_str());
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(webview, &observe_script(&snapshot))? {
+                match self.evaluate(webview, &observe_script(snapshot))? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -4642,11 +4642,13 @@ mod serialize_tests {
 const OBSERVE_JS: &str = r#"(function(snapshot) {
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
-  Array.from(document.querySelectorAll('[' + refAttr + ']')).forEach(function(node) {
-    node.removeAttribute(refAttr);
-  });
-  if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
-  const candidates = Array.from(document.querySelectorAll(
+  if (snapshot != null) {
+    Array.from(document.querySelectorAll('[' + refAttr + ']')).forEach(function(node) {
+      node.removeAttribute(refAttr);
+    });
+    if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
+  }
+  const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
     'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[contenteditable="true"]'
   )).filter(function(node) {
     const style = getComputedStyle(node);
@@ -4684,8 +4686,8 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
   });
 })(__GREPPY_SNAPSHOT__)"#;
 
-fn observe_script(snapshot: &str) -> String {
-    let encoded = serde_json::to_string(snapshot).expect("snapshot token serializes");
+fn observe_script(snapshot: Option<&str>) -> String {
+    let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS.replace("__GREPPY_SNAPSHOT__", &encoded)
 }
 
