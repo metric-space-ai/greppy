@@ -39,9 +39,8 @@ A bare argument is a CSS selector:
   greppy web network QUERY                requests, status, sizes
   greppy web trace start                  begin a Playwright trace
 
-ACT — TARGET is css=..., xpath=..., text~/RE/i, role=... name~/RE/i:
-  greppy web click TARGET                 click; --expect binds a download,
-                                          popup, dialog or response to it
+ACT — TARGET is css=..., xpath=..., text=..., role=... name=...:
+  greppy web click TARGET                 click and return the updated page state
   greppy web fill TARGET VALUE            set a field; --from-env for secrets
   greppy web type TARGET TEXT             type character by character
   greppy web clear TARGET                 empty a field

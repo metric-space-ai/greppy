@@ -1268,6 +1268,25 @@ pub(super) fn parse_target(
         }
         return Err(query_syntax("ref must be @ followed by digits"));
     }
+    for (prefix, kind) in [("css=", "css"), ("xpath=", "xpath"), ("text=", "text")] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let value = parse_complete_selector_value(rest)?;
+            if value.is_empty() {
+                return Err(query_syntax(&format!("{prefix} value is empty")));
+            }
+            let mut selector = json!({ "type": kind, "value": value });
+            if let Some(index) = if first {
+                Some(0)
+            } else if last {
+                Some(-1)
+            } else {
+                nth
+            } {
+                selector["nth"] = json!(index);
+            }
+            return Ok(ParsedTarget { selector });
+        }
+    }
     let mut css = None;
     let mut xpath = None;
     let mut text = None;
@@ -1409,6 +1428,19 @@ fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), Erro
     Ok((out, ""))
 }
 
+fn parse_complete_selector_value(input: &str) -> std::result::Result<String, ErrorObject> {
+    let input = input.trim();
+    if input.starts_with('"') {
+        let (value, rest) = parse_selector_value(input)?;
+        if !rest.trim().is_empty() {
+            return Err(query_syntax("unexpected text after quoted target"));
+        }
+        Ok(value)
+    } else {
+        Ok(input.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod target_tests {
     use super::*;
@@ -1419,6 +1451,14 @@ mod target_tests {
         assert_eq!(parsed.selector["type"], "css");
         assert_eq!(parsed.selector["value"], "div > a");
         assert_eq!(parsed.selector["nth"], 2);
+    }
+
+    #[test]
+    fn parse_css_with_spaces_has_one_shared_cli_shape() {
+        let unquoted = parse_target("css=a b", false, false, None).unwrap();
+        let quoted = parse_target(r#"css="a b""#, false, false, None).unwrap();
+        assert_eq!(unquoted.selector, json!({ "type": "css", "value": "a b" }));
+        assert_eq!(quoted.selector, unquoted.selector);
     }
 
     #[test]
