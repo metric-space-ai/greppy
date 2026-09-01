@@ -865,7 +865,7 @@ pub(crate) fn index_overlay_snapshot(
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
     announce: bool,
-    progress: Option<&mut BackgroundJobGuard>,
+    mut progress: Option<&mut BackgroundJobGuard>,
 ) -> Result<i32> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
     let temp_path = unique_store_sibling(active_path, "delta-building");
@@ -909,7 +909,17 @@ pub(crate) fn index_overlay_snapshot(
             .map(ToOwned::to_owned)
             .collect(),
     );
-    let report = greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)?;
+    let report = if let Some(job) = progress.as_deref_mut() {
+        greppy_indexer::index_with_options_and_progress(
+            &mut store,
+            target,
+            project,
+            &overlay_options,
+            &mut |update| job.indexing_progress(update),
+        )
+    } else {
+        greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)
+    }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     let base_commit = std::env::var(crate::store_cow::ENV_BASE_COMMIT)
         .map_err(|_| Error::Invalid("overlay index missing pinned Base commit".into()))?;

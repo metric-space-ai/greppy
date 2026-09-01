@@ -43,6 +43,23 @@ fn run_with_env(
     overlay: Option<(&Path, &str)>,
     extra_env: &[(&str, &str)],
 ) -> (i32, String, String) {
+    let output = configured_command(repo, store, args, overlay, extra_env)
+        .output()
+        .expect("spawn greppy");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn configured_command(
+    repo: &Path,
+    store: &Path,
+    args: &[&str],
+    overlay: Option<(&Path, &str)>,
+    extra_env: &[(&str, &str)],
+) -> Command {
     let mut command = Command::new(bin());
     command
         .args(args)
@@ -64,12 +81,7 @@ fn run_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().expect("spawn greppy");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    command
 }
 
 fn index(repo: &Path, store: &Path, overlay: Option<(&Path, &str)>) {
@@ -151,6 +163,15 @@ fn normalize_ephemeral_fields(value: &mut serde_json::Value) {
             // result; two separately opened stores cannot have identical
             // wall-clock duration even when their visible state is equal.
             object.remove("elapsed_ms");
+            if object.contains_key("fresh")
+                && object.contains_key("state")
+                && object.contains_key("total_inventory")
+            {
+                // Overlay and full snapshots prove the same visible result
+                // through different mechanisms. The source is validated by
+                // dedicated status assertions below, not query parity.
+                object.remove("source");
+            }
             if object.contains_key("edge_type")
                 && object.contains_key("source_id")
                 && object.contains_key("target_id")
@@ -275,6 +296,52 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
         ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
         ("GREPPY_AGENT_BASE_REUSED", "1"),
     ];
+    let progress_job_path = scratch.path().join("overlay-progress.json");
+    let progress_ready_path = scratch.path().join("overlay-progress-ready");
+    let progress_job = progress_job_path.to_string_lossy().into_owned();
+    let progress_ready = progress_ready_path.to_string_lossy().into_owned();
+    let progress_env = [
+        ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
+        ("GREPPY_AGENT_BASE_REUSED", "1"),
+        ("GREPPY_DELEGATED_BACKGROUND_JOB", progress_job.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_READY", progress_ready.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+    ];
+    let mut progress_child = configured_command(
+        &task_repo,
+        &delta_store,
+        &["index", "."],
+        overlay,
+        &progress_env,
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn held Delta index");
+    let progress_deadline = Instant::now() + Duration::from_secs(30);
+    while !progress_ready_path.exists() && Instant::now() < progress_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        progress_ready_path.exists(),
+        "Delta index never reached the publish failpoint"
+    );
+    let progress: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&progress_job_path).unwrap()).unwrap();
+    assert_ne!(
+        progress["state"], "indexing",
+        "an active Overlay graph build must publish its real indexer phase: {progress:#}"
+    );
+    assert!(
+        progress["progress_unit"].is_string(),
+        "Overlay progress must expose a meaningful unit: {progress:#}"
+    );
+    progress_child.kill().expect("terminate held Delta index");
+    progress_child.wait().expect("reap held Delta index");
+    std::fs::remove_dir_all(&delta_store).expect("remove interrupted test Delta store");
+    std::fs::remove_file(&progress_job_path).expect("remove delegated progress record");
+
     let (delta_code, delta_out, delta_err) = run_with_env(
         &task_repo,
         &delta_store,
@@ -546,7 +613,10 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
         base_tree_oid: git(&repo, &["rev-parse", "HEAD^{tree}"]),
         store_schema_version: greppy_store::migrate::CURRENT_VERSION,
         indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
-        parser_and_extractor_versions: "fixture-parser-v1".into(),
+        parser_and_extractor_versions: format!(
+            "greppy-parser/extractor-{}",
+            env!("CARGO_PKG_VERSION")
+        ),
         summary_model_and_prompt_version: "fixture-summary-v1".into(),
         embedding_model: "fixture-embedding-v1".into(),
         embedding_prompt_version: "fixture-prompt-v1".into(),
