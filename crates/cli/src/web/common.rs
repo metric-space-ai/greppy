@@ -729,7 +729,7 @@ pub fn prestart_unsandboxed() -> std::result::Result<(), String> {
     };
     ensure_supervisor(None, &spawn)
         .map(|_| ())
-        .map_err(|error| error.message.clone())
+        .map_err(|error| error.message.to_string())
 }
 
 pub(super) fn ensure_supervisor(
