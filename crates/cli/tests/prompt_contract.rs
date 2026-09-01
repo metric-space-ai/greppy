@@ -395,8 +395,13 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // prompt into assets/prompts/web-beta.md, so the web runtime can ship as
     // beta without the default prompt advertising a surface that is still
     // moving. AGENTS.md keeps a four-line pointer and nothing else.
+    // 01.09.2026 (merge of 0.3.4 main and the web branch): the frozen text is
+    // now the plain union of two individually owner-approved states - main's
+    // 26.08 bash-smart execution contract wording plus the branch's 31.08
+    // web-beta pointer. No new sentence was written for the merge; the hash
+    // moves mechanically to the union.
     const APPROVED_SHA256: &str =
-        "cbb60d37642425ce6396929dc6d5054a4efb62efebdd055100bfffe42086cdaa";
+        "d2530d19468c108edc9c81b23ad177020dc7990d989ea5d8395cb4ab074acc4f";
 
     let text = prompt();
     let digest = {

@@ -45,8 +45,8 @@ const LONG_HELP: &str = "\
 Coding agent with interactive and one-shot modes. Uses the installed portable
 Chunk-CoW provider and fails before the first model request when its adapter
 or persistent mount is not healthy. The immutable baseline includes the pinned
-commit plus visible staged, unstaged and untracked state; ignored files are
-excluded. It delivers a baseline-bound proposal ref
+commit plus visible staged, unstaged and untracked state;
+ignored files are excluded. It delivers a baseline-bound proposal ref
 (refs/greppy/agent/<run_id>); inspect it with `git show` or apply it with
 `greppy agent apply REF`. The agent has exactly one tool — `greppy` — covering
 search/navigate/read/edit; commands run through that tool as
