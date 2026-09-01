@@ -2285,23 +2285,51 @@ impl ContentEngine {
                 Ok(json!({}))
             }
             "locator.check" | "locator.uncheck" => {
-                let _ = self.resolve_actionable(&params)?;
+                let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let checked = method == "locator.check";
                 let selector = params
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, _) = self.page(&page_id)?.clone();
-                // Setting `.checked` alone changes state without telling the
-                // page (finding 019): frameworks listen on `change`, so a
-                // silent toggle looks successful and never reaches the app.
-                // Playwright treats an already-matching state as a no-op, so
-                // events fire only on an actual transition.
-                let source = format!(
-                    "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                // A property write plus dispatched input/change satisfies
+                // plain forms but stays invisible to frameworks that bind
+                // checkbox state to native CLICKS (React normalises checkbox
+                // onChange over click): finding 033 measured click 5/5 vs
+                // check 0/5 on the same app. So check IS a real, confirmed
+                // click when the state has to change (Playwright semantics:
+                // matching state is a no-op), verified afterwards; only if
+                // the click did not toggle (custom widget swallowing the
+                // event) fall back to property + events.
+                let read_state = format!(
+                    "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); return !!nodes[0].checked; }})({selector})"
                 );
-                self.evaluate(webview, &source)?;
+                let current = matches!(
+                    self.evaluate(webview.clone(), &read_state)?,
+                    JSValue::Boolean(true)
+                );
+                if current != checked {
+                    self.click_at_confirmed(
+                        &webview,
+                        &delegate,
+                        resolved.x,
+                        resolved.y,
+                        resolved.width,
+                        resolved.height,
+                    )?;
+                    self.servo.spin_event_loop();
+                    let after = matches!(
+                        self.evaluate(webview.clone(), &read_state)?,
+                        JSValue::Boolean(true)
+                    );
+                    if after != checked {
+                        let source = format!(
+                            "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
+                        );
+                        self.evaluate(webview, &source)?;
+                    }
+                }
                 Ok(json!({}))
             }
             "locator.selectOption" => {
