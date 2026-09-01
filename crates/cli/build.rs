@@ -47,6 +47,16 @@ const CI_QWEN_GGUF_SHA: &str = "b14c40dfa0c3e2428232027344341fe7cb1b4495b5086d98
 const CI_QWEN_TOK_SHA: &str = "8a3b4f437b9ee58c2190c1e409e24c5b31c0b697041f22925705fca5365db5ca";
 
 fn main() {
+    // clap's complete command tree is intentionally large. The default MSVC
+    // PE stack can overflow while parsing nested commands such as
+    // `greppy cache status`, so stamp a product/test stack that matches the
+    // other supported desktop platforms instead of special-casing tests.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg=/STACK:8388608");
+    }
+
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     if std::env::var_os("CARGO_FEATURE_CI_TEST_ASSETS").is_some() {
         assert_ne!(

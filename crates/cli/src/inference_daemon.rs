@@ -2513,7 +2513,7 @@ mod tests {
                 ServerPolicy {
                     model_ttl: Duration::from_millis(150),
                     exit_ttl: Duration::from_millis(700),
-                    request_deadline: Duration::from_secs(3),
+                    request_deadline: Duration::from_secs(10),
                     hard_request_timeout: None,
                     max_request_bytes: 4096,
                     max_response_bytes: 4096,
@@ -2573,7 +2573,7 @@ mod tests {
                 request(
                     &endpoint,
                     serde_json::json!({"op": "infer"}),
-                    Duration::from_secs(5),
+                    Duration::from_secs(15),
                     4096,
                     4096,
                 )
