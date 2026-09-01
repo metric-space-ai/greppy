@@ -525,7 +525,7 @@ fn index_agent_worktree_warms_the_tree_the_agent_will_use() {
 }
 
 #[test]
-fn index_agent_worktree_fails_closed_when_base_summary_generation_fails() {
+fn index_agent_worktree_fails_closed_when_base_summary_cache_publication_fails() {
     let dir = unique_temp("index-agent-worktree-summary-failure");
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -558,7 +558,7 @@ fn index_agent_worktree_fails_closed_when_base_summary_generation_fails() {
         "failure must name the fail-closed Base boundary; stderr={stderr}"
     );
     assert!(
-        stderr.contains("injected immutable Base summary generation failure"),
+        stderr.contains("injected immutable Base summary cache publication failure"),
         "test must reach the post-graph summary publication boundary; stderr={stderr}"
     );
     assert!(

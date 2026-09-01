@@ -1279,7 +1279,7 @@ fn read_insert_file_pack(
     reason = "keeps page metadata explicit at the rendering boundary"
 )]
 fn read_render_file_page(
-    store: &greppy_store::Store,
+    store: Option<&greppy_store::Store>,
     project: &str,
     path: &str,
     content: &str,
@@ -1291,6 +1291,9 @@ fn read_render_file_page(
     let mut out = format!("{path}:{start_line}-{end_line}\n");
     out.push_str(read_line_slice(content, start_line, end_line));
     if with_handle {
+        let store = store.ok_or_else(|| {
+            Error::Store("read-file handle requested without an available read store".into())
+        })?;
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -1310,7 +1313,11 @@ pub(crate) fn dispatch_read_files(
     path_filter_args: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
-    let store = open_default_store_query_writer(root)?;
+    // An exact file/range read is a filesystem operation, not a graph query.
+    // Keep it usable while a first index is building and avoid opening a
+    // query-writer connection that can collide with the indexer's schema
+    // publication. The store is needed only for continuation/handle records.
+    let mut store = None;
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     let path_filters = prepare_query_path_filters(root, "read-file", "", path_filter_args)?;
@@ -1343,11 +1350,23 @@ pub(crate) fn dispatch_read_files(
             (1, line_count, None)
         } else {
             let end = READ_FILE_PAGE_LINES;
-            let id = read_insert_file_pack(&store, &project, &shown, &content, end + 1)?;
+            if store.is_none() {
+                store = Some(open_default_store_query_writer(root)?);
+            }
+            let id = read_insert_file_pack(
+                store.as_ref().expect("read-file store initialized"),
+                &project,
+                &shown,
+                &content,
+                end + 1,
+            )?;
             (1, end, Some(id))
         };
+        if with_handle && store.is_none() {
+            store = Some(open_default_store_query_writer(root)?);
+        }
         let mut group = read_render_file_page(
-            &store,
+            store.as_ref(),
             &project,
             &shown,
             &content,
@@ -1367,8 +1386,20 @@ pub(crate) fn dispatch_read_files(
                 end_line + 1
             ));
         }
+        if group.is_empty() {
+            return Err(Error::Store(format!(
+                "read-file produced no output for existing file `{shown}` lines {start_line}:{end_line}; retry the command and report this invariant failure"
+            )));
+        }
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
-        print!("{group}");
+        {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            std::io::Write::write_all(&mut output, group.as_bytes())
+                .map_err(|error| Error::Store(format!("write read-file output: {error}")))?;
+            std::io::Write::flush(&mut output)
+                .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
+        }
         previous_ended_with_newline = group.ends_with('\n');
     }
     Ok(if failed { 1 } else { 0 })
@@ -1509,7 +1540,14 @@ pub(crate) fn dispatch_read_expand(
                 }
                 let end = (start + READ_FILE_PAGE_LINES - 1).min(line_count);
                 let mut text = read_render_file_page(
-                    store, project, &path, &content, start, end, false, &root_path,
+                    Some(store),
+                    project,
+                    &path,
+                    &content,
+                    start,
+                    end,
+                    false,
+                    &root_path,
                 )?;
                 let mut next = serde_json::Value::Null;
                 if end < line_count {

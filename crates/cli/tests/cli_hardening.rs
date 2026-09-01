@@ -433,6 +433,57 @@ fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     );
 }
 
+#[test]
+fn search_pattern_text_emits_a_readable_qualified_locator() {
+    let (root, _scratch) = fresh_dir("search-pattern-readable-locator");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/ElectronDialog.ts"),
+        r#"export const make = () => ({
+  async showOpenDialog() {
+    return pickFolder({ title: "locator_roundtrip_marker" });
+  },
+});
+
+function pickFolder(options: { title: string }) {
+  return options.title;
+}
+"#,
+    )
+    .unwrap();
+    let store = root.join("store");
+
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index should succeed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(
+        &["search-pattern", "locator_roundtrip_marker"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "search-pattern should find the TypeScript body; stderr={err}\nstdout={out}"
+    );
+    let locator = out
+        .lines()
+        .find_map(|line| line.split_once("  ").map(|(_, locator)| locator.trim()))
+        .filter(|locator| locator.contains("::"))
+        .unwrap_or_else(|| panic!("text result must include a qualified read locator: {out:?}"));
+
+    let (code, read_out, read_err) = run(&["read", locator], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "the exact locator emitted by search-pattern must be accepted by read; locator={locator:?}; stderr={read_err}; stdout={read_out}"
+    );
+    assert!(
+        read_out.contains("locator_roundtrip_marker"),
+        "read must return the enclosing source for the hit; locator={locator:?}; stdout={read_out}"
+    );
+}
+
 /// Small drift is atomically reindexed, while the current search-pattern request
 /// uses the live filesystem rather than the already-open old snapshot.
 #[test]
@@ -718,13 +769,17 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
         &store,
     );
     assert_eq!(
-        code, 1,
+        code, 75,
         "an incomplete semantic generation must be retryable; stdout={out} stderr={err}"
     );
     assert!(err.is_empty(), "JSON status must stay on stdout: {err:?}");
     let value: serde_json::Value = serde_json::from_str(&out).expect("semantic progress JSON");
     assert_eq!(value["status"], "indexing");
     assert_eq!(value["retryable"], true);
+    assert_eq!(value["exit_code"], 75);
+    assert!(value["retry_when"]
+        .as_str()
+        .is_some_and(|message| message.contains("embedding_complete=true")));
     assert!(value["retry_after_seconds"].as_u64().is_some());
     assert!(value["hits"].as_array().unwrap().is_empty());
     assert!(
@@ -795,9 +850,14 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
         &repo,
         &store,
     );
-    assert_eq!(code, 1, "partial vectors must remain hidden; stderr={err}");
+    assert_eq!(
+        code, 75,
+        "partial vectors must remain hidden and retryable; stderr={err}"
+    );
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["status"], "indexing");
+    assert_eq!(value["retryable"], true);
+    assert_eq!(value["exit_code"], 75);
     assert!(value["hits"].as_array().unwrap().is_empty());
 }
 
@@ -2151,7 +2211,10 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
     let first_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let pid = first_job["pid"].as_u64().expect("background pid") as u32;
-    assert_eq!(first_job["state"], "refreshing");
+    assert_eq!(first_job["state"], "syncing_snapshot");
+    assert_eq!(first_job["completed_spans"], 0);
+    assert_eq!(first_job["total_spans"], 0);
+    assert_eq!(first_job["progress_unit"], "steps");
 
     let (code, out, err) = run_with_env(
         &[
@@ -2272,8 +2335,51 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     let db = find_graph_db(&store).expect("fixture graph.db must exist");
     let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
     let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
-    std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
     let live_lock = hold_exclusive_lock(&lock_path);
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(code, 75, "an active refresh is temporary; stderr={err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "status must not open/check the previous graph while its writer is active"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "indexing");
+    assert_eq!(status["store_exists"], true);
+    assert_eq!(status["writer_active"], true);
+
+    let job_path = db.parent().unwrap().join("index.job");
+    std::fs::write(
+        &job_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": std::process::id(),
+            "updated_at_unix_secs": 1,
+            "state": "building_base_summaries"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "stalled progress is still retryable; stderr={err}"
+    );
+    let stalled: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(stalled["progress_stalled"], true);
+    assert!(
+        stalled["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("may be stalled")
+                && message.contains("terminate only that process")),
+        "stalled status needs bounded recovery guidance: {stalled}"
+    );
+    std::fs::remove_file(job_path).unwrap();
+
+    std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
 
     let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(code, 75, "an active first index is temporary; stderr={err}");
@@ -2286,11 +2392,13 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     assert_eq!(status["writer_active"], true);
     assert_eq!(status["background_state"], "refreshing");
     assert_eq!(status["background_job"], serde_json::Value::Null);
+    assert!(status["writer_lock"].as_str().is_some());
     assert!(
         status["message"]
             .as_str()
-            .is_some_and(|message| message.contains("index build in progress")),
-        "status must explain the live foreground writer: {status}"
+            .is_some_and(|message| message.contains("phase=starting")
+                && message.contains("releases when its owning process exits")),
+        "status must explain the job-record startup race and crash-safe recovery: {status}"
     );
 
     drop(live_lock);
@@ -2303,6 +2411,159 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
     assert_eq!(status["status"], "no_index");
     assert_eq!(status["writer_active"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn first_use_index_is_bounded_and_reports_retryable_progress() {
+    let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
+    let ready = scratch.0.join("first-use-writer-ready");
+    let ready_string = ready.to_string_lossy().into_owned();
+    let envs = [
+        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+    ];
+
+    let started = std::time::Instant::now();
+    let (code, out, err) =
+        run_with_env(&["search-symbol", "first_use_marker"], &repo, &store, &envs);
+    let elapsed = started.elapsed();
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() && std::time::Instant::now() < ready_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        ready.exists(),
+        "background index never reached its test hold point"
+    );
+
+    fn find_index_job(dir: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_index_job(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("index.job") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let job_path = find_index_job(&store).expect("first-use background job record");
+    let job: serde_json::Value = serde_json::from_slice(&std::fs::read(job_path).unwrap()).unwrap();
+    let pid_value = job["pid"].as_u64().expect("background job pid");
+    let pid = pid_value.to_string();
+    let pid_i32 = i32::try_from(pid_value).expect("background job pid fits pid_t");
+    assert_eq!(
+        unsafe { libc::getpgid(pid_i32) },
+        pid_i32,
+        "first-use index must own a process group independent of its short-lived caller"
+    );
+    let killed = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("terminate held background index");
+    assert!(
+        killed.success(),
+        "failed to terminate background index {pid}"
+    );
+    assert_eq!(
+        code, 75,
+        "first use must be retryable; stdout={out} stderr={err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a navigation command must never wait for the full first index; elapsed={elapsed:?}"
+    );
+    assert!(
+        err.contains("first-use index started")
+            && err.contains("greppy index status --json")
+            && err.contains("healthy=true"),
+        "the refusal must provide state and exact recovery; stderr={err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_index_publishes_observable_progress_while_building() {
+    let (repo, store, _scratch) = make_repo("foreground-index-progress", "progress_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "fixture index should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        err.contains("index started")
+            && err.contains("phase=preparing_base")
+            && err.contains("greppy index status --json"),
+        "a foreground cold index must immediately explain that it is alive and where progress is reported: {err:?}"
+    );
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn refreshed_progress_marker() -> i32 { 8 }\n",
+    )
+    .unwrap();
+    let _writer = hold_index_before_publish(&repo, &store, "foreground-progress");
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "an in-progress foreground index is retryable; stderr={err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "status must remain lock-free while reporting foreground progress"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON: {e}; {out}"));
+    assert_eq!(status["status"], "indexing");
+    assert_eq!(status["writer_active"], true);
+    assert_eq!(status["background_job"]["cause"], "foreground-index");
+    assert_eq!(status["background_job"]["state"], "syncing_snapshot");
+    assert_eq!(status["background_job"]["completed_spans"], 0);
+    assert_eq!(status["background_job"]["total_spans"], 0);
+    assert_eq!(status["background_job"]["progress_unit"], "steps");
+    assert!(status["background_job"]["pid"].as_u64().is_some());
+    assert!(
+        status["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("progress")),
+        "status must direct the caller to the published progress record: {status}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn query_wait_for_active_refresh_is_bounded_and_actionable() {
+    let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "fixture index should succeed; stderr={err}\nstdout={out}"
+    );
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn new_refresh_marker() -> i32 { 9 }\n",
+    )
+    .unwrap();
+    let _writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&["search-symbol", "old_refresh_marker"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "refresh contention is temporary; stdout={out}\nstderr={err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "query must not wait for the held writer indefinitely"
+    );
+    assert!(err.contains("waiting up to 2s"), "stderr={err}");
+    assert!(err.contains("phase=syncing_snapshot"), "stderr={err}");
+    assert!(err.contains("greppy index status --json"), "stderr={err}");
 }
 
 #[test]

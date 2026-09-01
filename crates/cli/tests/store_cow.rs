@@ -43,6 +43,23 @@ fn run_with_env(
     overlay: Option<(&Path, &str)>,
     extra_env: &[(&str, &str)],
 ) -> (i32, String, String) {
+    let output = configured_command(repo, store, args, overlay, extra_env)
+        .output()
+        .expect("spawn greppy");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn configured_command(
+    repo: &Path,
+    store: &Path,
+    args: &[&str],
+    overlay: Option<(&Path, &str)>,
+    extra_env: &[(&str, &str)],
+) -> Command {
     let mut command = Command::new(bin());
     command
         .args(args)
@@ -64,12 +81,7 @@ fn run_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().expect("spawn greppy");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    command
 }
 
 fn index(repo: &Path, store: &Path, overlay: Option<(&Path, &str)>) {
@@ -151,6 +163,15 @@ fn normalize_ephemeral_fields(value: &mut serde_json::Value) {
             // result; two separately opened stores cannot have identical
             // wall-clock duration even when their visible state is equal.
             object.remove("elapsed_ms");
+            if object.contains_key("fresh")
+                && object.contains_key("state")
+                && object.contains_key("total_inventory")
+            {
+                // Overlay and full snapshots prove the same visible result
+                // through different mechanisms. The source is validated by
+                // dedicated status assertions below, not query parity.
+                object.remove("source");
+            }
             if object.contains_key("edge_type")
                 && object.contains_key("source_id")
                 && object.contains_key("target_id")
@@ -232,7 +253,10 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
         base_tree_oid: git(&base_repo, &["rev-parse", "HEAD^{tree}"]),
         store_schema_version: greppy_store::migrate::CURRENT_VERSION,
         indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
-        parser_and_extractor_versions: "fixture-parser-v1".into(),
+        parser_and_extractor_versions: format!(
+            "greppy-parser/extractor-{}",
+            env!("CARGO_PKG_VERSION")
+        ),
         summary_model_and_prompt_version: "fixture-summary-v1".into(),
         embedding_model: "fixture-embedding-v1".into(),
         embedding_prompt_version: "fixture-prompt-v1".into(),
@@ -272,6 +296,52 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
         ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
         ("GREPPY_AGENT_BASE_REUSED", "1"),
     ];
+    let progress_job_path = scratch.path().join("overlay-progress.json");
+    let progress_ready_path = scratch.path().join("overlay-progress-ready");
+    let progress_job = progress_job_path.to_string_lossy().into_owned();
+    let progress_ready = progress_ready_path.to_string_lossy().into_owned();
+    let progress_env = [
+        ("GREPPY_PROJECT_IDENTITY", "WALinuxAgent"),
+        ("GREPPY_AGENT_BASE_REUSED", "1"),
+        ("GREPPY_DELEGATED_BACKGROUND_JOB", progress_job.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_READY", progress_ready.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+    ];
+    let mut progress_child = configured_command(
+        &task_repo,
+        &delta_store,
+        &["index", "."],
+        overlay,
+        &progress_env,
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn held Delta index");
+    let progress_deadline = Instant::now() + Duration::from_secs(30);
+    while !progress_ready_path.exists() && Instant::now() < progress_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        progress_ready_path.exists(),
+        "Delta index never reached the publish failpoint"
+    );
+    let progress: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&progress_job_path).unwrap()).unwrap();
+    assert_ne!(
+        progress["state"], "indexing",
+        "an active Overlay graph build must publish its real indexer phase: {progress:#}"
+    );
+    assert!(
+        progress["progress_unit"].is_string(),
+        "Overlay progress must expose a meaningful unit: {progress:#}"
+    );
+    progress_child.kill().expect("terminate held Delta index");
+    progress_child.wait().expect("reap held Delta index");
+    std::fs::remove_dir_all(&delta_store).expect("remove interrupted test Delta store");
+    std::fs::remove_file(&progress_job_path).expect("remove delegated progress record");
+
     let (delta_code, delta_out, delta_err) = run_with_env(
         &task_repo,
         &delta_store,
@@ -310,6 +380,191 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
     assert_eq!(status["store_cow"]["base_complete"], true, "{status:#}");
     assert_eq!(status["store_cow"]["dirty_file_count"], 1, "{status:#}");
     assert_eq!(status["store_cow"]["deleted_file_count"], 0, "{status:#}");
+}
+
+#[test]
+fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let first = scratch.path().join("feature-one");
+    let second = scratch.path().join("feature-two");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn shared_base_symbol() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        primary.join("src/change.rs"),
+        "pub fn original_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(
+        &primary,
+        &["config", "user.email", "linked-cow@test.invalid"],
+    );
+    git(&primary, &["config", "user.name", "Linked Store CoW"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-one",
+            first.to_str().unwrap(),
+        ],
+    );
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-two",
+            second.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        first.join("src/change.rs"),
+        "pub fn feature_one_symbol() -> i32 { 11 }\n",
+    )
+    .unwrap();
+    git(&first, &["add", "src/change.rs"]);
+    git(&first, &["commit", "-q", "-m", "feature one"]);
+    std::fs::write(
+        second.join("src/change.rs"),
+        "pub fn feature_two_symbol() -> i32 { 22 }\n",
+    )
+    .unwrap();
+    git(&second, &["add", "src/change.rs"]);
+    git(&second, &["commit", "-q", "-m", "feature two"]);
+
+    let (first_code, first_stdout, first_stderr) = run(&first, &store, &["index", "."], None);
+    assert_eq!(
+        first_code, 0,
+        "first linked index failed\nstdout={first_stdout}\nstderr={first_stderr}"
+    );
+    assert!(
+        first_stdout.contains("indexed Delta generation")
+            && !first_stdout.contains("indexed 2 files"),
+        "linked worktree must publish only a Delta: {first_stdout}"
+    );
+    assert!(
+        first_stderr.contains("linked worktree uses shared Base")
+            && first_stderr.contains("(created)"),
+        "first linked worktree must create one shared Base: {first_stderr}"
+    );
+    let first_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(first_status["healthy"], true, "{first_status:#}");
+    assert_eq!(first_status["fresh"], true, "{first_status:#}");
+    assert_eq!(first_status["stats"]["files"], 2, "{first_status:#}");
+    assert_eq!(first_status["store_cow"]["mode"], "overlay");
+    assert_eq!(first_status["store_cow"]["base_complete"], true);
+    assert_eq!(first_status["store_cow"]["dirty_file_count"], 1);
+    let shared_identity = first_status["store_cow"]["base_identity"]
+        .as_str()
+        .expect("first Base identity")
+        .to_string();
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "shared_base_symbol"],
+        None,
+    )
+    .contains("shared_base_symbol"));
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "feature_one_symbol"],
+        None,
+    )
+    .contains("feature_one_symbol"));
+
+    let (second_code, second_stdout, second_stderr) = run_with_env(
+        &second,
+        &store,
+        &["index", "."],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        second_code, 0,
+        "second linked index failed\nstdout={second_stdout}\nstderr={second_stderr}"
+    );
+    assert!(second_stdout.contains("indexed Delta generation"));
+    assert!(
+        second_stderr.contains("linked worktree uses shared Base")
+            && second_stderr.contains("(reused)"),
+        "second linked worktree must reuse the existing Base: {second_stderr}"
+    );
+    let second_status = query_json_raw(&second, &store, &["index", "status"], None);
+    assert_eq!(second_status["healthy"], true, "{second_status:#}");
+    assert_eq!(second_status["stats"]["files"], 2, "{second_status:#}");
+    assert_eq!(second_status["store_cow"]["base_identity"], shared_identity);
+    assert_eq!(second_status["store_cow"]["dirty_file_count"], 1);
+    assert!(query_text(
+        &second,
+        &store,
+        &["search-symbol", "feature_two_symbol"],
+        None,
+    )
+    .contains("feature_two_symbol"));
+
+    // The first process's environment is gone. A fresh query still composes
+    // its Base+Delta from the binding persisted in its private graph.
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "feature_one_symbol"],
+        None,
+    )
+    .contains("feature_one_symbol"));
+
+    // A later primary-branch commit must not invalidate every existing
+    // worktree's pinned Base. Refreshing this Delta reuses its persisted
+    // binding and performs no second temporary clean checkout.
+    std::fs::write(
+        primary.join("src/later.rs"),
+        "pub fn later_primary_symbol() -> i32 { 33 }\n",
+    )
+    .unwrap();
+    git(&primary, &["add", "src/later.rs"]);
+    git(&primary, &["commit", "-q", "-m", "advance primary"]);
+    std::fs::write(
+        first.join("src/untracked.rs"),
+        "pub fn first_untracked_symbol() -> i32 { 44 }\n",
+    )
+    .unwrap();
+    let (refresh_code, refresh_stdout, refresh_stderr) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        refresh_code, 0,
+        "pinned Delta refresh failed\nstdout={refresh_stdout}\nstderr={refresh_stderr}"
+    );
+    assert!(refresh_stderr.contains("(reused)"), "{refresh_stderr}");
+    let refreshed_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        refreshed_status["store_cow"]["base_identity"],
+        shared_identity
+    );
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "first_untracked_symbol"],
+        None,
+    )
+    .contains("first_untracked_symbol"));
 }
 
 #[test]
@@ -358,7 +613,10 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
         base_tree_oid: git(&repo, &["rev-parse", "HEAD^{tree}"]),
         store_schema_version: greppy_store::migrate::CURRENT_VERSION,
         indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
-        parser_and_extractor_versions: "fixture-parser-v1".into(),
+        parser_and_extractor_versions: format!(
+            "greppy-parser/extractor-{}",
+            env!("CARGO_PKG_VERSION")
+        ),
         summary_model_and_prompt_version: "fixture-summary-v1".into(),
         embedding_model: "fixture-embedding-v1".into(),
         embedding_prompt_version: "fixture-prompt-v1".into(),
@@ -618,6 +876,61 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
             .unwrap();
         assert_eq!(count, 0, "exact revert must empty Delta table {table}");
     }
+
+    let (clean_code, clean_out, clean_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        clean_code, 0,
+        "clean overlay status failed\nstdout={clean_out}\nstderr={clean_err}"
+    );
+    let clean_status: serde_json::Value = serde_json::from_str(&clean_out).unwrap();
+    assert_eq!(clean_status["healthy"], true, "{clean_status:#}");
+    assert_eq!(
+        clean_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{clean_status:#}"
+    );
+    assert_eq!(clean_status["freshness"]["total_inventory"], 4);
+
+    // Live Git visibility is an exact cheap invalidation oracle: adding a
+    // dirty path after publication must downgrade immediately, without a
+    // redundant full repository walk. After indexing that one path, the same
+    // proof validates only its private Delta content and becomes healthy.
+    std::fs::write(
+        repo.join("src/clean.rs"),
+        "pub fn clean_after_status_edit() -> i32 { 31 }\n",
+    )
+    .unwrap();
+    let (drift_code, drift_out, drift_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        drift_code, 73,
+        "dirty overlay status must fail closed\nstdout={drift_out}\nstderr={drift_err}"
+    );
+    let drift_status: serde_json::Value = serde_json::from_str(&drift_out).unwrap();
+    assert_eq!(
+        drift_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{drift_status:#}"
+    );
+    assert_eq!(
+        drift_status["freshness"]["changed_paths"],
+        serde_json::json!(["src/clean.rs"]),
+        "{drift_status:#}"
+    );
+
+    index(&repo, &delta_store, overlay);
+    let (indexed_code, indexed_out, indexed_err) =
+        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    assert_eq!(
+        indexed_code, 0,
+        "indexed dirty overlay status failed\nstdout={indexed_out}\nstderr={indexed_err}"
+    );
+    let indexed_status: serde_json::Value = serde_json::from_str(&indexed_out).unwrap();
+    assert_eq!(indexed_status["healthy"], true, "{indexed_status:#}");
+    assert_eq!(
+        indexed_status["freshness"]["source"], "verified_store_cow_overlay",
+        "{indexed_status:#}"
+    );
+    assert_eq!(indexed_status["store_cow"]["dirty_file_count"], 1);
 }
 
 fn timed_query(

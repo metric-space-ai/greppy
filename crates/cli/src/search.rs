@@ -153,6 +153,8 @@ pub(crate) fn semantic_embedding_indexing_json(
             "freshness": freshness,
             "retryable": true,
             "retry_after_seconds": retry_after_seconds,
+            "exit_code": EXIT_TEMPFAIL,
+            "retry_when": "greppy index status --json reports embedding_complete=true",
             "embedding_index": progress,
             "query_tokens": semantic_fallback_tokens(fallback.query),
             "next": semantic_fallback_commands(fallback.query, fallback.paths, fallback.root),
@@ -971,7 +973,7 @@ fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
             print_search_row(
                 &row.hit.file,
                 row.hit.line,
-                &nav_short_name(node),
+                &display_node_name(node),
                 None,
                 row.test,
             );
@@ -1286,9 +1288,12 @@ pub(crate) fn dispatch_semantic(
                     },
                 )?;
             } else {
-                println!("{}", embedding_progress_text(&progress));
+                println!(
+                    "semantic search temporarily unavailable — {}; retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit {EXIT_TEMPFAIL})",
+                    embedding_progress_text(&progress)
+                );
             }
-            return Ok(1);
+            return Ok(EXIT_TEMPFAIL as i32);
         }
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
             &project,

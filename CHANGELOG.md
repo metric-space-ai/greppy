@@ -4,6 +4,77 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [0.3.4] — 2026-08-30
 
+### Worktree indexing and agent feedback fixes
+
+- Ordinary linked Git worktrees now share one immutable, Git-tree-bound Base
+  index and publish only their committed/dirty private Delta. The binding is
+  persisted per worktree, stays pinned when the primary checkout advances,
+  and later worktrees reuse a verified Base without another checkout or full
+  repository walk.
+- `index status` is lock-free while an index writer is active and reports the
+  foreground phase, completed/total spans and ETA when available. Semantic
+  search against an incomplete embedding generation now returns temporary
+  exit 75 with an explicit `index status --json` retry condition.
+- Cold graph builds publish real discovery, extraction, graph-write and
+  structural phases with phase-local file/folder/edge counts. Structural
+  edges are committed in one transaction instead of one transaction per
+  edge, removing the multi-minute structural tail on large repositories.
+  Active work is no longer mislabeled as stalled at zero percent. Cold model
+  loading uses its own bounded stall threshold rather than the ordinary
+  two-minute graph threshold. A linked worktree waiting on
+  another immutable-Base publisher now stops after a bounded five seconds
+  with exit 75, the exact builder-lock path and retry guidance instead of
+  blocking silently in `flock` under the stale `preparing_base_checkout`
+  phase.
+- Immutable-Base publication no longer synchronously generates thousands of
+  derived text summaries. The fully validated graph and embeddings publish
+  immediately with a model-bound empty summary cache; requested summaries are
+  generated lazily in the private workspace cache. A busy summary daemon can
+  therefore no longer discard an otherwise healthy Base, and genuine Base
+  failures persist their exact terminal error in `index status --json` instead
+  of the generic `background index exited before successful publication`.
+- First-use graph navigation starts indexing as one observable background job
+  and waits at most two seconds for publication. Large repositories therefore
+  return retryable exit 75 instead of hiding an unbounded index walk. Job state
+  is published before process launch, immutable-Base child progress is relayed
+  under the outer owner PID, and a status record with no update for two minutes
+  is marked potentially stalled with bounded recovery guidance.
+- Stale graph navigation no longer hides model loading or a large full-store
+  rebuild inside `read`, `who-calls`, or another query. Vector-backed and large
+  stores start one observable background refresh and return bounded retry
+  guidance; small graph-only edits retain fast inline healing.
+- `bash-smart` now emits a liveness heartbeat after 15 seconds of silent child
+  execution and once per minute thereafter, including the direct child PID and
+  elapsed time, so active `cargo`, `rustfmt`, and test runs are not mistaken for
+  dead wrappers while their output is being compactly captured.
+- Background first-use indexers run in an independent OS process group (and a
+  detached no-window class on Windows), so an agent runner can return the
+  bounded retry response without its process cleanup killing the cache build.
+- A foreground `greppy index` now prints an immediate `preparing_base` line
+  with its PID and the exact nonblocking status command, so a cold build on a
+  large repository is never indistinguishable from a silent orphaned process.
+- `bash-smart` no longer opens writable graph-pack storage while an indexer
+  owns the workspace lock; the requested process starts immediately and only
+  optional expansion storage is skipped. Implicit grep pipelines now allow a
+  five-second producer-start window, preventing loaded but valid producers
+  such as `ps` from being misreported as missing stdin.
+- Exact `read-file --all` and `read-file --lines` operations no longer open or
+  migrate the graph store, so they remain available during concurrent first
+  indexing and cannot collide with the indexer's schema publication.
+- Linked-worktree root validation is structural on Windows and accepts the
+  equivalent long-path/8.3 spellings emitted by the OS without weakening the
+  rejection of real partial-subdirectory indexing.
+- Literal-search text rows emit lossless qualified locators accepted by
+  `greppy read`; enclosing provider nodes no longer produce a short name that
+  cannot be read back.
+- Edit verification selects a local verifier for the touched language instead
+  of an unrelated root manifest, streams start/still-running/final state,
+  never downloads a checker, and terminates the verifier process tree at a
+  bounded timeout with an actionable direct command.
+- Grep/rg passthrough tolerates realistically delayed pipeline producers. An
+  explicit `-` remains the unbounded, byte-exact contract for slow producers,
+  while an idle implicit stdin still fails with bounded recovery guidance.
+
 ### Portable Chunk-CoW agent workspaces (0.3.4)
 
 `greppy -p` now has one fail-closed workspace path on macOS ARM64, Linux

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use greppy_core::error::{Error, Result};
-use greppy_store::{BaseStoreIdentity, BaseStoreLayout, VisibilityIndex};
+use greppy_store::{BaseBuilderLease, BaseStoreIdentity, BaseStoreLayout, VisibilityIndex};
 use sha2::{Digest, Sha256};
 
 pub(crate) const ENV_MODE: &str = "GREPPY_AGENT_STORE_MODE";
@@ -12,16 +12,32 @@ pub(crate) const ENV_BASE_PATH: &str = "GREPPY_AGENT_BASE_STORE";
 pub(crate) const ENV_BASE_COMMIT: &str = "GREPPY_AGENT_BASE_COMMIT";
 pub(crate) const ENV_BASE_REUSED: &str = "GREPPY_AGENT_BASE_REUSED";
 pub(crate) const ENV_FALLBACK_REASON: &str = "GREPPY_AGENT_STORE_FALLBACK_REASON";
+pub(crate) const ENV_DISABLE_AUTO_LINKED_WORKTREE: &str = "GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW";
 pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
+const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
+const BASE_BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
+#[cfg(debug_assertions)]
+const ENV_TEST_FORBID_TEMP_BASE_CHECKOUT: &str = "GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverlaySpec {
     pub base_path: PathBuf,
     pub visibility: VisibilityIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverlayFreshnessProof {
+    Fresh {
+        total_inventory: usize,
+    },
+    Stale {
+        changed_paths: Vec<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -30,6 +46,25 @@ pub(crate) struct PreparedBase {
     pub identity_hash: String,
     pub reused: bool,
     _reader_lease: greppy_store::BaseReaderLease,
+}
+
+/// Keeps the clean Base workspace and its reader lease alive for the complete
+/// linked-worktree Delta publication. Environment changes are command-scoped
+/// and restored for in-process tests.
+pub(crate) struct AutoLinkedWorktreeOverlay {
+    _prepared: PreparedBase,
+    restore: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Drop for AutoLinkedWorktreeOverlay {
+    fn drop(&mut self) {
+        for (name, value) in self.restore.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
 }
 
 pub(crate) fn overlay_spec(root: &Path) -> Result<Option<OverlaySpec>> {
@@ -44,7 +79,7 @@ pub(crate) fn overlay_spec_live(root: &Path) -> Result<Option<OverlaySpec>> {
 }
 
 fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Option<OverlaySpec>> {
-    let Some((base_path, base_commit)) = overlay_environment()? else {
+    let Some((base_path, base_commit)) = overlay_environment(root)? else {
         return Ok(None);
     };
     let visibility = if allow_cached_visibility {
@@ -59,22 +94,315 @@ fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Opti
     }))
 }
 
-pub(crate) fn overlay_environment() -> Result<Option<(PathBuf, String)>> {
-    if std::env::var(ENV_MODE).ok().as_deref() != Some(MODE_OVERLAY) {
+pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String)>> {
+    if let Ok(mode) = std::env::var(ENV_MODE) {
+        if mode != MODE_OVERLAY {
+            return Ok(None);
+        }
+        let base_path = std::env::var_os(ENV_BASE_PATH)
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::Invalid(format!("{ENV_MODE}=overlay without {ENV_BASE_PATH}")))?;
+        if !base_path.is_file() {
+            return Err(Error::Invalid(format!(
+                "configured immutable Base Store is missing: {}; run `greppy index` to rebuild the linked-worktree Base",
+                base_path.display()
+            )));
+        }
+        let base_commit = std::env::var(ENV_BASE_COMMIT)
+            .map_err(|_| Error::Invalid(format!("{ENV_MODE}=overlay without {ENV_BASE_COMMIT}")))?;
+        return Ok(Some((base_path, base_commit)));
+    }
+
+    let delta_path = crate::workspace_locator::store_path(root);
+    if !delta_path.is_file() {
         return Ok(None);
     }
-    let base_path = std::env::var_os(ENV_BASE_PATH)
+    let Ok(connection) = rusqlite::Connection::open_with_flags(
+        &delta_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        // This lookup runs before the normal snapshot integrity/recovery path.
+        // A corrupt or legacy active DB cannot contain a trustworthy binding;
+        // let the indexer quarantine/replace it instead of blocking recovery.
+        return Ok(None);
+    };
+    let raw = match connection.query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        [OVERLAY_BINDING_META_KEY],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        // Missing schema_meta (old snapshot) and corrupt SQLite are handled by
+        // the ordinary index integrity path. Neither is evidence of a usable
+        // persisted overlay binding.
+        Err(_) => return Ok(None),
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        Error::Invalid(format!("decode linked-worktree Delta binding: {error}"))
+    })?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(Error::Invalid(
+            "unsupported linked-worktree Delta binding version; run `greppy index` to rebuild it"
+                .into(),
+        ));
+    }
+    let base_path = value
+        .get("base_path")
+        .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
-        .ok_or_else(|| Error::Invalid(format!("{ENV_MODE}=overlay without {ENV_BASE_PATH}")))?;
+        .ok_or_else(|| Error::Invalid("linked-worktree Delta binding lacks base_path".into()))?;
     if !base_path.is_file() {
         return Err(Error::Invalid(format!(
-            "configured immutable Base Store is missing: {}",
+            "linked-worktree Base Store is missing: {}; run `greppy index` to rebuild it",
             base_path.display()
         )));
     }
-    let base_commit = std::env::var(ENV_BASE_COMMIT)
-        .map_err(|_| Error::Invalid(format!("{ENV_MODE}=overlay without {ENV_BASE_COMMIT}")))?;
+    let base_commit = value
+        .get("base_commit")
+        .and_then(serde_json::Value::as_str)
+        .filter(|commit| {
+            matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            Error::Invalid("linked-worktree Delta binding has invalid base_commit".into())
+        })?
+        .to_string();
+    let project = value
+        .get("project")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Invalid("linked-worktree Delta binding lacks project".into()))?;
+    let expected_project = greppy_core::project_identity(root);
+    if project != expected_project {
+        return Err(Error::Invalid(format!(
+            "linked-worktree Base project mismatch: binding `{project}`, workspace `{expected_project}`; run `greppy index` to rebuild the binding"
+        )));
+    }
     Ok(Some((base_path, base_commit)))
+}
+
+/// Prove freshness from the immutable Base plus the small private Delta.
+///
+/// A Store-CoW query must not re-walk and stat/hash the complete repository:
+/// the published Base already binds an exact Git tree and the Delta binding
+/// persists the paths hidden from that Base. We still fail closed. The fast
+/// proof verifies the published Base bytes, its tree and project identity,
+/// compares the persisted visibility with live Git, and validates the current
+/// contents of every dirty path against the private Delta. Any shape we do not
+/// understand returns `None` so the ordinary full-inventory check remains the
+/// fallback.
+pub(crate) fn overlay_freshness_proof(
+    root: &Path,
+    store: &greppy_store::Store,
+    project: &str,
+) -> Result<Option<OverlayFreshnessProof>> {
+    if !store.is_overlay() {
+        return Ok(None);
+    }
+    let Some((base_path, base_commit)) = overlay_environment(root)? else {
+        return Ok(None);
+    };
+    let Some(cached) = cached_visibility(root, &base_commit) else {
+        return Ok(None);
+    };
+    let cached = cached?;
+    let live = visibility_against(root, &base_commit)?;
+    if cached != live {
+        let mut changed = cached
+            .dirty_paths()
+            .chain(cached.deleted_paths())
+            .chain(live.dirty_paths())
+            .chain(live.deleted_paths())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        changed.sort();
+        changed.dedup();
+        return Ok(Some(OverlayFreshnessProof::Stale {
+            changed_paths: changed,
+            reason: "live Git changes differ from the indexed Store-CoW Delta".into(),
+        }));
+    }
+
+    let attached = store.overlay_base_path().ok_or_else(|| {
+        Error::Invalid("Store reports overlay mode without an attached Base".into())
+    })?;
+    if !paths_resolve_equal(attached, &base_path) {
+        return Err(Error::Invalid(format!(
+            "attached Base {} differs from bound Base {}",
+            attached.display(),
+            base_path.display()
+        )));
+    }
+    let manifest = verified_manifest_for_graph(&base_path)
+        .map_err(|error| Error::io("verify immutable Store-CoW Base", error))?;
+    let tree_expr = format!("{base_commit}^{{tree}}");
+    let live_base_tree = git_output(root, &["rev-parse", &tree_expr])?;
+    if live_base_tree != manifest.identity.base_tree_oid {
+        return Err(Error::Invalid(format!(
+            "Store-CoW Base tree mismatch: binding {live_base_tree}, manifest {}",
+            manifest.identity.base_tree_oid
+        )));
+    }
+    if manifest.identity.store_schema_version != greppy_store::migrate::CURRENT_VERSION
+        || manifest.identity.indexer_version != greppy_core::INDEXER_VERSION_BASE
+        || manifest.identity.parser_and_extractor_versions
+            != format!("greppy-parser/extractor-{}", env!("CARGO_PKG_VERSION"))
+    {
+        return Ok(None);
+    }
+
+    let base_project_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM greppy_base.projects WHERE name = ?1",
+            [project],
+            |row| row.get(0),
+        )
+        .map_err(|error| Error::Store(format!("verify Store-CoW Base project: {error}")))?;
+    if base_project_count != 1 {
+        return Err(Error::Invalid(format!(
+            "Store-CoW Base project mismatch: expected exactly `{project}`"
+        )));
+    }
+    let root_string = root.to_string_lossy();
+    let Some(workspace) = store
+        .get_workspace_state(&root_string)
+        .map_err(|error| Error::Store(format!("read Store-CoW workspace state: {error}")))?
+    else {
+        return Ok(None);
+    };
+    if workspace.schema_version != greppy_store::migrate::CURRENT_VERSION
+        || workspace.indexer_version != greppy_core::INDEXER_VERSION_BASE
+        || workspace.graph_generation == 0
+    {
+        return Ok(None);
+    }
+
+    let dirty = cached
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deleted = cached
+        .deleted_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    for rel_path in &deleted {
+        match std::fs::symlink_metadata(root.join(rel_path)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Ok(Some(OverlayFreshnessProof::Stale {
+                    changed_paths: vec![(*rel_path).to_owned()],
+                    reason: "a path recorded as deleted exists again".into(),
+                }));
+            }
+            Err(error) => {
+                return Err(Error::io(
+                    format!("stat deleted Store-CoW path {rel_path}"),
+                    error,
+                ));
+            }
+        }
+    }
+
+    let identities = store
+        .list_file_identities(project)
+        .map_err(|error| Error::Store(format!("read Store-CoW file identities: {error}")))?;
+    for rel_path in &dirty {
+        if !persisted_delta_path_matches(root, store, project, rel_path, &identities)? {
+            return Ok(Some(OverlayFreshnessProof::Stale {
+                changed_paths: vec![(*rel_path).to_owned()],
+                reason: "a Store-CoW Delta path changed after it was indexed".into(),
+            }));
+        }
+    }
+
+    let mut private_paths = std::collections::BTreeSet::new();
+    for query in [
+        "SELECT rel_path FROM main.file_state",
+        "SELECT rel_path FROM main.index_skips",
+        "SELECT file_path FROM main.nodes WHERE file_path <> ''",
+        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
+        "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+    ] {
+        let mut statement = store
+            .conn()
+            .prepare(query)
+            .map_err(|error| Error::Store(format!("inspect Store-CoW Delta paths: {error}")))?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| Error::Store(format!("query Store-CoW Delta paths: {error}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
+        private_paths.extend(paths);
+    }
+    if let Some(unbound) = private_paths
+        .iter()
+        .find(|path| !dirty.contains(path.as_str()))
+    {
+        return Err(Error::Invalid(format!(
+            "private Store-CoW row `{unbound}` is absent from the Delta visibility manifest"
+        )));
+    }
+
+    let total_inventory = store
+        .file_count(project)
+        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
+    let total_inventory = usize::try_from(total_inventory)
+        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
+    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+fn persisted_delta_path_matches(
+    root: &Path,
+    store: &greppy_store::Store,
+    project: &str,
+    rel_path: &str,
+    identities: &std::collections::HashMap<String, greppy_store::FileIdentity>,
+) -> Result<bool> {
+    let path = root.join(rel_path);
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| Error::io(format!("stat Store-CoW Delta path {rel_path}"), error))?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let current = greppy_discover::stable_metadata(&metadata);
+    if let Some(state) = store
+        .get_file_state(project, rel_path)
+        .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
+    {
+        let identity = identities.get(rel_path);
+        let stat_matches = state.size >= 0
+            && state.size as u64 == current.size
+            && current.mtime_ns == Some(state.mtime_ns)
+            && identity.is_some_and(|identity| {
+                identity.ctime_ns == current.ctime_ns && identity.file_id == current.file_id
+            });
+        if stat_matches {
+            return Ok(true);
+        }
+        if current.size > greppy_freshness::incremental::MAX_FILE_SIZE_BYTES {
+            return Ok(false);
+        }
+        let (bytes, _) = greppy_discover::read_stable_file(&path)
+            .map_err(|error| Error::io(format!("read Store-CoW Delta path {rel_path}"), error))?;
+        return Ok(greppy_store::file_state::sha256_hex(&bytes) == state.sha256);
+    }
+    if let Some(skip) = store
+        .get_index_skip(project, rel_path)
+        .map_err(|error| Error::Store(format!("read Store-CoW skip state: {error}")))?
+    {
+        return Ok(skip.size >= 0
+            && skip.size as u64 == current.size
+            && current.mtime_ns == Some(skip.mtime_ns)
+            && skip.ctime_ns == current.ctime_ns
+            && skip.file_id == current.file_id);
+    }
+    Ok(false)
+}
+
+fn paths_resolve_equal(left: &Path, right: &Path) -> bool {
+    left == right
+        || left.canonicalize().ok() == right.canonicalize().ok()
+        || left == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
 }
 
 fn cached_visibility(root: &Path, base_commit: &str) -> Option<Result<VisibilityIndex>> {
@@ -152,6 +480,30 @@ pub(crate) fn persist_visibility(
     Ok(())
 }
 
+pub(crate) fn persist_overlay_binding(
+    store: &greppy_store::Store,
+    base_path: &Path,
+    base_commit: &str,
+    project: &str,
+) -> Result<()> {
+    let value = serde_json::json!({
+        "version": 1,
+        "base_path": base_path,
+        "base_commit": base_commit,
+        "project": project,
+    });
+    let raw = serde_json::to_string(&value)
+        .map_err(|error| Error::Invalid(format!("serialize Store-CoW binding: {error}")))?;
+    store
+        .conn()
+        .execute(
+            "INSERT INTO schema_meta(key, value) VALUES(?1, ?2)\n             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (OVERLAY_BINDING_META_KEY, raw),
+        )
+        .map_err(|error| Error::Store(format!("persist Store-CoW binding: {error}")))?;
+    Ok(())
+}
+
 pub(crate) fn configure_overlay_environment(prepared: &PreparedBase, base_commit: &str) {
     std::env::set_var(ENV_MODE, MODE_OVERLAY);
     std::env::set_var(ENV_BASE_PATH, &prepared.graph_path);
@@ -191,13 +543,38 @@ fn diagnostics_inner(
     store: Option<&greppy_store::Store>,
     delta_path: &Path,
 ) -> serde_json::Value {
-    let configured_mode = std::env::var(ENV_MODE).ok();
+    let resolved_binding = overlay_environment(root);
+    let binding_is_persisted = std::env::var_os(ENV_MODE).is_none();
+    let configured_mode = std::env::var(ENV_MODE).ok().or_else(|| {
+        resolved_binding
+            .as_ref()
+            .ok()
+            .and_then(|binding| binding.as_ref())
+            .map(|_| MODE_OVERLAY.to_string())
+    });
     let fallback_reason = std::env::var(ENV_FALLBACK_REASON).ok();
-    let base_commit = std::env::var(ENV_BASE_COMMIT).ok();
+    let base_commit = std::env::var(ENV_BASE_COMMIT).ok().or_else(|| {
+        resolved_binding
+            .as_ref()
+            .ok()
+            .and_then(|binding| binding.as_ref())
+            .map(|(_, commit)| commit.clone())
+    });
     let base_reused = std::env::var(ENV_BASE_REUSED)
         .ok()
         .as_deref()
-        .map(|value| value == "1");
+        .map(|value| value == "1")
+        .or_else(|| {
+            binding_is_persisted
+                .then(|| {
+                    resolved_binding
+                        .as_ref()
+                        .ok()
+                        .and_then(|binding| binding.as_ref())
+                        .map(|_| true)
+                })
+                .flatten()
+        });
 
     let mut base_path = None;
     let mut base_identity = None;
@@ -205,7 +582,7 @@ fn diagnostics_inner(
     let mut dirty_paths = None;
     let mut deleted_paths = None;
     let mut delta_identity = None;
-    let mut error = None;
+    let mut error = resolved_binding.err().map(|issue| issue.to_string());
     if configured_mode.as_deref() == Some(MODE_OVERLAY) {
         match overlay_spec(root) {
             Ok(Some(spec)) => {
@@ -303,9 +680,267 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn report_base_phase(path: Option<&Path>, phase: &str) {
+    let Some(path) = path else { return };
+    let Some(mut job) = crate::read_background_job(path) else {
+        return;
+    };
+    job["state"] = serde_json::json!(phase);
+    job["updated_at_unix_secs"] = serde_json::json!(crate::unix_now_secs_cli());
+    job["completed_spans"] = serde_json::json!(0);
+    job["total_spans"] = serde_json::json!(0);
+    job["progress_milli_percent"] = serde_json::json!(0);
+    job["progress_unit"] = serde_json::json!("steps");
+    job["rate_milli_spans_per_second"] = serde_json::Value::Null;
+    job["eta_seconds"] = serde_json::Value::Null;
+    job["eta_minutes"] = serde_json::Value::Null;
+    job["eta_unix_secs"] = serde_json::Value::Null;
+    job["last_error"] = serde_json::Value::Null;
+    let _ = crate::write_background_job(path, &job);
+}
+
+fn acquire_base_builder(
+    layout: &BaseStoreLayout,
+    identity_hash: &str,
+    progress_path: Option<&Path>,
+    max_wait: std::time::Duration,
+) -> Result<BaseBuilderLease> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(lease) = layout
+            .acquire_builder(true)
+            .map_err(|error| Error::io("acquire Base Store builder lease", error))?
+        {
+            return Ok(lease);
+        }
+        report_base_phase(progress_path, "waiting_for_base_builder");
+        if started.elapsed() >= max_wait {
+            let lock_path = layout
+                .builder_lock_path()
+                .map_err(|error| Error::io("resolve Base builder lock", error))?;
+            return Err(Error::Lock(format!(
+                "another worktree is building immutable Base {identity_hash}; lock {}; wait for that build to publish, then rerun `greppy index`",
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250).min(max_wait));
+    }
+}
+
+/// Prepare an immutable Base from the primary checkout and attach the current
+/// linked Git worktree as a private Delta. The primary checkout's HEAD is the
+/// repository-wide pinned Base; committed branch differences, dirty files and
+/// untracked files are all represented by [`visibility_against`].
+pub(crate) fn prepare_auto_linked_worktree_overlay(
+    root: &Path,
+    shared_data_root: &Path,
+    embedding_args: crate::EmbeddingCliArgs<'_>,
+    progress_path: Option<&Path>,
+) -> Result<Option<AutoLinkedWorktreeOverlay>> {
+    if std::env::var(ENV_DISABLE_AUTO_LINKED_WORKTREE)
+        .ok()
+        .as_deref()
+        == Some("1")
+        || std::env::var_os(ENV_MODE).is_some()
+        || !root.join(".git").is_file()
+    {
+        return Ok(None);
+    }
+    let primary = primary_worktree_root(root)?;
+    let project = greppy_core::project_identity(&primary);
+    let names = [
+        greppy_core::PROJECT_IDENTITY_ENV,
+        ENV_MODE,
+        ENV_BASE_PATH,
+        ENV_BASE_COMMIT,
+        ENV_BASE_REUSED,
+        ENV_FALLBACK_REASON,
+        ENV_DISABLE_AUTO_LINKED_WORKTREE,
+    ];
+    let restore = names
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, &project);
+    std::env::set_var(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1");
+
+    let outcome = (|| {
+        // Keep an existing worktree pinned to its verified Base. Advancing the
+        // primary checkout must not force every already-indexed worktree to
+        // build a new repository-wide Base on its next Delta refresh.
+        let persisted = overlay_environment(root)?;
+        let reused_persisted = match persisted {
+            Some((_, commit)) => {
+                reuse_verified_base_store(&primary, &commit, shared_data_root, &project)?
+                    .map(|prepared| (commit, prepared))
+            }
+            None => None,
+        };
+        let (base_commit, prepared) = match reused_persisted {
+            Some(binding) => binding,
+            None => {
+                let base_commit = git_output(&primary, &["rev-parse", "HEAD"])?;
+                let prepared = match reuse_verified_base_store(
+                    &primary,
+                    &base_commit,
+                    shared_data_root,
+                    &project,
+                )? {
+                    Some(prepared) => prepared,
+                    None => {
+                        // Only the first worktree for this immutable Git tree
+                        // needs a clean materialization. Every later worktree
+                        // opens the hash-verified published Base directly.
+                        report_base_phase(progress_path, "preparing_base_checkout");
+                        let clean = TemporaryBaseWorktree::create(
+                            &primary,
+                            shared_data_root,
+                            &base_commit,
+                        )?;
+                        prepare_base_store_paths(
+                            &primary,
+                            clean.path(),
+                            clean.path(),
+                            &base_commit,
+                            shared_data_root,
+                            embedding_args,
+                            progress_path,
+                        )?
+                    }
+                };
+                (base_commit, prepared)
+            }
+        };
+        configure_overlay_environment(&prepared, &base_commit);
+        eprintln!(
+            "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",
+            &prepared.identity_hash[..12],
+            base_commit,
+            if prepared.reused { "reused" } else { "created" },
+        );
+        Ok::<_, Error>(prepared)
+    })();
+
+    match outcome {
+        Ok(prepared) => Ok(Some(AutoLinkedWorktreeOverlay {
+            _prepared: prepared,
+            restore,
+        })),
+        Err(error) => {
+            for (name, value) in restore.into_iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+struct TemporaryBaseWorktree {
+    primary: PathBuf,
+    path: PathBuf,
+    _parent: tempfile::TempDir,
+}
+
+impl TemporaryBaseWorktree {
+    fn create(primary: &Path, shared_data_root: &Path, base_commit: &str) -> Result<Self> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os(ENV_TEST_FORBID_TEMP_BASE_CHECKOUT).is_some() {
+            return Err(Error::Invalid(
+                "test forbids a second temporary Base checkout".into(),
+            ));
+        }
+        std::fs::create_dir_all(shared_data_root)
+            .map_err(|error| Error::io("create shared Base root", error))?;
+        let parent = tempfile::Builder::new()
+            .prefix("greppy-linked-base-checkout-")
+            .tempdir_in(shared_data_root)
+            .map_err(|error| Error::io("create clean Base checkout parent", error))?;
+        let path = parent.path().join("worktree");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(primary)
+            .args(["worktree", "add", "--detach", "--force"])
+            .arg(&path)
+            .arg(base_commit)
+            .output()
+            .map_err(|error| Error::io("create clean Base checkout", error))?;
+        if !output.status.success() {
+            return Err(Error::Invalid(format!(
+                "cannot create clean Base checkout: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(Self {
+            primary: primary.to_path_buf(),
+            path,
+            _parent: parent,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn base_identity(workspace: &greppy_agent::workspace::AgentWorkspace) -> Result<BaseStoreIdentity> {
+    let repo = workspace.repo_root();
+    let canonical_repository_identity = canonical_repository_identity(repo)?;
+    let tree_expr = format!("{}^{{tree}}", workspace.base_commit());
+    let base_tree_oid = git_output(repo, &["rev-parse", &tree_expr])?;
+    let git_object_format = git_output(repo, &["rev-parse", "--show-object-format"])
+        .unwrap_or_else(|_| {
+            if base_tree_oid.len() == 64 {
+                "sha256"
+            } else {
+                "sha1"
+            }
+            .into()
+        });
+    let embedding = crate::embedding_config_for_required_use(crate::EmbeddingCliArgs {
+        device: None,
+        no_gpu: false,
+    })?;
+    let summary_model = crate::qwen_summary_config_optional()?
+        .map(|config| {
+            format!(
+                "{}#{}",
+                crate::qwen_summary_model_key(&config),
+                crate::SUMMARY_CACHE_GENERATION
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "unavailable/{}#{}",
+                greppy_qwen35_native::PROMPT_VERSION,
+                crate::SUMMARY_CACHE_GENERATION
+            )
+        });
+    Ok(BaseStoreIdentity {
+        format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+        canonical_repository_identity,
+        git_object_format,
+        base_tree_oid,
+        store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+        indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+        parser_and_extractor_versions: format!(
+            "greppy-parser/extractor-{}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        summary_model_and_prompt_version: summary_model,
+        embedding_model: embedding.model_id,
+        embedding_prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+        embedding_dimensions: greppy_embed_native::EMBEDDING_DIM,
+        embedding_encoding: "f32+i8-v1".into(),
+    })
+}
+
 /// Reuse an already-published Base without ever building one synchronously.
 /// Interactive startup uses this fast path so a cold Base cannot hide a full
-/// embedding run behind an opaque pre-TUI phase.
+/// embedding run behind an opaque pre-TUI phase. (Branch TUI fast path; the
+/// verified reuse below is the core campaign's path.)
 pub(crate) fn try_reuse_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
@@ -330,18 +965,111 @@ pub(crate) fn try_reuse_base_store(
     prepared_base_with_reader(&layout, manifest, true).map(Some)
 }
 
+fn reuse_verified_base_store(
+    repo_root: &Path,
+    base_commit: &str,
+    shared_data_root: &Path,
+    project: &str,
+) -> Result<Option<PreparedBase>> {
+    let identity = base_identity_parts(repo_root, base_commit)?;
+    let layout = BaseStoreLayout::new(shared_data_root, &identity)
+        .map_err(|error| Error::io("construct Base Store layout", error))?;
+    let Ok(manifest) = layout.read_verified_manifest() else {
+        return Ok(None);
+    };
+    if validate_base_contents_for_project(project, &layout.graph, &identity).is_err()
+        || greppy_store::SummaryCache::open_read_only(
+            layout
+                .summary_cache
+                .parent()
+                .ok_or_else(|| Error::Invalid("Base summary cache has no parent".into()))?,
+        )
+        .is_err()
+    {
+        return Ok(None);
+    }
+    prepared_base_with_reader(&layout, manifest, true).map(Some)
+}
+
+impl Drop for TemporaryBaseWorktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.primary)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .status();
+    }
+}
+
+fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
+    let expected_repository = canonical_repository_identity(root)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .map_err(|error| Error::io("list linked Git worktrees", error))?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "cannot list linked Git worktrees: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    for field in output.stdout.split(|byte| *byte == 0) {
+        let Some(path) = field.strip_prefix(b"worktree ") else {
+            continue;
+        };
+        let path = std::str::from_utf8(path)
+            .map_err(|_| Error::Invalid("Git worktree path is not valid UTF-8".into()))?;
+        let candidate = PathBuf::from(path);
+        if candidate.join(".git").is_dir()
+            && canonical_repository_identity(&candidate)? == expected_repository
+        {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+    Err(Error::Invalid(format!(
+        "linked worktree {} has no available primary checkout; restore the primary checkout before indexing",
+        root.display()
+    )))
+}
+
 pub(crate) fn prepare_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
 ) -> Result<PreparedBase> {
-    let identity = base_identity(workspace)?;
+    prepare_base_store_paths(
+        workspace.repo_root(),
+        workspace.repository_path(),
+        workspace.worktree_path(),
+        workspace.base_commit(),
+        shared_data_root,
+        embedding_args,
+        None,
+    )
+}
+
+fn prepare_base_store_paths(
+    repo_root: &Path,
+    source_path: &Path,
+    worktree_path: &Path,
+    base_commit: &str,
+    shared_data_root: &Path,
+    embedding_args: crate::EmbeddingCliArgs<'_>,
+    progress_path: Option<&Path>,
+) -> Result<PreparedBase> {
+    let identity = base_identity_parts(repo_root, base_commit)?;
+    let identity_hash = identity
+        .hash()
+        .map_err(|error| Error::io("hash Base Store identity", error))?;
     let layout = BaseStoreLayout::new(shared_data_root, &identity)
         .map_err(|error| Error::io("construct Base Store layout", error))?;
     if let Ok(manifest) = layout.read_verified_manifest() {
-        if validate_base_contents(workspace.worktree_path(), &layout.graph, &identity).is_ok()
+        if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
-                workspace.worktree_path(),
+                worktree_path,
                 &layout.graph,
                 &layout.summary_cache,
                 &identity,
@@ -352,14 +1080,16 @@ pub(crate) fn prepare_base_store(
         }
     }
 
-    let builder_lease = layout
-        .acquire_builder(false)
-        .map_err(|error| Error::io("acquire Base Store builder lease", error))?
-        .ok_or_else(|| Error::Lock("blocking Base builder lease returned no guard".into()))?;
+    // Never disappear into a blocking flock behind another worktree's Base
+    // build. That build can legitimately take minutes, but this caller must
+    // remain observable and bounded so agents can retry the completed Base
+    // instead of abandoning Greppy as hung.
+    let builder_lease =
+        acquire_base_builder(&layout, &identity_hash, progress_path, BASE_BUILDER_WAIT)?;
     if let Ok(manifest) = layout.read_verified_manifest() {
-        if validate_base_contents(workspace.worktree_path(), &layout.graph, &identity).is_ok()
+        if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
-                workspace.worktree_path(),
+                worktree_path,
                 &layout.graph,
                 &layout.summary_cache,
                 &identity,
@@ -373,7 +1103,8 @@ pub(crate) fn prepare_base_store(
     layout
         .quarantine_current()
         .map_err(|error| Error::io("quarantine invalid Base Store", error))?;
-    let expected_file_count = validate_workspace_inventory(workspace)?;
+    report_base_phase(progress_path, "validating_base_inventory");
+    let expected_file_count = validate_workspace_inventory(source_path, worktree_path)?;
 
     std::fs::create_dir_all(shared_data_root)
         .map_err(|error| Error::io("create shared Base data root", error))?;
@@ -386,6 +1117,7 @@ pub(crate) fn prepare_base_store(
         .map_err(|error| Error::io("create Base build data directory", error))?;
     let binary = std::env::current_exe()
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
+    report_base_phase(progress_path, "building_base_graph");
     let mut command = Command::new(binary);
     command.arg("index");
     #[cfg(any(
@@ -397,18 +1129,28 @@ pub(crate) fn prepare_base_store(
         command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
     }
     append_embedding_cli_args(&mut command, embedding_args);
-    let status = command
-        .current_dir(workspace.worktree_path())
+    command
+        .current_dir(worktree_path)
         .env("GREPPY_STORE_DIR", &staging_data)
         // A published Base is not valid until every candidate has its vector;
         // never let the ordinary foreground-index lazy threshold hand this
         // build to a background process outside the publication lease.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
+        .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
+        .env_remove("GREPPY_BACKGROUND_JOB")
+        .env_remove("GREPPY_BACKGROUND_CAUSE")
+        .env_remove("GREPPY_BACKGROUND_KIND")
+        .env_remove("GREPPY_BACKGROUND_STARTED_AT")
+        .env_remove("GREPPY_BACKGROUND_TARGET_GENERATION")
         .env_remove(ENV_MODE)
         .env_remove(ENV_BASE_PATH)
         .env_remove(ENV_BASE_COMMIT)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::null());
+    if let Some(path) = progress_path {
+        command.env(crate::ENV_DELEGATED_BACKGROUND_JOB, path);
+    }
+    let status = command
         .status()
         .map_err(|error| Error::io("start immutable Base index build", error))?;
     if !status.success() {
@@ -419,7 +1161,7 @@ pub(crate) fn prepare_base_store(
     let staged_graph = staging_data
         .join("workspaces")
         .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
-        .join(greppy_core::workspace_hash(workspace.worktree_path()))
+        .join(greppy_core::workspace_hash(worktree_path))
         .join("graph.db");
     if !staged_graph.is_file() {
         return Err(Error::Invalid(format!(
@@ -437,21 +1179,19 @@ pub(crate) fn prepare_base_store(
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
-    validate_base_contents(workspace.worktree_path(), &staged_graph, &identity)?;
+    validate_base_contents(worktree_path, &staged_graph, &identity)?;
     validate_base_file_count(&staged_graph, expected_file_count)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some() {
         return Err(Error::Invalid(
-            "injected immutable Base summary generation failure".into(),
+            "injected immutable Base summary cache publication failure".into(),
         ));
     }
-    let staged_summary_cache = build_base_summary_cache(
-        workspace.worktree_path(),
-        &staged_graph,
-        &identity.summary_model_and_prompt_version,
-    )?;
+    report_base_phase(progress_path, "initializing_base_summary_cache");
+    let staged_summary_cache =
+        build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)?;
     validate_base_summary_cache(
-        workspace.worktree_path(),
+        worktree_path,
         &staged_graph,
         &staged_summary_cache,
         &identity,
@@ -463,9 +1203,7 @@ pub(crate) fn prepare_base_store(
     prepared_base_with_reader(&layout, manifest, false)
 }
 
-fn validate_workspace_inventory(
-    workspace: &greppy_agent::workspace::AgentWorkspace,
-) -> Result<usize> {
+fn validate_workspace_inventory(source_path: &Path, worktree_path: &Path) -> Result<usize> {
     fn inventory(root: &Path) -> Result<Vec<(String, Option<u64>)>> {
         greppy_discover::walk(root)
             .map(|entries| {
@@ -482,8 +1220,8 @@ fn validate_workspace_inventory(
             })
     }
 
-    let expected = inventory(workspace.repository_path())?;
-    let actual = inventory(workspace.worktree_path())?;
+    let expected = inventory(source_path)?;
+    let actual = inventory(worktree_path)?;
     if expected == actual {
         return Ok(expected.len());
     }
@@ -540,6 +1278,14 @@ fn validate_base_contents(
     graph_path: &Path,
     identity: &BaseStoreIdentity,
 ) -> Result<()> {
+    validate_base_contents_for_project(&greppy_core::project_identity(root), graph_path, identity)
+}
+
+fn validate_base_contents_for_project(
+    project: &str,
+    graph_path: &Path,
+    identity: &BaseStoreIdentity,
+) -> Result<()> {
     let store = greppy_store::Store::open_with(graph_path, greppy_store::OpenOptions::read_only())?;
     store.integrity_check()?;
     let schema_version: Option<u32> = store
@@ -560,14 +1306,13 @@ fn validate_base_contents(
                 .unwrap_or_else(|| "missing".into())
         )));
     }
-    let project = greppy_core::project_identity(root);
     let generation = store
         .list_workspace_states()?
         .into_iter()
         .map(|state| state.graph_generation)
         .max()
         .ok_or_else(|| Error::Invalid("Base build has no workspace generation".into()))?;
-    let completion_key = crate::embedding_complete_key(&project);
+    let completion_key = crate::embedding_complete_key(project);
     let completion: Option<String> = store
         .conn()
         .query_row(
@@ -588,7 +1333,7 @@ fn validate_base_contents(
         )));
     }
     let provider_failures = store
-        .list_provider_states(&project)?
+        .list_provider_states(project)?
         .into_iter()
         .filter(|provider| provider.status != "unsupported")
         .map(|provider| provider.files_failed.max(0) as u64)
@@ -619,11 +1364,7 @@ fn prepared_base_with_reader(
     })
 }
 
-fn build_base_summary_cache(
-    root: &Path,
-    graph_path: &Path,
-    expected_model_key: &str,
-) -> Result<PathBuf> {
+fn build_base_summary_cache(graph_path: &Path, expected_model_key: &str) -> Result<PathBuf> {
     let summary_dir = graph_path
         .parent()
         .ok_or_else(|| Error::Invalid("staged Base graph has no parent".into()))?
@@ -655,29 +1396,16 @@ fn build_base_summary_cache(
             "Base summary model identity changed during publication".into(),
         ));
     }
-    let expected = expected_base_summary_spans(root, graph_path)?;
-    for (file_path, start_line, source, _) in &expected {
-        crate::summarize_source_cached(
-            &config,
-            &model_key,
-            Some(&cache),
-            None,
-            file_path,
-            source,
-            true,
-        )
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "Base summary generation failed for {file_path}:{start_line}"
-            ))
-        })?;
-    }
-    let actual = cache.count()? as usize;
-    if actual != expected.len() {
-        return Err(Error::Invalid(format!(
-            "Base summary cache is incomplete: expected {} entries, found {actual}",
-            expected.len()
-        )));
+    // Summaries are derived navigation output, not graph correctness data.
+    // Eagerly generating one summary for every definition made a cold Base
+    // take hours and allowed a transient summary daemon failure to discard an
+    // otherwise complete graph and embedding generation. Publish a verified
+    // empty cache bound to the model identity; navigation fills the private
+    // workspace cache lazily on an actual summary request.
+    if cache.count()? != 0 {
+        return Err(Error::Invalid(
+            "new Base summary cache unexpectedly contains entries".into(),
+        ));
     }
     drop(cache);
     Ok(summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE))
@@ -756,10 +1484,17 @@ fn validate_base_summary_cache(
         }
         return Ok(());
     }
+    // An empty Base summary cache is the intentional lazy-summary contract.
+    // The manifest still authenticates the empty SQLite file and the Base
+    // identity still pins the model/prompt generation. Non-empty legacy or
+    // externally warmed caches are validated below for bounded completeness.
+    if actual == 0 {
+        return Ok(());
+    }
     let expected = expected_base_summary_spans(root, graph_path)?;
-    if actual != expected.len() {
+    if actual > expected.len() {
         return Err(Error::Invalid(format!(
-            "Base summary cache is incomplete: expected {} entries, found {actual}",
+            "Base summary cache has more entries than the visible graph: maximum {}, found {actual}",
             expected.len()
         )));
     }
@@ -776,10 +1511,9 @@ fn validate_base_summary_cache(
     Ok(())
 }
 
-fn base_identity(workspace: &greppy_agent::workspace::AgentWorkspace) -> Result<BaseStoreIdentity> {
-    let repo = workspace.repo_root();
+fn base_identity_parts(repo: &Path, base_commit: &str) -> Result<BaseStoreIdentity> {
     let canonical_repository_identity = canonical_repository_identity(repo)?;
-    let tree_expr = format!("{}^{{tree}}", workspace.base_commit());
+    let tree_expr = format!("{base_commit}^{{tree}}");
     let base_tree_oid = git_output(repo, &["rev-parse", &tree_expr])?;
     let git_object_format = git_output(repo, &["rev-parse", "--show-object-format"])
         .unwrap_or_else(|_| {
@@ -987,6 +1721,59 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn concurrent_base_builder_wait_is_bounded_and_actionable() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let progress_path = data_root.path().join("index.job");
+        crate::write_background_job(
+            &progress_path,
+            &serde_json::json!({
+                "schema_version": crate::BACKGROUND_JOB_SCHEMA_VERSION,
+                "kind": "index",
+                "pid": std::process::id(),
+                "started_at_unix_secs": 1,
+                "updated_at_unix_secs": 1,
+                "state": "preparing_base_checkout"
+            }),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = match acquire_base_builder(
+            &layout,
+            &identity_hash,
+            Some(&progress_path),
+            std::time::Duration::from_millis(20),
+        ) {
+            Ok(_) => panic!("second Base builder unexpectedly acquired the held lease"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("another worktree is building immutable Base"));
+        assert!(message.contains(&identity_hash));
+        assert!(message.contains("rerun `greppy index`"));
+        assert!(message.contains(
+            layout
+                .builder_lock_path()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ));
+        let progress = crate::read_background_job(&progress_path).unwrap();
+        assert_eq!(progress["state"], "waiting_for_base_builder");
+        assert_eq!(progress["progress_unit"], "steps");
+        assert_eq!(progress["completed_spans"], 0);
+        assert_eq!(progress["total_spans"], 0);
     }
 
     #[test]

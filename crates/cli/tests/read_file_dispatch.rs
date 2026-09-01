@@ -200,6 +200,9 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
 fn read_file_range_and_all_bypass_pagination() {
     let (repo, store) = fresh_workspace("range-all");
     std::fs::write(repo.join("config.json"), "a\nb\nc\nd\n").unwrap();
+    // Exact reads must not touch the graph store. A concurrent first index
+    // can be creating/migrating it, and read-file must remain deterministic.
+    std::fs::write(&store, "not a store directory").unwrap();
 
     let (code, stdout, stderr) = run(
         &repo,
@@ -212,6 +215,43 @@ fn read_file_range_and_all_bypass_pagination() {
     let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
     assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
     assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+}
+
+#[test]
+fn concurrent_read_file_ranges_never_report_empty_success() {
+    let (repo, store) = fresh_workspace("parallel-range");
+    let content = (1..=128)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("source.txt"), content).unwrap();
+
+    let workers = (0..12)
+        .map(|_| {
+            let repo = repo.clone();
+            let store = store.clone();
+            std::thread::spawn(move || {
+                run(
+                    &repo,
+                    &store,
+                    &["read-file", "source.txt", "--lines", "32:96"],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for worker in workers {
+        let (code, stdout, stderr) = worker.join().expect("read worker");
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.starts_with("source.txt:32-96\nline 32\n"),
+            "{stdout}"
+        );
+        assert!(stdout.ends_with("line 96\n"), "{stdout}");
+        assert!(
+            !stdout.is_empty(),
+            "successful read-file output must not be empty"
+        );
+    }
 }
 
 #[test]

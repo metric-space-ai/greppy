@@ -186,6 +186,29 @@ pub struct IndexReport {
     pub files_skipped_by_time_budget: usize,
 }
 
+/// Observable progress for the non-embedding part of an index build.
+///
+/// The CLI persists these events in the background-job record so a large
+/// repository cannot look stalled while files are actively being parsed or
+/// written into the graph. Counts are phase-local: a new phase starts at zero
+/// and completes at `total_files`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBuildProgress {
+    pub phase: &'static str,
+    pub completed_files: usize,
+    pub total_files: usize,
+}
+
+impl IndexBuildProgress {
+    fn new(phase: &'static str, completed_files: usize, total_files: usize) -> Self {
+        Self {
+            phase,
+            completed_files,
+            total_files,
+        }
+    }
+}
+
 impl IndexReport {
     pub fn is_clean(&self) -> bool {
         self.files_unreadable == 0
@@ -204,23 +227,6 @@ pub struct IndexOptions {
     /// extraction and structural contributions are restricted to paths owned
     /// by the private Delta.
     pub only_paths: Option<std::collections::BTreeSet<String>>,
-}
-
-/// Observable progress for the graph-index phase.  The callback variant of
-/// the indexer uses actual inventory work units, so interactive clients can
-/// show an honest percentage and derive a rate/ETA without duplicating file
-/// discovery or extraction logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexProgress {
-    pub stage: IndexProgressStage,
-    pub completed_files: usize,
-    pub total_files: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexProgressStage {
-    Analyze,
-    Store,
 }
 
 /// Run the indexer against `root`. The store is mutated in-place; nodes
@@ -247,14 +253,18 @@ pub fn index_with_options(
     index_with_options_and_progress(store, root, project_name, options, &mut |_| {})
 }
 
-/// Run the indexer with explicit discovery options and graph progress.
+/// Run the indexer with explicit discovery options and report real work as it
+/// completes. The callback is invoked serially, including when extraction is
+/// parallel, so callers do not need synchronization around their progress
+/// sink.
 pub fn index_with_options_and_progress(
     store: &mut Store,
     root: &Path,
     project_name: &str,
     options: &IndexOptions,
-    progress: &mut dyn FnMut(IndexProgress),
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<IndexReport> {
+    progress(IndexBuildProgress::new("discovering_files", 0, 0));
     let abs_root = greppy_discover::detect_repo_root(root)?;
     let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
         &abs_root,
@@ -269,6 +279,11 @@ pub fn index_with_options_and_progress(
     } else {
         discovered_entries
     };
+    progress(IndexBuildProgress::new(
+        "classifying_files",
+        0,
+        all_entries.len(),
+    ));
 
     let mut report = IndexReport {
         project: project_name.to_string(),
@@ -326,11 +341,6 @@ pub fn index_with_options_and_progress(
     let controls = IndexControls::from_env();
     let controlled_entries = apply_large_repo_controls(&all_entries, &controls, &mut report);
     let entries = controlled_entries.active;
-    progress(IndexProgress {
-        stage: IndexProgressStage::Analyze,
-        completed_files: 0,
-        total_files: entries.len(),
-    });
 
     // Did a prior run of THIS (migrated) indexer materialize raw edges for
     // this project? We must NOT treat a run as incremental unless the store's
@@ -400,8 +410,15 @@ pub fn index_with_options_and_progress(
         // PHASE B (incremental). Re-resolve only the edges that PHASE A's
         // FK-cascade removed (or whose resolution could have flipped),
         // instead of the whole project's raw edges.
-        report.edges_extracted =
-            resolve_edges_incremental(store, project_name, &changed_files, &def_fp_before)?;
+        progress(IndexBuildProgress::new("resolving_edges", 0, 1));
+        report.edges_extracted = resolve_edges_incremental(
+            store,
+            project_name,
+            &changed_files,
+            &def_fp_before,
+            progress,
+        )?;
+        progress(IndexBuildProgress::new("resolving_edges", 1, 1));
     } else {
         let profile = std::env::var("GREPPY_PROFILE").is_ok();
         let t = std::time::Instant::now();
@@ -429,7 +446,8 @@ pub fn index_with_options_and_progress(
             eprintln!("[profile] load_all_raw_edges {:?}", t.elapsed());
         }
         let t = std::time::Instant::now();
-        report.edges_extracted = resolve_and_persist_edges(store, project_name, &raw_edges)?;
+        report.edges_extracted =
+            resolve_and_persist_edges_with_progress(store, project_name, &raw_edges, progress)?;
         if profile {
             eprintln!("[profile] resolve_and_persist_edges {:?}", t.elapsed());
         }
@@ -442,7 +460,14 @@ pub fn index_with_options_and_progress(
     // File→DEFINES targets are resolvable. Node/edge upserts make it
     // idempotent across incremental re-indexes; a deleted file's File node is
     // removed by the per-file node cascade in `run_incremental`.
-    structural::build_structural(store, project_name, &entries)?;
+    structural::build_structural(
+        store,
+        project_name,
+        &entries,
+        &mut |phase, completed, total| {
+            progress(IndexBuildProgress::new(phase, completed, total));
+        },
+    )?;
 
     // `require`/`import`→File IMPORTS. A path-style import
     // (Ruby `require 'record'`, Clojure `(:require ..)`, Elm/Erlang/Zig/Dart
@@ -453,7 +478,9 @@ pub fn index_with_options_and_progress(
     // maps to exactly one File basename stem, link the importer's Module node
     // to that File. Symbol-resolving imports (rust/python/java — already at
     // parity) are re-checked and skipped, so nothing is double-counted.
+    progress(IndexBuildProgress::new("resolving_file_imports", 0, 1));
     resolve_file_imports(store, project_name)?;
+    progress(IndexBuildProgress::new("resolving_file_imports", 1, 1));
 
     record_control_skips(store, project_name, &controlled_entries.skipped, generation)?;
 
@@ -464,11 +491,7 @@ pub fn index_with_options_and_progress(
     sync_provider_states(store, project_name, &all_entries, generation)?;
 
     report.graph_generation = generation;
-    progress(IndexProgress {
-        stage: IndexProgressStage::Store,
-        completed_files: entries.len(),
-        total_files: entries.len(),
-    });
+    progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
 
@@ -495,15 +518,18 @@ fn run_full(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
-    progress: &mut dyn FnMut(IndexProgress),
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<()> {
     let max_size = max_file_size_bytes();
-    let total_files = entries.len();
-    let mut completed_files = 0usize;
 
     // ── Classification (serial, cheap stat only) ────────────────────
     let mut supported: Vec<(usize, &InventoryEntry, Language)> = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
+        progress(IndexBuildProgress::new(
+            "classifying_files",
+            idx,
+            entries.len(),
+        ));
         let lang = greppy_parser::language_for_path(&entry.abs_path);
         if !lang.is_supported() {
             report.files_unsupported_language += 1;
@@ -521,12 +547,6 @@ fn run_full(
                 "language provider is unsupported",
                 generation,
             )?;
-            completed_files = completed_files.saturating_add(1);
-            progress(IndexProgress {
-                stage: IndexProgressStage::Analyze,
-                completed_files,
-                total_files,
-            });
             continue;
         }
         // Skip oversized files before reading them.
@@ -542,30 +562,29 @@ fn run_full(
                     &format!("file size {} exceeds cap {}", md.len(), max_size),
                     generation,
                 )?;
-                completed_files = completed_files.saturating_add(1);
-                progress(IndexProgress {
-                    stage: IndexProgressStage::Analyze,
-                    completed_files,
-                    total_files,
-                });
                 continue;
             }
         }
         supported.push((idx, entry, lang));
     }
+    progress(IndexBuildProgress::new(
+        "classifying_files",
+        entries.len(),
+        entries.len(),
+    ));
 
     // ── PHASE A1 — parallel extract (CPU-bound, no store) ───────────
     let profile = std::env::var("GREPPY_PROFILE").is_ok();
     let t_a1 = std::time::Instant::now();
-    let classified_files = completed_files;
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
     let (extractions, throttled) =
-        parallel_extract(&supported, worker_count, &mut |extracted_files| {
-            progress(IndexProgress {
-                stage: IndexProgressStage::Analyze,
-                completed_files: classified_files.saturating_add(extracted_files),
-                total_files,
-            });
-        });
+        parallel_extract(&supported, worker_count, &mut extraction_progress);
     report.throttled_for_memory = throttled;
     if profile {
         eprintln!(
@@ -576,16 +595,17 @@ fn run_full(
 
     // ── PHASE A2 — serial store writes (single-writer) ──────────────
     let t_a2 = std::time::Instant::now();
-    progress(IndexProgress {
-        stage: IndexProgressStage::Store,
-        completed_files: 0,
-        total_files: 0,
-    });
     // Content rows are collected here and written in ONE batched transaction
     // after the loop (see insert_file_content_batch) — content-FTS was the
     // dominant cold-index cost and one-commit-per-file was much of it.
     let mut content_batch: Vec<(String, Vec<greppy_store::ContentRow>)> = Vec::new();
-    for outcome in extractions {
+    let extraction_count = extractions.len();
+    progress(IndexBuildProgress::new(
+        "writing_graph",
+        0,
+        extraction_count,
+    ));
+    for (position, outcome) in extractions.into_iter().enumerate() {
         match outcome {
             FileOutcome::Extracted {
                 rel_path,
@@ -646,6 +666,11 @@ fn run_full(
                 )?;
             }
         }
+        progress(IndexBuildProgress::new(
+            "writing_graph",
+            position + 1,
+            extraction_count,
+        ));
     }
     // One transaction for ALL files' content (vs one per file before).
     if !content_batch.is_empty() {
@@ -676,15 +701,13 @@ fn run_incremental(
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
-    progress: &mut dyn FnMut(IndexProgress),
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<std::collections::HashSet<String>> {
     let max_size = max_file_size_bytes();
     let mut changed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Diff the on-disk inventory against the persisted file_state.
     let diffs = greppy_freshness::compute_file_diff(store, project_name, entries)?;
-    let total_files = diffs.len();
-    let mut completed_files = 0usize;
 
     // Map rel_path → inventory entry so a diff can recover the abs_path /
     // language for re-extraction.
@@ -698,12 +721,6 @@ fn run_incremental(
         match diff {
             greppy_freshness::FileDiff::Unchanged => {
                 report.files_skipped += 1;
-                completed_files = completed_files.saturating_add(1);
-                progress(IndexProgress {
-                    stage: IndexProgressStage::Analyze,
-                    completed_files,
-                    total_files,
-                });
             }
             greppy_freshness::FileDiff::Deleted(rel) => {
                 // Remove the file's nodes (FK-cascades its edges), content,
@@ -714,12 +731,6 @@ fn run_incremental(
                 store.delete_index_skip(project_name, rel)?;
                 delete_raw_edges_for_file(store, project_name, rel)?;
                 changed_files.insert(rel.clone());
-                completed_files = completed_files.saturating_add(1);
-                progress(IndexProgress {
-                    stage: IndexProgressStage::Analyze,
-                    completed_files,
-                    total_files,
-                });
             }
             greppy_freshness::FileDiff::Added(entry)
             | greppy_freshness::FileDiff::Modified { entry, .. } => {
@@ -747,12 +758,6 @@ fn run_incremental(
                     let _ = store.delete_nodes_for_file(project_name, &entry.rel_path)?;
                     let _ = store.delete_file_content(project_name, &entry.rel_path)?;
                     delete_raw_edges_for_file(store, project_name, &entry.rel_path)?;
-                    completed_files = completed_files.saturating_add(1);
-                    progress(IndexProgress {
-                        stage: IndexProgressStage::Analyze,
-                        completed_files,
-                        total_files,
-                    });
                     continue;
                 }
                 if let Ok(md) = std::fs::metadata(&full_entry.abs_path) {
@@ -771,12 +776,6 @@ fn run_incremental(
                         let _ = store.delete_nodes_for_file(project_name, &entry.rel_path)?;
                         let _ = store.delete_file_content(project_name, &entry.rel_path)?;
                         delete_raw_edges_for_file(store, project_name, &entry.rel_path)?;
-                        completed_files = completed_files.saturating_add(1);
-                        progress(IndexProgress {
-                            stage: IndexProgressStage::Analyze,
-                            completed_files,
-                            total_files,
-                        });
                         continue;
                     }
                 }
@@ -793,22 +792,23 @@ fn run_incremental(
 
     // Re-extract the changed files in parallel, then apply writes serially
     // in inventory order (same determinism contract as the full path).
-    let classified_files = completed_files;
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
     let (extractions, throttled) =
-        parallel_extract(&changed, worker_count, &mut |extracted_files| {
-            progress(IndexProgress {
-                stage: IndexProgressStage::Analyze,
-                completed_files: classified_files.saturating_add(extracted_files),
-                total_files,
-            });
-        });
+        parallel_extract(&changed, worker_count, &mut extraction_progress);
     report.throttled_for_memory = throttled;
-    progress(IndexProgress {
-        stage: IndexProgressStage::Store,
-        completed_files: 0,
-        total_files: 0,
-    });
-    for outcome in extractions {
+    let extraction_count = extractions.len();
+    progress(IndexBuildProgress::new(
+        "writing_graph",
+        0,
+        extraction_count,
+    ));
+    for (position, outcome) in extractions.into_iter().enumerate() {
         match outcome {
             FileOutcome::Extracted {
                 rel_path,
@@ -856,6 +856,11 @@ fn run_incremental(
                 )?;
             }
         }
+        progress(IndexBuildProgress::new(
+            "writing_graph",
+            position + 1,
+            extraction_count,
+        ));
     }
 
     // Every persisted file or skip row that survived this run reflects the
@@ -1051,9 +1056,10 @@ fn validate_or_degrade(
 fn parallel_extract(
     supported: &[(usize, &InventoryEntry, Language)],
     worker_count: usize,
-    progress: &mut dyn FnMut(usize),
+    progress: &mut dyn FnMut(usize, usize),
 ) -> (Vec<FileOutcome>, bool) {
     let n = supported.len();
+    progress(0, n);
     if n == 0 {
         return (Vec::new(), false);
     }
@@ -1063,9 +1069,13 @@ fn parallel_extract(
     if worker_count <= 1 || n == 1 {
         let out = supported
             .iter()
-            .map(|(_, entry, lang)| extract_one(entry, *lang))
+            .enumerate()
+            .map(|(position, (_, entry, lang))| {
+                let outcome = extract_one(entry, *lang);
+                progress(position + 1, n);
+                outcome
+            })
             .collect();
-        progress(n);
         return (out, false);
     }
 
@@ -1080,9 +1090,13 @@ fn parallel_extract(
         Err(_) => {
             let out = supported
                 .iter()
-                .map(|(_, entry, lang)| extract_one(entry, *lang))
+                .enumerate()
+                .map(|(position, (_, entry, lang))| {
+                    let outcome = extract_one(entry, *lang);
+                    progress(position + 1, n);
+                    outcome
+                })
                 .collect();
-            progress(n);
             return (out, false);
         }
     };
@@ -1099,9 +1113,7 @@ fn parallel_extract(
     // still executes at most `worker_count` parses simultaneously; the wider
     // window only gives idle workers enough queued files to steal. We retain
     // periodic memory-budget checks between bounded windows.
-    // Four waves keep enough work available for stealing while giving the
-    // startup UI regular, honest progress updates on medium-sized projects.
-    const WORK_STEALING_WINDOW_MULTIPLIER: usize = 4;
+    const WORK_STEALING_WINDOW_MULTIPLIER: usize = 16;
     let chunk = worker_count
         .saturating_mul(WORK_STEALING_WINDOW_MULTIPLIER)
         .max(worker_count)
@@ -1113,10 +1125,12 @@ fn parallel_extract(
         // parse trees in memory at once.
         if greppy_core::mem_over_budget() {
             throttled = true;
-            for (slot, (_, entry, lang)) in slots[pos..].iter_mut().zip(&supported[pos..]) {
+            for (offset, (slot, (_, entry, lang))) in
+                slots[pos..].iter_mut().zip(&supported[pos..]).enumerate()
+            {
                 *slot = Some(extract_one(entry, *lang));
+                progress(pos + offset + 1, n);
             }
-            progress(n);
             break;
         }
 
@@ -1132,7 +1146,7 @@ fn parallel_extract(
             *slot = Some(res);
         }
         pos = end;
-        progress(pos);
+        progress(pos, n);
     }
 
     let out = slots
@@ -1394,6 +1408,15 @@ fn resolve_and_persist_edges(
     project: &str,
     edges: &[ExtractedEdge],
 ) -> Result<usize> {
+    resolve_and_persist_edges_with_progress(store, project, edges, &mut |_| {})
+}
+
+fn resolve_and_persist_edges_with_progress(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
     let mut index = GraphIndex::load(store, project)?;
@@ -1407,10 +1430,18 @@ fn resolve_and_persist_edges(
     // IMPORTS edge and a reference edge never share endpoints, so no
     // edge's resolution is affected by the reordering.
     let mut resolved: Vec<NewEdge> = Vec::with_capacity(edges.len());
+    let mut examined = 0usize;
+    progress(IndexBuildProgress::new("resolving_edges", 0, edges.len()));
 
     // PASS 1 — IMPORTS. Record each resolved target into the index so the
     // reference pass can read a file's imports back.
     for edge in edges.iter().filter(|e| e.edge_type == "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            edges.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1445,6 +1476,12 @@ fn resolve_and_persist_edges(
 
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
     for edge in edges.iter().filter(|e| e.edge_type != "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            edges.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1491,6 +1528,7 @@ fn resolve_and_persist_edges(
     // Persist every resolved edge in a SINGLE transaction (was: one
     // transaction per edge). Determinism is unchanged — the edge order is
     // the same IMPORTS-then-references order resolved above.
+    progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     if store.is_overlay() {
         let logical = resolved
             .iter()
@@ -1522,6 +1560,7 @@ fn resolve_and_persist_edges(
     } else {
         insert_edges_batched(store, &resolved)?;
     }
+    progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
 }
 
@@ -1842,6 +1881,7 @@ fn resolve_edges_incremental(
     project: &str,
     changed_files: &std::collections::HashSet<String>,
     def_fp_before: &std::collections::BTreeSet<String>,
+    progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<usize> {
     // No file changed → nothing cascaded, graph already complete. O(1).
     if changed_files.is_empty() {
@@ -1855,7 +1895,7 @@ fn resolve_edges_incremental(
     if store.is_overlay() {
         let raw_edges = load_all_raw_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges(store, project, &raw_edges);
+        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
     }
 
     // Did a changed file alter the resolvable definition set? If so, an
@@ -1879,7 +1919,7 @@ fn resolve_edges_incremental(
             .map_err(sqlite_err)?;
         let raw_edges = load_all_raw_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges(store, project, &raw_edges);
+        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
     }
 
     // ── Pure body edit(s): def set unchanged. Re-resolve only the cascaded
@@ -1895,6 +1935,8 @@ fn resolve_edges_incremental(
     // Load the whole raw-edge set once (a single indexed read; no per-edge
     // resolution). We then resolve ONLY the candidate subset.
     let all_raw = load_all_raw_edges(store, project)?;
+    let mut examined = 0usize;
+    progress(IndexBuildProgress::new("resolving_edges", 0, all_raw.len()));
 
     let owned_by_changed = |e: &ExtractedEdge| changed_files.contains(source_file_of(e));
     let names_changed_def = |e: &ExtractedEdge| edge_references_name(e, &changed_def_names);
@@ -1916,6 +1958,12 @@ fn resolve_edges_incremental(
     }
     let mut resolved: Vec<NewEdge> = Vec::new();
     for edge in all_raw.iter().filter(|e| e.edge_type == "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            all_raw.len(),
+        ));
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
@@ -1958,6 +2006,12 @@ fn resolve_edges_incremental(
 
     // PASS 2 — reference edges. Resolve only candidates.
     for edge in all_raw.iter().filter(|e| e.edge_type != "IMPORTS") {
+        examined += 1;
+        progress(IndexBuildProgress::new(
+            "resolving_edges",
+            examined,
+            all_raw.len(),
+        ));
         if !is_candidate(edge) {
             continue;
         }
@@ -1993,7 +2047,9 @@ fn resolve_edges_incremental(
         resolved.push(new_edge(project, src_id, target_id, edge));
     }
 
+    progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     insert_edges_batched(store, &resolved)?;
+    progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     // The total live edge count = the survivors PHASE A kept + what we just
     // re-inserted (the `ON CONFLICT` upsert means a re-inserted row that
     // happened to survive is not double-counted by the COUNT).
@@ -3532,6 +3588,35 @@ mod tests {
     }
 
     #[test]
+    fn index_progress_reports_real_file_work_before_embeddings() {
+        let repo = setup_repo("index-progress", "pub fn keep_me() {}\n");
+        fs::write(repo.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let mut events = Vec::new();
+
+        let report = index_with_options_and_progress(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions::default(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(report.files_indexed, 2);
+        assert_eq!(events.first().unwrap().phase, "discovering_files");
+        assert!(events.iter().any(|event| {
+            event.phase == "extracting_files"
+                && event.total_files == 2
+                && event.completed_files == 2
+        }));
+        assert!(events.iter().any(|event| {
+            event.phase == "writing_graph" && event.total_files == 2 && event.completed_files == 2
+        }));
+        assert_eq!(events.last().unwrap().phase, "finalizing_graph");
+    }
+
+    #[test]
     fn index_records_file_state_with_sha256() {
         let repo = setup_repo("fsstate", RUST_SAMPLE);
         let mut store = Store::open_memory().unwrap();
@@ -4801,7 +4886,7 @@ def Widget():
             "need several files to exercise ordering"
         );
 
-        let (out, _throttled) = parallel_extract(&supported, 8, &mut |_| {});
+        let (out, _throttled) = parallel_extract(&supported, 8, &mut |_, _| {});
         assert_eq!(out.len(), supported.len());
         // Each extracted outcome's rel_path must equal the rel_path of the
         // supported entry at the SAME position (order preserved).

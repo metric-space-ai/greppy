@@ -6,6 +6,19 @@
 
 use super::*;
 
+fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
+    match phase {
+        // Loading the embedded models includes mapping and validating large
+        // assets. It is bounded by the inference path, but 120 seconds is too
+        // short on a cold macOS host and produced a false stall diagnosis.
+        Some("loading_model") => 600,
+        // Base identity/model hashing and checkout validation can precede the
+        // delegated graph worker. Keep this bounded, but allow cold disks.
+        Some("preparing_base") => 300,
+        _ => 120,
+    }
+}
+
 pub(crate) fn dispatch_index_status(json: bool, root: Option<&str>) -> Result<i32> {
     dispatch_index_health("index-status", json, root)
 }
@@ -41,6 +54,91 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     } else {
         job_state
     };
+    // `status` must never queue behind the writer it is meant to observe.
+    // Opening the previous graph and running integrity/freshness checks can be
+    // expensive while an atomic replacement is underway. Return the writer's
+    // lightweight progress record before touching SQLite or walking Git.
+    if writer_active {
+        let writer_lock = greppy_freshness::lock_path_for(&store_path);
+        let progress_age_seconds = background_job
+            .as_ref()
+            .and_then(|job| job.get("updated_at_unix_secs"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|updated| unix_now_secs_cli().saturating_sub(updated));
+        let phase = background_job
+            .as_ref()
+            .and_then(|job| job.get("state"))
+            .and_then(serde_json::Value::as_str);
+        let stall_threshold_seconds = progress_stall_threshold_seconds(phase);
+        let progress_stalled =
+            progress_age_seconds.is_some_and(|age| age >= stall_threshold_seconds);
+        let message = if progress_stalled {
+            let phase = phase.unwrap_or("unknown");
+            format!(
+                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the exact background_job PID, terminate only that process if it is no longer making progress, then rerun `greppy index`; the OS lock releases with its owner",
+                progress_age_seconds.unwrap_or(0)
+            )
+        } else if background_job.is_some() {
+            "index build in progress; inspect background_job for phase/progress, wait for completion, then retry".into()
+        } else {
+            "index writer owns the OS lock but has not published detailed progress yet; phase=starting, retry `greppy index status --json` shortly; the lock is crash-safe and releases when its owning process exits".into()
+        };
+        let status = serde_json::json!({
+            "command": command,
+            "status": "indexing",
+            "healthy": false,
+            "store_exists": store_path.exists(),
+            "writer_active": true,
+            "root_path": effective_root,
+            "store_path": store_path,
+            "writer_lock": writer_lock,
+            "store_format": store_format,
+            "store_bytes": store_bytes,
+            "background_job": background_job,
+            "background_state": "refreshing",
+            "progress_age_seconds": progress_age_seconds,
+            "progress_stall_threshold_seconds": stall_threshold_seconds,
+            "progress_stalled": progress_stalled,
+            "fresh": false,
+            "dirty_overlay": null,
+            "inference": null,
+            "message": message,
+        });
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).map_err(|error| Error::Invalid(format!(
+                    "serialize {command} JSON: {error}"
+                )))?
+            );
+        } else {
+            println!("status: indexing");
+            println!("root: {}", effective_root.display());
+            println!("store: {}", store_path.display());
+            if let Some(job) = status.get("background_job").filter(|job| !job.is_null()) {
+                println!(
+                    "progress: phase={} completed={}/{} eta_seconds={}",
+                    job.get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("starting"),
+                    job.get("completed_spans")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    job.get("total_spans")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    job.get("eta_seconds")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                );
+            } else {
+                println!("progress: phase=starting (detailed progress not published yet)");
+            }
+            println!("message: index build in progress; wait for completion, then retry");
+        }
+        return Ok(EXIT_TEMPFAIL as i32);
+    }
     let dirty_overlay = dirty_overlay(&effective_root)?;
     let inference = (command == "doctor")
         .then(inference_registry_status)
@@ -56,22 +154,14 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
 
     if !store_path.exists() {
         let store_cow = crate::store_cow::diagnostics_without_store(&effective_root, &store_path);
-        let status_label = if writer_active {
-            "indexing"
-        } else {
-            "no_index"
-        };
-        let message = if writer_active {
-            "index build in progress; wait for it to finish, then retry"
-        } else {
-            "no active index; run greppy index first"
-        };
+        let status_label = "no_index";
+        let message = "no active index; run greppy index first";
         let status = serde_json::json!({
             "command": command,
             "status": status_label,
             "healthy": false,
             "store_exists": false,
-            "writer_active": writer_active,
+            "writer_active": false,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,
@@ -112,11 +202,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             if let Some(reason) = store_cow["fallback_reason"].as_str() {
                 println!("store_fallback: {reason}");
             }
-            if writer_active {
-                println!("message: {message}");
-            } else {
-                println!("message: run `greppy index {}` first", root.unwrap_or("."));
-            }
+            println!("message: run `greppy index {}` first", root.unwrap_or("."));
             if let Some(inference) = &inference {
                 print_inference_registry(inference);
             }
@@ -136,11 +222,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                 );
             }
         }
-        return Ok(if writer_active {
-            EXIT_TEMPFAIL as i32
-        } else {
-            1
-        });
+        return Ok(1);
     }
 
     let store = match crate::store_cow::overlay_spec(&effective_root)? {
@@ -560,6 +642,19 @@ pub(crate) fn dispatch_index(
         }
         None => find_repo_root(&target),
     };
+    // A linked worktree root is identified by its `.git` file, not by the
+    // spelling of its absolute path. Windows can expose the same mounted
+    // directory once as a verbatim long path and once through an 8.3 alias;
+    // comparing those strings rejects the repository root as if it were a
+    // partial subdirectory. A real subdirectory has no `.git` marker of its
+    // own and is still rejected here.
+    if effective_root.join(".git").is_file() && !target.join(".git").is_file() {
+        return Err(Error::Invalid(format!(
+            "linked-worktree CoW indexing requires the repository root; run `greppy index --root {}` instead of indexing only {}",
+            effective_root.display(),
+            target.display()
+        )));
+    }
     let project = workspace_locator::project_identity(&effective_root);
     let index_options = greppy_indexer::IndexOptions {
         discover_overrides: discover_overrides_from_env()?,
@@ -613,8 +708,29 @@ pub(crate) fn dispatch_index(
             return Err(Error::io(context, source));
         }
     };
+    background_job.attach_foreground(background_job_path(&effective_root));
+    background_job.write_state("preparing_base", None);
+    if background_job.is_foreground_owner() && !cli_json_output() {
+        eprintln!(
+            "greppy: index started for {} (phase=preparing_base, pid={}); progress: `greppy index status --json`",
+            effective_root.display(),
+            std::process::id()
+        );
+    }
+    let _auto_linked_worktree_overlay = match crate::store_cow::prepare_auto_linked_worktree_overlay(
+        &effective_root,
+        &greppy_core::cache::data_root(),
+        embedding_args,
+        background_job.progress_path(),
+    ) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            background_job.fail(&error);
+            return Err(error);
+        }
+    };
+    background_job.write_state("indexing", None);
     if let Some(overlay) = crate::store_cow::overlay_spec_live(&effective_root)? {
-        let is_background = background_job.is_background();
         let result = index_overlay_snapshot(
             &store_path,
             &target,
@@ -622,18 +738,16 @@ pub(crate) fn dispatch_index(
             &overlay,
             embedding_config.as_ref(),
             &index_options,
-            OverlayIndexRun {
-                announce: true,
-                background_job: if is_background {
-                    Some(&mut background_job)
-                } else {
-                    None
-                },
+            true,
+            if background_job.has_progress_sink() {
+                Some(&mut background_job)
+            } else {
+                None
             },
         );
         match &result {
             Ok(0) => background_job.complete(),
-            Ok(_) => background_job.complete(),
+            Ok(_) => background_job.write_state("failed", Some("Delta index was incomplete")),
             Err(error) => background_job.fail(error),
         }
         return result;
@@ -651,7 +765,7 @@ pub(crate) fn dispatch_index(
         embedding_config.as_ref(),
         &index_options,
         !is_background,
-        if is_background {
+        if background_job.has_progress_sink() {
             Some(&mut background_job)
         } else {
             None
@@ -739,20 +853,10 @@ pub(crate) fn dispatch_index(
     Ok(0)
 }
 
-pub(crate) struct OverlayIndexRun<'a> {
-    announce: bool,
-    background_job: Option<&'a mut BackgroundJobGuard>,
-}
-
-impl OverlayIndexRun<'_> {
-    pub(crate) fn silent() -> Self {
-        Self {
-            announce: false,
-            background_job: None,
-        }
-    }
-}
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
+)]
 pub(crate) fn index_overlay_snapshot(
     active_path: &std::path::Path,
     target: &std::path::Path,
@@ -760,7 +864,8 @@ pub(crate) fn index_overlay_snapshot(
     overlay: &crate::store_cow::OverlaySpec,
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
-    mut run: OverlayIndexRun<'_>,
+    announce: bool,
+    mut progress: Option<&mut BackgroundJobGuard>,
 ) -> Result<i32> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
     let temp_path = unique_store_sibling(active_path, "delta-building");
@@ -804,22 +909,22 @@ pub(crate) fn index_overlay_snapshot(
             .map(ToOwned::to_owned)
             .collect(),
     );
-    let report = if let Some(job) = run.background_job.as_deref_mut() {
-        let mut progress = |value| job.indexing_progress(value);
+    let report = if let Some(job) = progress.as_deref_mut() {
         greppy_indexer::index_with_options_and_progress(
             &mut store,
             target,
             project,
             &overlay_options,
-            &mut progress,
-        )?
+            &mut |update| job.indexing_progress(update),
+        )
     } else {
-        greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)?
-    };
+        greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)
+    }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     let base_commit = std::env::var(crate::store_cow::ENV_BASE_COMMIT)
         .map_err(|_| Error::Invalid("overlay index missing pinned Base commit".into()))?;
     crate::store_cow::persist_visibility(&store, &overlay.visibility, &base_commit)?;
+    crate::store_cow::persist_overlay_binding(&store, &overlay.base_path, &base_commit, project)?;
     let embedding = if let Some(config) = embedding_config {
         Some(index_embeddings_into_temp_store(
             &mut store,
@@ -828,7 +933,7 @@ pub(crate) fn index_overlay_snapshot(
             config,
             &report,
             active_path.parent().map(std::path::Path::to_path_buf),
-            run.background_job,
+            progress,
         )?)
     } else {
         None
@@ -839,7 +944,7 @@ pub(crate) fn index_overlay_snapshot(
     publish_store_snapshot(&temp_path, active_path)?;
     cleanup_stale_snapshot_artifacts(active_path, false)?;
 
-    if run.announce {
+    if announce {
         println!(
             "indexed Delta generation {}: {} changed/deleted paths, {} private nodes (project: {project})",
             report.graph_generation,
@@ -905,25 +1010,23 @@ pub(crate) fn index_atomic_snapshot_attempt(
         }
     };
 
-    let report = {
-        let mut progress = |value| {
-            if let Some(job) = background_job.as_deref_mut() {
-                job.indexing_progress(value);
-            }
-        };
-        match greppy_indexer::index_with_options_and_progress(
+    let index_result = if let Some(job) = background_job.as_deref_mut() {
+        greppy_indexer::index_with_options_and_progress(
             &mut temp_store,
             target,
             project,
             index_options,
-            &mut progress,
-        ) {
-            Ok(report) => report,
-            Err(e) => {
-                drop(temp_store);
-                let _ = cleanup_sqlite_family(&temp_path);
-                return Err(e);
-            }
+            &mut |progress| job.indexing_progress(progress),
+        )
+    } else {
+        greppy_indexer::index_with_options(&mut temp_store, target, project, index_options)
+    };
+    let report = match index_result {
+        Ok(report) => report,
+        Err(e) => {
+            drop(temp_store);
+            let _ = cleanup_sqlite_family(&temp_path);
+            return Err(e);
         }
     };
 
@@ -942,6 +1045,9 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }
 
     let embedding_deferred = embedding_config.is_some_and(|cfg| {
+        if let Some(job) = background_job.as_deref_mut() {
+            job.finalization_phase("counting_embeddings");
+        }
         allow_deferred_embeddings
             && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
                 .is_ok_and(|count| should_defer_embedding(cfg, count))
@@ -955,7 +1061,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
                 cfg,
                 &report,
                 active_path.parent().map(std::path::Path::to_path_buf),
-                background_job,
+                background_job.as_deref_mut(),
             ) {
                 Ok(EmbeddingBuildOutcome::Complete(report)) => (Some(report), None),
                 Ok(EmbeddingBuildOutcome::Degraded { report, reason }) => (report, Some(reason)),
@@ -969,19 +1075,36 @@ pub(crate) fn index_atomic_snapshot_attempt(
             (None, None)
         };
 
-    checkpoint_store(&temp_store, &temp_path)?;
-    temp_store.integrity_check().map_err(|e| {
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checkpointing_wal");
+    }
+    drop(temp_store);
+    checkpoint_store_path(&temp_path)?;
+
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checking_integrity");
+    }
+    let integrity_store =
+        greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
+    integrity_store.integrity_check().map_err(|e| {
         Error::Store(format!(
             "temp index integrity_check failed for {}: {e}",
             temp_path.display()
         ))
     })?;
-    drop(temp_store);
+    drop(integrity_store);
+
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("syncing_snapshot");
+    }
     cleanup_sqlite_sidecars(&temp_path)?;
     sync_file(&temp_path)?;
     sync_parent_dir(&temp_path)?;
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
 
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("verifying_freshness");
+    }
     let verify_store =
         greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
     let verification = greppy_freshness::check_files_report_with_ttl(
@@ -1001,6 +1124,9 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
+    if let Some(job) = background_job {
+        job.finalization_phase("publishing_snapshot");
+    }
     publish_store_snapshot(&temp_path, active_path)?;
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     Ok(Some(IndexSnapshotReport {
@@ -1119,4 +1245,23 @@ pub(crate) fn index_embeddings_into_temp_store(
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
     Ok(EmbeddingBuildOutcome::Complete(embedding_report))
+}
+
+#[cfg(test)]
+mod progress_status_tests {
+    use super::progress_stall_threshold_seconds;
+
+    #[test]
+    fn cold_model_and_base_preparation_use_phase_specific_stall_thresholds() {
+        assert_eq!(progress_stall_threshold_seconds(Some("loading_model")), 600);
+        assert_eq!(
+            progress_stall_threshold_seconds(Some("preparing_base")),
+            300
+        );
+        assert_eq!(
+            progress_stall_threshold_seconds(Some("extracting_files")),
+            120
+        );
+        assert_eq!(progress_stall_threshold_seconds(None), 120);
+    }
 }

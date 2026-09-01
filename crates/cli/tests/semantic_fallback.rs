@@ -137,14 +137,14 @@ fn search_building_status_is_one_line_with_progress_and_eta() {
         &[],
     );
     assert_eq!(
-        code, 1,
-        "a building semantic index is not an answer: grep's exit 1; stdout={stdout}\nstderr={stderr}"
+        code, 75,
+        "a building semantic index is a retryable temporary failure; stdout={stdout}\nstderr={stderr}"
     );
     assert!(stderr.is_empty(), "status belongs on stdout: {stderr:?}");
     assert_eq!(
-        stdout, "semantic index building — 3/12 spans, ETA ~9s (backend cuda)\n",
-        "exactly ONE status line with progress and ETA — never partial hits, \
-         never try: instructions (NAV law 1); got: {stdout:?}"
+        stdout,
+        "semantic search temporarily unavailable — semantic index building — 3/12 spans, ETA ~9s (backend cuda); retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit 75)\n",
+        "exactly ONE actionable status line with progress, ETA and retry gate — never partial hits; got: {stdout:?}"
     );
 }
 

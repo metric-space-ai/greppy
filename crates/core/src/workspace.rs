@@ -181,12 +181,53 @@ pub fn project_identity(start: &Path) -> String {
             return identity.to_string();
         }
     }
-    resolve_workspace_root(start)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    let root = resolve_workspace_root(start);
+    linked_worktree_project_identity(&root)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// A linked worktree has an arbitrary directory basename, but every worktree
+/// in one repository must use the same logical project column when a shared
+/// immutable Base is overlaid with a private Delta. Resolve that stable name
+/// from Git's `commondir` metadata without spawning Git on every query.
+fn linked_worktree_project_identity(root: &Path) -> Option<String> {
+    let dot_git = root.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let git_file = std::fs::read_to_string(&dot_git).ok()?;
+    let linked_git_dir = git_file.trim().strip_prefix("gitdir:")?.trim();
+    let linked_git_dir = PathBuf::from(linked_git_dir);
+    let linked_git_dir = if linked_git_dir.is_absolute() {
+        linked_git_dir
+    } else {
+        root.join(linked_git_dir)
+    };
+    let linked_git_dir = linked_git_dir.canonicalize().unwrap_or(linked_git_dir);
+    let common = std::fs::read_to_string(linked_git_dir.join("commondir")).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        linked_git_dir.join(common)
+    };
+    let common = common.canonicalize().unwrap_or(common);
+    let repository_root = if common.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        common.parent()?
+    } else {
+        return None;
+    };
+    repository_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && crate::validate::is_valid_project_name(name))
+        .map(ToOwned::to_owned)
 }
 
 /// Mode for newly-created store/sidecar directories. The actual `mkdir`
@@ -425,6 +466,28 @@ mod tests {
             root.canonicalize().unwrap()
         );
         assert_eq!(project_identity(&nested), "monorepo");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn linked_worktrees_share_the_primary_repository_project_identity() {
+        let tmp = tempdir_root("greppy-linked-worktree-project");
+        let primary = tmp.join("primary-repository");
+        let linked = tmp.join("arbitrary-feature-name");
+        let linked_git_dir = primary.join(".git/worktrees/arbitrary-feature-name");
+        std::fs::create_dir_all(&linked_git_dir).unwrap();
+        std::fs::write(linked_git_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(linked.join("src/deep")).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_git_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            project_identity(&linked.join("src/deep")),
+            "primary-repository"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

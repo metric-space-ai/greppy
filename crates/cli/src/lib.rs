@@ -174,6 +174,7 @@ const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
+const ENV_DELEGATED_BACKGROUND_JOB: &str = "GREPPY_DELEGATED_BACKGROUND_JOB";
 #[cfg(all(
     not(feature = "ci-test-assets"),
     any(debug_assertions, feature = "store-cow-release-perf")
@@ -3576,6 +3577,68 @@ fn nav_freshness_json(
             });
         }
     };
+    if discover_scope == "default" {
+        match crate::store_cow::overlay_freshness_proof(&root_path, store, project) {
+            Ok(Some(crate::store_cow::OverlayFreshnessProof::Fresh { total_inventory })) => {
+                return serde_json::json!({
+                    "fresh": true,
+                    "state": "fresh",
+                    "reasons": [],
+                    "elapsed_ms": 0,
+                    "stale_file_count": 0,
+                    "changed_paths": [],
+                    "total_inventory": total_inventory,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+            Ok(Some(crate::store_cow::OverlayFreshnessProof::Stale {
+                changed_paths,
+                reason,
+            })) => {
+                return serde_json::json!({
+                    "fresh": false,
+                    "state": "drift",
+                    "reasons": [reason],
+                    "elapsed_ms": 0,
+                    "stale_file_count": changed_paths.len(),
+                    "changed_paths": changed_paths,
+                    "total_inventory": null,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return serde_json::json!({
+                    "fresh": false,
+                    "state": "unknown",
+                    "reasons": [format!("Store-CoW freshness proof failed: {error}")],
+                    "elapsed_ms": 0,
+                    "stale_file_count": null,
+                    "changed_paths": null,
+                    "total_inventory": null,
+                    "ttl_hit": false,
+                    "source": "verified_store_cow_overlay",
+                    "discover_scope": discover_scope,
+                    "discover_scope_env": {
+                        "include": ENV_DISCOVER_INCLUDE,
+                        "exclude": ENV_DISCOVER_EXCLUDE,
+                    },
+                });
+            }
+        }
+    }
     match greppy_freshness::check_files_report_with_overrides(
         store,
         &root_path,
@@ -3649,10 +3712,12 @@ impl FreshnessServe {
     }
 }
 
-/// Auto-reindex cap: an inline atomic snapshot is only attempted when at most
-/// this many files drifted. Above the cap one background refresh starts and
-/// stale indexed results are refused.
+/// Auto-reindex caps: a content refresh is considered only for a small drift,
+/// and a full non-overlay store is rebuilt inline only when the complete
+/// indexed inventory is also small. Vector-backed stores are always refreshed
+/// in the observable background because model loading alone can take minutes.
 const AUTO_REINDEX_MAX_FILES: usize = 10;
+const AUTO_REINDEX_INLINE_MAX_INDEXED_FILES: i64 = 128;
 
 /// Kill switch for automatic inline/background refresh (`0`/`false` disables).
 const ENV_AUTO_REINDEX: &str = "GREPPY_AUTO_REINDEX";
@@ -3878,6 +3943,9 @@ fn replace_background_job_file(
 
 struct BackgroundJobGuard {
     path: Option<std::path::PathBuf>,
+    detached: bool,
+    delegated: bool,
+    owner_pid: u32,
     cause: String,
     kind: String,
     started_at_unix_secs: u64,
@@ -3891,32 +3959,48 @@ struct BackgroundJobGuard {
     embedding_started: Option<std::time::Instant>,
     indexing_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
-    last_index_stage: Option<greppy_indexer::IndexProgressStage>,
+    progress_phase: Option<&'static str>,
     current_detail: Option<String>,
     complete: bool,
 }
 
 impl BackgroundJobGuard {
     fn from_env() -> Self {
-        let path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
+        let direct_path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
+        let delegated_path =
+            std::env::var_os(ENV_DELEGATED_BACKGROUND_JOB).map(std::path::PathBuf::from);
+        let detached = direct_path.is_some();
+        let delegated = direct_path.is_none() && delegated_path.is_some();
+        let path = direct_path.or(delegated_path);
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
         // before the parent writes `refreshing` over it.
-        if let Some(path) = &path {
-            for _ in 0..100 {
-                if read_background_job(path)
-                    .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
-                    == Some(u64::from(std::process::id()))
-                {
-                    break;
+        if detached {
+            if let Some(path) = &path {
+                for _ in 0..100 {
+                    if read_background_job(path)
+                        .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
+                        == Some(u64::from(std::process::id()))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         let published = path.as_deref().and_then(read_background_job);
+        let owner_pid = published
+            .as_ref()
+            .and_then(|job| job.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .unwrap_or_else(std::process::id);
         Self {
             path,
+            detached,
+            delegated,
+            owner_pid,
             cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
                 .unwrap_or_else(|_| "background-refresh".into()),
             kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
@@ -3953,58 +4037,34 @@ impl BackgroundJobGuard {
             embedding_started: None,
             indexing_started: None,
             last_progress_write: None,
-            last_index_stage: None,
+            progress_phase: None,
             current_detail: None,
             complete: false,
         }
     }
 
     fn is_background(&self) -> bool {
+        self.detached
+    }
+
+    fn is_foreground_owner(&self) -> bool {
+        !self.detached && !self.delegated
+    }
+
+    fn has_progress_sink(&self) -> bool {
         self.path.is_some()
     }
 
-    fn indexing_progress(&mut self, progress: greppy_indexer::IndexProgress) {
-        let stage_changed = self.last_index_stage != Some(progress.stage);
-        let state = match progress.stage {
-            greppy_indexer::IndexProgressStage::Analyze => {
-                let started = *self
-                    .indexing_started
-                    .get_or_insert_with(std::time::Instant::now);
-                self.completed_documents = progress.completed_files;
-                self.total_documents = progress.total_files;
-                let elapsed_ms = u64::try_from(started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX)
-                    .max(1);
-                self.eta_seconds = observed_embedding_eta_seconds(
-                    self.completed_documents,
-                    self.total_documents,
-                    elapsed_ms,
-                );
-                self.rate_milli_documents_per_second =
-                    observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
-                "analyzing"
-            }
-            greppy_indexer::IndexProgressStage::Store => {
-                self.completed_documents = 0;
-                self.total_documents = 0;
-                self.rate_milli_documents_per_second = None;
-                self.eta_seconds = None;
-                "storing"
-            }
-        };
-        let now = std::time::Instant::now();
-        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
-        let publish = background_progress_should_publish(
-            stage_changed,
-            finished,
-            self.last_progress_write,
-            now,
-        );
-        if publish {
-            self.write_state(state, None);
-            self.last_progress_write = Some(now);
-            self.last_index_stage = Some(progress.stage);
+    fn attach_foreground(&mut self, path: std::path::PathBuf) {
+        if self.path.is_some() {
+            return;
         }
+        self.path = Some(path);
+        self.owner_pid = std::process::id();
+        self.cause = "foreground-index".into();
+        self.kind = "index".into();
+        self.started_at_unix_secs = unix_now_secs_cli();
+        self.write_state("starting", None);
     }
 
     fn embedding_loading(&mut self) {
@@ -4023,12 +4083,49 @@ impl BackgroundJobGuard {
         self.total_documents = total_documents;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
-        self.indexing_started = None;
+        self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
+    }
+
+    fn indexing_progress(&mut self, progress: greppy_indexer::IndexBuildProgress) {
+        let phase_changed = self.progress_phase != Some(progress.phase);
+        self.progress_phase = Some(progress.phase);
+        self.completed_documents = progress.completed_files;
+        self.total_documents = progress.total_files;
+        self.backend = None;
+        self.device = None;
+        self.eta_seconds = None;
+        self.rate_milli_documents_per_second = None;
+        self.embedding_started = None;
+
+        let now = std::time::Instant::now();
+        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
+        let publish = phase_changed
+            || finished
+            || self.last_progress_write.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(500)
+            });
+        if publish {
+            self.write_state(progress.phase, None);
+            self.last_progress_write = Some(now);
+        }
+    }
+
+    fn finalization_phase(&mut self, phase: &'static str) {
+        self.progress_phase = Some(phase);
+        self.completed_documents = 0;
+        self.total_documents = 0;
+        self.backend = None;
+        self.device = None;
+        self.eta_seconds = None;
+        self.rate_milli_documents_per_second = None;
+        self.embedding_started = None;
+        self.write_state(phase, None);
+        self.last_progress_write = Some(std::time::Instant::now());
     }
 
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
@@ -4074,10 +4171,22 @@ impl BackgroundJobGuard {
                 .checked_div(self.total_documents)
                 .unwrap_or(0)
         };
+        let progress_unit = match self.progress_phase {
+            Some("embedding") => Some("spans"),
+            Some("classifying_files" | "extracting_files" | "writing_graph" | "building_files") => {
+                Some("files")
+            }
+            Some("building_folders") => Some("folders"),
+            Some("resolving_edges" | "writing_resolved_edges" | "writing_structure_edges") => {
+                Some("edges")
+            }
+            Some(_) => Some("steps"),
+            None => None,
+        };
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
-            "pid": std::process::id(),
+            "pid": self.owner_pid,
             "started_at_unix_secs": self.started_at_unix_secs,
             "updated_at_unix_secs": now,
             "cause": self.cause,
@@ -4088,6 +4197,7 @@ impl BackgroundJobGuard {
             "completed_spans": self.completed_documents,
             "total_spans": self.total_documents,
             "progress_milli_percent": progress_milli_percent,
+            "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
             "eta_minutes": eta_minutes,
@@ -4100,10 +4210,18 @@ impl BackgroundJobGuard {
 
     fn complete(&mut self) {
         self.complete = true;
+        if self.delegated {
+            self.write_state("base_graph_ready", None);
+            return;
+        }
         if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
             let _ = sync_parent_dir(path);
         }
+    }
+
+    fn progress_path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     fn fail(&mut self, error: &Error) {
@@ -4312,6 +4430,34 @@ fn spawn_background_job_handle(
     } else {
         (None, None, 0, None)
     };
+    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
+    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    // Publish a launch record before spawning. Otherwise a concurrent status
+    // call can observe the child-owned writer lock while background_job is
+    // still null and provide no useful progress or recovery information.
+    let mut value = serde_json::json!({
+        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+        "kind": kind,
+        "pid": serde_json::Value::Null,
+        "started_at_unix_secs": started_at,
+        "updated_at_unix_secs": started_at,
+        "cause": cause,
+        "target_generation": target_generation,
+        "state": "launching",
+        "backend": backend,
+        "device": device,
+        "completed_spans": 0,
+        "total_spans": total_spans,
+        "progress_milli_percent": 0,
+        "rate_milli_spans_per_second": serde_json::Value::Null,
+        "eta_seconds": eta_seconds,
+        "eta_minutes": eta_minutes,
+        "eta_unix_secs": eta_unix_secs,
+        "last_error": serde_json::Value::Null,
+    });
+    if write_background_job(&job_path, &value).is_err() {
+        return None;
+    }
     let mut command = std::process::Command::new(exe);
     command
         .arg("index")
@@ -4333,30 +4479,37 @@ fn spawn_background_job_handle(
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
     agent::scrub_credential_env(&mut command);
-    let Ok(mut child) = command.spawn() else {
-        return None;
+    // The first-use caller is intentionally allowed to return after a bounded
+    // join. Put the indexer in its own process group/session class so shell and
+    // agent runners that clean up the caller's process group do not kill the
+    // cache build they were explicitly told to continue in the background.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            value["state"] = serde_json::json!("failed");
+            value["last_error"] = serde_json::json!(format!("spawn background {kind}: {error}"));
+            let _ = write_background_job(&job_path, &value);
+            return None;
+        }
     };
-    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
-    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
-    let value = serde_json::json!({
-        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
-        "kind": kind,
-        "pid": child.id(),
-        "started_at_unix_secs": started_at,
-        "updated_at_unix_secs": started_at,
-        "cause": cause,
-        "target_generation": target_generation,
-        "state": if kind == "embedding" { "starting" } else { "refreshing" },
-        "backend": backend,
-        "device": device,
-        "completed_spans": 0,
-        "total_spans": total_spans,
-        "progress_milli_percent": 0,
-        "rate_milli_spans_per_second": serde_json::Value::Null,
-        "eta_seconds": eta_seconds,
-        "eta_minutes": eta_minutes,
-        "eta_unix_secs": eta_unix_secs,
-        "last_error": serde_json::Value::Null,
+    value["pid"] = serde_json::json!(child.id());
+    value["state"] = serde_json::json!(if kind == "embedding" {
+        "starting"
+    } else {
+        "refreshing"
     });
     if write_background_job(&job_path, &value).is_err() {
         let _ = child.kill();
@@ -7637,6 +7790,7 @@ fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summari
 struct LoadedEmbeddingModel {
     inner: greppy_embed_native::EmbeddingGemma,
     _model_lease: Option<greppy_core::cache::FileLock>,
+    _runtime_owner: greppy_core::cache::FileLock,
 }
 
 impl std::ops::Deref for LoadedEmbeddingModel {
@@ -7657,12 +7811,24 @@ fn load_embedding_model(
         tokenizer_cache_dir,
     };
     let EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source;
+    let runtime_owner =
+        inference_daemon::acquire_model_owner("embedding", &inference_device_identity(&cfg.device))
+            .map_err(|e| {
+                Error::io(
+                    format!(
+                        "wait for shared EmbeddingGemma owner ({})",
+                        inference_device_identity(&cfg.device)
+                    ),
+                    e,
+                )
+            })?;
     let lease = acquire_cached_model_lease(gguf)?;
     let inner = greppy_embed_native::EmbeddingGemma::load_gguf(gguf, tokenizer, options)
         .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))?;
     Ok(LoadedEmbeddingModel {
         inner,
         _model_lease: lease,
+        _runtime_owner: runtime_owner,
     })
 }
 
@@ -7722,8 +7888,10 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
     let vector = match daemon_result {
         embed_daemon::EmbedDaemonResult::Embedded(vector) => vector,
         embed_daemon::EmbedDaemonResult::NoDaemon => {
-            let model = load_embedding_model(cfg, store_dir)?;
-            greppy_search::embed_code_query(&model, &normalized)?
+            return Err(Error::Store(
+                "EmbeddingGemma daemon did not become ready; no in-process fallback was started because that can allocate one multi-gigabyte model per agent. Retry shortly or inspect `greppy doctor --json` for daemon state"
+                    .into(),
+            ));
         }
         embed_daemon::EmbedDaemonResult::DaemonBusy => {
             return Err(Error::Store(
@@ -8569,6 +8737,39 @@ fn checkpoint_store(store: &greppy_store::Store, path: &std::path::Path) -> Resu
         .conn()
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|e| Error::Store(format!("checkpoint {}: {e}", path.display())))
+}
+
+/// Checkpoint a completed snapshot only after every writer handle has been
+/// dropped. Running `wal_checkpoint(TRUNCATE)` on the connection that built
+/// the graph can wait indefinitely when SQLite still owns a statement or
+/// transaction. A dedicated maintenance connection gives the checkpoint a
+/// finite busy deadline and exposes SQLite's three result counters.
+fn checkpoint_store_path(path: &std::path::Path) -> Result<(i64, i64, i64)> {
+    use rusqlite::OpenFlags;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| Error::Store(format!("open checkpoint target {}: {e}", path.display())))?;
+    conn.busy_timeout(std::time::Duration::from_secs(15))
+        .map_err(|e| Error::Store(format!("set checkpoint timeout {}: {e}", path.display())))?;
+    let result = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| Error::Store(format!("checkpoint {}: {e}", path.display())))?;
+    if result.0 != 0 {
+        return Err(Error::Store(format!(
+            "checkpoint {} remained busy after 15s (busy={}, log_frames={}, checkpointed_frames={}); no snapshot was published; retry `greppy index` after the competing reader exits",
+            path.display(), result.0, result.1, result.2
+        )));
+    }
+    Ok(result)
 }
 
 fn unique_store_sibling(active_path: &std::path::Path, label: &str) -> std::path::PathBuf {
@@ -9493,6 +9694,7 @@ fn error_exit_code(error: &Error) -> u8 {
     match error {
         Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
         Error::Invalid(_) => EXIT_USAGE,
+        Error::Lock(_) => EXIT_TEMPFAIL,
         _ => EXIT_IO,
     }
 }

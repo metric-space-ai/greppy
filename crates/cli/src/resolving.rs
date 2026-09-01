@@ -289,6 +289,28 @@ pub(crate) fn resolve_symbol_nodes(
         // No symbol: mirror resolve_symbol_id's "first node" behaviour.
         return Ok(resolve_symbol_id(store, None)?.into_iter().collect());
     };
+    // Exact qualified names are the lossless locator emitted by search and
+    // navigation commands. Resolve that spelling before simplifying a
+    // path-qualified query to its leaf name: providers may expose an
+    // enclosing/synthetic node whose qualified name is stable even when its
+    // short leaf is not independently addressable.
+    if s.contains("::") {
+        let mut exact = greppy_search::search_graph(
+            store,
+            &greppy_search::GraphQuery::any()
+                .with_qualified_name(s)
+                .with_limit(10_000),
+        )?
+        .into_iter()
+        .filter(|row| is_primary_label(&row.label))
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+        exact.sort_unstable();
+        exact.dedup();
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+    }
     // Path-qualified query (`path::name`, `path::Kind::name`, `path::Owner::name`
     // — exactly what search-symbols/read print): the last segment is the name,
     // the file path narrows, any middle Kind/Owner segment narrows further but

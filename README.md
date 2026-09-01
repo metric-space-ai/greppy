@@ -63,6 +63,10 @@ greppy agent --continue --model MODEL          # restore this project's most rec
 # In 0.3.2, concurrent agents share an immutable Base index and write private Deltas:
 greppy index --agent-worktree                  # build or validate the shared Base ahead of time
 greppy -p --private-store "diagnose indexing"  # opt out for one run and use a full private Store
+
+# In 0.3.4, ordinary linked Git worktrees use the same Base+Delta model automatically:
+greppy index .                                 # first worktree creates the Base; later worktrees index only their Delta
+greppy index status --json                     # lock-free phase/progress/readiness, including ETA when known
 ```
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
@@ -155,10 +159,24 @@ First run:
 ```bash
 greppy --version
 greppy doctor --root . --json     # end-to-end index + backend health
-greppy who-calls SOME_SYMBOL --root . --json   # first query builds the index
+greppy who-calls SOME_SYMBOL --root . --json   # starts the first index if needed
 ```
 
-The index is built once per repository and reused across sessions. While
+The index is built once per repository and reused across sessions and linked
+Git worktrees through an immutable Base plus private Delta. A first graph query
+starts one background index and waits at most two seconds: small repositories
+usually answer immediately; larger ones return temporary exit 75 with the
+exact retry condition. `greppy index status --json` remains nonblocking during
+the build; an explicit foreground `greppy index` immediately prints its first
+phase, PID and that status command. Status reports Base, discovery, extraction,
+graph-write, structural and embedding phases with a `progress_unit` plus
+phase-local completed/total values. It marks a job whose real progress record
+has not changed for two minutes as potentially stalled. If another linked
+worktree already owns the immutable-Base builder lock, `index` waits at most
+five seconds and returns temporary exit 75 with the exact lock path and retry
+guidance instead of blocking behind that builder. Exact
+`read-file --all` and `read-file --lines` reads do not require the graph store
+and remain usable while indexing. While
 embeddings are still building, `search` prints one stable progress line such as
 `semantic index building — 3/12 spans, ETA ~9s (backend cuda)` and exits 1:
 a building semantic index is not yet a search answer, and Greppy never returns
@@ -296,9 +314,12 @@ when their preconditions do not hold:
 | `greppy patch [DIFF]` | apply a unified multi-file diff atomically |
 | `greppy undo [EDIT_ID]` | reverse the latest edit, or one named edit, when no later overlap prevents it |
 
-Add `--dry-run` to preview and `--verify` to run the configured build/linter and
-map diagnostics back to symbols. Coordinated edits belong in one `patch`; use
-`undo` to reverse a published edit rather than manually reconstructing it.
+Add `--dry-run` to preview and `--verify` to run a bounded local checker for
+the touched language and map diagnostics back to symbols. Verification prints
+its selected command and live state, never downloads a checker, and returns an
+actionable direct command if its timeout expires. Coordinated edits belong in
+one `patch`; use `undo` to reverse a published edit rather than manually
+reconstructing it.
 
 **Workspace & health**
 

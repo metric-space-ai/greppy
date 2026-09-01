@@ -158,8 +158,12 @@ fn apply_migration_atomic(conn: &Connection, m: &Migration) -> Result<(), Error>
     conn.execute_batch("BEGIN")
         .map_err(|e| Error::Store(format!("begin migration v{}: {e}", m.version)))?;
     let step = (|| -> Result<(), Error> {
-        conn.execute_batch(m.sql)
-            .map_err(|e| Error::Store(format!("migration v{} ({}): {e}", m.version, m.name)))?;
+        if m.version == 15 {
+            reconcile_index_skip_identity(conn)?;
+        } else {
+            conn.execute_batch(m.sql)
+                .map_err(|e| Error::Store(format!("migration v{} ({}): {e}", m.version, m.name)))?;
+        }
         conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -181,6 +185,55 @@ fn apply_migration_atomic(conn: &Connection, m: &Migration) -> Result<(), Error>
             Err(e)
         }
     }
+}
+
+/// Migration v15 was released as two unconditional `ALTER TABLE` statements.
+/// Stores whose DDL landed before their schema-version record (including
+/// stores produced by older recovery builds) therefore failed forever with
+/// "duplicate column". Reconcile the two nullable INTEGER columns instead:
+/// add only what is absent, accept the exact compatible shape, and refuse an
+/// incompatible pre-existing column without changing the version.
+fn reconcile_index_skip_identity(conn: &Connection) -> Result<(), Error> {
+    let columns = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(index_skips)")
+            .map_err(|e| Error::Store(format!("inspect migration v15 index_skips: {e}")))?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|e| Error::Store(format!("inspect migration v15 index_skips: {e}")))?
+    };
+    if columns.is_empty() {
+        return Err(Error::Store(
+            "migration v15 (index_skip_identity): index_skips is missing; the store schema is incompatible; back up the store and run `greppy cache clear --root <repository> --yes`, then `greppy index`"
+                .into(),
+        ));
+    }
+    for name in ["ctime_ns", "file_id"] {
+        match columns.iter().find(|(column, _, _)| column == name) {
+            None => conn
+                .execute_batch(&format!(
+                    "ALTER TABLE index_skips ADD COLUMN {name} INTEGER;"
+                ))
+                .map_err(|e| {
+                    Error::Store(format!(
+                        "migration v15 (index_skip_identity): add {name}: {e}"
+                    ))
+                })?,
+            Some((_, ty, not_null)) if ty.eq_ignore_ascii_case("INTEGER") && *not_null == 0 => {}
+            Some((_, ty, not_null)) => {
+                return Err(Error::Store(format!(
+                    "migration v15 (index_skip_identity): existing {name} has incompatible definition type={ty:?} not_null={not_null}; the store was not changed; back it up and run `greppy cache clear --root <repository> --yes`, then `greppy index`"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -547,6 +600,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(overlay_edges_present, 1);
+    }
+
+    #[test]
+    fn index_skip_identity_reconciles_partially_applied_v15() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        for migration in super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 14)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', '14');
+             ALTER TABLE index_skips ADD COLUMN ctime_ns INTEGER;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        for name in ["ctime_ns", "file_id"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('index_skips') WHERE name = ?1 AND upper(type) = 'INTEGER' AND \"notnull\" = 0",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{name} must exist exactly once");
+        }
+        assert_eq!(migrate(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn index_skip_identity_accepts_compatible_fully_applied_v15() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        for migration in super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 14)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', '14');
+             ALTER TABLE index_skips ADD COLUMN ctime_ns INTEGER;
+             ALTER TABLE index_skips ADD COLUMN file_id INTEGER;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION.to_string());
+    }
+
+    #[test]
+    fn index_skip_identity_rejects_incompatible_column_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        for migration in super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 14)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', '14');
+             ALTER TABLE index_skips ADD COLUMN ctime_ns TEXT;",
+        )
+        .unwrap();
+
+        let error = migrate(&conn).unwrap_err().to_string();
+        assert!(error.contains("incompatible definition"), "{error}");
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "14");
+        let file_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('index_skips') WHERE name = 'file_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_id_count, 0, "failed reconciliation must roll back");
     }
 
     /// a migration that fails part-way must not advance

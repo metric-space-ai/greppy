@@ -184,8 +184,16 @@ pub(crate) fn maybe_reindex_stale(
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
         let rebuilt = try_auto_reindex_inline(root);
-        if !rebuilt && workspace_writer_active(root) {
-            wait_for_active_index_refresh(root);
+        if !rebuilt {
+            let writer_active = workspace_writer_active(root);
+            let started = if writer_active {
+                false
+            } else {
+                spawn_background_index(root, "workspace-drift")
+            };
+            if started || writer_active || workspace_writer_active(root) {
+                wait_for_active_index_refresh(root);
+            }
         }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
@@ -195,19 +203,78 @@ pub(crate) fn maybe_reindex_stale(
 }
 
 /// An edit-owned or background indexer may already be building the exact fresh
-/// snapshot this query needs. Wait for that writer to publish instead of
-/// immediately returning an empty `refreshing` result. The OS lock has no stale
-/// owner: process exit releases it, so this cannot wait on an abandoned PID.
+/// snapshot this query needs. Give a short refresh a chance to publish, but
+/// never strand a noninteractive caller behind a large repository build.
 pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
     let Ok(effective_root) = resolve_root(root) else {
         return;
     };
     let store_path = workspace_locator::store_path(&effective_root);
-    eprintln!(
-        "greppy: graph refresh already running; waiting for fresh snapshot (ETA unavailable)"
-    );
-    if let Ok(lock) = greppy_freshness::acquire(&store_path) {
-        drop(lock);
+    let wait = std::time::Duration::from_secs(2);
+    eprintln!("greppy: graph refresh already running; waiting up to 2s for a fresh snapshot");
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match greppy_freshness::try_acquire(&store_path) {
+            Ok(lock) => {
+                drop(lock);
+                if store_path.exists() {
+                    eprintln!("greppy: graph refresh published; resuming query");
+                    return;
+                }
+                // A newly spawned first-use child publishes its job record
+                // before it acquires the writer lock. Do not confuse that
+                // short launch window with successful publication.
+                if read_background_job(&background_job_path(&effective_root)).is_some()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                eprintln!(
+                    "greppy: graph refresh has not published a snapshot yet; inspect `greppy index status --json`"
+                );
+                return;
+            }
+            Err(greppy_freshness::LockError::Held { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(greppy_freshness::LockError::Held { .. }) => {
+                let job = read_background_job(&background_job_path(&effective_root));
+                let phase = job
+                    .as_ref()
+                    .and_then(|value| value.get("state"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let completed = job
+                    .as_ref()
+                    .and_then(|value| value.get("completed_spans"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let total = job
+                    .as_ref()
+                    .and_then(|value| value.get("total_spans"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let eta = job
+                    .as_ref()
+                    .and_then(|value| value.get("eta_seconds"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                eprintln!(
+                    "greppy: graph refresh still active — phase={phase}, completed={completed}/{total}, eta_seconds={eta}; returning temporary failure instead of waiting indefinitely; retry after `greppy index status --json` reports healthy=true"
+                );
+                return;
+            }
+            Err(greppy_freshness::LockError::Io { context, source }) => {
+                eprintln!(
+                    "greppy: cannot observe graph refresh ({context}: {source}); returning temporary failure; inspect `greppy index status --json`"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -352,9 +419,15 @@ pub(crate) fn freshness_serve_decision_with_policy(
     });
     if allow_auto_reindex && auto_reindex_enabled() && small_enough {
         let rebuilt = try_auto_reindex_inline(root);
+        let writer_active = workspace_writer_active(root);
+        let started = if rebuilt || writer_active {
+            false
+        } else {
+            spawn_background_index(root, "workspace-drift")
+        };
         return FreshnessServe::Refuse(refresh_state(
             freshness,
-            rebuilt || workspace_writer_active(root),
+            rebuilt || started || writer_active || workspace_writer_active(root),
         ));
     }
     if allow_auto_reindex && auto_reindex_enabled() {
@@ -411,9 +484,20 @@ pub(crate) fn workspace_writer_active(root: Option<&str>) -> bool {
     )
 }
 
-/// Build a small-drift refresh through the same temp-snapshot publication
-/// boundary as an explicit `index`. The current query keeps its old inode and
-/// therefore never observes in-place mutation or a partially rebuilt graph.
+pub(crate) fn auto_reindex_inline_allowed(
+    had_vectors: bool,
+    indexed_files: i64,
+    overlay: bool,
+) -> bool {
+    !had_vectors
+        && (overlay || (0..=AUTO_REINDEX_INLINE_MAX_INDEXED_FILES).contains(&indexed_files))
+}
+
+/// Build a genuinely bounded small-drift refresh through the same
+/// temp-snapshot publication boundary as an explicit `index`. Vector-backed
+/// or large full stores return false so the caller starts one observable
+/// background refresh instead of hiding model loading or a full repository
+/// rebuild inside a navigation command.
 pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     let Ok(effective_root) = resolve_root(root) else {
         return false;
@@ -459,19 +543,11 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         .vector_model_ids(&project)
         .unwrap_or_default()
         .is_empty();
+    let indexed_files = store.file_count(&project).unwrap_or(i64::MAX);
+    if !auto_reindex_inline_allowed(had_vectors, indexed_files, overlay.is_some()) {
+        return false;
+    }
     drop(store);
-    let embedding_cfg = if had_vectors {
-        let no_args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        match embedding_config_optional(no_args) {
-            Ok(Some(cfg)) => Some(cfg),
-            _ => return false,
-        }
-    } else {
-        None
-    };
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
         only_paths: None,
@@ -482,9 +558,10 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             &effective_root,
             &project,
             overlay,
-            embedding_cfg.as_ref(),
+            None,
             &options,
-            crate::indexing::OverlayIndexRun::silent(),
+            false,
+            None,
         )
         .map(|code| code == 0)
         .unwrap_or(false)
@@ -493,7 +570,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             &store_path,
             &effective_root,
             &project,
-            embedding_cfg.as_ref(),
+            None,
             &options,
             false,
             None,
@@ -525,7 +602,8 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
     }
-    if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment()? {
+    if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment(&effective_root)?
+    {
         greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
             Error::io(
                 format!(
@@ -556,34 +634,25 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // with NOTHING on stdout/stderr — the agent just saw an empty result and
     // a bare non-zero code, with no hint that the fix is `greppy index`.
     //
-    // Feature A (auto-index on first use): rather than erroring, build a
-    // GRAPH index (no embeddings) inline on first use so the graph nav
-    // commands (who-calls / callees / references / impact /
-    // path / brief / fan-in / fan-out / trace) Just Work on a fresh repo.
-    // Gated behind the same kill switch as the inline auto-reindex
-    // (`GREPPY_AUTO_REINDEX=0` restores the old hard error). If the
-    // inline index fails for any reason we fall back to the actionable
-    // diagnostic below. Embeddings are NOT computed here — the vector
-    // path (`context` / `semantic`) still asks for `grep index` when it
-    // needs vectors.
+    // Auto-index on first use, but never hide an unbounded repository walk
+    // inside a navigation command. Start the ordinary detached indexer and
+    // join it for at most the same two-second window used by stale queries.
+    // Small repositories still feel immediate; large repositories return a
+    // retryable result with a stable status surface instead of appearing hung.
+    // Gated behind GREPPY_AUTO_REINDEX so explicit opt-out keeps the old error.
     // (Query commands only — the grep passthrough path never reaches here,
     // so the byte-exact passthrough contract is untouched.)
     if !path.exists() {
         let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
-            if !cli_json_output() {
-                eprintln!("greppy: indexing {} (first use)…", effective_root.display());
+            let started = spawn_background_index(root, "first-use");
+            if started || workspace_writer_active(root) {
+                wait_for_active_index_refresh(root);
             }
-            if try_auto_index_inline(root) && path.exists() {
-                // Index built: fall through to the normal read-only open.
-            } else {
-                eprintln!(
-                    "greppy: no index for {} — run `greppy index {}` first",
-                    effective_root.display(),
-                    shown_root
-                );
-                return Err(Error::Invalid(format!(
-                    "no index for {}; run `greppy index {}` first",
+            if !path.exists() {
+                return Err(Error::Lock(format!(
+                    "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
+                    if started { "started" } else { "is already running" },
                     effective_root.display(),
                     shown_root
                 )));
@@ -676,56 +745,6 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
         workspace_locator::touch_lastused(store_dir);
     }
     Ok(store)
-}
-
-/// First use publishes the deterministic graph quickly. Semantic commands
-/// start the generation-bound embedding snapshot in the background and report
-/// progress instead of making every graph command wait for inference.
-pub(crate) fn try_auto_index_inline(root: Option<&str>) -> bool {
-    let Ok(effective_root) = resolve_root(root) else {
-        return false;
-    };
-    let Ok(project) = project_for(root) else {
-        return false;
-    };
-    let Ok(overrides) = discover_overrides_from_env() else {
-        return false;
-    };
-    let store_path = workspace_locator::store_path(&effective_root);
-    // Create the versioned store namespace and its ownership manifest before
-    // opening the DB. GC will never manage a directory without this manifest.
-    if greppy_core::cache::ensure_workspace_store(&effective_root).is_err() {
-        return false;
-    }
-    let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
-        &effective_root,
-        greppy_core::cache::LockMode::Shared,
-        false,
-    ) else {
-        return false;
-    };
-    let _lock = match greppy_freshness::try_acquire(&store_path) {
-        Ok(lock) => lock,
-        _ => return false, // another writer is active
-    };
-    if store_path.exists() {
-        return true;
-    }
-    let options = greppy_indexer::IndexOptions {
-        discover_overrides: overrides,
-        only_paths: None,
-    };
-    index_atomic_snapshot(
-        &store_path,
-        &effective_root,
-        &project,
-        None,
-        &options,
-        false,
-        None,
-    )
-    .map(|snapshot| snapshot.index.is_clean())
-    .unwrap_or(false)
 }
 
 pub(crate) fn cleanup_expired_legacy_entries(

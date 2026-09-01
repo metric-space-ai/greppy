@@ -86,6 +86,104 @@ fn assert_file(path: &Path, expected: &str) {
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
 }
 
+#[cfg(unix)]
+fn install_fake_tsc(fixture: &Fixture, script: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::write(fixture.repo.join("package.json"), "{}\n").unwrap();
+    let bin = fixture.repo.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tsc = bin.join("tsc");
+    std::fs::write(&tsc, script).unwrap();
+    let mut permissions = std::fs::metadata(&tsc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(tsc, permissions).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_selects_the_touched_typescript_project_and_reports_live_status() {
+    let fixture = Fixture::new("verify-typescript-selection");
+    std::fs::write(
+        fixture.repo.join("Cargo.toml"),
+        "this would make cargo check the wrong verifier\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.repo.join("ui.ts"), "const oldValue = 1;\n").unwrap();
+    install_fake_tsc(
+        &fixture,
+        "#!/bin/sh\nprintf 'typescript verifier ran' > tsc-ran\nexit 0\n",
+    );
+
+    let output = fixture.run(&["replace-text", "ui.ts", "oldValue", "newValue", "--verify"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("verify: running local TypeScript check"),
+        "verification start must be visible immediately: {stderr}"
+    );
+    assert!(stderr.contains("verify: passed"), "stderr={stderr}");
+    assert!(stdout.contains("verify: passed — local TypeScript check"));
+    assert_file(&fixture.repo.join("tsc-ran"), "typescript verifier ran");
+    assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_timeout_is_bounded_actionable_and_keeps_the_applied_edit() {
+    let fixture = Fixture::new("verify-timeout");
+    std::fs::write(fixture.repo.join("ui.ts"), "const oldValue = 1;\n").unwrap();
+    install_fake_tsc(
+        &fixture,
+        "#!/bin/sh\nprintf started > verify-started\nsleep 30\n",
+    );
+
+    let mut child = fixture
+        .command()
+        .env("GREPPY_EDIT_VERIFY_TIMEOUT_SECS", "1")
+        .env("GREPPY_AUTO_REINDEX", "0")
+        .args(["replace-text", "ui.ts", "oldValue", "newValue", "--verify"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bounded verify");
+    let marker = fixture.repo.join("verify-started");
+    let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !marker.exists() {
+        if let Some(status) = child.try_wait().expect("poll bounded verify") {
+            panic!("verify exited before starting its checker: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < marker_deadline,
+            "timeout waiting for verifier startup"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let started = std::time::Instant::now();
+    let output = child.wait_with_output().expect("wait for bounded verify");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "elapsed={elapsed:?}; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stderr.contains("verify: running local TypeScript check"));
+    assert!(
+        stderr.contains("verify: timed out after 1s"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("edit remains applied; run"),
+        "the receipt must provide recovery: {stdout}"
+    );
+    assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+}
+
 #[test]
 fn dry_run_noop_never_claims_applied() {
     let fixture = Fixture::new("dry-run-noop");

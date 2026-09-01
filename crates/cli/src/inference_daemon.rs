@@ -96,22 +96,13 @@ struct RuntimeScope {
 impl RuntimeScope {
     fn from_env() -> Self {
         let explicit_runtime = env_absolute_path(ENV_RUNTIME_DIR);
-        let explicit_store = std::env::var("GREPPY_STORE_DIR")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .map(absolute_path);
         let identity = explicit_runtime
             .as_ref()
-            .map(|path| runtime_identity(b"runtime-dir\0", path))
-            .or_else(|| {
-                explicit_store
-                    .as_ref()
-                    .map(|path| runtime_identity(b"store-dir\0", path))
-            });
+            .map(|path| runtime_identity(b"runtime-dir\0", path));
         let state_dir = explicit_runtime
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| greppy_core::cache::data_root().join("runtime"))
+            .unwrap_or_else(default_runtime_dir)
             .join("daemon-state");
         #[cfg(unix)]
         let socket_dir = explicit_runtime
@@ -126,6 +117,39 @@ impl RuntimeScope {
             socket_dir,
         }
     }
+}
+
+fn default_runtime_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        return unix_runtime_dir();
+    }
+    #[cfg(windows)]
+    {
+        return std::env::temp_dir().join("greppy-daemon");
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::env::temp_dir().join("greppy-daemon")
+    }
+}
+
+/// Own the heavy model allocation for one device across every normal Greppy
+/// store and worktree. An explicit GREPPY_RUNTIME_DIR remains an intentional
+/// isolation boundary for release harnesses; GREPPY_STORE_DIR is not.
+pub(super) fn acquire_model_owner(
+    kind: &str,
+    device: &str,
+) -> std::io::Result<greppy_core::cache::FileLock> {
+    let runtime = RuntimeScope::from_env();
+    let name = format!("inference-{kind}-{device}.owner");
+    greppy_core::cache::acquire_named_lock_in(
+        &runtime.state_dir,
+        &name,
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )?
+    .ok_or_else(|| std::io::Error::other(format!("failed to acquire {name}")))
 }
 
 fn env_absolute_path(name: &str) -> Option<std::path::PathBuf> {
@@ -1935,30 +1959,24 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_identity_is_scoped_only_for_explicit_runtime_or_store_roots() {
+    fn endpoint_identity_is_scoped_only_for_explicit_runtime_roots() {
         let legacy = endpoint_digest("summary", "model|prompt|cpu", None);
-        let store_a = endpoint_digest(
-            "summary",
-            "model|prompt|cpu",
-            Some(b"store-dir\0/tmp/store-a"),
-        );
-        let store_b = endpoint_digest(
-            "summary",
-            "model|prompt|cpu",
-            Some(b"store-dir\0/tmp/store-b"),
-        );
         let runtime_a = endpoint_digest(
             "summary",
             "model|prompt|cpu",
             Some(b"runtime-dir\0/tmp/store-a"),
         );
-        assert_ne!(legacy, store_a);
-        assert_ne!(store_a, store_b);
-        assert_ne!(store_a, runtime_a);
+        let runtime_b = endpoint_digest(
+            "summary",
+            "model|prompt|cpu",
+            Some(b"runtime-dir\0/tmp/store-b"),
+        );
+        assert_ne!(legacy, runtime_a);
+        assert_ne!(runtime_a, runtime_b);
         assert_eq!(
             legacy,
             endpoint_digest("summary", "model|prompt|cpu", None),
-            "the no-override production endpoint must retain its legacy identity"
+            "workspace/store selection must not split the machine daemon"
         );
     }
 
