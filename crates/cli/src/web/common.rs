@@ -712,6 +712,26 @@ pub(super) fn rpc_on_response(
     }
 }
 
+/// Start the browser runtime in THIS process, before any sandbox is applied.
+///
+/// The runtime sandboxes its own worker processes. macOS Seatbelt cannot be
+/// nested: a process that is already sandboxed gets EPERM from `sandbox_init`,
+/// so a runtime spawned by a sandboxed agent tool child dies immediately with
+/// "worker sandbox: Operation not permitted" -- and the caller only sees
+/// "web-runtime did not create its socket".
+///
+/// Starting it from the unsandboxed parent avoids that entirely: the tool
+/// children then only connect to a socket that already exists.
+pub fn prestart_unsandboxed() -> std::result::Result<(), String> {
+    let spawn = SupervisorSpawn {
+        fixture_url: None,
+        search_endpoint: None,
+    };
+    ensure_supervisor(None, &spawn)
+        .map(|_| ())
+        .map_err(|error| error.message.to_string())
+}
+
 pub(super) fn ensure_supervisor(
     root: Option<&str>,
     spawn: &SupervisorSpawn,
@@ -1255,7 +1275,16 @@ pub(super) fn parse_target(
     let mut name = None;
     let mut rest = trimmed;
     while !rest.is_empty() {
-        let (atom, next) = parse_target_atom(rest)?;
+        let (atom, next) = match parse_target_atom(rest) {
+            Ok(pair) => pair,
+            Err(_) if css.is_some() || xpath.is_some() || text.is_some() || role.is_some() => {
+                let token = rest.split_whitespace().next().unwrap_or(rest);
+                return Err(query_syntax(&format!(
+                    "unexpected trailing atom `{token}`; quote the selector: css=\"... {token}\""
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         match atom {
             TargetAtom::Css(value) => assign_once(&mut css, value, "css")?,
             TargetAtom::Xpath(value) => assign_once(&mut xpath, value, "xpath")?,
@@ -1341,7 +1370,8 @@ fn parse_target_atom(input: &str) -> std::result::Result<(TargetAtom, &str), Err
         ("name=", TargetAtom::Name),
     ] {
         if let Some(rest) = input.strip_prefix(prefix) {
-            let (value, next) = parse_selector_value(rest)?;
+            let allow_spaces = prefix == "css=" || prefix == "xpath=";
+            let (value, next) = parse_selector_value(rest, allow_spaces)?;
             if value.is_empty() {
                 return Err(query_syntax(&format!("{prefix} value is empty")));
             }
@@ -1358,7 +1388,10 @@ fn parse_target_atom(input: &str) -> std::result::Result<(TargetAtom, &str), Err
     ))
 }
 
-fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), ErrorObject> {
+fn parse_selector_value(
+    input: &str,
+    allow_spaces: bool,
+) -> std::result::Result<(String, &str), ErrorObject> {
     if let Some(rest) = input.strip_prefix('"') {
         let mut out = String::new();
         let mut chars = rest.char_indices();
@@ -1382,11 +1415,26 @@ fn parse_selector_value(input: &str) -> std::result::Result<(String, &str), Erro
                 Some((_, escaped)) => out.push(escaped),
                 None => return Err(query_syntax("unterminated escape in target")),
             },
-            c if c.is_whitespace() => return Ok((out, &input[index..])),
+            c if c.is_whitespace() => {
+                if !allow_spaces {
+                    return Ok((out, &input[index..]));
+                }
+                let rest = input[index..].trim_start();
+                if starts_with_target_prefix(rest) {
+                    return Ok((out, &input[index..]));
+                }
+                out.push(c);
+            }
             other => out.push(other),
         }
     }
     Ok((out, ""))
+}
+
+fn starts_with_target_prefix(input: &str) -> bool {
+    ["css=", "xpath=", "text=", "role=", "name="]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -1399,6 +1447,30 @@ mod target_tests {
         assert_eq!(parsed.selector["type"], "css");
         assert_eq!(parsed.selector["value"], "div > a");
         assert_eq!(parsed.selector["nth"], 2);
+    }
+
+    #[test]
+    fn parse_css_descendant_without_quotes() {
+        let parsed = parse_target("css=#start button", false, false, None).unwrap();
+        assert_eq!(parsed.selector["type"], "css");
+        assert_eq!(parsed.selector["value"], "#start button");
+    }
+
+    #[test]
+    fn parse_css_attribute_descendant_without_quotes() {
+        let parsed = parse_target("css=form input[type=checkbox]", false, false, None).unwrap();
+        assert_eq!(parsed.selector["value"], "form input[type=checkbox]");
+    }
+
+    #[test]
+    fn parse_trailing_atom_names_the_atom() {
+        let error = parse_target(r#"css="a" banana"#, false, false, None).unwrap_err();
+        assert_eq!(error.code, "QUERY_SYNTAX");
+        assert!(
+            error.message.contains("unexpected trailing atom `banana`"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

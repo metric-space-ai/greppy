@@ -704,7 +704,47 @@ pub(super) fn query_expression_pub(query: &str, body: &str) -> String {
     query_expression(query, body)
 }
 
+/// Strip an optional quoted wrapper from a kind=VALUE query so read verbs
+/// accept the same `css="a b"` form the action verbs take (finding 032: the
+/// two families demanded mutually exclusive spellings; unquoted descendant
+/// CSS landed in 93612cfc, this is the read-side half). Only a value that is
+/// fully wrapped in double quotes is unwrapped; escapes follow the action
+/// parser (backslash escapes the next character). Anything else passes
+/// through untouched.
+fn unquote_query_value(query: &str) -> String {
+    for prefix in ["css=", "xpath=", "text=", "role=", "id=", "tag="] {
+        if let Some(rest) = query.strip_prefix(prefix) {
+            let rest_trimmed = rest.trim();
+            if let Some(inner) = rest_trimmed.strip_prefix('"') {
+                let mut out = String::new();
+                let mut chars = inner.chars();
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                out.push(escaped);
+                            }
+                        }
+                        '"' => {
+                            // Unwrap only when the quote closes the whole value.
+                            let tail: String = chars.collect();
+                            if tail.trim().is_empty() {
+                                return format!("{prefix}{out}");
+                            }
+                            return query.to_owned();
+                        }
+                        other => out.push(other),
+                    }
+                }
+            }
+            return query.to_owned();
+        }
+    }
+    query.to_owned()
+}
+
 fn query_expression(query: &str, body: &str) -> String {
+    let query = unquote_query_value(query);
     // The query is embedded as a JSON string so quotes and backslashes in a
     // regex survive intact.
     let literal = serde_json::Value::String(query.to_owned()).to_string();
@@ -712,4 +752,29 @@ fn query_expression(query: &str, body: &str) -> String {
         "(function(){{ var resolve = {RESOLVER_JS}; var describe = {DESCRIBE_JS}; \
          var nodes = resolve({literal}); {body} }})()"
     )
+}
+
+#[cfg(test)]
+mod unquote_tests {
+    use super::unquote_query_value;
+
+    #[test]
+    fn unwraps_fully_quoted_css_value() {
+        assert_eq!(unquote_query_value(r##"css="#t tbody tr""##), "css=#t tbody tr");
+        assert_eq!(unquote_query_value(r#"xpath="//a[@id]""#), "xpath=//a[@id]");
+    }
+
+    #[test]
+    fn keeps_unquoted_and_partial_forms_untouched() {
+        assert_eq!(unquote_query_value("css=#t tbody tr"), "css=#t tbody tr");
+        assert_eq!(unquote_query_value("#btn"), "#btn");
+        // Quote does not close the whole value: pass through unchanged.
+        assert_eq!(unquote_query_value(r#"css="a" b"#), r#"css="a" b"#);
+        assert_eq!(unquote_query_value(r#"text~/x/"#), r#"text~/x/"#);
+    }
+
+    #[test]
+    fn honours_escapes_like_the_action_parser() {
+        assert_eq!(unquote_query_value(r#"css="a\"b""#), r#"css=a"b"#);
+    }
 }

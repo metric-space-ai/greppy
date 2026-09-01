@@ -48,6 +48,14 @@ pub struct Session {
     pub download_bytes: u64,
     pub console_bytes: u64,
     pub peak_rss_bytes: u64,
+    /// CPU baselines so the session budget measures THIS session's work, not
+    /// the content/controller process lifetime (finding 039: the verb path
+    /// charged every session for all CPU ever burned, so a long-lived daemon
+    /// went permanently unusable after ~30s of cumulative work). Paired with
+    /// the pid so a worker respawn resets the baseline instead of producing
+    /// a bogus negative delta.
+    pub content_cpu_baseline: Option<(u32, u64)>,
+    pub controller_cpu_baseline: Option<(u32, u64)>,
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
@@ -77,6 +85,8 @@ impl Session {
             download_bytes: 0,
             console_bytes: 0,
             peak_rss_bytes: 0,
+            content_cpu_baseline: None,
+            controller_cpu_baseline: None,
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
@@ -95,6 +105,8 @@ impl Session {
                 | (SessionState::Busy, SessionState::Failed)
                 | (SessionState::Ready, SessionState::Failed)
                 | (SessionState::Creating, SessionState::Failed)
+                | (SessionState::Failed, SessionState::Ready)
+                | (SessionState::Failed, SessionState::Busy)
                 | (SessionState::Ready, SessionState::Closing)
                 | (SessionState::Busy, SessionState::Closing)
                 | (SessionState::Failed, SessionState::Closing)
@@ -146,5 +158,18 @@ mod tests {
         session.transition(SessionState::Closing).unwrap();
         session.transition(SessionState::Closed).unwrap();
         assert!(session.transition(SessionState::Ready).is_err());
+    }
+
+    #[test]
+    fn failed_session_accepts_the_next_operation() {
+        let mut session = Session::new("wrs_1", "run", crate::policy::NetworkProfile::Project);
+        session.transition(SessionState::Ready).unwrap();
+        session.begin_operation("wrq_1").unwrap();
+        session.transition(SessionState::Failed).unwrap();
+        session.begin_operation("wrq_2").unwrap();
+        assert_eq!(session.state, SessionState::Busy);
+        assert_eq!(session.operation_id.as_deref(), Some("wrq_2"));
+        session.transition(SessionState::Ready).unwrap();
+        assert_eq!(session.state, SessionState::Ready);
     }
 }

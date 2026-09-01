@@ -15,8 +15,9 @@ use clap::Parser;
 use greppy_agent::{
     run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
     AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
-    SandboxMode, StreamEvent, Usage, WorkspaceError, SYSTEM_PROMPT,
+    SandboxMode, StreamEvent, Usage, WorkspaceError,
 };
+use greppy_agent::system_prompt;
 
 use crate::agent_tui::{
     bounded_pair, compact_messages, messages_from_protocol, new_session_id,
@@ -643,7 +644,7 @@ fn run_agent(
 
     let config = AgentConfig {
         max_turns: args.max_turns,
-        system: Some(SYSTEM_PROMPT.to_string()),
+        system: Some(system_prompt()),
         model: model.clone(),
         deadline,
         deadline_total,
@@ -685,6 +686,47 @@ fn run_agent(
             },
         )
     } else {
+        // The one-shot path needs the same browser wiring as the interactive
+        // one: without a parent-owned attach token on fd 4, every `greppy web`
+        // tool call dies with "requires a parent-owned attach token". The
+        // interactive session sets this up; headless did not, so `greppy -p`
+        // could never drive a browser even once it knew the verbs.
+        //
+        // One deliberate difference: a failure here is NOT fatal. A coding task
+        // that never touches the web must not die because a browser token could
+        // not be claimed — the agent still gets a clear error if it tries.
+        std::env::set_var("GREPPY_RUN_ID", workspace.run_id());
+        // Point parent and tool children at this run's own runtime directory --
+        // the one the sandbox grants. Without it they fall back to the shared
+        // /tmp/greppy-daemon-<uid>, which the child may not write.
+        std::env::set_var("GREPPY_RUNTIME_DIR", agent_runtime_dir(workspace.run_id()));
+        match crate::web_attach::claim_persistent_parent() {
+            Ok(_) => {
+                let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
+                    .set(crate::web_attach::inherit_attach_for_agent);
+                // Start the runtime HERE, while this process is still
+                // unsandboxed. The runtime sandboxes its own workers, and macOS
+                // Seatbelt does not nest: started from a sandboxed tool child it
+                // dies with "worker sandbox: Operation not permitted", and the
+                // agent only ever sees "web-runtime did not create its socket".
+                // Started here, the tool children merely connect.
+                if let Err(error) = crate::web::prestart_unsandboxed() {
+                    eprintln!("greppy: browser unavailable to the agent ({error})");
+                }
+            }
+            Err(error) => {
+                eprintln!("greppy: browser unavailable to the agent (no attach token: {error})");
+            }
+        }
+        // A one-shot run must not leave a runtime behind: a long-lived one
+        // degrades until navigation stops working.
+        struct ShutdownWebOnDrop;
+        impl Drop for ShutdownWebOnDrop {
+            fn drop(&mut self) {
+                crate::web::shutdown_if_running();
+            }
+        }
+        let _shutdown_web = ShutdownWebOnDrop;
         run_headless_session(&mut client, &mut env, &config, &task)
     };
     let session = match session {
@@ -1615,6 +1657,30 @@ fn resolve_sandbox_mode(
     }
 }
 
+/// Per-run directory for this agent's browser runtime socket.
+///
+/// The web runtime needs a Unix socket, and `ensure_private_dir` **writes**
+/// (`set_permissions`) even when the directory already exists — so a sandboxed
+/// tool child cannot use the operator's shared `/tmp/greppy-daemon-<uid>`.
+///
+/// Giving the run its own directory beats widening the sandbox onto the shared
+/// one: the agent's browser can then never touch the sockets of the operator's
+/// other greppy daemons, and the grant dies with the run.
+///
+/// Must stay short. `RuntimeScope::from_env` only honours `GREPPY_RUNTIME_DIR`
+/// as a socket directory when it is <= 32 bytes, because a Unix socket path is
+/// capped near 104 bytes — which is exactly why the default is under `/tmp`
+/// and not the long macOS temp root.
+pub(crate) fn agent_runtime_dir(run_id: &str) -> std::path::PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // "/tmp/greppy-agent-" + 8 hex = 26 bytes, comfortably under the cap.
+    std::path::PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
+}
+
 /// Writable roots for a sandboxed `-p` tool subprocess.
 ///
 /// Deliberately narrow — each entry has a one-line reason. Do **not** re-add
@@ -1661,9 +1727,25 @@ fn writable_roots_for(
     roots.push(cargo_registry);
     roots.push(cargo_git);
 
+    // This run's own browser-runtime socket directory. Narrow on purpose: NOT
+    // the shared /tmp/greppy-daemon-<uid>, so the agent cannot reach the
+    // sockets of the operator's other greppy daemons. Without it the tool child
+    // dies with "cannot allocate web-runtime socket", because ensure_private_dir
+    // calls set_permissions even on an existing directory.
+    let runtime_dir = agent_runtime_dir(run_id);
+    if std::fs::create_dir_all(&runtime_dir).is_ok() {
+        // 0700 up front so the child's own ensure_private_dir finds what it
+        // wants and the socket is never group/world reachable.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &runtime_dir,
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+    roots.push(runtime_dir);
+
     // Stable-worktree PARENT and the sibling lock file must stay outside every
     // tool-writable root (worktree path itself is root 1; its parent is not).
-    let _ = run_id; // scratch path already carries run_id
     roots
 }
 

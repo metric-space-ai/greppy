@@ -277,7 +277,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
         config.socket.display()
     ); }
-    let listener = UnixListener::bind(&config.socket)?;
+    let listener = bind_socket_healing_stale(&config.socket)?;
     let mut permissions = std::fs::metadata(&config.socket)?.permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(&config.socket, permissions)?;
@@ -441,6 +441,54 @@ fn snapshot_session_rows(
             })
         })
         .collect()
+}
+
+/// Remove this runtime's control socket and its sibling attach token.
+/// Called on orderly shutdown so the next start never meets a stale path.
+fn remove_runtime_socket_files(socket: &Path) {
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(socket.with_extension("attach"));
+}
+
+/// Bind the control socket, healing a stale one left by a previous runtime.
+///
+/// Nothing removed the socket when a runtime exited (finding 040), so a
+/// crash, a kill, or even an ordinary `runtime stop` left the path behind.
+/// The next start then failed with EADDRINUSE, which the CLI reported as
+/// "did not create its socket" followed by a spawn cooldown -- the caller
+/// saw silence, not a cause. A stale path is only removed once a connect
+/// proves nobody is listening; a live runtime keeps its socket and the
+/// caller gets the real address-in-use error.
+fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() != io::ErrorKind::AddrInUse => return Err(error),
+        Err(error) => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "another web-runtime is already listening on {}",
+                        path.display()
+                    ),
+                ));
+            }
+            eprintln!(
+                "web-runtime: removing stale socket {} left by a previous runtime",
+                path.display()
+            );
+            std::fs::remove_file(path).map_err(|remove_error| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "stale socket {} could not be removed ({remove_error}); original bind error: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            UnixListener::bind(path)
+        }
+    }
 }
 
 fn accept_loop(
@@ -707,6 +755,7 @@ impl Daemon {
             error.session_id = request.session_id.clone();
             return Response::error(&request, error);
         }
+        let content_died = !self.content.is_running();
         if request.operation != "web.shutdown" {
             self.reap_idle_sessions();
             // session.close after a timed-out web.run must not spawn replacement
@@ -720,6 +769,35 @@ impl Daemon {
                 self.ensure_workers();
             }
         }
+        let touches_page = request.operation.starts_with("web.")
+            && request.operation != "web.status"
+            && request.operation != "web.doctor"
+            && request.operation != "web.session.create"
+            && request.operation != "web.session.close"
+            && request.operation != "web.session.list"
+            && request.operation != "web.shutdown";
+        // After a content SIGKILL, the 60s session.networkBytes sample around
+        // dispatch raced the client's 15s observe timeout. Recover, then answer
+        // the crashed operation without extra engine RPCs.
+        if content_died && touches_page {
+            // The call is lost here on purpose: the worker died at an unknown
+            // point, so replaying it could repeat a half-applied action. What
+            // the caller needs is not a retry but the ability to recover
+            // without knowing daemon internals (finding 030): the CLI already
+            // forgets the session on this text, and a direct protocol client -
+            // an SDK, a foreign harness - needs the same signal in a field it
+            // can branch on rather than in prose.
+            let mut error = ErrorObject::new(
+                "worker_restarted",
+                "content worker crashed and was restarted; session pages were reset",
+                request.request_id.clone(),
+                38,
+                "open a new session, then repeat this call",
+            );
+            error.session_id = request.session_id.clone();
+            error.retryable = true;
+            return Response::error(&request, error);
+        }
         // Only the web.run handlers filled the metrics; every other operation
         // answered with zeros, so the paths an agent actually uses -- goto,
         // click, observe -- reported nothing about what they cost. Time the
@@ -731,11 +809,11 @@ impl Daemon {
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
         // never incremented, which is why a 60 MB page showed 4096 bytes.
-        let touches_page = request.operation.starts_with("web.")
-            && request.operation != "web.status"
-            && request.operation != "web.doctor";
-        let bytes_before = touches_page
-            .then(|| self.engine_call("session.networkBytes", json!({})).ok())
+        let bytes_before = (touches_page && self.content.is_running())
+            .then(|| {
+                self.engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                    .ok()
+            })
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let mut response = self.dispatch_operation(request);
@@ -755,12 +833,14 @@ impl Daemon {
         }
         if response.metrics.network_bytes == 0 {
             if let Some(before) = bytes_before {
-                if let Some(after) = self
-                    .engine_call("session.networkBytes", json!({}))
-                    .ok()
-                    .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
-                {
-                    response.metrics.network_bytes = after.saturating_sub(before);
+                if self.content.is_running() {
+                    if let Some(after) = self
+                        .engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                        .ok()
+                        .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
+                    {
+                        response.metrics.network_bytes = after.saturating_sub(before);
+                    }
                 }
             }
         }
@@ -1064,6 +1144,10 @@ impl Daemon {
             "runtime.shutdown",
             json!({}),
         );
+        // Leave no socket behind (finding 040): an orphaned path made the
+        // next start fail with a silent spawn cooldown. The sibling .attach
+        // token is only meaningful for this runtime, so it goes too.
+        remove_runtime_socket_files(&self.socket);
         Response::ok(request, json!({ "shutdown": true }))
     }
 
@@ -2929,8 +3013,8 @@ impl Daemon {
         }
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
-        let content_cpu = Duration::from_millis(sample_cpu_ms(self.content.pid()));
-        let controller_cpu = Duration::from_millis(sample_cpu_ms(self.controller.pid()));
+        let content_pid = self.content.pid();
+        let controller_pid = self.controller.pid();
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             if matches!(
                 operation,
@@ -2939,6 +3023,16 @@ impl Daemon {
                 session.locator_snapshot = None;
             }
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
+            // Budget the CPU this SESSION used, not the worker lifetime
+            // (finding 039); a respawned worker resets the baseline.
+            let content_cpu = Duration::from_millis(session_cpu_delta_ms(
+                &mut session.content_cpu_baseline,
+                content_pid,
+            ));
+            let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
+                &mut session.controller_cpu_baseline,
+                controller_pid,
+            ));
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
@@ -3213,7 +3307,13 @@ impl Daemon {
             if remaining.is_zero() {
                 return Err(format!("timed out after {timeout:?} waiting for {method}"));
             }
-            match self.content.recv(remaining) {
+            if !self.content.is_running() {
+                let _ = self.recover_content("content worker exited");
+                return Err(
+                    "content worker crashed and was restarted; session pages were reset".into(),
+                );
+            }
+            match self.content.recv(remaining.min(Duration::from_millis(100))) {
                 Ok(Message::EngineResult {
                     request_id: got,
                     ok,
@@ -3242,7 +3342,7 @@ impl Daemon {
                 Ok(other) => return Err(format!("unexpected content message {other:?}")),
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
-                        return Err(format!("timed out after {timeout:?} waiting for {method}"));
+                        continue;
                     }
                     let message = error.to_string();
                     let _ = self.recover_content(&format!("content worker: {message}"));
@@ -4044,6 +4144,22 @@ fn sample_rss_bytes(pid: u32) -> u64 {
         .parse::<u64>()
         .unwrap_or(0);
     kb.saturating_mul(1024)
+}
+
+/// CPU spent since this session's baseline for the given worker, resetting
+/// the baseline when the worker was respawned (pid changed) so a fresh
+/// process never inherits or wrongly credits another lifetime (finding 039).
+fn session_cpu_delta_ms(baseline: &mut Option<(u32, u64)>, pid: u32) -> u64 {
+    let now_ns = sample_cpu_ns(pid);
+    match baseline {
+        Some((base_pid, base_ns)) if *base_pid == pid => {
+            now_ns.saturating_sub(*base_ns) / 1_000_000
+        }
+        _ => {
+            *baseline = Some((pid, now_ns));
+            0
+        }
+    }
 }
 
 fn sample_cpu_ms(pid: u32) -> u64 {

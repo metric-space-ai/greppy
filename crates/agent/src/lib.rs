@@ -46,7 +46,7 @@ pub use greppy_env::{
     parse_where_am_i_file_count, run_startup_self_check, GreppyEnv, SelfCheckError, SelfCheckOk,
 };
 pub use model::ModelStream;
-pub use prompt::SYSTEM_PROMPT;
+pub use prompt::{browser_prompt, system_prompt, SYSTEM_PROMPT};
 pub use protocol::{
     ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, ToolChoice, ToolDefinition,
     Usage,

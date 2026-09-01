@@ -2,13 +2,16 @@
 set -eu
 # Guide oracle is playwright@1.62.1 + Chromium revision 1234.
 # Do not download browsers. Write a skip receipt when the pin is missing.
+# Default to a temp file so `web status` / suite runs do not strip provenance
+# from the committed receipts in contracts/web-runtime/receipts/.
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-out="$root/contracts/web-runtime/receipts/oracle-skip.json"
+out="${1:-$(mktemp "${TMPDIR:-/tmp}/oracle-skip.XXXXXX")}"
 mkdir -p "$(dirname "$out")"
 chromium_pin="$HOME/Library/Caches/ms-playwright/chromium-1234"
 if [ -d "$chromium_pin" ]; then
-  echo "{\"status\":\"ready\",\"chromium\":\"1234\"}" > "$out"
+  printf '%s\n' '{"status":"ready","chromium":"1234"}' > "$out"
   echo "oracle chromium-1234 present"
+  echo "$out"
   exit 0
 fi
 cat > "$out" <<JSON
@@ -21,3 +24,4 @@ cat > "$out" <<JSON
 }
 JSON
 echo "oracle skipped: missing chromium-1234"
+echo "$out"

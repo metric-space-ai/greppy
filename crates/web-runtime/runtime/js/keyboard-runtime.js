@@ -289,6 +289,19 @@ function greppyCommitInsert(el, text, inputType) {
   return true;
 }
 
+function greppyImplicitSubmit(el) {
+  if (!el) return;
+  var form = el.form;
+  if (!form && el.closest) form = el.closest("form");
+  if (!form) return;
+  if (typeof form.requestSubmit === "function") {
+    try { form.requestSubmit(); return; } catch (_err) {}
+  }
+  if (typeof form.submit === "function") {
+    try { form.submit(); } catch (_err2) {}
+  }
+}
+
 function greppyDefaultAction(el, desc) {
   if (desc.inputType === "deleteContentBackward") {
     if (!greppyBeforeInput(el, "deleteContentBackward", null)) return;
@@ -309,7 +322,11 @@ function greppyDefaultAction(el, desc) {
       if (!greppyTextInput(el, "\n")) return;
       greppyInsertChars(el, "\n");
       greppyInput(el, "insertLineBreak", null);
+      return;
     }
+    // Script-dispatched Enter has no default action. Implicit form
+    // submission is the one agents actually need (finding 038).
+    greppyImplicitSubmit(el);
     return;
   }
   if (desc.key === "ArrowLeft") {

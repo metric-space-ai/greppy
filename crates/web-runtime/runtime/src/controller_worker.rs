@@ -539,6 +539,13 @@ fn install_console_capture(runtime: &mut JsRuntime) -> io::Result<()> {
 }
 
 fn recv_control(control_rx: &mpsc::Receiver<io::Result<Message>>) -> io::Result<Message> {
+    // Block until the next RunScript/Shutdown or until the supervisor hangs up.
+    // A 120s idle timeout here killed a live controller during
+    // web.session.create/close cycles: those operations never send RunScript,
+    // so a healthy supervisor looks "silent" for the whole run. When the
+    // controller then exited, the test harness abort()ed through mozalloc and
+    // the suite never printed `test result:`. Supervisor death already arrives
+    // as UnexpectedEof/BrokenPipe on the socketpair.
     match control_rx.recv() {
         Ok(message) => message,
         Err(_) => Err(io::Error::new(

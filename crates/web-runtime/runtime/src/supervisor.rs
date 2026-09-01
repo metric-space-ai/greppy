@@ -704,6 +704,21 @@ fn recv_any(
                 ));
             }
         }
+        // SIGKILL of a worker does not always deliver socket EOF before the
+        // client deadline. try_wait here so web.run/observe fail instead of
+        // sitting in the 50ms poll until the outer timeout.
+        if !controller.is_running() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "controller worker exited",
+            ));
+        }
+        if !content.is_running() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "content worker exited",
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

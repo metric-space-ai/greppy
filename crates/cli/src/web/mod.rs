@@ -20,7 +20,7 @@ use greppy_core::error::Result;
 
 pub use act::ActCommand;
 pub use chain::ChainCommand;
-pub use common::{shutdown_if_running, web_runtime_socket};
+pub use common::{prestart_unsandboxed, shutdown_if_running, web_runtime_socket};
 pub use diagnose::DiagnoseCommand;
 pub use expect::ExpectCommand;
 pub use nav::NavCommand;

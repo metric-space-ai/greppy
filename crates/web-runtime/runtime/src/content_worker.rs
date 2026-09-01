@@ -9,7 +9,7 @@ use dpi::PhysicalSize;
 use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
-    InputEvent, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
+    InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
@@ -342,6 +342,11 @@ struct Delegate {
     last_responses: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
+    /// Receipts for synthetic input: Servo acknowledges every input event,
+    /// and a painter-side drop (no display list yet -> empty hit test)
+    /// arrives as InputEventResult::DispatchFailed. Confirmed delivery
+    /// (finding 034) retries on that instead of losing clicks silently.
+    input_receipts: RefCell<HashMap<InputEventId, InputEventResult>>,
     wake: WakeFlag,
     /// Auxiliary webviews (popups) do not inherit the parent's user content
     /// manager; without threading it through here a popup would miss the Web
@@ -377,6 +382,7 @@ impl Delegate {
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
+            input_receipts: RefCell::new(HashMap::new()),
             wake,
             user_content,
         }
@@ -446,6 +452,16 @@ impl WebViewDelegate for Delegate {
             "type": kind,
             "text": message,
         }));
+        self.wake.wake();
+    }
+
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        event_id: InputEventId,
+        result: InputEventResult,
+    ) {
+        self.input_receipts.borrow_mut().insert(event_id, result);
         self.wake.wake();
     }
 
@@ -1961,7 +1977,7 @@ impl ContentEngine {
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let probe = format!(
                     "{}-{}",
                     std::process::id(),
@@ -1975,14 +1991,14 @@ impl ContentEngine {
                         "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var pending = 'pending:' + token; node.setAttribute(attr, pending); var mark = function() {{ if (node.getAttribute(attr) === pending) node.setAttribute(attr, 'seen:' + token); node.removeEventListener('click', mark, true); }}; node.addEventListener('click', mark, true); return true"
                     ),
                 )?;
-                click_at(
+                self.click_at_confirmed(
                     &webview,
+                    &delegate,
                     resolved.x,
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
-                );
+                )?;
                 self.servo.spin_event_loop();
                 let dispatch = match self.locator_eval(
                     &params,
@@ -2032,24 +2048,24 @@ impl ContentEngine {
             "locator.dblclick" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
-                click_at(
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                self.click_at_confirmed(
                     &webview,
+                    &delegate,
                     resolved.x,
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
-                );
+                )?;
                 self.servo.spin_event_loop();
-                click_at(
+                self.click_at_confirmed(
                     &webview,
+                    &delegate,
                     resolved.x,
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
-                );
+                )?;
                 self.servo.spin_event_loop();
                 let _ = self.locator_eval(
                     &params,
@@ -2061,15 +2077,15 @@ impl ContentEngine {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let value = required_str(&params, "value")?;
-                let (webview, _) = self.page(&page_id)?.clone();
-                click_at(
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                self.click_at_confirmed(
                     &webview,
+                    &delegate,
                     resolved.x,
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
-                );
+                )?;
                 self.servo.spin_event_loop();
                 let selector = params
                     .get("selector")
@@ -2296,23 +2312,51 @@ impl ContentEngine {
                 Ok(json!({}))
             }
             "locator.check" | "locator.uncheck" => {
-                let _ = self.resolve_actionable(&params)?;
+                let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let checked = method == "locator.check";
                 let selector = params
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, _) = self.page(&page_id)?.clone();
-                // Setting `.checked` alone changes state without telling the
-                // page (finding 019): frameworks listen on `change`, so a
-                // silent toggle looks successful and never reaches the app.
-                // Playwright treats an already-matching state as a no-op, so
-                // events fire only on an actual transition.
-                let source = format!(
-                    "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                // A property write plus dispatched input/change satisfies
+                // plain forms but stays invisible to frameworks that bind
+                // checkbox state to native CLICKS (React normalises checkbox
+                // onChange over click): finding 033 measured click 5/5 vs
+                // check 0/5 on the same app. So check IS a real, confirmed
+                // click when the state has to change (Playwright semantics:
+                // matching state is a no-op), verified afterwards; only if
+                // the click did not toggle (custom widget swallowing the
+                // event) fall back to property + events.
+                let read_state = format!(
+                    "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); return !!nodes[0].checked; }})({selector})"
                 );
-                self.evaluate(webview, &source)?;
+                let current = matches!(
+                    self.evaluate(webview.clone(), &read_state)?,
+                    JSValue::Boolean(true)
+                );
+                if current != checked {
+                    self.click_at_confirmed(
+                        &webview,
+                        &delegate,
+                        resolved.x,
+                        resolved.y,
+                        resolved.width,
+                        resolved.height,
+                    )?;
+                    self.servo.spin_event_loop();
+                    let after = matches!(
+                        self.evaluate(webview.clone(), &read_state)?,
+                        JSValue::Boolean(true)
+                    );
+                    if after != checked {
+                        let source = format!(
+                            "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
+                        );
+                        self.evaluate(webview, &source)?;
+                    }
+                }
                 Ok(json!({}))
             }
             "locator.selectOption" => {
@@ -3205,8 +3249,9 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
-                click_at(&webview, x, y, 0.0, 0.0, || self.servo.spin_event_loop());
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
+                self.click_at_confirmed(&webview, &delegate, x, y, 0.0, 0.0)?;
                 self.servo.spin_event_loop();
                 Ok(json!({}))
             }
@@ -3215,6 +3260,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 hover_at(&webview, x, y, 0.0, 0.0);
                 self.servo.spin_event_loop();
                 Ok(json!({}))
@@ -3224,6 +3270,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Down,
@@ -3239,6 +3286,7 @@ impl ContentEngine {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
                     WheelDelta {
@@ -3257,6 +3305,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, _) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     MouseButtonAction::Up,
@@ -3272,6 +3321,104 @@ impl ContentEngine {
         }
     }
 
+    /// Make `target` the only visible webview before delivering synthetic
+    /// input or reading the framebuffer. All live webviews share one
+    /// rendering context and every page ever opened stays shown; input
+    /// delivery then hits whichever stale webview the internal order offers
+    /// and the event dies silently in a dead document (finding 034: the CLI
+    /// verb loop lost 8 of 12 clicks to orphaned sessions, non-monotonically;
+    /// closing the orphans made it 12/12).
+    fn present_exclusively(&self, target: &WebView) {
+        for other in self.live_webviews() {
+            if other.id() != target.id() {
+                other.hide();
+            }
+        }
+        target.show();
+        target.focus();
+        // hide/show travel through the constellation asynchronously; without
+        // a spin the hit test can still see the old visibility and route the
+        // very next input into a hidden webview (2 of 12 clicks still died).
+        self.servo.spin_event_loop();
+    }
+
+    /// Deliver one synthetic input event with a delivery receipt. The painter
+    /// silently drops point events whose hit test is empty (fresh webview,
+    /// display list not committed yet) and acknowledges them as
+    /// DispatchFailed; each retry paints and spins so WebRender can commit
+    /// the scene, then sends a freshly built event.
+    fn notify_input_confirmed(
+        &self,
+        webview: &WebView,
+        delegate: &Delegate,
+        make_event: &dyn Fn() -> InputEvent,
+    ) -> bool {
+        for _attempt in 0..8 {
+            let id = webview.notify_input_event(make_event());
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let result = loop {
+                if let Some(result) = delegate.input_receipts.borrow_mut().remove(&id) {
+                    break Some(result);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                self.servo.spin_event_loop();
+                let _ = self.wake.wait_for_generation(self.wake.generation(), Duration::from_millis(5));
+            };
+            match result {
+                Some(result) if !result.contains(InputEventResult::DispatchFailed) => return true,
+                _ => {
+                    webview.paint();
+                    self.servo.spin_event_loop();
+                }
+            }
+        }
+        false
+    }
+
+    /// Move+press+release at the centre of a box, each leg delivery-confirmed.
+    /// Rule from finding 019/034: a verb that cannot deliver its event must
+    /// fail, never report silent success.
+    fn click_at_confirmed(
+        &self,
+        webview: &WebView,
+        delegate: &Delegate,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> io::Result<()> {
+        let cx = (x + width / 2.0) as f32;
+        let cy = (y + height / 2.0) as f32;
+        let point = move || WebViewPoint::Device(DevicePoint::new(cx, cy));
+        let legs: [&dyn Fn() -> InputEvent; 3] = [
+            &move || InputEvent::MouseMove(MouseMoveEvent::new(point())),
+            &move || {
+                InputEvent::MouseButton(MouseButtonEvent::new(
+                    MouseButtonAction::Down,
+                    MouseButton::Left,
+                    point(),
+                ))
+            },
+            &move || {
+                InputEvent::MouseButton(MouseButtonEvent::new(
+                    MouseButtonAction::Up,
+                    MouseButton::Left,
+                    point(),
+                ))
+            },
+        ];
+        for leg in legs {
+            if !self.notify_input_confirmed(webview, delegate, leg) {
+                return Err(io::Error::other(
+                    "input delivery failed: painter dropped the event after retries (no display list?)",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
         let page_id = required_str(params, "page")?;
         let selector = params
@@ -3279,6 +3426,7 @@ impl ContentEngine {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
+        self.present_exclusively(&webview);
         let script = resolve_script(&selector);
         let deadline = Instant::now() + call_timeout(params);
         let mut last = String::from("failed_check=stable");
@@ -3549,8 +3697,39 @@ function greppyRoleOf(el) {
   if (tag === 'input' || tag === 'textarea') return 'textbox';
   return tag;
 }
+function greppyIsDisplayed(el) {
+  var n = el;
+  while (n && n.nodeType === 1) {
+    var style = getComputedStyle(n);
+    if (style && (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse")) {
+      return false;
+    }
+    n = n.parentElement;
+  }
+  var rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
 function greppyQueryAll(root, sel) {
-  try { return Array.from(root.querySelectorAll(sel)); } catch (error) { return []; }
+  var visible = null;
+  var css = String(sel);
+  if (css.indexOf(":visible") !== -1) {
+    visible = true;
+    css = css.split(":visible").join("");
+  }
+  if (css.indexOf(":hidden") !== -1) {
+    visible = false;
+    css = css.split(":hidden").join("");
+  }
+  css = css.replace(/\s{2,}/g, " ").trim();
+  try {
+    var ctx = root === document ? document : root;
+    var nodes = css ? Array.from(ctx.querySelectorAll(css)) : [];
+    if (visible === null) return nodes;
+    return nodes.filter(function (el) {
+      var shown = greppyIsDisplayed(el);
+      return visible ? shown : !shown;
+    });
+  } catch (error) { return []; }
 }
 function greppyCandidates(root) {
   return greppyQueryAll(root === document ? document : root, '*');
