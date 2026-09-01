@@ -550,12 +550,7 @@ fn locate_web_runtime() -> Option<std::path::PathBuf> {
         manifest.join("../../target/debug/web-runtime"),
         manifest.join("../web-runtime/runtime/target/release/web-runtime"),
     ];
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 #[cfg(unix)]

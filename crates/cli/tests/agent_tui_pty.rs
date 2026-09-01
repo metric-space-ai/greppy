@@ -198,7 +198,7 @@ mod pty {
             unsafe {
                 let mut master = 0;
                 let mut slave = 0;
-                let mut ws = libc::winsize {
+                let ws = libc::winsize {
                     ws_row: 24,
                     ws_col: 80,
                     ws_xpixel: 0,
@@ -210,7 +210,7 @@ mod pty {
                         &mut slave,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
-                        &mut ws
+                        std::ptr::from_ref(&ws).cast_mut()
                     ),
                     0
                 );
