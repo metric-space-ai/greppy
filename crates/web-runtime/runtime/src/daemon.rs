@@ -277,7 +277,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
         config.socket.display()
     ); }
-    let listener = UnixListener::bind(&config.socket)?;
+    let listener = bind_socket_healing_stale(&config.socket)?;
     let mut permissions = std::fs::metadata(&config.socket)?.permissions();
     permissions.set_mode(0o600);
     std::fs::set_permissions(&config.socket, permissions)?;
@@ -441,6 +441,54 @@ fn snapshot_session_rows(
             })
         })
         .collect()
+}
+
+/// Remove this runtime's control socket and its sibling attach token.
+/// Called on orderly shutdown so the next start never meets a stale path.
+fn remove_runtime_socket_files(socket: &Path) {
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(socket.with_extension("attach"));
+}
+
+/// Bind the control socket, healing a stale one left by a previous runtime.
+///
+/// Nothing removed the socket when a runtime exited (finding 040), so a
+/// crash, a kill, or even an ordinary `runtime stop` left the path behind.
+/// The next start then failed with EADDRINUSE, which the CLI reported as
+/// "did not create its socket" followed by a spawn cooldown -- the caller
+/// saw silence, not a cause. A stale path is only removed once a connect
+/// proves nobody is listening; a live runtime keeps its socket and the
+/// caller gets the real address-in-use error.
+fn bind_socket_healing_stale(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() != io::ErrorKind::AddrInUse => return Err(error),
+        Err(error) => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "another web-runtime is already listening on {}",
+                        path.display()
+                    ),
+                ));
+            }
+            eprintln!(
+                "web-runtime: removing stale socket {} left by a previous runtime",
+                path.display()
+            );
+            std::fs::remove_file(path).map_err(|remove_error| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "stale socket {} could not be removed ({remove_error}); original bind error: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            UnixListener::bind(path)
+        }
+    }
 }
 
 fn accept_loop(
@@ -1084,6 +1132,10 @@ impl Daemon {
             "runtime.shutdown",
             json!({}),
         );
+        // Leave no socket behind (finding 040): an orphaned path made the
+        // next start fail with a silent spawn cooldown. The sibling .attach
+        // token is only meaningful for this runtime, so it goes too.
+        remove_runtime_socket_files(&self.socket);
         Response::ok(request, json!({ "shutdown": true }))
     }
 
