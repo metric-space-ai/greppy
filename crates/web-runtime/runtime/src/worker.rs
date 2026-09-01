@@ -400,6 +400,20 @@ impl FexecveArgs {
             env_p,
         })
     }
+
+    /// Execute while `self` still owns every CString referenced by the pointer
+    /// arrays. Keeping this as a method also prevents field-precise closure
+    /// capture from dropping `argv`/`env` before the child reaches `fexecve`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn exec(&self, fd: i32) -> libc::c_int {
+        unsafe {
+            libc::fexecve(
+                fd,
+                self.argv_p.as_ptr() as *const *const libc::c_char,
+                self.env_p.as_ptr() as *const *const libc::c_char,
+            )
+        }
+    }
 }
 
 /// Pin the running supervisor image (`/proc/self/exe` on Linux, `current_exe`
@@ -517,11 +531,7 @@ impl PinnedSupervisorImage {
         // callback must be last: it does not return on success.
         unsafe {
             command.pre_exec(move || {
-                libc::fexecve(
-                    exec_fd.as_raw_fd(),
-                    args.argv_p.as_ptr() as *const *const libc::c_char,
-                    args.env_p.as_ptr() as *const *const libc::c_char,
-                );
+                args.exec(exec_fd.as_raw_fd());
                 Err(io::Error::last_os_error())
             });
         }
