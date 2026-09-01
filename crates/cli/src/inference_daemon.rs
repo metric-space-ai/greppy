@@ -2408,7 +2408,11 @@ mod tests {
                 &server_address,
                 ServerPolicy {
                     model_ttl: Duration::from_secs(1),
-                    exit_ttl: Duration::from_millis(500),
+                    // Keep enough post-load margin for a contended CI host.
+                    // The prewarm below still exceeds this TTL, so a server
+                    // that incorrectly measures idleness from process start
+                    // deterministically exits before the ready probe.
+                    exit_ttl: Duration::from_secs(2),
                     request_deadline: Duration::from_secs(1),
                     hard_request_timeout: None,
                     max_request_bytes: 4096,
@@ -2464,7 +2468,7 @@ mod tests {
         // A long prewarm must not consume the daemon's post-load idle lifetime.
         // The old lifecycle measured exit_ttl from process start and exited on
         // the first loop iteration after a sufficiently slow model load.
-        std::thread::sleep(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(2_100));
         release_load_tx.send(()).expect("finish prewarm load");
         load_finished_rx
             .recv_timeout(Duration::from_secs(1))
