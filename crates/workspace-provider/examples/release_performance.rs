@@ -149,17 +149,10 @@ fn main() {
         serde_json::json!({"source_commit": args.source_commit}),
     );
     let cold_prime_started = Instant::now();
-    let previous_trace_dir = std::env::var_os("GREPPY_WORKSPACE_PHASE_TRACE_DIR");
     if let Some(path) = &args.phase_trace_dir {
         std::env::set_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR", path);
     }
     let prime = AgentWorkspace::create(&args.repository, "perf-prime");
-    if args.phase_trace_dir.is_some() {
-        match previous_trace_dir {
-            Some(path) => std::env::set_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR", path),
-            None => std::env::remove_var("GREPPY_WORKSPACE_PHASE_TRACE_DIR"),
-        }
-    }
     let prime = prime.unwrap();
     let prime_root = prime.worktree_path();
     assert_eq!(
