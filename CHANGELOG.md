@@ -50,6 +50,9 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   pre-lock window. It no longer mistakes the still-existing old graph for the
   new publication, prints `graph refresh published`, and immediately retries
   against the same stale generation.
+- Store-CoW visibility diagnostics now report the exact symmetric difference
+  between the indexed and live Delta manifests. A detached-HEAD move no longer
+  labels every Base-relative path as changed when only one path differs.
 - Typed caller/path traversal now constrains each Base/Delta edge layer by its
   indexed logical endpoint before composing visible node ids. It no longer
   scans the complete overlay edge view once per BFS node, and call-site lookup

@@ -208,17 +208,8 @@ pub(crate) fn overlay_freshness_proof(
     let cached = cached?;
     let live = visibility_against(root, &base_commit)?;
     if cached != live {
-        let mut changed = cached
-            .dirty_paths()
-            .chain(cached.deleted_paths())
-            .chain(live.dirty_paths())
-            .chain(live.deleted_paths())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        changed.sort();
-        changed.dedup();
         return Ok(Some(OverlayFreshnessProof::Stale {
-            changed_paths: changed,
+            changed_paths: visibility_changed_paths(&cached, &live),
             reason: "live Git changes differ from the indexed Store-CoW Delta".into(),
         }));
     }
@@ -330,6 +321,28 @@ pub(crate) fn overlay_freshness_proof(
     let total_inventory = usize::try_from(total_inventory)
         .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
     Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) -> Vec<String> {
+    let cached_dirty = cached
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    let live_dirty = live
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    let cached_deleted = cached
+        .deleted_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    let live_deleted = live
+        .deleted_paths()
+        .collect::<std::collections::BTreeSet<_>>();
+    cached_dirty
+        .symmetric_difference(&live_dirty)
+        .chain(cached_deleted.symmetric_difference(&live_deleted))
+        .map(|path| (*path).to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::BTreeSet<String>> {
@@ -1904,5 +1917,23 @@ mod tests {
             &std::collections::HashMap::new(),
         )
         .unwrap());
+    }
+
+    #[test]
+    fn visibility_diagnostics_report_only_the_actual_manifest_delta() {
+        let cached = VisibilityIndex::new(
+            ["kept.rs".into(), "removed.rs".into()],
+            ["was-deleted.rs".into()],
+        )
+        .unwrap();
+        let live = VisibilityIndex::new(
+            ["kept.rs".into(), "was-deleted.rs".into()],
+            ["now-deleted.rs".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            visibility_changed_paths(&cached, &live),
+            ["now-deleted.rs", "removed.rs", "was-deleted.rs"]
+        );
     }
 }
