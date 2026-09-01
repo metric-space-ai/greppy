@@ -828,6 +828,19 @@ fn fixture_source(name: &str) -> (PathBuf, String) {
     (path, source)
 }
 
+
+fn write_receipt_preserving_provenance(path: PathBuf, receipt: &serde_json::Value) {
+    let mut receipt = receipt.clone();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if let Ok(old) = serde_json::from_str::<serde_json::Value>(&existing) {
+            if let Some(provenance) = old.get("provenance") {
+                receipt["provenance"] = provenance.clone();
+            }
+        }
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+}
+
 #[test]
 fn session_create_run_close_over_unix_socket() {
     let socket =
@@ -2643,20 +2656,17 @@ fn oracle_skip_receipt_when_chromium_pin_missing() {
         .join("..")
         .join("scripts")
         .join("oracle-skip.sh");
+    let receipt = std::env::temp_dir().join(format!(
+        "greppy-oracle-skip-{}.json",
+        std::process::id()
+    ));
     let status = Command::new("sh")
         .arg(&script)
+        .arg(&receipt)
         .status()
         .expect("oracle-skip");
     assert!(status.success(), "{status}");
-    let receipt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("contracts/web-runtime/receipts/oracle-skip.json");
-    // CARGO_MANIFEST_DIR is crates/web-runtime/runtime → repo is ../../..
-    let text = std::fs::read_to_string(&receipt).unwrap_or_else(|_| {
-        let alt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../contracts/web-runtime/receipts/oracle-skip.json");
-        std::fs::read_to_string(alt).expect("oracle skip receipt")
-    });
+    let text = std::fs::read_to_string(&receipt).expect("oracle skip receipt");
     assert!(text.contains("skipped") || text.contains("ready"), "{text}");
 }
 
@@ -3541,11 +3551,7 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
         "match": true,
         "scope": "setContent title/evaluate/innerText only; not full Playwright surface",
     });
-    std::fs::write(
-        receipts_dir.join("oracle-setcontent.json"),
-        serde_json::to_vec_pretty(&receipt).unwrap(),
-    )
-    .unwrap();
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-setcontent.json"), &receipt);
 
     let content_ref = reference["cases"]["content"].clone();
     let content_receipt = json!({
@@ -3579,11 +3585,7 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "Chromium and Servo serialize quotes/doctype differently; only substring markers, count, and innerHTML of #x are compared"
         ],
     });
-    std::fs::write(
-        receipts_dir.join("oracle-content.json"),
-        serde_json::to_vec_pretty(&content_receipt).unwrap(),
-    )
-    .unwrap();
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-content.json"), &content_receipt);
     assert_eq!(content_receipt["match"], true, "{content_receipt}");
 
     let (dialog_path, dialog_source) = fixture_source("native-dialog.mjs");
@@ -3617,11 +3619,7 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "candidate page.on(dialog) is a policy probe; waitForEvent(dialog) reads retained SimpleDialog records after evaluate"
         ],
     });
-    std::fs::write(
-        receipts_dir.join("oracle-dialog.json"),
-        serde_json::to_vec_pretty(&dialog_receipt).unwrap(),
-    )
-    .unwrap();
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-dialog.json"), &dialog_receipt);
     assert_eq!(dialog_receipt["match"], true, "{dialog_receipt}");
 
     let (fill_path, fill_source) = fixture_source("oracle-fill.mjs");
@@ -3644,11 +3642,7 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
         "match": fill_ref["value"] == "ok",
         "scope": "locator.fill of a text input value only",
     });
-    std::fs::write(
-        receipts_dir.join("oracle-fill.json"),
-        serde_json::to_vec_pretty(&fill_receipt).unwrap(),
-    )
-    .unwrap();
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-fill.json"), &fill_receipt);
     assert_eq!(fill_receipt["match"], true, "{fill_receipt}");
 
     let (console_path, console_source) = fixture_source("console-messages.mjs");
@@ -3679,11 +3673,7 @@ fn oracle_matches_playwright_chromium_on_setcontent() {
             "Chromium delivers ConsoleMessage during the log; candidate records Servo show_console_message and flushes after evaluate"
         ],
     });
-    std::fs::write(
-        receipts_dir.join("oracle-console.json"),
-        serde_json::to_vec_pretty(&console_receipt).unwrap(),
-    )
-    .unwrap();
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-console.json"), &console_receipt);
     assert_eq!(console_receipt["match"], true, "{console_receipt}");
 }
 #[test]
@@ -3730,6 +3720,24 @@ fn twenty_independent_playwright_scripts() {
         );
         assert_eq!(ran.status, "ok", "{name}: {ran:?}");
     }
+}
+
+#[test]
+fn playwright_visible_pseudo_counts_displayed_nodes() {
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-visible-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let (path, source) = fixture_source("locator-count.mjs");
+    let _guard = Supervisor::spawn(&socket, "run_visible", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_visible",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
 }
 
 #[test]
