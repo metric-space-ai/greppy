@@ -1046,13 +1046,14 @@ exit 0;
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         image.bind_command(&mut command).unwrap();
         let mut child = command.spawn().expect("fd-backed spawn");
         std::thread::sleep(std::time::Duration::from_millis(50));
+        let early_status = child.try_wait().unwrap();
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "fexecve must run the pinned sleep image, not the replaced true path"
+            early_status.is_none(),
+            "fexecve must run the pinned sleep image, not the replaced true path; status={early_status:?}"
         );
         image.prove_child(child.id()).unwrap();
         let _ = child.kill();
