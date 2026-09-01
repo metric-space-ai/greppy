@@ -16,6 +16,10 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   and concurrent cache-writer contention cannot turn a valid hit into a new
   inference request. Live index status reports local reuse, global hits and
   genuine inference misses separately.
+- Store-CoW embedding counting and indexing now page the writable Delta table
+  directly. They no longer sort and deserialize every immutable Base node only
+  to discard it afterward, eliminating long zero-progress
+  `counting_embeddings` phases for small worktree deltas.
 - Exact token sizing uses the lightweight tokenizer in the indexing client
   while all heavyweight model inference remains in the shared supervisor.
   First-use indexing no longer serializes one daemon request per candidate
@@ -42,6 +46,13 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   immediately reporting a false Store-CoW drift for an unchanged hidden file.
   Freshness validation also excludes structural Folder nodes from its
   file-owned private-path invariant.
+- Typed caller/path traversal now constrains each Base/Delta edge layer by its
+  indexed logical endpoint before composing visible node ids. It no longer
+  scans the complete overlay edge view once per BFS node, and call-site lookup
+  reads only files reached by candidate paths instead of sorting every raw
+  edge in the project. `path --code` now explains that path is call-site-only
+  and gives the exact `greppy read SYMBOL` recovery; the agent contract no
+  longer advertises that unsupported combination.
 - `index status` is lock-free while an index writer is active and reports the
   foreground phase, completed/total spans and ETA when available. Semantic
   search against an incomplete embedding generation now returns temporary

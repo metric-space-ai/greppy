@@ -387,6 +387,31 @@ impl Store {
         Ok(rows)
     }
 
+    /// Paginate only nodes physically owned by the writable Store.
+    ///
+    /// In a Store-CoW overlay, `nodes` is a composed Base/Delta view. Indexer
+    /// phases that intentionally operate only on newly extracted Delta nodes
+    /// must not scan, sort and deserialize the immutable Base merely to reject
+    /// its negative ids afterward.
+    pub fn list_private_nodes(
+        &self,
+        project: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Node>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+             FROM main.nodes
+             WHERE project = ?1
+             ORDER BY qualified_name, id
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![project, limit as i64, offset as i64], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Count nodes matching the same `(project, label, file)` filter as
     /// [`Store::list_nodes`] (empty `label`/`file` means "do not filter").
     /// Useful for a paging UI that needs the total to compute page counts.

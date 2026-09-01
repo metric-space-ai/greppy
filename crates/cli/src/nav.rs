@@ -3772,17 +3772,21 @@ pub(crate) fn nav_path_distances_to(
     Ok(distances)
 }
 
+/// Add the first source location for every matching raw edge in one file.
+///
 /// Resolved edges collapse repeated calls from one definition to one target,
 /// so their `line` property is only the last occurrence inserted. Raw edges
-/// retain every occurrence. Path names one editable site per graph edge and
-/// consistently chooses the first call in source order.
-pub(crate) fn nav_path_first_sites(
+/// retain every occurrence. Loading them through the existing
+/// `(project, file_path)` index keeps `path` proportional to the files on the
+/// candidate paths instead of sorting every raw edge in a large project.
+pub(crate) fn nav_path_first_sites_for_file(
     store: &greppy_store::Store,
     project: &str,
     edge_type: &str,
-) -> Result<std::collections::HashMap<(String, String), u32>> {
-    let mut sites = std::collections::HashMap::new();
-    for edge in store.list_raw_edges(project)? {
+    file_path: &str,
+    sites: &mut std::collections::HashMap<(String, String), u32>,
+) -> Result<()> {
+    for edge in store.list_raw_edges_for_file(project, file_path)? {
         if edge.edge_type != edge_type {
             continue;
         }
@@ -3799,7 +3803,7 @@ pub(crate) fn nav_path_first_sites(
             .and_modify(|first: &mut u32| *first = (*first).min(line))
             .or_insert(line);
     }
-    Ok(sites)
+    Ok(())
 }
 
 /// Collect at most eight simple paths in deterministic call-site order. The
@@ -3814,7 +3818,9 @@ pub(crate) fn nav_collect_paths(
     edge_type: &str,
     max_hops: usize,
     distances: &std::collections::HashMap<i64, usize>,
-    first_sites: &std::collections::HashMap<(String, String), u32>,
+    project: &str,
+    first_sites: &mut std::collections::HashMap<(String, String), u32>,
+    loaded_site_files: &mut std::collections::HashSet<String>,
     nodes: &mut std::collections::HashMap<i64, greppy_store::Node>,
     stack: &mut std::collections::HashSet<i64>,
     path: &mut Vec<NavPathStep>,
@@ -3836,6 +3842,10 @@ pub(crate) fn nav_collect_paths(
             source
         }
     };
+
+    if loaded_site_files.insert(source.file_path.clone()) {
+        nav_path_first_sites_for_file(store, project, edge_type, &source.file_path, first_sites)?;
+    }
 
     let mut next_steps = Vec::new();
     for edge in store.outgoing_edges(current, Some(edge_type), 1024)? {
@@ -3906,7 +3916,9 @@ pub(crate) fn nav_collect_paths(
                 edge_type,
                 max_hops,
                 distances,
+                project,
                 first_sites,
+                loaded_site_files,
                 nodes,
                 stack,
                 path,
@@ -4144,7 +4156,8 @@ pub(crate) fn dispatch_path(
     };
 
     let distances = nav_path_distances_to(&store, to_id, &edge_upper, max_hops)?;
-    let first_sites = nav_path_first_sites(&store, &project, &edge_upper)?;
+    let mut first_sites = std::collections::HashMap::new();
+    let mut loaded_site_files = std::collections::HashSet::new();
     let mut nodes = std::collections::HashMap::from([(from_id, start.clone())]);
     let mut stack = std::collections::HashSet::from([from_id]);
     let mut current_path = Vec::new();
@@ -4157,7 +4170,9 @@ pub(crate) fn dispatch_path(
         &edge_upper,
         max_hops,
         &distances,
-        &first_sites,
+        &project,
+        &mut first_sites,
+        &mut loaded_site_files,
         &mut nodes,
         &mut stack,
         &mut current_path,

@@ -93,7 +93,9 @@ NAVIGATE:
 
   who-calls and callees answer for several symbols at once: `who-calls A B C`.
 
-  --code            also print the source at each result
+  --code            also print source for who-calls, callees, brief and impact; path is a
+                    bounded call-site tree and intentionally rejects --code — read a returned
+                    symbol when its definition body is needed
   --all             every result instead of the first few
 
 READ:
@@ -182,4 +184,3 @@ greppy has a local browser runtime — no Chromium, no Node. Its command surface
 is still moving, so it is not described here. To let an agent drive a browser,
 append `assets/prompts/web-beta.md` to this prompt. Without it, nothing about
 greppy changes.
-

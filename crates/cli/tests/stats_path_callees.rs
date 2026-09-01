@@ -589,6 +589,27 @@ fn path_help_uses_stored_edge_names_and_has_no_code_flag() {
 }
 
 #[test]
+fn path_rejects_code_with_actionable_recovery() {
+    let root = fresh_dir("path-code");
+    let store = root.join("store");
+    let (code, out, err) = run(
+        &["path", "--from", "entry", "--to", "leaf", "--code"],
+        &root,
+        &store,
+    );
+    assert_eq!(
+        code, 64,
+        "unsupported path --code must exit 64: {out}\n{err}"
+    );
+    assert!(
+        out.contains("run it without `--code`")
+            && out.contains("greppy read SYMBOL")
+            && out.contains("greppy path --from SYMBOL --to SYMBOL"),
+        "refusal must provide exact recovery and valid usage: {out:?}"
+    );
+}
+
+#[test]
 fn path_rejects_edge_names_the_store_does_not_use() {
     let root = fresh_dir("path-edge-values");
     let store = root.join("store");

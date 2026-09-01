@@ -888,7 +888,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                println!("`{stray}` does not fit `{sub}`");
+                if sub == "path" && stray == "--code" {
+                    println!(
+                        "`path` prints the bounded call-site chain and does not accept `--code`; \
+                         run it without `--code`, then use `greppy read SYMBOL` for a returned \
+                         definition body"
+                    );
+                } else {
+                    println!("`{stray}` does not fit `{sub}`");
+                }
             } else {
                 println!("{first}");
             }

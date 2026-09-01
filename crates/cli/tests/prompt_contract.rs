@@ -400,8 +400,13 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // 26.08 bash-smart execution contract wording plus the branch's 31.08
     // web-beta pointer. No new sentence was written for the merge; the hash
     // moves mechanically to the union.
+    // 01.09.2026: a reproduced usability report showed that NAVIGATE's
+    // generic --code footer incorrectly included `path`, whose stable surface
+    // is deliberately a bounded call-site tree. The owner-approved correction
+    // names the exception and the exact `read` recovery instead of adding a
+    // new path output mode to the 0.3.x stability line.
     const APPROVED_SHA256: &str =
-        "d2530d19468c108edc9c81b23ad177020dc7990d989ea5d8395cb4ab074acc4f";
+        "8bf151473a1ef3d02db20986059c309a7e9e28e82c03229ce1b4b00c24a43f17";
 
     let text = prompt();
     let digest = {

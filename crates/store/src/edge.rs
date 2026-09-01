@@ -35,6 +35,16 @@ pub struct NewOverlayEdge {
     pub properties: serde_json::Value,
 }
 
+#[derive(Debug)]
+struct OverlayEdgeCandidate {
+    id: i64,
+    project: String,
+    source_qualified_name: String,
+    target_qualified_name: String,
+    edge_type: String,
+    properties: String,
+}
+
 impl Store {
     /// Upsert private overlay edges in one transaction.
     ///
@@ -208,6 +218,11 @@ impl Store {
         edge_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Edge>> {
+        if self.is_overlay() {
+            if let Some(edge_type) = edge_type {
+                return self.overlay_edges_for_endpoint(source_id, edge_type, limit, false);
+            }
+        }
         let (sql, has_type) = match edge_type {
             Some(_) => (
                 "SELECT id, project, source_id, target_id, edge_type, properties
@@ -244,6 +259,11 @@ impl Store {
         edge_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Edge>> {
+        if self.is_overlay() {
+            if let Some(edge_type) = edge_type {
+                return self.overlay_edges_for_endpoint(target_id, edge_type, limit, true);
+            }
+        }
         let (sql, has_type) = match edge_type {
             Some(_) => (
                 "SELECT id, project, source_id, target_id, edge_type, properties
@@ -270,6 +290,150 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         Ok(rows)
+    }
+
+    /// Resolve typed edges in an overlay without filtering the composed
+    /// `edges` view by a derived numeric id. SQLite cannot push that predicate
+    /// through the Base/Delta UNION and joins, so the generic query scans and
+    /// sorts the full Base graph for every BFS node. Qualified endpoint names
+    /// are the native indexed keys of overlay edges; constrain each UNION arm
+    /// first, then map the small candidate set back to visible node ids.
+    fn overlay_edges_for_endpoint(
+        &self,
+        node_id: i64,
+        edge_type: &str,
+        limit: usize,
+        incoming: bool,
+    ) -> Result<Vec<Edge>> {
+        let Some(endpoint) = self.get_node(node_id)? else {
+            return Ok(Vec::new());
+        };
+        let sql = if incoming {
+            r#"
+WITH candidate_edges AS (
+    SELECT d.id, d.project, d.source_qualified_name, d.target_qualified_name,
+           d.edge_type, d.properties
+    FROM main.overlay_edges d
+    WHERE d.project = ?1
+      AND d.target_qualified_name = ?2
+      AND d.edge_type = ?3
+    UNION ALL
+    SELECT -e.id, e.project, base_source.qualified_name,
+           base_target.qualified_name, e.edge_type, e.properties
+    FROM greppy_base.nodes base_target
+    JOIN greppy_base.edges e ON e.target_id = base_target.id
+    JOIN greppy_base.nodes base_source ON base_source.id = e.source_id
+    WHERE base_target.project = ?1
+      AND base_target.qualified_name = ?2
+      AND e.edge_type = ?3
+      AND NOT EXISTS (
+          SELECT 1 FROM greppy_hidden_paths h
+          WHERE h.path = base_source.file_path
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM main.overlay_edges d
+          WHERE d.project = e.project
+            AND d.source_qualified_name = base_source.qualified_name
+            AND d.target_qualified_name = base_target.qualified_name
+            AND d.edge_type = e.edge_type
+      )
+)
+SELECT id, project, source_qualified_name, target_qualified_name,
+       edge_type, properties
+FROM candidate_edges
+ORDER BY id
+LIMIT ?4
+"#
+        } else {
+            r#"
+WITH candidate_edges AS (
+    SELECT d.id, d.project, d.source_qualified_name, d.target_qualified_name,
+           d.edge_type, d.properties
+    FROM main.overlay_edges d
+    WHERE d.project = ?1
+      AND d.source_qualified_name = ?2
+      AND d.edge_type = ?3
+    UNION ALL
+    SELECT -e.id, e.project, base_source.qualified_name,
+           base_target.qualified_name, e.edge_type, e.properties
+    FROM greppy_base.nodes base_source
+    JOIN greppy_base.edges e ON e.source_id = base_source.id
+    JOIN greppy_base.nodes base_target ON base_target.id = e.target_id
+    WHERE base_source.project = ?1
+      AND base_source.qualified_name = ?2
+      AND e.edge_type = ?3
+      AND NOT EXISTS (
+          SELECT 1 FROM greppy_hidden_paths h
+          WHERE h.path = base_source.file_path
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM main.overlay_edges d
+          WHERE d.project = e.project
+            AND d.source_qualified_name = base_source.qualified_name
+            AND d.target_qualified_name = base_target.qualified_name
+            AND d.edge_type = e.edge_type
+      )
+)
+SELECT id, project, source_qualified_name, target_qualified_name,
+       edge_type, properties
+FROM candidate_edges
+ORDER BY id
+LIMIT ?4
+"#
+        };
+
+        // A hidden endpoint can make a candidate disappear while resolving
+        // the composed node view. Fetch a small cushion so the public limit
+        // remains useful without ever returning an unbounded candidate set.
+        let candidate_limit = limit.saturating_mul(4).max(limit) as i64;
+        let candidates = {
+            let mut stmt = self.conn().prepare(sql)?;
+            let rows = stmt.query_map(
+                params![
+                    endpoint.project,
+                    endpoint.qualified_name,
+                    edge_type,
+                    candidate_limit
+                ],
+                |row| {
+                    Ok(OverlayEdgeCandidate {
+                        id: row.get(0)?,
+                        project: row.get(1)?,
+                        source_qualified_name: row.get(2)?,
+                        target_qualified_name: row.get(3)?,
+                        edge_type: row.get(4)?,
+                        properties: row.get(5)?,
+                    })
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut edges = Vec::with_capacity(candidates.len().min(limit));
+        for candidate in candidates {
+            let Some(source) =
+                self.get_node_by_qname(&candidate.project, &candidate.source_qualified_name)?
+            else {
+                continue;
+            };
+            let Some(target) =
+                self.get_node_by_qname(&candidate.project, &candidate.target_qualified_name)?
+            else {
+                continue;
+            };
+            edges.push(Edge {
+                id: candidate.id,
+                project: candidate.project,
+                source_id: source.id,
+                target_id: target.id,
+                edge_type: candidate.edge_type,
+                properties: serde_json::from_str(&candidate.properties)?,
+            });
+            if edges.len() >= limit {
+                break;
+            }
+        }
+        Ok(edges)
     }
 
     /// Count edges of a given type within a project.
@@ -448,6 +612,15 @@ mod tests {
         let store = view.store_mut();
         let source = store.get_node_by_qname("p", "p.A").unwrap().unwrap();
         let target = store.get_node_by_qname("p", "p.B").unwrap().unwrap();
+        let private_nodes = store.list_private_nodes("p", 0, 10).unwrap();
+        assert_eq!(
+            private_nodes
+                .iter()
+                .map(|node| node.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p.B"],
+            "Delta-only index phases must not scan immutable Base nodes"
+        );
         store
             .insert_overlay_edges(&[NewOverlayEdge {
                 project: "p".into(),
@@ -462,6 +635,83 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].target_id, target.id);
         assert_eq!(edges[0].properties["line"], 7);
+        let incoming = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_id, source.id);
+        assert_eq!(incoming[0].properties["line"], 7);
+    }
+
+    #[test]
+    fn typed_overlay_queries_return_indexed_base_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("base.db");
+        let delta_path = tmp.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "2026-09-01T00:00:00Z".into(),
+                root_path: "/base".into(),
+            })
+            .unwrap();
+            let source = base
+                .insert_node(&NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "A".into(),
+                    qualified_name: "p.A".into(),
+                    file_path: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 5,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            let target = base
+                .insert_node(&NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "B".into(),
+                    qualified_name: "p.B".into(),
+                    file_path: "b.rs".into(),
+                    start_line: 1,
+                    end_line: 5,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            base.insert_edge(&NewEdge {
+                project: "p".into(),
+                source_id: source,
+                target_id: target,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"line": 11}),
+            })
+            .unwrap();
+        }
+        {
+            let mut delta = Store::open(&delta_path).unwrap();
+            delta
+                .upsert_project(&Project {
+                    name: "p".into(),
+                    indexed_at: "2026-09-01T00:00:00Z".into(),
+                    root_path: "/delta".into(),
+                })
+                .unwrap();
+        }
+
+        let visibility = VisibilityIndex::new(std::iter::empty(), std::iter::empty()).unwrap();
+        let mut view = StoreView::open_overlay(&base_path, &delta_path, visibility).unwrap();
+        let store = view.store_mut();
+        let source = store.get_node_by_qname("p", "p.A").unwrap().unwrap();
+        let target = store.get_node_by_qname("p", "p.B").unwrap().unwrap();
+
+        let outgoing = store.outgoing_edges(source.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].target_id, target.id);
+        assert_eq!(outgoing[0].properties["line"], 11);
+        let incoming = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_id, source.id);
+        assert_eq!(incoming[0].properties["line"], 11);
     }
 
     #[test]

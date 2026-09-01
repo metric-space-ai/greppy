@@ -234,16 +234,17 @@ pub fn count_code_embedding_documents_for_project(
     let mut total = 0usize;
 
     loop {
-        let nodes = store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?;
+        let nodes = if store.is_overlay() {
+            store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
+        } else {
+            store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
+        };
         if nodes.is_empty() {
             break;
         }
         offset += nodes.len();
 
         for node in nodes {
-            if store.is_overlay() && node.id < 0 {
-                continue;
-            }
             if !is_embedding_candidate_label(&node.label) {
                 continue;
             }
@@ -326,16 +327,17 @@ pub fn index_code_embeddings_for_project_with_progress(
     });
 
     loop {
-        let nodes = store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?;
+        let nodes = if store.is_overlay() {
+            store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
+        } else {
+            store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
+        };
         if nodes.is_empty() {
             break;
         }
         offset += nodes.len();
 
         for node in nodes {
-            if store.is_overlay() && node.id < 0 {
-                continue;
-            }
             report.nodes_considered += 1;
             if !is_embedding_candidate_label(&node.label) {
                 report.nodes_skipped_non_definition += 1;
