@@ -36,6 +36,10 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   persisted per worktree, stays pinned when the primary checkout advances,
   and later worktrees reuse a verified Base without another checkout or full
   repository walk.
+- Tracked Delta paths intentionally excluded by discovery policy (for example
+  `.gitattributes`) now persist a metadata identity without entering the code
+  graph. A successful Base+Delta build therefore remains fresh instead of
+  immediately reporting a false Store-CoW drift for an unchanged hidden file.
 - `index status` is lock-free while an index writer is active and reports the
   foreground phase, completed/total spans and ETA when available. Semantic
   search against an incomplete embedding generation now returns temporary

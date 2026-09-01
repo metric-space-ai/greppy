@@ -271,14 +271,27 @@ pub fn index_with_options_and_progress(
         &greppy_discover::SkipPolicy::walk_default(),
         &options.discover_overrides,
     )?;
-    let all_entries = if let Some(only_paths) = options.only_paths.as_ref() {
-        discovered_entries
-            .into_iter()
-            .filter(|entry| only_paths.contains(&entry.rel_path))
-            .collect::<Vec<_>>()
-    } else {
-        discovered_entries
-    };
+    let (all_entries, discovery_filtered_entries) =
+        if let Some(only_paths) = options.only_paths.as_ref() {
+            let discovered_paths = discovered_entries
+                .iter()
+                .map(|entry| entry.rel_path.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let filtered = only_paths
+                .iter()
+                .filter(|rel_path| !discovered_paths.contains(rel_path.as_str()))
+                .filter_map(|rel_path| explicit_filtered_inventory_entry(&abs_root, rel_path))
+                .collect::<Vec<_>>();
+            (
+                discovered_entries
+                    .into_iter()
+                    .filter(|entry| only_paths.contains(&entry.rel_path))
+                    .collect::<Vec<_>>(),
+                filtered,
+            )
+        } else {
+            (discovered_entries, Vec::new())
+        };
     progress(IndexBuildProgress::new(
         "classifying_files",
         0,
@@ -483,6 +496,18 @@ pub fn index_with_options_and_progress(
     progress(IndexBuildProgress::new("resolving_file_imports", 1, 1));
 
     record_control_skips(store, project_name, &controlled_entries.skipped, generation)?;
+    for entry in &discovery_filtered_entries {
+        drop_indexed_rows_for_skip(store, project_name, &entry.rel_path)?;
+        record_index_skip(
+            store,
+            project_name,
+            entry,
+            greppy_parser::language_for_path(&entry.abs_path).name(),
+            "discovery_filtered",
+            "tracked Store-CoW Delta path is intentionally excluded by discovery policy",
+            generation,
+        )?;
+    }
 
     // R3.5 diagnostics: record the provider completeness state reflected by
     // this index generation. The provider table is store-owned so query-time
@@ -493,6 +518,36 @@ pub fn index_with_options_and_progress(
     report.graph_generation = generation;
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
+}
+
+fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<InventoryEntry> {
+    let relative = Path::new(rel_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let abs_path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&abs_path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let stable = stable_metadata(&metadata);
+    Some(InventoryEntry {
+        rel_path: rel_path.replace('\\', "/"),
+        abs_path,
+        size: Some(stable.size),
+        mtime_ns: stable.mtime_ns,
+        ctime_ns: stable.ctime_ns,
+        file_id: stable.file_id,
+    })
 }
 
 fn indexer_version_for_options(options: &IndexOptions) -> String {
@@ -3351,6 +3406,28 @@ mod tests {
             }
         }
     "#;
+
+    #[test]
+    fn store_cow_only_paths_persist_discovery_filtered_file_identity() {
+        let repo = setup_repo("filtered-hidden", RUST_SAMPLE);
+        fs::write(repo.join(".gitattributes"), "*.bin binary\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                ".gitattributes".to_string()
+            ])),
+            ..IndexOptions::default()
+        };
+        index_with_options(&mut store, &repo, "p", &options).unwrap();
+        let skip = store
+            .get_index_skip("p", ".gitattributes")
+            .unwrap()
+            .expect("filtered Delta path must have a persisted identity");
+        assert_eq!(skip.reason, "discovery_filtered");
+        assert_eq!(skip.size, 13);
+        assert!(skip.file_id.is_some());
+        let _ = fs::remove_dir_all(repo);
+    }
 
     const CALLS_SAMPLE: &str = r#"
         fn a() {
