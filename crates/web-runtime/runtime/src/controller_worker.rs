@@ -15,13 +15,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const PLAYWRIGHT_JS: &str = include_str!("../js/playwright.mjs");
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(120);
 /// RPC/transport headroom beyond the requested action timeout so the engine
 /// can return a named actionability error instead of racing the same deadline.
 const ENGINE_RPC_HEADROOM_MS: u64 = 250;
@@ -540,13 +539,16 @@ fn install_console_capture(runtime: &mut JsRuntime) -> io::Result<()> {
 }
 
 fn recv_control(control_rx: &mpsc::Receiver<io::Result<Message>>) -> io::Result<Message> {
-    match control_rx.recv_timeout(MESSAGE_TIMEOUT) {
+    // Block until the next RunScript/Shutdown or until the supervisor hangs up.
+    // A 120s idle timeout here killed a live controller during
+    // web.session.create/close cycles: those operations never send RunScript,
+    // so a healthy supervisor looks "silent" for the whole run. When the
+    // controller then exited, the test harness abort()ed through mozalloc and
+    // the suite never printed `test result:`. Supervisor death already arrives
+    // as UnexpectedEof/BrokenPipe on the socketpair.
+    match control_rx.recv() {
         Ok(message) => message,
-        Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out waiting for supervisor message",
-        )),
-        Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+        Err(_) => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "controller protocol reader stopped",
         )),
