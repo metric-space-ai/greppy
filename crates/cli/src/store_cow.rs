@@ -314,26 +314,7 @@ pub(crate) fn overlay_freshness_proof(
         }
     }
 
-    let mut private_paths = std::collections::BTreeSet::new();
-    for query in [
-        "SELECT rel_path FROM main.file_state",
-        "SELECT rel_path FROM main.index_skips",
-        "SELECT file_path FROM main.nodes WHERE file_path <> ''",
-        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
-        "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
-        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
-    ] {
-        let mut statement = store
-            .conn()
-            .prepare(query)
-            .map_err(|error| Error::Store(format!("inspect Store-CoW Delta paths: {error}")))?;
-        let paths = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| Error::Store(format!("query Store-CoW Delta paths: {error}")))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
-        private_paths.extend(paths);
-    }
+    let private_paths = private_delta_paths(store)?;
     if let Some(unbound) = private_paths
         .iter()
         .find(|path| !dirty.contains(path.as_str()))
@@ -349,6 +330,30 @@ pub(crate) fn overlay_freshness_proof(
     let total_inventory = usize::try_from(total_inventory)
         .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
     Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::BTreeSet<String>> {
+    let mut private_paths = std::collections::BTreeSet::new();
+    for query in [
+        "SELECT rel_path FROM main.file_state",
+        "SELECT rel_path FROM main.index_skips",
+        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'",
+        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
+        "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+    ] {
+        let mut statement = store
+            .conn()
+            .prepare(query)
+            .map_err(|error| Error::Store(format!("inspect Store-CoW Delta paths: {error}")))?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| Error::Store(format!("query Store-CoW Delta paths: {error}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
+        private_paths.extend(paths);
+    }
+    Ok(private_paths)
 }
 
 fn persisted_delta_path_matches(
@@ -1721,6 +1726,35 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn private_delta_paths_exclude_structural_folders() {
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-09-01T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+        for (label, name, path) in [("Folder", "src", "src"), ("Function", "run", "src/lib.rs")] {
+            store
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: label.into(),
+                    name: name.into(),
+                    qualified_name: format!("p::{name}"),
+                    file_path: path.into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+        let paths = private_delta_paths(&store).unwrap();
+        assert!(!paths.contains("src"));
+        assert!(paths.contains("src/lib.rs"));
     }
 
     #[test]

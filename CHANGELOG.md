@@ -40,6 +40,8 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   `.gitattributes`) now persist a metadata identity without entering the code
   graph. A successful Base+Delta build therefore remains fresh instead of
   immediately reporting a false Store-CoW drift for an unchanged hidden file.
+  Freshness validation also excludes structural Folder nodes from its
+  file-owned private-path invariant.
 - `index status` is lock-free while an index writer is active and reports the
   foreground phase, completed/total spans and ETA when available. Semantic
   search against an incomplete embedding generation now returns temporary
