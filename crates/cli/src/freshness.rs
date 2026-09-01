@@ -217,18 +217,35 @@ pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
         match greppy_freshness::try_acquire(&store_path) {
             Ok(lock) => {
                 drop(lock);
+                // The launcher publishes its job record before the child can
+                // acquire the writer lock. During that short window the old
+                // graph still exists and the lock is momentarily free. Treating
+                // `path.exists()` as proof of publication made a stale query
+                // announce "refresh published", reopen the old generation,
+                // and fail stale again. A refresh is complete only after its
+                // owned record disappears; `BackgroundJobGuard::complete`
+                // removes it after snapshot publication.
+                if let Some(job) = read_background_job(&background_job_path(&effective_root)) {
+                    if background_refresh_is_pending(&job) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    let state = job
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let error = job
+                        .get("last_error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no error was recorded");
+                    eprintln!(
+                        "greppy: graph refresh did not publish a new snapshot — state={state}, error={error}; inspect `greppy index status --json`"
+                    );
+                    return;
+                }
                 if store_path.exists() {
                     eprintln!("greppy: graph refresh published; resuming query");
                     return;
-                }
-                // A newly spawned first-use child publishes its job record
-                // before it acquires the writer lock. Do not confuse that
-                // short launch window with successful publication.
-                if read_background_job(&background_job_path(&effective_root)).is_some()
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    continue;
                 }
                 eprintln!(
                     "greppy: graph refresh has not published a snapshot yet; inspect `greppy index status --json`"
@@ -275,6 +292,24 @@ pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
                 return;
             }
         }
+    }
+}
+
+fn background_refresh_is_pending(job: &serde_json::Value) -> bool {
+    let state = job
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if matches!(state, "failed" | "complete") {
+        return false;
+    }
+    match job
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        Some(pid) => process_is_alive(pid),
+        None => state == "launching",
     }
 }
 
@@ -904,4 +939,26 @@ pub(crate) fn cleanup_sqlite_family(path: &std::path::Path) -> Result<()> {
 pub(crate) fn cleanup_sqlite_sidecars(path: &std::path::Path) -> Result<()> {
     remove_file_if_exists(&sqlite_sidecar(path, "-wal"))?;
     remove_file_if_exists(&sqlite_sidecar(path, "-shm"))
+}
+
+#[cfg(test)]
+mod refresh_wait_tests {
+    use super::background_refresh_is_pending;
+
+    #[test]
+    fn launch_record_without_writer_lock_is_still_pending() {
+        assert!(background_refresh_is_pending(&serde_json::json!({
+            "state": "launching",
+            "pid": null
+        })));
+    }
+
+    #[test]
+    fn failed_refresh_record_is_not_publication() {
+        assert!(!background_refresh_is_pending(&serde_json::json!({
+            "state": "failed",
+            "pid": null,
+            "last_error": "fixture"
+        })));
+    }
 }

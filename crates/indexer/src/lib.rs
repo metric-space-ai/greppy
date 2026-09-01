@@ -507,6 +507,14 @@ pub fn index_with_options_and_progress(
             "tracked Store-CoW Delta path is intentionally excluded by discovery policy",
             generation,
         )?;
+        // A discovery-filtered Delta path is still part of the visible
+        // workspace. Persist its content identity as well as the diagnostic
+        // skip row. The skip row's stat tuple is a fast path, but metadata can
+        // legitimately change while Git content remains byte-identical (for
+        // example after a checkout, chmod, or backup restore). Without the
+        // hash-backed file_state fallback, the next query falsely declared a
+        // clean Store-CoW snapshot stale and entered a refresh loop.
+        record_unsupported_file_state(store, project_name, entry, generation);
     }
 
     // R3.5 diagnostics: record the provider completeness state reflected by
@@ -3426,6 +3434,16 @@ mod tests {
         assert_eq!(skip.reason, "discovery_filtered");
         assert_eq!(skip.size, 13);
         assert!(skip.file_id.is_some());
+        let state = store
+            .get_file_state("p", ".gitattributes")
+            .unwrap()
+            .expect("filtered Delta path must retain a hash-backed file identity");
+        assert_eq!(state.size, 13);
+        assert_eq!(
+            state.sha256,
+            file_state::sha256_hex(b"*.bin binary\n"),
+            "metadata-only drift must be recoverable through content identity"
+        );
         let _ = fs::remove_dir_all(repo);
     }
 

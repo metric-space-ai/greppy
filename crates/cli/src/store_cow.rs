@@ -1872,4 +1872,37 @@ mod tests {
         assert!(visibility.is_deleted_path("src/a.rs"));
         assert!(visibility.is_dirty_path("src/renamed.rs"));
     }
+
+    #[test]
+    fn discovery_filtered_delta_freshness_falls_back_to_content_hash() {
+        let repo = fixture();
+        let hidden = repo.path().join(".github/workflows/ci.yml");
+        std::fs::create_dir_all(hidden.parent().unwrap()).unwrap();
+        std::fs::write(&hidden, "name: CI\n").unwrap();
+
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                ".github/workflows/ci.yml".to_string(),
+            ])),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        let skip = store
+            .get_index_skip("p", ".github/workflows/ci.yml")
+            .unwrap()
+            .expect("hidden path skip identity");
+        assert_eq!(skip.reason, "discovery_filtered");
+
+        // An absent/mismatched stat identity forces the content fallback.
+        // The unchanged bytes must still prove the Delta snapshot fresh.
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            ".github/workflows/ci.yml",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+    }
 }

@@ -41,11 +41,15 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
   and later worktrees reuse a verified Base without another checkout or full
   repository walk.
 - Tracked Delta paths intentionally excluded by discovery policy (for example
-  `.gitattributes`) now persist a metadata identity without entering the code
-  graph. A successful Base+Delta build therefore remains fresh instead of
-  immediately reporting a false Store-CoW drift for an unchanged hidden file.
-  Freshness validation also excludes structural Folder nodes from its
-  file-owned private-path invariant.
+  `.gitattributes` or `.github/workflows/ci.yml`) now persist both metadata and
+  content identities without entering the code graph. Metadata-only changes
+  therefore fall back to the content hash instead of starting a false
+  Store-CoW freshness loop. Freshness validation also excludes structural
+  Folder nodes from its file-owned private-path invariant.
+- A stale query joining a background refresh now waits through the launcher's
+  pre-lock window. It no longer mistakes the still-existing old graph for the
+  new publication, prints `graph refresh published`, and immediately retries
+  against the same stale generation.
 - Typed caller/path traversal now constrains each Base/Delta edge layer by its
   indexed logical endpoint before composing visible node ids. It no longer
   scans the complete overlay edge view once per BFS node, and call-site lookup
