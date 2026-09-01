@@ -568,6 +568,13 @@ mod tests {
         assert!(matched("visible=true", json!({ "visible": true })));
         assert!(matched("visible>=1", json!({ "visible": true })));
     }
+
+    #[test]
+    fn node_query_quotes_are_only_cli_grouping() {
+        assert_eq!(normalize_node_query("css=a b"), "css=a b");
+        assert_eq!(normalize_node_query(r#"css="a b""#), "css=a b");
+        assert_eq!(normalize_node_query(r#"text="Save draft""#), "text=Save draft");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +754,7 @@ fn query_expression(query: &str, body: &str) -> String {
     let query = unquote_query_value(query);
     // The query is embedded as a JSON string so quotes and backslashes in a
     // regex survive intact.
-    let literal = serde_json::Value::String(query.to_owned()).to_string();
+    let literal = serde_json::Value::String(normalize_node_query(query)).to_string();
     format!(
         "(function(){{ var resolve = {RESOLVER_JS}; var describe = {DESCRIBE_JS}; \
          var nodes = resolve({literal}); {body} }})()"
