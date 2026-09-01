@@ -445,11 +445,26 @@ pub(super) fn retry_delays() -> impl Iterator<Item = Duration> {
         .map(Duration::from_millis)
 }
 
-pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
+/// Configure `command` to run detached from this process group without
+/// spawning it. Callers that need to decorate the command further (the web
+/// runtime hands over an attach token) or keep the child handle use this;
+/// [`spawn_detached`] remains the one-call variant.
+pub(crate) fn detach_command(command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        detach_command(command);
         command.spawn().map(|_| ())
     }
     #[cfg(windows)]

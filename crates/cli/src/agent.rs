@@ -46,8 +46,7 @@ Coding agent with interactive and one-shot modes. Uses the installed portable
 Chunk-CoW provider and fails before the first model request when its adapter
 or persistent mount is not healthy. The immutable baseline includes the pinned
 commit plus visible staged, unstaged and untracked state; ignored files are
-excluded, and ignored build caches are kept deliberately for speed unless
---fresh is passed. It delivers a baseline-bound proposal ref
+excluded. It delivers a baseline-bound proposal ref
 (refs/greppy/agent/<run_id>); inspect it with `git show` or apply it with
 `greppy agent apply REF`. The agent has exactly one tool — `greppy` — covering
 search/navigate/read/edit; commands run through that tool as
@@ -331,15 +330,6 @@ fn apply_interactive_settings(
         && std::env::var_os("GREPPY_SKIP_SELFCHECK").is_none()
     {
         args.skip_selfcheck = settings.skip_selfcheck;
-    }
-    if !has_long_option(argv, "--workspace-backend")
-        && std::env::var_os("GREPPY_WORKSPACE_BACKEND").is_none()
-    {
-        args.workspace_backend = match settings.workspace_backend.as_str() {
-            "native" => WorkspaceBackendArg::Native,
-            "cow" => WorkspaceBackendArg::Cow,
-            _ => WorkspaceBackendArg::Auto,
-        };
     }
     if std::env::var_os("GREPPY_DEVICE").is_none()
         && std::env::var_os("GREPPY_NO_GPU").is_none()
@@ -1994,7 +1984,6 @@ mod tests {
             private_store: true,
             no_sandbox: true,
             skip_selfcheck: true,
-            workspace_backend: "native".into(),
             ..crate::agent_tui::AgentSettings::default()
         };
         apply_interactive_settings(&mut args, &[], &settings);
@@ -2003,7 +1992,6 @@ mod tests {
         assert!(args.private_store);
         assert!(args.no_sandbox);
         assert!(args.skip_selfcheck);
-        assert_eq!(args.workspace_backend, WorkspaceBackendArg::Native);
     }
 
     #[test]
@@ -2202,10 +2190,6 @@ mod tests {
         assert!(
             help.contains("ignored files are excluded"),
             "help must document ignored-file exclusion: {help}"
-        );
-        assert!(
-            help.contains("--fresh") || help.contains("fresh"),
-            "help must mention --fresh: {help}"
         );
         assert!(help.contains("/model"), "help must mention /model: {help}");
         assert!(
