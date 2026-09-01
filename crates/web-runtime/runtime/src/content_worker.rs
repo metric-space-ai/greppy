@@ -343,7 +343,11 @@ struct Delegate {
     last_responses: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
-    handled_input_events: RefCell<HashMap<InputEventId, InputEventResult>>,
+    /// Receipts for synthetic input: Servo acknowledges every input event,
+    /// and a painter-side drop (no display list yet -> empty hit test)
+    /// arrives as InputEventResult::DispatchFailed. Confirmed delivery
+    /// (finding 034) retries on that instead of losing clicks silently.
+    input_receipts: RefCell<HashMap<InputEventId, InputEventResult>>,
     wake: WakeFlag,
     /// Auxiliary webviews (popups) do not inherit the parent's user content
     /// manager; without threading it through here a popup would miss the Web
@@ -379,7 +383,7 @@ impl Delegate {
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
-            handled_input_events: RefCell::new(HashMap::new()),
+            input_receipts: RefCell::new(HashMap::new()),
             wake,
             user_content,
         }
@@ -424,7 +428,7 @@ impl WebViewDelegate for Delegate {
         event_id: InputEventId,
         result: InputEventResult,
     ) {
-        self.handled_input_events
+        self.input_receipts
             .borrow_mut()
             .insert(event_id, result);
         self.wake.wake();
@@ -1990,6 +1994,7 @@ impl ContentEngine {
                         "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var pending = 'pending:' + token; node.setAttribute(attr, pending); var mark = function() {{ if (node.getAttribute(attr) === pending) node.setAttribute(attr, 'seen:' + token); node.removeEventListener('click', mark, true); }}; node.addEventListener('click', mark, true); return true"
                     ),
                 )?;
+                self.present_exclusively(&webview);
                 click_at(
                     &webview,
                     &delegate,
@@ -2053,6 +2058,7 @@ impl ContentEngine {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 click_at(
                     &webview,
                     &delegate,
@@ -2084,6 +2090,7 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let value = required_str(&params, "value")?;
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 click_at(
                     &webview,
                     &delegate,
@@ -3231,6 +3238,7 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 click_at(&webview, &delegate, x, y, 0.0, 0.0, || {
                     self.servo.spin_event_loop()
                 })?;
@@ -3242,11 +3250,12 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    InputEvent::MouseMove(MouseMoveEvent::new(point)),
+                    || InputEvent::MouseMove(MouseMoveEvent::new(point)),
                     &mut || self.servo.spin_event_loop(),
                 )?;
                 Ok(json!({}))
@@ -3256,11 +3265,12 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    InputEvent::MouseButton(MouseButtonEvent::new(
+                    || InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Down,
                         MouseButton::Left,
                         point,
@@ -3276,6 +3286,7 @@ impl ContentEngine {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let probe = format!(
                     "{}-{}",
                     std::process::id(),
@@ -3293,7 +3304,7 @@ impl ContentEngine {
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    InputEvent::Wheel(WheelEvent::new(
+                    || InputEvent::Wheel(WheelEvent::new(
                         WheelDelta {
                             x: delta_x,
                             y: delta_y,
@@ -3321,11 +3332,12 @@ impl ContentEngine {
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    InputEvent::MouseButton(MouseButtonEvent::new(
+                    || InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Up,
                         MouseButton::Left,
                         point,
@@ -3341,6 +3353,26 @@ impl ContentEngine {
         }
     }
 
+    /// Make `target` the only visible webview before delivering synthetic
+    /// input or reading the framebuffer. All live webviews share one
+    /// rendering context and every page ever opened stays shown; input
+    /// delivery then hits whichever stale webview the internal order offers
+    /// and the event dies silently in a dead document (finding 034: the CLI
+    /// verb loop lost 8 of 12 clicks to orphaned sessions, non-monotonically;
+    /// closing the orphans made it 12/12).
+    fn present_exclusively(&self, target: &WebView) {
+        for other in self.live_webviews() {
+            if other.id() != target.id() {
+                other.hide();
+            }
+        }
+        target.show();
+        target.focus();
+        // hide/show travel through the constellation asynchronously; without
+        // a spin the hit test can still see the old visibility and route the
+        // very next input into a hidden webview (2 of 12 clicks still died).
+        self.servo.spin_event_loop();
+    }
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
         let page_id = required_str(params, "page")?;
         let selector = params
@@ -3348,6 +3380,7 @@ impl ContentEngine {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
+        self.present_exclusively(&webview);
         let script = resolve_script(&selector);
         let deadline = Instant::now() + call_timeout(params);
         let mut last = String::from("failed_check=stable");
@@ -3629,8 +3662,39 @@ function greppyRoleOf(el) {
   if (tag === 'input' || tag === 'textarea') return 'textbox';
   return tag;
 }
+function greppyIsDisplayed(el) {
+  var n = el;
+  while (n && n.nodeType === 1) {
+    var style = getComputedStyle(n);
+    if (style && (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse")) {
+      return false;
+    }
+    n = n.parentElement;
+  }
+  var rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
 function greppyQueryAll(root, sel) {
-  try { return Array.from(root.querySelectorAll(sel)); } catch (error) { return []; }
+  var visible = null;
+  var css = String(sel);
+  if (css.indexOf(":visible") !== -1) {
+    visible = true;
+    css = css.split(":visible").join("");
+  }
+  if (css.indexOf(":hidden") !== -1) {
+    visible = false;
+    css = css.split(":hidden").join("");
+  }
+  css = css.replace(/\s{2,}/g, " ").trim();
+  try {
+    var ctx = root === document ? document : root;
+    var nodes = css ? Array.from(ctx.querySelectorAll(css)) : [];
+    if (visible === null) return nodes;
+    return nodes.filter(function (el) {
+      var shown = greppyIsDisplayed(el);
+      return visible ? shown : !shown;
+    });
+  } catch (error) { return []; }
 }
 function greppyCandidates(root) {
   return greppyQueryAll(root === document ? document : root, '*');
@@ -3947,7 +4011,7 @@ fn hover_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        InputEvent::MouseMove(MouseMoveEvent::new(point)),
+        || InputEvent::MouseMove(MouseMoveEvent::new(point)),
         spin,
     )
 }
@@ -3969,7 +4033,7 @@ fn tap_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        InputEvent::Touch(TouchEvent::new(
+        || InputEvent::Touch(TouchEvent::new(
             TouchEventType::Down,
             id,
             point,
@@ -3980,7 +4044,7 @@ fn tap_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        InputEvent::Touch(TouchEvent::new(
+        || InputEvent::Touch(TouchEvent::new(
             TouchEventType::Up,
             id,
             point,
@@ -3993,27 +4057,31 @@ fn tap_at(
 fn dispatch_input_and_wait(
     webview: &WebView,
     delegate: &Delegate,
-    event: InputEvent,
+    make_event: impl Fn() -> InputEvent,
     spin: &mut impl FnMut(),
 ) -> io::Result<()> {
-    let event_id = webview.notify_input_event(event);
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        spin();
-        if let Some(result) = delegate.handled_input_events.borrow_mut().remove(&event_id) {
-            if result.contains(InputEventResult::DispatchFailed) {
-                return Err(io::Error::other("input event dispatch failed"));
+    for _attempt in 0..8 {
+        let event_id = webview.notify_input_event(make_event());
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            spin();
+            if let Some(result) = delegate.input_receipts.borrow_mut().remove(&event_id) {
+                if !result.contains(InputEventResult::DispatchFailed) {
+                    return Ok(());
+                }
+                break;
             }
-            return Ok(());
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out waiting for input event acknowledgement",
-            ));
-        }
-        std::thread::yield_now();
+        webview.paint();
+        spin();
     }
+    Err(io::Error::other(
+        "input delivery failed: painter dropped or did not acknowledge the event after 8 retries",
+    ))
 }
 
 /// Synthesize a left click at the centre of a box.
@@ -4040,7 +4108,7 @@ fn click_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        InputEvent::MouseButton(MouseButtonEvent::new(
+        || InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Down,
             MouseButton::Left,
             point,
@@ -4050,7 +4118,7 @@ fn click_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        InputEvent::MouseButton(MouseButtonEvent::new(
+        || InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Up,
             MouseButton::Left,
             point,
