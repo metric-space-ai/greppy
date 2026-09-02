@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const IRREGEXP_MEMBER: &str = "Unified_cpp_js_src_irregexp0.o";
+const UNIX_IRREGEXP_MEMBER: &str = "Unified_cpp_js_src_irregexp0.o";
+const WINDOWS_IRREGEXP_MEMBER: &str = "Unified_cpp_js_src_irregexp0.obj";
 
 /// V8/SpiderMonkey irregexp overlap: ld64 coalesces these and V8 Isolate::Delete
 /// runs the SpiderMonkey destructor (KERN_INVALID_ADDRESS).
@@ -41,15 +42,25 @@ const RENAME_SYMBOLS: &[(&str, &str)] = &[
     ),
 ];
 
+// The same two PrintF definitions overlap under the MSVC ABI. The Isolate
+// destructor does not: SpiderMonkey exports the public QEAA form while V8's
+// copy is the private AEAA form. Keep this list tied to the measured COFF
+// symbol intersection instead of transliterating the Itanium list.
+const WINDOWS_RENAME_SYMBOLS: &[(&str, &str)] = &[
+    (
+        "?PrintF@internal@v8@@YAXPEBDZZ",
+        "?GreppySMPrintF@internal@v8@@YAXPEBDZZ",
+    ),
+    (
+        "?PrintF@internal@v8@@YAXPEAU_iobuf@@PEBDZZ",
+        "?GreppySMPrintF@internal@v8@@YAXPEAU_iobuf@@PEBDZZ",
+    ),
+];
+
 pub fn localize_mozjs_js_static() {
-    if cfg!(windows) {
-        panic!(
-            "web-runtime one-binary localization is an explicit unsatisfied gate on Windows"
-        );
-    }
     let archives = find_js_static_archives();
     if archives.is_empty() {
-        panic!("mozjs_sys libjs_static.a not found; cannot localize V8/SpiderMonkey overlap");
+        panic!("mozjs_sys js_static archive not found; cannot localize V8/SpiderMonkey overlap");
     }
     for archive in &archives {
         if let Err(error) = localize_archive(archive) {
@@ -103,6 +114,11 @@ fn find_mozjs_sys_rlibs() -> Vec<PathBuf> {
 }
 
 fn find_js_static_archives() -> Vec<PathBuf> {
+    let archive_name = if cfg!(windows) {
+        "js_static.lib"
+    } else {
+        "libjs_static.a"
+    };
     let mut found = Vec::new();
     for root in build_roots() {
         let Ok(entries) = fs::read_dir(&root) else {
@@ -120,7 +136,7 @@ fn find_js_static_archives() -> Vec<PathBuf> {
                 .join("js")
                 .join("src")
                 .join("build")
-                .join("libjs_static.a");
+                .join(archive_name);
             if archive.is_file() && !found.contains(&archive) {
                 found.push(archive);
             }
@@ -130,8 +146,13 @@ fn find_js_static_archives() -> Vec<PathBuf> {
 }
 
 fn find_rusty_v8() -> Option<PathBuf> {
+    let archive_name = if cfg!(windows) {
+        "rusty_v8.lib"
+    } else {
+        "librusty_v8.a"
+    };
     for root in search_roots() {
-        let candidate = root.join("gn_out").join("obj").join("librusty_v8.a");
+        let candidate = root.join("gn_out").join("obj").join(archive_name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -141,7 +162,7 @@ fn find_rusty_v8() -> Option<PathBuf> {
                 if !name.to_string_lossy().starts_with("rusty_v8-") {
                     continue;
                 }
-                let nested = entry.path().join("out").join("obj").join("librusty_v8.a");
+                let nested = entry.path().join("out").join("obj").join(archive_name);
                 if nested.is_file() {
                     return Some(nested);
                 }
@@ -167,7 +188,10 @@ fn search_roots() -> Vec<PathBuf> {
     if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
         let dir = PathBuf::from(dir);
         roots.push(dir.join(&profile));
-        roots.push(dir.join(env::var("TARGET").unwrap_or_default()).join(&profile));
+        roots.push(
+            dir.join(env::var("TARGET").unwrap_or_default())
+                .join(&profile),
+        );
     }
     if let Ok(out) = env::var("OUT_DIR") {
         let out = PathBuf::from(out);
@@ -192,44 +216,96 @@ fn localize_archive(archive: &Path) -> Result<(), String> {
     let work = parent.join("greppy-localize-irregexp");
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work).map_err(|e| format!("mkdir {}: {e}", work.display()))?;
-    let status = Command::new("ar")
-        .args(["x", archive.to_str().unwrap(), IRREGEXP_MEMBER])
+    let member_name = irregexp_member_name(archive)?;
+    let status = Command::new(archive_tool())
+        .args(["x", archive.to_str().unwrap(), &member_name])
         .current_dir(&work)
         .status()
-        .map_err(|e| format!("ar x: {e}"))?;
+        .map_err(|e| format!("{} x: {e}", archive_tool()))?;
     if !status.success() {
-        return Err(format!("ar x failed: {status}"));
+        return Err(format!("{} x failed: {status}", archive_tool()));
     }
-    let member = work.join(IRREGEXP_MEMBER);
+    let member_basename = Path::new(&member_name)
+        .file_name()
+        .ok_or_else(|| format!("archive member has no file name: {member_name}"))?;
+    let member = work.join(member_basename);
     if !member.is_file() {
-        return Err(format!("missing {IRREGEXP_MEMBER} in {}", archive.display()));
+        return Err(format!("missing {member_name} in {}", archive.display()));
     }
     rename_v8_overlap_symbols(&member)?;
     let archive_str = archive.to_str().unwrap();
-    let _ = Command::new("ar")
-        .args(["d", archive_str, IRREGEXP_MEMBER])
+    let _ = Command::new(archive_tool())
+        .args(["d", archive_str, &member_name])
         .status();
-    let status = Command::new("ar")
-        .args(["r", archive_str, IRREGEXP_MEMBER])
+    let status = Command::new(archive_tool())
+        .args(["r", archive_str, member_basename.to_str().unwrap()])
         .current_dir(&work)
         .status()
-        .map_err(|e| format!("ar r: {e}"))?;
+        .map_err(|e| format!("{} r: {e}", archive_tool()))?;
     if !status.success() {
-        return Err(format!("ar r failed: {status}"));
+        return Err(format!("{} r failed: {status}", archive_tool()));
     }
-    if archive.extension().and_then(|e| e.to_str()) != Some("rlib") {
+    if !cfg!(windows) && archive.extension().and_then(|e| e.to_str()) != Some("rlib") {
         let _ = Command::new("ranlib").arg(archive).status();
     }
     Ok(())
 }
 
+fn archive_tool() -> &'static str {
+    if cfg!(windows) {
+        "llvm-ar"
+    } else {
+        "ar"
+    }
+}
+
+fn irregexp_member_name(archive: &Path) -> Result<String, String> {
+    let wanted = if cfg!(windows) {
+        WINDOWS_IRREGEXP_MEMBER
+    } else {
+        UNIX_IRREGEXP_MEMBER
+    };
+    let output = Command::new(archive_tool())
+        .args(["t", archive.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("{} t {}: {e}", archive_tool(), archive.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} t {} failed: {}\n{}",
+            archive_tool(),
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|name| {
+            name.replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .is_some_and(|base| base == wanted)
+        })
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("missing {wanted} in {}", archive.display()))
+}
+
 fn verify_hidden(archive: &Path) -> Result<(), String> {
     let defined = defined_symbols(archive)?;
-    let still: Vec<_> = HIDE_SYMBOLS
-        .iter()
-        .copied()
-        .filter(|name| defined.contains(*name))
-        .collect();
+    let still: Vec<_> = if cfg!(windows) {
+        WINDOWS_RENAME_SYMBOLS
+            .iter()
+            .map(|(from, _)| *from)
+            .filter(|name| defined.contains(*name))
+            .collect()
+    } else {
+        HIDE_SYMBOLS
+            .iter()
+            .copied()
+            .filter(|name| defined.contains(*name))
+            .collect()
+    };
     if !still.is_empty() {
         return Err(format!(
             "SpiderMonkey still defines V8-overlapping symbols (local or global): {still:?}"
@@ -241,19 +317,16 @@ fn verify_hidden(archive: &Path) -> Result<(), String> {
 fn assert_symbol_intersection(js_static: &Path, rusty_v8: &Path) -> Result<(), String> {
     let sm = defined_globals(js_static)?;
     let v8 = defined_globals(rusty_v8)?;
-    let mut icu = 0usize;
+    let mut permitted = 0usize;
     let mut dangerous = Vec::new();
     for name in sm.intersection(&v8) {
-        if is_icu(name) {
-            if name.contains("icu_76")
-                || name.contains("icudt76")
-                || name.contains("_76")
-            {
+        if is_permitted_overlap(name) {
+            if name.contains("icu_76") || name.contains("icudt76") || name.contains("_76") {
                 return Err(format!(
                     "ICU overlap {name} is not ICU 77; refusing mixed ICU versions"
                 ));
             }
-            icu += 1;
+            permitted += 1;
             continue;
         }
         dangerous.push(name.clone());
@@ -265,7 +338,7 @@ fn assert_symbol_intersection(js_static: &Path, rusty_v8: &Path) -> Result<(), S
             dangerous.len()
         ));
     }
-    println!("cargo:warning=engine symbol intersection: 0 non-ICU overlaps, {icu} ICU 77 overlaps (coalesced same-version ICU is permitted)");
+    println!("cargo:warning=engine symbol intersection: 0 dangerous overlaps, {permitted} permitted same-toolchain ICU/CRT overlaps");
     Ok(())
 }
 
@@ -277,10 +350,34 @@ fn is_icu(name: &str) -> bool {
         || name.contains("CollatorSpec")
         || name.contains("UErrorCode")
         || name.contains("CReg")
+        || name.starts_with("uprv_")
+}
+
+fn is_permitted_overlap(name: &str) -> bool {
+    is_icu(name) || (cfg!(windows) && is_permitted_windows_crt_overlap(name))
+}
+
+fn is_permitted_windows_crt_overlap(name: &str) -> bool {
+    matches!(
+        name,
+        "?_OptionsStorage@?1??__local_stdio_printf_options@@9@4_KA"
+            | "?what@bad_optional_access@std@@UEBAPEBDXZ"
+            | "?abort_noreturn@@YAXXZ"
+            | "_Avx2WmemEnabledWeakValue"
+            | "__local_stdio_printf_options"
+            | "fprintf"
+            | "printf"
+            | "snprintf"
+    )
 }
 
 fn defined_globals(archive: &Path) -> Result<BTreeSet<String>, String> {
-    defined_symbols_with(archive, &["-gU"])
+    let extra: &[&str] = if cfg!(target_os = "macos") {
+        &["-gU"]
+    } else {
+        &["-g", "--defined-only"]
+    };
+    defined_symbols_with(archive, extra)
 }
 
 fn defined_symbols(archive: &Path) -> Result<BTreeSet<String>, String> {
@@ -291,13 +388,14 @@ fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<Strin
     let mut args: Vec<&str> = extra.to_vec();
     let path = archive.to_str().unwrap();
     args.push(path);
-    let output = Command::new("nm")
+    let nm = if cfg!(windows) { "llvm-nm" } else { "nm" };
+    let output = Command::new(nm)
         .args(&args)
         .output()
-        .map_err(|e| format!("nm {}: {e}", archive.display()))?;
+        .map_err(|e| format!("{nm} {}: {e}", archive.display()))?;
     if !output.status.success() {
         return Err(format!(
-            "nm {} failed: {}\n{}",
+            "{nm} {} failed: {}\n{}",
             archive.display(),
             output.status,
             String::from_utf8_lossy(&output.stderr)
@@ -329,31 +427,46 @@ fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<Strin
 }
 
 fn rename_v8_overlap_symbols(object: &Path) -> Result<(), String> {
-    for (from, to) in RENAME_SYMBOLS {
-        if from.len() != to.len() {
+    let renames = if cfg!(windows) {
+        WINDOWS_RENAME_SYMBOLS
+    } else {
+        RENAME_SYMBOLS
+    };
+    for (from, to) in renames {
+        if cfg!(target_os = "macos") && from.len() != to.len() {
             return Err(format!("rename length mismatch {from} -> {to}"));
         }
     }
-    if cfg!(target_os = "linux") {
-        let mut cmd = Command::new("objcopy");
-        for (from, to) in RENAME_SYMBOLS {
+    if cfg!(windows) || cfg!(target_os = "linux") {
+        let objcopy = if cfg!(windows) {
+            "llvm-objcopy"
+        } else {
+            "objcopy"
+        };
+        let mut cmd = Command::new(objcopy);
+        for (from, to) in renames {
             cmd.arg(format!("--redefine-sym={from}={to}"));
         }
         let output = cmd
             .arg(object)
             .output()
-            .map_err(|e| format!("objcopy redefine: {e}"))?;
+            .map_err(|e| format!("{objcopy} redefine: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "objcopy redefine failed: {}\n{}",
+                "{objcopy} redefine failed: {}\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
         return Ok(());
     }
+    for (from, to) in renames {
+        if from.len() != to.len() {
+            return Err(format!("rename length mismatch {from} -> {to}"));
+        }
+    }
     let mut bytes = fs::read(object).map_err(|e| format!("read {}: {e}", object.display()))?;
-    for (from, to) in RENAME_SYMBOLS {
+    for (from, to) in renames {
         let needle = format!("{from}\0").into_bytes();
         let replacement = format!("{to}\0").into_bytes();
         let mut replaced = 0usize;
@@ -451,5 +564,22 @@ fn clear_pext_on_renamed_symbols(bytes: &mut [u8]) -> Result<(), String> {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_permitted_windows_crt_overlap;
+
+    #[test]
+    fn windows_bad_optional_access_comdat_is_permitted_but_v8_shims_are_not() {
+        assert!(is_permitted_windows_crt_overlap(
+            "?what@bad_optional_access@std@@UEBAPEBDXZ"
+        ));
+        assert!(!is_permitted_windows_crt_overlap(
+            "?PrintF@internal@v8@@YAXPEBDZZ"
+        ));
+    }
 }

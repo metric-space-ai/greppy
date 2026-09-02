@@ -6,10 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $BinaryDir = Split-Path -Parent ([IO.Path]::GetFullPath($Binary))
 $WebRuntimeDist = Join-Path $BinaryDir 'web-runtime'
-$WebRuntime = Join-Path $WebRuntimeDist 'bin\web-runtime.exe'
-if (-not (Test-Path -LiteralPath (Join-Path $WebRuntimeDist '.greppy-web-runtime-dist') -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $WebRuntime -PathType Leaf)) {
-    throw 'packaged web-runtime dist is missing beside greppy.exe'
+if (Test-Path -LiteralPath $WebRuntimeDist) {
+    throw 'Windows 0.4.0 package must not contain the web-runtime distributable'
 }
 New-Item -ItemType Directory -Force "$Work/repo/src", "$Work/repo/.git", "$Work/store" | Out-Null
 New-Item -ItemType Directory -Force `
@@ -36,10 +34,12 @@ $env:GREPPY_SUMMARIZE_DAEMON_MODEL_TTL_S = '5'
 $env:GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S = '15'
 
 & $Binary --help | Out-Null
-$webDoctor = (& $Binary web doctor --json) | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or $webDoctor.status -ne 'ok' -or
-    -not $webDoctor.result.executable.EndsWith('web-runtime\bin\web-runtime.exe')) {
-    throw 'packaged web-runtime doctor contract failed'
+$webUnavailable = & $Binary web status --json
+$webExit = $LASTEXITCODE
+$webText = $webUnavailable -join "`n"
+if ($webExit -ne 31 -or
+    -not $webText.Contains('web tool is not available on Windows in 0.4.0')) {
+    throw "Windows web scope diagnostic failed: exit=$webExit output=$webText"
 }
 $doctorRaw = & $Binary --device cpu --root "$Work/repo" doctor --json
 $doctorExit = $LASTEXITCODE

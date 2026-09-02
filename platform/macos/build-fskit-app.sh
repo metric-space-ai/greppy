@@ -168,6 +168,7 @@ swiftc \
     -framework FSKit \
     -framework Foundation \
     -lsqlite3 \
+    -Xlinker -e -Xlinker _NSExtensionMain \
     -Xlinker -fatal_warnings \
     -o "$extension/Contents/MacOS/GreppyWorkspaceFSExtension"
 

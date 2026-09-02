@@ -439,20 +439,30 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("greppy-linux-x86_64.rpm", workflow)
         self.assertIn("platform/linux/build-packages.sh", workflow)
         self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
-        self.assertIn("target/release/web-runtime-dist", workflow)
+        self.assertIn("target/web-runtime-dist", workflow)
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
+        self.assertIn(
+            "- name: Build the linked web runtime\n        if: runner.os != 'Windows'",
+            workflow,
+        )
+        self.assertIn(
+            "- name: Verify linked runtime contains the release input contracts\n"
+            "        if: runner.os != 'Windows'",
+            workflow,
+        )
+        self.assertNotIn("Pin Windows LLVM archive tools", workflow)
         self.assertIn("fund-034-input-receipts", workflow)
         self.assertIn("fund-038-implicit-submit", workflow)
         self.assertIn("fund-033-checkbox-activation", workflow)
         self.assertIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", workflow)
         self.assertIn("web-runtime-ci.yml", workflow)
         self.assertIn("--manifest-path crates/web-runtime/Cargo.toml", workflow)
-        self.assertIn(
+        self.assertNotIn(
             "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD crates/web-runtime/target/release/web-runtime.exe",
             workflow,
         )
-        self.assertIn(
-            "Copy-Item target/release/web-runtime-dist dist/web-runtime -Recurse",
+        self.assertNotIn(
+            "Copy-Item target/web-runtime-dist dist/web-runtime -Recurse",
             workflow,
         )
         self.assertIn('deb_root="$clean/deb"', workflow)
@@ -511,8 +521,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         windows_msi_builder = (
             REPOSITORY_ROOT / "tools/build_windows_msi.ps1"
         ).read_text(encoding="utf-8")
-        self.assertIn("web-runtime\\bin\\web-runtime.exe", windows_msi_builder)
-        self.assertIn("web-runtime\\.greppy-web-runtime-dist", windows_msi_builder)
+        self.assertNotIn("web-runtime\\bin\\web-runtime.exe", windows_msi_builder)
+        self.assertNotIn("web-runtime\\.greppy-web-runtime-dist", windows_msi_builder)
         web_runtime_packager = (
             REPOSITORY_ROOT / "crates/web-runtime/scripts/package-web-runtime.sh"
         ).read_text(encoding="utf-8")
@@ -561,16 +571,16 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("name: Windows x86_64 real WinFsp performance", cow_workflow)
         self.assertIn("name: Exact-SHA three-platform performance set", cow_workflow)
         self.assertIn("verify_portable_cow_performance.py", cow_workflow)
-        self.assertIn("Build linked web runtime for MSI authoring", cow_workflow)
+        self.assertNotIn("Build linked web runtime for MSI authoring", cow_workflow)
         windows_provider_job = cow_workflow.split("windows-winfsp:", 1)[1].split(
             "portable-agent-contract:", 1
         )[0]
         self.assertIn("timeout-minutes: 45", windows_provider_job)
-        self.assertIn(
+        self.assertNotIn(
             "crates/web-runtime/scripts/package-web-runtime.sh", cow_workflow
         )
-        self.assertIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", cow_workflow)
-        self.assertIn(
+        self.assertNotIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", cow_workflow)
+        self.assertNotIn(
             "Copy-Item target\\release\\web-runtime-dist (Join-Path $dist 'web-runtime') -Recurse",
             cow_workflow,
         )
@@ -621,8 +631,11 @@ class ReleaseArtifactTests(unittest.TestCase):
         windows_smoke = (
             REPOSITORY_ROOT / "bench/release_package_smoke.ps1"
         ).read_text(encoding="utf-8")
-        self.assertIn("web-runtime\\bin\\web-runtime.exe", windows_smoke)
-        self.assertIn("web doctor --json", windows_smoke)
+        self.assertNotIn("web-runtime\\bin\\web-runtime.exe", windows_smoke)
+        self.assertNotIn("web doctor --json", windows_smoke)
+        self.assertIn(
+            "web tool is not available on Windows in 0.4.0", windows_smoke
+        )
         self.assertNotIn(' semantic-search \'', windows_smoke)
         self.assertIn(" search --json ", windows_smoke)
         windows_daemon_stress = (

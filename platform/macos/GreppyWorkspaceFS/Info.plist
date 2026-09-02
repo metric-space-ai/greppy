@@ -22,6 +22,23 @@
     <dict>
         <key>EXExtensionPointIdentifier</key>
         <string>com.apple.fskit.fsmodule</string>
+        <key>EXExtensionPrincipalClass</key>
+        <string>GreppyFileSystem</string>
+        <key>FSActivateOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>o:</string>
+        </dict>
+        <key>FSCheckOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>nqy</string>
+        </dict>
+        <key>FSFormatOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>v</string>
+        </dict>
         <key>FSShortName</key>
         <string>greppy-cow</string>
         <key>FSMediaTypes</key>

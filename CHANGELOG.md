@@ -105,9 +105,10 @@ under 6 s); a detached HEAD reports only the paths that actually drift.
 
 **Known limits.** A JavaScript search component that intercepts Enter (for
 example Wikipedia's) still needs the button; the agent finds it, at roughly
-five times the turns. `greppy web` on a binary built without the web feature
-falls through to the grep passthrough and prints grep usage. The HTTPS
-extra-header tests trust the fixture certificate only in debug builds.
+five times the turns. Windows: the Web tool is not included in 0.4.0; Windows
+web-runtime localization follows in 0.4.1. The Windows CLI reports that scope
+explicitly instead of attempting runtime discovery. The HTTPS extra-header
+tests trust the fixture certificate only in debug builds.
 
 ## [0.3.4] — 2026-08-30
 

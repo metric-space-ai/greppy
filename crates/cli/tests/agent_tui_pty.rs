@@ -519,7 +519,12 @@ mod pty {
         let _ = handle.join();
         let text = String::from_utf8_lossy(&bytes);
         assert!(
-            status.success() || status.code() == Some(0) || status.code() == Some(3),
+            status.success()
+                || status.code() == Some(0)
+                || status.code() == Some(3)
+                // Ctrl+C may win the race with the subsequent `/exit`; 130 is
+                // the CLI's explicit EXIT_CANCELLED contract, not a crash.
+                || status.code() == Some(130),
             "status={status:?} output={text:?}"
         );
         assert!(
