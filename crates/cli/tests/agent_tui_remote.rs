@@ -26,8 +26,8 @@ fn binary_path() -> PathBuf {
 
 fn unique_temp(kind: &str) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let temp = std::env::temp_dir();
-    let root = temp.parent().unwrap_or(&temp).join(format!(
+    // The system temp dir is always writable; its parent is not on Linux CI.
+    let root = std::env::temp_dir().join(format!(
         "gtr-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)

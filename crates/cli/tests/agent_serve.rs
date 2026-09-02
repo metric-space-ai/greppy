@@ -26,9 +26,10 @@ fn binary_path() -> PathBuf {
 
 fn unique_temp(tag: &str) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let temp_root = std::env::temp_dir();
-    let short_root = temp_root.parent().unwrap_or(&temp_root);
-    let parent = short_root.join(format!(
+    // Sockets live under the hashed runtime dir, so the store and repo paths
+    // no longer need to be short; the system temp dir is always writable
+    // (its parent is not on Linux CI, where temp_dir() is /tmp).
+    let parent = std::env::temp_dir().join(format!(
         "gs-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)

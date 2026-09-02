@@ -558,8 +558,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir()
-            .join(format!("greppy-control-{}-{nonce}", std::process::id()))
+        // Keep well under SUN_LEN (104 bytes on macOS, where temp_dir() is a
+        // long /var/folders/... path): use /tmp with a short nonce.
+        PathBuf::from("/tmp")
+            .join(format!(
+                "gc-{}-{}",
+                std::process::id(),
+                nonce % 1_000_000_000
+            ))
             .join(format!("{tag}.sock"))
     }
 
