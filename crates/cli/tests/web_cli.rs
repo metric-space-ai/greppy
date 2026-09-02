@@ -45,6 +45,11 @@ fn web_status_json_is_unavailable_without_runtime_bins() {
             || stdout.contains("greppy.web-runtime.v1")
     );
     assert!(stdout.contains("runtime_unavailable") || stdout.contains("error"));
+    #[cfg(target_os = "windows")]
+    assert!(
+        stdout.contains("web tool is not available on Windows in 0.4.0"),
+        "stdout={stdout}"
+    );
 }
 
 #[test]

@@ -36,8 +36,6 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "MSI version must be plain x.y
 $required = @(
     'greppy.exe',
     'greppy-workspace-provider.exe',
-    'web-runtime\bin\web-runtime.exe',
-    'web-runtime\.greppy-web-runtime-dist',
     'greppyworkspacefsp-x64.dll',
     'greppyworkspacefsp-x64.sys',
     'README.md',

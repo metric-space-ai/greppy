@@ -1071,6 +1071,7 @@ pub(super) fn emit_web(json_out: bool, payload: &serde_json::Value) -> Result<()
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 pub(super) fn unavailable(message: &str) -> ErrorObject {
     ErrorObject::new(
         "runtime_unavailable",
@@ -1078,6 +1079,17 @@ pub(super) fn unavailable(message: &str) -> ErrorObject {
         new_request_id(),
         EXIT_WEB_UNAVAILABLE,
         "install the web-runtime distributable (one linked executable)",
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn unavailable(_message: &str) -> ErrorObject {
+    ErrorObject::new(
+        "runtime_unavailable",
+        "web tool is not available on Windows in 0.4.0",
+        new_request_id(),
+        EXIT_WEB_UNAVAILABLE,
+        "use the web tool on macOS or Linux; Windows web-runtime localization follows in 0.4.1",
     )
 }
 

@@ -346,20 +346,6 @@ jobs:
         if: runner.os == 'Windows' && matrix.features == 'cuda'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
-      - name: Pin Windows LLVM archive tools
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $llvm = 'C:\Program Files\LLVM\bin'
-          foreach ($tool in @('llvm-ar.exe', 'llvm-nm.exe', 'llvm-objcopy.exe')) {
-            $path = Join-Path $llvm $tool
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "required LLVM archive tool is missing: $path"
-            }
-            & $path --version
-          }
-          $llvm | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       - name: Build exact Greppy WinFsp transport fork
         if: runner.os == 'Windows'
         shell: pwsh
@@ -372,6 +358,7 @@ jobs:
         run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
 
       - name: Build the linked web runtime
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           cargo build --locked --release \
@@ -380,6 +367,7 @@ jobs:
             --bin web-runtime
 
       - name: Verify linked runtime contains the release input contracts
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           python3 - <<'PY'
@@ -557,27 +545,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool sign failed' }
           & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppyworkspacefsp-x64.dll
           if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool sign failed' }
-          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD crates/web-runtime/target/release/web-runtime.exe
-          if ($LASTEXITCODE -ne 0) { throw 'web-runtime signtool sign failed' }
           & signtool verify /pa /all /v target/release/greppy.exe
           if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppy-workspace-provider.exe
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppyworkspacefsp-x64.dll
           if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool verify failed' }
-          & signtool verify /pa /all /v crates/web-runtime/target/release/web-runtime.exe
-          if ($LASTEXITCODE -ne 0) { throw 'web-runtime signtool verify failed' }
           "WINDOWS_SIGNING_PFX_PATH=$cert" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Stage the linked web runtime distributable (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
-          GREPPY_SOURCE_COMMIT: ${{ github.sha }}
-        run: >-
-          crates/web-runtime/scripts/package-web-runtime.sh
-          target/web-runtime-dist
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -783,7 +757,6 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
-          Copy-Item target/web-runtime-dist dist/web-runtime -Recurse
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item target/release/greppyworkspacefsp-x64.sys dist/greppyworkspacefsp-x64.sys
           if (Test-Path target/release/greppyworkspacefsp-x64.cat) {
