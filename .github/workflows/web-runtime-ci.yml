@@ -10,13 +10,7 @@ on:
       - 'crates/cli/src/web/**'
       - 'crates/web-runtime/**'
   push:
-    branches: [main]
-    paths:
-      - '.github/workflows/web-runtime-ci.yml'
-      - 'assets/prompts/web-beta.md'
-      - 'crates/agent/**'
-      - 'crates/cli/src/web/**'
-      - 'crates/web-runtime/**'
+    branches: ['**']
 
 permissions:
   contents: read
