@@ -573,15 +573,17 @@ extension GreppyFSVolume: FSVolume.Operations {
     }
 
     private func markerAttributes(item: GreppyFSItem) -> FSItem.Attributes {
+        let snapshot = heartbeat.manifestSnapshot()
         let value = FSItem.Attributes()
         value.fileID = item.identifier
         value.parentID = .rootDirectory
         value.type = .file
         value.mode = UInt32(S_IFREG | 0o400)
         value.linkCount = 1
-        value.size = UInt64(heartbeat.manifestData().count)
+        value.size = UInt64(snapshot.data.count)
         value.allocSize = value.size
-        completeStandardAttributes(value, timestamp: mountTime)
+        value.inhibitKernelOffloadedIO = true
+        completeStandardAttributes(value, timestamp: dateTime(snapshot.modifiedAt))
         return value
     }
 

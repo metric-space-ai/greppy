@@ -104,7 +104,11 @@ impl ProviderInstallation {
             ))
         })?;
         let marker: ProviderManifest = serde_json::from_slice(&marker_bytes)?;
-        validate_manifest(&marker, &data_root, now)?;
+        // The mounted marker proves that the live mount belongs to the same
+        // provider instance. Its bytes may be held in the host kernel's file
+        // cache, so freshness is authoritative only in provider.json, which
+        // the provider updates atomically outside the mount.
+        validate_manifest_identity(&marker, &data_root)?;
         if !same_provider_identity(&marker, &manifest) {
             return Err(Error::AdapterUnhealthy(
                 "control manifest and mounted provider identity differ".into(),
@@ -206,6 +210,14 @@ fn validate_manifest(
     expected_data_root: &Path,
     now: SystemTime,
 ) -> Result<()> {
+    validate_manifest_identity(manifest, expected_data_root)?;
+    validate_manifest_heartbeat(manifest, now)
+}
+
+fn validate_manifest_identity(
+    manifest: &ProviderManifest,
+    expected_data_root: &Path,
+) -> Result<()> {
     if manifest.protocol_version != PROVIDER_PROTOCOL_VERSION {
         return Err(Error::AdapterUnhealthy(format!(
             "provider protocol {} is incompatible with required protocol {}",
@@ -236,6 +248,10 @@ fn validate_manifest(
             "provider did not report an adapter version".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_manifest_heartbeat(manifest: &ProviderManifest, now: SystemTime) -> Result<()> {
     let heartbeat = UNIX_EPOCH
         .checked_add(Duration::from_millis(manifest.heartbeat_unix_ms))
         .ok_or_else(|| Error::AdapterUnhealthy("provider heartbeat overflowed".into()))?;
@@ -357,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_stale_mount_heartbeat_even_when_control_is_fresh() {
+    fn accepts_a_kernel_cached_mount_heartbeat_when_control_is_fresh() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let mount = temp.path().join("mount");
@@ -375,10 +391,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            ProviderInstallation::require_healthy_at(&data, now),
-            Err(Error::AdapterUnhealthy(_))
-        ));
+        ProviderInstallation::require_healthy_at(&data, now).unwrap();
     }
 
     #[test]
