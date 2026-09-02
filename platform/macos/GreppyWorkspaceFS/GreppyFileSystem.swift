@@ -1,7 +1,7 @@
 import Foundation
 import FSKit
 
-final class GreppyFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
+@objc(GreppyFileSystem) final class GreppyFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     private static let containerID = UUID(uuidString: "F5BC37B2-0AB6-4D4C-AE1D-E3489732E590")!
     private var loadedResource: FSBlockDeviceResource?
 
