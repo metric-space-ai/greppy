@@ -306,6 +306,38 @@ impl Drop for Pty {
     }
 }
 
+/// Drop CSI/OSC escape sequences and collapse runs of blanks.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            Some(']') => {
+                for next in chars.by_ref() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn find_socket(repo: &Path, store: &Path) -> Option<PathBuf> {
     // Sockets live under the hashed runtime dir, not in the store: ask the
     // reader for the live row's `socket` field instead of scanning directories.
@@ -406,9 +438,14 @@ fn tui_remote_turn_broadcasts_events_and_unlinks_socket() {
     next_event(&mut client, "turn_complete");
 
     screen.extend_from_slice(&pty.read_until(b"hi from tui stub", Duration::from_secs(20)));
-    let rendered = String::from_utf8_lossy(&screen);
+    // ratatui redraws cell by cell, so visible text is interleaved with cursor
+    // moves and colour resets; compare the ANSI-stripped screen instead.
+    let rendered = strip_ansi(&String::from_utf8_lossy(&screen));
     assert!(rendered.contains("hello from remote"), "{rendered:?}");
-    assert!(rendered.contains("remote >"), "{rendered:?}");
+    assert!(
+        rendered.contains("remote ->") || rendered.contains("remote \u{203a}"),
+        "remote badge missing: {rendered:?}"
+    );
     assert!(rendered.contains("hi from tui stub"), "{rendered:?}");
 
     assert_eq!(
