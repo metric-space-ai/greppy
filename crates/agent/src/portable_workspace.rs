@@ -768,9 +768,16 @@ fn repository_tracker_fence(
             WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
         })?;
         if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
-            return Err(WorkspaceError::AdapterUnavailable(
-                "repository tracker changed before fence".into(),
-            ));
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker changed before fence: state={:?}, epoch={}, expected_epoch={}, generation={}, owner_pid={}, heartbeat_age_ms={}, detail={}",
+                before.state,
+                before.epoch,
+                epoch,
+                before.generation,
+                before.owner_pid,
+                now_unix_ms().saturating_sub(before.heartbeat_unix_ms),
+                before.detail.as_deref().unwrap_or("none"),
+            )));
         }
         let name = format!(
             "greppy-tracker-fence-{}-{}-{attempt}",
