@@ -441,6 +441,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
         self.assertIn("target/release/web-runtime-dist", workflow)
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
+        self.assertIn("fund-034-input-receipts", workflow)
+        self.assertIn("fund-038-implicit-submit", workflow)
+        self.assertIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", workflow)
+        self.assertIn("web-runtime-ci.yml", workflow)
         self.assertIn("--manifest-path crates/web-runtime/Cargo.toml", workflow)
         self.assertIn(
             "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD crates/web-runtime/target/release/web-runtime.exe",
@@ -508,6 +512,20 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("web-runtime\\bin\\web-runtime.exe", windows_msi_builder)
         self.assertIn("web-runtime\\.greppy-web-runtime-dist", windows_msi_builder)
+        web_runtime_packager = (
+            REPOSITORY_ROOT / "crates/web-runtime/scripts/package-web-runtime.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"source_commit": source_commit', web_runtime_packager)
+        self.assertIn('"source_tree_dirty": source_tree_dirty == "true"', web_runtime_packager)
+        self.assertIn(
+            "refusing a production-signed web runtime from a dirty source tree",
+            web_runtime_packager,
+        )
+        web_runtime_ci = (
+            REPOSITORY_ROOT / ".github/workflows/web-runtime-ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("session daemon three-run stability", web_runtime_ci)
+        self.assertIn("for attempt in 1 2 3", web_runtime_ci)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
@@ -538,6 +556,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn(
             "crates/web-runtime/scripts/package-web-runtime.sh", cow_workflow
         )
+        self.assertIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", cow_workflow)
         self.assertIn(
             "Copy-Item target\\release\\web-runtime-dist (Join-Path $dist 'web-runtime') -Recurse",
             cow_workflow,

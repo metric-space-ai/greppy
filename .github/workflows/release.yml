@@ -63,7 +63,7 @@ jobs:
           # require the remaining mechanical gates on the exact release subject
           # as well - a tag must never outrun its checks. Agent benchmarks are
           # diagnostic inputs for subsequent releases, never release gates.
-          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml; do
+          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml filesystem-cow.yml web-runtime-ci.yml; do
             ok="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --limit 100 \
@@ -340,6 +340,28 @@ jobs:
             --package web-runtime \
             --bin web-runtime
 
+      - name: Verify linked runtime contains the release input contracts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          name = "web-runtime.exe" if os.environ["RUNNER_OS"] == "Windows" else "web-runtime"
+          binary = Path("crates/web-runtime/target/release") / name
+          data = binary.read_bytes()
+          markers = {
+              "fund-034-input-receipts": b"input delivery failed: painter dropped or did not acknowledge the event after 8 retries",
+              "fund-038-implicit-submit": b"greppyImplicitSubmit",
+          }
+          missing = [label for label, marker in markers.items() if marker not in data]
+          if missing:
+              raise SystemExit(f"linked runtime is missing release contracts: {', '.join(missing)}")
+          print(f"{binary}: sha256={hashlib.sha256(data).hexdigest()}")
+          print("verified contracts: " + ", ".join(markers))
+          PY
+
       - name: Stage private Greppy WinFsp user runtime
         if: runner.os == 'Windows'
         shell: pwsh
@@ -441,6 +463,7 @@ jobs:
         shell: bash
         env:
           GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: ${{ runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) }}
+          GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
           target/release/web-runtime-dist
@@ -511,6 +534,7 @@ jobs:
         shell: bash
         env:
           GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
+          GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
           target/release/web-runtime-dist

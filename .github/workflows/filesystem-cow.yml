@@ -265,6 +265,7 @@ jobs:
         shell: bash
         env:
           GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: 'false'
+          GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
           target/release/web-runtime-dist

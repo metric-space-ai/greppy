@@ -238,6 +238,12 @@ not a Playwright-compatibility claim.
 - Pressing Enter in an eligible form field now performs the HTML implicit-submit
   action through the native input path. This is the distinct Fund 038 fix and
   is not attributed to the pointer-delivery retry above.
+- Web-runtime release evidence now binds the exact source commit, records a
+  dirty-tree bit and rejects production signing from a dirty checkout. The
+  built runtime itself is inspected for the separate Fund 034 and Fund 038
+  contracts, while a dedicated exact-SHA gate requires three serial passes of
+  the complete session-daemon suite instead of treating one load-sensitive
+  failure snapshot as a stable defect list.
 - Cancelling the interactive agent during its visible startup phase now returns
   exit 130 deterministically. The terminal UI's cancellation result is no
   longer discarded in a race with a worker that can finish cleanly first.
