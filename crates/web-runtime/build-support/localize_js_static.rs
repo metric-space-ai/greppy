@@ -280,7 +280,12 @@ fn is_icu(name: &str) -> bool {
 }
 
 fn defined_globals(archive: &Path) -> Result<BTreeSet<String>, String> {
-    defined_symbols_with(archive, &["-gU"])
+    let extra: &[&str] = if cfg!(target_os = "macos") {
+        &["-gU"]
+    } else {
+        &["-g", "--defined-only"]
+    };
+    defined_symbols_with(archive, extra)
 }
 
 fn defined_symbols(archive: &Path) -> Result<BTreeSet<String>, String> {

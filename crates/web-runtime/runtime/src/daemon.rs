@@ -273,22 +273,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             "supervisor requires inherited attach token on fd 4",
         )
     })?;
-    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
-        config.socket.display()
-    ); }
-    let listener = bind_socket_healing_stale(&config.socket)?;
-    let mut permissions = std::fs::metadata(&config.socket)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(&config.socket, permissions)?;
-    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); } }
-    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
     let early_control = Arc::new(RunControl::new());
-    let accept_attach = attach.clone();
-    let accept_control = Arc::clone(&early_control);
-    thread::Builder::new()
-        .name("web-runtime-accept".into())
-        .spawn(move || accept_loop(listener, tx, accept_control, accept_attach))
-        .map_err(io::Error::other)?;
     match crate::supervisor::warmup_parent_image() {
         Ok(hash) => {
             if crate::supervisor::phase_trace_enabled() {
@@ -307,6 +292,21 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
         ); }
     }
     let mut daemon = Daemon::start(config, attach, Arc::clone(&early_control))?;
+    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase bind-socket socket={}",
+        daemon.socket.display()
+    ); }
+    let listener = bind_socket_healing_stale(&daemon.socket)?;
+    let mut permissions = std::fs::metadata(&daemon.socket)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&daemon.socket, permissions)?;
+    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase listening"); } }
+    let (tx, rx) = mpsc::channel::<(UnixStream, Request)>();
+    let accept_attach = daemon.attach_capability.clone();
+    let accept_control = Arc::clone(&early_control);
+    thread::Builder::new()
+        .name("web-runtime-accept".into())
+        .spawn(move || accept_loop(listener, tx, accept_control, accept_attach))
+        .map_err(io::Error::other)?;
     if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase request-ready elapsed_ms={}",
         started.elapsed().as_millis()
     ); }
