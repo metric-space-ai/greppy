@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::agent_tui::SessionStore;
 
 const MAX_LINE: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 32;
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 pub type ConnId = u64;
@@ -120,6 +121,14 @@ impl ControlServer {
                 while !accept_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            let at_capacity = accept_connections
+                                .lock()
+                                .map(|all| all.len() >= MAX_CONNECTIONS)
+                                .unwrap_or(true);
+                            if at_capacity {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
                             let conn = next_id.fetch_add(1, Ordering::Relaxed);
                             let reader = match stream.try_clone() {
                                 Ok(reader) => reader,
@@ -128,15 +137,21 @@ impl ControlServer {
                             if stream.set_nonblocking(true).is_err() {
                                 continue;
                             }
-                            if let Ok(mut all) = accept_connections.lock() {
-                                all.insert(
-                                    conn,
-                                    Connection {
-                                        writer: stream,
-                                        subscribed: false,
-                                        pending: Vec::new(),
-                                    },
-                                );
+                            let inserted = accept_connections
+                                .lock()
+                                .map(|mut all| {
+                                    all.insert(
+                                        conn,
+                                        Connection {
+                                            writer: stream,
+                                            subscribed: false,
+                                            pending: Vec::new(),
+                                        },
+                                    );
+                                })
+                                .is_ok();
+                            if !inserted {
+                                continue;
                             }
                             let _ = tx.send(WireIncoming::Connected(conn));
                             let reader_tx = tx.clone();
@@ -625,6 +640,42 @@ mod tests {
         assert!(is_live(&path));
         drop(replacement);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_connections_are_capped() {
+        let path = temp_socket("connection-cap");
+        let server = ControlServer::bind(&path).unwrap();
+        let mut streams = (0..=MAX_CONNECTIONS)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.connections.lock().unwrap().len() < MAX_CONNECTIONS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not accept {MAX_CONNECTIONS} connections"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let rejected = streams.last_mut().unwrap();
+        rejected.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        loop {
+            match rejected.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "rejected connection was not closed"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                result => panic!("unexpected rejected connection read: {result:?}"),
+            }
+        }
+        assert_eq!(server.connections.lock().unwrap().len(), MAX_CONNECTIONS);
+        drop(streams);
+        drop(server);
     }
 
     #[test]

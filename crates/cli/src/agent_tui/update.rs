@@ -13,6 +13,8 @@ use super::settings::AgentSettings;
 use super::state::{App, RunPhase, TranscriptItem, MIN_COLS, MIN_ROWS};
 use crate::agent_control::ConnId;
 
+const MAX_QUEUED_REMOTE: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Submit(String),
@@ -149,6 +151,13 @@ fn handle_remote(app: &mut App, request: RemoteRequest) -> Vec<Effect> {
                     conn,
                     id,
                     result: Err(crate::agent_control::RpcError::new(-32602, "empty prompt")),
+                }];
+            }
+            if app.phase != RunPhase::Idle && app.queued_remote.len() >= MAX_QUEUED_REMOTE {
+                return vec![Effect::RemoteReply {
+                    conn,
+                    id,
+                    result: Err(crate::agent_control::RpcError::new(-32001, "queue full")),
                 }];
             }
             let source = params
@@ -1267,6 +1276,24 @@ mod tests {
             app.queued_remote.back(),
             Some(&Some(("p-1".into(), "automation".into())))
         );
+    }
+
+    #[test]
+    fn remote_prompt_queue_is_capped() {
+        let mut app = app();
+        app.phase = RunPhase::Busy;
+        for index in 0..MAX_QUEUED_REMOTE {
+            app.queued.push_back(format!("queued-{index}"));
+            app.queued_remote
+                .push_back(Some((format!("p-{index}"), "remote".into())));
+        }
+        let effects = update(&mut app, remote("turn/start", json!({"text":"overflow"})));
+        let error = reply_result(&effects[0]).as_ref().unwrap_err();
+        assert_eq!(error.code, -32001);
+        assert_eq!(error.message, "queue full");
+        assert_eq!(app.queued.len(), MAX_QUEUED_REMOTE);
+        assert_eq!(app.queued_remote.len(), MAX_QUEUED_REMOTE);
+        assert_eq!(app.next_prompt_id, 1);
     }
 
     #[test]
