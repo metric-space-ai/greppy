@@ -618,11 +618,14 @@ fn capture_tracked_repository(
                 repository_tracker_fence(&repository, core, active.epoch)?;
                 let trailing =
                     core.repository_changes_since(&repository, active.epoch, changes.generation)?;
-                if trailing
-                    .paths
-                    .iter()
-                    .all(|path| is_repository_tracker_fence(path))
-                {
+                if repository_changes_preserve_snapshot(
+                    &repository,
+                    core.chunks(),
+                    &incremental,
+                    &trailing.paths,
+                    active.epoch,
+                    trailing.generation,
+                )? {
                     incremental.tracker_generation = Some(trailing.generation);
                     return Ok((incremental, true));
                 }
@@ -676,11 +679,14 @@ fn capture_tracked_repository(
         }
         let changes =
             core.repository_changes_since(&repository, before.epoch, before.generation)?;
-        if changes
-            .paths
-            .iter()
-            .all(|path| is_repository_tracker_fence(path))
-        {
+        if repository_changes_preserve_snapshot(
+            &repository,
+            core.chunks(),
+            &baseline,
+            &changes.paths,
+            before.epoch,
+            changes.generation,
+        )? {
             baseline.tracker_epoch = Some(after.epoch);
             baseline.tracker_generation = Some(changes.generation);
             return Ok((baseline, true));
@@ -698,6 +704,48 @@ fn capture_tracked_repository(
         }
     }
     unreachable!("two bounded snapshot attempts")
+}
+
+/// Distinguishes watcher noise caused by the snapshot's own reads from a real
+/// repository mutation without trusting the backend's event classification.
+///
+/// macOS FSEvents reports atime-only reads as `Modify(Metadata(Any))`, the same
+/// coarse bucket that may also contain a chmod. Re-capturing only the journaled
+/// paths lets the repository hash decide: access-time noise preserves the
+/// snapshot, while content, index and executable-bit changes remain mutations.
+fn repository_changes_preserve_snapshot(
+    repository: &Path,
+    chunks: &ChunkStore,
+    snapshot: &BaselineSnapshot,
+    journal_paths: &[String],
+    tracker_epoch: u64,
+    tracker_generation: u64,
+) -> Result<bool, WorkspaceError> {
+    let changed_paths = journal_paths
+        .iter()
+        .filter(|path| !is_repository_tracker_fence(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if changed_paths.is_empty() {
+        return Ok(true);
+    }
+
+    match capture_repository_incremental(
+        repository,
+        chunks,
+        snapshot,
+        &changed_paths,
+        tracker_epoch,
+        tracker_generation,
+    ) {
+        Ok(Some(candidate)) => {
+            let unchanged = candidate.baseline_hash == snapshot.baseline_hash;
+            release_snapshot(chunks, candidate);
+            Ok(unchanged)
+        }
+        Ok(None) | Err(greppy_workspace_core::Error::ConcurrentRepositoryMutation) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn is_repository_tracker_fence(path: &str) -> bool {
@@ -3090,6 +3138,93 @@ mod tests {
         ));
         assert!(!is_repository_tracker_fence(".git/index"));
         assert!(!is_repository_tracker_fence("src/lib.rs"));
+    }
+
+    #[test]
+    fn snapshot_read_metadata_noise_is_equivalent_but_real_changes_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.name", "Greppy Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "greppy@example.invalid"],
+        );
+        fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-qm", "baseline"]);
+
+        let chunks_root = tempfile::tempdir().unwrap();
+        let chunks = ChunkStore::open(chunks_root.path()).unwrap();
+        let snapshot = capture_repository(&repository, &chunks).unwrap();
+        let head = git(&repository, &["rev-parse", "HEAD"]);
+        let object_path = format!(".git/objects/{}/{}", &head[..2], &head[2..]);
+        let journal_paths = vec![object_path, ".git/index".into(), "tracked.txt".into()];
+
+        // Reading these paths can update atime and arrive from macOS FSEvents
+        // as Metadata(Any), but it does not change the Git-visible snapshot.
+        let _ = fs::read(repository.join("tracked.txt")).unwrap();
+        let _ = fs::read(repository.join(".git/index")).unwrap();
+        assert!(repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &journal_paths,
+            1,
+            1,
+        )
+        .unwrap());
+
+        fs::write(repository.join("tracked.txt"), b"changed\n").unwrap();
+        assert!(!repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &["tracked.txt".into()],
+            1,
+            2,
+        )
+        .unwrap());
+        release_snapshot(&chunks, snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_metadata_reconciliation_preserves_executable_bit_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.name", "Greppy Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "greppy@example.invalid"],
+        );
+        let script = repository.join("script.sh");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        git(&repository, &["add", "script.sh"]);
+        git(&repository, &["commit", "-qm", "baseline"]);
+
+        let chunks_root = tempfile::tempdir().unwrap();
+        let chunks = ChunkStore::open(chunks_root.path()).unwrap();
+        let snapshot = capture_repository(&repository, &chunks).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        assert!(!repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &["script.sh".into()],
+            1,
+            1,
+        )
+        .unwrap());
+        release_snapshot(&chunks, snapshot);
     }
 
     #[test]
