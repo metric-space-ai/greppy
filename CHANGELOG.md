@@ -115,7 +115,11 @@ example Wikipedia's) still needs the button; the agent finds it, at roughly
 five times the turns. Windows: the Web tool is not included in 0.4.0; Windows
 web-runtime localization follows in 0.4.1. The Windows CLI reports that scope
 explicitly instead of attempting runtime discovery. The HTTPS extra-header
-tests trust the fixture certificate only in debug builds.
+tests trust the fixture certificate only in debug builds. On macOS, replacing
+or updating the signed app can require one renewed approval of `Greppy
+Workspace FS`. `workspace setup` detects approval for the exact current bundle
+before mounting, opens the File System Extensions pane directly when needed,
+and remains fail-closed until the user enables the named switch and reruns it.
 
 ## [0.3.4] — 2026-08-30
 

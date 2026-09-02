@@ -140,7 +140,13 @@ baselines remain pinned until their refs are removed.
   with Developer ID code-signing and Gatekeeper before it opens System
   Settings. An older or incomplete installation therefore fails with a
   reinstall diagnostic instead of directing the user to a switch macOS cannot
-  activate. Private provider data remains in the signed application-group
+  activate. Replacing or updating the application bundle can cause macOS to
+  require approval again. Before mounting, setup now queries FSKit for the
+  enabled extension whose bundle URL belongs to the exact installed app. If it
+  is disabled, missing, or still bound to the replaced app, setup opens the
+  File System Extensions pane directly and names the `Greppy Workspace FS`
+  switch; enable it and rerun `greppy workspace setup`. This does not bypass
+  the macOS security boundary. Private provider data remains in the signed application-group
   container, while the actual FSKit mount is
   `~/Library/Application Support/greppy/workspace-mount`; macOS rejects
   filesystem mounts inside managed Group Container directories.

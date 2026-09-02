@@ -177,6 +177,7 @@ swiftc \
     -target "$target" \
     platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.swift \
     -framework AppKit \
+    -framework FSKit \
     -Xlinker -fatal_warnings \
     -o "$app/Contents/MacOS/GreppyWorkspaceFS"
 

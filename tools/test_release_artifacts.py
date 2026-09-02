@@ -108,6 +108,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("com.apple.application-identifier", builder)
         self.assertIn("com.apple.developer.team-identifier", builder)
         self.assertIn('test "$signed_team_id" = "$profile_team_id"', builder)
+        self.assertIn("-framework FSKit", builder)
+        host = (
+            REPOSITORY_ROOT
+            / "platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.swift"
+        ).read_text(encoding="utf-8")
+        self.assertIn("openFileSystemExtensionsSettings", host)
 
     def test_training_archive_is_deterministic_and_self_verifying(self) -> None:
         _, manifest = self.make_training_tree()

@@ -566,9 +566,12 @@ write it; writable Delta state remains isolated per run.
 The 0.3.4 portable agent workspace is a separate layer from the Base/Delta
 index store. `greppy -p` has one workspace contract and no backend
 selector or native fallback: it starts only after the bundled portable adapter
-is mounted and healthy. Run `greppy workspace setup` once after installation,
-then use `greppy workspace doctor --json` to verify provider identity, recovery,
-CAS integrity, and mounted read/write/rename/delete behavior. A failed doctor
+is mounted and healthy. Run `greppy workspace setup` after installation, then
+use `greppy workspace doctor --json` to verify provider identity, recovery, CAS
+integrity, and mounted read/write/rename/delete behavior. On macOS, replacing or
+updating the app can make macOS require approval of `Greppy Workspace FS` again.
+Setup detects that state before attempting a mount and opens the File System
+Extensions pane; enable that named switch and rerun setup. A failed doctor
 prevents the first model call.
 
 Workspace data uses fixed 1 MiB BLAKE3-addressed chunks in append-only segments
