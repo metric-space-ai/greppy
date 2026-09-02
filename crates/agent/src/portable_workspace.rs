@@ -734,14 +734,7 @@ fn repository_tracker_fence(
         fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait = remaining.min(REPOSITORY_TRACKER_FENCE_ATTEMPT);
-        let observed = wait_for_tracker_path(
-            repository,
-            core,
-            epoch,
-            before.generation,
-            &virtual_path,
-            wait,
-        );
+        let observed = wait_for_tracker_path(repository, core, epoch, &virtual_path, wait);
         let remove = fs::remove_file(&path);
         match observed {
             Ok(Some(generation)) => {
@@ -774,7 +767,6 @@ fn wait_for_tracker_path(
     repository: &Path,
     core: &WorkspaceCore,
     epoch: u64,
-    after_generation: u64,
     expected_path: &str,
     timeout: Duration,
 ) -> Result<Option<u64>, WorkspaceError> {
@@ -791,11 +783,8 @@ fn wait_for_tracker_path(
                     .unwrap_or_else(|| "epoch/state changed".into())
             )));
         }
-        if status.generation > after_generation {
-            let changes = core.repository_changes_since(repository, epoch, after_generation)?;
-            if changes.paths.iter().any(|path| path == expected_path) {
-                return Ok(Some(status.generation));
-            }
+        if let Some(generation) = core.consume_repository_fence(repository, epoch, expected_path)? {
+            return Ok(Some(generation));
         }
         if std::time::Instant::now() >= deadline {
             return Ok(None);
@@ -3355,7 +3344,7 @@ mod tests {
                     if let Some(name) = current {
                         let path = format!(".git/{name}");
                         tracker_for_fence
-                            .record_repository_changes(
+                            .record_repository_fences(
                                 &repo_for_fence,
                                 std::slice::from_ref(&path),
                                 2,
@@ -3366,7 +3355,7 @@ mod tests {
                 } else if let Some(observed_path) = observed.as_ref().filter(|_| current.is_none())
                 {
                     tracker_for_fence
-                        .record_repository_changes(
+                        .record_repository_fences(
                             &repo_for_fence,
                             std::slice::from_ref(observed_path),
                             3,

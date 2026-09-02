@@ -65,7 +65,6 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
         let tracked_repo = std::fs::canonicalize(&repo_thread).unwrap();
         let git_dir = tracked_repo.join(".git");
         let mut tracker_active = false;
-        let mut tracker_generation = 0_u64;
         let mut tracker_fences = HashSet::new();
         let mut mirrored = HashSet::new();
         let mut last_heartbeat = 0;
@@ -98,11 +97,10 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                     .map(|name| format!(".git/{name}"))
                     .collect::<Vec<_>>();
                 if !fence_changes.is_empty() {
-                    tracker_generation += 1;
-                    core.record_repository_changes(
+                    core.record_repository_fences(
                         &tracked_repo,
                         &fence_changes,
-                        tracker_generation,
+                        unix_milliseconds(),
                     )
                     .unwrap();
                     tracker_fences = current_fences;

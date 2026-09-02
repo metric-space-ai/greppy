@@ -61,7 +61,15 @@ pub(crate) fn install_schema(connection: &Connection) -> Result<()> {
              PRIMARY KEY(repository, epoch, generation, path)
          );
          CREATE INDEX IF NOT EXISTS cow_repository_events_since
-             ON cow_repository_events(repository, epoch, generation);",
+             ON cow_repository_events(repository, epoch, generation);
+         CREATE TABLE IF NOT EXISTS cow_repository_fences (
+             repository TEXT NOT NULL REFERENCES cow_repository_trackers(repository)
+                 ON DELETE CASCADE,
+             epoch INTEGER NOT NULL CHECK(epoch >= 0),
+             path TEXT NOT NULL,
+             observed_unix_ms INTEGER NOT NULL CHECK(observed_unix_ms >= 0),
+             PRIMARY KEY(repository, epoch, path)
+         );",
     )?;
     ensure_column(
         connection,
@@ -189,6 +197,10 @@ pub(crate) fn activate(
         "DELETE FROM cow_repository_events WHERE repository = ?1",
         params![repository_text],
     )?;
+    transaction.execute(
+        "DELETE FROM cow_repository_fences WHERE repository = ?1",
+        params![repository_text],
+    )?;
     transaction.commit()?;
     status(connection, repository)?
         .ok_or_else(|| Error::Corrupt(format!("repository tracker disappeared: {repository_text}")))
@@ -241,6 +253,86 @@ pub(crate) fn record(
     }
     transaction.commit()?;
     Ok(())
+}
+
+pub(crate) fn record_fences(
+    connection: &mut Connection,
+    repository: &Path,
+    paths: &[String],
+    heartbeat_unix_ms: u64,
+) -> Result<()> {
+    let repository = path_text(repository)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (state, epoch, owner_pid): (String, i64, i64) = transaction
+        .query_row(
+            "SELECT state, epoch, owner_pid FROM cow_repository_trackers
+             WHERE repository = ?1",
+            params![repository],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Corrupt(format!("unregistered repository tracker {repository}")))?;
+    if state == "requested" {
+        return Ok(());
+    }
+    if state != "active" {
+        return Err(Error::Corrupt(format!(
+            "repository tracker is not active: {repository} ({state})"
+        )));
+    }
+    if owner_pid != std::process::id() as i64 {
+        return Err(Error::ConcurrentRepositoryMutation);
+    }
+    transaction.execute(
+        "UPDATE cow_repository_trackers SET heartbeat_unix_ms = ?2
+         WHERE repository = ?1",
+        params![repository, heartbeat_unix_ms as i64],
+    )?;
+    for path in paths {
+        transaction.execute(
+            "INSERT INTO cow_repository_fences(repository, epoch, path, observed_unix_ms)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(repository, epoch, path) DO UPDATE
+             SET observed_unix_ms = excluded.observed_unix_ms",
+            params![repository, epoch, path, heartbeat_unix_ms as i64],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM cow_repository_fences
+         WHERE repository = ?1 AND observed_unix_ms < ?2",
+        params![repository, heartbeat_unix_ms.saturating_sub(60_000) as i64],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn consume_fence(
+    connection: &mut Connection,
+    repository: &Path,
+    epoch: u64,
+    path: &str,
+) -> Result<Option<u64>> {
+    let repository = path_text(repository)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (state, current_epoch, generation): (String, i64, i64) = transaction
+        .query_row(
+            "SELECT state, epoch, generation FROM cow_repository_trackers
+             WHERE repository = ?1",
+            params![repository],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Corrupt(format!("unknown repository tracker: {repository}")))?;
+    if state != "active" || current_epoch as u64 != epoch {
+        return Err(Error::ConcurrentRepositoryMutation);
+    }
+    let removed = transaction.execute(
+        "DELETE FROM cow_repository_fences
+         WHERE repository = ?1 AND epoch = ?2 AND path = ?3",
+        params![repository, epoch as i64, path],
+    )?;
+    transaction.commit()?;
+    Ok((removed == 1).then_some(generation as u64))
 }
 
 pub(crate) fn mark_gap(
@@ -523,6 +615,43 @@ mod tests {
         let requested = status(&connection, repository).unwrap().unwrap();
         assert_eq!(requested.state, RepositoryTrackerState::Requested);
         assert_eq!(requested.owner_pid, 0);
+    }
+
+    #[test]
+    fn fence_acknowledgements_do_not_advance_repository_generation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        install_schema(&connection).unwrap();
+        let repository = Path::new("/repo");
+        request(&mut connection, repository, 100).unwrap();
+        let active = activate(&mut connection, repository, 101).unwrap();
+        let fence = ".git/greppy-tracker-fence-123-456-0".to_string();
+
+        record_fences(
+            &mut connection,
+            repository,
+            std::slice::from_ref(&fence),
+            102,
+        )
+        .unwrap();
+        assert_eq!(
+            status(&connection, repository).unwrap().unwrap().generation,
+            active.generation
+        );
+        assert_eq!(
+            consume_fence(&mut connection, repository, active.epoch, &fence).unwrap(),
+            Some(active.generation)
+        );
+        assert_eq!(
+            consume_fence(&mut connection, repository, active.epoch, &fence).unwrap(),
+            None
+        );
+
+        record(&mut connection, repository, &["src/lib.rs".into()], 103).unwrap();
+        let changes =
+            changes_since(&connection, repository, active.epoch, active.generation).unwrap();
+        assert_eq!(changes.generation, active.generation + 1);
+        assert_eq!(changes.paths, ["src/lib.rs"]);
     }
 
     #[test]

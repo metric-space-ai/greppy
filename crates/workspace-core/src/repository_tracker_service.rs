@@ -657,29 +657,48 @@ fn handle_armed_event(
                             _ => true,
                         });
                     }
+                    let fence_paths = paths
+                        .iter()
+                        .filter(|path| is_tracker_fence_path(path))
+                        .cloned()
+                        .collect::<Vec<_>>();
                     paths.retain(|path| !is_tracker_internal_path(path));
-                    if paths.is_empty() && emitted_paths {
-                        return;
-                    }
                     if paths.is_empty() {
-                        mark_tracker_gap(
-                            core,
-                            repository,
-                            &format!(
-                                "watcher emitted an event without paths: kind={:?}, need_rescan={}",
-                                event.kind,
-                                event.need_rescan()
-                            ),
-                        );
-                        return;
-                    }
-                    if let Err(error) = core.record_repository_changes(repository, &paths, now_ms())
+                        if !emitted_paths {
+                            mark_tracker_gap(
+                                core,
+                                repository,
+                                &format!(
+                                    "watcher emitted an event without paths: kind={:?}, need_rescan={}",
+                                    event.kind,
+                                    event.need_rescan()
+                                ),
+                            );
+                            return;
+                        }
+                    } else if let Err(error) =
+                        core.record_repository_changes(repository, &paths, now_ms())
                     {
                         mark_tracker_gap(
                             core,
                             repository,
                             &format!("cannot record watcher event: {error}"),
                         );
+                        return;
+                    }
+                    // A fence is an ordering acknowledgement, not a repository
+                    // mutation. Publish it only after every ordinary path in
+                    // the same callback has advanced the mutation journal.
+                    if !fence_paths.is_empty() {
+                        if let Err(error) =
+                            core.record_repository_fences(repository, &fence_paths, now_ms())
+                        {
+                            mark_tracker_gap(
+                                core,
+                                repository,
+                                &format!("cannot record tracker fence: {error}"),
+                            );
+                        }
                     }
                 }
                 Err(detail) => mark_tracker_gap(core, repository, &detail),
@@ -692,7 +711,11 @@ fn handle_armed_event(
 }
 
 fn is_tracker_internal_path(path: &str) -> bool {
-    path.starts_with(".git/greppy-tracker-ready-")
+    path.starts_with(".git/greppy-tracker-ready-") || is_tracker_fence_path(path)
+}
+
+fn is_tracker_fence_path(path: &str) -> bool {
+    path.starts_with(".git/greppy-tracker-fence-")
 }
 
 fn mark_tracker_gap(core: &WorkspaceCore, repository: &Path, detail: &str) {
@@ -823,18 +846,26 @@ mod tests {
         std::fs::write(repository.join(".git").join(&name), b"fence").unwrap();
         let expected = format!(".git/{name}");
         loop {
-            let changes = core
-                .repository_changes_since(&repository, active.epoch, active.generation)
-                .unwrap();
-            if changes.paths.iter().any(|path| path == &expected) {
+            if core
+                .consume_repository_fence(&repository, active.epoch, &expected)
+                .unwrap()
+                == Some(active.generation)
+            {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "first post-Active fence was not routed: {changes:?}"
+                "first post-Active fence was not acknowledged"
             );
             thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(
+            core.repository_tracker_status(&repository)
+                .unwrap()
+                .unwrap()
+                .generation,
+            active.generation
+        );
     }
 
     #[test]
@@ -886,18 +917,26 @@ mod tests {
         std::fs::write(&fence, b"fence").unwrap();
         let expected = format!(".git/{name}");
         loop {
-            let changes = core
-                .repository_changes_since(&repository, active.epoch, active.generation)
-                .unwrap();
-            if changes.paths.iter().any(|path| path == &expected) {
+            if core
+                .consume_repository_fence(&repository, active.epoch, &expected)
+                .unwrap()
+                == Some(active.generation)
+            {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "replacement tracker did not route its fence: {changes:?}"
+                "replacement tracker did not acknowledge its fence"
             );
             thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(
+            core.repository_tracker_status(&repository)
+                .unwrap()
+                .unwrap()
+                .generation,
+            active.generation
+        );
         std::fs::remove_file(fence).unwrap();
     }
 
@@ -1137,6 +1176,69 @@ mod tests {
             .repository_changes_since(&repository, active.epoch, active.generation)
             .unwrap();
         assert_eq!(changes.paths, vec!["."]);
+    }
+
+    #[test]
+    fn delayed_fence_events_acknowledge_without_invalidating_snapshot_generation() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        use notify::{Event, EventKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let git_dir = repository.join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+        let active = core
+            .activate_repository_tracker(&repository, now_ms())
+            .unwrap();
+        let fence_name = "greppy-tracker-fence-123-456-0";
+        let fence_path = git_dir.join(fence_name);
+        let virtual_path = format!(".git/{fence_name}");
+
+        for event in [
+            Event::new(EventKind::Create(CreateKind::File)).add_path(fence_path.clone()),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(fence_path.clone()),
+            Event::new(EventKind::Remove(RemoveKind::File)).add_path(fence_path),
+        ] {
+            handle_armed_event(&core, &repository, &git_dir, Ok(event));
+            assert_eq!(
+                core.repository_tracker_status(&repository)
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                active.generation
+            );
+        }
+
+        assert_eq!(
+            core.consume_repository_fence(&repository, active.epoch, &virtual_path)
+                .unwrap(),
+            Some(active.generation)
+        );
+        let changes = core
+            .repository_changes_since(&repository, active.epoch, active.generation)
+            .unwrap();
+        assert!(changes.paths.is_empty());
+        assert_eq!(changes.generation, active.generation);
+
+        let combined_name = "greppy-tracker-fence-123-789-1";
+        let combined_virtual_path = format!(".git/{combined_name}");
+        let combined = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(repository.join("src/lib.rs"))
+            .add_path(git_dir.join(combined_name));
+        handle_armed_event(&core, &repository, &git_dir, Ok(combined));
+        assert_eq!(
+            core.consume_repository_fence(&repository, active.epoch, &combined_virtual_path)
+                .unwrap(),
+            Some(active.generation + 1)
+        );
+        let changes = core
+            .repository_changes_since(&repository, active.epoch, active.generation)
+            .unwrap();
+        assert_eq!(changes.generation, active.generation + 1);
+        assert_eq!(changes.paths, ["src/lib.rs"]);
     }
 
     #[test]

@@ -863,6 +863,28 @@ impl WorkspaceCore {
         repository_tracker::record(&mut connection, repository, paths, heartbeat_unix_ms)
     }
 
+    pub fn record_repository_fences(
+        &self,
+        repository: &Path,
+        paths: &[String],
+        heartbeat_unix_ms: u64,
+    ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::record_fences(&mut connection, repository, paths, heartbeat_unix_ms)
+    }
+
+    pub fn consume_repository_fence(
+        &self,
+        repository: &Path,
+        epoch: u64,
+        path: &str,
+    ) -> Result<Option<u64>> {
+        let _writer = self.lock_metadata_writer()?;
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::consume_fence(&mut connection, repository, epoch, path)
+    }
+
     pub fn heartbeat_repository_tracker(
         &self,
         repository: &Path,
