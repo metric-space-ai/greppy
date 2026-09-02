@@ -230,6 +230,10 @@ there is no separate 0.3.5 web feature release. The current source remains an
 experimental web-runtime spike until its own gates below are green; this is
 not a Playwright-compatibility claim.
 
+- The terminal UI now uses Ratatui 0.30.2 and one aligned Crossterm 0.29
+  runtime. This removes the transitive vulnerable `lru` 0.12 implementation
+  (GHSA-rhfx-m35p-ff5j) in favor of 0.18.3 without changing Greppy's TUI API;
+  the complete CLI test suite and Clippy remain green.
 - Synthetic pointer input now has an engine receipt for every move, press, and
   release. A fresh WebView whose display list is not yet available is repainted
   and retried instead of silently dropping the event; exhausted retries fail
