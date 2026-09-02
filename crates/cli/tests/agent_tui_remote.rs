@@ -306,18 +306,20 @@ impl Drop for Pty {
     }
 }
 
-fn find_socket(root: &Path) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(root).ok()? {
-        let path = entry.ok()?.path();
-        if path.is_dir() {
-            if let Some(found) = find_socket(&path) {
-                return Some(found);
-            }
-        } else if path.extension().and_then(|value| value.to_str()) == Some("sock") {
-            return Some(path);
-        }
-    }
-    None
+fn find_socket(repo: &Path, store: &Path) -> Option<PathBuf> {
+    // Sockets live under the hashed runtime dir, not in the store: ask the
+    // reader for the live row's `socket` field instead of scanning directories.
+    let output = Command::new(binary_path())
+        .current_dir(repo)
+        .env("GREPPY_STORE_DIR", store)
+        .args(["agent", "sessions", "list", "--json"])
+        .output()
+        .ok()?;
+    let rows: Value = serde_json::from_slice(&output.stdout).ok()?;
+    rows.as_array()?
+        .iter()
+        .find(|row| row["live"] == true)
+        .and_then(|row| row["socket"].as_str().map(PathBuf::from))
 }
 
 fn next_event(client: &mut ControlClient, wanted: &str) -> Value {
@@ -354,11 +356,11 @@ fn tui_remote_turn_broadcasts_events_and_unlinks_socket() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let socket = loop {
-        if let Some(path) = find_socket(&pty.store) {
+        if let Some(path) = find_socket(&repo, &pty.store) {
             break path;
         }
         assert!(Instant::now() < deadline, "control socket was not created");
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(200));
     };
     let mut client = ControlClient::connect(&socket).unwrap();
     let description = match client.call("session/describe", json!({})) {

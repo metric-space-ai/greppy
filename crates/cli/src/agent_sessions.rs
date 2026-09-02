@@ -344,18 +344,22 @@ fn source_from_lines(lines: &[SessionLogLine]) -> String {
     String::new()
 }
 
-fn live_socket(session: &ListedSession) -> (bool, Option<PathBuf>) {
-    let Some(project_dir) = session.path.parent() else {
-        return (false, None);
-    };
-    let Some(data_root) = project_dir.parent().and_then(Path::parent) else {
-        return (false, None);
-    };
-    let Some(project) = project_dir.file_name().and_then(|name| name.to_str()) else {
-        return (false, None);
-    };
+/// Control-socket path of a listed session (the same mapping the hosts use).
+pub(crate) fn control_socket_path(session: &ListedSession) -> Option<PathBuf> {
+    let project_dir = session.path.parent()?;
+    let data_root = project_dir.parent().and_then(Path::parent)?;
+    let project = project_dir.file_name().and_then(|name| name.to_str())?;
     let store = SessionStore::new(data_root, project);
-    let socket = crate::agent_control::socket_path_for(&store, &session.record.id);
+    Some(crate::agent_control::socket_path_for(
+        &store,
+        &session.record.id,
+    ))
+}
+
+fn live_socket(session: &ListedSession) -> (bool, Option<PathBuf>) {
+    let Some(socket) = control_socket_path(session) else {
+        return (false, None);
+    };
     #[cfg(unix)]
     let live = crate::agent_control::is_live(&socket);
     #[cfg(not(unix))]

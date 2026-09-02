@@ -342,7 +342,10 @@ fn open_live(
     root: Option<&str>,
 ) -> std::result::Result<(ControlClient, ListedSession), i32> {
     let session = resolve_from_root(root, id)?;
-    let socket = session.path.with_extension("sock");
+    let Some(socket) = crate::agent_sessions::control_socket_path(&session) else {
+        eprintln!("{}", not_live_message(&session.record.id));
+        return Err(3);
+    };
     if !is_live(&socket) {
         eprintln!("{}", not_live_message(&session.record.id));
         return Err(3);
