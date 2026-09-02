@@ -297,18 +297,25 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang-15 libclang-15-dev
+          sudo apt-get install --yes clang-15 libclang-15-dev llvm-15-dev
           test -x /usr/bin/clang-15
           test -x /usr/bin/clang++-15
+          test -x /usr/bin/llvm-config-15
           test -e /usr/lib/llvm-15/lib/libclang.so
+          resource_dir="$(/usr/bin/clang-15 -print-resource-dir)"
+          test -r "$resource_dir/include/emmintrin.h"
           /usr/bin/clang-15 --version
           /usr/bin/clang++-15 --version
+          printf '%s\n' '/usr/lib/llvm-15/bin' >> "$GITHUB_PATH"
           printf '%s\n' \
             'CC=/usr/bin/clang-15' \
             'CXX=/usr/bin/clang++-15' \
             'HOST_CC=/usr/bin/clang-15' \
             'HOST_CXX=/usr/bin/clang++-15' \
-            'LIBCLANG_PATH=/usr/lib/llvm-15/lib' >> "$GITHUB_ENV"
+            'CLANG_PATH=/usr/bin/clang-15' \
+            'LLVM_CONFIG_PATH=/usr/bin/llvm-config-15' \
+            'LIBCLANG_PATH=/usr/lib/llvm-15/lib' \
+            "BINDGEN_EXTRA_CLANG_ARGS=--resource-dir=$resource_dir" >> "$GITHUB_ENV"
 
       - name: Assert and record native build host
         shell: bash

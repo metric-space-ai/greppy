@@ -354,18 +354,21 @@ fn is_icu(name: &str) -> bool {
 }
 
 fn is_permitted_overlap(name: &str) -> bool {
-    is_icu(name)
-        || (cfg!(windows)
-            && matches!(
-                name,
-                "?_OptionsStorage@?1??__local_stdio_printf_options@@9@4_KA"
-                    | "?abort_noreturn@@YAXXZ"
-                    | "_Avx2WmemEnabledWeakValue"
-                    | "__local_stdio_printf_options"
-                    | "fprintf"
-                    | "printf"
-                    | "snprintf"
-            ))
+    is_icu(name) || (cfg!(windows) && is_permitted_windows_crt_overlap(name))
+}
+
+fn is_permitted_windows_crt_overlap(name: &str) -> bool {
+    matches!(
+        name,
+        "?_OptionsStorage@?1??__local_stdio_printf_options@@9@4_KA"
+            | "?what@bad_optional_access@std@@UEBAPEBDXZ"
+            | "?abort_noreturn@@YAXXZ"
+            | "_Avx2WmemEnabledWeakValue"
+            | "__local_stdio_printf_options"
+            | "fprintf"
+            | "printf"
+            | "snprintf"
+    )
 }
 
 fn defined_globals(archive: &Path) -> Result<BTreeSet<String>, String> {
@@ -564,4 +567,19 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_permitted_windows_crt_overlap;
+
+    #[test]
+    fn windows_bad_optional_access_comdat_is_permitted_but_v8_shims_are_not() {
+        assert!(is_permitted_windows_crt_overlap(
+            "?what@bad_optional_access@std@@UEBAPEBDXZ"
+        ));
+        assert!(!is_permitted_windows_crt_overlap(
+            "?PrintF@internal@v8@@YAXPEBDZZ"
+        ));
+    }
 }
