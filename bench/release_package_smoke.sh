@@ -13,6 +13,12 @@ BIN="${1:?usage: release_package_smoke.sh /path/to/greppy [work-dir]}"
 # Sections cd into fixture dirs; a relative binary path would break there.
 case "$BIN" in /*) ;; *) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" ;; esac
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 64; }
+BIN_DIR="$(cd "$(dirname "$BIN")" && pwd)"
+WEB_RUNTIME_DIST="$BIN_DIR/web-runtime"
+[ -f "$WEB_RUNTIME_DIST/.greppy-web-runtime-dist" ] \
+  || { echo "missing packaged web-runtime dist beside $BIN" >&2; exit 64; }
+[ -x "$WEB_RUNTIME_DIST/bin/web-runtime" ] \
+  || { echo "missing packaged web-runtime executable beside $BIN" >&2; exit 64; }
 WORK="${2:-$(mktemp -d "${TMPDIR:-/tmp}/greppy-release-smoke-XXXXXX")}"
 mkdir -p "$WORK/repo/src" "$WORK/repo/.git" "$WORK/store"
 # A 0.3.1 data root may contain these now-unmanaged namespaces. They must not
@@ -133,6 +139,12 @@ export XDG_RUNTIME_DIR="$RUNTIME_BASE"
 section "baseline: doctor, index, JSON brief + semantic-search + expand"
 
 "$BIN" --help >/dev/null
+"$BIN" web doctor --json >"$WORK/web-doctor.json"
+jq -e '
+  .status == "ok" and
+  (.result.executable | endswith("/web-runtime/bin/web-runtime")) and
+  (.result.stamp | endswith("/web-runtime/.greppy-web-runtime-dist"))
+' "$WORK/web-doctor.json" >/dev/null
 "$BIN" --device cpu --root "$WORK/repo" doctor --json >"$WORK/doctor.json" || test $? -eq 1
 jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$WORK/doctor.json" >/dev/null
 
@@ -459,6 +471,7 @@ FAKE_HOME="$WORK/fake-home"
 FAKE_TMP="$WORK/fake-tmp"
 mkdir -p "$PREFIX/bin" "$PREFIX/smoke-repo/src" "$PREFIX/smoke-repo/.git" "$FAKE_HOME" "$FAKE_TMP"
 cp "$BIN" "$PREFIX/bin/greppy"
+cp -a "$WEB_RUNTIME_DIST" "$PREFIX/bin/web-runtime"
 chmod +x "$PREFIX/bin/greppy"
 cp "$WORK/repo/src/lib.rs" "$WORK/repo/src/case.rs" "$PREFIX/smoke-repo/src/"
 

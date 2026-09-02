@@ -18,6 +18,9 @@ staging_cleanup() {
 }
 trap staging_cleanup EXIT
 bin=web-runtime
+case "${OS:-}:$(uname -s 2>/dev/null || true)" in
+  Windows_NT:*|*:MINGW*|*:MSYS*) bin=web-runtime.exe ;;
+esac
 found=
 # Release first. A debug build exists on every developer machine, so
 # searching debug first meant a release would ship the unoptimised binary
@@ -38,16 +41,16 @@ do
 done
 if [ -z "$found" ]; then
   echo "package-web-runtime: unified web-runtime binary is required" >&2
-  echo "looked for an executable named web-runtime in:" >&2
-  echo "  crates/web-runtime/target/{debug,release}/web-runtime" >&2
-  echo "  target/{debug,release}/web-runtime" >&2
+  echo "looked for an executable named $bin in:" >&2
+  echo "  crates/web-runtime/target/{debug,release}/$bin" >&2
+  echo "  target/{debug,release}/$bin" >&2
   echo "do not package web-runtime-supervisor / web-controller-worker / web-content-worker" >&2
   exit 1
 fi
-python3 - "$staging" <<'PY'
+python3 - "$staging" "$bin" <<'PY'
 import hashlib, json, os, platform, sys, time
-dest = sys.argv[1]
-bins = ["web-runtime"]
+dest, executable = sys.argv[1:]
+bins = [executable]
 components = []
 for name in bins:
     path = os.path.join(dest, "bin", name)
@@ -71,14 +74,20 @@ prov = {
     "platform": f"{platform.system()}-{platform.machine()}",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "images": components,
-    "production_signed": False,
-    "note": "Local unsigned package. Production signatures require GREPPY_CODESIGN_IDENTITY; notarization requires GREPPY_NOTARY_PROFILE or Apple notary credentials.",
+    "production_signed": os.environ.get("GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED") == "true",
+    "note": "Signature state is bound by the release workflow before this dist is hashed.",
 }
 open(os.path.join(dest, "provenance.json"), "w").write(json.dumps(prov, indent=2) + "\n")
 PY
+signature_label=unsigned
+signature_sentence="This archive is not production-signed."
+if [ "${GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED:-false}" = true ]; then
+  signature_label=production-signed
+  signature_sentence="The executable was production-signed before this archive was hashed."
+fi
 cat > "$staging/README.txt" <<TXT
 Greppy web-runtime local distributable
-Contains one linked executable. Supervisor, controller, and content roles are selected with --internal-role. This archive is not signed.
+Contains one linked executable. Supervisor, controller, and content roles are selected with --internal-role. $signature_sentence
 TXT
 if [ -f "$root/LICENSE" ] && [ ! -L "$root/LICENSE" ]; then
   web_runtime_copy_regular_file "$root/LICENSE" "$staging/LICENSE"
@@ -87,10 +96,10 @@ coverage="$root/contracts/web-runtime/playwright-public-surface.v1.json"
 if [ -f "$coverage" ] && [ ! -L "$coverage" ]; then
   web_runtime_copy_regular_file "$coverage" "$staging/coverage-manifest.json"
 fi
-python3 - "$staging" "$found" <<'PY'
+python3 - "$staging" "$found" "$bin" <<'PY'
 import json, os, platform, sys, time
-dest, src = sys.argv[1], sys.argv[2]
-size = os.path.getsize(os.path.join(dest, "bin", "web-runtime"))
+dest, src, executable = sys.argv[1:]
+size = os.path.getsize(os.path.join(dest, "bin", executable))
 profile = "release" if "/release/" in src.replace("\\", "/") else "debug"
 receipt = {
     "buildType": "greppy.web-runtime.size.v1",
@@ -121,7 +130,11 @@ bench = {
 }
 open(os.path.join(dest, "benchmark-receipt.json"), "w").write(json.dumps(bench, indent=2) + "\n")
 PY
-echo "NOT_PRODUCTION_SIGNED" > "$staging/UNSIGNED"
+if [ "${GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED:-false}" = true ]; then
+  echo "PRODUCTION_SIGNED" > "$staging/SIGNED"
+else
+  echo "NOT_PRODUCTION_SIGNED" > "$staging/UNSIGNED"
+fi
 web_runtime_write_sha256sums "$staging"
 web_runtime_write_stamp "$staging"
 web_runtime_commit_staging "$staging" "$dest"
@@ -139,4 +152,4 @@ if [ -e "$archive" ] || [ -L "$archive" ]; then
   rm -f "$archive"
 fi
 tar -C "$parent" -czf "$archive" "$base"
-echo "packed $dest and $archive (unsigned)"
+echo "packed $dest and $archive ($signature_label)"

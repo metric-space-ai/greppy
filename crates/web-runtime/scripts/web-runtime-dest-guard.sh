@@ -194,11 +194,24 @@ web_runtime_stamp_name() {
   printf '%s' ".greppy-web-runtime-dist"
 }
 
+web_runtime_executable_name() {
+  case "${OS:-}:$(uname -s 2>/dev/null || true)" in
+    Windows_NT:*|*:MINGW*|*:MSYS*) printf '%s' "web-runtime.exe" ;;
+    *) printf '%s' "web-runtime" ;;
+  esac
+}
+
+web_runtime_executable_member() {
+  printf 'bin/%s' "$(web_runtime_executable_name)"
+}
+
 web_runtime_known_members() {
+  kr_executable=$(web_runtime_executable_name)
   printf '%s\n' \
     ".greppy-web-runtime-dist" \
     "README.txt" \
     "UNSIGNED" \
+    "SIGNED" \
     "SHA256SUMS" \
     "sbom.json" \
     "provenance.json" \
@@ -212,8 +225,8 @@ web_runtime_known_members() {
     "NOTARIZATION_RECEIPT" \
     "NOTARIZATION_SKIPPED" \
     "NOTARIZED_UNSIGNED" \
-    "bin/web-runtime" \
-    "previous/web-runtime"
+    "bin/$kr_executable" \
+    "previous/$kr_executable"
 }
 
 web_runtime_member_dirs() {
@@ -248,6 +261,7 @@ web_runtime_preflight_tree() {
 
 web_runtime_is_owned_dist() {
   iod_dest=$1
+  iod_executable=$(web_runtime_executable_name)
   [ -L "$iod_dest" ] && return 1
   [ -d "$iod_dest" ] || return 1
   [ -L "$iod_dest/bin" ] && return 1
@@ -265,30 +279,30 @@ web_runtime_is_owned_dist() {
   [ -L "$iod_dest/provenance.json" ] && return 1
   [ -f "$iod_dest/provenance.json" ] || return 1
   grep -q 'greppy.web-runtime.package.v1' "$iod_dest/provenance.json" || return 1
-  [ -L "$iod_dest/bin/web-runtime" ] && return 1
-  [ -f "$iod_dest/bin/web-runtime" ] || return 1
+  [ -L "$iod_dest/bin/$iod_executable" ] && return 1
+  [ -f "$iod_dest/bin/$iod_executable" ] || return 1
   for name in $(ls -A "$iod_dest"); do
     case "$name" in
-      .greppy-web-runtime-dist | README.txt | UNSIGNED | SHA256SUMS | sbom.json | provenance.json | LICENSE | coverage-manifest.json | benchmark-receipt.json | size-receipt.json | SIGNING_RECEIPT | SIGNING_SKIPPED | SIGNING_STATUS | NOTARIZATION_RECEIPT | NOTARIZATION_SKIPPED | NOTARIZED_UNSIGNED | bin | previous) ;;
+      .greppy-web-runtime-dist | README.txt | UNSIGNED | SIGNED | SHA256SUMS | sbom.json | provenance.json | LICENSE | coverage-manifest.json | benchmark-receipt.json | size-receipt.json | SIGNING_RECEIPT | SIGNING_SKIPPED | SIGNING_STATUS | NOTARIZATION_RECEIPT | NOTARIZATION_SKIPPED | NOTARIZED_UNSIGNED | bin | previous) ;;
       *) return 1 ;;
     esac
   done
   for name in $(ls -A "$iod_dest/bin"); do
     case "$name" in
-      web-runtime) ;;
+      "$iod_executable") ;;
       *) return 1 ;;
     esac
   done
   if [ -d "$iod_dest/previous" ]; then
     for name in $(ls -A "$iod_dest/previous"); do
       case "$name" in
-        web-runtime) ;;
+        "$iod_executable") ;;
         *) return 1 ;;
       esac
     done
-    if [ -e "$iod_dest/previous/web-runtime" ] || [ -L "$iod_dest/previous/web-runtime" ]; then
-      [ -L "$iod_dest/previous/web-runtime" ] && return 1
-      [ -f "$iod_dest/previous/web-runtime" ] || return 1
+    if [ -e "$iod_dest/previous/$iod_executable" ] || [ -L "$iod_dest/previous/$iod_executable" ]; then
+      [ -L "$iod_dest/previous/$iod_executable" ] && return 1
+      [ -f "$iod_dest/previous/$iod_executable" ] || return 1
     fi
   fi
   return 0
@@ -553,10 +567,12 @@ web_runtime_uninstall_owned_dist() {
 # previous/ is an install-local snapshot, and signing receipts are evidence
 # about the payload.
 web_runtime_hashed_members() {
+  hm_executable=$(web_runtime_executable_member)
   printf '%s\n' \
-    "bin/web-runtime" \
+    "$hm_executable" \
     "README.txt" \
     "UNSIGNED" \
+    "SIGNED" \
     "sbom.json" \
     "provenance.json" \
     "LICENSE" \
@@ -574,6 +590,7 @@ web_runtime_write_sha256sums() {
   web_runtime_check_owned_real_dir "$ws_root/bin"
   ws_files=
   ws_have_bin=0
+  ws_executable=$(web_runtime_executable_member)
   for member in $(web_runtime_hashed_members); do
     ws_path="$ws_root/$member"
     if [ -L "$ws_path" ]; then
@@ -581,13 +598,13 @@ web_runtime_write_sha256sums() {
     fi
     if [ -f "$ws_path" ]; then
       ws_files="$ws_files $member"
-      if [ "$member" = "bin/web-runtime" ]; then
+      if [ "$member" = "$ws_executable" ]; then
         ws_have_bin=1
       fi
     fi
   done
   if [ "$ws_have_bin" != 1 ]; then
-    web_runtime_die "missing bin/web-runtime for SHA256SUMS"
+    web_runtime_die "missing $ws_executable for SHA256SUMS"
   fi
   (
     CDPATH= cd -- "$ws_root" || exit 1
@@ -628,8 +645,9 @@ web_runtime_verify_sha256sums() {
   if [ "$vs_listed" != "$vs_present" ]; then
     web_runtime_die "SHA256SUMS is incomplete or lists unexpected members"
   fi
-  printf '%s\n' "$vs_listed" | grep -qx 'bin/web-runtime' ||
-    web_runtime_die "SHA256SUMS missing bin/web-runtime"
+  vs_executable=$(web_runtime_executable_member)
+  printf '%s\n' "$vs_listed" | grep -qx "$vs_executable" ||
+    web_runtime_die "SHA256SUMS missing $vs_executable"
   (
     CDPATH= cd -- "$vs_root" || exit 1
     if command -v shasum >/dev/null; then

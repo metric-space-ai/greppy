@@ -332,6 +332,14 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --bin greppy --bin greppy-workspace-provider --features ${{ matrix.features }}
 
+      - name: Build the linked web runtime
+        shell: bash
+        run: |
+          cargo build --locked --release \
+            --manifest-path crates/web-runtime/Cargo.toml \
+            --package web-runtime \
+            --bin web-runtime
+
       - name: Stage private Greppy WinFsp user runtime
         if: runner.os == 'Windows'
         shell: pwsh
@@ -416,6 +424,26 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$APPLICATION_CERTIFICATE_PASSWORD" "$keychain"
           codesign --force --options runtime --timestamp --sign "$APPLICATION_SIGNING_IDENTITY" target/release/greppy
           codesign --verify --strict --verbose=2 target/release/greppy
+          codesign --force --options runtime --timestamp --sign "$APPLICATION_SIGNING_IDENTITY" crates/web-runtime/target/release/web-runtime
+          codesign --verify --strict --verbose=2 crates/web-runtime/target/release/web-runtime
+
+      - name: Ad-hoc sign the macOS web runtime for unsigned dry-runs
+        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/') && !inputs.sign_dry_run
+        shell: bash
+        run: |
+          codesign --force --timestamp=none --options runtime --sign - \
+            crates/web-runtime/target/release/web-runtime
+          codesign --verify --strict --verbose=2 \
+            crates/web-runtime/target/release/web-runtime
+
+      - name: Stage the linked web runtime distributable (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: ${{ runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) }}
+        run: >-
+          crates/web-runtime/scripts/package-web-runtime.sh
+          target/release/web-runtime-dist
 
       - name: Build macOS FSKit application with bundled CLI
         if: runner.os == 'macOS'
@@ -443,6 +471,7 @@ jobs:
           APP_PROVISIONING_PROFILE="$app_profile" \
           FSKIT_PROVISIONING_PROFILE="$fskit_profile" \
           GREPPY_CLI_BINARY="$PWD/target/release/greppy" \
+          GREPPY_WEB_RUNTIME_DIST="$PWD/target/release/web-runtime-dist" \
             platform/macos/build-fskit-app.sh "$RUNNER_TEMP/greppy-fskit"
           codesign --verify --deep --strict --verbose=2 \
             "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app"
@@ -465,13 +494,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool sign failed' }
           & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppyworkspacefsp-x64.dll
           if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool sign failed' }
+          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD crates/web-runtime/target/release/web-runtime.exe
+          if ($LASTEXITCODE -ne 0) { throw 'web-runtime signtool sign failed' }
           & signtool verify /pa /all /v target/release/greppy.exe
           if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppy-workspace-provider.exe
           if ($LASTEXITCODE -ne 0) { throw 'provider signtool verify failed' }
           & signtool verify /pa /all /v target/release/greppyworkspacefsp-x64.dll
           if ($LASTEXITCODE -ne 0) { throw 'Greppy WinFsp runtime signtool verify failed' }
+          & signtool verify /pa /all /v crates/web-runtime/target/release/web-runtime.exe
+          if ($LASTEXITCODE -ne 0) { throw 'web-runtime signtool verify failed' }
           "WINDOWS_SIGNING_PFX_PATH=$cert" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Stage the linked web runtime distributable (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: ${{ startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run }}
+        run: >-
+          crates/web-runtime/scripts/package-web-runtime.sh
+          target/release/web-runtime-dist
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -593,6 +635,7 @@ jobs:
           platform/linux/build-packages.sh \
             target/release/greppy \
             target/release/greppy-workspace-provider \
+            target/release/web-runtime-dist \
               "$version" \
               "${{ matrix.asset }}" \
               "${{ matrix.secondary_asset }}" \
@@ -676,6 +719,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
+          Copy-Item target/release/web-runtime-dist dist/web-runtime -Recurse
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item target/release/greppyworkspacefsp-x64.sys dist/greppyworkspacefsp-x64.sys
           if (Test-Path target/release/greppyworkspacefsp-x64.cat) {
