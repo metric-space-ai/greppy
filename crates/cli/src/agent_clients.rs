@@ -12,6 +12,7 @@ use crate::agent_control::{is_live, not_live_message, ControlClient};
 use crate::agent_sessions::{
     print_session_tail, render_tail_line, resolve_from_root, ListedSession,
 };
+use crate::agent_tui::sanitize_terminal_text;
 
 const EVENT_POLL: Duration = Duration::from_millis(200);
 
@@ -157,7 +158,6 @@ pub(crate) fn quit(id: &str, json: bool, root: Option<&str>) -> Result<i32> {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn attach(id: &str, json: bool, since_start: bool, root: Option<&str>) -> Result<i32> {
     #[cfg(not(unix))]
     {
@@ -176,8 +176,12 @@ pub(crate) fn attach(id: &str, json: bool, since_start: bool, root: Option<&str>
         if since_start {
             print_session_tail(&session, json, 40);
         }
-        stream_events(&mut client, json, 0, |_| None)
+        stream_events(&mut client, json, stream_interrupt_exit_code(), |_| None)
     }
+}
+
+fn stream_interrupt_exit_code() -> i32 {
+    130
 }
 
 fn read_prompt(text: &str) -> std::result::Result<String, i32> {
@@ -197,24 +201,30 @@ fn read_prompt(text: &str) -> std::result::Result<String, i32> {
 fn print_status(description: &Value, session: &ListedSession) {
     println!(
         "id: {}",
-        description
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        sanitize_human(
+            description
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        )
     );
     println!(
         "phase: {}",
-        description
-            .get("phase")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        sanitize_human(
+            description
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        )
     );
     println!(
         "model: {}",
-        description
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        sanitize_human(
+            description
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        )
     );
     println!(
         "turns: {}",
@@ -230,12 +240,24 @@ fn print_status(description: &Value, session: &ListedSession) {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     );
-    println!("worktree: {}", json_path(description.get("worktree")));
+    println!(
+        "worktree: {}",
+        sanitize_human(&json_path(description.get("worktree")))
+    );
     if !session.record.proposal_ref.is_empty() {
-        println!("proposal_ref: {}", session.record.proposal_ref);
+        println!(
+            "proposal_ref: {}",
+            sanitize_human(&session.record.proposal_ref)
+        );
     }
-    println!("socket: {}", json_path(description.get("socket")));
-    println!("jsonl: {}", json_path(description.get("jsonl")));
+    println!(
+        "socket: {}",
+        sanitize_human(&json_path(description.get("socket")))
+    );
+    println!(
+        "jsonl: {}",
+        sanitize_human(&json_path(description.get("jsonl")))
+    );
 }
 
 fn json_path(value: Option<&Value>) -> String {
@@ -244,6 +266,10 @@ fn json_path(value: Option<&Value>) -> String {
         Some(other) => other.to_string(),
         None => String::new(),
     }
+}
+
+fn sanitize_human(input: &str) -> String {
+    sanitize_terminal_text(input).into_owned()
 }
 
 fn emit_event(event: &Value, json: bool) {
@@ -356,7 +382,7 @@ fn subscribe(client: &mut ControlClient) -> std::result::Result<(), i32> {
 #[cfg(unix)]
 fn stream_until_turn(client: &mut ControlClient, prompt_id: &str, json: bool) -> Result<i32> {
     let mut saw_start = false;
-    stream_events(client, json, 130, |event| {
+    stream_events(client, json, stream_interrupt_exit_code(), |event| {
         let event_type = event.get("type").and_then(Value::as_str);
         if !saw_start {
             if event_type == Some("turn_start")
@@ -423,4 +449,61 @@ fn install_stream_stop() {
 #[cfg(unix)]
 extern "C" fn stream_sigint(_: libc::c_int) {
     STREAM_STOP.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn injected() -> &'static str {
+        "\u{1b}]52;c;x\u{07}safe\u{1b}[2J"
+    }
+
+    fn assert_no_esc(rendered: &str) {
+        assert!(
+            !rendered.as_bytes().contains(&0x1b),
+            "escape leaked: {rendered:?}"
+        );
+        assert!(rendered.contains("safe"), "{rendered:?}");
+    }
+
+    #[test]
+    fn ctrl_c_maps_to_exit_130() {
+        assert_eq!(stream_interrupt_exit_code(), 130);
+    }
+
+    #[test]
+    fn client_event_renderers_strip_terminal_control_sequences() {
+        let evil = injected();
+        assert_no_esc(
+            &render_control_event(&json!({
+                "type": "turn_start",
+                "source": evil,
+                "text": evil,
+            }))
+            .unwrap(),
+        );
+        assert_no_esc(
+            &render_control_event(&json!({
+                "type": "tool_start",
+                "name": "greppy",
+                "summary": evil,
+            }))
+            .unwrap(),
+        );
+        assert_no_esc(
+            &render_control_event(&json!({
+                "type": "text",
+                "text": evil,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            sanitize_human(evil).as_bytes().contains(&0x1b),
+            false,
+            "{}",
+            sanitize_human(evil)
+        );
+    }
 }

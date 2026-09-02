@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -284,6 +284,56 @@ fn unknown_id_exits_2() {
         utf8(&output.stdout),
         utf8(&output.stderr)
     );
+    let attach = greppy(&repo, &store, &["agent", "attach", "does-not-exist"]);
+    assert_eq!(
+        attach.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        utf8(&attach.stdout),
+        utf8(&attach.stderr)
+    );
+}
+
+#[test]
+fn attach_without_live_socket_exits_3() {
+    let repo = unique_temp("attach-dead-repo");
+    init_repo(&repo);
+    let store = unique_temp("attach-dead-store");
+    let (_, project) = greppy::agent_session_store_identity(&repo);
+    let path = store
+        .join("agent-sessions")
+        .join(&project)
+        .join("sess-dead.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "v": 1,
+                "type": "meta",
+                "id": "sess-dead",
+                "project": project,
+                "title": "dead",
+                "model": "m",
+                "created_ms": 1,
+                "run_id": "run",
+                "worktree": "",
+                "branch": "main",
+                "proposal_ref": "",
+                "source": "headless"
+            })
+        ),
+    )
+    .unwrap();
+    let output = greppy(&repo, &store, &["agent", "attach", "sess-dead"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout={} stderr={}",
+        utf8(&output.stdout),
+        utf8(&output.stderr)
+    );
 }
 
 #[test]
@@ -393,6 +443,93 @@ fn status_send_interrupt_quit_drive_a_live_session() {
         "stdout={after_out} stderr={after_err}"
     );
 
+    stop_gateway(stop, gateway);
+    drop(provider);
+}
+
+#[test]
+fn attach_json_streams_turn_events_from_a_live_session() {
+    let repo = unique_temp("attach-live-repo");
+    init_repo(&repo);
+    let store = unique_temp("attach-live-store");
+    let provider_root = unique_temp("attach-live-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::from_millis(50));
+    let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
+    let id = hosted.session["session_id"].as_str().unwrap().to_string();
+    wait_status_idle(&repo, &store, &id);
+
+    let mut child = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .env_remove("GREPPY_PROJECT_IDENTITY")
+        .args(["agent", "attach", &id, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        let mut handle = stderr;
+        handle.read_to_string(&mut buf).ok();
+        buf
+    });
+    let (tx, rx) = mpsc::channel::<Vec<Value>>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut events = Vec::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Ok(event) = serde_json::from_str::<Value>(line.trim()) {
+                let done = event["type"] == "turn_complete";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            line.clear();
+        }
+        let _ = tx.send(events);
+    });
+    thread::sleep(Duration::from_millis(400));
+    let sent = greppy(&repo, &store, &["agent", "send", &id, "hello"]);
+    let sent_out = utf8(&sent.stdout);
+    let sent_err = utf8(&sent.stderr);
+    assert_eq!(
+        sent.status.code(),
+        Some(0),
+        "stdout={sent_out} stderr={sent_err}"
+    );
+    let events = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("attach should observe turn_complete within 30s");
+    let _ = child.kill();
+    let _ = child.wait();
+    let attach_err = stderr_thread.join().unwrap();
+    assert!(
+        events.iter().any(|event| event["type"] == "turn_start"),
+        "missing turn_start in {events:?} stderr={attach_err}"
+    );
+    assert!(
+        events.iter().any(|event| event["type"] == "turn_complete"),
+        "missing turn_complete in {events:?} stderr={attach_err}"
+    );
+
+    let quit = greppy(&repo, &store, &["agent", "quit", &id]);
+    assert_eq!(
+        quit.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        utf8(&quit.stdout),
+        utf8(&quit.stderr)
+    );
+    let _ = hosted.child.wait();
+    let mut rest = String::new();
+    hosted.stdout.read_to_string(&mut rest).ok();
     stop_gateway(stop, gateway);
     drop(provider);
 }

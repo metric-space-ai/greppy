@@ -417,6 +417,17 @@ pub enum AgentCommand {
         #[arg(long, default_value = "remote")]
         source: String,
     },
+    /// Stream events from a live hosted session.
+    Attach {
+        /// Session id or unique prefix.
+        id: String,
+        /// Emit one JSON event object per line.
+        #[arg(long)]
+        json: bool,
+        /// Replay recent session log lines before live events.
+        #[arg(long)]
+        since_start: bool,
+    },
     /// Request cancellation of the in-flight turn.
     Interrupt {
         /// Session id or unique prefix.
@@ -1645,6 +1656,7 @@ fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
                 || token == "sessions"
                 || token == "status"
                 || token == "send"
+                || token == "attach"
                 || token == "interrupt"
                 || token == "quit"
         })
@@ -1661,6 +1673,11 @@ fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32
             json,
             source,
         } => agent_clients::send(&id, &text, wait, json, &source, root),
+        AgentCommand::Attach {
+            id,
+            json,
+            since_start,
+        } => agent_clients::attach(&id, json, since_start, root),
         AgentCommand::Interrupt { id, json } => agent_clients::interrupt(&id, json, root),
         AgentCommand::Quit { id, json } => agent_clients::quit(&id, json, root),
         AgentCommand::Apply { ref_name } => {

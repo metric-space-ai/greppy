@@ -14,7 +14,9 @@ recovered.
 `greppy -p` persists a session in the same store, prints `session: <id>` as
 the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
 `greppy -p --json` streams newline-delimited JSON events on stdout; `greppy
-agent --json` is rejected.
+agent --json` is rejected. The first SIGINT/SIGTERM cancels at a safe
+boundary and still emits `result` with status `cancelled` and exit 130; a
+second signal exits immediately.
 
 ### Agent session readers
 
@@ -22,14 +24,17 @@ agent --json` is rejected.
 without starting the TUI or writing to the store. `list` is newest-first;
 `show` renders the transcript; `tail --follow` polls every 200 ms until SIGINT;
 `path` prints the JSONL location. Unknown JSONL types are ignored. Session ids
-accept a unique prefix; unknown or ambiguous ids exit 2.
+accept a unique prefix; unknown or ambiguous ids exit 2. Human `show`/`tail`
+and client event rendering strip terminal control sequences from remote text;
+`--json` stays byte-faithful.
 
 ### Agent control clients
 
-`greppy agent status|send|interrupt|quit` drive a live `greppy agent serve`
+`greppy agent status|send|attach|interrupt|quit` drive a live `greppy agent serve`
 session over its control socket. Ids resolve like `sessions`; a session
 without a live socket exits 3. `send --wait` streams events until that turn
 completes; without `--wait` it prints the queued prompt id and returns.
+`attach` streams live events until Ctrl+C (exit 130).
 
 ## [0.4.0] — 2026-09-02
 
