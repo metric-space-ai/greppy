@@ -95,6 +95,7 @@ impl ControlServer {
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            greppy_core::cache::secure_private_directory(parent)?;
         }
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -542,10 +543,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "greppy-control-{tag}-{}-{nonce}.sock",
-            std::process::id()
-        ))
+        std::env::temp_dir()
+            .join(format!("greppy-control-{}-{nonce}", std::process::id()))
+            .join(format!("{tag}.sock"))
     }
 
     fn wait_for_request(server: &mut ControlServer) -> (ConnId, Value, String, Value) {
@@ -587,11 +587,20 @@ mod tests {
         let path = temp_socket("mode");
         let server = ControlServer::bind(&path).unwrap();
         assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         drop(server);
         assert!(!path.exists());
+        fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[test]

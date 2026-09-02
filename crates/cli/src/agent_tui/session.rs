@@ -95,7 +95,11 @@ impl SessionStore {
     }
 
     pub fn create(&self, record: &SessionRecord) -> io::Result<PathBuf> {
-        fs::create_dir_all(self.project_dir())?;
+        fs::create_dir_all(&self.root)?;
+        greppy_core::cache::secure_private_directory(&self.root)?;
+        let project_dir = self.project_dir();
+        fs::create_dir_all(&project_dir)?;
+        greppy_core::cache::secure_private_directory(&project_dir)?;
         let path = self.path_for(&record.id);
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -773,6 +777,33 @@ mod tests {
         ));
         let _ = fs::create_dir_all(&root);
         (SessionStore::new(&root, "demo"), root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_secures_session_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, root) = temp_store("private");
+        fs::create_dir_all(store.project_dir()).unwrap();
+        fs::set_permissions(&store.root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(store.project_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        let record =
+            SessionRecord::new("sess-private".into(), "demo".into(), "m".into(), "r".into());
+        store.create(&record).unwrap();
+        assert_eq!(
+            fs::metadata(&store.root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.project_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
