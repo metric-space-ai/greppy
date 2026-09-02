@@ -242,7 +242,13 @@ fn item_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     match item {
-        TranscriptItem::User { text } => labeled("you", theme.user(), text, false, theme),
+        TranscriptItem::User { text, source } => {
+            let label = source
+                .as_deref()
+                .map(|source| format!("you  {source} {}", theme.arrow()))
+                .unwrap_or_else(|| "you".to_string());
+            labeled(&label, theme.user(), text, false, theme)
+        }
         TranscriptItem::Assistant { text } => {
             let mut lines = vec![Line::from(Span::styled("greppy", theme.assistant()))];
             lines.extend(render_markdown(text, theme));

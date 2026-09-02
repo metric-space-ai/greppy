@@ -26,6 +26,18 @@ pub enum RunPhase {
     Cancelling,
 }
 
+impl RunPhase {
+    pub fn control_label(self) -> &'static str {
+        match self {
+            Self::Setup | Self::Configuring => "setup",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+            Self::Cancelling => "cancelling",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPhase {
     Running,
@@ -37,6 +49,7 @@ pub enum ToolPhase {
 pub enum TranscriptItem {
     User {
         text: String,
+        source: Option<String>,
     },
     Assistant {
         text: String,
@@ -115,10 +128,16 @@ pub struct App {
     pub turns: u64,
     pub submitted_prompts: u64,
     pub queued: VecDeque<String>,
+    pub queued_remote: VecDeque<Option<(String, String)>>,
+    pub next_prompt_id: u64,
     pub thinking_expanded: bool,
     pub completion: Option<CompletionMenu>,
     pub session_id: String,
     pub session_title: String,
+    pub session_project: String,
+    pub session_run_id: String,
+    pub control_socket: String,
+    pub session_jsonl: String,
     pub persist_warning: Option<String>,
     pub last_ctrl_c: Option<Instant>,
     pub force_exit: bool,
@@ -168,10 +187,16 @@ impl App {
             turns: session.turns,
             submitted_prompts: 0,
             queued: VecDeque::new(),
+            queued_remote: VecDeque::new(),
+            next_prompt_id: 1,
             thinking_expanded: false,
             completion: None,
             session_id: session.id.clone(),
             session_title: session.title.clone(),
+            session_project: session.project.clone(),
+            session_run_id: session.run_id.clone(),
+            control_socket: String::new(),
+            session_jsonl: String::new(),
             persist_warning: None,
             last_ctrl_c: None,
             force_exit: false,
@@ -216,6 +241,7 @@ impl App {
                 }),
                 "image" => self.items.push(TranscriptItem::User {
                     text: sanitize_terminal_text(&part.text).into_owned(),
+                    source: None,
                 }),
                 "tool_result" => {
                     let id = sanitize_terminal_text(&part.id).into_owned();
@@ -239,6 +265,7 @@ impl App {
                 }
                 _ => self.items.push(TranscriptItem::User {
                     text: sanitize_terminal_text(&part.text).into_owned(),
+                    source: None,
                 }),
             }
         }
@@ -256,8 +283,13 @@ impl App {
     }
 
     pub fn push_user(&mut self, text: String) {
+        self.push_user_from(text, None);
+    }
+
+    pub fn push_user_from(&mut self, text: String, source: Option<String>) {
         self.items.push(TranscriptItem::User {
             text: sanitize_terminal_text(&text).into_owned(),
+            source: source.map(|value| sanitize_terminal_text(&value).into_owned()),
         });
         self.follow_tail = true;
     }
