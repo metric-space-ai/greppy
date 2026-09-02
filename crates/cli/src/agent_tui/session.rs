@@ -221,6 +221,47 @@ impl SessionStore {
     }
 }
 
+/// Project directories under `<data_root>/agent-sessions/`.
+pub fn list_session_project_dirs(data_root: &Path) -> io::Result<Vec<PathBuf>> {
+    let root = data_root.join("agent-sessions");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// One non-empty JSONL line from a session log.
+#[derive(Debug, Clone)]
+pub struct SessionLogLine {
+    pub raw: String,
+    pub value: Option<Value>,
+}
+
+/// Reads a session JSONL file without mutating it.
+pub fn read_session_log_lines(path: &Path) -> io::Result<Vec<SessionLogLine>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        let raw = line?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&raw).ok();
+        lines.push(SessionLogLine { raw, value });
+    }
+    Ok(lines)
+}
+
 pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);

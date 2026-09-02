@@ -428,8 +428,22 @@ Slash commands: `/help`, `/clear`, `/model`, `/usage`, `/tools`, `/copy`,
 messages and an extractive summary of earlier turns. Sessions are append-only
 JSONL under the Greppy data root (`…/agent-sessions/<project>/`); a truncated
 tail restores the valid prefix. `--continue` and `--resume SESSION_ID` reload
-them. The one-shot `greppy -p "TASK"` stdout/stderr/exit-code contract is
-unchanged; `greppy -e -p` still reaches grep passthrough.
+them. Other programs can read the same files without a running agent:
+
+```bash
+greppy agent sessions list [--json] [--all-projects]
+greppy agent sessions show ID [--json] [--full]
+greppy agent sessions tail ID [--json] [--follow] [--lines N]
+greppy agent sessions path ID
+```
+
+`list` is newest-first. `show` prints a header plus the transcript (`user:` /
+`assistant:` text, `tool ▶` / `tool ✓|✗`; thinking omitted; tool results
+truncated to 400 characters unless `--full`). `tail --follow` polls every
+200 ms until SIGINT (exit 0). `path` prints the absolute JSONL path. Session
+ids may be unique prefixes; unknown or ambiguous ids exit 2. These commands
+never write the store. The one-shot `greppy -p "TASK"` stdout/stderr/exit-code
+contract is unchanged; `greppy -e -p` still reaches grep passthrough.
 
 Deterministic TUI previews (production renderer, not a mock layout):
 

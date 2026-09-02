@@ -94,6 +94,8 @@ mod context;
 mod workspace_setup;
 use context::*;
 mod agent;
+pub use agent::agent_session_store_identity;
+mod agent_sessions;
 mod agent_tui;
 mod store_cow;
 
@@ -379,6 +381,11 @@ pub enum AgentCommand {
     Apply {
         /// Proposal ref under refs/greppy/agent/.
         ref_name: String,
+    },
+    /// Read persisted agent sessions without starting the TUI.
+    Sessions {
+        #[command(subcommand)]
+        command: agent_sessions::AgentSessionsCommand,
     },
 }
 
@@ -739,7 +746,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    if agent::is_agent_tui_invocation(&argv) {
+    if agent::is_agent_tui_invocation(&argv) && !is_agent_admin_invocation(&argv) {
         return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
@@ -1584,8 +1591,17 @@ fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = grep_passthrough_args(argv);
+    rest.first().is_some_and(|token| token == "agent")
+        && rest
+            .get(1)
+            .is_some_and(|token| token == "apply" || token == "sessions")
+}
+
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
     match command {
+        AgentCommand::Sessions { command } => agent_sessions::run(command, root),
         AgentCommand::Apply { ref_name } => {
             let target = match root {
                 Some(path) => std::path::PathBuf::from(path),

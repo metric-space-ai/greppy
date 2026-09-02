@@ -205,6 +205,23 @@ pub struct AgentArgs {
     pub resume: Option<String>,
 }
 
+/// Data root and logical project used by the agent session store for `repo_root`.
+///
+/// Matches `run_agent`: `GREPPY_STORE_DIR` via [`greppy_core::cache::data_root`]
+/// and the same logical project identity, ignoring a stale
+/// `GREPPY_PROJECT_IDENTITY` so worktree cache names cannot leak in.
+pub fn agent_session_store_identity(repo_root: &Path) -> (PathBuf, String) {
+    let data_root = greppy_core::cache::data_root();
+    let saved = std::env::var_os(greppy_core::PROJECT_IDENTITY_ENV);
+    std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
+    let logical_project = greppy_core::project_identity(repo_root);
+    match saved {
+        Some(value) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, value),
+        None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
+    }
+    (data_root, logical_project)
+}
+
 /// True when argv (after greppy-owned globals) starts with `-p`.
 pub fn is_agent_p_invocation(argv: &[std::ffi::OsString]) -> bool {
     let rest = super::grep_passthrough_args(argv);
