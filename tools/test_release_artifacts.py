@@ -451,6 +451,12 @@ class ReleaseArtifactTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("Pin Windows LLVM archive tools", workflow)
+        self.assertIn(
+            '"BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$resource_dir"', workflow
+        )
+        self.assertNotIn(
+            '"BINDGEN_EXTRA_CLANG_ARGS=--resource-dir=$resource_dir"', workflow
+        )
         self.assertIn("fund-034-input-receipts", workflow)
         self.assertIn("fund-038-implicit-submit", workflow)
         self.assertIn("fund-033-checkbox-activation", workflow)

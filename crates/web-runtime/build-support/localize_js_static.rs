@@ -16,13 +16,6 @@ const WINDOWS_IRREGEXP_MEMBER: &str = "Unified_cpp_js_src_irregexp0.obj";
 /// Rename the SM symbol *strings* (same length) so the final bind cannot pick them.
 /// Intra-object relocations follow the symbol index, not the string, so SM still
 /// calls its own destructor. Keep js::irregexp::* exported.
-const HIDE_SYMBOLS: &[&str] = &[
-    "__ZN2v88internal7IsolateD1Ev",
-    "__ZN2v88internal7IsolateD2Ev",
-    "__ZN2v88internal6PrintFEPKcz",
-    "__ZN2v88internal6PrintFEP7__sFILEPKcz",
-];
-
 const RENAME_SYMBOLS: &[(&str, &str)] = &[
     (
         "__ZN2v88internal7IsolateD1Ev",
@@ -39,6 +32,28 @@ const RENAME_SYMBOLS: &[(&str, &str)] = &[
     (
         "__ZN2v88internal6PrintFEP7__sFILEPKcz",
         "__ZN2sm8internal6PrintFEP7__sFILEPKcz",
+    ),
+];
+
+// ELF uses one leading underscore for Itanium C++ names, and glibc spells
+// FILE as `_IO_FILE`. Keep this list bound to the measured Linux archive
+// intersection; the Mach-O names above are not portable objcopy inputs.
+const LINUX_RENAME_SYMBOLS: &[(&str, &str)] = &[
+    (
+        "_ZN2v88internal7IsolateD1Ev",
+        "_ZN2sm8internal7IsolateD1Ev",
+    ),
+    (
+        "_ZN2v88internal7IsolateD2Ev",
+        "_ZN2sm8internal7IsolateD2Ev",
+    ),
+    (
+        "_ZN2v88internal6PrintFEPKcz",
+        "_ZN2sm8internal6PrintFEPKcz",
+    ),
+    (
+        "_ZN2v88internal6PrintFEP8_IO_FILEPKcz",
+        "_ZN2sm8internal6PrintFEP8_IO_FILEPKcz",
     ),
 ];
 
@@ -293,19 +308,18 @@ fn irregexp_member_name(archive: &Path) -> Result<String, String> {
 
 fn verify_hidden(archive: &Path) -> Result<(), String> {
     let defined = defined_symbols(archive)?;
-    let still: Vec<_> = if cfg!(windows) {
+    let hidden = if cfg!(windows) {
         WINDOWS_RENAME_SYMBOLS
-            .iter()
-            .map(|(from, _)| *from)
-            .filter(|name| defined.contains(*name))
-            .collect()
+    } else if cfg!(target_os = "linux") {
+        LINUX_RENAME_SYMBOLS
     } else {
-        HIDE_SYMBOLS
-            .iter()
-            .copied()
-            .filter(|name| defined.contains(*name))
-            .collect()
+        RENAME_SYMBOLS
     };
+    let still: Vec<_> = hidden
+        .iter()
+        .map(|(from, _)| *from)
+        .filter(|name| defined.contains(*name))
+        .collect();
     if !still.is_empty() {
         return Err(format!(
             "SpiderMonkey still defines V8-overlapping symbols (local or global): {still:?}"
@@ -429,6 +443,8 @@ fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<Strin
 fn rename_v8_overlap_symbols(object: &Path) -> Result<(), String> {
     let renames = if cfg!(windows) {
         WINDOWS_RENAME_SYMBOLS
+    } else if cfg!(target_os = "linux") {
+        LINUX_RENAME_SYMBOLS
     } else {
         RENAME_SYMBOLS
     };
@@ -571,7 +587,29 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_permitted_windows_crt_overlap;
+    use super::{is_permitted_windows_crt_overlap, LINUX_RENAME_SYMBOLS};
+
+    #[test]
+    fn linux_irregexp_renames_match_the_measured_elf_overlap() {
+        let sources = LINUX_RENAME_SYMBOLS
+            .iter()
+            .map(|(from, _)| *from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![
+                "_ZN2v88internal7IsolateD1Ev",
+                "_ZN2v88internal7IsolateD2Ev",
+                "_ZN2v88internal6PrintFEPKcz",
+                "_ZN2v88internal6PrintFEP8_IO_FILEPKcz",
+            ]
+        );
+        assert!(
+            LINUX_RENAME_SYMBOLS
+                .iter()
+                .all(|(from, to)| from.len() == to.len())
+        );
+    }
 
     #[test]
     fn windows_bad_optional_access_comdat_is_permitted_but_v8_shims_are_not() {
