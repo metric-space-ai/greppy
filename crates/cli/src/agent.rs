@@ -212,6 +212,48 @@ pub struct AgentArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Parser)]
+#[command(name = "greppy agent serve", disable_version_flag = true)]
+struct ServeArgs {
+    /// Optional first task, queued after setup.
+    #[arg(value_name = "TASK")]
+    task: Option<String>,
+    #[arg(long, env = "GREPPY_MODEL")]
+    model: Option<String>,
+    #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
+    endpoint: String,
+    #[arg(long = "continue")]
+    continue_session: bool,
+    #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
+    resume: Option<String>,
+    #[arg(long, value_name = "N")]
+    idle_timeout_secs: Option<u64>,
+    #[arg(long, default_value_t = DEFAULT_MAX_TURNS, hide = true)]
+    max_turns: usize,
+    #[arg(long, hide = true)]
+    private_store: bool,
+    #[arg(
+        long,
+        env = "GREPPY_NO_SANDBOX",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+    )]
+    no_sandbox: bool,
+    #[arg(
+        long,
+        env = "GREPPY_SKIP_SELFCHECK",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+    )]
+    skip_selfcheck: bool,
+}
+
 /// Data root and logical project used by the agent session store for `repo_root`.
 ///
 /// Matches `run_agent`: `GREPPY_STORE_DIR` via [`greppy_core::cache::data_root`]
@@ -248,7 +290,74 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 
 /// Parse and run `greppy agent …` in the full-screen interactive UI.
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
+    let rest = super::grep_passthrough_args(argv);
+    if rest.get(1).is_some_and(|token| token == "serve") {
+        return run_agent_serve_invocation(&rest);
+    }
     run_agent_invocation(argv, true)
+}
+
+fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
+    #[cfg(not(unix))]
+    {
+        let _ = rest;
+        eprintln!("greppy agent serve: Unix domain sockets are unsupported on this platform");
+        return EXIT_USAGE;
+    }
+    #[cfg(unix)]
+    {
+        let mut argv = vec![std::ffi::OsString::from("greppy agent serve")];
+        argv.extend(rest.iter().skip(2).cloned());
+        let serve = match ServeArgs::try_parse_from(argv) {
+            Ok(args) => args,
+            Err(error) => {
+                use clap::error::ErrorKind;
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) {
+                    let _ = error.print();
+                    return EXIT_OK;
+                }
+                let _ = error.print();
+                return EXIT_USAGE;
+            }
+        };
+        if serve
+            .model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            eprintln!("error: --model is required (or set GREPPY_MODEL)");
+            return EXIT_USAGE;
+        }
+        let args = AgentArgs {
+            task: serve.task,
+            model: serve.model,
+            endpoint: serve.endpoint,
+            max_turns: serve.max_turns,
+            deadline_secs: None,
+            apply: false,
+            diff: false,
+            keep_worktree: false,
+            private_store: serve.private_store,
+            no_sandbox: serve.no_sandbox,
+            skip_selfcheck: serve.skip_selfcheck,
+            continue_session: serve.continue_session,
+            resume: serve.resume,
+            json: true,
+        };
+        run_agent(
+            args,
+            false,
+            true,
+            serve.idle_timeout_secs,
+            None,
+            crate::agent_tui::AgentSettings::default(),
+        )
+    }
 }
 
 fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
@@ -318,7 +427,7 @@ fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
         None
     };
 
-    run_agent(args, interactive, bootstrap, settings)
+    run_agent(args, interactive, false, None, bootstrap, settings)
 }
 
 fn has_long_option(argv: &[std::ffi::OsString], name: &str) -> bool {
@@ -428,6 +537,8 @@ fn resolve_headless_session_record(
 fn run_agent(
     args: AgentArgs,
     interactive: bool,
+    serve: bool,
+    idle_timeout_secs: Option<u64>,
     mut bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     settings: crate::agent_tui::AgentSettings,
 ) -> u8 {
@@ -482,6 +593,10 @@ fn run_agent(
                 eprintln!("session: {}", record.id);
                 json_session.session_id = record.id.clone();
                 json_session.resumed = resumed;
+                let mut record = record;
+                if serve && !resumed {
+                    record.source = "serve".to_string();
+                }
                 Some((record, resumed))
             }
             Err((code, message)) => {
@@ -568,7 +683,7 @@ fn run_agent(
     if let Ok(key) = std::env::var("GREPPY_API_KEY") {
         client = client.with_api_key(key);
     }
-    if !interactive {
+    if !interactive && !serve {
         match client.probe() {
             Ok(()) => {}
             Err(ProbeError::Unreachable(_)) => {
@@ -930,19 +1045,43 @@ fn run_agent(
         json_session.worktree = record.worktree.clone();
         json_session.branch = record.branch.clone();
         json_session.model = model.clone();
-        run_headless_session(
-            &mut client,
-            &mut env,
-            &config,
-            &task,
-            &session_store,
-            &mut record,
-            resumed,
-            &model,
-            json.as_mut(),
-            &json_session,
-        )
-        .map(|session| (session, false))
+        if serve {
+            let Some(emitter) = json.as_mut() else {
+                return EXIT_AGENT;
+            };
+            crate::agent_serve::run(
+                client,
+                env,
+                config.clone(),
+                &session_store,
+                record,
+                resumed,
+                emitter,
+                crate::agent_serve::ServeLaunch {
+                    task: &task,
+                    endpoint: &endpoint,
+                    model: &model,
+                    sandbox: &json_session.sandbox,
+                    idle_timeout_secs,
+                    json_session: &json_session,
+                },
+            )
+            .map(|session| (session, false))
+        } else {
+            run_headless_session(
+                &mut client,
+                &mut env,
+                &config,
+                &task,
+                &session_store,
+                &mut record,
+                resumed,
+                &model,
+                json.as_mut(),
+                &json_session,
+            )
+            .map(|session| (session, false))
+        }
     };
     let (session, interactive_cancelled) = match session {
         Ok(session) => session,

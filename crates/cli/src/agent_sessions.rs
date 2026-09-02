@@ -125,7 +125,7 @@ fn list_sessions(
         );
         return Ok(0);
     }
-    println!("ID  CREATED  TURNS  STOP  MODEL  TITLE  PROPOSAL");
+    println!("ID  CREATED  LIVE  TURNS  STOP  MODEL  TITLE  PROPOSAL");
     for session in sessions {
         let proposal = if session.record.proposal_ref.is_empty() {
             "-"
@@ -137,10 +137,12 @@ fn list_sessions(
         } else {
             session.record.stop.as_str()
         };
+        let (live, _) = live_socket(&session);
         println!(
-            "{}  {}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}  {}",
             session.record.id,
             format_local_iso8601(session.record.created_ms),
+            if live { "yes" } else { "no" },
             session.record.turns,
             stop,
             session.record.model,
@@ -320,7 +322,17 @@ fn source_from_lines(lines: &[SessionLogLine]) -> String {
     String::new()
 }
 
+fn live_socket(session: &ListedSession) -> (bool, Option<PathBuf>) {
+    let socket = session.path.with_extension("sock");
+    #[cfg(unix)]
+    if crate::agent_control::is_live(&socket) {
+        return (true, Some(socket));
+    }
+    (false, None)
+}
+
 fn list_json_row(session: &ListedSession) -> Value {
+    let (live, socket) = live_socket(session);
     json!({
         "id": session.record.id,
         "project": session.record.project,
@@ -336,6 +348,8 @@ fn list_json_row(session: &ListedSession) -> Value {
         "source": session.source,
         "recovered": session.record.recovered,
         "path": session.path,
+        "live": live,
+        "socket": socket,
     })
 }
 

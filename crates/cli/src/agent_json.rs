@@ -53,59 +53,44 @@ impl JsonEmitter {
             return;
         }
         self.session_emitted = true;
-        write_line(&json!({
-            "type": "session",
-            "session_id": session.session_id,
-            "run_id": session.run_id,
-            "project": session.project,
-            "worktree": session.worktree,
-            "branch": session.branch,
-            "model": session.model,
-            "endpoint": session.endpoint,
-            "sandbox": session.sandbox,
-            "resumed": session.resumed,
-        }));
+        write_line(&session_event(session));
+    }
+
+    pub fn serve_session(&mut self, session: &JsonSession, socket: &str) {
+        if self.session_emitted {
+            return;
+        }
+        self.session_emitted = true;
+        let mut event = session_event(session);
+        if let Some(object) = event.as_object_mut() {
+            object.insert("socket".to_string(), Value::String(socket.to_string()));
+            object.insert("mode".to_string(), Value::String("serve".to_string()));
+        }
+        write_line(&event);
+    }
+
+    pub(crate) fn emit(&mut self, event: &Value) {
+        write_line(event);
     }
 
     pub fn text(&mut self, text: &str) {
-        write_line(&json!({
-            "type": "text",
-            "text": redact_text(text),
-        }));
+        write_line(&text_event(text));
     }
 
     pub fn tool_start(&mut self, id: &str, name: &str, summary: &str) {
-        write_line(&json!({
-            "type": "tool_start",
-            "id": id,
-            "name": name,
-            "summary": summary,
-        }));
+        write_line(&tool_start_event(id, name, summary));
     }
 
     pub fn tool_finish(&mut self, id: &str, failed: bool, elapsed_ms: u64, preview: &str) {
-        write_line(&json!({
-            "type": "tool_finish",
-            "id": id,
-            "failed": failed,
-            "elapsed_ms": elapsed_ms,
-            "preview": clip_chars(&redact_text(preview), 400),
-        }));
+        write_line(&tool_finish_event(id, failed, elapsed_ms, preview));
     }
 
     pub fn turn_complete(&mut self, stop: &str, usage: &Usage) {
-        write_line(&json!({
-            "type": "turn_complete",
-            "stop": stop,
-            "usage": usage_object(usage),
-        }));
+        write_line(&turn_complete_event(stop, usage));
     }
 
     pub fn error(&mut self, message: &str) {
-        write_line(&json!({
-            "type": "error",
-            "message": message,
-        }));
+        write_line(&error_event(message));
     }
 
     pub fn result(&mut self, result: &JsonResult) {
@@ -130,6 +115,55 @@ impl JsonEmitter {
             "apply_error": result.apply_error,
         }));
     }
+}
+
+pub(crate) fn session_event(session: &JsonSession) -> Value {
+    json!({
+        "type": "session",
+        "session_id": session.session_id,
+        "run_id": session.run_id,
+        "project": session.project,
+        "worktree": session.worktree,
+        "branch": session.branch,
+        "model": session.model,
+        "endpoint": session.endpoint,
+        "sandbox": session.sandbox,
+        "resumed": session.resumed,
+    })
+}
+
+pub(crate) fn text_event(text: &str) -> Value {
+    json!({"type":"text","text":redact_text(text)})
+}
+
+pub(crate) fn tool_start_event(id: &str, name: &str, summary: &str) -> Value {
+    json!({"type":"tool_start","id":id,"name":name,"summary":summary})
+}
+
+pub(crate) fn tool_finish_event(id: &str, failed: bool, elapsed_ms: u64, preview: &str) -> Value {
+    json!({
+        "type":"tool_finish",
+        "id":id,
+        "failed":failed,
+        "elapsed_ms":elapsed_ms,
+        "preview":clip_chars(&redact_text(preview), 400),
+    })
+}
+
+pub(crate) fn turn_complete_event(stop: &str, usage: &Usage) -> Value {
+    json!({"type":"turn_complete","stop":stop,"usage":usage_object(usage)})
+}
+
+pub(crate) fn error_event(message: &str) -> Value {
+    json!({"type":"error","message":message})
+}
+
+pub(crate) fn turn_start_event(prompt_id: &str, source: &str, text: &str) -> Value {
+    json!({"type":"turn_start","prompt_id":prompt_id,"source":source,"text":redact_text(text)})
+}
+
+pub(crate) fn phase_event(phase: &str) -> Value {
+    json!({"type":"phase","phase":phase})
 }
 
 pub fn emit_error_result(
@@ -177,7 +211,7 @@ fn write_line(value: &Value) {
     let _ = stdout.flush();
 }
 
-fn usage_object(usage: &Usage) -> Value {
+pub(crate) fn usage_object(usage: &Usage) -> Value {
     json!({
         "input": usage.input_tokens,
         "output": usage.output_tokens,

@@ -96,6 +96,8 @@ use context::*;
 mod agent;
 #[cfg(unix)]
 pub mod agent_control;
+#[cfg(unix)]
+mod agent_serve;
 pub use agent::agent_session_store_identity;
 mod agent_json;
 mod agent_sessions;
