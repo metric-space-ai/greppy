@@ -39,18 +39,9 @@ const RENAME_SYMBOLS: &[(&str, &str)] = &[
 // FILE as `_IO_FILE`. Keep this list bound to the measured Linux archive
 // intersection; the Mach-O names above are not portable objcopy inputs.
 const LINUX_RENAME_SYMBOLS: &[(&str, &str)] = &[
-    (
-        "_ZN2v88internal7IsolateD1Ev",
-        "_ZN2sm8internal7IsolateD1Ev",
-    ),
-    (
-        "_ZN2v88internal7IsolateD2Ev",
-        "_ZN2sm8internal7IsolateD2Ev",
-    ),
-    (
-        "_ZN2v88internal6PrintFEPKcz",
-        "_ZN2sm8internal6PrintFEPKcz",
-    ),
+    ("_ZN2v88internal7IsolateD1Ev", "_ZN2sm8internal7IsolateD1Ev"),
+    ("_ZN2v88internal7IsolateD2Ev", "_ZN2sm8internal7IsolateD2Ev"),
+    ("_ZN2v88internal6PrintFEPKcz", "_ZN2sm8internal6PrintFEPKcz"),
     (
         "_ZN2v88internal6PrintFEP8_IO_FILEPKcz",
         "_ZN2sm8internal6PrintFEP8_IO_FILEPKcz",
@@ -100,6 +91,11 @@ pub fn localize_mozjs_js_static() {
         panic!("librusty_v8.a not found; cannot run defined-symbol intersection gate");
     };
     println!("cargo:rerun-if-changed={}", v8.display());
+    if cfg!(target_os = "linux") {
+        if let Err(error) = namespace_linux_engine_symbols(&archives, &rlibs, &v8) {
+            panic!("namespace Linux SpiderMonkey symbols: {error}");
+        }
+    }
     for archive in &archives {
         if let Err(error) = assert_symbol_intersection(archive, &v8) {
             panic!("symbol intersection {}: {error}", archive.display());
@@ -108,6 +104,10 @@ pub fn localize_mozjs_js_static() {
 }
 
 fn find_mozjs_sys_rlibs() -> Vec<PathBuf> {
+    find_rlibs("libmozjs_sys-")
+}
+
+fn find_rlibs(prefix: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for root in search_roots() {
         let deps = root.join("deps");
@@ -117,7 +117,7 @@ fn find_mozjs_sys_rlibs() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("libmozjs_sys-") && name.ends_with(".rlib") {
+            if name.starts_with(prefix) && name.ends_with(".rlib") {
                 let path = entry.path();
                 if path.is_file() && !found.contains(&path) {
                     found.push(path);
@@ -126,6 +126,133 @@ fn find_mozjs_sys_rlibs() -> Vec<PathBuf> {
         }
     }
     found
+}
+
+fn namespace_linux_engine_symbols(
+    js_static_archives: &[PathBuf],
+    mozjs_rlibs: &[PathBuf],
+    rusty_v8: &Path,
+) -> Result<(), String> {
+    let v8_globals = defined_globals(rusty_v8)?;
+
+    // Both engines embed ICU 77. ELF does not coalesce those strong C/C++
+    // definitions as ld64 does, so merely calling the overlap "permitted"
+    // still makes the final link fail. Rename the SpiderMonkey copy, including
+    // every reference in each archive, and leave V8's public symbol names as
+    // the process-wide owner.
+    for archive in js_static_archives.iter().chain(mozjs_rlibs) {
+        let globals = defined_globals(archive)?;
+        let overlaps = globals
+            .intersection(&v8_globals)
+            .filter(|name| is_icu(name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        reject_mixed_icu_versions(&overlaps)?;
+        redefine_linux_archive_symbols(archive, &overlaps, "__greppy_sm_")?;
+        verify_symbols_absent(archive, &overlaps, "ICU")?;
+    }
+
+    // mozjs_sys uses diplomat-runtime 0.8 through icu_capi while V8's
+    // temporal bindings use diplomat-runtime 0.16. Both crates export the
+    // same unmangled allocator entry points from otherwise incompatible
+    // versions. Namespace the older side and all of its possible callers.
+    let diplomat_symbols =
+        BTreeSet::from(["diplomat_alloc".to_owned(), "diplomat_free".to_owned()]);
+    let diplomat_rlibs = find_rlibs("libdiplomat_runtime-");
+    let old_diplomat = diplomat_rlibs
+        .iter()
+        .filter_map(|archive| {
+            defined_globals(archive)
+                .ok()
+                .filter(|symbols| symbols.contains("diplomat_buffer_write_create"))
+                .map(|_| archive.clone())
+        })
+        .collect::<Vec<_>>();
+    if old_diplomat.is_empty() {
+        return Err("diplomat-runtime 0.8 archive not found by its ABI marker".into());
+    }
+    let icu_capi_rlibs = find_rlibs("libicu_capi-");
+    for archive in old_diplomat
+        .iter()
+        .chain(icu_capi_rlibs.iter())
+        .chain(mozjs_rlibs.iter())
+    {
+        redefine_linux_archive_symbols(archive, &diplomat_symbols, "greppy_sm_")?;
+    }
+    for archive in &old_diplomat {
+        verify_symbols_absent(archive, &diplomat_symbols, "diplomat-runtime")?;
+    }
+    Ok(())
+}
+
+fn reject_mixed_icu_versions(symbols: &BTreeSet<String>) -> Result<(), String> {
+    if let Some(name) = symbols
+        .iter()
+        .find(|name| name.contains("icu_76") || name.contains("icudt76") || name.contains("_76"))
+    {
+        return Err(format!(
+            "ICU overlap {name} is not ICU 77; refusing mixed ICU versions"
+        ));
+    }
+    Ok(())
+}
+
+fn redefine_linux_archive_symbols(
+    archive: &Path,
+    symbols: &BTreeSet<String>,
+    prefix: &str,
+) -> Result<(), String> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    let parent = archive
+        .parent()
+        .ok_or_else(|| format!("archive has no parent: {}", archive.display()))?;
+    let map = parent.join(format!(
+        ".greppy-redefine-{}-{}.txt",
+        std::process::id(),
+        archive.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let contents = symbols
+        .iter()
+        .map(|name| format!("{name} {prefix}{name}\n"))
+        .collect::<String>();
+    fs::write(&map, contents).map_err(|e| format!("write {}: {e}", map.display()))?;
+    let output = Command::new("objcopy")
+        .arg(format!("--redefine-syms={}", map.display()))
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("objcopy redefine {}: {e}", archive.display()));
+    let _ = fs::remove_file(&map);
+    let output = output?;
+    if !output.status.success() {
+        return Err(format!(
+            "objcopy redefine {} failed: {}\n{}",
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn verify_symbols_absent(
+    archive: &Path,
+    symbols: &BTreeSet<String>,
+    family: &str,
+) -> Result<(), String> {
+    let remaining = defined_globals(archive)?
+        .intersection(symbols)
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{family} symbols remain globally defined in {}: {:?}",
+        archive.display(),
+        remaining.iter().take(20).collect::<Vec<_>>()
+    ))
 }
 
 fn find_js_static_archives() -> Vec<PathBuf> {
@@ -335,11 +462,6 @@ fn assert_symbol_intersection(js_static: &Path, rusty_v8: &Path) -> Result<(), S
     let mut dangerous = Vec::new();
     for name in sm.intersection(&v8) {
         if is_permitted_overlap(name) {
-            if name.contains("icu_76") || name.contains("icudt76") || name.contains("_76") {
-                return Err(format!(
-                    "ICU overlap {name} is not ICU 77; refusing mixed ICU versions"
-                ));
-            }
             permitted += 1;
             continue;
         }
@@ -368,7 +490,8 @@ fn is_icu(name: &str) -> bool {
 }
 
 fn is_permitted_overlap(name: &str) -> bool {
-    is_icu(name) || (cfg!(windows) && is_permitted_windows_crt_overlap(name))
+    (cfg!(target_os = "macos") && is_icu(name))
+        || (cfg!(windows) && is_permitted_windows_crt_overlap(name))
 }
 
 fn is_permitted_windows_crt_overlap(name: &str) -> bool {
@@ -587,7 +710,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_permitted_windows_crt_overlap, LINUX_RENAME_SYMBOLS};
+    use super::{
+        is_permitted_overlap, is_permitted_windows_crt_overlap, reject_mixed_icu_versions,
+        LINUX_RENAME_SYMBOLS,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn linux_irregexp_renames_match_the_measured_elf_overlap() {
@@ -604,11 +731,9 @@ mod tests {
                 "_ZN2v88internal6PrintFEP8_IO_FILEPKcz",
             ]
         );
-        assert!(
-            LINUX_RENAME_SYMBOLS
-                .iter()
-                .all(|(from, to)| from.len() == to.len())
-        );
+        assert!(LINUX_RENAME_SYMBOLS
+            .iter()
+            .all(|(from, to)| from.len() == to.len()));
     }
 
     #[test]
@@ -619,5 +744,18 @@ mod tests {
         assert!(!is_permitted_windows_crt_overlap(
             "?PrintF@internal@v8@@YAXPEBDZZ"
         ));
+    }
+
+    #[test]
+    fn linux_never_treats_icu_overlap_as_linker_safe() {
+        if cfg!(target_os = "linux") {
+            assert!(!is_permitted_overlap("_ZN6icu_7713UnicodeStringD1Ev"));
+        }
+    }
+
+    #[test]
+    fn mixed_icu_overlap_is_rejected_before_namespacing() {
+        let symbols = BTreeSet::from(["_ZN6icu_7613UnicodeStringD1Ev".to_owned()]);
+        assert!(reject_mixed_icu_versions(&symbols).is_err());
     }
 }
