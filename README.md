@@ -455,6 +455,22 @@ truncated to 400 characters unless `--full`). `tail --follow` polls every
 ids may be unique prefixes; unknown or ambiguous ids exit 2. These commands
 never write the store.
 
+A live `greppy agent serve` session can also be driven from another shell
+over its control socket:
+
+```bash
+greppy agent status    ID [--json]
+greppy agent send      ID TEXT [--wait] [--json] [--source LABEL]
+greppy agent interrupt ID [--json]
+greppy agent quit      ID [--json]
+```
+
+`ID` resolves like `sessions` (exact id or unique prefix; `--root` honored).
+A session without a live socket exits 3. `send` queues a turn (`TEXT` may be
+`-` for stdin); `--wait` subscribes first and streams events until that turn
+completes. `interrupt` cancels an in-flight turn; `quit` asks the host to
+exit.
+
 Deterministic TUI previews (production renderer, not a mock layout):
 
 ```bash

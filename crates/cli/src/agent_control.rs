@@ -487,6 +487,12 @@ pub fn is_live(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
 }
 
+pub fn not_live_message(session_id: &str) -> String {
+    format!(
+        "session {session_id} is not live (no control socket); start it with greppy agent serve --resume {session_id}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

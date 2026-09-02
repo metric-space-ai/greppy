@@ -24,6 +24,13 @@ without starting the TUI or writing to the store. `list` is newest-first;
 `path` prints the JSONL location. Unknown JSONL types are ignored. Session ids
 accept a unique prefix; unknown or ambiguous ids exit 2.
 
+### Agent control clients
+
+`greppy agent status|send|interrupt|quit` drive a live `greppy agent serve`
+session over its control socket. Ids resolve like `sessions`; a session
+without a live socket exits 3. `send --wait` streams events until that turn
+completes; without `--wait` it prints the queued prompt id and returns.
+
 ## [0.4.0] — 2026-09-02
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache

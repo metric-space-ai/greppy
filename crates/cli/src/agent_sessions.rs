@@ -89,11 +89,50 @@ pub fn run(command: AgentSessionsCommand, root: Option<&str>) -> Result<i32> {
 }
 
 #[derive(Clone)]
-struct ListedSession {
-    record: SessionRecord,
+pub(crate) struct ListedSession {
+    pub(crate) record: SessionRecord,
     source: String,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     lines: Vec<SessionLogLine>,
+}
+
+pub(crate) fn resolve_from_root(
+    root: Option<&str>,
+    id: &str,
+) -> std::result::Result<ListedSession, i32> {
+    let repo_root = match root {
+        Some(path) => PathBuf::from(path),
+        None => match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("greppy: cannot resolve cwd: {error}");
+                return Err(2);
+            }
+        },
+    };
+    let (data_root, logical_project) = crate::agent::agent_session_store_identity(&repo_root);
+    resolve_session(&data_root, &logical_project, id)
+}
+
+pub(crate) fn print_session_tail(session: &ListedSession, json: bool, lines: usize) {
+    if json {
+        let start = session.lines.len().saturating_sub(lines);
+        for line in &session.lines[start..] {
+            println!("{}", line.raw);
+        }
+        let _ = std::io::stdout().flush();
+        return;
+    }
+    let rendered: Vec<String> = session
+        .lines
+        .iter()
+        .filter_map(|line| line.value.as_ref().and_then(render_tail_line))
+        .collect();
+    let start = rendered.len().saturating_sub(lines);
+    for line in &rendered[start..] {
+        println!("{line}");
+    }
+    let _ = std::io::stdout().flush();
 }
 
 fn list_sessions(
@@ -189,24 +228,7 @@ fn tail_session(
         Ok(session) => session,
         Err(code) => return Ok(code),
     };
-    if json {
-        let start = session.lines.len().saturating_sub(lines);
-        for line in &session.lines[start..] {
-            println!("{}", line.raw);
-        }
-        let _ = std::io::stdout().flush();
-    } else {
-        let rendered: Vec<String> = session
-            .lines
-            .iter()
-            .filter_map(|line| line.value.as_ref().and_then(render_tail_line))
-            .collect();
-        let start = rendered.len().saturating_sub(lines);
-        for line in &rendered[start..] {
-            println!("{line}");
-        }
-        let _ = std::io::stdout().flush();
-    }
+    print_session_tail(&session, json, lines);
     if !follow {
         return Ok(0);
     }
@@ -224,7 +246,7 @@ fn path_session(data_root: &Path, logical_project: &str, id: &str) -> Result<i32
     Ok(0)
 }
 
-fn resolve_session(
+pub(crate) fn resolve_session(
     data_root: &Path,
     logical_project: &str,
     id: &str,
@@ -499,7 +521,7 @@ fn render_show_tool(value: &Value) -> Option<String> {
     }
 }
 
-fn render_tail_line(value: &Value) -> Option<String> {
+pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
     match value.get("type").and_then(Value::as_str)? {
         "message" => {
             let role = value
