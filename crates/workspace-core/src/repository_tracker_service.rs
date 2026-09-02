@@ -576,13 +576,16 @@ fn wait_for_active_watcher_probe(
                 status.state, status.epoch
             )));
         }
-        if status.generation > after_generation {
-            let changes = core
-                .repository_changes_since(repository, epoch, after_generation)
-                .map_err(io::Error::other)?;
-            if changes.paths.iter().any(|path| path == &expected) {
-                break Ok(());
+        if let Some(observed_generation) = core
+            .consume_repository_fence(repository, epoch, &expected)
+            .map_err(io::Error::other)?
+        {
+            if observed_generation < after_generation {
+                break Err(io::Error::other(format!(
+                    "tracker fence moved backwards: observed_generation={observed_generation}, after_generation={after_generation}"
+                )));
             }
+            break Ok(());
         }
         if std::time::Instant::now() >= deadline {
             break Err(io::Error::new(
@@ -866,6 +869,38 @@ mod tests {
                 .generation,
             active.generation
         );
+    }
+
+    #[test]
+    fn active_health_fence_is_acknowledged_without_a_mutation_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository_path = temp.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = std::fs::canonicalize(repository_path).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let git_dir = std::fs::canonicalize(repository.join(".git")).unwrap();
+        let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
+        core.request_repository_tracker(&repository).unwrap();
+        let prepared = prepare_watcher(core.clone(), &repository, &git_dir).unwrap();
+        prepared.armed.store(true, Ordering::Release);
+        let active = core
+            .activate_repository_tracker(&repository, now_ms())
+            .unwrap();
+
+        let _watcher = verify_or_fallback_active_watcher(
+            core.clone(),
+            &repository,
+            &git_dir,
+            &active,
+            prepared,
+        )
+        .unwrap();
+        let status = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, RepositoryTrackerState::Active);
+        assert_eq!(status.generation, active.generation);
     }
 
     #[test]
