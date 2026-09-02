@@ -40,7 +40,7 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|assert(?:ion)? ?(?:failed|error)|E:)",
+        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -597,7 +597,10 @@ fn detect_blocks(
             .iter()
             .map(u8::to_ascii_lowercase)
             .collect::<Vec<_>>();
-        lower.starts_with(b"at ") || lower.starts_with(b"...") || lower.starts_with(b"caused by")
+        lower.starts_with(b"at ")
+            || lower.starts_with(b"...")
+            || lower.starts_with(b"caused by")
+            || lower.starts_with(b"note:")
     }
 
     let mut blocks = Vec::new();
@@ -2128,6 +2131,48 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Error);
         assert_eq!(blocks[0].lines.len(), 2);
         assert_eq!(blocks[1].kind, BlockKind::Warning);
+    }
+
+    #[test]
+    fn rust_test_failure_keeps_test_identity_panic_and_assertion() {
+        let stdout = split_lines(
+            b"running 2 tests\ntest tests::works ... ok\ntest tests::fails ... FAILED\n\nfailures:\n\n---- tests::fails stdout ----\n\nthread 'tests::fails' panicked at src/lib.rs:10:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    tests::fails\n\ntest result: FAILED. 1 passed; 1 failed\nerror: test failed, to rerun pass `--lib`\n",
+        );
+        let blocks = detect_blocks(&stdout, &[]);
+
+        assert!(blocks.iter().any(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.bytes == b"test tests::fails ... FAILED")
+        }));
+        assert!(blocks.iter().any(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.bytes.starts_with(b"thread 'tests::fails' panicked at"))
+        }));
+        let assertion = blocks
+            .iter()
+            .find(|block| {
+                block
+                    .lines
+                    .iter()
+                    .any(|line| line.bytes.starts_with(b"assertion `left == right` failed"))
+            })
+            .expect("assertion block");
+        assert!(assertion
+            .lines
+            .iter()
+            .any(|line| line.bytes == b"  left: 1"));
+        assert!(assertion
+            .lines
+            .iter()
+            .any(|line| line.bytes == b" right: 2"));
+        assert!(assertion
+            .lines
+            .iter()
+            .any(|line| line.bytes.starts_with(b"note:")));
     }
 
     #[test]
