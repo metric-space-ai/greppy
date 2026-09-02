@@ -253,6 +253,22 @@ jobs:
           --no-default-features
           --features ci-test-assets,cpu-only,bash-smart
 
+      - name: Build linked web runtime for MSI authoring
+        shell: bash
+        run: |
+          cargo build --locked --release \
+            --manifest-path crates/web-runtime/Cargo.toml \
+            --package web-runtime \
+            --bin web-runtime
+
+      - name: Stage unsigned linked web runtime for MSI authoring
+        shell: bash
+        env:
+          GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED: 'false'
+        run: >-
+          crates/web-runtime/scripts/package-web-runtime.sh
+          target/release/web-runtime-dist
+
       - name: Bind only the private Greppy runtime
         shell: pwsh
         run: |
@@ -278,6 +294,7 @@ jobs:
           $dist = Join-Path $env:RUNNER_TEMP 'greppy-msi-smoke-dist'
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item target\debug\greppy.exe,target\release\greppy-workspace-provider.exe $dist
+          Copy-Item target\release\web-runtime-dist (Join-Path $dist 'web-runtime') -Recurse
           Copy-Item "$env:GREPPY_WINFSP_FORK_ROOT\build\VStudio\build\Release\greppyworkspacefsp-x64.dll" $dist
           Copy-Item "$env:GREPPY_WINFSP_FORK_ROOT\build\VStudio\build\Release\greppyworkspacefsp-x64.sys" $dist
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md,Cargo.lock $dist

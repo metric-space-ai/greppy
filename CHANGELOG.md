@@ -319,6 +319,10 @@ not a Playwright-compatibility claim.
 - Cancelling the interactive agent during its visible startup phase now returns
   exit 130 deterministically. The terminal UI's cancellation result is no
   longer discarded in a race with a worker that can finish cleanly first.
+- An ordinary web action deadline now returns the public timeout error (exit
+  35) with a partial artifact without poisoning the session. A follow-up run
+  on that same session succeeds instead of reporting the internal
+  `Failed -> Busy` transition previously tracked as Fund 030.
 - Release artifacts now carry the stamped web-runtime distribution beside the
   CLI on macOS, Linux, and Windows, including its executable, checksums, SBOM,
   provenance, coverage manifest, and signature-state marker. Package smoke

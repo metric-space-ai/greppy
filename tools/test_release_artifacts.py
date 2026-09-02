@@ -534,6 +534,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("name: Windows x86_64 real WinFsp performance", cow_workflow)
         self.assertIn("name: Exact-SHA three-platform performance set", cow_workflow)
         self.assertIn("verify_portable_cow_performance.py", cow_workflow)
+        self.assertIn("Build linked web runtime for MSI authoring", cow_workflow)
+        self.assertIn(
+            "crates/web-runtime/scripts/package-web-runtime.sh", cow_workflow
+        )
+        self.assertIn(
+            "Copy-Item target\\release\\web-runtime-dist (Join-Path $dist 'web-runtime') -Recurse",
+            cow_workflow,
+        )
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         portable_docs = (
             REPOSITORY_ROOT / "docs/portable-cow-workspaces.md"
