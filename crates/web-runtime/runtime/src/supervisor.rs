@@ -791,6 +791,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
+    stderr_drain: Option<JoinHandle<()>>,
     reaped: bool,
 }
 
@@ -818,6 +819,7 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        "GREPPY_WEB_TRACE_PHASE",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))
@@ -894,7 +896,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             .envs(inherited_worker_env())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         command.process_group(0);
         let sandbox_exe = path.clone();
         unsafe {
@@ -984,6 +986,24 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
                 ));
             }
         };
+        let stderr = child.stderr.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "worker stderr was not piped")
+        })?;
+        let echo_stderr = phase_trace_enabled();
+        let stderr_drain = match thread::Builder::new()
+            .name(format!("web-runtime-{worker:?}-stderr-drain"))
+            .spawn(move || drain_worker_stderr(stderr, echo_stderr))
+        {
+            Ok(stderr_drain) => stderr_drain,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn {worker:?} stderr drain: {error}"),
+                ));
+            }
+        };
         let (message_sender, messages) = mpsc::channel();
         let reader_thread = match thread::Builder::new()
             .name(format!("web-runtime-{worker:?}-protocol-reader"))
@@ -1024,8 +1044,25 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
+            stderr_drain: Some(stderr_drain),
             reaped: false,
         })
+}
+
+fn drain_worker_stderr(mut stderr: std::process::ChildStderr, echo: bool) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if echo {
+                    let _ = io::stderr().write_all(&buf[..n]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 fn drain_worker_stdout(mut stdout: std::process::ChildStdout, log: Arc<Mutex<Vec<u8>>>) {
@@ -1647,6 +1684,14 @@ impl WorkerProcess {
 
     fn join_reader_bounded(&mut self, timeout: Duration) {
         if let Some(drain) = self.stdout_drain.take() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = drain.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(timeout);
+        }
+        if let Some(drain) = self.stderr_drain.take() {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 let _ = drain.join();

@@ -1075,6 +1075,89 @@ fn one_thousand_session_create_close_cycles() {
 }
 
 #[test]
+fn session_close_after_web_run_returns_within_client_deadline() {
+    // web.run / goto can return while the content worker is still spinning
+    // layout. Close used to wait out the 60s engine budget and the client
+    // saw `close N: timed out after 5s`. The session layer must answer inside
+    // that 5s even if the engine is busy.
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><body><p>close-after-run</p></body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-closebusy-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/launch-only.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_closebusy", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ready = unix_request(
+        &socket,
+        &Request::new("run_closebusy", "handshake", json!({})),
+        Duration::from_secs(30),
+    )
+    .expect("handshake");
+    assert_eq!(
+        ready.status, "ok",
+        "runtime not request-ready: {ready:?}"
+    );
+    for i in 0..8 {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_closebusy",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("create {i}: {error}"));
+        assert_eq!(created.status, "ok", "create {i}: {created:?}");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            "run_closebusy",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_source": "file",
+                "script_file": script.display().to_string(),
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 30_000;
+        let ran = unix_request(&socket, &run, Duration::from_secs(30))
+            .unwrap_or_else(|error| panic!("run {i}: {error}"));
+        assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
+        let went = unix_request(
+            &socket,
+            &Request::new(
+                "run_closebusy",
+                "web.goto",
+                json!({ "session_id": session_id, "url": fixture }),
+            ),
+            Duration::from_secs(15),
+        )
+        .unwrap_or_else(|error| panic!("goto {i}: {error}"));
+        assert_eq!(went.status, "ok", "goto {i}: {went:?}");
+        let closed = unix_request(
+            &socket,
+            &Request::new(
+                "run_closebusy",
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("close {i}: {error}"));
+        assert_eq!(closed.status, "ok", "close {i}: {closed:?}");
+    }
+}
+
+#[test]
 fn observe_read_search_research_screenshot_and_policy() {
     let origin = serve_site();
     let socket =

@@ -5051,6 +5051,13 @@ pub fn run() -> io::Result<()> {
                             engine.pages.len()
                         ); }
                     }
+                    // Layout can run for seconds after web.run/goto returned.
+                    // page.close is queued on `rx` during that spin; skip the
+                    // next idle wait so the supervisor's 250ms close budget
+                    // sees it as soon as the event loop yields.
+                    if elapsed >= Duration::from_millis(50) {
+                        continue;
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
