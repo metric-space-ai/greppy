@@ -158,7 +158,6 @@ pub(crate) fn quit(id: &str, json: bool, root: Option<&str>) -> Result<i32> {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn attach(id: &str, json: bool, since_start: bool, root: Option<&str>) -> Result<i32> {
     #[cfg(not(unix))]
     {

@@ -30,10 +30,11 @@ and client event rendering strip terminal control sequences from remote text;
 
 ### Agent control clients
 
-`greppy agent status|send|interrupt|quit` drive a live `greppy agent serve`
+`greppy agent status|send|attach|interrupt|quit` drive a live `greppy agent serve`
 session over its control socket. Ids resolve like `sessions`; a session
 without a live socket exits 3. `send --wait` streams events until that turn
 completes; without `--wait` it prints the queued prompt id and returns.
+`attach` streams live events until Ctrl+C (exit 130).
 
 ## [0.4.0] — 2026-09-02
 

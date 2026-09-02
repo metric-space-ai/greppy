@@ -467,6 +467,7 @@ over its control socket:
 ```bash
 greppy agent status    ID [--json]
 greppy agent send      ID TEXT [--wait] [--json] [--source LABEL]
+greppy agent attach    ID [--json] [--since-start]
 greppy agent interrupt ID [--json]
 greppy agent quit      ID [--json]
 ```
@@ -474,8 +475,10 @@ greppy agent quit      ID [--json]
 `ID` resolves like `sessions` (exact id or unique prefix; `--root` honored).
 A session without a live socket exits 3. `send` queues a turn (`TEXT` may be
 `-` for stdin); `--wait` subscribes first and streams events until that turn
-completes. `interrupt` cancels an in-flight turn; `quit` asks the host to
-exit.
+completes. `attach` subscribes and streams events until Ctrl+C (exit 130);
+`--since-start` first reprints recent log lines. `interrupt` cancels an
+in-flight turn; `quit` asks the host to exit. Ctrl+C on `send --wait` and
+`attach` exits 130.
 
 Deterministic TUI previews (production renderer, not a mock layout):
 
