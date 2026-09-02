@@ -378,6 +378,14 @@ jobs:
           done
           echo "FSKit provider did not become healthy" >&2
           exit 1
+      - name: Keep the mounted FSKit heartbeat fresh beyond the cache window
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
+          GREPPY_RUN_FSKIT_TEST=1 GREPPY_FSKIT_DATA_ROOT="$data" \
+            cargo test -p greppy-workspace-provider \
+              --test macos_fskit_mount --locked -- --nocapture
       - name: Run hard gate over the real FSKit mount
         timeout-minutes: 10
         shell: bash

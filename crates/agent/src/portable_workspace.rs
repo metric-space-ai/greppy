@@ -21,6 +21,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const REPOSITORY_TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
+const REPOSITORY_TRACKER_FENCE_ATTEMPT: Duration = Duration::from_secs(2);
+
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
@@ -179,6 +182,11 @@ impl AgentWorkspace {
         trace_workspace_phase(run_id, "provider-healthy", started);
         provider.doctor_io(&format!("startup-{run_id}"))?;
         trace_workspace_phase(run_id, "provider-io-verified", started);
+        #[cfg(target_os = "macos")]
+        {
+            greppy_workspace_core::spawn_repository_tracker(data_root.clone())?;
+            trace_workspace_phase(run_id, "repository-tracker-started", started);
+        }
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         trace_workspace_phase(run_id, "core-open", started);
@@ -531,12 +539,20 @@ fn capture_tracked_repository(
     started: Instant,
 ) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
     let repository = fs::canonicalize(repository)?;
+    let before_request = core.repository_tracker_status(&repository)?;
+    let minimum_epoch = before_request
+        .as_ref()
+        .filter(|status| !status.is_live_at(now_unix_ms()))
+        .map_or(0, |status| status.epoch.saturating_add(1));
     core.request_repository_tracker(&repository)?;
     trace_workspace_phase(run_id, "tracker-requested", started);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
     let active = loop {
         if let Some(status) = core.repository_tracker_status(&repository)? {
-            if status.state == RepositoryTrackerState::Active {
+            if status.state == RepositoryTrackerState::Active
+                && status.epoch >= minimum_epoch
+                && status.is_live_at(now_unix_ms())
+            {
                 trace_workspace_phase(run_id, "tracker-active", started);
                 break status;
             }
@@ -550,9 +566,22 @@ fn capture_tracked_repository(
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(WorkspaceError::AdapterUnavailable(
-                "repository tracker did not become active within three seconds".into(),
-            ));
+            let detail = core
+                .repository_tracker_status(&repository)?
+                .map(|status| {
+                    format!(
+                        "state={:?}, epoch={}, owner_pid={}, heartbeat_age_ms={}",
+                        status.state,
+                        status.epoch,
+                        status.owner_pid,
+                        now_unix_ms().saturating_sub(status.heartbeat_unix_ms)
+                    )
+                })
+                .unwrap_or_else(|| "tracker row missing".into());
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker did not become live within {} seconds ({detail})",
+                REPOSITORY_TRACKER_TIMEOUT.as_secs(),
+            )));
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -589,11 +618,14 @@ fn capture_tracked_repository(
                 repository_tracker_fence(&repository, core, active.epoch)?;
                 let trailing =
                     core.repository_changes_since(&repository, active.epoch, changes.generation)?;
-                if trailing
-                    .paths
-                    .iter()
-                    .all(|path| is_repository_tracker_fence(path))
-                {
+                if repository_changes_preserve_snapshot(
+                    &repository,
+                    core.chunks(),
+                    &incremental,
+                    &trailing.paths,
+                    active.epoch,
+                    trailing.generation,
+                )? {
                     incremental.tracker_generation = Some(trailing.generation);
                     return Ok((incremental, true));
                 }
@@ -647,11 +679,14 @@ fn capture_tracked_repository(
         }
         let changes =
             core.repository_changes_since(&repository, before.epoch, before.generation)?;
-        if changes
-            .paths
-            .iter()
-            .all(|path| is_repository_tracker_fence(path))
-        {
+        if repository_changes_preserve_snapshot(
+            &repository,
+            core.chunks(),
+            &baseline,
+            &changes.paths,
+            before.epoch,
+            changes.generation,
+        )? {
             baseline.tracker_epoch = Some(after.epoch);
             baseline.tracker_generation = Some(changes.generation);
             return Ok((baseline, true));
@@ -671,6 +706,48 @@ fn capture_tracked_repository(
     unreachable!("two bounded snapshot attempts")
 }
 
+/// Distinguishes watcher noise caused by the snapshot's own reads from a real
+/// repository mutation without trusting the backend's event classification.
+///
+/// macOS FSEvents reports atime-only reads as `Modify(Metadata(Any))`, the same
+/// coarse bucket that may also contain a chmod. Re-capturing only the journaled
+/// paths lets the repository hash decide: access-time noise preserves the
+/// snapshot, while content, index and executable-bit changes remain mutations.
+fn repository_changes_preserve_snapshot(
+    repository: &Path,
+    chunks: &ChunkStore,
+    snapshot: &BaselineSnapshot,
+    journal_paths: &[String],
+    tracker_epoch: u64,
+    tracker_generation: u64,
+) -> Result<bool, WorkspaceError> {
+    let changed_paths = journal_paths
+        .iter()
+        .filter(|path| !is_repository_tracker_fence(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if changed_paths.is_empty() {
+        return Ok(true);
+    }
+
+    match capture_repository_incremental(
+        repository,
+        chunks,
+        snapshot,
+        &changed_paths,
+        tracker_epoch,
+        tracker_generation,
+    ) {
+        Ok(Some(candidate)) => {
+            let unchanged = candidate.baseline_hash == snapshot.baseline_hash;
+            release_snapshot(chunks, candidate);
+            Ok(unchanged)
+        }
+        Ok(None) | Err(greppy_workspace_core::Error::ConcurrentRepositoryMutation) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn is_repository_tracker_fence(path: &str) -> bool {
     path.starts_with(".git/greppy-tracker-fence-")
 }
@@ -684,43 +761,71 @@ fn repository_tracker_fence(
         repository,
         &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
     )?);
-    let name = format!(
-        "greppy-tracker-fence-{}-{}",
-        std::process::id(),
-        now_unix_ns()
-    );
-    let path = git_dir.join(&name);
-    let virtual_path = format!(".git/{name}");
-    let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
-        WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
-    })?;
-    if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
-        return Err(WorkspaceError::AdapterUnavailable(
-            "repository tracker changed before fence".into(),
-        ));
+    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
+    let mut attempt = 0u32;
+    loop {
+        let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
+            WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+        })?;
+        if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker changed before fence: state={:?}, epoch={}, expected_epoch={}, generation={}, owner_pid={}, heartbeat_age_ms={}, detail={}",
+                before.state,
+                before.epoch,
+                epoch,
+                before.generation,
+                before.owner_pid,
+                now_unix_ms().saturating_sub(before.heartbeat_unix_ms),
+                before.detail.as_deref().unwrap_or("none"),
+            )));
+        }
+        let name = format!(
+            "greppy-tracker-fence-{}-{}-{attempt}",
+            std::process::id(),
+            now_unix_ns()
+        );
+        let path = git_dir.join(&name);
+        let virtual_path = format!(".git/{name}");
+        fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait = remaining.min(REPOSITORY_TRACKER_FENCE_ATTEMPT);
+        let observed = wait_for_tracker_path(repository, core, epoch, &virtual_path, wait);
+        let remove = fs::remove_file(&path);
+        match observed {
+            Ok(Some(generation)) => {
+                remove?;
+                // The observed create event is the ordering barrier: every
+                // repository event before this fence has reached the journal.
+                return Ok(generation);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                remove?;
+                attempt += 1;
+            }
+            Ok(None) => {
+                remove?;
+                return Err(WorkspaceError::AdapterUnavailable(format!(
+                    "repository tracker fence timed out after {} seconds and {} attempts; set GREPPY_TRACKER_TRACE=1 for event-path diagnostics",
+                    REPOSITORY_TRACKER_TIMEOUT.as_secs(),
+                    attempt + 1
+                )));
+            }
+            Err(error) => {
+                let _ = remove;
+                return Err(error);
+            }
+        }
     }
-    fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
-    let created = wait_for_tracker_path(repository, core, epoch, before.generation, &virtual_path);
-    let remove = fs::remove_file(&path);
-    let created = created?;
-    remove?;
-    // The observed create event is the ordering barrier: every repository
-    // event that happened before the fence write has reached the journal.
-    // Removal is synchronous and fence paths are excluded from every snapshot
-    // delta, so waiting for a second watcher round-trip adds latency without
-    // strengthening the captured baseline. A delayed removal event remains a
-    // harmless ignored journal entry for the next fence.
-    Ok(created)
 }
 
 fn wait_for_tracker_path(
     repository: &Path,
     core: &WorkspaceCore,
     epoch: u64,
-    after_generation: u64,
     expected_path: &str,
-) -> Result<u64, WorkspaceError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    timeout: Duration,
+) -> Result<Option<u64>, WorkspaceError> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let status = core.repository_tracker_status(repository)?.ok_or_else(|| {
             WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
@@ -733,16 +838,11 @@ fn wait_for_tracker_path(
                     .unwrap_or_else(|| "epoch/state changed".into())
             )));
         }
-        if status.generation > after_generation {
-            let changes = core.repository_changes_since(repository, epoch, after_generation)?;
-            if changes.paths.iter().any(|path| path == expected_path) {
-                return Ok(status.generation);
-            }
+        if let Some(generation) = core.consume_repository_fence(repository, epoch, expected_path)? {
+            return Ok(Some(generation));
         }
         if std::time::Instant::now() >= deadline {
-            return Err(WorkspaceError::AdapterUnavailable(format!(
-                "repository tracker fence timed out for {expected_path}"
-            )));
+            return Ok(None);
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -2519,6 +2619,13 @@ fn now_unix_ns() -> u128 {
         .as_nanos()
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn baseline_bytes(chunks: &ChunkStore, entry: &BaselineEntry) -> Result<Vec<u8>, WorkspaceError> {
     let mut bytes = Vec::with_capacity(entry.size as usize);
     for chunk in &entry.chunks {
@@ -3041,6 +3148,93 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_read_metadata_noise_is_equivalent_but_real_changes_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.name", "Greppy Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "greppy@example.invalid"],
+        );
+        fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-qm", "baseline"]);
+
+        let chunks_root = tempfile::tempdir().unwrap();
+        let chunks = ChunkStore::open(chunks_root.path()).unwrap();
+        let snapshot = capture_repository(&repository, &chunks).unwrap();
+        let head = git(&repository, &["rev-parse", "HEAD"]);
+        let object_path = format!(".git/objects/{}/{}", &head[..2], &head[2..]);
+        let journal_paths = vec![object_path, ".git/index".into(), "tracked.txt".into()];
+
+        // Reading these paths can update atime and arrive from macOS FSEvents
+        // as Metadata(Any), but it does not change the Git-visible snapshot.
+        let _ = fs::read(repository.join("tracked.txt")).unwrap();
+        let _ = fs::read(repository.join(".git/index")).unwrap();
+        assert!(repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &journal_paths,
+            1,
+            1,
+        )
+        .unwrap());
+
+        fs::write(repository.join("tracked.txt"), b"changed\n").unwrap();
+        assert!(!repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &["tracked.txt".into()],
+            1,
+            2,
+        )
+        .unwrap());
+        release_snapshot(&chunks, snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_metadata_reconciliation_preserves_executable_bit_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.name", "Greppy Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "greppy@example.invalid"],
+        );
+        let script = repository.join("script.sh");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        git(&repository, &["add", "script.sh"]);
+        git(&repository, &["commit", "-qm", "baseline"]);
+
+        let chunks_root = tempfile::tempdir().unwrap();
+        let chunks = ChunkStore::open(chunks_root.path()).unwrap();
+        let snapshot = capture_repository(&repository, &chunks).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        assert!(!repository_changes_preserve_snapshot(
+            &repository,
+            &chunks,
+            &snapshot,
+            &["script.sh".into()],
+            1,
+            1,
+        )
+        .unwrap());
+        release_snapshot(&chunks, snapshot);
+    }
+
+    #[test]
     fn workspace_snapshot_visibility_requires_a_real_baseline_entry() {
         let root = tempfile::tempdir().unwrap();
         let entries = vec![BaselineEntry {
@@ -3273,7 +3467,7 @@ mod tests {
             .request_repository_tracker(&tracked_repo)
             .unwrap();
         tracker_core
-            .activate_repository_tracker(&tracked_repo, 1)
+            .activate_repository_tracker(&tracked_repo, now_unix_ms())
             .unwrap();
         let tracker_for_fence = tracker_core.clone();
         let repo_for_fence = tracked_repo.clone();
@@ -3292,7 +3486,7 @@ mod tests {
                     if let Some(name) = current {
                         let path = format!(".git/{name}");
                         tracker_for_fence
-                            .record_repository_changes(
+                            .record_repository_fences(
                                 &repo_for_fence,
                                 std::slice::from_ref(&path),
                                 2,
@@ -3303,7 +3497,7 @@ mod tests {
                 } else if let Some(observed_path) = observed.as_ref().filter(|_| current.is_none())
                 {
                     tracker_for_fence
-                        .record_repository_changes(
+                        .record_repository_fences(
                             &repo_for_fence,
                             std::slice::from_ref(observed_path),
                             3,

@@ -572,6 +572,7 @@ fn run_agent(
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
     let run_id = make_run_id();
+    let _runtime_dir_cleanup = AgentRuntimeDirCleanup::new(&run_id);
     let mut json = args.json.then(crate::agent_json::JsonEmitter::new);
     let mut json_session = crate::agent_json::JsonSession {
         session_id: String::new(),
@@ -2566,6 +2567,38 @@ pub(crate) fn agent_runtime_dir(run_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/tmp/greppy-agent-{:08x}", hash as u32))
 }
 
+/// Removes only this invocation's empty browser-runtime directory.
+///
+/// The web shutdown guard is scoped inside the one-shot session and therefore
+/// runs before this outer guard.  `remove_dir` deliberately refuses a
+/// non-empty directory: an unexpected socket/file or a hash collision must be
+/// preserved for diagnosis rather than recursively deleting another process's
+/// state.
+struct AgentRuntimeDirCleanup {
+    path: std::path::PathBuf,
+}
+
+impl AgentRuntimeDirCleanup {
+    fn new(run_id: &str) -> Self {
+        Self {
+            path: agent_runtime_dir(run_id),
+        }
+    }
+}
+
+impl Drop for AgentRuntimeDirCleanup {
+    fn drop(&mut self) {
+        match std::fs::remove_dir(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "greppy: preserved non-empty or unavailable agent runtime directory {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
 /// Writable roots for a sandboxed `-p` tool subprocess.
 ///
 /// Deliberately narrow — each entry has a one-line reason. Do **not** re-add
@@ -3343,6 +3376,25 @@ mod tests {
         let _ = fs::remove_dir_all(&git_dir);
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&agent_data);
+    }
+
+    #[test]
+    fn agent_runtime_cleanup_removes_only_its_empty_directory() {
+        let run_id = format!(
+            "runtime-cleanup-{}-{}",
+            std::process::id(),
+            unique("runtime-cleanup").display()
+        );
+        let runtime_dir = agent_runtime_dir(&run_id);
+        fs::create_dir(&runtime_dir).unwrap();
+        drop(AgentRuntimeDirCleanup::new(&run_id));
+        assert!(!runtime_dir.exists());
+
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::write(runtime_dir.join("unexpected-owner"), b"preserve").unwrap();
+        drop(AgentRuntimeDirCleanup::new(&run_id));
+        assert!(runtime_dir.join("unexpected-owner").is_file());
+        fs::remove_dir_all(runtime_dir).unwrap();
     }
 
     #[test]

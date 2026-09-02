@@ -497,7 +497,55 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         return Ok(1);
     }
 
-    let store = match crate::store_cow::overlay_spec(&effective_root)? {
+    let overlay = match crate::store_cow::overlay_spec(&effective_root) {
+        Ok(overlay) => overlay,
+        Err(issue) => {
+            let store_cow =
+                crate::store_cow::diagnostics_without_store(&effective_root, &store_path);
+            let message = issue.to_string();
+            let status = serde_json::json!({
+                "command": command,
+                "status": "unhealthy",
+                "healthy": false,
+                "store_exists": true,
+                "writer_active": false,
+                "root_path": effective_root,
+                "store_path": store_path,
+                "store_format": store_format,
+                "store_bytes": store_bytes,
+                "background_job": background_job,
+                "background_state": background_state,
+                "embedding_complete": false,
+                "project": project,
+                "fresh": false,
+                "freshness": null,
+                "schema_current": null,
+                "integrity_ok": null,
+                "project_present": null,
+                "incomplete_provider_count": null,
+                "skip_counts_by_reason": [],
+                "dirty_overlay": dirty_overlay.to_json(),
+                "inference": inference_diagnostics,
+                "store_cow": store_cow,
+                "message": message,
+            });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).map_err(|error| {
+                        Error::Invalid(format!("serialize {command} JSON: {error}"))
+                    })?
+                );
+            } else {
+                println!("status: unhealthy");
+                println!("root: {}", effective_root.display());
+                println!("store: {}", store_path.display());
+                println!("message: {message}");
+            }
+            return Ok(EXIT_TEMPFAIL as i32);
+        }
+    };
+    let store = match overlay {
         Some(overlay) => greppy_store::Store::open_overlay_read_only(
             &overlay.base_path,
             &store_path,

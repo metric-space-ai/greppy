@@ -315,7 +315,7 @@ jobs:
             'CLANG_PATH=/usr/bin/clang-15' \
             'LLVM_CONFIG_PATH=/usr/bin/llvm-config-15' \
             'LIBCLANG_PATH=/usr/lib/llvm-15/lib' \
-            "BINDGEN_EXTRA_CLANG_ARGS=--resource-dir=$resource_dir" >> "$GITHUB_ENV"
+            "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$resource_dir" >> "$GITHUB_ENV"
 
       - name: Assert and record native build host
         shell: bash

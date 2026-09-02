@@ -10,14 +10,20 @@ description = "Filesystem-independent chunk CoW workspace core for greppy agents
 [dependencies]
 blake3 = { workspace = true }
 rusqlite = { workspace = true }
+notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

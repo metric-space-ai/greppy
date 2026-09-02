@@ -97,14 +97,18 @@ impl ProviderInstallation {
         validate_manifest(&manifest, &data_root, now)?;
 
         let marker_path = manifest.mount_root.join(".greppy-provider.json");
-        let marker_bytes = fs::read(&marker_path).map_err(|error| {
+        let marker_bytes = read_mount_marker(&marker_path).map_err(|error| {
             Error::AdapterUnhealthy(format!(
                 "mount marker {} is unavailable: {error}",
                 marker_path.display()
             ))
         })?;
         let marker: ProviderManifest = serde_json::from_slice(&marker_bytes)?;
-        validate_manifest(&marker, &data_root, now)?;
+        // The mounted marker proves that the live mount belongs to the same
+        // provider instance. Its bytes may be held in the host kernel's file
+        // cache, so freshness is authoritative only in provider.json, which
+        // the provider updates atomically outside the mount.
+        validate_manifest_identity(&marker, &data_root)?;
         if !same_provider_identity(&marker, &manifest) {
             return Err(Error::AdapterUnhealthy(
                 "control manifest and mounted provider identity differ".into(),
@@ -190,6 +194,21 @@ impl ProviderInstallation {
     }
 }
 
+fn read_mount_marker(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn same_provider_identity(left: &ProviderManifest, right: &ProviderManifest) -> bool {
     left.protocol_version == right.protocol_version
         && left.adapter_version == right.adapter_version
@@ -205,6 +224,14 @@ fn validate_manifest(
     manifest: &ProviderManifest,
     expected_data_root: &Path,
     now: SystemTime,
+) -> Result<()> {
+    validate_manifest_identity(manifest, expected_data_root)?;
+    validate_manifest_heartbeat(manifest, now)
+}
+
+fn validate_manifest_identity(
+    manifest: &ProviderManifest,
+    expected_data_root: &Path,
 ) -> Result<()> {
     if manifest.protocol_version != PROVIDER_PROTOCOL_VERSION {
         return Err(Error::AdapterUnhealthy(format!(
@@ -236,6 +263,10 @@ fn validate_manifest(
             "provider did not report an adapter version".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_manifest_heartbeat(manifest: &ProviderManifest, now: SystemTime) -> Result<()> {
     let heartbeat = UNIX_EPOCH
         .checked_add(Duration::from_millis(manifest.heartbeat_unix_ms))
         .ok_or_else(|| Error::AdapterUnhealthy("provider heartbeat overflowed".into()))?;
@@ -357,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_stale_mount_heartbeat_even_when_control_is_fresh() {
+    fn accepts_a_kernel_cached_mount_heartbeat_when_control_is_fresh() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let mount = temp.path().join("mount");
@@ -375,10 +406,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            ProviderInstallation::require_healthy_at(&data, now),
-            Err(Error::AdapterUnhealthy(_))
-        ));
+        ProviderInstallation::require_healthy_at(&data, now).unwrap();
     }
 
     #[test]

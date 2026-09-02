@@ -50,6 +50,7 @@ final class ProviderHeartbeat {
     private let adapterVersion: String
     private let lock = NSLock()
     private var published = Data()
+    private var publishedAt = Date(timeIntervalSince1970: 0)
     private let timer: DispatchSourceTimer
 
     init(dataRoot: URL) throws {
@@ -102,13 +103,20 @@ final class ProviderHeartbeat {
         return published
     }
 
+    func manifestSnapshot() -> (data: Data, modifiedAt: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (published, publishedAt)
+    }
+
     private func publish() throws {
+        let now = Date()
         let manifest = ProviderManifest(
             adapterVersion: adapterVersion,
             instanceID: instanceID,
             dataRoot: dataRoot.path,
             mountRoot: mountRoot.path,
-            heartbeatUnixMilliseconds: UInt64(Date().timeIntervalSince1970 * 1_000)
+            heartbeatUnixMilliseconds: UInt64(now.timeIntervalSince1970 * 1_000)
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -116,6 +124,7 @@ final class ProviderHeartbeat {
         try data.write(to: dataRoot.appendingPathComponent("provider.json"), options: .atomic)
         lock.lock()
         published = data
+        publishedAt = now
         lock.unlock()
     }
 }
