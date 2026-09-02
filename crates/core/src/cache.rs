@@ -1646,6 +1646,29 @@ mod tests {
         dir
     }
 
+    #[cfg(windows)]
+    fn set_directory_modified(path: &Path, modified: SystemTime) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0001 | 0x0002 | 0x0004;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    fn set_directory_modified(path: &Path, modified: SystemTime) {
+        File::open(path).unwrap().set_modified(modified).unwrap();
+    }
+
     #[test]
     fn versioned_store_has_valid_manifest() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
@@ -1706,7 +1729,7 @@ mod tests {
         }
         let old = SystemTime::now() - Duration::from_secs(7 * 60 * 60);
         for dir in [&stale_build, &stale_checkout] {
-            File::open(dir).unwrap().set_modified(old).unwrap();
+            set_directory_modified(dir, old);
         }
         let removed = reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap();
         assert_eq!(removed, 2);
