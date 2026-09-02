@@ -1,0 +1,62 @@
+name: web-runtime compatibility
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/web-runtime-ci.yml'
+      - 'assets/prompts/web-beta.md'
+      - 'crates/agent/**'
+      - 'crates/cli/src/web/**'
+      - 'crates/web-runtime/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/web-runtime-ci.yml'
+      - 'assets/prompts/web-beta.md'
+      - 'crates/agent/**'
+      - 'crates/cli/src/web/**'
+      - 'crates/web-runtime/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-runtime-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  session-daemon:
+    name: session daemon three-run stability
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+
+      - name: Compile the exact session-daemon suite once
+        shell: bash
+        run: >-
+          cargo test --locked
+          --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime
+          --test session-daemon
+          --no-run
+
+      - name: Require three stable serial suite passes
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::session-daemon stability pass $attempt/3"
+            cargo test --locked \
+              --manifest-path crates/web-runtime/Cargo.toml \
+              --package web-runtime \
+              --test session-daemon \
+              -- --test-threads=1
+            echo "::endgroup::"
+          done

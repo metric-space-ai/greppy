@@ -10,6 +10,19 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 
 root="$(web_runtime_repo_root)"
 dest="$(web_runtime_require_package_dest "${1:-}")"
+actual_source_commit="$(git -C "$root" rev-parse HEAD)"
+source_commit="${GREPPY_SOURCE_COMMIT:-$actual_source_commit}"
+[ "$source_commit" = "$actual_source_commit" ] ||
+  web_runtime_die "source commit $source_commit does not match checkout HEAD $actual_source_commit"
+source_tree_dirty=false
+if ! git -C "$root" diff --quiet --ignore-submodules -- ||
+   ! git -C "$root" diff --cached --quiet --ignore-submodules --; then
+  source_tree_dirty=true
+fi
+if [ "${GREPPY_WEB_RUNTIME_PRODUCTION_SIGNED:-false}" = true ] &&
+   [ "$source_tree_dirty" = true ]; then
+  web_runtime_die "refusing a production-signed web runtime from a dirty source tree"
+fi
 staging="$(web_runtime_begin_staging "$dest")"
 staging_cleanup() {
   if [ -n "${staging:-}" ] && [ -d "$staging" ] && [ ! -L "$staging" ]; then
@@ -47,9 +60,9 @@ if [ -z "$found" ]; then
   echo "do not package web-runtime-supervisor / web-controller-worker / web-content-worker" >&2
   exit 1
 fi
-python3 - "$staging" "$bin" <<'PY'
+python3 - "$staging" "$bin" "$source_commit" "$source_tree_dirty" <<'PY'
 import hashlib, json, os, platform, sys, time
-dest, executable = sys.argv[1:]
+dest, executable, source_commit, source_tree_dirty = sys.argv[1:]
 bins = [executable]
 components = []
 for name in bins:
@@ -71,6 +84,8 @@ open(os.path.join(dest, "sbom.json"), "w").write(json.dumps(sbom, indent=2) + "\
 prov = {
     "predicateType": "https://slsa.dev/provenance/v1",
     "buildType": "greppy.web-runtime.package.v1",
+    "source_commit": source_commit,
+    "source_tree_dirty": source_tree_dirty == "true",
     "platform": f"{platform.system()}-{platform.machine()}",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "images": components,
@@ -96,15 +111,17 @@ coverage="$root/contracts/web-runtime/playwright-public-surface.v1.json"
 if [ -f "$coverage" ] && [ ! -L "$coverage" ]; then
   web_runtime_copy_regular_file "$coverage" "$staging/coverage-manifest.json"
 fi
-python3 - "$staging" "$found" "$bin" <<'PY'
+python3 - "$staging" "$found" "$bin" "$source_commit" "$source_tree_dirty" <<'PY'
 import json, os, platform, sys, time
-dest, src, executable = sys.argv[1:]
+dest, src, executable, source_commit, source_tree_dirty = sys.argv[1:]
 size = os.path.getsize(os.path.join(dest, "bin", executable))
 profile = "release" if "/release/" in src.replace("\\", "/") else "debug"
 receipt = {
     "buildType": "greppy.web-runtime.size.v1",
     "measured": True,
     "profile": profile,
+    "source_commit": source_commit,
+    "source_tree_dirty": source_tree_dirty == "true",
     "installed_bytes": size,
     "platform": f"{platform.system()}-{platform.machine()}",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -116,6 +133,8 @@ bench = {
     "buildType": "greppy.web-runtime.benchmark.v1",
     "measured": True,
     "profile": profile,
+    "source_commit": source_commit,
+    "source_tree_dirty": source_tree_dirty == "true",
     "installed_bytes": size,
     "platform": f"{platform.system()}-{platform.machine()}",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

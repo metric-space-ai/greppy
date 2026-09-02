@@ -2031,10 +2031,14 @@ mod tests {
         let directory = executable.parent().unwrap();
         let started = directory.join("greppy-detach-daemon-started");
         let completed = directory.join("greppy-detach-daemon-completed");
+        let release = directory.join("greppy-detach-daemon-release");
 
         if stem == "greppy-detach-daemon" {
             std::fs::write(&started, b"started\n").unwrap();
-            std::thread::sleep(Duration::from_secs(3));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !release.is_file() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             std::fs::write(&completed, b"completed\n").unwrap();
             return;
         }
@@ -2053,33 +2057,28 @@ mod tests {
         std::fs::copy(&executable, &intermediate).unwrap();
         std::fs::copy(&executable, &daemon).unwrap();
 
-        let began = Instant::now();
         let output = std::process::Command::new(&intermediate)
             .arg("--exact")
             .arg(TEST_NAME)
             .arg("--nocapture")
             .output()
             .unwrap();
-        let elapsed = began.elapsed();
         assert!(
             output.status.success(),
             "intermediate test process failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "redirected streams remained inherited for {elapsed:?}"
-        );
         let started_marker = binaries.join("greppy-detach-daemon-started");
-        let started_deadline = Instant::now() + Duration::from_secs(2);
+        let started_deadline = Instant::now() + Duration::from_secs(5);
         while !started_marker.is_file() && Instant::now() < started_deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(started_marker.is_file(), "detached child did not start");
         assert!(
             !binaries.join("greppy-detach-daemon-completed").is_file(),
-            "detached child completed before its three-second hold interval"
+            "detached child retained redirected streams until its hold interval expired"
         );
+        std::fs::write(binaries.join("greppy-detach-daemon-release"), b"release\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !binaries.join("greppy-detach-daemon-completed").is_file()
