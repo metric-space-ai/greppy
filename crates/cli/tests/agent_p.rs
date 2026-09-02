@@ -207,6 +207,11 @@ fn greppy_p_text_only_end_turn_proposes_nothing() {
         stderr.contains("store mode: private (--private-store)"),
         "expected explicit full-private fallback mode: {stdout}\nstderr={stderr}"
     );
+    let session_id = session_id_from_stderr(&stderr);
+    assert!(
+        !session_id.is_empty(),
+        "expected a non-empty session id; stderr={stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
@@ -265,6 +270,7 @@ fn greppy_p_aborts_before_model_turn_when_base_preparation_fails() {
             && stderr.contains("agent start aborted before the first model call"),
         "agent failure must identify the fail-closed Base boundary; stderr={stderr}"
     );
+    let _ = session_id_from_stderr(&stderr);
     assert!(
         !stdout.contains("hi from stub") && !stdout.contains("no changes proposed"),
         "no model turn or proposal outcome may run after Base failure; stdout={stdout}"
@@ -384,7 +390,107 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
         stdout.contains("no changes proposed."),
         "deadline stop must still deliver the clean/proposal outcome: stdout={stdout}\nstderr={stderr}"
     );
+    let _ = session_id_from_stderr(&stderr);
 
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
+}
+
+#[test]
+fn greppy_p_persists_session_and_continue_reuses_id() {
+    let repo = unique_temp("continue-repo");
+    init_repo(&repo);
+    let store = unique_temp("continue-store");
+    let provider_root = unique_temp("continue-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, handle) = spawn_stub_gateway();
+
+    let first = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "say hi",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "2",
+            "--private-store",
+            "--skip-selfcheck",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -p");
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stdout={first_stdout}\nstderr={first_stderr}"
+    );
+    let session_id = session_id_from_stderr(&first_stderr);
+    let jsonl = session_jsonl(&store);
+    let first_log = std::fs::read_to_string(&jsonl).unwrap_or_default();
+    assert_eq!(
+        usage_line_count(&first_log),
+        1,
+        "first run should append one usage line; jsonl={first_log}"
+    );
+
+    let second = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "keep going",
+            "--continue",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "2",
+            "--private-store",
+            "--skip-selfcheck",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -p --continue");
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stdout={second_stdout}\nstderr={second_stderr}"
+    );
+    assert_eq!(
+        session_id_from_stderr(&second_stderr),
+        session_id,
+        "continue must reuse the same session id; stderr={second_stderr}"
+    );
+    let second_log = std::fs::read_to_string(&jsonl).unwrap_or_default();
+    assert_eq!(
+        usage_line_count(&second_log),
+        2,
+        "continue should append a second usage line; jsonl={second_log}"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
     drop(provider);
@@ -578,6 +684,48 @@ fn index_agent_worktree_fails_closed_when_base_summary_cache_publication_fails()
 fn find_file_named(root: &std::path::Path, name: &str) -> PathBuf {
     try_find_file_named(root, name)
         .unwrap_or_else(|| panic!("{name} not found under {}", root.display()))
+}
+
+fn session_id_from_stderr(stderr: &str) -> String {
+    let line = stderr.lines().next().unwrap_or("");
+    assert!(
+        line.starts_with("session: "),
+        "first stderr line must be session: <id>; stderr={stderr}"
+    );
+    line["session: ".len()..].trim().to_string()
+}
+
+fn session_jsonl(store: &std::path::Path) -> PathBuf {
+    let root = store.join("agent-sessions");
+    let mut found = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("read directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    walk(&root, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one session jsonl under {}, got {found:?}",
+        root.display()
+    );
+    found.remove(0)
+}
+
+fn usage_line_count(jsonl: &str) -> usize {
+    jsonl
+        .lines()
+        .filter(|line| line.contains("\"type\":\"usage\""))
+        .count()
 }
 
 fn try_find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {

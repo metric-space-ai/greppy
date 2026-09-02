@@ -38,6 +38,7 @@ pub struct SessionRecord {
     pub worktree: String,
     pub branch: String,
     pub proposal_ref: String,
+    pub source: String,
     pub messages: Vec<PersistedMessage>,
     pub usage: Usage,
     pub turns: u64,
@@ -57,6 +58,7 @@ impl SessionRecord {
             worktree: String::new(),
             branch: String::new(),
             proposal_ref: String::new(),
+            source: String::new(),
             messages: Vec::new(),
             usage: Usage::default(),
             turns: 0,
@@ -84,13 +86,39 @@ impl SessionStore {
         self.root.join(&self.project)
     }
 
-    pub fn path_for(&self, session_id: &str) -> PathBuf {
-        self.project_dir().join(format!("{session_id}.jsonl"))
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
+    pub fn is_valid_id(session_id: &str) -> bool {
+        let bytes = session_id.as_bytes();
+        (1..=128).contains(&bytes.len())
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            && !session_id.contains('/')
+            && !session_id.contains('\\')
+            && !session_id.contains("..")
+    }
+
+    pub fn path_for(&self, session_id: &str) -> io::Result<PathBuf> {
+        if !Self::is_valid_id(session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid session id",
+            ));
+        }
+        Ok(self.project_dir().join(format!("{session_id}.jsonl")))
     }
 
     pub fn create(&self, record: &SessionRecord) -> io::Result<PathBuf> {
-        fs::create_dir_all(self.project_dir())?;
-        let path = self.path_for(&record.id);
+        let path = self.path_for(&record.id)?;
+        fs::create_dir_all(&self.root)?;
+        greppy_core::cache::secure_private_directory(&self.root)?;
+        let project_dir = self.project_dir();
+        fs::create_dir_all(&project_dir)?;
+        greppy_core::cache::secure_private_directory(&project_dir)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -101,7 +129,7 @@ impl SessionStore {
     }
 
     pub fn append(&self, session_id: &str, line: &Value) -> io::Result<()> {
-        let path = self.path_for(session_id);
+        let path = self.path_for(session_id)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{line}")?;
         file.flush()?;
@@ -181,14 +209,128 @@ impl SessionStore {
         )
     }
 
+    pub fn append_worktree(
+        &self,
+        session_id: &str,
+        path: &str,
+        proposal_ref: &str,
+    ) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "worktree",
+                "path": path,
+                "proposal_ref": proposal_ref,
+            }),
+        )
+    }
+
+    pub fn append_turn_start(
+        &self,
+        session_id: &str,
+        source: &str,
+        prompt: &str,
+    ) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "turn",
+                "event": "start",
+                "ts_ms": now_ms(),
+                "source": source,
+                "prompt": redact_text(prompt),
+            }),
+        )
+    }
+
+    pub fn append_tool_start(
+        &self,
+        session_id: &str,
+        id: &str,
+        name: &str,
+        summary: &str,
+    ) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "tool",
+                "event": "start",
+                "ts_ms": now_ms(),
+                "id": id,
+                "name": name,
+                "summary": summary,
+            }),
+        )
+    }
+
+    pub fn append_tool_finish(
+        &self,
+        session_id: &str,
+        id: &str,
+        failed: bool,
+        elapsed_ms: u64,
+        preview: &str,
+    ) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "tool",
+                "event": "finish",
+                "ts_ms": now_ms(),
+                "id": id,
+                "failed": failed,
+                "elapsed_ms": elapsed_ms,
+                "preview": clip_chars(&redact_text(preview), 400),
+            }),
+        )
+    }
+
+    pub fn append_turn_done(
+        &self,
+        session_id: &str,
+        stop: &str,
+        turns: u64,
+        usage: &Usage,
+    ) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "turn",
+                "event": "done",
+                "ts_ms": now_ms(),
+                "stop": stop,
+                "turns": turns,
+                "usage": usage_object(usage),
+            }),
+        )
+    }
+
+    pub fn append_turn_error(&self, session_id: &str, message: &str) -> io::Result<()> {
+        self.append(
+            session_id,
+            &json!({
+                "v": SESSION_FORMAT,
+                "type": "turn",
+                "event": "error",
+                "ts_ms": now_ms(),
+                "message": message,
+            }),
+        )
+    }
+
     pub fn load(&self, session_id: &str) -> io::Result<SessionRecord> {
-        load_path(&self.path_for(session_id))
+        load_path(&self.path_for(session_id)?)
     }
 
     pub fn latest(&self) -> io::Result<Option<SessionRecord>> {
         let mut best: Option<(SystemTime, SessionRecord)> = None;
         for record in self.list()? {
-            let modified = fs::metadata(self.path_for(&record.id))
+            let modified = fs::metadata(self.path_for(&record.id)?)
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             match &best {
@@ -221,14 +363,62 @@ impl SessionStore {
     }
 }
 
+/// Project directories under `<data_root>/agent-sessions/`.
+pub fn list_session_project_dirs(data_root: &Path) -> io::Result<Vec<PathBuf>> {
+    let root = data_root.join("agent-sessions");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// One non-empty JSONL line from a session log.
+#[derive(Debug, Clone)]
+pub struct SessionLogLine {
+    pub raw: String,
+    pub value: Option<Value>,
+}
+
+/// Reads a session JSONL file without mutating it.
+pub fn read_session_log_lines(path: &Path) -> io::Result<Vec<SessionLogLine>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        let raw = line?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&raw).ok();
+        lines.push(SessionLogLine { raw, value });
+    }
+    Ok(lines)
+}
+
 pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid session id"))?;
+    if !SessionStore::is_valid_id(session_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session id",
+        ));
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut record = SessionRecord::new(
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session")
-            .to_string(),
+        session_id.to_string(),
         String::new(),
         String::new(),
         String::new(),
@@ -288,6 +478,7 @@ pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
                     record.proposal_ref = reference.to_string();
                 }
             }
+            Some("tool") | Some("turn") => {}
             _ => {}
         }
     }
@@ -451,6 +642,7 @@ fn meta_line(record: &SessionRecord) -> Value {
         "worktree": record.worktree,
         "branch": record.branch,
         "proposal_ref": record.proposal_ref,
+        "source": record.source,
     })
 }
 
@@ -500,7 +692,11 @@ fn message_from_value(value: &Value) -> Option<PersistedMessage> {
 }
 
 fn apply_meta(record: &mut SessionRecord, value: &Value) {
-    if let Some(id) = value.get("id").and_then(Value::as_str) {
+    if let Some(id) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| SessionStore::is_valid_id(id))
+    {
         record.id = id.to_string();
     }
     if let Some(project) = value.get("project").and_then(Value::as_str) {
@@ -526,6 +722,26 @@ fn apply_meta(record: &mut SessionRecord, value: &Value) {
     }
     if let Some(reference) = value.get("proposal_ref").and_then(Value::as_str) {
         record.proposal_ref = reference.to_string();
+    }
+    if let Some(source) = value.get("source").and_then(Value::as_str) {
+        record.source = source.to_string();
+    }
+}
+
+fn usage_object(usage: &Usage) -> Value {
+    json!({
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_read": usage.cache_read_input_tokens,
+        "cache_write": usage.cache_creation_input_tokens,
+    })
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
     }
 }
 
@@ -593,6 +809,78 @@ mod tests {
     }
 
     #[test]
+    fn session_id_validation_accepts_only_safe_basenames() {
+        for valid in ["a", "Session-1", "20260902_172554.abcd"] {
+            assert!(SessionStore::is_valid_id(valid), "expected valid: {valid}");
+        }
+        for invalid in [
+            "",
+            ".hidden",
+            "-leading",
+            "../x",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "with space",
+            "ümlaut",
+        ] {
+            assert!(
+                !SessionStore::is_valid_id(invalid),
+                "expected invalid: {invalid}"
+            );
+        }
+        assert!(!SessionStore::is_valid_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn path_for_rejects_traversal() {
+        let (store, root) = temp_store("invalid-id");
+        let error = store.path_for("../x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "invalid session id");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_meta_id_keeps_filename_derived_id() {
+        let mut record = SessionRecord::new(
+            "filename-id".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        apply_meta(&mut record, &json!({"id":"../x"}));
+        assert_eq!(record.id, "filename-id");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_secures_session_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, root) = temp_store("private");
+        fs::create_dir_all(store.project_dir()).unwrap();
+        fs::set_permissions(&store.root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(store.project_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        let record =
+            SessionRecord::new("sess-private".into(), "demo".into(), "m".into(), "r".into());
+        store.create(&record).unwrap();
+        assert_eq!(
+            fs::metadata(&store.root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.project_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn append_and_restore_round_trip() {
         let (store, root) = temp_store("round");
         let mut record = SessionRecord::new(
@@ -646,7 +934,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let path = store.path_for("sess-2");
+        let path = store.path_for("sess-2").unwrap();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, "{{not json").unwrap();
         let loaded = store.load("sess-2").unwrap();
@@ -760,6 +1048,99 @@ mod tests {
         assert_eq!(loaded.usage.cache_read_input_tokens, 3);
         assert_eq!(loaded.turns, 3);
         assert_eq!(loaded.stop, "end_turn");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_defaults_empty_on_legacy_meta() {
+        let (store, root) = temp_store("legacy-source");
+        let path = store.path_for("sess-legacy").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"v":1,"type":"meta","id":"sess-legacy","project":"demo","title":"untitled","model":"m","created_ms":1,"run_id":"run","worktree":"","branch":"","proposal_ref":""}
+{"v":1,"type":"message","role":"user","parts":[{"kind":"text","text":"hi","id":"","name":"","is_error":false}]}
+{"v":1,"type":"usage","input":4,"output":2,"cache_read":0,"cache_write":0,"turns":1,"stop":"ready"}
+"#,
+        )
+        .unwrap();
+        let loaded = store.load("sess-legacy").unwrap();
+        assert_eq!(loaded.source, "");
+        assert_eq!(loaded.messages[0].parts[0].text, "hi");
+        assert_eq!(loaded.usage.input_tokens, 4);
+        assert!(!loaded.recovered);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_and_turn_event_lines_do_not_affect_messages_or_usage() {
+        let (store, root) = temp_store("events");
+        let mut record = SessionRecord::new(
+            "sess-events".into(),
+            "demo".into(),
+            "m".into(),
+            "run".into(),
+        );
+        record.source = "interactive".into();
+        store.create(&record).unwrap();
+        let message = PersistedMessage {
+            role: "user".into(),
+            parts: vec![PersistedPart {
+                kind: "text".into(),
+                text: "prompt".into(),
+                id: String::new(),
+                name: String::new(),
+                is_error: false,
+            }],
+        };
+        store.append_messages(&record.id, &[message]).unwrap();
+        let usage = Usage {
+            input_tokens: 11,
+            output_tokens: 5,
+            cache_read_input_tokens: 1,
+            cache_creation_input_tokens: 2,
+        };
+        store.append_usage(&record.id, &usage, 2, "ready").unwrap();
+        store
+            .append_turn_start(&record.id, "interactive", "secret token sk-test")
+            .unwrap();
+        store
+            .append_tool_start(&record.id, "c1", "greppy", "→ greppy who-calls foo")
+            .unwrap();
+        store
+            .append_tool_finish(&record.id, "c1", false, 12, &"x".repeat(500))
+            .unwrap();
+        store
+            .append_turn_done(&record.id, "ready", 1, &usage)
+            .unwrap();
+        store.append_turn_error(&record.id, "boom").unwrap();
+        store
+            .append_worktree(&record.id, "/tmp/wt", "refs/greppy/agent/run")
+            .unwrap();
+
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(loaded.source, "interactive");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].parts[0].text, "prompt");
+        assert_eq!(loaded.usage.input_tokens, 11);
+        assert_eq!(loaded.usage.output_tokens, 5);
+        assert_eq!(loaded.usage.cache_read_input_tokens, 1);
+        assert_eq!(loaded.usage.cache_creation_input_tokens, 2);
+        assert_eq!(loaded.turns, 2);
+        assert_eq!(loaded.stop, "ready");
+        assert_eq!(loaded.worktree, "/tmp/wt");
+        assert_eq!(loaded.proposal_ref, "refs/greppy/agent/run");
+        assert!(!loaded.recovered);
+
+        let raw = fs::read_to_string(store.path_for(&record.id).unwrap()).unwrap();
+        assert!(raw.contains(r#""type":"turn""#));
+        assert!(raw.contains(r#""type":"tool""#));
+        let finish = raw
+            .lines()
+            .find(|line| line.contains(r#""event":"finish""#))
+            .unwrap();
+        let value: Value = serde_json::from_str(finish).unwrap();
+        assert_eq!(value["preview"].as_str().unwrap().chars().count(), 400);
         let _ = fs::remove_dir_all(root);
     }
 }

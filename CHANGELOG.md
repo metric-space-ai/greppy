@@ -2,6 +2,42 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
+## [Unreleased]
+
+### Agent session events
+
+Interactive session JSONL now records additive `tool` and `turn` event lines
+(start/finish/done/error) plus a `source` field on `meta` (`interactive` /
+`headless`). Unknown or new line types still load without marking the session
+recovered.
+
+`greppy -p` persists a session in the same store, prints `session: <id>` as
+the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
+`greppy -p --json` streams newline-delimited JSON events on stdout; `greppy
+agent --json` is rejected. The first SIGINT/SIGTERM cancels at a safe
+boundary and still emits `result` with status `cancelled` and exit 130; a
+second signal exits immediately.
+
+### Agent session readers
+
+`greppy agent sessions list|show|tail|path` reads persisted JSONL session logs
+without starting the TUI or writing to the store. `list` is newest-first;
+`show` renders the transcript; `tail --follow` polls every 200 ms until SIGINT;
+`path` prints the JSONL location. Unknown JSONL types are ignored. Session ids
+accept a unique prefix; unknown or ambiguous ids exit 2. Human `show`/`tail`
+and client event rendering strip terminal control sequences from remote text;
+`--json` stays byte-faithful.
+
+### Agent control clients
+
+`greppy agent status|send|attach|interrupt|quit` drive a live `greppy agent serve`
+session over its control socket. Ids resolve like `sessions`; a session
+without a live socket exits 3. Sockets use short hashed paths in a per-user
+runtime directory so they fit the macOS Unix-socket limit; `sessions list
+--json` reports the path. `send --wait` streams events until that turn
+completes; without `--wait` it prints the queued prompt id and returns.
+`attach` streams live events until Ctrl+C (exit 130).
+
 ## [0.4.0] — 2026-09-02
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache

@@ -3,17 +3,26 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use serde_json::{json, Value};
 
 use super::commands::{parse_slash, SlashCommand};
-use super::events::{SessionCommand, SessionEvent};
+use super::events::{RemoteRequest, SessionCommand, SessionEvent};
 use super::overlay::{Overlay, ToolOverlay};
 use super::redaction::sanitize_terminal_text;
 use super::settings::AgentSettings;
 use super::state::{App, RunPhase, TranscriptItem, MIN_COLS, MIN_ROWS};
+use crate::agent_control::ConnId;
+
+const MAX_QUEUED_REMOTE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Submit(String),
+    SubmitRemote {
+        text: String,
+        source: String,
+        prompt_id: String,
+    },
     Cancel,
     Quit,
     SetModel(String),
@@ -23,6 +32,11 @@ pub enum Effect {
     PersistTitle(String),
     Copy(String),
     SaveSettings(AgentSettings),
+    RemoteReply {
+        conn: ConnId,
+        id: Value,
+        result: Result<Value, crate::agent_control::RpcError>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +46,7 @@ pub enum Action {
     Scroll { up: bool, amount: u16 },
     Resize { cols: u16, rows: u16 },
     Worker(SessionEvent),
+    Remote(RemoteRequest),
     Stream { text: String, thinking: String },
     Disconnect,
     Saturated,
@@ -89,8 +104,128 @@ pub fn update(app: &mut App, action: Action) -> Vec<Effect> {
             Vec::new()
         }
         Action::Worker(event) => handle_worker(app, event),
+        Action::Remote(request) => handle_remote(app, request),
         Action::Key(key) => handle_key(app, key),
     }
+}
+
+fn handle_remote(app: &mut App, request: RemoteRequest) -> Vec<Effect> {
+    let RemoteRequest {
+        conn,
+        id,
+        method,
+        params,
+    } = request;
+    let result = match method.as_str() {
+        "session/describe" => Ok(json!({
+            "session_id": app.session_id,
+            "run_id": app.session_run_id,
+            "project": app.session_project,
+            "worktree": app.header.worktree,
+            "branch": app.header.branch,
+            "model": app.header.model,
+            "endpoint": app.header.endpoint,
+            "sandbox": app.header.sandbox,
+            "phase": app.phase.control_label(),
+            "turns": app.turns,
+            "usage": {
+                "input": app.input_tokens,
+                "output": app.output_tokens,
+                "cache_read": app.cache_read,
+                "cache_write": app.cache_write,
+            },
+            "pending": app.queued.len(),
+            "pid": std::process::id(),
+            "socket": app.control_socket,
+            "jsonl": app.session_jsonl,
+        })),
+        "session/subscribe" => Ok(json!({"subscribed":true})),
+        "turn/start" => {
+            let text = params
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                return vec![Effect::RemoteReply {
+                    conn,
+                    id,
+                    result: Err(crate::agent_control::RpcError::new(-32602, "empty prompt")),
+                }];
+            }
+            if app.phase != RunPhase::Idle && app.queued_remote.len() >= MAX_QUEUED_REMOTE {
+                return vec![Effect::RemoteReply {
+                    conn,
+                    id,
+                    result: Err(crate::agent_control::RpcError::new(-32001, "queue full")),
+                }];
+            }
+            let source = params
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|source| !source.trim().is_empty())
+                .unwrap_or("remote")
+                .to_string();
+            let prompt_id = format!("p-{}", app.next_prompt_id);
+            app.next_prompt_id = app.next_prompt_id.saturating_add(1);
+            let position = app.queued.len() + 1;
+            let reply = Effect::RemoteReply {
+                conn,
+                id,
+                result: Ok(json!({
+                    "accepted": true,
+                    "prompt_id": prompt_id,
+                    "position": position,
+                })),
+            };
+            if app.phase == RunPhase::Idle {
+                app.push_user_from(text.to_string(), Some(source.clone()));
+                app.phase = RunPhase::Busy;
+                app.status = "working".into();
+                app.submitted_prompts = app.submitted_prompts.saturating_add(1);
+                app.follow_tail = true;
+                return vec![
+                    reply,
+                    Effect::SubmitRemote {
+                        text: text.to_string(),
+                        source,
+                        prompt_id,
+                    },
+                ];
+            }
+            app.queued.push_back(text.to_string());
+            app.queued_remote
+                .push_back(Some((prompt_id, source.clone())));
+            app.items.push(TranscriptItem::Queued {
+                text: text.to_string(),
+            });
+            app.status = format!("queued {}", app.queued.len());
+            return vec![reply];
+        }
+        "turn/interrupt" => {
+            let mut effects = Vec::new();
+            if app.phase == RunPhase::Busy {
+                app.phase = RunPhase::Cancelling;
+                app.status = "cancelling at next safe boundary".into();
+                effects.push(Effect::Cancel);
+            }
+            effects.push(Effect::RemoteReply {
+                conn,
+                id,
+                result: Ok(json!({"accepted":true})),
+            });
+            return effects;
+        }
+        "session/quit" => Err(crate::agent_control::RpcError::new(
+            -32000,
+            "interactive host",
+        )),
+        _ => Err(crate::agent_control::RpcError::new(
+            -32601,
+            "method not found",
+        )),
+    };
+    vec![Effect::RemoteReply { conn, id, result }]
 }
 
 fn handle_resize(app: &mut App, cols: u16, rows: u16) {
@@ -307,12 +442,20 @@ fn handle_worker(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 return vec![Effect::Quit];
             }
             if let Some(next) = app.queued.pop_front() {
-                convert_queued_to_user(app, &next);
+                let remote = app.queued_remote.pop_front().flatten();
+                convert_queued_to_user(app, &next, remote.as_ref().map(|(_, source)| source));
                 app.phase = RunPhase::Busy;
                 app.status = "working".into();
                 app.submitted_prompts = app.submitted_prompts.saturating_add(1);
                 app.follow_tail = true;
-                return vec![Effect::Submit(next)];
+                return match remote {
+                    Some((prompt_id, source)) => vec![Effect::SubmitRemote {
+                        text: next,
+                        source,
+                        prompt_id,
+                    }],
+                    None => vec![Effect::Submit(next)],
+                };
             }
         }
         SessionEvent::Compacted { messages } => {
@@ -355,12 +498,20 @@ fn finish_startup_if_ready(app: &mut App) -> Vec<Effect> {
     app.cancel
         .store(false, std::sync::atomic::Ordering::Relaxed);
     if let Some(next) = app.queued.pop_front() {
-        convert_queued_to_user(app, &next);
+        let remote = app.queued_remote.pop_front().flatten();
+        convert_queued_to_user(app, &next, remote.as_ref().map(|(_, source)| source));
         app.phase = RunPhase::Busy;
         app.status = "working".into();
         app.submitted_prompts = app.submitted_prompts.saturating_add(1);
         app.follow_tail = true;
-        return vec![Effect::Submit(next)];
+        return match remote {
+            Some((prompt_id, source)) => vec![Effect::SubmitRemote {
+                text: next,
+                source,
+                prompt_id,
+            }],
+            None => vec![Effect::Submit(next)],
+        };
     }
     Vec::new()
 }
@@ -700,6 +851,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                     {
                         app.session_id = record.id.clone();
                         app.session_title = record.title.clone();
+                        app.session_project = record.project.clone();
+                        app.session_run_id = record.run_id.clone();
                         app.header.model = record.model.clone();
                         app.input_tokens = record.usage.input_tokens;
                         app.output_tokens = record.usage.output_tokens;
@@ -797,6 +950,7 @@ fn submit(app: &mut App) -> Vec<Effect> {
     app.follow_tail = true;
     if app.busy() {
         app.queued.push_back(prompt.clone());
+        app.queued_remote.push_back(None);
         app.items.push(TranscriptItem::Queued { text: prompt });
         app.status = if app.phase == RunPhase::Setup && !app.repository_ready {
             "Queued — starts after this repository's one-time code analysis completes".into()
@@ -905,7 +1059,7 @@ fn dispatch_slash(app: &mut App, command: SlashCommand) -> Vec<Effect> {
     }
 }
 
-fn convert_queued_to_user(app: &mut App, text: &str) {
+fn convert_queued_to_user(app: &mut App, text: &str, source: Option<&String>) {
     if let Some(item) = app
         .items
         .iter_mut()
@@ -913,10 +1067,11 @@ fn convert_queued_to_user(app: &mut App, text: &str) {
     {
         *item = TranscriptItem::User {
             text: text.to_string(),
+            source: source.cloned(),
         };
         return;
     }
-    app.push_user(text.to_string());
+    app.push_user_from(text.to_string(), source.cloned());
 }
 
 fn scroll(app: &mut App, up: bool, amount: u16) {
@@ -944,13 +1099,20 @@ pub fn apply_effects(effects: &[Effect]) -> Vec<SessionCommand> {
         .iter()
         .filter_map(|effect| match effect {
             Effect::Submit(prompt) => Some(SessionCommand::Prompt(prompt.clone())),
+            Effect::SubmitRemote { text, source, .. } => Some(SessionCommand::RemotePrompt {
+                text: text.clone(),
+                source: source.clone(),
+            }),
             Effect::Cancel => Some(SessionCommand::Cancel),
             Effect::Quit => Some(SessionCommand::Quit),
             Effect::SetModel(model) => Some(SessionCommand::SetModel(model.clone())),
             Effect::SetEndpoint(url) => Some(SessionCommand::SetEndpoint(url.clone())),
             Effect::ResumeSession(id) => Some(SessionCommand::Resume(id.clone())),
             Effect::Compact => Some(SessionCommand::Compact),
-            Effect::PersistTitle(_) | Effect::Copy(_) | Effect::SaveSettings(_) => None,
+            Effect::PersistTitle(_)
+            | Effect::Copy(_)
+            | Effect::SaveSettings(_)
+            | Effect::RemoteReply { .. } => None,
         })
         .collect()
 }
@@ -1006,6 +1168,165 @@ mod tests {
                 app,
                 Action::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
             );
+        }
+    }
+
+    fn remote(method: &str, params: Value) -> Action {
+        Action::Remote(RemoteRequest {
+            conn: 7,
+            id: json!(11),
+            method: method.into(),
+            params,
+        })
+    }
+
+    fn reply_result(effect: &Effect) -> &Result<Value, crate::agent_control::RpcError> {
+        let Effect::RemoteReply { conn, id, result } = effect else {
+            panic!("expected remote reply, got {effect:?}");
+        };
+        assert_eq!(*conn, 7);
+        assert_eq!(*id, json!(11));
+        result
+    }
+
+    #[test]
+    fn remote_describe_maps_phases_and_reports_pending() {
+        let mappings = [
+            (RunPhase::Setup, "setup"),
+            (RunPhase::Configuring, "setup"),
+            (RunPhase::Blocked, "blocked"),
+            (RunPhase::Idle, "idle"),
+            (RunPhase::Busy, "busy"),
+            (RunPhase::Cancelling, "cancelling"),
+        ];
+        for (phase, label) in mappings {
+            let mut app = app();
+            app.phase = phase;
+            app.queued.extend(["one".into(), "two".into()]);
+            let effects = update(&mut app, remote("session/describe", json!({})));
+            assert_eq!(effects.len(), 1);
+            let value = reply_result(&effects[0]).as_ref().unwrap();
+            assert_eq!(value["phase"], label);
+            assert_eq!(value["pending"], 2);
+            assert_eq!(value["session_id"], "sess");
+        }
+    }
+
+    #[test]
+    fn remote_subscribe_is_acknowledged() {
+        let mut app = app();
+        let effects = update(&mut app, remote("session/subscribe", json!({})));
+        assert_eq!(
+            reply_result(&effects[0]).as_ref().unwrap(),
+            &json!({"subscribed": true})
+        );
+    }
+
+    #[test]
+    fn remote_turn_start_while_idle_submits_and_badges_user_item() {
+        let mut app = app();
+        let effects = update(
+            &mut app,
+            remote(
+                "turn/start",
+                json!({"text":"hello from remote","source":"remote"}),
+            ),
+        );
+        assert_eq!(effects.len(), 2);
+        assert_eq!(
+            reply_result(&effects[0]).as_ref().unwrap(),
+            &json!({"accepted":true,"prompt_id":"p-1","position":1})
+        );
+        assert_eq!(
+            effects[1],
+            Effect::SubmitRemote {
+                text: "hello from remote".into(),
+                source: "remote".into(),
+                prompt_id: "p-1".into(),
+            }
+        );
+        assert_eq!(app.phase, RunPhase::Busy);
+        assert!(matches!(
+            app.items.last(),
+            Some(TranscriptItem::User { text, source: Some(source) })
+                if text == "hello from remote" && source == "remote"
+        ));
+    }
+
+    #[test]
+    fn remote_turn_start_while_busy_queues_with_position() {
+        let mut app = app();
+        app.phase = RunPhase::Busy;
+        app.queued.push_back("already queued".into());
+        app.queued_remote.push_back(None);
+        let effects = update(
+            &mut app,
+            remote(
+                "turn/start",
+                json!({"text":"hello later","source":"automation"}),
+            ),
+        );
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            reply_result(&effects[0]).as_ref().unwrap(),
+            &json!({"accepted":true,"prompt_id":"p-1","position":2})
+        );
+        assert_eq!(app.queued.back().map(String::as_str), Some("hello later"));
+        assert_eq!(
+            app.queued_remote.back(),
+            Some(&Some(("p-1".into(), "automation".into())))
+        );
+    }
+
+    #[test]
+    fn remote_prompt_queue_is_capped() {
+        let mut app = app();
+        app.phase = RunPhase::Busy;
+        for index in 0..MAX_QUEUED_REMOTE {
+            app.queued.push_back(format!("queued-{index}"));
+            app.queued_remote
+                .push_back(Some((format!("p-{index}"), "remote".into())));
+        }
+        let effects = update(&mut app, remote("turn/start", json!({"text":"overflow"})));
+        let error = reply_result(&effects[0]).as_ref().unwrap_err();
+        assert_eq!(error.code, -32001);
+        assert_eq!(error.message, "queue full");
+        assert_eq!(app.queued.len(), MAX_QUEUED_REMOTE);
+        assert_eq!(app.queued_remote.len(), MAX_QUEUED_REMOTE);
+        assert_eq!(app.next_prompt_id, 1);
+    }
+
+    #[test]
+    fn remote_interrupt_cancels_only_while_busy() {
+        let mut app = app();
+        let idle = update(&mut app, remote("turn/interrupt", json!({})));
+        assert_eq!(idle.len(), 1);
+        assert_eq!(
+            reply_result(&idle[0]).as_ref().unwrap(),
+            &json!({"accepted":true})
+        );
+
+        app.phase = RunPhase::Busy;
+        let busy = update(&mut app, remote("turn/interrupt", json!({})));
+        assert_eq!(busy[0], Effect::Cancel);
+        assert_eq!(
+            reply_result(&busy[1]).as_ref().unwrap(),
+            &json!({"accepted":true})
+        );
+        assert_eq!(app.phase, RunPhase::Cancelling);
+    }
+
+    #[test]
+    fn remote_rejects_quit_unknown_method_and_empty_text() {
+        let mut app = app();
+        for (method, params, code) in [
+            ("session/quit", json!({}), -32000),
+            ("not/a/method", json!({}), -32601),
+            ("turn/start", json!({"text":"  "}), -32602),
+        ] {
+            let effects = update(&mut app, remote(method, params));
+            let error = reply_result(&effects[0]).as_ref().unwrap_err();
+            assert_eq!(error.code, code);
         }
     }
 
@@ -1122,7 +1443,7 @@ mod tests {
         assert!(app.queued.is_empty());
         assert!(matches!(
             app.items.last(),
-            Some(TranscriptItem::User { text }) if text == "inspect parser"
+            Some(TranscriptItem::User { text, .. }) if text == "inspect parser"
         ));
     }
 

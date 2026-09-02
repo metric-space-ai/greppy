@@ -80,30 +80,37 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                 core = WorkspaceCore::open(data_thread.join("core")).ok();
             }
             if let Some(core) = &core {
-                if !tracker_active {
-                    core.request_repository_tracker(&tracked_repo).unwrap();
-                    core.activate_repository_tracker(&tracked_repo, unix_milliseconds())
+                // The real macOS provider is the sandboxed FSKit extension;
+                // the unsandboxed agent process owns its repository tracker.
+                // Linux and Windows providers own the native tracker. Mirror
+                // that split here so the fixture and the macOS child cannot
+                // race to replace each other's tracker owner PID.
+                if !cfg!(target_os = "macos") {
+                    if !tracker_active {
+                        core.request_repository_tracker(&tracked_repo).unwrap();
+                        core.activate_repository_tracker(&tracked_repo, unix_milliseconds())
+                            .unwrap();
+                        tracker_active = true;
+                    }
+                    let current_fences = std::fs::read_dir(&git_dir)
+                        .unwrap()
+                        .filter_map(|entry| entry.ok())
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .filter(|name| name.starts_with("greppy-tracker-fence-"))
+                        .collect::<HashSet<_>>();
+                    let fence_changes = current_fences
+                        .symmetric_difference(&tracker_fences)
+                        .map(|name| format!(".git/{name}"))
+                        .collect::<Vec<_>>();
+                    if !fence_changes.is_empty() {
+                        core.record_repository_fences(
+                            &tracked_repo,
+                            &fence_changes,
+                            unix_milliseconds(),
+                        )
                         .unwrap();
-                    tracker_active = true;
-                }
-                let current_fences = std::fs::read_dir(&git_dir)
-                    .unwrap()
-                    .filter_map(|entry| entry.ok())
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|name| name.starts_with("greppy-tracker-fence-"))
-                    .collect::<HashSet<_>>();
-                let fence_changes = current_fences
-                    .symmetric_difference(&tracker_fences)
-                    .map(|name| format!(".git/{name}"))
-                    .collect::<Vec<_>>();
-                if !fence_changes.is_empty() {
-                    core.record_repository_fences(
-                        &tracked_repo,
-                        &fence_changes,
-                        unix_milliseconds(),
-                    )
-                    .unwrap();
-                    tracker_fences = current_fences;
+                        tracker_fences = current_fences;
+                    }
                 }
                 if let Ok(workspaces) = core.list_workspaces() {
                     let active = workspaces

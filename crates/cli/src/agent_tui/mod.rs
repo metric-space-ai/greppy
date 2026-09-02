@@ -26,15 +26,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
+use greppy_agent::Usage;
+use serde_json::Value;
 
 use crate::agent::EXIT_USAGE;
+use crate::agent_control::{socket_path_for, ControlServer, Incoming};
+use crate::agent_json::{
+    error_event, phase_event, text_event, tool_finish_event, tool_start_event, turn_complete_event,
+    turn_start_event,
+};
 
 pub use bootstrap::BootstrapScreen;
-pub use events::{bounded_pair, EventBridge, EventIntake, SessionCommand, SessionEvent};
-pub use redaction::redact_json;
+pub use events::{
+    bounded_pair, EventBridge, EventIntake, RemoteRequest, SessionCommand, SessionEvent,
+};
+pub use redaction::{redact_json, redact_text, sanitize_terminal_text};
 pub use session::{
-    compact_messages, messages_from_protocol, new_session_id, protocol_from_persisted,
-    SessionRecord, SessionStore,
+    compact_messages, list_session_project_dirs, load_path, messages_from_protocol, new_session_id,
+    protocol_from_persisted, read_session_log_lines, SessionLogLine, SessionRecord, SessionStore,
 };
 pub use settings::AgentSettings;
 pub use state::HeaderState;
@@ -78,6 +87,8 @@ pub fn run(
     initial_draft: String,
     commands: Sender<SessionCommand>,
     events: EventIntake,
+    mut control: Option<ControlServer>,
+    control_warning: Option<String>,
 ) -> io::Result<TuiOutcome> {
     if !tty_suitable() {
         return Err(io::Error::new(
@@ -99,6 +110,10 @@ pub fn run(
         sandbox: config.sandbox,
     };
     let mut app = App::new(header, theme, &session);
+    set_control_paths(&mut app, &store);
+    if let Some(warning) = control_warning {
+        app.push_warning(warning);
+    }
     app.settings = config.settings;
     if config.initializing {
         app.phase = state::RunPhase::Setup;
@@ -116,7 +131,7 @@ pub fn run(
     {
         app.composer.set_text(prompt);
         let effects = update(&mut app, Action::Key(enter_key()));
-        dispatch_effects(&mut app, &store, &commands, effects);
+        dispatch_effects(&mut app, &store, &commands, &mut control, effects);
     }
     if !initial_draft.is_empty() {
         app.composer.set_text(initial_draft);
@@ -133,6 +148,9 @@ pub fn run(
         let intake = events.try_poll();
         let streamed = !intake.text.is_empty() || !intake.thinking.is_empty();
         if streamed {
+            if !intake.text.is_empty() {
+                broadcast(&mut control, &text_event(&intake.text));
+            }
             let _ = update(
                 &mut app,
                 Action::Stream {
@@ -147,13 +165,65 @@ pub fn run(
         }
         let had_discrete = !intake.discrete.is_empty();
         for event in intake.discrete {
+            broadcast_session_event(&mut control, &event);
+            let previous_phase = app.phase;
             let effects = update(&mut app, Action::Worker(event));
-            dispatch_effects(&mut app, &store, &commands, effects);
+            dispatch_with_phase(
+                &mut app,
+                &store,
+                &commands,
+                &mut control,
+                previous_phase,
+                effects,
+            );
         }
         let disconnected = intake.disconnected;
         if disconnected {
+            let previous_phase = app.phase;
             let effects = update(&mut app, Action::Disconnect);
-            dispatch_effects(&mut app, &store, &commands, effects);
+            dispatch_with_phase(
+                &mut app,
+                &store,
+                &commands,
+                &mut control,
+                previous_phase,
+                effects,
+            );
+        }
+
+        let incoming = control
+            .as_mut()
+            .map(ControlServer::poll)
+            .unwrap_or_default();
+        let had_remote = !incoming.is_empty();
+        for request in incoming {
+            let Incoming::Request {
+                conn,
+                id,
+                method,
+                params,
+            } = request
+            else {
+                continue;
+            };
+            let previous_phase = app.phase;
+            let effects = update(
+                &mut app,
+                Action::Remote(RemoteRequest {
+                    conn,
+                    id,
+                    method,
+                    params,
+                }),
+            );
+            dispatch_with_phase(
+                &mut app,
+                &store,
+                &commands,
+                &mut control,
+                previous_phase,
+                effects,
+            );
         }
 
         let mut input_changed = false;
@@ -162,8 +232,16 @@ pub fn run(
                 match event::read()? {
                     Event::Key(key) => {
                         input_changed = true;
+                        let previous_phase = app.phase;
                         let effects = update(&mut app, Action::Key(key));
-                        dispatch_effects(&mut app, &store, &commands, effects);
+                        dispatch_with_phase(
+                            &mut app,
+                            &store,
+                            &commands,
+                            &mut control,
+                            previous_phase,
+                            effects,
+                        );
                     }
                     Event::Paste(text) => {
                         input_changed = true;
@@ -194,7 +272,14 @@ pub fn run(
             let _ = update(&mut app, Action::Tick);
             last_pulse = Instant::now();
         }
-        if input_changed || streamed || saturated || had_discrete || disconnected || pulse {
+        if input_changed
+            || streamed
+            || saturated
+            || had_discrete
+            || disconnected
+            || had_remote
+            || pulse
+        {
             terminal.draw(|frame| render(frame, &mut app))?;
         }
 
@@ -231,6 +316,7 @@ fn dispatch_effects(
     app: &mut App,
     store: &SessionStore,
     commands: &Sender<SessionCommand>,
+    control: &mut Option<ControlServer>,
     effects: Vec<Effect>,
 ) {
     for effect in &effects {
@@ -258,12 +344,35 @@ fn dispatch_effects(
                     app.push_warning(format!("settings save failed: {error}"));
                 }
             }
-            Effect::ResumeSession(_)
-            | Effect::Submit(_)
-            | Effect::Quit
-            | Effect::SetModel(_)
-            | Effect::SetEndpoint(_)
-            | Effect::Compact => {}
+            Effect::RemoteReply { conn, id, result } => {
+                if let Some(server) = control.as_mut() {
+                    server.reply(*conn, id.clone(), result.clone());
+                }
+            }
+            Effect::ResumeSession(id) => {
+                let path = socket_path_for(store, id);
+                *control = None;
+                match ControlServer::bind(&path) {
+                    Ok(server) => *control = Some(server),
+                    Err(error) => {
+                        app.push_warning(format!("remote control unavailable: {error}"));
+                    }
+                }
+                set_control_paths(app, store);
+            }
+            Effect::SubmitRemote {
+                text,
+                source,
+                prompt_id,
+            } => {
+                broadcast(control, &turn_start_event(prompt_id, source, text));
+            }
+            Effect::Submit(text) => {
+                let prompt_id = format!("p-{}", app.next_prompt_id);
+                app.next_prompt_id = app.next_prompt_id.saturating_add(1);
+                broadcast(control, &turn_start_event(&prompt_id, "interactive", text));
+            }
+            Effect::Quit | Effect::SetModel(_) | Effect::SetEndpoint(_) | Effect::Compact => {}
         }
     }
     for command in apply_effects(&effects) {
@@ -271,6 +380,81 @@ fn dispatch_effects(
             app.push_error("The agent worker stopped unexpectedly.");
             app.request_exit = true;
         }
+    }
+}
+
+fn dispatch_with_phase(
+    app: &mut App,
+    store: &SessionStore,
+    commands: &Sender<SessionCommand>,
+    control: &mut Option<ControlServer>,
+    previous_phase: state::RunPhase,
+    effects: Vec<Effect>,
+) {
+    dispatch_effects(app, store, commands, control, effects);
+    if previous_phase.control_label() != app.phase.control_label() {
+        broadcast(control, &phase_event(app.phase.control_label()));
+    }
+}
+
+fn set_control_paths(app: &mut App, store: &SessionStore) {
+    app.control_socket = socket_path_for(store, &app.session_id)
+        .display()
+        .to_string();
+    app.session_jsonl = store
+        .path_for(&app.session_id)
+        .unwrap_or_default()
+        .display()
+        .to_string();
+}
+
+fn broadcast(control: &mut Option<ControlServer>, event: &Value) {
+    if let Some(server) = control.as_mut() {
+        server.broadcast(event);
+    }
+}
+
+fn broadcast_session_event(control: &mut Option<ControlServer>, event: &SessionEvent) {
+    let event = match event {
+        SessionEvent::Text(text) => Some(text_event(text)),
+        SessionEvent::ToolStart { id, summary } => Some(tool_start_event(id, "", summary)),
+        SessionEvent::ToolFinish {
+            id,
+            failed,
+            elapsed_ms,
+            preview,
+        } => Some(tool_finish_event(id, *failed, *elapsed_ms, preview)),
+        SessionEvent::Done {
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_write,
+            stop,
+            ..
+        } => Some(turn_complete_event(
+            stop,
+            &Usage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cache_read_input_tokens: *cache_read,
+                cache_creation_input_tokens: *cache_write,
+            },
+        )),
+        SessionEvent::Error(message)
+        | SessionEvent::SetupBlocked(message)
+        | SessionEvent::GatewayRequired(message) => Some(error_event(message)),
+        SessionEvent::SetupProgress { .. }
+        | SessionEvent::BackgroundProgress { .. }
+        | SessionEvent::BackgroundReady
+        | SessionEvent::SetupReady
+        | SessionEvent::EndpointRejected { .. }
+        | SessionEvent::Configuration { .. }
+        | SessionEvent::Thinking(_)
+        | SessionEvent::Compacted { .. }
+        | SessionEvent::Warning(_) => None,
+    };
+    if let Some(event) = event {
+        broadcast(control, &event);
     }
 }
 

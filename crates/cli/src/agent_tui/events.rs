@@ -5,7 +5,18 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde_json::Value;
+
 use super::session::PersistedMessage;
+use crate::agent_control::ConnId;
+
+#[derive(Debug, Clone)]
+pub struct RemoteRequest {
+    pub conn: ConnId,
+    pub id: Value,
+    pub method: String,
+    pub params: Value,
+}
 
 const STREAM_CAP_BYTES: usize = 256 * 1024;
 const DISCRETE_CAPACITY: usize = 64;
@@ -13,6 +24,7 @@ const DISCRETE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     Prompt(String),
+    RemotePrompt { text: String, source: String },
     Cancel,
     SetModel(String),
     SetEndpoint(String),
