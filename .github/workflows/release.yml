@@ -467,7 +467,7 @@ jobs:
           GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
-          "$GITHUB_WORKSPACE/target/release/web-runtime-dist"
+          "$GITHUB_WORKSPACE/target/web-runtime-dist"
 
       - name: Build macOS FSKit application with bundled CLI
         if: runner.os == 'macOS'
@@ -495,7 +495,7 @@ jobs:
           APP_PROVISIONING_PROFILE="$app_profile" \
           FSKIT_PROVISIONING_PROFILE="$fskit_profile" \
           GREPPY_CLI_BINARY="$PWD/target/release/greppy" \
-          GREPPY_WEB_RUNTIME_DIST="$PWD/target/release/web-runtime-dist" \
+          GREPPY_WEB_RUNTIME_DIST="$PWD/target/web-runtime-dist" \
             platform/macos/build-fskit-app.sh "$RUNNER_TEMP/greppy-fskit"
           codesign --verify --deep --strict --verbose=2 \
             "$RUNNER_TEMP/greppy-fskit/GreppyWorkspaceFS.app"
@@ -538,7 +538,7 @@ jobs:
           GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
-          target/release/web-runtime-dist
+          target/web-runtime-dist
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -660,7 +660,7 @@ jobs:
           platform/linux/build-packages.sh \
             target/release/greppy \
             target/release/greppy-workspace-provider \
-            target/release/web-runtime-dist \
+            target/web-runtime-dist \
               "$version" \
               "${{ matrix.asset }}" \
               "${{ matrix.secondary_asset }}" \
@@ -744,7 +744,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item target/release/greppy-workspace-provider.exe dist/greppy-workspace-provider.exe
-          Copy-Item target/release/web-runtime-dist dist/web-runtime -Recurse
+          Copy-Item target/web-runtime-dist dist/web-runtime -Recurse
           Copy-Item target/release/greppyworkspacefsp-x64.dll dist/greppyworkspacefsp-x64.dll
           Copy-Item target/release/greppyworkspacefsp-x64.sys dist/greppyworkspacefsp-x64.sys
           if (Test-Path target/release/greppyworkspacefsp-x64.cat) {

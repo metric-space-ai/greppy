@@ -439,7 +439,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("greppy-linux-x86_64.rpm", workflow)
         self.assertIn("platform/linux/build-packages.sh", workflow)
         self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
-        self.assertIn("target/release/web-runtime-dist", workflow)
+        self.assertIn("target/web-runtime-dist", workflow)
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
         self.assertIn("fund-034-input-receipts", workflow)
         self.assertIn("fund-038-implicit-submit", workflow)
@@ -452,7 +452,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            "Copy-Item target/release/web-runtime-dist dist/web-runtime -Recurse",
+            "Copy-Item target/web-runtime-dist dist/web-runtime -Recurse",
             workflow,
         )
         self.assertIn('deb_root="$clean/deb"', workflow)
