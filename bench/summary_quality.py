@@ -421,7 +421,7 @@ def execute(args: argparse.Namespace) -> int:
         binary=binary,
         device=args.device,
         env=env,
-        timeout=args.timeout,
+        timeout=args.prewarm_timeout,
     )
     records: list[dict[str, Any]] = []
     for index, case in enumerate(cases_doc["cases"], 1):
@@ -887,6 +887,7 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output", type=pathlib.Path, required=True)
     run_parser.add_argument("--device", default="auto")
     run_parser.add_argument("--timeout", type=float, default=120)
+    run_parser.add_argument("--prewarm-timeout", type=float, default=1800)
     run_parser.set_defaults(func=execute)
 
     judge_parser = subparsers.add_parser("judge")

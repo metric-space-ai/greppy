@@ -151,6 +151,24 @@ class SummaryQualityGateTests(unittest.TestCase):
 
 
 class SummaryQualityPrewarmTests(unittest.TestCase):
+    def test_run_parser_allows_long_foreground_prewarm(self):
+        args = SUMMARY_QUALITY.parser().parse_args(
+            [
+                "run",
+                "--binary",
+                "/tmp/greppy",
+                "--store-dir",
+                "/tmp/store",
+                "--cases",
+                "/tmp/cases.json",
+                "--output",
+                "/tmp/results.json",
+            ]
+        )
+
+        self.assertEqual(args.timeout, 120)
+        self.assertEqual(args.prewarm_timeout, 1800)
+
     def test_prewarms_each_repository_once_and_requires_ready_status(self):
         completed = [
             mock.Mock(returncode=0, stdout="", stderr=""),
