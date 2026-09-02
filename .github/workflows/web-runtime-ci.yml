@@ -33,6 +33,25 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      - name: Build exact Greppy CLI test asset
+        shell: bash
+        env:
+          CI: 'true'
+        run: cargo build --locked --package greppy --features ci-test-assets
+
+      - name: Install pinned Playwright Chromium oracle
+        shell: bash
+        env:
+          PLAYWRIGHT_VERSION: '1.62.1'
+        run: |
+          oracle_root="$RUNNER_TEMP/greppy-playwright-oracle"
+          mkdir -p "$oracle_root"
+          npm install --prefix "$oracle_root" --ignore-scripts "playwright@$PLAYWRIGHT_VERSION"
+          PLAYWRIGHT_BROWSERS_PATH="$oracle_root/browsers" \
+            "$oracle_root/node_modules/.bin/playwright" install chromium
+          echo "PLAYWRIGHT_PACKAGE=$oracle_root/node_modules/playwright" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$oracle_root/browsers" >> "$GITHUB_ENV"
+
       - name: Compile the exact session-daemon suite once
         shell: bash
         run: >-

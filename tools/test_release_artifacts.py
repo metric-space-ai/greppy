@@ -528,6 +528,13 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("session daemon three-run stability", web_runtime_ci)
         self.assertIn("for attempt in 1 2 3", web_runtime_ci)
         self.assertIn("branches: ['**']", web_runtime_ci)
+        self.assertIn("Build exact Greppy CLI test asset", web_runtime_ci)
+        self.assertIn("CI: 'true'", web_runtime_ci)
+        self.assertIn("--features ci-test-assets", web_runtime_ci)
+        self.assertIn("PLAYWRIGHT_VERSION: '1.62.1'", web_runtime_ci)
+        self.assertIn("playwright@$PLAYWRIGHT_VERSION", web_runtime_ci)
+        self.assertIn("PLAYWRIGHT_PACKAGE=", web_runtime_ci)
+        self.assertIn("PLAYWRIGHT_BROWSERS_PATH=", web_runtime_ci)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
