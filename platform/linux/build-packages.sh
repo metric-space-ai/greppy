@@ -2,21 +2,25 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 GREPPY PROVIDER VERSION OUTPUT.deb OUTPUT.rpm STAGING_ROOT" >&2
+  echo "usage: $0 GREPPY PROVIDER WEB_RUNTIME_DIST VERSION OUTPUT.deb OUTPUT.rpm STAGING_ROOT" >&2
   exit 64
 }
 
-[[ $# -eq 6 ]] || usage
+[[ $# -eq 7 ]] || usage
 
 GREPPY_BINARY=$1
 PROVIDER_BINARY=$2
-VERSION=$3
-DEB_OUTPUT=$4
-RPM_OUTPUT=$5
-STAGING_ROOT=$(realpath -m "$6")
+WEB_RUNTIME_DIST=$3
+VERSION=$4
+DEB_OUTPUT=$5
+RPM_OUTPUT=$6
+STAGING_ROOT=$(realpath -m "$7")
 
 [[ -x "$GREPPY_BINARY" ]] || { echo "greppy binary is not executable: $GREPPY_BINARY" >&2; exit 66; }
 [[ -x "$PROVIDER_BINARY" ]] || { echo "workspace provider is not executable: $PROVIDER_BINARY" >&2; exit 66; }
+[[ -d "$WEB_RUNTIME_DIST" && ! -L "$WEB_RUNTIME_DIST" ]] || { echo "web-runtime dist is not a regular directory: $WEB_RUNTIME_DIST" >&2; exit 66; }
+[[ -f "$WEB_RUNTIME_DIST/.greppy-web-runtime-dist" ]] || { echo "web-runtime dist is missing its package stamp" >&2; exit 66; }
+[[ -x "$WEB_RUNTIME_DIST/bin/web-runtime" ]] || { echo "web-runtime dist is missing bin/web-runtime" >&2; exit 66; }
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
   echo "invalid package version: $VERSION" >&2
   exit 64
@@ -53,6 +57,7 @@ mkdir -p \
 
 install -m 0755 "$GREPPY_BINARY" "$STAGING_ROOT/usr/lib/greppy/bin/greppy"
 install -m 0755 "$PROVIDER_BINARY" "$STAGING_ROOT/usr/lib/greppy/bin/greppy-workspace-provider"
+cp -a "$WEB_RUNTIME_DIST" "$STAGING_ROOT/usr/lib/greppy/bin/web-runtime"
 install -m 0644 "$repository_root/platform/linux/greppy-workspace-provider.service" \
   "$STAGING_ROOT/usr/lib/systemd/user/greppy-workspace-provider.service"
 ln -s ../lib/greppy/bin/greppy "$STAGING_ROOT/usr/bin/greppy"

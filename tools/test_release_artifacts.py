@@ -438,6 +438,18 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("greppy-linux-x86_64.deb", workflow)
         self.assertIn("greppy-linux-x86_64.rpm", workflow)
         self.assertIn("platform/linux/build-packages.sh", workflow)
+        self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
+        self.assertIn("target/release/web-runtime-dist", workflow)
+        self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
+        self.assertIn("--manifest-path crates/web-runtime/Cargo.toml", workflow)
+        self.assertIn(
+            "signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD crates/web-runtime/target/release/web-runtime.exe",
+            workflow,
+        )
+        self.assertIn(
+            "Copy-Item target/release/web-runtime-dist dist/web-runtime -Recurse",
+            workflow,
+        )
         self.assertIn('deb_root="$clean/deb"', workflow)
         self.assertIn('rpm_root="$clean/rpm"', workflow)
         self.assertIn('"$deb_bin/greppy" workspace doctor --json', workflow)
@@ -466,11 +478,36 @@ class ReleaseArtifactTests(unittest.TestCase):
             REPOSITORY_ROOT / "platform/linux/build-packages.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("WINFSP-*|RIFT-*", linux_packager)
-        self.assertIn('STAGING_ROOT=$(realpath -m "$6")', linux_packager)
+        self.assertIn('STAGING_ROOT=$(realpath -m "$7")', linux_packager)
+        self.assertIn('WEB_RUNTIME_DIST=$3', linux_packager)
+        self.assertIn(
+            'cp -a "$WEB_RUNTIME_DIST" "$STAGING_ROOT/usr/lib/greppy/bin/web-runtime"',
+            linux_packager,
+        )
         self.assertIn("%global __strip /bin/true", linux_packager)
         self.assertIn("%global _build_id_links none", linux_packager)
         self.assertIn("greppy-workspace-provider.service", linux_packager)
         self.assertIn("default.target.wants/greppy-workspace-provider.service", workflow)
+        macos_app_builder = (
+            REPOSITORY_ROOT / "platform/macos/build-fskit-app.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("GREPPY_WEB_RUNTIME_DIST", macos_app_builder)
+        self.assertIn(
+            '"$app/Contents/Resources/bin/web-runtime/bin/web-runtime"',
+            macos_app_builder,
+        )
+        macos_pkg_builder = (
+            REPOSITORY_ROOT / "platform/macos/build-fskit-pkg.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Contents/Resources/bin/web-runtime/bin/web-runtime",
+            macos_pkg_builder,
+        )
+        windows_msi_builder = (
+            REPOSITORY_ROOT / "tools/build_windows_msi.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("web-runtime\\bin\\web-runtime.exe", windows_msi_builder)
+        self.assertIn("web-runtime\\.greppy-web-runtime-dist", windows_msi_builder)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
@@ -544,6 +581,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         windows_smoke = (
             REPOSITORY_ROOT / "bench/release_package_smoke.ps1"
         ).read_text(encoding="utf-8")
+        self.assertIn("web-runtime\\bin\\web-runtime.exe", windows_smoke)
+        self.assertIn("web doctor --json", windows_smoke)
         self.assertNotIn(' semantic-search \'', windows_smoke)
         self.assertIn(" search --json ", windows_smoke)
         windows_daemon_stress = (
@@ -640,6 +679,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         unix_smoke = (
             REPOSITORY_ROOT / "bench/release_package_smoke.sh"
         ).read_text(encoding="utf-8")
+        self.assertIn('WEB_RUNTIME_DIST="$BIN_DIR/web-runtime"', unix_smoke)
+        self.assertIn('"$BIN" web doctor --json', unix_smoke)
         self.assertNotIn('" semantic-search', unix_smoke)
         self.assertGreaterEqual(unix_smoke.count(" search --json"), 4)
         self.assertNotIn("pgrep -f", unix_smoke)

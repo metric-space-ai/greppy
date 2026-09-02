@@ -85,7 +85,9 @@ pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::common::{export_regular_file, find_binary, images_from_dist};
+    use super::common::{
+        export_regular_file, find_binary, images_from_dist, runtime_executable_name,
+    };
     use super::sessions::SessionCommand;
     use super::*;
     use crate::{Cli, Command};
@@ -586,10 +588,14 @@ mod tests {
             "greppy.web-runtime.package.v1\n",
         )
         .unwrap();
-        std::fs::write(root.join("bin").join("web-runtime"), b"web-runtime").unwrap();
+        std::fs::write(
+            root.join("bin").join(runtime_executable_name()),
+            b"web-runtime",
+        )
+        .unwrap();
         let runtime = images_from_dist(&root).expect("dist");
         assert_eq!(runtime.dist.as_ref(), Some(&root));
-        assert!(runtime.executable.ends_with("web-runtime"));
+        assert!(runtime.executable.ends_with(runtime_executable_name()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -607,7 +613,8 @@ mod tests {
         .unwrap();
         let target = root.join("payload");
         std::fs::write(&target, b"web-runtime").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("bin").join("web-runtime")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("bin").join(runtime_executable_name()))
+            .unwrap();
         assert!(images_from_dist(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }

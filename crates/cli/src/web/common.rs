@@ -1117,7 +1117,7 @@ pub(super) fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObj
             if sibling_dist.join(".greppy-web-runtime-dist").is_file() {
                 return images_from_dist(&sibling_dist);
             }
-            if let Some(runtime) = runtime_from_file(&dir.join("web-runtime"), None) {
+            if let Some(runtime) = runtime_from_file(&dir.join(runtime_executable_name()), None) {
                 return Ok(runtime);
             }
             if exe.file_name().is_some_and(|name| name == "web-runtime") {
@@ -1147,18 +1147,27 @@ pub(super) fn images_from_dist(
         return Err(unavailable("refusing symlink web-runtime dist/bin"));
     }
     if !bin.is_dir() {
-        return Err(unavailable("web-runtime dist is missing bin/web-runtime"));
+        return Err(unavailable(if cfg!(windows) {
+            "web-runtime dist is missing bin/web-runtime.exe"
+        } else {
+            "web-runtime dist is missing bin/web-runtime"
+        }));
     }
-    let executable = bin.join("web-runtime");
+    let executable_name = runtime_executable_name();
+    let executable = bin.join(executable_name);
     if is_symlink(&executable) {
         return Err(unavailable("refusing symlink web-runtime dist/bin member"));
     }
     if !executable.is_file() {
-        return Err(unavailable("web-runtime dist is missing bin/web-runtime"));
+        return Err(unavailable(if cfg!(windows) {
+            "web-runtime dist is missing bin/web-runtime.exe"
+        } else {
+            "web-runtime dist is missing bin/web-runtime"
+        }));
     }
     if let Ok(entries) = std::fs::read_dir(&bin) {
         for entry in entries.flatten() {
-            if entry.file_name() != "web-runtime" {
+            if entry.file_name() != executable_name {
                 return Err(unavailable("web-runtime dist/bin has unexpected members"));
             }
         }
@@ -1167,6 +1176,14 @@ pub(super) fn images_from_dist(
         dist: Some(dist.to_path_buf()),
         executable,
     })
+}
+
+pub(super) const fn runtime_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "web-runtime.exe"
+    } else {
+        "web-runtime"
+    }
 }
 
 pub(super) fn runtime_from_file(

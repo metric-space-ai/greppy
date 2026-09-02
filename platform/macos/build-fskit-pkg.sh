@@ -23,6 +23,11 @@ test -x "$app/Contents/Resources/bin/greppy" || {
     echo "FSKit application does not contain the bundled Greppy CLI" >&2
     exit 1
 }
+test -f "$app/Contents/Resources/bin/web-runtime/.greppy-web-runtime-dist" &&
+test -x "$app/Contents/Resources/bin/web-runtime/bin/web-runtime" || {
+    echo "FSKit application does not contain the bundled Greppy web runtime" >&2
+    exit 1
+}
 app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
     "$app/Contents/Info.plist")
 extension_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
@@ -95,4 +100,5 @@ fi
 payload_listing="$build_root/payload-files.txt"
 pkgutil --payload-files "$output" > "$payload_listing"
 grep -q '^\./Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy$' "$payload_listing"
+grep -q '^\./Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/web-runtime/bin/web-runtime$' "$payload_listing"
 grep -q '^\./usr/local/bin/greppy$' "$payload_listing"

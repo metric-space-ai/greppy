@@ -241,6 +241,11 @@ not a Playwright-compatibility claim.
 - Cancelling the interactive agent during its visible startup phase now returns
   exit 130 deterministically. The terminal UI's cancellation result is no
   longer discarded in a race with a worker that can finish cleanly first.
+- Release artifacts now carry the stamped web-runtime distribution beside the
+  CLI on macOS, Linux, and Windows, including its executable, checksums, SBOM,
+  provenance, coverage manifest, and signature-state marker. Package smoke
+  tests resolve that exact sibling distribution through `web doctor`; Windows
+  uses the native `web-runtime.exe` member instead of a Unix-only filename.
 
 Local gates landed in this stream (exact tests, not inventory shrink):
 

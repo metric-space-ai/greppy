@@ -15,6 +15,7 @@ application_group=group.ai.metricspace.greppy
 cargo_target="$repository_root/target/fskit-aarch64-macos15.4"
 ffi_archive="$cargo_target/aarch64-apple-darwin/release/libgreppy_workspace_ffi.a"
 cli_binary=${GREPPY_CLI_BINARY:-}
+web_runtime_dist=${GREPPY_WEB_RUNTIME_DIST:-}
 if [ -n "$cli_binary" ]; then
     package_version=$("$cli_binary" --version | awk '{print $NF}')
 else
@@ -132,6 +133,24 @@ if [ -n "$cli_binary" ]; then
     cp "$cli_binary" "$app/Contents/Resources/bin/greppy"
     chmod 0755 "$app/Contents/Resources/bin/greppy"
 fi
+if [ -n "$web_runtime_dist" ]; then
+    test -d "$web_runtime_dist" && test ! -L "$web_runtime_dist" || {
+        echo "GREPPY_WEB_RUNTIME_DIST is not a regular directory: $web_runtime_dist" >&2
+        exit 1
+    }
+    test -f "$web_runtime_dist/.greppy-web-runtime-dist" || {
+        echo "GREPPY_WEB_RUNTIME_DIST is missing its package stamp" >&2
+        exit 1
+    }
+    test -x "$web_runtime_dist/bin/web-runtime" || {
+        echo "GREPPY_WEB_RUNTIME_DIST is missing bin/web-runtime" >&2
+        exit 1
+    }
+    mkdir -p "$app/Contents/Resources/bin"
+    /usr/bin/ditto --norsrc --noextattr --noqtn \
+        "$web_runtime_dist" "$app/Contents/Resources/bin/web-runtime"
+    chmod 0755 "$app/Contents/Resources/bin/web-runtime/bin/web-runtime"
+fi
 
 cd "$repository_root"
 MACOSX_DEPLOYMENT_TARGET=15.4 CARGO_TARGET_DIR="$cargo_target" cargo build \
@@ -213,6 +232,13 @@ if [ -n "$cli_binary" ]; then
         codesign --force --timestamp --options runtime \
             --sign "$identity" "$app/Contents/Resources/bin/greppy"
     fi
+fi
+if [ -n "$web_runtime_dist" ]; then
+    # The release workflow signs the source executable before the dist is
+    # hashed. Re-signing after the copy would invalidate SHA256SUMS and the
+    # dist SBOM, so require and preserve that exact signed image here.
+    codesign --verify --strict --verbose=2 \
+        "$app/Contents/Resources/bin/web-runtime/bin/web-runtime"
 fi
 sign_bundle \
     "$app_entitlements" \
