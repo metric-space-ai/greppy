@@ -19,6 +19,7 @@ use greppy_agent::{
     StreamEvent, Usage, WorkspaceError,
 };
 
+use crate::agent_control::{socket_path_for, ControlServer};
 use crate::agent_tui::{
     bounded_pair, compact_messages, messages_from_protocol, new_session_id,
     protocol_from_persisted, redact_json, SessionCommand, SessionEvent, SessionRecord,
@@ -1650,7 +1651,14 @@ pub(crate) fn spawn_session_worker(
             }
             let mut tool_started = std::collections::HashMap::<String, Instant>::new();
             while let Ok(command) = command_rx.recv() {
+                let (command, remote_source) = match command {
+                    SessionCommand::RemotePrompt { text, source } => {
+                        (SessionCommand::Prompt(text), Some(source))
+                    }
+                    command => (command, None),
+                };
                 match command {
+                    SessionCommand::RemotePrompt { .. } => unreachable!("remote prompt normalized"),
                     SessionCommand::Quit => break,
                     SessionCommand::Cancel => {
                         cancel.store(true, Ordering::Relaxed);
@@ -1738,7 +1746,7 @@ pub(crate) fn spawn_session_worker(
                         cancel.store(false, Ordering::Relaxed);
                         let mut prompt_turns = 0u64;
                         let previous_message_count = history.len();
-                        if let Some(source) = prompt_source.as_deref() {
+                        if let Some(source) = remote_source.as_deref().or(prompt_source.as_deref()) {
                             if let Err(error) = store_for_worker.append_turn_start(
                                 &session_id,
                                 source,
@@ -1965,6 +1973,11 @@ fn run_interactive_session(
             eprintln!("greppy agent: session save failed: {error}");
         }
     }
+    let control_path = socket_path_for(&store, &record.id);
+    let (control, control_warning) = match ControlServer::bind(&control_path) {
+        Ok(server) => (Some(server), None),
+        Err(error) => (None, Some(format!("remote control unavailable: {error}"))),
+    };
 
     let cancel = Arc::new(AtomicBool::new(false));
     config.cancel = Some(Arc::clone(&cancel));
@@ -2066,6 +2079,8 @@ fn run_interactive_session(
         initial_draft,
         command_tx.clone(),
         intake,
+        control,
+        control_warning,
     );
     let _ = command_tx.send(SessionCommand::Quit);
     index_monitor_cancel.store(true, Ordering::Relaxed);
