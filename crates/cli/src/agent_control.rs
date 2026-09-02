@@ -340,10 +340,7 @@ fn read_connection(conn: ConnId, mut stream: UnixStream, tx: mpsc::Sender<WireIn
             Ok(0) => break,
             Ok(count) => {
                 pending.extend_from_slice(&chunk[..count]);
-                loop {
-                    let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
-                        break;
-                    };
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                     if newline > MAX_LINE {
                         let _ = tx.send(WireIncoming::Oversized(conn));
                         return;

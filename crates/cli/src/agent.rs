@@ -292,7 +292,7 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
     let rest = super::grep_passthrough_args(argv);
     if rest.get(1).is_some_and(|token| token == "serve") {
-        return run_agent_serve_invocation(&rest);
+        return run_agent_serve_invocation(rest);
     }
     run_agent_invocation(argv, true)
 }
