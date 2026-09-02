@@ -150,6 +150,58 @@ class SummaryQualityGateTests(unittest.TestCase):
         self.assertNotIn("no_signature_echoes", report["checks"])
 
 
+class SummaryQualityPrewarmTests(unittest.TestCase):
+    def test_prewarms_each_repository_once_and_requires_ready_status(self):
+        completed = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"healthy": True, "embedding_complete": True}),
+                stderr="",
+            ),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"healthy": True, "embedding_complete": True}),
+                stderr="",
+            ),
+        ]
+        cases = [{"repo": "serde"}, {"repo": "serde"}, {"repo": "flask"}]
+
+        with mock.patch.object(SUMMARY_QUALITY, "run", side_effect=completed) as run:
+            SUMMARY_QUALITY.prewarm_repositories(
+                cases,
+                binary=pathlib.Path("/tmp/greppy"),
+                device="metal",
+                env={"GREPPY_STORE_DIR": "/tmp/store"},
+                timeout=600,
+            )
+
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_args_list[0].args[0][-2:], ["index", str((SUMMARY_QUALITY.REALCORPUS / "serde").resolve())])
+        self.assertEqual(run.call_args_list[1].args[0][-3:], ["index", "status", "--json"])
+
+    def test_rejects_index_that_is_not_embedding_complete(self):
+        completed = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"healthy": True, "embedding_complete": False}),
+                stderr="still embedding",
+            ),
+        ]
+
+        with mock.patch.object(SUMMARY_QUALITY, "run", side_effect=completed):
+            with self.assertRaisesRegex(RuntimeError, "did not produce a ready index"):
+                SUMMARY_QUALITY.prewarm_repositories(
+                    [{"repo": "serde"}],
+                    binary=pathlib.Path("/tmp/greppy"),
+                    device="metal",
+                    env={},
+                    timeout=600,
+                )
+
+
 class SummaryQualityJudgeTests(unittest.TestCase):
     def valid_response(self) -> dict:
         return {

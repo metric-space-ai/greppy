@@ -114,6 +114,73 @@ def source_for(case: dict[str, Any]) -> str:
     return source
 
 
+def prewarm_repositories(
+    cases: list[dict[str, Any]],
+    *,
+    binary: pathlib.Path,
+    device: str,
+    env: dict[str, str],
+    timeout: float,
+) -> None:
+    """Build and verify every repository snapshot before measuring summaries."""
+    repositories = dict.fromkeys(case["repo"] for case in cases)
+    for repo in repositories:
+        root = (REALCORPUS / repo).resolve()
+        index_proc = run(
+            [
+                str(binary),
+                "--device",
+                device,
+                "--root",
+                str(root),
+                "index",
+                str(root),
+            ],
+            cwd=root,
+            env=env,
+            timeout=timeout,
+        )
+        if index_proc.returncode != 0:
+            raise RuntimeError(
+                f"summary-quality prewarm failed for {repo} with exit "
+                f"{index_proc.returncode}: {index_proc.stderr[-2000:]}"
+            )
+
+        status_proc = run(
+            [
+                str(binary),
+                "--device",
+                device,
+                "--root",
+                str(root),
+                "index",
+                "status",
+                "--json",
+            ],
+            cwd=root,
+            env=env,
+            timeout=timeout,
+        )
+        try:
+            status = json.loads(status_proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"summary-quality prewarm returned invalid status for {repo}: {exc}"
+            ) from exc
+        if (
+            status_proc.returncode != 0
+            or status.get("healthy") is not True
+            or status.get("embedding_complete") is not True
+        ):
+            raise RuntimeError(
+                f"summary-quality prewarm did not produce a ready index for {repo}: "
+                f"exit={status_proc.returncode}, healthy={status.get('healthy')}, "
+                f"embedding_complete={status.get('embedding_complete')}, "
+                f"stderr={status_proc.stderr[-2000:]}"
+            )
+        print(f"[prewarm] {repo}: healthy and embedding-complete", flush=True)
+
+
 def manifest_entry(manifest: dict[str, Any], repo: str) -> dict[str, Any]:
     repositories = manifest.get("repos", manifest)
     entry = repositories.get(repo) if isinstance(repositories, dict) else None
@@ -349,6 +416,13 @@ def execute(args: argparse.Namespace) -> int:
     env["GREPPY_STORE_DIR"] = str(store_dir)
     env["GREPPY_SUMMARIZE_DAEMON_MODEL_TTL_S"] = "300"
     env["GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S"] = "1800"
+    prewarm_repositories(
+        cases_doc["cases"],
+        binary=binary,
+        device=args.device,
+        env=env,
+        timeout=args.timeout,
+    )
     records: list[dict[str, Any]] = []
     for index, case in enumerate(cases_doc["cases"], 1):
         root = (REALCORPUS / case["repo"]).resolve()
