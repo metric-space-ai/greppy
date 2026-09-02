@@ -833,8 +833,8 @@ impl WorkspaceCore {
 
     pub fn request_repository_tracker(&self, repository: &Path) -> Result<()> {
         let _writer = self.lock_metadata_writer()?;
-        let connection = self.lock_metadata()?;
-        repository_tracker::request(&connection, repository)
+        let mut connection = self.lock_metadata()?;
+        repository_tracker::request(&mut connection, repository, repository_tracker_now_ms())
     }
 
     pub fn pending_repository_trackers(&self) -> Result<Vec<PathBuf>> {
@@ -861,6 +861,16 @@ impl WorkspaceCore {
         let _writer = self.lock_metadata_writer()?;
         let mut connection = self.lock_metadata()?;
         repository_tracker::record(&mut connection, repository, paths, heartbeat_unix_ms)
+    }
+
+    pub fn heartbeat_repository_tracker(
+        &self,
+        repository: &Path,
+        heartbeat_unix_ms: u64,
+    ) -> Result<()> {
+        let _writer = self.lock_metadata_writer()?;
+        let connection = self.lock_metadata()?;
+        repository_tracker::heartbeat(&connection, repository, heartbeat_unix_ms)
     }
 
     pub fn mark_repository_tracker_gap(
@@ -2513,6 +2523,13 @@ fn now_unix_ns() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0)
+}
+
+fn repository_tracker_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn load_inode_for_path(

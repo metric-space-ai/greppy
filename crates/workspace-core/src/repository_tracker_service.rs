@@ -11,7 +11,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EVENT_QUEUE_CAPACITY: usize = 4_096;
 const RECOMMENDED_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,6 +70,7 @@ pub fn spawn_repository_tracker(data_root: PathBuf) -> io::Result<thread::JoinHa
 
 fn supervise(core: Arc<WorkspaceCore>) {
     let mut watchers = HashMap::<PathBuf, LiveWatcher>::new();
+    let mut last_heartbeat = Instant::now();
     loop {
         let requests = match core.pending_repository_trackers() {
             Ok(requests) => requests,
@@ -135,6 +136,19 @@ fn supervise(core: Arc<WorkspaceCore>) {
                     );
                 }
             }
+        }
+        if last_heartbeat.elapsed()
+            >= Duration::from_millis(crate::repository_tracker::HEARTBEAT_INTERVAL_MS)
+        {
+            let heartbeat = now_ms();
+            watchers.retain(|repository, _| {
+                match core.heartbeat_repository_tracker(repository, heartbeat) {
+                    Ok(()) => true,
+                    Err(crate::Error::ConcurrentRepositoryMutation) => false,
+                    Err(_) => true,
+                }
+            });
+            last_heartbeat = Instant::now();
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -629,15 +643,19 @@ fn handle_armed_event(
                 .collect::<Result<Vec<_>, _>>();
             match paths {
                 Ok(mut paths) => {
-                    // Creating or removing a child updates the repository
-                    // directory's own metadata. macOS Kqueue/FSEvents can
-                    // report that parent Modify in addition to the precise
-                    // child event. It carries no extra mutation information
-                    // and must not turn a healthy tracker into a gap. A root
-                    // event that requests a rescan, or removes the root, is
-                    // retained as `.` and forces a fail-closed full capture.
-                    if event.kind.is_modify() && !event.need_rescan() {
-                        paths.retain(|path| path != ".");
+                    // Creating or removing a child updates its parent
+                    // directory. macOS Kqueue can report that parent as
+                    // Modify *or Remove* even though the directory still
+                    // exists, in addition to the precise child event. Ignore
+                    // only those proven-existing parent paths. A missing root
+                    // or a rescan request is retained and forces a fail-closed
+                    // full capture.
+                    if !event.need_rescan() {
+                        paths.retain(|path| match path.as_str() {
+                            "." => !repository.is_dir(),
+                            ".git" => !git_dir.is_dir(),
+                            _ => true,
+                        });
                     }
                     paths.retain(|path| !is_tracker_internal_path(path));
                     if paths.is_empty() && emitted_paths {
@@ -817,6 +835,87 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_new_service_reclaims_a_dead_persisted_owner_and_routes_its_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("data");
+        let repository_path = temp.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = std::fs::canonicalize(repository_path).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let core = WorkspaceCore::open(data_root.join("core")).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("repository_tracker_service::tests::repository_tracker_owner_child")
+            .arg("--nocapture")
+            .env("GREPPY_TRACKER_OWNER_CHILD_DATA", &data_root)
+            .env("GREPPY_TRACKER_OWNER_CHILD_REPOSITORY", &repository)
+            .status()
+            .unwrap();
+        assert!(child.success());
+        let stale = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.state, RepositoryTrackerState::Active);
+        assert!(!stale.is_live_at(now_ms()));
+
+        let _tracker = spawn_repository_tracker(data_root).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let active = loop {
+            let status = core.repository_tracker_status(&repository).unwrap();
+            if status.as_ref().is_some_and(|status| {
+                status.state == RepositoryTrackerState::Active
+                    && status.epoch > stale.epoch
+                    && status.is_live_at(now_ms())
+            }) {
+                break status.unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement tracker did not become live: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        let name = format!("greppy-tracker-fence-second-process-{}", now_ms());
+        let fence = repository.join(".git").join(&name);
+        std::fs::write(&fence, b"fence").unwrap();
+        let expected = format!(".git/{name}");
+        loop {
+            let changes = core
+                .repository_changes_since(&repository, active.epoch, active.generation)
+                .unwrap();
+            if changes.paths.iter().any(|path| path == &expected) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement tracker did not route its fence: {changes:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(fence).unwrap();
+    }
+
+    #[test]
+    fn repository_tracker_owner_child() {
+        let Some(data_root) = std::env::var_os("GREPPY_TRACKER_OWNER_CHILD_DATA") else {
+            return;
+        };
+        let repository = std::env::var_os("GREPPY_TRACKER_OWNER_CHILD_REPOSITORY")
+            .map(PathBuf::from)
+            .unwrap();
+        let core = WorkspaceCore::open(PathBuf::from(data_root).join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+        let active = core
+            .activate_repository_tracker(&repository, now_ms())
+            .unwrap();
+        assert_eq!(active.owner_pid, std::process::id());
+        assert!(active.is_live_at(now_ms()));
     }
 
     #[test]
@@ -1020,13 +1119,20 @@ mod tests {
         assert_eq!(after_mutation.state, RepositoryTrackerState::Active);
         assert_eq!(after_mutation.generation, active.generation);
 
-        let removal = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(repository.clone());
-        handle_armed_event(&core, &repository, &git_dir, Ok(removal));
-        let after_removal = core
+        let parent_remove_noise =
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(repository.clone());
+        handle_armed_event(&core, &repository, &git_dir, Ok(parent_remove_noise));
+        let after_parent_noise = core
             .repository_tracker_status(&repository)
             .unwrap()
             .unwrap();
-        assert_eq!(after_removal.state, RepositoryTrackerState::Active);
+        assert_eq!(after_parent_noise.state, RepositoryTrackerState::Active);
+        assert_eq!(after_parent_noise.generation, active.generation);
+
+        std::fs::remove_dir_all(&repository).unwrap();
+        let actual_removal =
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(repository.clone());
+        handle_armed_event(&core, &repository, &git_dir, Ok(actual_removal));
         let changes = core
             .repository_changes_since(&repository, active.epoch, active.generation)
             .unwrap();

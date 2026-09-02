@@ -539,12 +539,20 @@ fn capture_tracked_repository(
     started: Instant,
 ) -> Result<(BaselineSnapshot, bool), WorkspaceError> {
     let repository = fs::canonicalize(repository)?;
+    let before_request = core.repository_tracker_status(&repository)?;
+    let minimum_epoch = before_request
+        .as_ref()
+        .filter(|status| !status.is_live_at(now_unix_ms()))
+        .map_or(0, |status| status.epoch.saturating_add(1));
     core.request_repository_tracker(&repository)?;
     trace_workspace_phase(run_id, "tracker-requested", started);
     let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
     let active = loop {
         if let Some(status) = core.repository_tracker_status(&repository)? {
-            if status.state == RepositoryTrackerState::Active {
+            if status.state == RepositoryTrackerState::Active
+                && status.epoch >= minimum_epoch
+                && status.is_live_at(now_unix_ms())
+            {
                 trace_workspace_phase(run_id, "tracker-active", started);
                 break status;
             }
@@ -558,9 +566,21 @@ fn capture_tracked_repository(
             }
         }
         if std::time::Instant::now() >= deadline {
+            let detail = core
+                .repository_tracker_status(&repository)?
+                .map(|status| {
+                    format!(
+                        "state={:?}, epoch={}, owner_pid={}, heartbeat_age_ms={}",
+                        status.state,
+                        status.epoch,
+                        status.owner_pid,
+                        now_unix_ms().saturating_sub(status.heartbeat_unix_ms)
+                    )
+                })
+                .unwrap_or_else(|| "tracker row missing".into());
             return Err(WorkspaceError::AdapterUnavailable(format!(
-                "repository tracker did not become active within {} seconds",
-                REPOSITORY_TRACKER_TIMEOUT.as_secs()
+                "repository tracker did not become live within {} seconds ({detail})",
+                REPOSITORY_TRACKER_TIMEOUT.as_secs(),
             )));
         }
         thread::sleep(Duration::from_millis(20));
@@ -2555,6 +2575,13 @@ fn now_unix_ns() -> u128 {
         .as_nanos()
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn baseline_bytes(chunks: &ChunkStore, entry: &BaselineEntry) -> Result<Vec<u8>, WorkspaceError> {
     let mut bytes = Vec::with_capacity(entry.size as usize);
     for chunk in &entry.chunks {
@@ -3309,7 +3336,7 @@ mod tests {
             .request_repository_tracker(&tracked_repo)
             .unwrap();
         tracker_core
-            .activate_repository_tracker(&tracked_repo, 1)
+            .activate_repository_tracker(&tracked_repo, now_unix_ms())
             .unwrap();
         let tracker_for_fence = tracker_core.clone();
         let repo_for_fence = tracked_repo.clone();
