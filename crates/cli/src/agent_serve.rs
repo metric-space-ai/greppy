@@ -19,6 +19,7 @@ use crate::agent_json::{
 use crate::agent_tui::{SessionCommand, SessionEvent, SessionRecord, SessionStore};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_PENDING_PROMPTS: usize = 64;
 static SIGNALS: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn record_signal(_: libc::c_int) {
@@ -80,6 +81,18 @@ struct PendingPrompt {
     id: String,
     text: String,
     source: String,
+}
+
+fn enqueue_prompt(
+    queue: &mut VecDeque<PendingPrompt>,
+    prompt: PendingPrompt,
+) -> Result<usize, RpcError> {
+    if queue.len() >= MAX_PENDING_PROMPTS {
+        return Err(RpcError::new(-32001, "queue full"));
+    }
+    let position = queue.len() + 1;
+    queue.push_back(prompt);
+    Ok(position)
 }
 
 #[derive(Clone, Copy)]
@@ -162,6 +175,7 @@ pub(crate) fn run(
 
     loop {
         let intake = handle.intake.poll(POLL_INTERVAL);
+        let mut worker_error_event = false;
         if !intake.text.is_empty() {
             emit(&mut server, emitter, text_event(&intake.text));
             last_activity = Instant::now();
@@ -228,8 +242,10 @@ pub(crate) fn run(
                 }
                 SessionEvent::Error(message) => {
                     emit(&mut server, emitter, error_event(&message));
+                    set_phase(&mut server, emitter, &mut phase, Phase::Idle);
                     blocked_error = Some(message);
                     quit = true;
+                    worker_error_event = true;
                 }
                 SessionEvent::Warning(message) | SessionEvent::EndpointRejected { message, .. } => {
                     eprintln!("greppy agent serve: {message}");
@@ -241,6 +257,9 @@ pub(crate) fn run(
                 | SessionEvent::Thinking(_)
                 | SessionEvent::Compacted { .. } => {}
             }
+        }
+        if worker_error_event || handle.join.is_finished() {
+            break;
         }
 
         for incoming in server.poll() {
@@ -293,13 +312,21 @@ pub(crate) fn run(
                         .unwrap_or("remote")
                         .to_string();
                     let prompt_id = format!("p-{next_prompt}");
+                    let position = match enqueue_prompt(
+                        &mut queue,
+                        PendingPrompt {
+                            id: prompt_id.clone(),
+                            text: text.to_string(),
+                            source,
+                        },
+                    ) {
+                        Ok(position) => position,
+                        Err(error) => {
+                            server.reply(conn, id, Err(error));
+                            continue;
+                        }
+                    };
                     next_prompt = next_prompt.saturating_add(1);
-                    let position = queue.len() + 1;
-                    queue.push_back(PendingPrompt {
-                        id: prompt_id.clone(),
-                        text: text.to_string(),
-                        source,
-                    });
                     server.reply(
                         conn,
                         id,
@@ -417,7 +444,7 @@ fn describe(
         "pending": pending,
         "pid": std::process::id(),
         "socket": socket,
-        "jsonl": store.path_for(&record.id),
+        "jsonl": store.path_for(&record.id).unwrap_or_default(),
     })
 }
 
@@ -430,4 +457,37 @@ fn add_usage(total: &mut Usage, delta: &Usage) {
     total.cache_creation_input_tokens = total
         .cache_creation_input_tokens
         .saturating_add(delta.cache_creation_input_tokens);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_prompt_queue_is_capped() {
+        let mut queue = VecDeque::new();
+        for index in 0..MAX_PENDING_PROMPTS {
+            let position = enqueue_prompt(
+                &mut queue,
+                PendingPrompt {
+                    id: format!("p-{index}"),
+                    text: "prompt".into(),
+                    source: "remote".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(position, index + 1);
+        }
+        let error = enqueue_prompt(
+            &mut queue,
+            PendingPrompt {
+                id: "overflow".into(),
+                text: "prompt".into(),
+                source: "remote".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, RpcError::new(-32001, "queue full"));
+        assert_eq!(queue.len(), MAX_PENDING_PROMPTS);
+    }
 }

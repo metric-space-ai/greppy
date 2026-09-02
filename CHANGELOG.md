@@ -32,7 +32,9 @@ and client event rendering strip terminal control sequences from remote text;
 
 `greppy agent status|send|attach|interrupt|quit` drive a live `greppy agent serve`
 session over its control socket. Ids resolve like `sessions`; a session
-without a live socket exits 3. `send --wait` streams events until that turn
+without a live socket exits 3. Sockets use short hashed paths in a per-user
+runtime directory so they fit the macOS Unix-socket limit; `sessions list
+--json` reports the path. `send --wait` streams events until that turn
 completes; without `--wait` it prints the queued prompt id and returns.
 `attach` streams live events until Ctrl+C (exit 130).
 

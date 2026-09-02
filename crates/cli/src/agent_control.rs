@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,10 +15,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::agent_tui::SessionStore;
 
 const MAX_LINE: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 32;
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 pub type ConnId = u64;
@@ -77,6 +79,7 @@ struct Connection {
 
 pub struct ControlServer {
     path: PathBuf,
+    identity: (u64, u64),
     incoming: Receiver<WireIncoming>,
     connections: Arc<Mutex<HashMap<ConnId, Connection>>>,
     stop: Arc<AtomicBool>,
@@ -85,8 +88,15 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn bind(path: &Path) -> io::Result<Self> {
+        if probe_live(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "session already hosted",
+            ));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            greppy_core::cache::secure_private_directory(parent)?;
         }
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -94,6 +104,8 @@ impl ControlServer {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(path)?;
+        let metadata = fs::metadata(path)?;
+        let identity = (metadata.dev(), metadata.ino());
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
 
@@ -109,6 +121,14 @@ impl ControlServer {
                 while !accept_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            let at_capacity = accept_connections
+                                .lock()
+                                .map(|all| all.len() >= MAX_CONNECTIONS)
+                                .unwrap_or(true);
+                            if at_capacity {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
                             let conn = next_id.fetch_add(1, Ordering::Relaxed);
                             let reader = match stream.try_clone() {
                                 Ok(reader) => reader,
@@ -117,15 +137,21 @@ impl ControlServer {
                             if stream.set_nonblocking(true).is_err() {
                                 continue;
                             }
-                            if let Ok(mut all) = accept_connections.lock() {
-                                all.insert(
-                                    conn,
-                                    Connection {
-                                        writer: stream,
-                                        subscribed: false,
-                                        pending: Vec::new(),
-                                    },
-                                );
+                            let inserted = accept_connections
+                                .lock()
+                                .map(|mut all| {
+                                    all.insert(
+                                        conn,
+                                        Connection {
+                                            writer: stream,
+                                            subscribed: false,
+                                            pending: Vec::new(),
+                                        },
+                                    );
+                                })
+                                .is_ok();
+                            if !inserted {
+                                continue;
                             }
                             let _ = tx.send(WireIncoming::Connected(conn));
                             let reader_tx = tx.clone();
@@ -143,6 +169,7 @@ impl ControlServer {
 
         Ok(Self {
             path: path.to_path_buf(),
+            identity,
             incoming,
             connections,
             stop,
@@ -295,7 +322,12 @@ impl Drop for ControlServer {
                 let _ = connection.writer.shutdown(std::net::Shutdown::Both);
             }
         }
-        let _ = fs::remove_file(&self.path);
+        if fs::metadata(&self.path)
+            .map(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -480,11 +512,32 @@ fn io_rpc_error(error: io::Error) -> RpcError {
 }
 
 pub fn socket_path_for(store: &SessionStore, session_id: &str) -> PathBuf {
-    store.path_for(session_id).with_extension("sock")
+    let user_key = format!("control-{}", unsafe { libc::geteuid() });
+    let mut hasher = Sha256::new();
+    hasher.update(store.project().as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    crate::agent::agent_runtime_dir(&user_key)
+        .join("s")
+        .join(format!("{}.sock", &digest[..16]))
+}
+
+fn probe_live(path: &Path) -> io::Result<bool> {
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ECONNREFUSED) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn is_live(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    probe_live(path).unwrap_or(false)
 }
 
 pub fn not_live_message(session_id: &str) -> String {
@@ -496,6 +549,7 @@ pub fn not_live_message(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -504,10 +558,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "greppy-control-{tag}-{}-{nonce}.sock",
-            std::process::id()
-        ))
+        std::env::temp_dir()
+            .join(format!("greppy-control-{}-{nonce}", std::process::id()))
+            .join(format!("{tag}.sock"))
     }
 
     fn wait_for_request(server: &mut ControlServer) -> (ConnId, Value, String, Value) {
@@ -529,15 +582,100 @@ mod tests {
     }
 
     #[test]
+    fn socket_paths_are_short_and_session_specific() {
+        let store = SessionStore::new(
+            "/Users/example/Library/Application Support/greppy",
+            "p".repeat(60),
+        );
+        let first = socket_path_for(&store, "20260902-172554-abcdef12");
+        let second = socket_path_for(&store, "20260902-172554-fedcba21");
+        assert!(
+            first.as_os_str().as_bytes().len() <= 100,
+            "socket path is too long: {}",
+            first.display()
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn socket_is_private_and_removed_on_drop() {
         let path = temp_socket("mode");
         let server = ControlServer::bind(&path).unwrap();
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         drop(server);
         assert!(!path.exists());
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn second_bind_refuses_to_replace_a_live_socket() {
+        let path = temp_socket("live-bind");
+        let server = ControlServer::bind(&path).unwrap();
+        let error = ControlServer::bind(&path).err().expect("second bind fails");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(error.to_string(), "session already hosted");
+        assert!(is_live(&path));
+        drop(server);
+    }
+
+    #[test]
+    fn stale_server_drop_preserves_a_replacement_socket() {
+        let path = temp_socket("replacement");
+        let stale = ControlServer::bind(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement = ControlServer::bind(&path).unwrap();
+        drop(stale);
+        assert!(path.exists());
+        assert!(is_live(&path));
+        drop(replacement);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_connections_are_capped() {
+        let path = temp_socket("connection-cap");
+        let server = ControlServer::bind(&path).unwrap();
+        let mut streams = (0..=MAX_CONNECTIONS)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.connections.lock().unwrap().len() < MAX_CONNECTIONS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not accept {MAX_CONNECTIONS} connections"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let rejected = streams.last_mut().unwrap();
+        rejected.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        loop {
+            match rejected.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "rejected connection was not closed"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                result => panic!("unexpected rejected connection read: {result:?}"),
+            }
+        }
+        assert_eq!(server.connections.lock().unwrap().len(), MAX_CONNECTIONS);
+        drop(streams);
+        drop(server);
     }
 
     #[test]

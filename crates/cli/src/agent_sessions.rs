@@ -345,12 +345,22 @@ fn source_from_lines(lines: &[SessionLogLine]) -> String {
 }
 
 fn live_socket(session: &ListedSession) -> (bool, Option<PathBuf>) {
-    let socket = session.path.with_extension("sock");
+    let Some(project_dir) = session.path.parent() else {
+        return (false, None);
+    };
+    let Some(data_root) = project_dir.parent().and_then(Path::parent) else {
+        return (false, None);
+    };
+    let Some(project) = project_dir.file_name().and_then(|name| name.to_str()) else {
+        return (false, None);
+    };
+    let store = SessionStore::new(data_root, project);
+    let socket = crate::agent_control::socket_path_for(&store, &session.record.id);
     #[cfg(unix)]
-    if crate::agent_control::is_live(&socket) {
-        return (true, Some(socket));
-    }
-    (false, None)
+    let live = crate::agent_control::is_live(&socket);
+    #[cfg(not(unix))]
+    let live = false;
+    (live, Some(socket))
 }
 
 fn list_json_row(session: &ListedSession) -> Value {

@@ -473,7 +473,9 @@ greppy agent quit      ID [--json]
 ```
 
 `ID` resolves like `sessions` (exact id or unique prefix; `--root` honored).
-A session without a live socket exits 3. `send` queues a turn (`TEXT` may be
+Control sockets use a short per-user runtime path under `/tmp` rather than the
+long data-root path; `sessions list --json` reports the authoritative `socket`
+path. A session without a live socket exits 3. `send` queues a turn (`TEXT` may be
 `-` for stdin); `--wait` subscribes first and streams events until that turn
 completes. `attach` subscribes and streams events until Ctrl+C (exit 130);
 `--since-start` first reprints recent log lines. `interrupt` cancels an

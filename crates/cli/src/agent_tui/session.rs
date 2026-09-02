@@ -86,13 +86,39 @@ impl SessionStore {
         self.root.join(&self.project)
     }
 
-    pub fn path_for(&self, session_id: &str) -> PathBuf {
-        self.project_dir().join(format!("{session_id}.jsonl"))
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
+    pub fn is_valid_id(session_id: &str) -> bool {
+        let bytes = session_id.as_bytes();
+        (1..=128).contains(&bytes.len())
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            && !session_id.contains('/')
+            && !session_id.contains('\\')
+            && !session_id.contains("..")
+    }
+
+    pub fn path_for(&self, session_id: &str) -> io::Result<PathBuf> {
+        if !Self::is_valid_id(session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid session id",
+            ));
+        }
+        Ok(self.project_dir().join(format!("{session_id}.jsonl")))
     }
 
     pub fn create(&self, record: &SessionRecord) -> io::Result<PathBuf> {
-        fs::create_dir_all(self.project_dir())?;
-        let path = self.path_for(&record.id);
+        let path = self.path_for(&record.id)?;
+        fs::create_dir_all(&self.root)?;
+        greppy_core::cache::secure_private_directory(&self.root)?;
+        let project_dir = self.project_dir();
+        fs::create_dir_all(&project_dir)?;
+        greppy_core::cache::secure_private_directory(&project_dir)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -103,7 +129,7 @@ impl SessionStore {
     }
 
     pub fn append(&self, session_id: &str, line: &Value) -> io::Result<()> {
-        let path = self.path_for(session_id);
+        let path = self.path_for(session_id)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{line}")?;
         file.flush()?;
@@ -298,13 +324,13 @@ impl SessionStore {
     }
 
     pub fn load(&self, session_id: &str) -> io::Result<SessionRecord> {
-        load_path(&self.path_for(session_id))
+        load_path(&self.path_for(session_id)?)
     }
 
     pub fn latest(&self) -> io::Result<Option<SessionRecord>> {
         let mut best: Option<(SystemTime, SessionRecord)> = None;
         for record in self.list()? {
-            let modified = fs::metadata(self.path_for(&record.id))
+            let modified = fs::metadata(self.path_for(&record.id)?)
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             match &best {
@@ -379,13 +405,20 @@ pub fn read_session_log_lines(path: &Path) -> io::Result<Vec<SessionLogLine>> {
 }
 
 pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid session id"))?;
+    if !SessionStore::is_valid_id(session_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session id",
+        ));
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut record = SessionRecord::new(
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session")
-            .to_string(),
+        session_id.to_string(),
         String::new(),
         String::new(),
         String::new(),
@@ -659,7 +692,11 @@ fn message_from_value(value: &Value) -> Option<PersistedMessage> {
 }
 
 fn apply_meta(record: &mut SessionRecord, value: &Value) {
-    if let Some(id) = value.get("id").and_then(Value::as_str) {
+    if let Some(id) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| SessionStore::is_valid_id(id))
+    {
         record.id = id.to_string();
     }
     if let Some(project) = value.get("project").and_then(Value::as_str) {
@@ -772,6 +809,78 @@ mod tests {
     }
 
     #[test]
+    fn session_id_validation_accepts_only_safe_basenames() {
+        for valid in ["a", "Session-1", "20260902_172554.abcd"] {
+            assert!(SessionStore::is_valid_id(valid), "expected valid: {valid}");
+        }
+        for invalid in [
+            "",
+            ".hidden",
+            "-leading",
+            "../x",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "with space",
+            "ümlaut",
+        ] {
+            assert!(
+                !SessionStore::is_valid_id(invalid),
+                "expected invalid: {invalid}"
+            );
+        }
+        assert!(!SessionStore::is_valid_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn path_for_rejects_traversal() {
+        let (store, root) = temp_store("invalid-id");
+        let error = store.path_for("../x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "invalid session id");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_meta_id_keeps_filename_derived_id() {
+        let mut record = SessionRecord::new(
+            "filename-id".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        apply_meta(&mut record, &json!({"id":"../x"}));
+        assert_eq!(record.id, "filename-id");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_secures_session_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, root) = temp_store("private");
+        fs::create_dir_all(store.project_dir()).unwrap();
+        fs::set_permissions(&store.root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(store.project_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        let record =
+            SessionRecord::new("sess-private".into(), "demo".into(), "m".into(), "r".into());
+        store.create(&record).unwrap();
+        assert_eq!(
+            fs::metadata(&store.root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.project_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn append_and_restore_round_trip() {
         let (store, root) = temp_store("round");
         let mut record = SessionRecord::new(
@@ -825,7 +934,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let path = store.path_for("sess-2");
+        let path = store.path_for("sess-2").unwrap();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, "{{not json").unwrap();
         let loaded = store.load("sess-2").unwrap();
@@ -945,7 +1054,7 @@ mod tests {
     #[test]
     fn source_defaults_empty_on_legacy_meta() {
         let (store, root) = temp_store("legacy-source");
-        let path = store.path_for("sess-legacy");
+        let path = store.path_for("sess-legacy").unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -1023,7 +1132,7 @@ mod tests {
         assert_eq!(loaded.proposal_ref, "refs/greppy/agent/run");
         assert!(!loaded.recovered);
 
-        let raw = fs::read_to_string(store.path_for(&record.id)).unwrap();
+        let raw = fs::read_to_string(store.path_for(&record.id).unwrap()).unwrap();
         assert!(raw.contains(r#""type":"turn""#));
         assert!(raw.contains(r#""type":"tool""#));
         let finish = raw
