@@ -162,6 +162,7 @@ pub(crate) fn run(
 
     loop {
         let intake = handle.intake.poll(POLL_INTERVAL);
+        let mut worker_error_event = false;
         if !intake.text.is_empty() {
             emit(&mut server, emitter, text_event(&intake.text));
             last_activity = Instant::now();
@@ -228,8 +229,10 @@ pub(crate) fn run(
                 }
                 SessionEvent::Error(message) => {
                     emit(&mut server, emitter, error_event(&message));
+                    set_phase(&mut server, emitter, &mut phase, Phase::Idle);
                     blocked_error = Some(message);
                     quit = true;
+                    worker_error_event = true;
                 }
                 SessionEvent::Warning(message) | SessionEvent::EndpointRejected { message, .. } => {
                     eprintln!("greppy agent serve: {message}");
@@ -241,6 +244,9 @@ pub(crate) fn run(
                 | SessionEvent::Thinking(_)
                 | SessionEvent::Compacted { .. } => {}
             }
+        }
+        if worker_error_event || handle.join.is_finished() {
+            break;
         }
 
         for incoming in server.poll() {

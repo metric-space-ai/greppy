@@ -71,7 +71,10 @@ fn init_repo(root: &Path) {
     git(root, &["commit", "-m", "initial"]);
 }
 
-fn spawn_gateway(delay: Duration) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+fn spawn_gateway(
+    delay: Duration,
+    fail_messages: bool,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -143,11 +146,20 @@ fn spawn_gateway(delay: Duration) -> (String, Arc<AtomicBool>, thread::JoinHandl
                             stream.write_all(response.as_bytes()).ok();
                         } else if first.starts_with("POST /v1/messages") {
                             thread::sleep(delay);
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
-                                sse.len()
-                            );
-                            stream.write_all(response.as_bytes()).ok();
+                            if fail_messages {
+                                let body = r#"{"error":{"message":"serve stub failure"}}"#;
+                                let response = format!(
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                stream.write_all(response.as_bytes()).ok();
+                            } else {
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                                    sse.len()
+                                );
+                                stream.write_all(response.as_bytes()).ok();
+                            }
                         }
                     });
                 }
@@ -274,7 +286,7 @@ fn control_socket_hosts_queued_turns_and_quits_cleanly() {
     let store = unique_temp("control-store");
     let provider_root = unique_temp("control-provider");
     let provider = spawn_fake_provider(&provider_root, &repo);
-    let (endpoint, stop, gateway) = spawn_gateway(Duration::from_millis(250));
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::from_millis(250), false);
     let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
 
     assert_eq!(hosted.session["type"], "session");
@@ -386,13 +398,55 @@ fn control_socket_hosts_queued_turns_and_quits_cleanly() {
 }
 
 #[test]
+fn worker_error_exits_with_error_result_and_unlinks_socket() {
+    let repo = unique_temp("error-repo");
+    init_repo(&repo);
+    let store = unique_temp("error-store");
+    let provider_root = unique_temp("error-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::ZERO, true);
+    let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
+    let socket = PathBuf::from(hosted.session["socket"].as_str().unwrap());
+    let mut client = ControlClient::connect(&socket).unwrap();
+    wait_idle(&mut client);
+    assert_eq!(
+        client.call("turn/start", json!({"text":"fail"})).unwrap()["accepted"],
+        true
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = hosted.child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = hosted.child.kill();
+            let _ = hosted.child.wait();
+            panic!("serve did not exit after worker error");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut rest = String::new();
+    hosted.stdout.read_to_string(&mut rest).unwrap();
+    assert!(!status.success(), "stdout remainder={rest}");
+    let result: Value = serde_json::from_str(rest.lines().last().expect("final result line"))
+        .unwrap_or_else(|error| panic!("final stdout line is not JSON: {error}: {rest:?}"));
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["status"], "error");
+    assert!(!socket.exists());
+
+    stop_gateway(stop, gateway);
+    drop(provider);
+}
+
+#[test]
 fn sigterm_during_idle_emits_result_and_unlinks_socket() {
     let repo = unique_temp("signal-repo");
     init_repo(&repo);
     let store = unique_temp("signal-store");
     let provider_root = unique_temp("signal-provider");
     let provider = spawn_fake_provider(&provider_root, &repo);
-    let (endpoint, stop, gateway) = spawn_gateway(Duration::ZERO);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::ZERO, false);
     let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
     let socket = PathBuf::from(hosted.session["socket"].as_str().unwrap());
     let mut client = ControlClient::connect(&socket).unwrap();
@@ -415,7 +469,7 @@ fn idle_timeout_exits_without_a_client() {
     let store = unique_temp("timeout-store");
     let provider_root = unique_temp("timeout-provider");
     let provider = spawn_fake_provider(&provider_root, &repo);
-    let (endpoint, stop, gateway) = spawn_gateway(Duration::ZERO);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::ZERO, false);
     let mut hosted = spawn_serve(
         &repo,
         &store,
