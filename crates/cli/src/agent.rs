@@ -14,9 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use greppy_agent::system_prompt;
 use greppy_agent::{
-    run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
-    AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
-    SandboxMode, StreamEvent, Usage, WorkspaceError,
+    run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
+    GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StreamEvent,
+    Usage, WorkspaceError,
 };
 
 use crate::agent_tui::{
@@ -75,6 +75,7 @@ Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
+                   [--continue | --resume ID]
   greppy -p --help
 
 Flags:
@@ -109,8 +110,9 @@ Interactive keys and commands (`greppy agent`):
   /exit /quit /q      Finish, restore the terminal, publish the proposal
 
 Session flags:
-  --continue          Restore this project's most recent interactive session
+  --continue          Restore this project's most recent session
   --resume ID         Restore a specific session id
+                      (`greppy -p` and `greppy agent`)
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
@@ -196,11 +198,11 @@ pub struct AgentArgs {
     )]
     pub skip_selfcheck: bool,
 
-    /// Restore the most recent interactive session for this project.
+    /// Restore this project's most recent session.
     #[arg(long = "continue")]
     pub continue_session: bool,
 
-    /// Restore a specific interactive session by id.
+    /// Restore a specific session by id.
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
     pub resume: Option<String>,
 }
@@ -354,11 +356,47 @@ fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
         eprintln!("details: greppy -p --help");
         return Err(EXIT_USAGE);
     }
-    if !interactive && (args.continue_session || args.resume.is_some()) {
-        eprintln!("error: --continue / --resume are only valid with `greppy agent`");
-        return Err(EXIT_USAGE);
-    }
     Ok(())
+}
+
+fn resolve_headless_session_record(
+    store: &SessionStore,
+    project: &str,
+    model: &str,
+    run_id: &str,
+    continue_session: bool,
+    resume: Option<&str>,
+) -> Result<(SessionRecord, bool), (u8, String)> {
+    if let Some(id) = resume {
+        match store.load(id) {
+            Ok(record) => Ok((record, true)),
+            Err(error) => Err((
+                EXIT_USAGE,
+                format!("greppy -p: cannot resume session {id}: {error}"),
+            )),
+        }
+    } else if continue_session {
+        match store.latest() {
+            Ok(Some(record)) => Ok((record, true)),
+            Ok(None) => Err((
+                EXIT_USAGE,
+                "greppy -p: no previous session for this project".to_string(),
+            )),
+            Err(error) => Err((
+                EXIT_USAGE,
+                format!("greppy -p: cannot resume session: {error}"),
+            )),
+        }
+    } else {
+        let mut record = SessionRecord::new(
+            new_session_id(),
+            project.to_string(),
+            model.to_string(),
+            run_id.to_string(),
+        );
+        record.source = "headless".to_string();
+        Ok((record, false))
+    }
 }
 
 fn run_agent(
@@ -390,6 +428,28 @@ fn run_agent(
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
     let run_id = make_run_id();
+    let session_store = SessionStore::new(&shared_data_root, &logical_project);
+    let mut headless_session = if interactive {
+        None
+    } else {
+        match resolve_headless_session_record(
+            &session_store,
+            &logical_project,
+            &model,
+            &run_id,
+            args.continue_session,
+            args.resume.as_deref(),
+        ) {
+            Ok((record, resumed)) => {
+                eprintln!("session: {}", record.id);
+                Some((record, resumed))
+            }
+            Err((code, message)) => {
+                eprintln!("{message}");
+                return code;
+            }
+        }
+    };
     let workspace = match AgentWorkspace::create(&cwd, &run_id) {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
@@ -727,7 +787,27 @@ fn run_agent(
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
-        run_headless_session(&mut client, &mut env, &config, &task).map(|session| (session, false))
+        let (mut record, resumed) = match headless_session.take() {
+            Some(session) => session,
+            None => {
+                eprintln!("greppy -p: internal error: headless session was not resolved");
+                keep_worktree_on_error(&workspace);
+                return EXIT_AGENT;
+            }
+        };
+        record.worktree = workspace.worktree_path().display().to_string();
+        record.branch = git_branch(&cwd);
+        run_headless_session(
+            &mut client,
+            &mut env,
+            &config,
+            &task,
+            &session_store,
+            &mut record,
+            resumed,
+            &model,
+        )
+        .map(|session| (session, false))
     };
     let (session, interactive_cancelled) = match session {
         Ok(session) => session,
@@ -902,38 +982,138 @@ struct SessionSummary {
     session_id: String,
 }
 
+fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
+    if let Err(error) = op {
+        let _ = writeln!(stderr, "greppy -p: session save failed: {error}");
+    }
+}
+
 fn run_headless_session(
     client: &mut Client,
     env: &mut GreppyEnv,
     config: &AgentConfig,
     task: &str,
+    store: &SessionStore,
+    record: &mut SessionRecord,
+    resumed: bool,
+    model: &str,
 ) -> Result<SessionSummary, String> {
+    if resumed {
+        if record.model != model {
+            if let Err(error) = store.set_model(&record.id, model) {
+                eprintln!("greppy -p: session save failed: {error}");
+            }
+            record.model = model.to_string();
+        }
+    } else if let Err(error) = store.create(record) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            eprintln!("greppy -p: session save failed: {error}");
+        }
+    }
+
+    let history = protocol_from_persisted(&record.messages);
+    let previous_message_count = history.len();
+    let mut summary = SessionSummary {
+        usage: record.usage,
+        turns: record.turns,
+        last_stop: None,
+        session_id: record.id.clone(),
+    };
+    if let Err(error) = store.append_turn_start(&record.id, "headless", task) {
+        eprintln!("greppy -p: session save failed: {error}");
+    }
+
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     let mut tool_line_open = false;
-    let mut turns = 0u64;
-    let result = run_agent_loop(client, env, config, task, &mut |event| {
+    let mut prompt_turns = 0u64;
+    let mut tool_started = std::collections::HashMap::<String, Instant>::new();
+    let result = run_agent_loop_with_history(client, env, config, &history, task, &mut |event| {
         if matches!(event, LoopEvent::TurnComplete { .. }) {
-            turns = turns.saturating_add(1);
+            prompt_turns = prompt_turns.saturating_add(1);
+        }
+        match &event {
+            LoopEvent::ToolStart {
+                call_id,
+                name,
+                arguments,
+            } => {
+                tool_started.insert(call_id.clone(), Instant::now());
+                let tool_summary = format_tool_start(name, arguments);
+                persist_session(
+                    &mut stderr,
+                    store.append_tool_start(&record.id, call_id, name, &tool_summary),
+                );
+            }
+            LoopEvent::ToolFinish {
+                call_id, outcome, ..
+            } => {
+                let elapsed_ms = tool_started
+                    .remove(call_id)
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                persist_session(
+                    &mut stderr,
+                    store.append_tool_finish(
+                        &record.id,
+                        call_id,
+                        outcome.is_error,
+                        elapsed_ms,
+                        &outcome.content,
+                    ),
+                );
+            }
+            _ => {}
         }
         handle_loop_event(event, &mut stdout, &mut stderr, &mut tool_line_open);
-    })
-    .map_err(|error| error.to_string())?;
+    });
 
-    if tool_line_open {
-        let _ = writeln!(stderr);
-    }
-    if !result.final_text.is_empty() && !result.final_text.ends_with('\n') {
-        let _ = writeln!(stdout);
-    }
-    let _ = stdout.flush();
+    match result {
+        Ok(result) => {
+            if tool_line_open {
+                let _ = writeln!(stderr);
+            }
+            if !result.final_text.is_empty() && !result.final_text.ends_with('\n') {
+                let _ = writeln!(stdout);
+            }
+            let _ = stdout.flush();
 
-    Ok(SessionSummary {
-        usage: result.usage,
-        turns,
-        last_stop: Some(result.stop),
-        session_id: String::new(),
-    })
+            let new_messages = messages_from_protocol(
+                &result.messages[previous_message_count.min(result.messages.len())..],
+            );
+            persist_session(
+                &mut stderr,
+                store.append_messages(&record.id, &new_messages),
+            );
+            add_usage(&mut summary.usage, &result.usage);
+            summary.turns = summary.turns.saturating_add(prompt_turns);
+            persist_session(
+                &mut stderr,
+                store.append_usage(
+                    &record.id,
+                    &summary.usage,
+                    summary.turns,
+                    stop_label(&result.stop),
+                ),
+            );
+            persist_session(
+                &mut stderr,
+                store.append_turn_done(
+                    &record.id,
+                    stop_label(&result.stop),
+                    prompt_turns,
+                    &result.usage,
+                ),
+            );
+            summary.last_stop = Some(result.stop);
+            Ok(summary)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+            Err(message)
+        }
+    }
 }
 
 struct InteractiveLaunch {
@@ -2824,8 +3004,43 @@ mod tests {
         assert_eq!(b.resume.as_deref(), Some("sess-1"));
         assert!(parse(&["--model", "m", "--continue", "--resume", "x"]).is_err());
         let headless = parse(&["task", "--model", "m", "--continue"]).expect("parse");
-        assert_eq!(validate_args(&headless, false), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&headless, false), Ok(()));
         assert_eq!(validate_args(&headless, true), Ok(()));
+        let resumed = parse(&["task", "--model", "m", "--resume", "sess-1"]).expect("parse");
+        assert_eq!(validate_args(&resumed, false), Ok(()));
+    }
+
+    #[test]
+    fn resolve_headless_session_errors_are_usage() {
+        let root = unique("headless-session");
+        let _ = fs::create_dir_all(&root);
+        let store = SessionStore::new(&root, "demo");
+        let missing = resolve_headless_session_record(
+            &store,
+            "demo",
+            "m",
+            "run",
+            false,
+            Some("does-not-exist"),
+        )
+        .unwrap_err();
+        assert_eq!(missing.0, EXIT_USAGE);
+        assert!(
+            missing
+                .1
+                .starts_with("greppy -p: cannot resume session does-not-exist:"),
+            "{}",
+            missing.1
+        );
+        let none =
+            resolve_headless_session_record(&store, "demo", "m", "run", true, None).unwrap_err();
+        assert_eq!(none.0, EXIT_USAGE);
+        assert_eq!(none.1, "greppy -p: no previous session for this project");
+        let (fresh, resumed) =
+            resolve_headless_session_record(&store, "demo", "m", "run", false, None).unwrap();
+        assert!(!resumed);
+        assert_eq!(fresh.source, "headless");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

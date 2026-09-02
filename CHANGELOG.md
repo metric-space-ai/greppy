@@ -11,6 +11,9 @@ Interactive session JSONL now records additive `tool` and `turn` event lines
 `headless`). Unknown or new line types still load without marking the session
 recovered.
 
+`greppy -p` persists a session in the same store, prints `session: <id>` as
+the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
+
 ## [0.4.0] — 2026-09-02
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache
