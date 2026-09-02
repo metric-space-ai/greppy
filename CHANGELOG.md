@@ -242,6 +242,11 @@ not a Playwright-compatibility claim.
 - Pressing Enter in an eligible form field now performs the HTML implicit-submit
   action through the native input path. This is the distinct Fund 038 fix and
   is not attributed to the pointer-delivery retry above.
+- `web.check` and `web.uncheck` now use the same acknowledged native activation
+  path as `web.click`, verify the resulting checkbox state, and fail explicitly
+  if activation did not take effect. This fixes Fund 033: DOM state and page
+  application state can no longer silently diverge because checkbox events were
+  skipped; an already-matching state remains an intentional event-free no-op.
 - Web-runtime release evidence now binds the exact source commit, records a
   dirty-tree bit and rejects production signing from a dirty checkout. The
   built runtime itself is inspected for the separate Fund 034 and Fund 038

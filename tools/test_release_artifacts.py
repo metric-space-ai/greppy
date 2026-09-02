@@ -443,6 +443,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
         self.assertIn("fund-034-input-receipts", workflow)
         self.assertIn("fund-038-implicit-submit", workflow)
+        self.assertIn("fund-033-checkbox-activation", workflow)
         self.assertIn("GREPPY_SOURCE_COMMIT: ${{ github.sha }}", workflow)
         self.assertIn("web-runtime-ci.yml", workflow)
         self.assertIn("--manifest-path crates/web-runtime/Cargo.toml", workflow)
