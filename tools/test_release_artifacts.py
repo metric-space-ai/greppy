@@ -562,6 +562,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("name: Exact-SHA three-platform performance set", cow_workflow)
         self.assertIn("verify_portable_cow_performance.py", cow_workflow)
         self.assertIn("Build linked web runtime for MSI authoring", cow_workflow)
+        windows_provider_job = cow_workflow.split("windows-winfsp:", 1)[1].split(
+            "portable-agent-contract:", 1
+        )[0]
+        self.assertIn("timeout-minutes: 45", windows_provider_job)
         self.assertIn(
             "crates/web-runtime/scripts/package-web-runtime.sh", cow_workflow
         )

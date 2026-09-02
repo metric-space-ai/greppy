@@ -207,7 +207,7 @@ jobs:
   windows-winfsp:
     name: Windows Greppy WinFsp fork/provider compile
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

@@ -190,6 +190,7 @@ mod pty {
     struct Pty {
         master: File,
         child: Child,
+        terminal_query_tail: Vec<u8>,
         _provider: FakeProvider,
     }
 
@@ -257,6 +258,7 @@ mod pty {
                 Self {
                     master,
                     child,
+                    terminal_query_tail: Vec::new(),
                     _provider: provider,
                 }
             }
@@ -265,6 +267,24 @@ mod pty {
         fn write_all(&mut self, bytes: &[u8]) {
             let _ = self.master.write_all(bytes);
             let _ = self.master.flush();
+        }
+
+        fn answer_terminal_queries(&mut self, bytes: &[u8]) {
+            let mut observed = std::mem::take(&mut self.terminal_query_tail);
+            observed.extend_from_slice(bytes);
+            for offset in 0..observed.len() {
+                let rest = &observed[offset..];
+                if rest.starts_with(b"\x1b[6n") {
+                    self.write_all(b"\x1b[24;1R");
+                } else if rest.starts_with(b"\x1b[c") || rest.starts_with(b"\x1b[0c") {
+                    self.write_all(b"\x1b[?1;2c");
+                } else if rest.starts_with(b"\x1b[>c") || rest.starts_with(b"\x1b[>0c") {
+                    self.write_all(b"\x1b[>0;0;0c");
+                }
+            }
+            let keep = observed.len().min(3);
+            self.terminal_query_tail
+                .extend_from_slice(&observed[observed.len() - keep..]);
         }
 
         fn read_for(&mut self, dur: Duration) -> Vec<u8> {
@@ -279,7 +299,10 @@ mod pty {
                         }
                         thread::sleep(Duration::from_millis(20));
                     }
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        self.answer_terminal_queries(&buf[..n]);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(20));
                     }
@@ -321,6 +344,7 @@ mod pty {
                     }
                     Ok(n) => {
                         out.extend_from_slice(&buf[..n]);
+                        self.answer_terminal_queries(&buf[..n]);
                         if out.windows(needle.len()).any(|window| window == needle) {
                             break;
                         }
