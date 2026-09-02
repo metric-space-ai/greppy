@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,6 +78,7 @@ struct Connection {
 
 pub struct ControlServer {
     path: PathBuf,
+    identity: (u64, u64),
     incoming: Receiver<WireIncoming>,
     connections: Arc<Mutex<HashMap<ConnId, Connection>>>,
     stop: Arc<AtomicBool>,
@@ -86,6 +87,12 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn bind(path: &Path) -> io::Result<Self> {
+        if probe_live(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "session already hosted",
+            ));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -95,6 +102,8 @@ impl ControlServer {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(path)?;
+        let metadata = fs::metadata(path)?;
+        let identity = (metadata.dev(), metadata.ino());
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
 
@@ -144,6 +153,7 @@ impl ControlServer {
 
         Ok(Self {
             path: path.to_path_buf(),
+            identity,
             incoming,
             connections,
             stop,
@@ -296,7 +306,12 @@ impl Drop for ControlServer {
                 let _ = connection.writer.shutdown(std::net::Shutdown::Both);
             }
         }
-        let _ = fs::remove_file(&self.path);
+        if fs::metadata(&self.path)
+            .map(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -492,8 +507,21 @@ pub fn socket_path_for(store: &SessionStore, session_id: &str) -> PathBuf {
         .join(format!("{}.sock", &digest[..16]))
 }
 
+fn probe_live(path: &Path) -> io::Result<bool> {
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ECONNREFUSED) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn is_live(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    probe_live(path).unwrap_or(false)
 }
 
 pub fn not_live_message(session_id: &str) -> String {
@@ -563,6 +591,30 @@ mod tests {
             0o600
         );
         drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn second_bind_refuses_to_replace_a_live_socket() {
+        let path = temp_socket("live-bind");
+        let server = ControlServer::bind(&path).unwrap();
+        let error = ControlServer::bind(&path).err().expect("second bind fails");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(error.to_string(), "session already hosted");
+        assert!(is_live(&path));
+        drop(server);
+    }
+
+    #[test]
+    fn stale_server_drop_preserves_a_replacement_socket() {
+        let path = temp_socket("replacement");
+        let stale = ControlServer::bind(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement = ControlServer::bind(&path).unwrap();
+        drop(stale);
+        assert!(path.exists());
+        assert!(is_live(&path));
+        drop(replacement);
         assert!(!path.exists());
     }
 
