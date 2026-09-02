@@ -212,6 +212,48 @@ pub struct AgentArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Parser)]
+#[command(name = "greppy agent serve", disable_version_flag = true)]
+struct ServeArgs {
+    /// Optional first task, queued after setup.
+    #[arg(value_name = "TASK")]
+    task: Option<String>,
+    #[arg(long, env = "GREPPY_MODEL")]
+    model: Option<String>,
+    #[arg(long, env = "GREPPY_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
+    endpoint: String,
+    #[arg(long = "continue")]
+    continue_session: bool,
+    #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
+    resume: Option<String>,
+    #[arg(long, value_name = "N")]
+    idle_timeout_secs: Option<u64>,
+    #[arg(long, default_value_t = DEFAULT_MAX_TURNS, hide = true)]
+    max_turns: usize,
+    #[arg(long, hide = true)]
+    private_store: bool,
+    #[arg(
+        long,
+        env = "GREPPY_NO_SANDBOX",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+    )]
+    no_sandbox: bool,
+    #[arg(
+        long,
+        env = "GREPPY_SKIP_SELFCHECK",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+    )]
+    skip_selfcheck: bool,
+}
+
 /// Data root and logical project used by the agent session store for `repo_root`.
 ///
 /// Matches `run_agent`: `GREPPY_STORE_DIR` via [`greppy_core::cache::data_root`]
@@ -248,7 +290,74 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 
 /// Parse and run `greppy agent …` in the full-screen interactive UI.
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
+    let rest = super::grep_passthrough_args(argv);
+    if rest.get(1).is_some_and(|token| token == "serve") {
+        return run_agent_serve_invocation(&rest);
+    }
     run_agent_invocation(argv, true)
+}
+
+fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
+    #[cfg(not(unix))]
+    {
+        let _ = rest;
+        eprintln!("greppy agent serve: Unix domain sockets are unsupported on this platform");
+        return EXIT_USAGE;
+    }
+    #[cfg(unix)]
+    {
+        let mut argv = vec![std::ffi::OsString::from("greppy agent serve")];
+        argv.extend(rest.iter().skip(2).cloned());
+        let serve = match ServeArgs::try_parse_from(argv) {
+            Ok(args) => args,
+            Err(error) => {
+                use clap::error::ErrorKind;
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) {
+                    let _ = error.print();
+                    return EXIT_OK;
+                }
+                let _ = error.print();
+                return EXIT_USAGE;
+            }
+        };
+        if serve
+            .model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            eprintln!("error: --model is required (or set GREPPY_MODEL)");
+            return EXIT_USAGE;
+        }
+        let args = AgentArgs {
+            task: serve.task,
+            model: serve.model,
+            endpoint: serve.endpoint,
+            max_turns: serve.max_turns,
+            deadline_secs: None,
+            apply: false,
+            diff: false,
+            keep_worktree: false,
+            private_store: serve.private_store,
+            no_sandbox: serve.no_sandbox,
+            skip_selfcheck: serve.skip_selfcheck,
+            continue_session: serve.continue_session,
+            resume: serve.resume,
+            json: true,
+        };
+        run_agent(
+            args,
+            false,
+            true,
+            serve.idle_timeout_secs,
+            None,
+            crate::agent_tui::AgentSettings::default(),
+        )
+    }
 }
 
 fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
@@ -318,7 +427,7 @@ fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
         None
     };
 
-    run_agent(args, interactive, bootstrap, settings)
+    run_agent(args, interactive, false, None, bootstrap, settings)
 }
 
 fn has_long_option(argv: &[std::ffi::OsString], name: &str) -> bool {
@@ -428,6 +537,8 @@ fn resolve_headless_session_record(
 fn run_agent(
     args: AgentArgs,
     interactive: bool,
+    serve: bool,
+    idle_timeout_secs: Option<u64>,
     mut bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     settings: crate::agent_tui::AgentSettings,
 ) -> u8 {
@@ -482,6 +593,10 @@ fn run_agent(
                 eprintln!("session: {}", record.id);
                 json_session.session_id = record.id.clone();
                 json_session.resumed = resumed;
+                let mut record = record;
+                if serve && !resumed {
+                    record.source = "serve".to_string();
+                }
                 Some((record, resumed))
             }
             Err((code, message)) => {
@@ -568,7 +683,7 @@ fn run_agent(
     if let Ok(key) = std::env::var("GREPPY_API_KEY") {
         client = client.with_api_key(key);
     }
-    if !interactive {
+    if !interactive && !serve {
         match client.probe() {
             Ok(()) => {}
             Err(ProbeError::Unreachable(_)) => {
@@ -930,19 +1045,43 @@ fn run_agent(
         json_session.worktree = record.worktree.clone();
         json_session.branch = record.branch.clone();
         json_session.model = model.clone();
-        run_headless_session(
-            &mut client,
-            &mut env,
-            &config,
-            &task,
-            &session_store,
-            &mut record,
-            resumed,
-            &model,
-            json.as_mut(),
-            &json_session,
-        )
-        .map(|session| (session, false))
+        if serve {
+            let Some(emitter) = json.as_mut() else {
+                return EXIT_AGENT;
+            };
+            crate::agent_serve::run(
+                client,
+                env,
+                config.clone(),
+                &session_store,
+                record,
+                resumed,
+                emitter,
+                crate::agent_serve::ServeLaunch {
+                    task: &task,
+                    endpoint: &endpoint,
+                    model: &model,
+                    sandbox: &json_session.sandbox,
+                    idle_timeout_secs,
+                    json_session: &json_session,
+                },
+            )
+            .map(|session| (session, false))
+        } else {
+            run_headless_session(
+                &mut client,
+                &mut env,
+                &config,
+                &task,
+                &session_store,
+                &mut record,
+                resumed,
+                &model,
+                json.as_mut(),
+                &json_session,
+            )
+            .map(|session| (session, false))
+        }
     };
     let (session, interactive_cancelled) = match session {
         Ok(session) => session,
@@ -1214,11 +1353,34 @@ fn run_agent(
 }
 
 #[derive(Debug, Default)]
-struct SessionSummary {
-    usage: Usage,
-    turns: u64,
-    last_stop: Option<LoopStop>,
-    session_id: String,
+pub(crate) struct SessionSummary {
+    pub(crate) usage: Usage,
+    pub(crate) turns: u64,
+    pub(crate) last_stop: Option<LoopStop>,
+    pub(crate) session_id: String,
+}
+
+pub(crate) struct SessionWorkerParts {
+    pub(crate) client: Client,
+    pub(crate) env: GreppyEnv,
+    pub(crate) config: AgentConfig,
+    pub(crate) endpoint: String,
+    pub(crate) store: SessionStore,
+    pub(crate) record: SessionRecord,
+    pub(crate) prompt_source: Option<String>,
+    pub(crate) start_paused: bool,
+}
+
+pub(crate) struct SessionWorkerHandle {
+    pub(crate) commands: mpsc::Sender<SessionCommand>,
+    pub(crate) intake: crate::agent_tui::EventIntake,
+    pub(crate) join: thread::JoinHandle<Result<SessionSummary, String>>,
+    #[allow(dead_code)]
+    pub(crate) session_id: String,
+    pub(crate) store: SessionStore,
+    pub(crate) record: SessionRecord,
+    pub(crate) bridge: crate::agent_tui::EventBridge,
+    start: Option<mpsc::SyncSender<()>>,
 }
 
 fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
@@ -1385,6 +1547,357 @@ fn run_headless_session(
     }
 }
 
+pub(crate) fn spawn_session_worker(
+    parts: SessionWorkerParts,
+) -> Result<SessionWorkerHandle, String> {
+    let SessionWorkerParts {
+        mut client,
+        mut env,
+        mut config,
+        endpoint: mut current_endpoint,
+        store,
+        record,
+        prompt_source,
+        start_paused,
+    } = parts;
+    let cancel = config
+        .cancel
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    config.cancel = Some(Arc::clone(&cancel));
+    let history = protocol_from_persisted(&record.messages);
+    let restored_usage = record.usage;
+    let restored_turns = record.turns;
+    let (command_tx, command_rx) = mpsc::channel();
+    let (bridge, intake) = bounded_pair();
+    let worker_bridge = bridge.clone();
+    let store_for_worker = store.clone();
+    let record_for_handle = record.clone();
+    let session_id_for_handle = record.id.clone();
+    let mut session_id = record.id;
+    let gateway_api_key = std::env::var("GREPPY_API_KEY").ok();
+    let (start, wait_for_start) = if start_paused {
+        let (tx, rx) = mpsc::sync_channel(0);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let join = thread::Builder::new()
+        .name("greppy-agent-session".to_string())
+        .spawn(move || {
+            if let Some(wait) = wait_for_start {
+                let _ = wait.recv();
+            }
+            let mut history = history;
+            let mut summary = SessionSummary {
+                usage: restored_usage,
+                turns: restored_turns,
+                last_stop: None,
+                session_id: session_id.clone(),
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(summary);
+            }
+            worker_bridge.send_setup_progress(SessionEvent::SetupProgress {
+                phase: "Connecting model gateway".into(),
+                detail: None,
+                unit: "steps".into(),
+                completed: 0,
+                total: 0,
+                rate_milli_per_second: None,
+                eta_seconds: None,
+                elapsed_seconds: 0,
+            });
+            let gateway_ready = match client.list_models() {
+                Ok(models) if !models.is_empty() => {
+                    if config.model == "auto" {
+                        config.model = models[0].clone();
+                        if let Err(error) = store_for_worker.set_model(&session_id, &config.model) {
+                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                        client = client_for_endpoint(
+                            &current_endpoint,
+                            &config.model,
+                            gateway_api_key.as_deref(),
+                        );
+                    }
+                    worker_bridge.send_discrete(SessionEvent::Configuration {
+                        endpoint: current_endpoint.clone(),
+                        model: config.model.clone(),
+                        models,
+                    });
+                    true
+                }
+                Ok(_) => {
+                    worker_bridge.send_discrete(SessionEvent::GatewayRequired(
+                        "The gateway reports no available models. Enter another gateway URL below."
+                            .into(),
+                    ));
+                    false
+                }
+                Err(_) => {
+                    worker_bridge.send_discrete(SessionEvent::GatewayRequired(
+                        "No model gateway detected. Enter its URL below.".into(),
+                    ));
+                    false
+                }
+            };
+            if gateway_ready {
+                worker_bridge.send_discrete(SessionEvent::SetupReady);
+            }
+            let mut tool_started = std::collections::HashMap::<String, Instant>::new();
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    SessionCommand::Quit => break,
+                    SessionCommand::Cancel => {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    SessionCommand::SetModel(model) => {
+                        config.model = model.clone();
+                        if let Err(error) = store_for_worker.set_model(&session_id, &model) {
+                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                    }
+                    SessionCommand::SetEndpoint(endpoint) => {
+                        let candidate = client_for_endpoint(
+                            &endpoint,
+                            &config.model,
+                            gateway_api_key.as_deref(),
+                        );
+                        match candidate.list_models() {
+                            Ok(models) if !models.is_empty() => {
+                                current_endpoint = endpoint;
+                                if config.model == "auto"
+                                    || !models.iter().any(|model| model == &config.model)
+                                {
+                                    config.model = models[0].clone();
+                                }
+                                client = client_for_endpoint(
+                                    &current_endpoint,
+                                    &config.model,
+                                    gateway_api_key.as_deref(),
+                                );
+                                worker_bridge.send_discrete(SessionEvent::Configuration {
+                                    endpoint: current_endpoint.clone(),
+                                    model: config.model.clone(),
+                                    models,
+                                });
+                                worker_bridge.send_discrete(SessionEvent::SetupReady);
+                            }
+                            Ok(_) => worker_bridge.send_discrete(SessionEvent::EndpointRejected {
+                                endpoint,
+                                message: "The gateway reports no available models. Enter another gateway URL below."
+                                    .into(),
+                            }),
+                            Err(_) => worker_bridge.send_discrete(SessionEvent::EndpointRejected {
+                                endpoint,
+                                message: "That gateway is unreachable. Check the URL and GREPPY_API_KEY, then try again."
+                                    .into(),
+                            }),
+                        }
+                    }
+                    SessionCommand::Resume(next_session_id) => {
+                        match store_for_worker.load(&next_session_id) {
+                            Ok(next) => {
+                                history = protocol_from_persisted(&next.messages);
+                                summary.usage = next.usage;
+                                summary.turns = next.turns;
+                                summary.last_stop = None;
+                                config.model = next.model;
+                                session_id = next.id;
+                                summary.session_id = session_id.clone();
+                                cancel.store(false, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                worker_bridge.send_discrete(SessionEvent::Error(format!(
+                                    "cannot resume session {next_session_id}: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    SessionCommand::Compact => {
+                        let compacted = compact_messages(&messages_from_protocol(&history), 8);
+                        history = protocol_from_persisted(&compacted);
+                        if let Err(error) =
+                            store_for_worker.append_message_checkpoint(&session_id, &compacted)
+                        {
+                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
+                        worker_bridge.send_discrete(SessionEvent::Compacted {
+                            messages: compacted,
+                        });
+                    }
+                    SessionCommand::Prompt(prompt) => {
+                        cancel.store(false, Ordering::Relaxed);
+                        let mut prompt_turns = 0u64;
+                        let previous_message_count = history.len();
+                        if let Some(source) = prompt_source.as_deref() {
+                            if let Err(error) = store_for_worker.append_turn_start(
+                                &session_id,
+                                source,
+                                &prompt,
+                            ) {
+                                worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                    "session save failed: {error}"
+                                )));
+                            }
+                        }
+                        let result = run_agent_loop_with_history(
+                            &mut client,
+                            &mut env,
+                            &config,
+                            &history,
+                            &prompt,
+                            &mut |event| {
+                                if matches!(event, LoopEvent::TurnComplete { .. }) {
+                                    prompt_turns = prompt_turns.saturating_add(1);
+                                }
+                                match event {
+                                    LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
+                                        worker_bridge.send_text(&text);
+                                    }
+                                    LoopEvent::Stream(StreamEvent::ThinkingDelta { text }) => {
+                                        worker_bridge.send_thinking(&text);
+                                    }
+                                    LoopEvent::ToolStart {
+                                        call_id,
+                                        name,
+                                        arguments,
+                                    } => {
+                                        tool_started.insert(call_id.clone(), Instant::now());
+                                        let summary =
+                                            format_tool_start(&name, &redact_json(&arguments));
+                                        if let Err(error) = store_for_worker.append_tool_start(
+                                            &session_id,
+                                            &call_id,
+                                            &name,
+                                            &summary,
+                                        ) {
+                                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
+                                        worker_bridge.send_discrete(SessionEvent::ToolStart {
+                                            id: call_id,
+                                            summary,
+                                        });
+                                    }
+                                    LoopEvent::ToolFinish {
+                                        call_id, outcome, ..
+                                    } => {
+                                        let elapsed_ms = tool_started
+                                            .remove(&call_id)
+                                            .map(|started| started.elapsed().as_millis() as u64)
+                                            .unwrap_or(0);
+                                        if let Err(error) = store_for_worker.append_tool_finish(
+                                            &session_id,
+                                            &call_id,
+                                            outcome.is_error,
+                                            elapsed_ms,
+                                            &outcome.content,
+                                        ) {
+                                            worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
+                                        worker_bridge.send_discrete(SessionEvent::ToolFinish {
+                                            id: call_id,
+                                            failed: outcome.is_error,
+                                            elapsed_ms,
+                                            preview: truncate_chars(&outcome.content, 400),
+                                        });
+                                    }
+                                    LoopEvent::Stream(_) | LoopEvent::TurnComplete { .. } => {}
+                                }
+                            },
+                        );
+
+                        match result {
+                            Ok(result) => {
+                                history = result.messages;
+                                add_usage(&mut summary.usage, &result.usage);
+                                summary.turns = summary.turns.saturating_add(prompt_turns);
+                                summary.last_stop = Some(result.stop.clone());
+                                let persisted = messages_from_protocol(&history);
+                                let new_messages = messages_from_protocol(
+                                    &history[previous_message_count.min(history.len())..],
+                                );
+                                if let Err(error) =
+                                    store_for_worker.append_messages(&session_id, &new_messages)
+                                {
+                                    worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
+                                if let Err(error) = store_for_worker.append_usage(
+                                    &session_id,
+                                    &summary.usage,
+                                    summary.turns,
+                                    stop_label(&result.stop),
+                                ) {
+                                    worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
+                                if let Err(error) = store_for_worker.append_turn_done(
+                                    &session_id,
+                                    stop_label(&result.stop),
+                                    prompt_turns,
+                                    &result.usage,
+                                ) {
+                                    worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
+                                worker_bridge.send_discrete(SessionEvent::Done {
+                                    input_tokens: result.usage.input_tokens,
+                                    output_tokens: result.usage.output_tokens,
+                                    cache_read: result.usage.cache_read_input_tokens,
+                                    cache_write: result.usage.cache_creation_input_tokens,
+                                    turns: prompt_turns,
+                                    stop: stop_label(&result.stop).to_string(),
+                                    messages: persisted,
+                                });
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                if let Err(persist_error) =
+                                    store_for_worker.append_turn_error(&session_id, &message)
+                                {
+                                    worker_bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {persist_error}"
+                                    )));
+                                }
+                                worker_bridge.send_discrete(SessionEvent::Error(message.clone()));
+                                return Err(message);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(summary)
+        })
+        .map_err(|error| format!("cannot start session worker: {error}"))?;
+
+    Ok(SessionWorkerHandle {
+        commands: command_tx,
+        intake,
+        join,
+        session_id: session_id_for_handle,
+        store,
+        record: record_for_handle,
+        bridge,
+        start,
+    })
+}
+
 struct InteractiveLaunch {
     model: String,
     endpoint: String,
@@ -1402,8 +1915,8 @@ struct InteractiveLaunch {
 }
 
 fn run_interactive_session(
-    mut client: Client,
-    mut env: GreppyEnv,
+    client: Client,
+    env: GreppyEnv,
     mut config: AgentConfig,
     initial_task: String,
     bootstrap: Option<crate::agent_tui::BootstrapScreen>,
@@ -1457,23 +1970,23 @@ fn run_interactive_session(
     config.cancel = Some(Arc::clone(&cancel));
     config.model = launch.model.clone();
     let ui_cancel = Arc::clone(&cancel);
-    let history = protocol_from_persisted(&record.messages);
-    let restored_usage = record.usage;
-    let restored_turns = record.turns;
-
-    let (command_tx, command_rx) = mpsc::channel();
-    let (bridge, intake) = bounded_pair();
-    let store_for_worker = store.clone();
-    let mut session_id = record.id.clone();
     let startup_worktree = PathBuf::from(&launch.worktree);
     // Gateway/model discovery also runs in the visible setup phase, even when
     // the index is already warm.
     let initializing = true;
-    let mut current_endpoint = launch.endpoint.clone();
-    let gateway_api_key = std::env::var("GREPPY_API_KEY").ok();
+    let mut handle = spawn_session_worker(SessionWorkerParts {
+        client,
+        env,
+        config,
+        endpoint: launch.endpoint.clone(),
+        store,
+        record,
+        prompt_source: Some("interactive".to_string()),
+        start_paused: true,
+    })?;
 
     let index_monitor_cancel = Arc::new(AtomicBool::new(false));
-    let monitor_bridge = bridge.clone();
+    let monitor_bridge = handle.bridge.clone();
     let monitor_cancel = Arc::clone(&index_monitor_cancel);
     let index_monitor = Some(
         thread::Builder::new()
@@ -1508,304 +2021,18 @@ fn run_interactive_session(
             })
             .map_err(|error| format!("cannot start index monitor: {error}"))?,
     );
+    if let Some(start) = handle.start.take() {
+        let _ = start.send(());
+    }
 
-    let worker = thread::Builder::new()
-        .name("greppy-agent-session".to_string())
-        .spawn(move || {
-            let mut history = history;
-            let mut summary = SessionSummary {
-                usage: restored_usage,
-                turns: restored_turns,
-                last_stop: None,
-                session_id: session_id.clone(),
-            };
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(summary);
-            }
-            bridge.send_setup_progress(SessionEvent::SetupProgress {
-                phase: "Connecting model gateway".into(),
-                detail: None,
-                unit: "steps".into(),
-                completed: 0,
-                total: 0,
-                rate_milli_per_second: None,
-                eta_seconds: None,
-                elapsed_seconds: 0,
-            });
-            let gateway_ready = match client.list_models() {
-                Ok(models) if !models.is_empty() => {
-                    if config.model == "auto" {
-                        config.model = models[0].clone();
-                        if let Err(error) = store_for_worker.set_model(&session_id, &config.model) {
-                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                "session save failed: {error}"
-                            )));
-                        }
-                        client = client_for_endpoint(
-                            &current_endpoint,
-                            &config.model,
-                            gateway_api_key.as_deref(),
-                        );
-                    }
-                    bridge.send_discrete(SessionEvent::Configuration {
-                        endpoint: current_endpoint.clone(),
-                        model: config.model.clone(),
-                        models,
-                    });
-                    true
-                }
-                Ok(_) => {
-                    bridge.send_discrete(SessionEvent::GatewayRequired(
-                        "The gateway reports no available models. Enter another gateway URL below."
-                            .into(),
-                    ));
-                    false
-                }
-                Err(_) => {
-                    bridge.send_discrete(SessionEvent::GatewayRequired(
-                        "No model gateway detected. Enter its URL below.".into(),
-                    ));
-                    false
-                }
-            };
-            if gateway_ready {
-                bridge.send_discrete(SessionEvent::SetupReady);
-            }
-            let mut tool_started = std::collections::HashMap::<String, Instant>::new();
-            while let Ok(command) = command_rx.recv() {
-                match command {
-                    SessionCommand::Quit => break,
-                    SessionCommand::Cancel => {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                    SessionCommand::SetModel(model) => {
-                        config.model = model.clone();
-                        if let Err(error) = store_for_worker.set_model(&session_id, &model) {
-                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                "session save failed: {error}"
-                            )));
-                        }
-                    }
-                    SessionCommand::SetEndpoint(endpoint) => {
-                        let candidate = client_for_endpoint(
-                            &endpoint,
-                            &config.model,
-                            gateway_api_key.as_deref(),
-                        );
-                        match candidate.list_models() {
-                            Ok(models) if !models.is_empty() => {
-                                current_endpoint = endpoint;
-                                if config.model == "auto"
-                                    || !models.iter().any(|model| model == &config.model)
-                                {
-                                    config.model = models[0].clone();
-                                }
-                                client = client_for_endpoint(
-                                    &current_endpoint,
-                                    &config.model,
-                                    gateway_api_key.as_deref(),
-                                );
-                                bridge.send_discrete(SessionEvent::Configuration {
-                                    endpoint: current_endpoint.clone(),
-                                    model: config.model.clone(),
-                                    models,
-                                });
-                                bridge.send_discrete(SessionEvent::SetupReady);
-                            }
-                            Ok(_) => bridge.send_discrete(SessionEvent::EndpointRejected {
-                                endpoint,
-                                message: "The gateway reports no available models. Enter another gateway URL below."
-                                    .into(),
-                            }),
-                            Err(_) => bridge.send_discrete(SessionEvent::EndpointRejected {
-                                endpoint,
-                                message: "That gateway is unreachable. Check the URL and GREPPY_API_KEY, then try again."
-                                    .into(),
-                            }),
-                        }
-                    }
-                    SessionCommand::Resume(next_session_id) => {
-                        match store_for_worker.load(&next_session_id) {
-                            Ok(next) => {
-                                history = protocol_from_persisted(&next.messages);
-                                summary.usage = next.usage;
-                                summary.turns = next.turns;
-                                summary.last_stop = None;
-                                config.model = next.model;
-                                session_id = next.id;
-                                summary.session_id = session_id.clone();
-                                cancel.store(false, Ordering::Relaxed);
-                            }
-                            Err(error) => {
-                                bridge.send_discrete(SessionEvent::Error(format!(
-                                    "cannot resume session {next_session_id}: {error}"
-                                )));
-                            }
-                        }
-                    }
-                    SessionCommand::Compact => {
-                        let compacted = compact_messages(&messages_from_protocol(&history), 8);
-                        history = protocol_from_persisted(&compacted);
-                        if let Err(error) =
-                            store_for_worker.append_message_checkpoint(&session_id, &compacted)
-                        {
-                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                "session save failed: {error}"
-                            )));
-                        }
-                        bridge.send_discrete(SessionEvent::Compacted {
-                            messages: compacted,
-                        });
-                    }
-                    SessionCommand::Prompt(prompt) => {
-                        cancel.store(false, Ordering::Relaxed);
-                        let mut prompt_turns = 0u64;
-                        let previous_message_count = history.len();
-                        if let Err(error) = store_for_worker.append_turn_start(
-                            &session_id,
-                            "interactive",
-                            &prompt,
-                        ) {
-                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                "session save failed: {error}"
-                            )));
-                        }
-                        let result = run_agent_loop_with_history(
-                            &mut client,
-                            &mut env,
-                            &config,
-                            &history,
-                            &prompt,
-                            &mut |event| {
-                                if matches!(event, LoopEvent::TurnComplete { .. }) {
-                                    prompt_turns = prompt_turns.saturating_add(1);
-                                }
-                                match event {
-                                    LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
-                                        bridge.send_text(&text);
-                                    }
-                                    LoopEvent::Stream(StreamEvent::ThinkingDelta { text }) => {
-                                        bridge.send_thinking(&text);
-                                    }
-                                    LoopEvent::ToolStart {
-                                        call_id,
-                                        name,
-                                        arguments,
-                                    } => {
-                                        tool_started.insert(call_id.clone(), Instant::now());
-                                        let summary =
-                                            format_tool_start(&name, &redact_json(&arguments));
-                                        if let Err(error) = store_for_worker.append_tool_start(
-                                            &session_id,
-                                            &call_id,
-                                            &name,
-                                            &summary,
-                                        ) {
-                                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                                "session save failed: {error}"
-                                            )));
-                                        }
-                                        bridge.send_discrete(SessionEvent::ToolStart {
-                                            id: call_id,
-                                            summary,
-                                        });
-                                    }
-                                    LoopEvent::ToolFinish {
-                                        call_id, outcome, ..
-                                    } => {
-                                        let elapsed_ms = tool_started
-                                            .remove(&call_id)
-                                            .map(|started| started.elapsed().as_millis() as u64)
-                                            .unwrap_or(0);
-                                        if let Err(error) = store_for_worker.append_tool_finish(
-                                            &session_id,
-                                            &call_id,
-                                            outcome.is_error,
-                                            elapsed_ms,
-                                            &outcome.content,
-                                        ) {
-                                            bridge.send_discrete(SessionEvent::Warning(format!(
-                                                "session save failed: {error}"
-                                            )));
-                                        }
-                                        bridge.send_discrete(SessionEvent::ToolFinish {
-                                            id: call_id,
-                                            failed: outcome.is_error,
-                                            elapsed_ms,
-                                            preview: truncate_chars(&outcome.content, 400),
-                                        });
-                                    }
-                                    LoopEvent::Stream(_) | LoopEvent::TurnComplete { .. } => {}
-                                }
-                            },
-                        );
-
-                        match result {
-                            Ok(result) => {
-                                history = result.messages;
-                                add_usage(&mut summary.usage, &result.usage);
-                                summary.turns = summary.turns.saturating_add(prompt_turns);
-                                summary.last_stop = Some(result.stop.clone());
-                                let persisted = messages_from_protocol(&history);
-                                let new_messages = messages_from_protocol(
-                                    &history[previous_message_count.min(history.len())..],
-                                );
-                                if let Err(error) =
-                                    store_for_worker.append_messages(&session_id, &new_messages)
-                                {
-                                    bridge.send_discrete(SessionEvent::Warning(format!(
-                                        "session save failed: {error}"
-                                    )));
-                                }
-                                if let Err(error) = store_for_worker.append_usage(
-                                    &session_id,
-                                    &summary.usage,
-                                    summary.turns,
-                                    stop_label(&result.stop),
-                                ) {
-                                    bridge.send_discrete(SessionEvent::Warning(format!(
-                                        "session save failed: {error}"
-                                    )));
-                                }
-                                if let Err(error) = store_for_worker.append_turn_done(
-                                    &session_id,
-                                    stop_label(&result.stop),
-                                    prompt_turns,
-                                    &result.usage,
-                                ) {
-                                    bridge.send_discrete(SessionEvent::Warning(format!(
-                                        "session save failed: {error}"
-                                    )));
-                                }
-                                bridge.send_discrete(SessionEvent::Done {
-                                    input_tokens: result.usage.input_tokens,
-                                    output_tokens: result.usage.output_tokens,
-                                    cache_read: result.usage.cache_read_input_tokens,
-                                    cache_write: result.usage.cache_creation_input_tokens,
-                                    turns: prompt_turns,
-                                    stop: stop_label(&result.stop).to_string(),
-                                    messages: persisted,
-                                });
-                            }
-                            Err(error) => {
-                                let message = error.to_string();
-                                if let Err(persist_error) =
-                                    store_for_worker.append_turn_error(&session_id, &message)
-                                {
-                                    bridge.send_discrete(SessionEvent::Warning(format!(
-                                        "session save failed: {persist_error}"
-                                    )));
-                                }
-                                bridge.send_discrete(SessionEvent::Error(message.clone()));
-                                return Err(message);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(summary)
-        })
-        .map_err(|error| format!("cannot start session worker: {error}"))?;
+    let SessionWorkerHandle {
+        commands: command_tx,
+        intake,
+        join: worker,
+        store,
+        record,
+        ..
+    } = handle;
 
     let mut initial_prompts = Vec::new();
     if !initial_task.trim().is_empty() {
