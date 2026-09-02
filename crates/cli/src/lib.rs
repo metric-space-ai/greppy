@@ -93,7 +93,6 @@ mod bash_smart;
 mod context;
 mod workspace_setup;
 use context::*;
-#[allow(clippy::needless_borrow)]
 mod agent;
 mod agent_clients;
 #[cfg(unix)]
