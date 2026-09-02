@@ -209,15 +209,49 @@ class SummaryQualityPrewarmTests(unittest.TestCase):
             ),
         ]
 
-        with mock.patch.object(SUMMARY_QUALITY, "run", side_effect=completed):
+        with (
+            mock.patch.object(SUMMARY_QUALITY, "run", side_effect=completed),
+            mock.patch.object(SUMMARY_QUALITY.time, "monotonic", side_effect=[0, 2]),
+        ):
             with self.assertRaisesRegex(RuntimeError, "did not produce a ready index"):
                 SUMMARY_QUALITY.prewarm_repositories(
                     [{"repo": "serde"}],
                     binary=pathlib.Path("/tmp/greppy"),
                     device="metal",
                     env={},
-                    timeout=600,
+                    timeout=1,
                 )
+
+    def test_waits_for_background_embedding_to_become_ready(self):
+        completed = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(
+                returncode=75,
+                stdout=json.dumps({"healthy": False, "embedding_complete": False}),
+                stderr="",
+            ),
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"healthy": True, "embedding_complete": True}),
+                stderr="",
+            ),
+        ]
+
+        with (
+            mock.patch.object(SUMMARY_QUALITY, "run", side_effect=completed) as run,
+            mock.patch.object(SUMMARY_QUALITY.time, "monotonic", side_effect=[0, 1]),
+            mock.patch.object(SUMMARY_QUALITY.time, "sleep") as sleep,
+        ):
+            SUMMARY_QUALITY.prewarm_repositories(
+                [{"repo": "tokio"}],
+                binary=pathlib.Path("/tmp/greppy"),
+                device="metal",
+                env={},
+                timeout=600,
+            )
+
+        self.assertEqual(run.call_count, 3)
+        sleep.assert_called_once_with(2.0)
 
 
 class SummaryQualityJudgeTests(unittest.TestCase):

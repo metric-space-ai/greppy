@@ -146,38 +146,44 @@ def prewarm_repositories(
                 f"{index_proc.returncode}: {index_proc.stderr[-2000:]}"
             )
 
-        status_proc = run(
-            [
-                str(binary),
-                "--device",
-                device,
-                "--root",
-                str(root),
-                "index",
-                "status",
-                "--json",
-            ],
-            cwd=root,
-            env=env,
-            timeout=timeout,
-        )
-        try:
-            status = json.loads(status_proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"summary-quality prewarm returned invalid status for {repo}: {exc}"
-            ) from exc
-        if (
-            status_proc.returncode != 0
-            or status.get("healthy") is not True
-            or status.get("embedding_complete") is not True
-        ):
-            raise RuntimeError(
-                f"summary-quality prewarm did not produce a ready index for {repo}: "
-                f"exit={status_proc.returncode}, healthy={status.get('healthy')}, "
-                f"embedding_complete={status.get('embedding_complete')}, "
-                f"stderr={status_proc.stderr[-2000:]}"
+        deadline = time.monotonic() + timeout
+        while True:
+            status_proc = run(
+                [
+                    str(binary),
+                    "--device",
+                    device,
+                    "--root",
+                    str(root),
+                    "index",
+                    "status",
+                    "--json",
+                ],
+                cwd=root,
+                env=env,
+                timeout=min(timeout, 120),
             )
+            try:
+                status = json.loads(status_proc.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"summary-quality prewarm returned invalid status for {repo}: {exc}"
+                ) from exc
+            if (
+                status_proc.returncode == 0
+                and status.get("healthy") is True
+                and status.get("embedding_complete") is True
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"summary-quality prewarm did not produce a ready index for {repo}: "
+                    f"exit={status_proc.returncode}, healthy={status.get('healthy')}, "
+                    f"embedding_complete={status.get('embedding_complete')}, "
+                    f"status={json.dumps(status, sort_keys=True)[-4000:]}, "
+                    f"stderr={status_proc.stderr[-2000:]}"
+                )
+            time.sleep(2.0)
         print(f"[prewarm] {repo}: healthy and embedding-complete", flush=True)
 
 
