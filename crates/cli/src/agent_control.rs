@@ -340,10 +340,7 @@ fn read_connection(conn: ConnId, mut stream: UnixStream, tx: mpsc::Sender<WireIn
             Ok(0) => break,
             Ok(count) => {
                 pending.extend_from_slice(&chunk[..count]);
-                loop {
-                    let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
-                        break;
-                    };
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                     if newline > MAX_LINE {
                         let _ = tx.send(WireIncoming::Oversized(conn));
                         return;
@@ -488,6 +485,12 @@ pub fn socket_path_for(store: &SessionStore, session_id: &str) -> PathBuf {
 
 pub fn is_live(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
+}
+
+pub fn not_live_message(session_id: &str) -> String {
+    format!(
+        "session {session_id} is not live (no control socket); start it with greppy agent serve --resume {session_id}"
+    )
 }
 
 #[cfg(test)]

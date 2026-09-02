@@ -93,7 +93,9 @@ mod bash_smart;
 mod context;
 mod workspace_setup;
 use context::*;
+#[allow(clippy::needless_borrow)]
 mod agent;
+mod agent_clients;
 #[cfg(unix)]
 pub mod agent_control;
 #[cfg(unix)]
@@ -391,6 +393,46 @@ pub enum AgentCommand {
     Sessions {
         #[command(subcommand)]
         command: agent_sessions::AgentSessionsCommand,
+    },
+    /// Describe a live hosted session.
+    Status {
+        /// Session id or unique prefix.
+        id: String,
+        /// Emit the describe result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Queue a prompt on a live hosted session.
+    Send {
+        /// Session id or unique prefix.
+        id: String,
+        /// Prompt text, or `-` to read stdin.
+        text: String,
+        /// Wait for this prompt's turn to finish and stream events.
+        #[arg(long)]
+        wait: bool,
+        /// Emit JSON (queued result, or one event object per line with `--wait`).
+        #[arg(long)]
+        json: bool,
+        /// Prompt source label recorded on the turn.
+        #[arg(long, default_value = "remote")]
+        source: String,
+    },
+    /// Request cancellation of the in-flight turn.
+    Interrupt {
+        /// Session id or unique prefix.
+        id: String,
+        /// Emit the interrupt result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a live hosted session to exit.
+    Quit {
+        /// Session id or unique prefix.
+        id: String,
+        /// Emit the quit result as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1599,14 +1641,29 @@ fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
 fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
     let rest = grep_passthrough_args(argv);
     rest.first().is_some_and(|token| token == "agent")
-        && rest
-            .get(1)
-            .is_some_and(|token| token == "apply" || token == "sessions")
+        && rest.get(1).is_some_and(|token| {
+            token == "apply"
+                || token == "sessions"
+                || token == "status"
+                || token == "send"
+                || token == "interrupt"
+                || token == "quit"
+        })
 }
 
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
     match command {
         AgentCommand::Sessions { command } => agent_sessions::run(command, root),
+        AgentCommand::Status { id, json } => agent_clients::status(&id, json, root),
+        AgentCommand::Send {
+            id,
+            text,
+            wait,
+            json,
+            source,
+        } => agent_clients::send(&id, &text, wait, json, &source, root),
+        AgentCommand::Interrupt { id, json } => agent_clients::interrupt(&id, json, root),
+        AgentCommand::Quit { id, json } => agent_clients::quit(&id, json, root),
         AgentCommand::Apply { ref_name } => {
             let target = match root {
                 Some(path) => std::path::PathBuf::from(path),
