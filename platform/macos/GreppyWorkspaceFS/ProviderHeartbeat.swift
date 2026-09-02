@@ -54,9 +54,31 @@ final class ProviderHeartbeat {
 
     init(dataRoot: URL) throws {
         self.dataRoot = dataRoot.standardizedFileURL
-        mountRoot = dataRoot.deletingLastPathComponent()
-            .appendingPathComponent("workspace-mount", isDirectory: true)
+        let contractURL = dataRoot.appendingPathComponent("mount-root", isDirectory: false)
+        let mountPath = try String(contentsOf: contractURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard mountPath.hasPrefix("/") else {
+            throw NSError(
+                domain: "ai.metricspace.greppy.workspacefs",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "FSKit mount-root contract is not absolute"]
+            )
+        }
+        let configuredMountRoot = URL(fileURLWithPath: mountPath, isDirectory: true)
             .standardizedFileURL
+        let applicationGroupRoot = dataRoot.deletingLastPathComponent().standardizedFileURL.path
+        guard configuredMountRoot.path != applicationGroupRoot,
+              !configuredMountRoot.path.hasPrefix(applicationGroupRoot + "/") else {
+            throw NSError(
+                domain: "ai.metricspace.greppy.workspacefs",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "FSKit mount-root contract must be outside the application-group container"
+                ]
+            )
+        }
+        mountRoot = configuredMountRoot
         doctorRoot = dataRoot.appendingPathComponent("provider-doctor", isDirectory: true)
         adapterVersion = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"

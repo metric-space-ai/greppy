@@ -38,11 +38,29 @@ pub(crate) fn setup(data_root: &Path) -> Result<ProviderInstallation, String> {
     Ok(provider)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn mount_root(data_root: &Path) -> Result<PathBuf, String> {
     let parent = data_root
         .parent()
         .ok_or_else(|| format!("workspace data root has no parent: {}", data_root.display()))?;
     Ok(parent.join("workspace-mount"))
+}
+
+#[cfg(target_os = "macos")]
+fn mount_root(_data_root: &Path) -> Result<PathBuf, String> {
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .ok_or_else(|| "HOME is unavailable for the FSKit mount root".to_string())?,
+    );
+    macos_mount_root(&home)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_root(home: &Path) -> Result<PathBuf, String> {
+    if !home.is_absolute() {
+        return Err(format!("HOME is not absolute: {}", home.display()));
+    }
+    Ok(home.join("Library/Application Support/greppy/workspace-mount"))
 }
 
 fn sibling(current_exe: &Path, name: &str) -> Result<PathBuf, String> {
@@ -396,6 +414,14 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
 
 #[cfg(target_os = "macos")]
 fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), String> {
+    let mount_root_text = mount_root
+        .to_str()
+        .ok_or_else(|| format!("macOS mount root is not UTF-8: {}", mount_root.display()))?;
+    atomic_write_autostart(
+        &data_root.join("mount-root"),
+        &format!("{mount_root_text}\n"),
+    )
+    .map_err(|error| format!("cannot publish the FSKit mount-root contract: {error}"))?;
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
     let app = locate_macos_app(&current)?;
@@ -677,11 +703,21 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn mount_is_a_sibling_not_an_alias_of_private_data() {
         let data = Path::new("/tmp/greppy-test/workspace");
         assert_eq!(
             mount_root(data).unwrap(),
             Path::new("/tmp/greppy-test/workspace-mount")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_mount_is_outside_the_application_group_container() {
+        assert_eq!(
+            macos_mount_root(Path::new("/Users/greppy")).unwrap(),
+            Path::new("/Users/greppy/Library/Application Support/greppy/workspace-mount")
         );
     }
 

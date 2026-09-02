@@ -140,7 +140,10 @@ baselines remain pinned until their refs are removed.
   with Developer ID code-signing and Gatekeeper before it opens System
   Settings. An older or incomplete installation therefore fails with a
   reinstall diagnostic instead of directing the user to a switch macOS cannot
-  activate.
+  activate. Private provider data remains in the signed application-group
+  container, while the actual FSKit mount is
+  `~/Library/Application Support/greppy/workspace-mount`; macOS rejects
+  filesystem mounts inside managed Group Container directories.
 
 For the macOS release-signing handoff, the Apple Developer account for team
 `2HS27B8739` must contain these exact resources:

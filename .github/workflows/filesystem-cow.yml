@@ -352,7 +352,7 @@ jobs:
           test -n "$FSKIT_PROFILE_BASE64"
           security find-identity -v -p codesigning | grep -F "$CODE_SIGN_IDENTITY"
           data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
-          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          mount="$HOME/Library/Application Support/greppy/workspace-mount"
           test ! -e "$data"
           test ! -e "$mount"
       - name: Build and install the exact signed FSKit provider
@@ -381,7 +381,7 @@ jobs:
         shell: bash
         run: |
           resource="$RUNNER_TEMP/greppy-workspace-resource.img"
-          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          mount="$HOME/Library/Application Support/greppy/workspace-mount"
           mkfile 1m "$resource"
           device="$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$resource" | awk 'NR == 1 { print $1 }')"
           test -n "$device"
@@ -420,7 +420,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          mount="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace-mount"
+          mount="$HOME/Library/Application Support/greppy/workspace-mount"
           mount | grep -F " on $mount " >/dev/null && diskutil unmount force "$mount" || true
           test -f "$RUNNER_TEMP/fskit-device" && \
             hdiutil detach -force "$(cat "$RUNNER_TEMP/fskit-device")" || true
