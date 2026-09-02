@@ -401,7 +401,11 @@ fn set_control_paths(app: &mut App, store: &SessionStore) {
     app.control_socket = socket_path_for(store, &app.session_id)
         .display()
         .to_string();
-    app.session_jsonl = store.path_for(&app.session_id).display().to_string();
+    app.session_jsonl = store
+        .path_for(&app.session_id)
+        .unwrap_or_default()
+        .display()
+        .to_string();
 }
 
 fn broadcast(control: &mut Option<ControlServer>, event: &Value) {

@@ -476,6 +476,12 @@ fn apply_interactive_settings(
 }
 
 fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
+    if let Some(id) = args.resume.as_deref() {
+        if !SessionStore::is_valid_id(id) {
+            eprintln!("error: invalid session id: {id}");
+            return Err(EXIT_USAGE);
+        }
+    }
     if args.json && interactive {
         eprintln!("error: --json is only valid with `greppy -p`");
         return Err(EXIT_USAGE);
@@ -3555,6 +3561,9 @@ mod tests {
         assert_eq!(validate_args(&headless, true), Ok(()));
         let resumed = parse(&["task", "--model", "m", "--resume", "sess-1"]).expect("parse");
         assert_eq!(validate_args(&resumed, false), Ok(()));
+        let invalid = parse(&["task", "--model", "m", "--resume", "../x"]).expect("parse");
+        assert_eq!(validate_args(&invalid, false), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&invalid, true), Err(EXIT_USAGE));
         let json = parse(&["task", "--model", "m", "--json"]).expect("parse");
         assert!(json.json);
         assert_eq!(validate_args(&json, false), Ok(()));

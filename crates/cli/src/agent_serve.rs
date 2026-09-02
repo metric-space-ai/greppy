@@ -423,7 +423,7 @@ fn describe(
         "pending": pending,
         "pid": std::process::id(),
         "socket": socket,
-        "jsonl": store.path_for(&record.id),
+        "jsonl": store.path_for(&record.id).unwrap_or_default(),
     })
 }
 
