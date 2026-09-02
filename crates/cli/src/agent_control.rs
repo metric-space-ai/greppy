@@ -1,6 +1,6 @@
 //! Local JSON-RPC control transport for hosted agent sessions.
-
-#![cfg(unix)]
+//!
+//! Unix only; `lib.rs` swaps in `agent_control_stub.rs` elsewhere.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;

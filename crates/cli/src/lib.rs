@@ -96,8 +96,16 @@ use context::*;
 mod agent;
 mod agent_clients;
 #[cfg(unix)]
+#[path = "agent_control.rs"]
+pub mod agent_control;
+#[cfg(not(unix))]
+#[path = "agent_control_stub.rs"]
 pub mod agent_control;
 #[cfg(unix)]
+#[path = "agent_serve.rs"]
+mod agent_serve;
+#[cfg(not(unix))]
+#[path = "agent_serve_stub.rs"]
 mod agent_serve;
 pub use agent::agent_session_store_identity;
 mod agent_json;
