@@ -467,7 +467,7 @@ jobs:
           GREPPY_SOURCE_COMMIT: ${{ github.sha }}
         run: >-
           crates/web-runtime/scripts/package-web-runtime.sh
-          target/release/web-runtime-dist
+          "$GITHUB_WORKSPACE/target/release/web-runtime-dist"
 
       - name: Build macOS FSKit application with bundled CLI
         if: runner.os == 'macOS'
