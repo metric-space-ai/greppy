@@ -29,6 +29,13 @@ pub(crate) struct OverlaySpec {
     pub visibility: VisibilityIndex,
 }
 
+#[derive(Debug, Clone)]
+struct PersistedOverlayBinding {
+    base_path: PathBuf,
+    base_commit: String,
+    project: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OverlayFreshnessProof {
     Fresh {
@@ -113,6 +120,19 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
         return Ok(Some((base_path, base_commit)));
     }
 
+    let Some(binding) = persisted_overlay_binding(root)? else {
+        return Ok(None);
+    };
+    if !binding.base_path.is_file() {
+        return Err(Error::Invalid(format!(
+            "linked-worktree Base Store is missing: {}; run `greppy index` to rebuild it",
+            binding.base_path.display()
+        )));
+    }
+    Ok(Some((binding.base_path, binding.base_commit)))
+}
+
+fn persisted_overlay_binding(root: &Path) -> Result<Option<PersistedOverlayBinding>> {
     let delta_path = crate::workspace_locator::store_path(root);
     if !delta_path.is_file() {
         return Ok(None);
@@ -152,12 +172,6 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
         .ok_or_else(|| Error::Invalid("linked-worktree Delta binding lacks base_path".into()))?;
-    if !base_path.is_file() {
-        return Err(Error::Invalid(format!(
-            "linked-worktree Base Store is missing: {}; run `greppy index` to rebuild it",
-            base_path.display()
-        )));
-    }
     let base_commit = value
         .get("base_commit")
         .and_then(serde_json::Value::as_str)
@@ -178,7 +192,11 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
             "linked-worktree Base project mismatch: binding `{project}`, workspace `{expected_project}`; run `greppy index` to rebuild the binding"
         )));
     }
-    Ok(Some((base_path, base_commit)))
+    Ok(Some(PersistedOverlayBinding {
+        base_path,
+        base_commit,
+        project: project.to_string(),
+    }))
 }
 
 /// Prove freshness from the immutable Base plus the small private Delta.
@@ -563,12 +581,22 @@ fn diagnostics_inner(
 ) -> serde_json::Value {
     let resolved_binding = overlay_environment(root);
     let binding_is_persisted = std::env::var_os(ENV_MODE).is_none();
+    let persisted_binding = if binding_is_persisted {
+        persisted_overlay_binding(root).ok().flatten()
+    } else {
+        None
+    };
     let configured_mode = std::env::var(ENV_MODE).ok().or_else(|| {
         resolved_binding
             .as_ref()
             .ok()
             .and_then(|binding| binding.as_ref())
             .map(|_| MODE_OVERLAY.to_string())
+            .or_else(|| persisted_binding.as_ref().map(|_| MODE_OVERLAY.to_string()))
+            .or_else(|| {
+                (binding_is_persisted && resolved_binding.is_err())
+                    .then(|| MODE_OVERLAY.to_string())
+            })
     });
     let fallback_reason = std::env::var(ENV_FALLBACK_REASON).ok();
     let base_commit = std::env::var(ENV_BASE_COMMIT).ok().or_else(|| {
@@ -577,6 +605,11 @@ fn diagnostics_inner(
             .ok()
             .and_then(|binding| binding.as_ref())
             .map(|(_, commit)| commit.clone())
+            .or_else(|| {
+                persisted_binding
+                    .as_ref()
+                    .map(|binding| binding.base_commit.clone())
+            })
     });
     let base_reused = std::env::var(ENV_BASE_REUSED)
         .ok()
@@ -594,13 +627,22 @@ fn diagnostics_inner(
                 .flatten()
         });
 
-    let mut base_path = None;
+    let mut base_path = std::env::var_os(ENV_BASE_PATH)
+        .map(PathBuf::from)
+        .or_else(|| {
+            persisted_binding
+                .as_ref()
+                .map(|binding| binding.base_path.clone())
+        });
     let mut base_identity = None;
-    let mut base_complete = None;
+    let mut base_complete = base_path.as_ref().map(|path| path.is_file());
     let mut dirty_paths = None;
     let mut deleted_paths = None;
     let mut delta_identity = None;
-    let mut error = resolved_binding.err().map(|issue| issue.to_string());
+    let mut error = resolved_binding
+        .as_ref()
+        .err()
+        .map(|issue| issue.to_string());
     if configured_mode.as_deref() == Some(MODE_OVERLAY) {
         match overlay_spec(root) {
             Ok(Some(spec)) => {
@@ -786,11 +828,29 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         // Keep an existing worktree pinned to its verified Base. Advancing the
         // primary checkout must not force every already-indexed worktree to
         // build a new repository-wide Base on its next Delta refresh.
-        let persisted = overlay_environment(root)?;
+        let persisted = match persisted_overlay_binding(root) {
+            Ok(binding) => binding,
+            Err(error) => {
+                eprintln!(
+                    "greppy index: persisted linked-worktree binding is unusable ({error}); rebuilding it"
+                );
+                None
+            }
+        };
         let reused_persisted = match persisted {
-            Some((_, commit)) => {
-                reuse_verified_base_store(&primary, &commit, shared_data_root, &project)?
-                    .map(|prepared| (commit, prepared))
+            Some(binding) if binding.project == project => reuse_verified_base_store(
+                &primary,
+                &binding.base_commit,
+                shared_data_root,
+                &project,
+            )?
+            .map(|prepared| (binding.base_commit, prepared)),
+            Some(binding) => {
+                eprintln!(
+                    "greppy index: persisted linked-worktree project `{}` does not match `{project}`; rebuilding it",
+                    binding.project
+                );
+                None
             }
             None => None,
         };

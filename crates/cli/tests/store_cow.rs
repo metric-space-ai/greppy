@@ -565,6 +565,46 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("first_untracked_symbol"));
+
+    // A manually removed or externally cleaned shared Base used to trap the
+    // linked worktree in a circular recovery: status and queries told the
+    // user to run `greppy index`, but that command opened the same missing
+    // persisted Base before reaching the rebuilding path. Status must now be
+    // structured and the documented foreground recovery must recreate the
+    // immutable Base and republish a healthy Delta binding.
+    let missing_base = PathBuf::from(
+        refreshed_status["store_cow"]["base_path"]
+            .as_str()
+            .expect("persisted Base path"),
+    );
+    std::fs::remove_file(&missing_base).unwrap();
+    let (status_code, status_stdout, status_stderr) =
+        run(&first, &store, &["index", "status", "--json"], None);
+    assert_eq!(status_code, 75, "stderr={status_stderr}");
+    let missing_status: serde_json::Value = serde_json::from_str(&status_stdout).unwrap();
+    assert_eq!(missing_status["status"], "unhealthy", "{missing_status:#}");
+    assert_eq!(missing_status["store_cow"]["mode"], "overlay");
+    assert_eq!(
+        missing_status["store_cow"]["base_path"],
+        missing_base.to_string_lossy().as_ref()
+    );
+    assert_eq!(missing_status["store_cow"]["base_complete"], false);
+    assert!(missing_status["message"]
+        .as_str()
+        .unwrap()
+        .contains("run `greppy index` to rebuild it"));
+
+    let (recovery_code, recovery_stdout, recovery_stderr) =
+        run(&first, &store, &["index", "."], None);
+    assert_eq!(
+        recovery_code, 0,
+        "missing Base recovery failed\nstdout={recovery_stdout}\nstderr={recovery_stderr}"
+    );
+    assert!(recovery_stderr.contains("(created)"), "{recovery_stderr}");
+    let recovered_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(recovered_status["healthy"], true, "{recovered_status:#}");
+    assert_eq!(recovered_status["fresh"], true, "{recovered_status:#}");
+    assert_eq!(recovered_status["store_cow"]["base_complete"], true);
 }
 
 #[test]
