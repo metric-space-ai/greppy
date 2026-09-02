@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Greppy follows Semantic Versioning.
 
+## [Unreleased]
+
+### Agent session events
+
+Interactive session JSONL now records additive `tool` and `turn` event lines
+(start/finish/done/error) plus a `source` field on `meta` (`interactive` /
+`headless`). Unknown or new line types still load without marking the session
+recovered.
+
 ## [0.4.0] — 2026-09-02
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache

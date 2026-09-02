@@ -782,6 +782,25 @@ fn run_agent(
         }
     };
 
+    if !session.session_id.is_empty() {
+        let store = SessionStore::new(&shared_data_root, &logical_project);
+        let proposal_ref = match &outcome {
+            RunOutcome::Clean => "",
+            RunOutcome::Proposal { ref_name, .. } => ref_name.as_str(),
+        };
+        if let Err(error) = store.append_worktree(
+            &session.session_id,
+            &workspace.worktree_path().display().to_string(),
+            proposal_ref,
+        ) {
+            let _ = writeln!(
+                stderr,
+                "greppy {}: session save failed: {error}",
+                if interactive { "agent" } else { "-p" }
+            );
+        }
+    }
+
     let mut exit = EXIT_OK;
     match outcome {
         RunOutcome::Clean => {
@@ -880,6 +899,7 @@ struct SessionSummary {
     usage: Usage,
     turns: u64,
     last_stop: Option<LoopStop>,
+    session_id: String,
 }
 
 fn run_headless_session(
@@ -912,6 +932,7 @@ fn run_headless_session(
         usage: result.usage,
         turns,
         last_stop: Some(result.stop),
+        session_id: String::new(),
     })
 }
 
@@ -950,12 +971,14 @@ fn run_interactive_session(
             .map_err(|error| format!("cannot continue session: {error}"))?
             .ok_or_else(|| "no previous interactive session for this project".to_string())?
     } else {
-        SessionRecord::new(
+        let mut record = SessionRecord::new(
             new_session_id(),
             launch.project.clone(),
             launch.model.clone(),
             launch.run_id.clone(),
-        )
+        );
+        record.source = "interactive".to_string();
+        record
     };
     record.model = launch.model.clone();
     record.run_id = launch.run_id.clone();
@@ -1045,6 +1068,7 @@ fn run_interactive_session(
                 usage: restored_usage,
                 turns: restored_turns,
                 last_stop: None,
+                session_id: session_id.clone(),
             };
             if cancel.load(Ordering::Relaxed) {
                 return Ok(summary);
@@ -1160,6 +1184,7 @@ fn run_interactive_session(
                                 summary.last_stop = None;
                                 config.model = next.model;
                                 session_id = next.id;
+                                summary.session_id = session_id.clone();
                                 cancel.store(false, Ordering::Relaxed);
                             }
                             Err(error) => {
@@ -1187,6 +1212,15 @@ fn run_interactive_session(
                         cancel.store(false, Ordering::Relaxed);
                         let mut prompt_turns = 0u64;
                         let previous_message_count = history.len();
+                        if let Err(error) = store_for_worker.append_turn_start(
+                            &session_id,
+                            "interactive",
+                            &prompt,
+                        ) {
+                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
                         let result = run_agent_loop_with_history(
                             &mut client,
                             &mut env,
@@ -1212,6 +1246,16 @@ fn run_interactive_session(
                                         tool_started.insert(call_id.clone(), Instant::now());
                                         let summary =
                                             format_tool_start(&name, &redact_json(&arguments));
+                                        if let Err(error) = store_for_worker.append_tool_start(
+                                            &session_id,
+                                            &call_id,
+                                            &name,
+                                            &summary,
+                                        ) {
+                                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
                                         bridge.send_discrete(SessionEvent::ToolStart {
                                             id: call_id,
                                             summary,
@@ -1224,6 +1268,17 @@ fn run_interactive_session(
                                             .remove(&call_id)
                                             .map(|started| started.elapsed().as_millis() as u64)
                                             .unwrap_or(0);
+                                        if let Err(error) = store_for_worker.append_tool_finish(
+                                            &session_id,
+                                            &call_id,
+                                            outcome.is_error,
+                                            elapsed_ms,
+                                            &outcome.content,
+                                        ) {
+                                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
                                         bridge.send_discrete(SessionEvent::ToolFinish {
                                             id: call_id,
                                             failed: outcome.is_error,
@@ -1263,6 +1318,16 @@ fn run_interactive_session(
                                         "session save failed: {error}"
                                     )));
                                 }
+                                if let Err(error) = store_for_worker.append_turn_done(
+                                    &session_id,
+                                    stop_label(&result.stop),
+                                    prompt_turns,
+                                    &result.usage,
+                                ) {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
                                 bridge.send_discrete(SessionEvent::Done {
                                     input_tokens: result.usage.input_tokens,
                                     output_tokens: result.usage.output_tokens,
@@ -1275,6 +1340,13 @@ fn run_interactive_session(
                             }
                             Err(error) => {
                                 let message = error.to_string();
+                                if let Err(persist_error) =
+                                    store_for_worker.append_turn_error(&session_id, &message)
+                                {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {persist_error}"
+                                    )));
+                                }
                                 bridge.send_discrete(SessionEvent::Error(message.clone()));
                                 return Err(message);
                             }
