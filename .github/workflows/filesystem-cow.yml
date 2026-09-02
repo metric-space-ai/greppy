@@ -386,9 +386,10 @@ jobs:
           device="$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$resource" | awk 'NR == 1 { print $1 }')"
           test -n "$device"
           echo "$device" >"$RUNNER_TEMP/fskit-device"
-          mkdir -p "$mount"
-          mount -t greppy-cow "$device" "$mount" >"$RUNNER_TEMP/greppy-cow-provider-macos.log" 2>&1
           data="$HOME/Library/Group Containers/group.ai.metricspace.greppy/workspace"
+          mkdir -p "$data" "$mount"
+          printf '%s\n' "$mount" >"$data/mount-root"
+          mount -t greppy-cow "$device" "$mount" >"$RUNNER_TEMP/greppy-cow-provider-macos.log" 2>&1
           for _ in $(seq 1 300); do
             test -f "$data/provider.json" && mount | grep -F " on $mount " && exit 0
             sleep 0.1
