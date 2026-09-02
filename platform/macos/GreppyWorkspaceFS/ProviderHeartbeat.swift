@@ -60,7 +60,7 @@ final class ProviderHeartbeat {
         doctorRoot = dataRoot.appendingPathComponent("provider-doctor", isDirectory: true)
         adapterVersion = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? "0.3.4"
+        ) as? String ?? "0.4.0"
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "greppy.fskit.heartbeat"))
         try FileManager.default.createDirectory(
             at: doctorRoot,
