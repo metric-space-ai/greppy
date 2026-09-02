@@ -1,4 +1,4 @@
-use greppy_workspace_core::WorkspaceCore;
+use crate::WorkspaceCore;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io;
@@ -14,7 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const EVENT_QUEUE_CAPACITY: usize = 4_096;
 type TrackerEvent = notify::Result<notify::Event>;
 
-pub(crate) fn spawn(data_root: PathBuf) -> io::Result<thread::JoinHandle<()>> {
+/// Starts the repository mutation tracker for one workspace data root.
+///
+/// Native provider processes call this on Linux and Windows. macOS calls it
+/// from the unsandboxed Greppy agent process because the sandboxed FSKit
+/// extension cannot watch arbitrary user repositories.
+pub fn spawn_repository_tracker(data_root: PathBuf) -> io::Result<thread::JoinHandle<()>> {
     let core = Arc::new(WorkspaceCore::open(data_root.join("core")).map_err(io::Error::other)?);
     thread::Builder::new()
         .name("greppy-repository-tracker".into())
@@ -188,20 +193,16 @@ fn handle_armed_event(
                         );
                     }
                 }
-                Ok(_) => {
-                    mark_tracker_gap(
-                        core,
-                        repository,
-                        &format!(
-                            "watcher emitted an event without paths: kind={:?}, need_rescan={}",
-                            event.kind,
-                            event.need_rescan()
-                        ),
-                    );
-                }
-                Err(detail) => {
-                    mark_tracker_gap(core, repository, &detail);
-                }
+                Ok(_) => mark_tracker_gap(
+                    core,
+                    repository,
+                    &format!(
+                        "watcher emitted an event without paths: kind={:?}, need_rescan={}",
+                        event.kind,
+                        event.need_rescan()
+                    ),
+                ),
+                Err(detail) => mark_tracker_gap(core, repository, &detail),
             }
         }
         Err(error) => {
@@ -278,7 +279,35 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greppy_workspace_core::RepositoryTrackerState;
+    use crate::RepositoryTrackerState;
+    use std::time::Instant;
+
+    #[test]
+    fn spawned_service_activates_a_late_repository_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let _tracker = spawn_repository_tracker(temp.path().to_path_buf()).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = core.repository_tracker_status(&repository).unwrap();
+            if status
+                .as_ref()
+                .is_some_and(|status| status.state == RepositoryTrackerState::Active)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "repository tracker did not activate: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn path_normalization_is_relative_and_rejects_escape() {

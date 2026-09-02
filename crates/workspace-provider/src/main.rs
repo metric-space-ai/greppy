@@ -18,7 +18,7 @@ fn main() {
         eprintln!("workspace provider paths must be absolute");
         std::process::exit(64);
     }
-    if let Err(error) = tracker::spawn(args.data_root.clone()) {
+    if let Err(error) = greppy_workspace_core::spawn_repository_tracker(args.data_root.clone()) {
         eprintln!("greppy repository tracker failed to start: {error}");
         std::process::exit(1);
     }
@@ -47,5 +47,3 @@ mod linux;
 
 #[cfg(target_os = "windows")]
 mod windows;
-
-mod tracker;

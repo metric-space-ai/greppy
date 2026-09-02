@@ -10,6 +10,7 @@ description = "Filesystem-independent chunk CoW workspace core for greppy agents
 [dependencies]
 blake3 = { workspace = true }
 rusqlite = { workspace = true }
+notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

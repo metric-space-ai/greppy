@@ -179,6 +179,11 @@ impl AgentWorkspace {
         trace_workspace_phase(run_id, "provider-healthy", started);
         provider.doctor_io(&format!("startup-{run_id}"))?;
         trace_workspace_phase(run_id, "provider-io-verified", started);
+        #[cfg(target_os = "macos")]
+        {
+            greppy_workspace_core::spawn_repository_tracker(data_root.clone())?;
+            trace_workspace_phase(run_id, "repository-tracker-started", started);
+        }
         let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         trace_workspace_phase(run_id, "core-open", started);
