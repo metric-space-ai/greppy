@@ -343,3 +343,52 @@ fn sessions_empty_store_is_ok() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert_eq!(stdout.trim(), "[]");
 }
+
+#[test]
+fn sessions_show_and_tail_strip_terminal_control_sequences() {
+    let fx = setup_fixture();
+    let evil = "\\u001b]52;c;x\\u0007SAFE\\u001b[2J";
+    write_session(
+        &fx.sess1,
+        &[
+            &format!(
+                r#"{{"v":1,"type":"meta","id":"sess-1","project":"{}","title":"first","model":"m1","created_ms":1000,"run_id":"run-1","worktree":"/tmp/wt1","branch":"main","proposal_ref":"","source":"{evil}"}}"#,
+                fx.project
+            ),
+            &format!(
+                r#"{{"v":1,"type":"turn","event":"start","ts_ms":1001,"source":"{evil}","prompt":"{evil}"}}"#
+            ),
+            &format!(
+                r#"{{"v":1,"type":"message","role":"user","parts":[{{"kind":"text","text":"{evil}","id":"","name":"","is_error":false}}]}}"#
+            ),
+            &format!(
+                r#"{{"v":1,"type":"tool","event":"start","ts_ms":1002,"id":"t1","name":"greppy","summary":"{evil}"}}"#
+            ),
+        ],
+    );
+
+    let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "show", "sess-1"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.as_bytes().contains(&0x1b),
+        "show leaked ESC: {stdout:?}"
+    );
+    assert!(stdout.contains("SAFE"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "tail", "sess-1"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.as_bytes().contains(&0x1b),
+        "tail leaked ESC: {stdout:?}"
+    );
+    assert!(stdout.contains("SAFE"), "{stdout}");
+    assert!(stdout.contains("turn start (SAFE): SAFE"), "{stdout}");
+    assert!(stdout.contains("▶ SAFE"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "tail", "sess-1", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(evil),
+        "json tail must stay byte-faithful: {stdout}"
+    );
+}

@@ -40,7 +40,7 @@ pub use bootstrap::BootstrapScreen;
 pub use events::{
     bounded_pair, EventBridge, EventIntake, RemoteRequest, SessionCommand, SessionEvent,
 };
-pub use redaction::{redact_json, redact_text};
+pub use redaction::{redact_json, redact_text, sanitize_terminal_text};
 pub use session::{
     compact_messages, list_session_project_dirs, load_path, messages_from_protocol, new_session_id,
     protocol_from_persisted, read_session_log_lines, SessionLogLine, SessionRecord, SessionStore,

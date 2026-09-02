@@ -450,7 +450,9 @@ greppy agent sessions path ID
 
 `list` is newest-first. `show` prints a header plus the transcript (`user:` /
 `assistant:` text, `tool ▶` / `tool ✓|✗`; thinking omitted; tool results
-truncated to 400 characters unless `--full`). `tail --follow` polls every
+truncated to 400 characters unless `--full`). Human `show`/`tail` (and live
+client event rendering) strip terminal control sequences from remote text;
+`--json` stays byte-faithful. `tail --follow` polls every
 200 ms until SIGINT (exit 0). `path` prints the absolute JSONL path. Session
 ids may be unique prefixes; unknown or ambiguous ids exit 2. These commands
 never write the store.

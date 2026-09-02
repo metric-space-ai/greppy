@@ -11,8 +11,8 @@ use greppy_core::error::{Error, Result};
 use serde_json::{json, Value};
 
 use crate::agent_tui::{
-    list_session_project_dirs, load_path, read_session_log_lines, SessionLogLine, SessionRecord,
-    SessionStore,
+    list_session_project_dirs, load_path, read_session_log_lines, sanitize_terminal_text,
+    SessionLogLine, SessionRecord, SessionStore,
 };
 
 const TOOL_RESULT_PREVIEW: usize = 400;
@@ -470,20 +470,18 @@ fn print_show_transcript(session: &ListedSession, full: bool) {
 }
 
 fn print_show_message(value: &Value, full: bool) {
-    let role = value
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("message");
+    let role = sanitize_human(
+        value
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("message"),
+    );
     let Some(parts) = value.get("parts").and_then(Value::as_array) else {
         return;
     };
     for part in parts {
         let kind = part.get("kind").and_then(Value::as_str).unwrap_or("");
-        let mut text = part
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let mut text = sanitize_human(part.get("text").and_then(Value::as_str).unwrap_or(""));
         match kind {
             "thinking" => continue,
             "tool_result" if !full => text = truncate_chars(&text, TOOL_RESULT_PREVIEW),
@@ -500,8 +498,9 @@ fn print_show_message(value: &Value, full: bool) {
 fn render_show_tool(value: &Value) -> Option<String> {
     match value.get("event").and_then(Value::as_str)? {
         "start" => {
-            let name = value.get("name").and_then(Value::as_str).unwrap_or("tool");
-            let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+            let name = sanitize_human(value.get("name").and_then(Value::as_str).unwrap_or("tool"));
+            let summary =
+                sanitize_human(value.get("summary").and_then(Value::as_str).unwrap_or(""));
             Some(format!("tool ▶ {name} {summary}"))
         }
         "finish" => {
@@ -524,16 +523,19 @@ fn render_show_tool(value: &Value) -> Option<String> {
 pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
     match value.get("type").and_then(Value::as_str)? {
         "message" => {
-            let role = value
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("message");
+            let role = sanitize_human(
+                value
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message"),
+            );
             let preview = message_text_preview(value, TAIL_TEXT_PREVIEW);
             Some(format!("{role}: {preview}"))
         }
         "tool" => match value.get("event").and_then(Value::as_str) {
             Some("start") => {
-                let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+                let summary =
+                    sanitize_human(value.get("summary").and_then(Value::as_str).unwrap_or(""));
                 Some(format!("▶ {summary}"))
             }
             Some("finish") => {
@@ -543,7 +545,8 @@ pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    let preview = value.get("preview").and_then(Value::as_str).unwrap_or("");
+                    let preview =
+                        sanitize_human(value.get("preview").and_then(Value::as_str).unwrap_or(""));
                     Some(format!("✗ {elapsed} ms {preview}"))
                 } else {
                     Some(format!("✓ {elapsed} ms"))
@@ -553,12 +556,14 @@ pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
         },
         "turn" => match value.get("event").and_then(Value::as_str) {
             Some("start") => {
-                let source = value.get("source").and_then(Value::as_str).unwrap_or("");
-                let prompt = value.get("prompt").and_then(Value::as_str).unwrap_or("");
+                let source =
+                    sanitize_human(value.get("source").and_then(Value::as_str).unwrap_or(""));
+                let prompt =
+                    sanitize_human(value.get("prompt").and_then(Value::as_str).unwrap_or(""));
                 Some(format!("turn start ({source}): {prompt}"))
             }
             Some("done") => {
-                let stop = value.get("stop").and_then(Value::as_str).unwrap_or("");
+                let stop = sanitize_human(value.get("stop").and_then(Value::as_str).unwrap_or(""));
                 let turns = value.get("turns").and_then(Value::as_u64).unwrap_or(0);
                 let usage = value.get("usage");
                 let input = usage
@@ -574,7 +579,8 @@ pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
                 ))
             }
             Some("error") => {
-                let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+                let message =
+                    sanitize_human(value.get("message").and_then(Value::as_str).unwrap_or(""));
                 Some(format!("turn error: {message}"))
             }
             _ => None,
@@ -583,34 +589,41 @@ pub(crate) fn render_tail_line(value: &Value) -> Option<String> {
             let input = value.get("input").and_then(Value::as_u64).unwrap_or(0);
             let output = value.get("output").and_then(Value::as_u64).unwrap_or(0);
             let turns = value.get("turns").and_then(Value::as_u64).unwrap_or(0);
-            let stop = value.get("stop").and_then(Value::as_str).unwrap_or("");
+            let stop = sanitize_human(value.get("stop").and_then(Value::as_str).unwrap_or(""));
             Some(format!(
                 "usage in={input} out={output} turns={turns} stop={stop}"
             ))
         }
         "title" => Some(format!(
             "title: {}",
-            value.get("title").and_then(Value::as_str).unwrap_or("")
+            sanitize_human(value.get("title").and_then(Value::as_str).unwrap_or(""))
         )),
         "model" => Some(format!(
             "model: {}",
-            value.get("model").and_then(Value::as_str).unwrap_or("")
+            sanitize_human(value.get("model").and_then(Value::as_str).unwrap_or(""))
         )),
         "worktree" => {
-            let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-            let proposal = value
-                .get("proposal_ref")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let path = sanitize_human(value.get("path").and_then(Value::as_str).unwrap_or(""));
+            let proposal = sanitize_human(
+                value
+                    .get("proposal_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
             Some(format!("worktree: {path} {proposal}"))
         }
         "meta" => {
-            let id = value.get("id").and_then(Value::as_str).unwrap_or("");
-            let project = value.get("project").and_then(Value::as_str).unwrap_or("");
+            let id = sanitize_human(value.get("id").and_then(Value::as_str).unwrap_or(""));
+            let project =
+                sanitize_human(value.get("project").and_then(Value::as_str).unwrap_or(""));
             Some(format!("meta: {id} {project}"))
         }
         _ => None,
     }
+}
+
+fn sanitize_human(input: &str) -> String {
+    sanitize_terminal_text(input).into_owned()
 }
 
 fn message_text_preview(value: &Value, max: usize) -> String {
@@ -623,7 +636,9 @@ fn message_text_preview(value: &Value, max: usize) -> String {
             if !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+            text.push_str(&sanitize_human(
+                part.get("text").and_then(Value::as_str).unwrap_or(""),
+            ));
         }
     }
     truncate_chars(&text, max)
@@ -780,4 +795,60 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn injected() -> &'static str {
+        "\u{1b}]52;c;x\u{07}safe\u{1b}[2J"
+    }
+
+    fn assert_no_esc(rendered: &str) {
+        assert!(
+            !rendered.as_bytes().contains(&0x1b),
+            "escape leaked: {rendered:?}"
+        );
+        assert!(rendered.contains("safe"), "{rendered:?}");
+    }
+
+    #[test]
+    fn human_renderers_strip_terminal_control_sequences() {
+        let evil = injected();
+        assert_no_esc(
+            &render_tail_line(&json!({
+                "type": "turn",
+                "event": "start",
+                "source": evil,
+                "prompt": evil,
+            }))
+            .unwrap(),
+        );
+        assert_no_esc(
+            &render_tail_line(&json!({
+                "type": "tool",
+                "event": "start",
+                "summary": evil,
+            }))
+            .unwrap(),
+        );
+        assert_no_esc(
+            &render_tail_line(&json!({
+                "type": "message",
+                "role": "assistant",
+                "parts": [{"kind": "text", "text": evil}],
+            }))
+            .unwrap(),
+        );
+        assert_no_esc(
+            &render_show_tool(&json!({
+                "event": "start",
+                "name": "greppy",
+                "summary": evil,
+            }))
+            .unwrap(),
+        );
+    }
 }

@@ -22,7 +22,9 @@ agent --json` is rejected.
 without starting the TUI or writing to the store. `list` is newest-first;
 `show` renders the transcript; `tail --follow` polls every 200 ms until SIGINT;
 `path` prints the JSONL location. Unknown JSONL types are ignored. Session ids
-accept a unique prefix; unknown or ambiguous ids exit 2.
+accept a unique prefix; unknown or ambiguous ids exit 2. Human `show`/`tail`
+and client event rendering strip terminal control sequences from remote text;
+`--json` stays byte-faithful.
 
 ### Agent control clients
 
