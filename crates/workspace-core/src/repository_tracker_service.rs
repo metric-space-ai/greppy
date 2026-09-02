@@ -1,7 +1,9 @@
 use crate::WorkspaceCore;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -12,7 +14,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EVENT_QUEUE_CAPACITY: usize = 4_096;
+const WATCHER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 type TrackerEvent = notify::Result<notify::Event>;
+
+struct PreparedWatcher {
+    watcher: RecommendedWatcher,
+    armed: Arc<AtomicBool>,
+    readiness_events: Receiver<TrackerEvent>,
+    readiness_overflowed: Arc<AtomicBool>,
+}
 
 /// Starts the repository mutation tracker for one workspace data root.
 ///
@@ -50,8 +60,11 @@ fn supervise(core: Arc<WorkspaceCore>) {
                 }
             };
             match build_watcher(core.clone(), &repository, &git_dir) {
-                Ok((mut watcher, armed)) => {
-                    if let Err(error) = watcher.watch(&repository, RecursiveMode::Recursive) {
+                Ok(mut prepared) => {
+                    if let Err(error) = prepared
+                        .watcher
+                        .watch(&repository, RecursiveMode::Recursive)
+                    {
                         let _ = core.mark_repository_tracker_gap(
                             &repository,
                             &format!("cannot watch repository: {error}"),
@@ -60,7 +73,9 @@ fn supervise(core: Arc<WorkspaceCore>) {
                         continue;
                     }
                     if !git_dir.starts_with(&repository) {
-                        if let Err(error) = watcher.watch(&git_dir, RecursiveMode::Recursive) {
+                        if let Err(error) =
+                            prepared.watcher.watch(&git_dir, RecursiveMode::Recursive)
+                        {
                             let _ = core.mark_repository_tracker_gap(
                                 &repository,
                                 &format!("cannot watch linked Git directory: {error}"),
@@ -69,12 +84,24 @@ fn supervise(core: Arc<WorkspaceCore>) {
                             continue;
                         }
                     }
+                    if let Err(error) = wait_for_watcher_probe(
+                        &git_dir,
+                        &prepared.readiness_events,
+                        &prepared.readiness_overflowed,
+                    ) {
+                        let _ = core.mark_repository_tracker_gap(
+                            &repository,
+                            &format!("watcher readiness probe failed: {error}"),
+                            now_ms(),
+                        );
+                        continue;
+                    }
                     if core
                         .activate_repository_tracker(&repository, now_ms())
                         .is_ok()
                     {
-                        armed.store(true, Ordering::Release);
-                        watchers.insert(repository, watcher);
+                        prepared.armed.store(true, Ordering::Release);
+                        watchers.insert(repository, prepared.watcher);
                     }
                 }
                 Err(error) => {
@@ -94,13 +121,15 @@ fn build_watcher(
     core: Arc<WorkspaceCore>,
     repository: &Path,
     git_dir: &Path,
-) -> notify::Result<(RecommendedWatcher, Arc<AtomicBool>)> {
+) -> notify::Result<PreparedWatcher> {
     let repository = repository.to_path_buf();
     let git_dir = git_dir.to_path_buf();
     let armed = Arc::new(AtomicBool::new(false));
     let callback_armed = armed.clone();
     let (events, pending_events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
     let overflowed = Arc::new(AtomicBool::new(false));
+    let (readiness_sender, readiness_events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    let readiness_overflowed = Arc::new(AtomicBool::new(false));
     let worker_overflowed = overflowed.clone();
     let worker_core = core.clone();
     let worker_repository = repository.clone();
@@ -114,24 +143,43 @@ fn build_watcher(
             &worker_overflowed,
         )
     });
+    let callback_readiness_overflowed = readiness_overflowed.clone();
     let watcher = notify::recommended_watcher(move |event: TrackerEvent| {
-        enqueue_watcher_event(&events, &overflowed, &callback_armed, event)
+        enqueue_watcher_event(
+            &events,
+            &overflowed,
+            &readiness_sender,
+            &callback_readiness_overflowed,
+            &callback_armed,
+            event,
+        )
     })?;
-    Ok((watcher, armed))
+    Ok(PreparedWatcher {
+        watcher,
+        armed,
+        readiness_events,
+        readiness_overflowed,
+    })
 }
 
 fn enqueue_watcher_event(
     events: &SyncSender<TrackerEvent>,
     overflowed: &AtomicBool,
+    readiness_events: &SyncSender<TrackerEvent>,
+    readiness_overflowed: &AtomicBool,
     armed: &AtomicBool,
     event: TrackerEvent,
 ) {
     if event.as_ref().is_ok_and(|event| event.kind.is_access()) {
         return;
     }
-    if event.is_ok() && !armed.load(Ordering::Acquire) {
-        // Successful events emitted while watch roots are being installed are
-        // covered by the first full double-capture after activation.
+    if !armed.load(Ordering::Acquire) {
+        if matches!(
+            readiness_events.try_send(event),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+        ) {
+            readiness_overflowed.store(true, Ordering::Release);
+        }
         return;
     }
     if matches!(
@@ -140,6 +188,74 @@ fn enqueue_watcher_event(
     ) {
         overflowed.store(true, Ordering::Release);
     }
+}
+
+fn wait_for_watcher_probe(
+    git_dir: &Path,
+    events: &Receiver<TrackerEvent>,
+    overflowed: &AtomicBool,
+) -> io::Result<()> {
+    let name = format!("greppy-tracker-ready-{}-{}", std::process::id(), now_ms());
+    let probe = git_dir.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    if let Err(error) = file
+        .write_all(b"greppy.repository-tracker-ready.v1\n")
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        return Err(error);
+    }
+    drop(file);
+
+    let deadline = std::time::Instant::now() + WATCHER_READY_TIMEOUT;
+    let result = loop {
+        if overflowed.swap(false, Ordering::AcqRel) {
+            break Err(io::Error::other("readiness event queue overflowed"));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no event for {} within {} seconds",
+                    probe.display(),
+                    WATCHER_READY_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        match events.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(Ok(event)) if event.paths.iter().any(|path| path == &probe) => break Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                break Err(io::Error::other(format!(
+                    "watcher backend error before activation: {error}"
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "no event for {} within {} seconds",
+                        probe.display(),
+                        WATCHER_READY_TIMEOUT.as_secs()
+                    ),
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "readiness event channel disconnected",
+                ))
+            }
+        }
+    };
+    let cleanup = std::fs::remove_file(&probe);
+    result?;
+    cleanup
 }
 
 fn drain_watcher_events(
@@ -332,8 +448,9 @@ mod tests {
         let git_dir = std::fs::canonicalize(git_dir_path).unwrap();
         let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
         core.request_repository_tracker(&repository).unwrap();
-        let (mut watcher, armed) = build_watcher(core.clone(), &repository, &git_dir).unwrap();
-        watcher
+        let mut prepared = build_watcher(core.clone(), &repository, &git_dir).unwrap();
+        prepared
+            .watcher
             .watch(&repository, RecursiveMode::Recursive)
             .unwrap();
         std::fs::write(
@@ -349,10 +466,16 @@ mod tests {
                 .state,
             RepositoryTrackerState::Requested
         );
+        wait_for_watcher_probe(
+            &git_dir,
+            &prepared.readiness_events,
+            &prepared.readiness_overflowed,
+        )
+        .unwrap();
         let active = core
             .activate_repository_tracker(&repository, now_ms())
             .unwrap();
-        armed.store(true, Ordering::Release);
+        prepared.armed.store(true, Ordering::Release);
         std::fs::write(repository.join("changed.txt"), b"changed").unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -453,11 +576,15 @@ mod tests {
         use notify::{Event, EventKind};
 
         let (events, _pending) = mpsc::sync_channel(1);
+        let (readiness_events, _pending_readiness) = mpsc::sync_channel(1);
         let overflowed = AtomicBool::new(false);
+        let readiness_overflowed = AtomicBool::new(false);
         let armed = AtomicBool::new(true);
         enqueue_watcher_event(
             &events,
             &overflowed,
+            &readiness_events,
+            &readiness_overflowed,
             &armed,
             Ok(Event::new(EventKind::Access(AccessKind::Close(
                 AccessMode::Read,
@@ -466,12 +593,16 @@ mod tests {
         enqueue_watcher_event(
             &events,
             &overflowed,
+            &readiness_events,
+            &readiness_overflowed,
             &armed,
             Ok(Event::new(EventKind::Modify(ModifyKind::Any))),
         );
         enqueue_watcher_event(
             &events,
             &overflowed,
+            &readiness_events,
+            &readiness_overflowed,
             &armed,
             Ok(Event::new(EventKind::Modify(ModifyKind::Any))),
         );

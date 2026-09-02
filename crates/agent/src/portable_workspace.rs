@@ -21,6 +21,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const REPOSITORY_TRACKER_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct AgentWorkspace {
     repo_root: PathBuf,
     worktree: PathBuf,
@@ -538,7 +540,7 @@ fn capture_tracked_repository(
     let repository = fs::canonicalize(repository)?;
     core.request_repository_tracker(&repository)?;
     trace_workspace_phase(run_id, "tracker-requested", started);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
     let active = loop {
         if let Some(status) = core.repository_tracker_status(&repository)? {
             if status.state == RepositoryTrackerState::Active {
@@ -555,9 +557,10 @@ fn capture_tracked_repository(
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(WorkspaceError::AdapterUnavailable(
-                "repository tracker did not become active within three seconds".into(),
-            ));
+            return Err(WorkspaceError::AdapterUnavailable(format!(
+                "repository tracker did not become active within {} seconds",
+                REPOSITORY_TRACKER_TIMEOUT.as_secs()
+            )));
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -725,7 +728,7 @@ fn wait_for_tracker_path(
     after_generation: u64,
     expected_path: &str,
 ) -> Result<u64, WorkspaceError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
     loop {
         let status = core.repository_tracker_status(repository)?.ok_or_else(|| {
             WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())

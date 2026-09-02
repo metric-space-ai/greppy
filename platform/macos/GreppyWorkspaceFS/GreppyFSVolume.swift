@@ -12,6 +12,11 @@ final class GreppyFSVolume: FSVolume {
     private let resource: FSResource
     private let core: RustWorkspaceCore
     private let heartbeat: ProviderHeartbeat
+    private let mountTime: timespec = {
+        var value = timespec()
+        clock_gettime(CLOCK_REALTIME, &value)
+        return value
+    }()
     private let cache = NSLock()
     private var items: [GreppyFSItem.Location: GreppyFSItem] = [:]
     private var nextIdentifier: UInt64 = FSItem.Identifier.rootDirectory.rawValue + 16
@@ -563,6 +568,7 @@ extension GreppyFSVolume: FSVolume.Operations {
         value.linkCount = 2
         value.size = 0
         value.allocSize = 0
+        completeStandardAttributes(value, timestamp: mountTime)
         return value
     }
 
@@ -575,6 +581,7 @@ extension GreppyFSVolume: FSVolume.Operations {
         value.linkCount = 1
         value.size = UInt64(heartbeat.manifestData().count)
         value.allocSize = value.size
+        completeStandardAttributes(value, timestamp: mountTime)
         return value
     }
 
@@ -602,10 +609,9 @@ extension GreppyFSVolume: FSVolume.Operations {
         value.linkCount = (raw[.referenceCount] as? NSNumber)?.uint32Value ?? 1
         value.size = (raw[.size] as? NSNumber)?.uint64Value ?? 0
         value.allocSize = value.size
-        let modified = (raw[.modificationDate] as? Date) ?? Date()
-        value.modifyTime = dateTime(modified)
-        value.changeTime = value.modifyTime
-        value.accessTime = value.modifyTime
+        let modified = (raw[.modificationDate] as? Date).map(dateTime) ?? mountTime
+        let created = (raw[.creationDate] as? Date).map(dateTime) ?? modified
+        completeStandardAttributes(value, timestamp: modified, birthTime: created)
         return value
     }
 
@@ -691,7 +697,25 @@ extension GreppyFSVolume: FSVolume.Operations {
         value.accessTime = time(metadata.accessedNanoseconds)
         value.modifyTime = time(metadata.modifiedNanoseconds)
         value.changeTime = time(metadata.changedNanoseconds)
+        value.birthTime = value.changeTime
+        value.uid = getuid()
+        value.gid = getgid()
+        value.flags = 0
         return value
+    }
+
+    private func completeStandardAttributes(
+        _ value: FSItem.Attributes,
+        timestamp: timespec,
+        birthTime: timespec? = nil
+    ) {
+        value.uid = getuid()
+        value.gid = getgid()
+        value.flags = 0
+        value.birthTime = birthTime ?? timestamp
+        value.accessTime = timestamp
+        value.modifyTime = timestamp
+        value.changeTime = timestamp
     }
 
     private func itemType(_ kind: RustWorkspaceMetadata.Kind) -> FSItem.ItemType {
