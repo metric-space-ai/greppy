@@ -21,7 +21,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const REPOSITORY_TRACKER_TIMEOUT: Duration = Duration::from_secs(5);
+const REPOSITORY_TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
+const REPOSITORY_TRACKER_FENCE_ATTEMPT: Duration = Duration::from_secs(2);
 
 pub struct AgentWorkspace {
     repo_root: PathBuf,
@@ -692,33 +693,61 @@ fn repository_tracker_fence(
         repository,
         &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
     )?);
-    let name = format!(
-        "greppy-tracker-fence-{}-{}",
-        std::process::id(),
-        now_unix_ns()
-    );
-    let path = git_dir.join(&name);
-    let virtual_path = format!(".git/{name}");
-    let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
-        WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
-    })?;
-    if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
-        return Err(WorkspaceError::AdapterUnavailable(
-            "repository tracker changed before fence".into(),
-        ));
+    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
+    let mut attempt = 0u32;
+    loop {
+        let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
+            WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+        })?;
+        if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
+            return Err(WorkspaceError::AdapterUnavailable(
+                "repository tracker changed before fence".into(),
+            ));
+        }
+        let name = format!(
+            "greppy-tracker-fence-{}-{}-{attempt}",
+            std::process::id(),
+            now_unix_ns()
+        );
+        let path = git_dir.join(&name);
+        let virtual_path = format!(".git/{name}");
+        fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait = remaining.min(REPOSITORY_TRACKER_FENCE_ATTEMPT);
+        let observed = wait_for_tracker_path(
+            repository,
+            core,
+            epoch,
+            before.generation,
+            &virtual_path,
+            wait,
+        );
+        let remove = fs::remove_file(&path);
+        match observed {
+            Ok(Some(generation)) => {
+                remove?;
+                // The observed create event is the ordering barrier: every
+                // repository event before this fence has reached the journal.
+                return Ok(generation);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                remove?;
+                attempt += 1;
+            }
+            Ok(None) => {
+                remove?;
+                return Err(WorkspaceError::AdapterUnavailable(format!(
+                    "repository tracker fence timed out after {} seconds and {} attempts; set GREPPY_TRACKER_TRACE=1 for event-path diagnostics",
+                    REPOSITORY_TRACKER_TIMEOUT.as_secs(),
+                    attempt + 1
+                )));
+            }
+            Err(error) => {
+                let _ = remove;
+                return Err(error);
+            }
+        }
     }
-    fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
-    let created = wait_for_tracker_path(repository, core, epoch, before.generation, &virtual_path);
-    let remove = fs::remove_file(&path);
-    let created = created?;
-    remove?;
-    // The observed create event is the ordering barrier: every repository
-    // event that happened before the fence write has reached the journal.
-    // Removal is synchronous and fence paths are excluded from every snapshot
-    // delta, so waiting for a second watcher round-trip adds latency without
-    // strengthening the captured baseline. A delayed removal event remains a
-    // harmless ignored journal entry for the next fence.
-    Ok(created)
 }
 
 fn wait_for_tracker_path(
@@ -727,8 +756,9 @@ fn wait_for_tracker_path(
     epoch: u64,
     after_generation: u64,
     expected_path: &str,
-) -> Result<u64, WorkspaceError> {
-    let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
+    timeout: Duration,
+) -> Result<Option<u64>, WorkspaceError> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let status = core.repository_tracker_status(repository)?.ok_or_else(|| {
             WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
@@ -744,13 +774,11 @@ fn wait_for_tracker_path(
         if status.generation > after_generation {
             let changes = core.repository_changes_since(repository, epoch, after_generation)?;
             if changes.paths.iter().any(|path| path == expected_path) {
-                return Ok(status.generation);
+                return Ok(Some(status.generation));
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(WorkspaceError::AdapterUnavailable(format!(
-                "repository tracker fence timed out for {expected_path}"
-            )));
+            return Ok(None);
         }
         thread::sleep(Duration::from_millis(10));
     }

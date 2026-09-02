@@ -1,5 +1,5 @@
 use crate::WorkspaceCore;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -14,11 +14,43 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EVENT_QUEUE_CAPACITY: usize = 4_096;
-const WATCHER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOMMENDED_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 type TrackerEvent = notify::Result<notify::Event>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatcherBackend {
+    Recommended,
+    Poll,
+}
+
+impl WatcherBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::Poll => "poll-250ms",
+        }
+    }
+}
+
+enum LiveWatcher {
+    Recommended(RecommendedWatcher),
+    Poll(PollWatcher),
+}
+
+impl LiveWatcher {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Recommended(watcher) => watcher.watch(path, mode),
+            Self::Poll(watcher) => watcher.watch(path, mode),
+        }
+    }
+}
+
 struct PreparedWatcher {
-    watcher: RecommendedWatcher,
+    watcher: LiveWatcher,
+    backend: WatcherBackend,
     armed: Arc<AtomicBool>,
     readiness_events: Receiver<TrackerEvent>,
     readiness_overflowed: Arc<AtomicBool>,
@@ -37,7 +69,7 @@ pub fn spawn_repository_tracker(data_root: PathBuf) -> io::Result<thread::JoinHa
 }
 
 fn supervise(core: Arc<WorkspaceCore>) {
-    let mut watchers = HashMap::<PathBuf, RecommendedWatcher>::new();
+    let mut watchers = HashMap::<PathBuf, LiveWatcher>::new();
     loop {
         let requests = match core.pending_repository_trackers() {
             Ok(requests) => requests,
@@ -59,49 +91,40 @@ fn supervise(core: Arc<WorkspaceCore>) {
                     continue;
                 }
             };
-            match build_watcher(core.clone(), &repository, &git_dir) {
-                Ok(mut prepared) => {
-                    if let Err(error) = prepared
-                        .watcher
-                        .watch(&repository, RecursiveMode::Recursive)
-                    {
-                        let _ = core.mark_repository_tracker_gap(
+            match prepare_watcher(core.clone(), &repository, &git_dir) {
+                Ok(prepared) => {
+                    // Publish the callback routing before exposing Active in
+                    // SQLite. The client writes its fence as soon as it sees
+                    // Active; activating first allowed that event to fall into
+                    // the no-longer-consumed readiness queue under load.
+                    prepared.armed.store(true, Ordering::Release);
+                    match core.activate_repository_tracker(&repository, now_ms()) {
+                        Ok(active) => match verify_or_fallback_active_watcher(
+                            core.clone(),
                             &repository,
-                            &format!("cannot watch repository: {error}"),
-                            now_ms(),
-                        );
-                        continue;
-                    }
-                    if !git_dir.starts_with(&repository) {
-                        if let Err(error) =
-                            prepared.watcher.watch(&git_dir, RecursiveMode::Recursive)
-                        {
+                            &git_dir,
+                            &active,
+                            prepared,
+                        ) {
+                            Ok(watcher) => {
+                                watchers.insert(repository, watcher);
+                            }
+                            Err(error) => {
+                                let _ = core.mark_repository_tracker_gap(
+                                    &repository,
+                                    &format!("active watcher fence failed: {error}"),
+                                    now_ms(),
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            prepared.armed.store(false, Ordering::Release);
                             let _ = core.mark_repository_tracker_gap(
                                 &repository,
-                                &format!("cannot watch linked Git directory: {error}"),
+                                &format!("cannot activate watcher: {error}"),
                                 now_ms(),
                             );
-                            continue;
                         }
-                    }
-                    if let Err(error) = wait_for_watcher_probe(
-                        &git_dir,
-                        &prepared.readiness_events,
-                        &prepared.readiness_overflowed,
-                    ) {
-                        let _ = core.mark_repository_tracker_gap(
-                            &repository,
-                            &format!("watcher readiness probe failed: {error}"),
-                            now_ms(),
-                        );
-                        continue;
-                    }
-                    if core
-                        .activate_repository_tracker(&repository, now_ms())
-                        .is_ok()
-                    {
-                        prepared.armed.store(true, Ordering::Release);
-                        watchers.insert(repository, prepared.watcher);
                     }
                 }
                 Err(error) => {
@@ -117,10 +140,149 @@ fn supervise(core: Arc<WorkspaceCore>) {
     }
 }
 
+fn verify_or_fallback_active_watcher(
+    core: Arc<WorkspaceCore>,
+    repository: &Path,
+    git_dir: &Path,
+    active: &crate::RepositoryTrackerStatus,
+    prepared: PreparedWatcher,
+) -> Result<LiveWatcher, String> {
+    let timeout = if prepared.backend == WatcherBackend::Recommended {
+        RECOMMENDED_READY_TIMEOUT
+    } else {
+        POLL_READY_TIMEOUT
+    };
+    match wait_for_active_watcher_probe(
+        &core,
+        repository,
+        git_dir,
+        active.epoch,
+        active.generation,
+        timeout,
+    ) {
+        Ok(()) => {
+            trace_tracker_state(repository, "tracker-active", prepared.backend, None);
+            Ok(prepared.watcher)
+        }
+        Err(primary_error)
+            if cfg!(target_os = "macos") && prepared.backend == WatcherBackend::Recommended =>
+        {
+            prepared.armed.store(false, Ordering::Release);
+            drop(prepared.watcher);
+            trace_tracker_state(
+                repository,
+                "tracker-poll-fallback",
+                WatcherBackend::Poll,
+                Some(&primary_error.to_string()),
+            );
+            let fallback = install_and_probe_watcher(
+                core.clone(),
+                repository,
+                git_dir,
+                WatcherBackend::Poll,
+                POLL_READY_TIMEOUT,
+            )?;
+            fallback.armed.store(true, Ordering::Release);
+            let generation = core
+                .repository_tracker_status(repository)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "repository tracker disappeared during fallback".to_owned())?
+                .generation;
+            wait_for_active_watcher_probe(
+                &core,
+                repository,
+                git_dir,
+                active.epoch,
+                generation,
+                POLL_READY_TIMEOUT,
+            )
+            .map_err(|error| format!("PollWatcher active fence failed: {error}"))?;
+            trace_tracker_state(repository, "tracker-active", WatcherBackend::Poll, None);
+            Ok(fallback.watcher)
+        }
+        Err(error) => Err(format!(
+            "{} active fence failed: {error}",
+            prepared.backend.label()
+        )),
+    }
+}
+
+fn prepare_watcher(
+    core: Arc<WorkspaceCore>,
+    repository: &Path,
+    git_dir: &Path,
+) -> Result<PreparedWatcher, String> {
+    match install_and_probe_watcher(
+        core.clone(),
+        repository,
+        git_dir,
+        WatcherBackend::Recommended,
+        RECOMMENDED_READY_TIMEOUT,
+    ) {
+        Ok(prepared) => Ok(prepared),
+        Err(recommended_error) if cfg!(target_os = "macos") => {
+            trace_tracker_state(
+                repository,
+                "tracker-poll-fallback",
+                WatcherBackend::Poll,
+                Some(&recommended_error),
+            );
+            install_and_probe_watcher(
+                core,
+                repository,
+                git_dir,
+                WatcherBackend::Poll,
+                POLL_READY_TIMEOUT,
+            )
+            .map_err(|poll_error| {
+                format!(
+                    "recommended watcher failed ({recommended_error}); PollWatcher failed ({poll_error})"
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn install_and_probe_watcher(
+    core: Arc<WorkspaceCore>,
+    repository: &Path,
+    git_dir: &Path,
+    backend: WatcherBackend,
+    timeout: Duration,
+) -> Result<PreparedWatcher, String> {
+    let mut prepared = build_watcher(core, repository, git_dir, backend)
+        .map_err(|error| format!("cannot create {} watcher: {error}", backend.label()))?;
+    prepared
+        .watcher
+        .watch(repository, RecursiveMode::Recursive)
+        .map_err(|error| format!("cannot watch repository with {}: {error}", backend.label()))?;
+    if !git_dir.starts_with(repository) {
+        prepared
+            .watcher
+            .watch(git_dir, RecursiveMode::Recursive)
+            .map_err(|error| {
+                format!(
+                    "cannot watch linked Git directory with {}: {error}",
+                    backend.label()
+                )
+            })?;
+    }
+    wait_for_watcher_probe(
+        git_dir,
+        &prepared.readiness_events,
+        &prepared.readiness_overflowed,
+        timeout,
+    )
+    .map_err(|error| format!("{} readiness probe failed: {error}", backend.label()))?;
+    Ok(prepared)
+}
+
 fn build_watcher(
     core: Arc<WorkspaceCore>,
     repository: &Path,
     git_dir: &Path,
+    backend: WatcherBackend,
 ) -> notify::Result<PreparedWatcher> {
     let repository = repository.to_path_buf();
     let git_dir = git_dir.to_path_buf();
@@ -144,7 +306,10 @@ fn build_watcher(
         )
     });
     let callback_readiness_overflowed = readiness_overflowed.clone();
-    let watcher = notify::recommended_watcher(move |event: TrackerEvent| {
+    let callback_repository = repository.clone();
+    let callback_git_dir = git_dir.clone();
+    let callback = move |event: TrackerEvent| {
+        trace_tracker_event(&callback_repository, &callback_git_dir, backend, &event);
         enqueue_watcher_event(
             &events,
             &overflowed,
@@ -153,9 +318,19 @@ fn build_watcher(
             &callback_armed,
             event,
         )
-    })?;
+    };
+    let watcher = match backend {
+        WatcherBackend::Recommended => {
+            LiveWatcher::Recommended(notify::recommended_watcher(callback)?)
+        }
+        WatcherBackend::Poll => LiveWatcher::Poll(PollWatcher::new(
+            callback,
+            Config::default().with_poll_interval(POLL_INTERVAL),
+        )?),
+    };
     Ok(PreparedWatcher {
         watcher,
+        backend,
         armed,
         readiness_events,
         readiness_overflowed,
@@ -190,10 +365,98 @@ fn enqueue_watcher_event(
     }
 }
 
+fn tracker_trace_enabled() -> bool {
+    std::env::var("GREPPY_TRACKER_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn trace_tracker_event(
+    repository: &Path,
+    git_dir: &Path,
+    backend: WatcherBackend,
+    event: &TrackerEvent,
+) {
+    if !tracker_trace_enabled() {
+        return;
+    }
+    let (kind, need_rescan, paths, error) = match event {
+        Ok(event) => (
+            Some(format!("{:?}", event.kind)),
+            Some(event.need_rescan()),
+            event
+                .paths
+                .iter()
+                .map(|path| match relative_utf8(repository, git_dir, path) {
+                    Ok(relative) => serde_json::json!({
+                        "raw": path,
+                        "relative_utf8": relative,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "raw": path,
+                        "relative_utf8_error": error,
+                    }),
+                })
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(error) => (None, None, Vec::new(), Some(error.to_string())),
+    };
+    trace_tracker_json(serde_json::json!({
+        "phase": "tracker-notify-event",
+        "backend": backend.label(),
+        "repository": repository,
+        "git_dir": git_dir,
+        "kind": kind,
+        "need_rescan": need_rescan,
+        "paths": paths,
+        "error": error,
+        "timestamp_unix_ms": now_ms(),
+    }));
+}
+
+fn trace_tracker_state(
+    repository: &Path,
+    phase: &str,
+    backend: WatcherBackend,
+    detail: Option<&str>,
+) {
+    if !tracker_trace_enabled() {
+        return;
+    }
+    trace_tracker_json(serde_json::json!({
+        "phase": phase,
+        "backend": backend.label(),
+        "repository": repository,
+        "detail": detail,
+        "timestamp_unix_ms": now_ms(),
+    }));
+}
+
+fn trace_tracker_json(event: serde_json::Value) {
+    let encoded = event.to_string();
+    eprintln!("greppy tracker trace: {encoded}");
+    let Some(root) = std::env::var_os("GREPPY_WORKSPACE_PHASE_TRACE_DIR") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if !root.is_absolute() || std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    if let Ok(mut output) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(format!("tracker-{}.jsonl", std::process::id())))
+    {
+        let _ = writeln!(output, "{encoded}");
+    }
+}
+
 fn wait_for_watcher_probe(
     git_dir: &Path,
     events: &Receiver<TrackerEvent>,
     overflowed: &AtomicBool,
+    timeout: Duration,
 ) -> io::Result<()> {
     let name = format!("greppy-tracker-ready-{}-{}", std::process::id(), now_ms());
     let probe = git_dir.join(name);
@@ -211,7 +474,7 @@ fn wait_for_watcher_probe(
     }
     drop(file);
 
-    let deadline = std::time::Instant::now() + WATCHER_READY_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let result = loop {
         if overflowed.swap(false, Ordering::AcqRel) {
             break Err(io::Error::other("readiness event queue overflowed"));
@@ -223,7 +486,7 @@ fn wait_for_watcher_probe(
                 format!(
                     "no event for {} within {} seconds",
                     probe.display(),
-                    WATCHER_READY_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             ));
         }
@@ -241,7 +504,7 @@ fn wait_for_watcher_probe(
                     format!(
                         "no event for {} within {} seconds",
                         probe.display(),
-                        WATCHER_READY_TIMEOUT.as_secs()
+                        timeout.as_secs()
                     ),
                 ))
             }
@@ -252,6 +515,71 @@ fn wait_for_watcher_probe(
                 ))
             }
         }
+    };
+    let cleanup = std::fs::remove_file(&probe);
+    result?;
+    cleanup
+}
+
+fn wait_for_active_watcher_probe(
+    core: &WorkspaceCore,
+    repository: &Path,
+    git_dir: &Path,
+    epoch: u64,
+    after_generation: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let name = format!(
+        "greppy-tracker-fence-health-{}-{}",
+        std::process::id(),
+        now_ms()
+    );
+    let probe = git_dir.join(&name);
+    let expected = format!(".git/{name}");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    if let Err(error) = file
+        .write_all(b"greppy.repository-tracker-active.v1\n")
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        return Err(error);
+    }
+    drop(file);
+
+    let deadline = std::time::Instant::now() + timeout;
+    let result = loop {
+        let status = core
+            .repository_tracker_status(repository)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tracker disappeared"))?;
+        if status.state != crate::RepositoryTrackerState::Active || status.epoch != epoch {
+            break Err(io::Error::other(format!(
+                "tracker lost continuity: state={:?}, epoch={}",
+                status.state, status.epoch
+            )));
+        }
+        if status.generation > after_generation {
+            let changes = core
+                .repository_changes_since(repository, epoch, after_generation)
+                .map_err(io::Error::other)?;
+            if changes.paths.iter().any(|path| path == &expected) {
+                break Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no journaled event for {expected} within {} seconds",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
     };
     let cleanup = std::fs::remove_file(&probe);
     result?;
@@ -293,13 +621,40 @@ fn handle_armed_event(
             // generation-bound mutation journal.
         }
         Ok(event) => {
+            let emitted_paths = !event.paths.is_empty();
             let paths = event
                 .paths
                 .iter()
                 .map(|path| relative_utf8(repository, git_dir, path))
                 .collect::<Result<Vec<_>, _>>();
             match paths {
-                Ok(paths) if !paths.is_empty() => {
+                Ok(mut paths) => {
+                    // Creating or removing a child updates the repository
+                    // directory's own metadata. macOS Kqueue/FSEvents can
+                    // report that parent Modify in addition to the precise
+                    // child event. It carries no extra mutation information
+                    // and must not turn a healthy tracker into a gap. A root
+                    // event that requests a rescan, or removes the root, is
+                    // retained as `.` and forces a fail-closed full capture.
+                    if event.kind.is_modify() && !event.need_rescan() {
+                        paths.retain(|path| path != ".");
+                    }
+                    paths.retain(|path| !is_tracker_internal_path(path));
+                    if paths.is_empty() && emitted_paths {
+                        return;
+                    }
+                    if paths.is_empty() {
+                        mark_tracker_gap(
+                            core,
+                            repository,
+                            &format!(
+                                "watcher emitted an event without paths: kind={:?}, need_rescan={}",
+                                event.kind,
+                                event.need_rescan()
+                            ),
+                        );
+                        return;
+                    }
                     if let Err(error) = core.record_repository_changes(repository, &paths, now_ms())
                     {
                         mark_tracker_gap(
@@ -309,15 +664,6 @@ fn handle_armed_event(
                         );
                     }
                 }
-                Ok(_) => mark_tracker_gap(
-                    core,
-                    repository,
-                    &format!(
-                        "watcher emitted an event without paths: kind={:?}, need_rescan={}",
-                        event.kind,
-                        event.need_rescan()
-                    ),
-                ),
                 Err(detail) => mark_tracker_gap(core, repository, &detail),
             }
         }
@@ -325,6 +671,10 @@ fn handle_armed_event(
             mark_tracker_gap(core, repository, &format!("watcher backend error: {error}"));
         }
     }
+}
+
+fn is_tracker_internal_path(path: &str) -> bool {
+    path.starts_with(".git/greppy-tracker-ready-")
 }
 
 fn mark_tracker_gap(core: &WorkspaceCore, repository: &Path, detail: &str) {
@@ -335,10 +685,10 @@ fn mark_tracker_gap(core: &WorkspaceCore, repository: &Path, detail: &str) {
 }
 
 fn relative_utf8(repository: &Path, git_dir: &Path, path: &Path) -> Result<String, String> {
-    let (prefix, relative) = if let Ok(relative) = path.strip_prefix(repository) {
-        ("", relative)
-    } else if let Ok(relative) = path.strip_prefix(git_dir) {
+    let (prefix, relative) = if let Ok(relative) = path.strip_prefix(git_dir) {
         (".git/", relative)
+    } else if let Ok(relative) = path.strip_prefix(repository) {
+        ("", relative)
     } else {
         return Err(format!(
             "watcher path escaped repository roots: {}",
@@ -360,8 +710,11 @@ fn relative_utf8(repository: &Path, git_dir: &Path, path: &Path) -> Result<Strin
             }
         }
     }
+    if parts.is_empty() && prefix == ".git/" {
+        return Ok(".git".into());
+    }
     if parts.is_empty() {
-        return Err("watcher reported the repository root without a child path".into());
+        return Ok(".".into());
     }
     Ok(format!("{prefix}{}", parts.join("/")))
 }
@@ -426,6 +779,47 @@ mod tests {
     }
 
     #[test]
+    fn active_state_never_precedes_fence_event_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository_path = temp.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = std::fs::canonicalize(repository_path).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let _tracker = spawn_repository_tracker(temp.path().to_path_buf()).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&repository).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let active = loop {
+            let status = core.repository_tracker_status(&repository).unwrap();
+            if let Some(status) =
+                status.filter(|status| status.state == RepositoryTrackerState::Active)
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "tracker did not activate");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        let name = format!("greppy-tracker-fence-test-{}", now_ms());
+        std::fs::write(repository.join(".git").join(&name), b"fence").unwrap();
+        let expected = format!(".git/{name}");
+        loop {
+            let changes = core
+                .repository_changes_since(&repository, active.epoch, active.generation)
+                .unwrap();
+            if changes.paths.iter().any(|path| path == &expected) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first post-Active fence was not routed: {changes:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn path_normalization_is_relative_and_rejects_escape() {
         let root = Path::new("/tmp/repository");
         let git_dir = Path::new("/tmp/repository/.git");
@@ -433,8 +827,9 @@ mod tests {
             relative_utf8(root, git_dir, Path::new("/tmp/repository/src/lib.rs")).unwrap(),
             "src/lib.rs"
         );
+        assert_eq!(relative_utf8(root, git_dir, git_dir).unwrap(), ".git");
+        assert_eq!(relative_utf8(root, git_dir, root).unwrap(), ".");
         assert!(relative_utf8(root, git_dir, Path::new("/tmp/other/file")).is_err());
-        assert!(relative_utf8(root, git_dir, root).is_err());
     }
 
     #[test]
@@ -448,7 +843,13 @@ mod tests {
         let git_dir = std::fs::canonicalize(git_dir_path).unwrap();
         let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
         core.request_repository_tracker(&repository).unwrap();
-        let mut prepared = build_watcher(core.clone(), &repository, &git_dir).unwrap();
+        let mut prepared = build_watcher(
+            core.clone(),
+            &repository,
+            &git_dir,
+            WatcherBackend::Recommended,
+        )
+        .unwrap();
         prepared
             .watcher
             .watch(&repository, RecursiveMode::Recursive)
@@ -470,12 +871,13 @@ mod tests {
             &git_dir,
             &prepared.readiness_events,
             &prepared.readiness_overflowed,
+            RECOMMENDED_READY_TIMEOUT,
         )
         .unwrap();
+        prepared.armed.store(true, Ordering::Release);
         let active = core
             .activate_repository_tracker(&repository, now_ms())
             .unwrap();
-        prepared.armed.store(true, Ordering::Release);
         std::fs::write(repository.join("changed.txt"), b"changed").unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -488,12 +890,64 @@ mod tests {
                 let changes = core
                     .repository_changes_since(&repository, active.epoch, 0)
                     .unwrap();
-                assert_eq!(changes.paths, ["changed.txt"]);
-                break;
+                if changes.paths.iter().any(|path| path == "changed.txt") {
+                    assert!(!changes
+                        .paths
+                        .iter()
+                        .any(|path| path.starts_with(".git/greppy-tracker-ready-")));
+                    break;
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "watcher event timed out"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn poll_fallback_probes_and_records_a_generation_bound_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository_path = temp.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        let repository = std::fs::canonicalize(repository_path).unwrap();
+        let git_dir_path = repository.join(".git");
+        std::fs::create_dir(&git_dir_path).unwrap();
+        let git_dir = std::fs::canonicalize(git_dir_path).unwrap();
+        let core = Arc::new(WorkspaceCore::open(temp.path().join("core")).unwrap());
+        core.request_repository_tracker(&repository).unwrap();
+
+        let prepared = install_and_probe_watcher(
+            core.clone(),
+            &repository,
+            &git_dir,
+            WatcherBackend::Poll,
+            POLL_READY_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(prepared.backend, WatcherBackend::Poll);
+        prepared.armed.store(true, Ordering::Release);
+        let active = core
+            .activate_repository_tracker(&repository, now_ms())
+            .unwrap();
+        std::fs::write(repository.join("changed-by-poll.txt"), b"changed").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let changes = core
+                .repository_changes_since(&repository, active.epoch, 0)
+                .unwrap();
+            if changes
+                .paths
+                .iter()
+                .any(|path| path == "changed-by-poll.txt")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PollWatcher event timed out: {changes:?}"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -531,8 +985,8 @@ mod tests {
     }
 
     #[test]
-    fn access_events_do_not_mutate_or_invalidate_the_tracker() {
-        use notify::event::{AccessKind, AccessMode, ModifyKind};
+    fn access_and_parent_modify_events_do_not_invalidate_the_tracker() {
+        use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind};
         use notify::{Event, EventKind};
 
         let temp = tempfile::tempdir().unwrap();
@@ -563,11 +1017,20 @@ mod tests {
             .repository_tracker_status(&repository)
             .unwrap()
             .unwrap();
-        assert_eq!(after_mutation.state, RepositoryTrackerState::Gap);
-        assert_eq!(
-            after_mutation.detail.as_deref(),
-            Some("watcher reported the repository root without a child path")
-        );
+        assert_eq!(after_mutation.state, RepositoryTrackerState::Active);
+        assert_eq!(after_mutation.generation, active.generation);
+
+        let removal = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(repository.clone());
+        handle_armed_event(&core, &repository, &git_dir, Ok(removal));
+        let after_removal = core
+            .repository_tracker_status(&repository)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_removal.state, RepositoryTrackerState::Active);
+        let changes = core
+            .repository_changes_since(&repository, active.epoch, active.generation)
+            .unwrap();
+        assert_eq!(changes.paths, vec!["."]);
     }
 
     #[test]

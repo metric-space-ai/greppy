@@ -494,6 +494,14 @@ fn capture_repository_incremental_once(
         .collect::<BTreeSet<_>>();
     let mut git_metadata_changed = index_hash != cached.index_hash;
     for path in journal_paths {
+        if path == "." {
+            // The watcher observed a root-level event that could not be
+            // reduced to an individual child (for example a backend rescan
+            // request or removal). Incremental capture cannot prove which
+            // paths changed, so preserve correctness by taking the existing
+            // bounded full-capture path.
+            return Ok(None);
+        }
         if let Some(path) = path.strip_prefix(".git/") {
             if path == "index" || path == "index.lock" {
                 git_metadata_changed = true;
@@ -1596,5 +1604,21 @@ mod tests {
         assert!(incremental.entries.is_empty());
         assert_eq!(incremental.baseline_hash, full.baseline_hash);
         assert_eq!(incremental.entries, full.entries);
+    }
+
+    #[test]
+    fn root_watcher_event_forces_a_full_capture() {
+        let repo = fixture();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(store_root.path()).unwrap();
+        let mut cached = capture_repository(repo.path(), &store).unwrap();
+        cached.tracker_epoch = Some(11);
+        cached.tracker_generation = Some(4);
+
+        assert!(
+            capture_repository_incremental(repo.path(), &store, &cached, &[".".into()], 11, 5,)
+                .unwrap()
+                .is_none()
+        );
     }
 }
