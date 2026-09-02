@@ -3,8 +3,12 @@
 #[path = "common/mounted_contract.rs"]
 mod mounted_contract;
 
-use greppy_workspace_core::{capture_repository, ProviderInstallation, WorkspaceCore};
+use greppy_workspace_core::{
+    capture_repository, ProviderInstallation, ProviderManifest, WorkspaceCore,
+};
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -24,6 +28,18 @@ fn git(path: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().into()
 }
 
+fn uncached_marker(path: &Path) -> (ProviderManifest, SystemTime) {
+    let mut file = fs::File::open(path).unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) },
+        -1
+    );
+    let modified = file.metadata().unwrap().modified().unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    (serde_json::from_slice(&bytes).unwrap(), modified)
+}
+
 #[test]
 fn activated_fskit_provider_satisfies_shared_mounted_contract() {
     if std::env::var_os("GREPPY_RUN_FSKIT_TEST").is_none() {
@@ -40,6 +56,21 @@ fn activated_fskit_provider_satisfies_shared_mounted_contract() {
     let provider = ProviderInstallation::require_healthy(&data_root)
         .expect("the signed FSKit provider must already be activated and mounted");
     provider.doctor_io("macos-fskit-contract").unwrap();
+    let marker_path = provider.mount_root().join(".greppy-provider.json");
+    let (first_marker, first_modified) = uncached_marker(&marker_path);
+    thread::sleep(Duration::from_secs(65));
+    ProviderInstallation::require_healthy(&data_root)
+        .expect("the FSKit provider must remain healthy beyond the kernel cache window");
+    let (second_marker, second_modified) = uncached_marker(&marker_path);
+    assert_eq!(second_marker.instance_id, first_marker.instance_id);
+    assert!(
+        second_marker.heartbeat_unix_ms >= first_marker.heartbeat_unix_ms + 60_000,
+        "the mounted marker heartbeat did not advance for 60 seconds"
+    );
+    assert!(
+        second_modified > first_modified,
+        "the mounted marker modification time did not advance"
+    );
     let core = WorkspaceCore::open(data_root.join("core")).unwrap();
 
     let temp = tempfile::tempdir().unwrap();

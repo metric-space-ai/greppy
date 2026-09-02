@@ -97,7 +97,7 @@ impl ProviderInstallation {
         validate_manifest(&manifest, &data_root, now)?;
 
         let marker_path = manifest.mount_root.join(".greppy-provider.json");
-        let marker_bytes = fs::read(&marker_path).map_err(|error| {
+        let marker_bytes = read_mount_marker(&marker_path).map_err(|error| {
             Error::AdapterUnhealthy(format!(
                 "mount marker {} is unavailable: {error}",
                 marker_path.display()
@@ -192,6 +192,21 @@ impl ProviderInstallation {
         }
         Ok(())
     }
+}
+
+fn read_mount_marker(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn same_provider_identity(left: &ProviderManifest, right: &ProviderManifest) -> bool {
