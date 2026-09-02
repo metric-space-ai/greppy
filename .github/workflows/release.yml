@@ -354,6 +354,7 @@ jobs:
           markers = {
               "fund-034-input-receipts": b"input delivery failed: painter dropped or did not acknowledge the event after 8 retries",
               "fund-038-implicit-submit": b"greppyImplicitSubmit",
+              "fund-033-checkbox-activation": b"checkbox activation did not produce the requested state",
           }
           missing = [label for label, marker in markers.items() if marker not in data]
           if missing:

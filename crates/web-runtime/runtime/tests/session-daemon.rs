@@ -3398,6 +3398,146 @@ document.getElementById('go').addEventListener('click', function() {\
 }
 
 #[test]
+fn web_check_uses_activation_events_and_noops_only_when_already_matched() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><body>\
+<input id=\"done\" type=\"checkbox\">\
+<p id=\"state\">unchecked:0:0:0</p>\
+<script>\
+var clicks = 0, inputs = 0, changes = 0;\
+var box = document.getElementById('done');\
+function render() { document.getElementById('state').textContent = (box.checked ? 'checked:' : 'unchecked:') + clicks + ':' + inputs + ':' + changes; }\
+box.addEventListener('click', function() { clicks += 1; render(); });\
+box.addEventListener('input', function() { inputs += 1; render(); });\
+box.addEventListener('change', function() { changes += 1; render(); });\
+</script>\
+</body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-check-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_check", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_check",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = unix_request(
+        &socket,
+        &Request::new(
+            "run_check",
+            "web.goto",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("goto");
+    assert_eq!(went.status, "ok", "{went:?}");
+
+    let invoke = |operation: &str| {
+        unix_request(
+            &socket,
+            &Request::new(
+                "run_check",
+                operation,
+                json!({
+                    "session_id": session_id,
+                    "selector": { "type": "css", "value": "#done" }
+                }),
+            ),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("{operation}: {error}"))
+    };
+    let observe = || {
+        unix_request(
+            &socket,
+            &Request::new(
+                "run_check",
+                "web.observe",
+                json!({ "session_id": session_id, "format": "text" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("observe")
+    };
+
+    let checked = invoke("web.check");
+    assert_eq!(checked.status, "ok", "{checked:?}");
+    assert!(
+        matches!(
+            checked.result.as_ref().unwrap()["dispatch"].as_str(),
+            Some("native" | "dom-fallback")
+        ),
+        "check must use the acknowledged activation path: {checked:?}"
+    );
+    let checked_state = observe();
+    assert!(
+        checked_state
+            .result
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("checked:1:1:1"),
+        "check must update DOM and application event state: {checked_state:?}"
+    );
+
+    let unchecked = invoke("web.uncheck");
+    assert_eq!(unchecked.status, "ok", "{unchecked:?}");
+    let unchecked_state = observe();
+    assert!(
+        unchecked_state
+            .result
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("unchecked:2:2:2"),
+        "uncheck must update DOM and application event state: {unchecked_state:?}"
+    );
+
+    let noop = invoke("web.uncheck");
+    assert_eq!(noop.status, "ok", "{noop:?}");
+    assert_eq!(
+        noop.result.as_ref().unwrap()["dispatch"].as_str(),
+        Some("noop")
+    );
+    let noop_state = observe();
+    assert!(
+        noop_state
+            .result
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("unchecked:2:2:2"),
+        "an already-matching uncheck must not synthesize events: {noop_state:?}"
+    );
+
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_check",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
 fn observed_refs_drive_locators_and_expire_on_navigation() {
     let fixture = serve_fixture(
         "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button onclick=\"document.body.setAttribute('data-clicked','yes')\">go</button></body></html>",

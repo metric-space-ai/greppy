@@ -1979,52 +1979,7 @@ impl ContentEngine {
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let page_id = required_str(&params, "page")?;
-                let (webview, delegate) = self.page(&page_id)?.clone();
-                let probe = format!(
-                    "{}-{}",
-                    std::process::id(),
-                    CLICK_PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-                );
-                let encoded_probe =
-                    serde_json::to_string(&probe).expect("click probe serializes");
-                self.locator_eval(
-                    &params,
-                    &format!(
-                        "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var pending = 'pending:' + token; node.setAttribute(attr, pending); var mark = function() {{ if (node.getAttribute(attr) === pending) node.setAttribute(attr, 'seen:' + token); node.removeEventListener('click', mark, true); }}; node.addEventListener('click', mark, true); return true"
-                    ),
-                )?;
-                self.present_exclusively(&webview);
-                click_at(
-                    &webview,
-                    &delegate,
-                    resolved.x,
-                    resolved.y,
-                    resolved.width,
-                    resolved.height,
-                    || self.servo.spin_event_loop(),
-                )?;
-                self.servo.spin_event_loop();
-                let dispatch = match self.locator_eval(
-                    &params,
-                    &format!(
-                        "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var state = node.getAttribute(attr); if (state === 'seen:' + token) {{ node.removeAttribute(attr); return 'native'; }} if (state === 'pending:' + token) {{ node.click(); node.removeAttribute(attr); return 'dom-fallback'; }} return 'document-changed'"
-                    ),
-                ) {
-                    Ok(JSValue::String(dispatch)) => dispatch,
-                    // A successful click may navigate or replace its own node,
-                    // making the old locator intentionally unresolvable. Never
-                    // issue a second click in that case.
-                    Err(_) => "document-changed".to_owned(),
-                    Ok(_) => "unknown".to_owned(),
-                };
-                if let Some(selector) = params
-                    .get("selector")
-                    .and_then(|value| value.get("value"))
-                    .and_then(|value| value.as_str())
-                {
-                    let _ = self.assign_pending_files(&page_id, selector);
-                }
+                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
                 Ok(json!({ "dispatch": dispatch }))
             }
             "locator.tap" => {
@@ -2329,53 +2284,23 @@ impl ContentEngine {
             }
             "locator.check" | "locator.uncheck" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let page_id = required_str(&params, "page")?;
                 let checked = method == "locator.check";
-                let selector = params
-                    .get("selector")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let (webview, delegate) = self.page(&page_id)?.clone();
-                // A property write plus dispatched input/change satisfies
-                // plain forms but stays invisible to frameworks that bind
-                // checkbox state to native CLICKS (React normalises checkbox
-                // onChange over click): finding 033 measured click 5/5 vs
-                // check 0/5 on the same app. So check IS a real, confirmed
-                // click when the state has to change (Playwright semantics:
-                // matching state is a no-op), verified afterwards; only if
-                // the click did not toggle (custom widget swallowing the
-                // event) fall back to property + events.
-                let read_state = format!(
-                    "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); return !!nodes[0].checked; }})({selector})"
-                );
-                let current = matches!(
-                    self.evaluate(webview.clone(), &read_state)?,
-                    JSValue::Boolean(true)
-                );
-                if current != checked {
-                    self.present_exclusively(&webview);
-                    click_at(
-                        &webview,
-                        &delegate,
-                        resolved.x,
-                        resolved.y,
-                        resolved.width,
-                        resolved.height,
-                        || self.servo.spin_event_loop(),
-                    )?;
-                    self.servo.spin_event_loop();
-                    let after = matches!(
-                        self.evaluate(webview.clone(), &read_state)?,
-                        JSValue::Boolean(true)
-                    );
-                    if after != checked {
-                        let source = format!(
-                            "(function(selector, checked) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.checked !== checked) {{ el.checked = checked; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {checked})"
-                        );
-                        self.evaluate(webview, &source)?;
-                    }
+                let current = self.locator_checked_state(&params)?;
+                if current == checked {
+                    return Ok(json!({ "dispatch": "noop" }));
                 }
-                Ok(json!({}))
+                // A checkbox transition is an activation, not a property
+                // assignment. Reuse the same acknowledged native click path
+                // as `locator.click` so click/input/change and framework
+                // handlers all observe one real transition (Fund 033).
+                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
+                let actual = self.locator_checked_state(&params)?;
+                if actual != checked {
+                    return Err(io::Error::other(format!(
+                        "checkbox activation did not produce the requested state: expected checked={checked}, observed checked={actual}"
+                    )));
+                }
+                Ok(json!({ "dispatch": dispatch }))
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
@@ -3403,6 +3328,72 @@ impl ContentEngine {
         // very next input into a hidden webview (2 of 12 clicks still died).
         self.servo.spin_event_loop();
     }
+
+    fn dispatch_locator_click(
+        &mut self,
+        params: &serde_json::Value,
+        resolved: &ResolvedNode,
+    ) -> io::Result<String> {
+        let page_id = required_str(params, "page")?;
+        let (webview, delegate) = self.page(&page_id)?.clone();
+        let probe = format!(
+            "{}-{}",
+            std::process::id(),
+            CLICK_PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let encoded_probe = serde_json::to_string(&probe).expect("click probe serializes");
+        self.locator_eval(
+            params,
+            &format!(
+                "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var pending = 'pending:' + token; node.setAttribute(attr, pending); var mark = function() {{ if (node.getAttribute(attr) === pending) node.setAttribute(attr, 'seen:' + token); node.removeEventListener('click', mark, true); }}; node.addEventListener('click', mark, true); return true"
+            ),
+        )?;
+        self.present_exclusively(&webview);
+        click_at(
+            &webview,
+            &delegate,
+            resolved.x,
+            resolved.y,
+            resolved.width,
+            resolved.height,
+            || self.servo.spin_event_loop(),
+        )?;
+        self.servo.spin_event_loop();
+        let dispatch = match self.locator_eval(
+            params,
+            &format!(
+                "var node = nodes[0]; var token = {encoded_probe}; var attr = 'data-greppy-click-probe'; var state = node.getAttribute(attr); if (state === 'seen:' + token) {{ node.removeAttribute(attr); return 'native'; }} if (state === 'pending:' + token) {{ node.click(); node.removeAttribute(attr); return 'dom-fallback'; }} return 'document-changed'"
+            ),
+        ) {
+            Ok(JSValue::String(dispatch)) => dispatch,
+            // A successful click may navigate or replace its own node,
+            // making the old locator intentionally unresolvable. Never issue
+            // a second click in that case.
+            Err(_) => "document-changed".to_owned(),
+            Ok(_) => "unknown".to_owned(),
+        };
+        if let Some(selector) = params
+            .get("selector")
+            .and_then(|value| value.get("value"))
+            .and_then(|value| value.as_str())
+        {
+            let _ = self.assign_pending_files(&page_id, selector);
+        }
+        Ok(dispatch)
+    }
+
+    fn locator_checked_state(&self, params: &serde_json::Value) -> io::Result<bool> {
+        match self.locator_eval(
+            params,
+            "var node = nodes[0]; if (typeof node.checked !== 'boolean') throw new Error('check requires a checkbox or radio input'); return node.checked",
+        )? {
+            JSValue::Boolean(value) => Ok(value),
+            other => Err(io::Error::other(format!(
+                "check state returned an unexpected value: {other:?}"
+            ))),
+        }
+    }
+
     fn resolve_actionable(&self, params: &serde_json::Value) -> io::Result<ResolvedNode> {
         let page_id = required_str(params, "page")?;
         let selector = params
