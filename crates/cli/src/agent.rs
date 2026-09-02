@@ -14,9 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use greppy_agent::system_prompt;
 use greppy_agent::{
-    run_agent_loop, run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig,
-    AgentWorkspace, Client, GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError,
-    SandboxMode, StreamEvent, Usage, WorkspaceError,
+    run_agent_loop_with_history, sandbox as agent_sandbox, AgentConfig, AgentWorkspace, Client,
+    GreppyEnv, LoopEvent, LoopStop, ProbeError, RunOutcome, SandboxError, SandboxMode, StopReason,
+    StreamEvent, Usage, WorkspaceError,
 };
 
 use crate::agent_tui::{
@@ -75,6 +75,7 @@ Usage:
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
+                   [--continue | --resume ID] [--json]
   greppy -p --help
 
 Flags:
@@ -92,6 +93,7 @@ Flags:
   --keep-worktree     Preserve the portable namespace and private delta
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
+  --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
 
 Interactive keys and commands (`greppy agent`):
   Enter               Send the prompt
@@ -109,8 +111,9 @@ Interactive keys and commands (`greppy agent`):
   /exit /quit /q      Finish, restore the terminal, publish the proposal
 
 Session flags:
-  --continue          Restore this project's most recent interactive session
+  --continue          Restore this project's most recent session
   --resume ID         Restore a specific session id
+                      (`greppy -p` and `greppy agent`)
 
 Exit codes:
   0  ok (clean, proposal saved, or applied)
@@ -196,13 +199,17 @@ pub struct AgentArgs {
     )]
     pub skip_selfcheck: bool,
 
-    /// Restore the most recent interactive session for this project.
+    /// Restore this project's most recent session.
     #[arg(long = "continue")]
     pub continue_session: bool,
 
-    /// Restore a specific interactive session by id.
+    /// Restore a specific session by id.
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "continue_session")]
     pub resume: Option<String>,
+
+    /// Stream newline-delimited JSON events on stdout (`greppy -p` only).
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Data root and logical project used by the agent session store for `repo_root`.
@@ -359,6 +366,10 @@ fn apply_interactive_settings(
 }
 
 fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
+    if args.json && interactive {
+        eprintln!("error: --json is only valid with `greppy -p`");
+        return Err(EXIT_USAGE);
+    }
     let task = args.task.as_deref().map(str::trim).unwrap_or("");
     if !interactive && task.is_empty() {
         eprintln!("error: missing TASK");
@@ -371,11 +382,47 @@ fn validate_args(args: &AgentArgs, interactive: bool) -> Result<(), u8> {
         eprintln!("details: greppy -p --help");
         return Err(EXIT_USAGE);
     }
-    if !interactive && (args.continue_session || args.resume.is_some()) {
-        eprintln!("error: --continue / --resume are only valid with `greppy agent`");
-        return Err(EXIT_USAGE);
-    }
     Ok(())
+}
+
+fn resolve_headless_session_record(
+    store: &SessionStore,
+    project: &str,
+    model: &str,
+    run_id: &str,
+    continue_session: bool,
+    resume: Option<&str>,
+) -> Result<(SessionRecord, bool), (u8, String)> {
+    if let Some(id) = resume {
+        match store.load(id) {
+            Ok(record) => Ok((record, true)),
+            Err(error) => Err((
+                EXIT_USAGE,
+                format!("greppy -p: cannot resume session {id}: {error}"),
+            )),
+        }
+    } else if continue_session {
+        match store.latest() {
+            Ok(Some(record)) => Ok((record, true)),
+            Ok(None) => Err((
+                EXIT_USAGE,
+                "greppy -p: no previous session for this project".to_string(),
+            )),
+            Err(error) => Err((
+                EXIT_USAGE,
+                format!("greppy -p: cannot resume session: {error}"),
+            )),
+        }
+    } else {
+        let mut record = SessionRecord::new(
+            new_session_id(),
+            project.to_string(),
+            model.to_string(),
+            run_id.to_string(),
+        );
+        record.source = "headless".to_string();
+        Ok((record, false))
+    }
 }
 
 fn run_agent(
@@ -407,39 +454,106 @@ fn run_agent(
     // Refuse unsupported repositories (e.g. tracked submodules) BEFORE any
     // worktree is created and BEFORE contacting the gateway.
     let run_id = make_run_id();
+    let mut json = args.json.then(crate::agent_json::JsonEmitter::new);
+    let mut json_session = crate::agent_json::JsonSession {
+        session_id: String::new(),
+        run_id: run_id.clone(),
+        project: logical_project.clone(),
+        worktree: String::new(),
+        branch: git_branch(&cwd),
+        model: model.clone(),
+        endpoint: endpoint.clone(),
+        sandbox: "disabled".to_string(),
+        resumed: false,
+    };
+    let session_store = SessionStore::new(&shared_data_root, &logical_project);
+    let mut headless_session = if interactive {
+        None
+    } else {
+        match resolve_headless_session_record(
+            &session_store,
+            &logical_project,
+            &model,
+            &run_id,
+            args.continue_session,
+            args.resume.as_deref(),
+        ) {
+            Ok((record, resumed)) => {
+                eprintln!("session: {}", record.id);
+                json_session.session_id = record.id.clone();
+                json_session.resumed = resumed;
+                Some((record, resumed))
+            }
+            Err((code, message)) => {
+                eprintln!("{message}");
+                json_session.session_id = args.resume.clone().unwrap_or_default();
+                json_session.resumed = args.continue_session || args.resume.is_some();
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    code,
+                    &message,
+                );
+            }
+        }
+    };
     let workspace = match AgentWorkspace::create(&cwd, &run_id) {
         Ok(ws) => ws,
         Err(WorkspaceError::Unsupported(reason)) => {
             // Stable user-facing message for the submodule case; fall back to
             // the typed reason for any future Unsupported variants.
-            if reason.contains("gitmodules") || reason.contains("submodule") {
-                eprintln!(
-                    "greppy -p does not support repositories with submodules yet — \
+            let message = if reason.contains("gitmodules") || reason.contains("submodule") {
+                "greppy -p does not support repositories with submodules yet — \
                      the agent worktree cannot reset them safely. Run the task \
                      without -p, or remove the submodule from the working branch."
-                );
+                    .to_string()
             } else {
-                eprintln!("greppy -p: unsupported repository: {reason}");
-            }
-            return EXIT_USAGE;
+                format!("greppy -p: unsupported repository: {reason}")
+            };
+            eprintln!("{message}");
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_USAGE,
+                &message,
+            );
         }
         Err(WorkspaceError::AdapterUnavailable(reason)) => {
-            eprintln!("greppy -p: portable CoW adapter is unavailable: {reason}");
+            let message = format!("greppy -p: portable CoW adapter is unavailable: {reason}");
+            eprintln!("{message}");
             eprintln!("run `greppy workspace setup`, then `greppy workspace doctor --json`");
-            return EXIT_USAGE;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_USAGE,
+                &message,
+            );
         }
         Err(e @ WorkspaceError::Tampered { .. }) => {
             // Create/reuse-reset can surface Tampered when an existing stable
             // tree fails identity during a path that re-raises rather than
             // discards; keep the consistent exit-3 shape.
             report_tampered(&e, None);
-            return EXIT_AGENT;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &e.to_string(),
+            );
         }
         Err(e) => {
-            eprintln!("greppy -p: workspace create failed: {e}");
-            return EXIT_AGENT;
+            let message = format!("greppy -p: workspace create failed: {e}");
+            eprintln!("{message}");
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &message,
+            );
         }
     };
+    json_session.worktree = workspace.worktree_path().display().to_string();
+    json_session.branch = git_branch(&cwd);
     if bootstrap
         .as_ref()
         .is_some_and(crate::agent_tui::BootstrapScreen::cancelled)
@@ -458,26 +572,39 @@ fn run_agent(
         match client.probe() {
             Ok(()) => {}
             Err(ProbeError::Unreachable(_)) => {
-                eprintln!(
+                let message = format!(
                     "greppy -p needs a local model gateway and found none at {endpoint}.\n\
                  Start one (standard: CLIProxyAPI on 127.0.0.1:8317) or set\n\
                  GREPPY_ENDPOINT / --endpoint. Details: greppy -p --help"
                 );
+                eprintln!("{message}");
                 keep_worktree_on_error(&workspace);
-                return EXIT_USAGE;
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_USAGE,
+                    &message,
+                );
             }
             Err(ProbeError::BadResponse(detail)) => {
-                eprintln!(
+                let message = format!(
                     "greppy -p reached {endpoint}, but the gateway rejected the probe:\n\
                  {detail}\n\
                  If it requires an API key, set GREPPY_API_KEY. Details: greppy -p --help"
                 );
+                eprintln!("{message}");
                 keep_worktree_on_error(&workspace);
-                return EXIT_USAGE;
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_USAGE,
+                    &message,
+                );
             }
         }
     } else if model.is_empty() {
         model = "auto".into();
+        json_session.model = model.clone();
         client = Client::new(&endpoint, &model);
         if let Ok(key) = std::env::var("GREPPY_API_KEY") {
             client = client.with_api_key(key);
@@ -490,9 +617,15 @@ fn run_agent(
     // the platform-wide Application Support / XDG data path.
     let agent_data = workspace.agent_data_root();
     if let Err(e) = std::fs::create_dir_all(&agent_data) {
-        eprintln!("greppy -p: cannot create agent data root: {e}");
+        let message = format!("greppy -p: cannot create agent data root: {e}");
+        eprintln!("{message}");
         keep_worktree_on_error(&workspace);
-        return EXIT_AGENT;
+        return crate::agent_json::emit_error_result_opt(
+            json.as_mut(),
+            &json_session,
+            EXIT_AGENT,
+            &message,
+        );
     }
 
     let prepared_base = if args.private_store {
@@ -539,9 +672,10 @@ fn run_agent(
                 Some(prepared)
             }
             Err(error) => {
-                eprintln!(
+                let message = format!(
                     "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
                 );
+                eprintln!("{message}");
                 if args.keep_worktree {
                     keep_worktree_on_error(&workspace);
                 } else if let Err(cleanup_error) = workspace.cleanup() {
@@ -549,7 +683,12 @@ fn run_agent(
                         "greppy -p: failed to clean the aborted portable workspace: {cleanup_error}"
                     );
                 }
-                return EXIT_AGENT;
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_AGENT,
+                    &message,
+                );
             }
         }
     };
@@ -570,7 +709,7 @@ fn run_agent(
     // Headless runs still prewarm synchronously. Interactive runs launch and
     // monitor the same index job only after the full TUI is visible.
     if !interactive {
-        ensure_semantic_index(workspace.worktree_path());
+        ensure_semantic_index(workspace.worktree_path(), args.json);
     }
     if bootstrap
         .as_ref()
@@ -586,9 +725,15 @@ fn run_agent(
     // parent and lock sibling so those stay non-writable to tools.
     let scratch_dir = workspace.agent_scratch_root();
     if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
-        eprintln!("greppy -p: cannot create agent scratch dir: {e}");
+        let message = format!("greppy -p: cannot create agent scratch dir: {e}");
+        eprintln!("{message}");
         keep_worktree_on_error(&workspace);
-        return EXIT_AGENT;
+        return crate::agent_json::emit_error_result_opt(
+            json.as_mut(),
+            &json_session,
+            EXIT_AGENT,
+            &message,
+        );
     }
 
     let sandbox_mode = match resolve_sandbox_mode(
@@ -602,9 +747,19 @@ fn run_agent(
         Ok(mode) => mode,
         Err(code) => {
             keep_worktree_on_error(&workspace);
-            return code;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                code,
+                "greppy -p: sandbox setup failed",
+            );
         }
     };
+    json_session.sandbox = match &sandbox_mode {
+        SandboxMode::Off => "disabled",
+        SandboxMode::Enforce(_) => "confined",
+    }
+    .to_string();
 
     // Point tool children at the per-run scratch (also used by temp-file APIs
     // that honour TMPDIR). Set for the remainder of this process so every
@@ -617,9 +772,15 @@ fn run_agent(
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
         Ok(env) => env.with_sandbox(sandbox_mode.clone()),
         Err(e) => {
-            eprintln!("greppy -p: cannot build greppy env: {e}");
+            let message = format!("greppy -p: cannot build greppy env: {e}");
+            eprintln!("{message}");
             keep_worktree_on_error(&workspace);
-            return EXIT_AGENT;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &message,
+            );
         }
     };
     if let Some(screen) = bootstrap.as_mut() {
@@ -640,9 +801,15 @@ fn run_agent(
                 }
             }
             Err(err) => {
-                eprintln!("{}", err.diagnostic());
+                let message = err.diagnostic();
+                eprintln!("{message}");
                 keep_worktree_on_error(&workspace);
-                return EXIT_AGENT;
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_AGENT,
+                    &message,
+                );
             }
         }
     }
@@ -744,21 +911,63 @@ fn run_agent(
             }
         }
         let _shutdown_web = ShutdownWebOnDrop;
-        run_headless_session(&mut client, &mut env, &config, &task).map(|session| (session, false))
+        let (mut record, resumed) = match headless_session.take() {
+            Some(session) => session,
+            None => {
+                let message = "greppy -p: internal error: headless session was not resolved";
+                eprintln!("{message}");
+                keep_worktree_on_error(&workspace);
+                return crate::agent_json::emit_error_result_opt(
+                    json.as_mut(),
+                    &json_session,
+                    EXIT_AGENT,
+                    message,
+                );
+            }
+        };
+        record.worktree = workspace.worktree_path().display().to_string();
+        record.branch = git_branch(&cwd);
+        json_session.worktree = record.worktree.clone();
+        json_session.branch = record.branch.clone();
+        json_session.model = model.clone();
+        run_headless_session(
+            &mut client,
+            &mut env,
+            &config,
+            &task,
+            &session_store,
+            &mut record,
+            resumed,
+            &model,
+            json.as_mut(),
+            &json_session,
+        )
+        .map(|session| (session, false))
     };
     let (session, interactive_cancelled) = match session {
         Ok(session) => session,
         Err(error) => {
-            eprintln!(
+            let message = format!(
                 "greppy {}: agent error: {error}",
                 if interactive { "agent" } else { "-p" }
             );
+            eprintln!("{message}");
             keep_worktree_on_error(&workspace);
-            return EXIT_AGENT;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &message,
+            );
         }
     };
     if interactive_cancelled {
-        return EXIT_CANCELLED;
+        return crate::agent_json::emit_error_result_opt(
+            json.as_mut(),
+            &json_session,
+            EXIT_CANCELLED,
+            "stopped: cancelled by user",
+        );
     }
 
     eprintln!(
@@ -782,6 +991,7 @@ fn run_agent(
         &task
     };
     let commit_message = truncate_chars(commit_subject, 72);
+    let json_mode = json.is_some();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     let outcome = match workspace.finish(&commit_message) {
@@ -790,19 +1000,58 @@ fn run_agent(
             report_tampered_to(&e, Some(workspace.worktree_path()), &mut stderr);
             // Tree is already kept by the error path; do not call cleanup.
             drop(workspace);
-            return EXIT_AGENT;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &e.to_string(),
+            );
         }
         Err(e) => {
-            let _ = writeln!(stderr, "greppy -p: finish failed: {e}");
+            let message = format!("greppy -p: finish failed: {e}");
+            let _ = writeln!(stderr, "{message}");
             keep_worktree_on_error(&workspace);
-            return EXIT_AGENT;
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &message,
+            );
         }
     };
 
+    if !session.session_id.is_empty() {
+        let store = SessionStore::new(&shared_data_root, &logical_project);
+        let proposal_ref = match &outcome {
+            RunOutcome::Clean => "",
+            RunOutcome::Proposal { ref_name, .. } => ref_name.as_str(),
+        };
+        if let Err(error) = store.append_worktree(
+            &session.session_id,
+            &workspace.worktree_path().display().to_string(),
+            proposal_ref,
+        ) {
+            let _ = writeln!(
+                stderr,
+                "greppy {}: session save failed: {error}",
+                if interactive { "agent" } else { "-p" }
+            );
+        }
+    }
+
     let mut exit = EXIT_OK;
+    let mut result_status = "clean";
+    let mut proposal_ref = None;
+    let mut commit_id = None;
+    let mut stat_text = None;
+    let mut patch_text = None;
+    let mut applied = false;
+    let mut apply_error = None;
     match outcome {
         RunOutcome::Clean => {
-            let _ = writeln!(stdout, "no changes proposed.");
+            if !json_mode {
+                let _ = writeln!(stdout, "no changes proposed.");
+            }
         }
         RunOutcome::Proposal {
             commit,
@@ -810,10 +1059,19 @@ fn run_agent(
             patch,
             stat,
         } => {
-            let _ = writeln!(stdout);
-            let _ = write!(stdout, "{stat}");
-            if !stat.ends_with('\n') {
+            result_status = "proposal";
+            proposal_ref = Some(ref_name.clone());
+            commit_id = Some(commit.clone());
+            stat_text = Some(stat.clone());
+            if args.diff {
+                patch_text = Some(patch.clone());
+            }
+            if !json_mode {
                 let _ = writeln!(stdout);
+                let _ = write!(stdout, "{stat}");
+                if !stat.ends_with('\n') {
+                    let _ = writeln!(stdout);
+                }
             }
             let binary_files = stat.lines().filter(|l| l.contains("| Bin")).count();
             if binary_files > 0 {
@@ -823,11 +1081,13 @@ fn run_agent(
                      artifacts from verification — is the repo's .gitignore complete?"
                 );
             }
-            let _ = writeln!(stdout, "proposal saved: {ref_name}");
-            let _ = writeln!(stdout, "inspect: git show {ref_name}");
-            let _ = writeln!(stdout, "apply:   git cherry-pick -n {ref_name}");
+            if !json_mode {
+                let _ = writeln!(stdout, "proposal saved: {ref_name}");
+                let _ = writeln!(stdout, "inspect: git show {ref_name}");
+                let _ = writeln!(stdout, "apply:   git cherry-pick -n {ref_name}");
+            }
 
-            if args.diff {
+            if args.diff && !json_mode {
                 let _ = write!(stdout, "{patch}");
                 if !patch.ends_with('\n') {
                     let _ = writeln!(stdout);
@@ -837,30 +1097,42 @@ fn run_agent(
             if args.apply {
                 match workspace.apply_to(workspace.repo_root(), &commit) {
                     Ok(()) => {
-                        let _ = writeln!(stdout, "applied (staged, not committed).");
+                        applied = true;
+                        if !json_mode {
+                            let _ = writeln!(stdout, "applied (staged, not committed).");
+                        }
                     }
                     Err(WorkspaceError::DirtyTarget { ref_name, .. }) => {
-                        let _ = writeln!(
-                            stderr,
+                        let message = format!(
                             "target checkout has uncommitted changes — commit or stash first; \
                              the proposal remains at {ref_name}"
                         );
+                        let _ = writeln!(stderr, "{message}");
+                        apply_error = Some(message);
                         exit = EXIT_CONFLICT;
                     }
                     Err(WorkspaceError::Conflict { ref_name, detail }) => {
-                        let _ = writeln!(
-                            stderr,
+                        let message = format!(
                             "greppy -p: apply conflict: {detail}\n\
                              resolve from {ref_name}:\n\
                              inspect: git show {ref_name}\n\
                              apply:   git cherry-pick -n {ref_name}"
                         );
+                        let _ = writeln!(stderr, "{message}");
+                        apply_error = Some(message);
                         exit = EXIT_CONFLICT;
                     }
                     Err(e) => {
-                        let _ = writeln!(stderr, "greppy -p: apply failed: {e}");
+                        let message = format!("greppy -p: apply failed: {e}");
+                        let _ = writeln!(stderr, "{message}");
                         keep_worktree_on_error(&workspace);
-                        return EXIT_AGENT;
+                        drop(stdout);
+                        return crate::agent_json::emit_error_result_opt(
+                            json.as_mut(),
+                            &json_session,
+                            EXIT_AGENT,
+                            &message,
+                        );
                     }
                 }
             }
@@ -872,7 +1144,15 @@ fn run_agent(
         if let Err(e) = workspace.cleanup() {
             // Any cleanup failure is a non-zero exit — a successful run
             // whose cleanup fails is not a success.
-            return map_cleanup_error(&e, Some(&wt_path), &mut stderr);
+            let code = map_cleanup_error(&e, Some(&wt_path), &mut stderr);
+            drop(stdout);
+            drop(stderr);
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                code,
+                &e.to_string(),
+            );
         }
     } else if exit != EXIT_OK {
         // Conflict still cleans unless keep — success-path cleanup only when
@@ -882,11 +1162,52 @@ fn run_agent(
     } else {
         let path = workspace.worktree_path().display().to_string();
         if let Err(error) = workspace.keep() {
-            let _ = writeln!(stderr, "greppy -p: cannot preserve workspace: {error}");
-            return EXIT_AGENT;
+            let message = format!("greppy -p: cannot preserve workspace: {error}");
+            let _ = writeln!(stderr, "{message}");
+            drop(stdout);
+            drop(stderr);
+            return crate::agent_json::emit_error_result_opt(
+                json.as_mut(),
+                &json_session,
+                EXIT_AGENT,
+                &message,
+            );
         }
         let _ = writeln!(stderr, "worktree kept: {path}");
         drop(workspace);
+    }
+
+    drop(stdout);
+    drop(stderr);
+    if let Some(emitter) = json.as_mut() {
+        let status = if exit == EXIT_OK {
+            result_status
+        } else if exit == EXIT_CANCELLED {
+            "cancelled"
+        } else {
+            "error"
+        };
+        emitter.session(&json_session);
+        emitter.result(&crate::agent_json::JsonResult {
+            status,
+            exit_code: exit,
+            session_id: json_session.session_id.clone(),
+            run_id: json_session.run_id.clone(),
+            stop: session
+                .last_stop
+                .as_ref()
+                .map(stop_label)
+                .unwrap_or("")
+                .to_string(),
+            turns: session.turns,
+            usage: session.usage,
+            proposal_ref,
+            commit: commit_id,
+            stat: stat_text,
+            patch: patch_text,
+            applied,
+            apply_error,
+        });
     }
 
     exit
@@ -897,6 +1218,13 @@ struct SessionSummary {
     usage: Usage,
     turns: u64,
     last_stop: Option<LoopStop>,
+    session_id: String,
+}
+
+fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
+    if let Err(error) = op {
+        let _ = writeln!(stderr, "greppy -p: session save failed: {error}");
+    }
 }
 
 fn run_headless_session(
@@ -904,32 +1232,157 @@ fn run_headless_session(
     env: &mut GreppyEnv,
     config: &AgentConfig,
     task: &str,
+    store: &SessionStore,
+    record: &mut SessionRecord,
+    resumed: bool,
+    model: &str,
+    mut json: Option<&mut crate::agent_json::JsonEmitter>,
+    json_session: &crate::agent_json::JsonSession,
 ) -> Result<SessionSummary, String> {
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
-    let mut tool_line_open = false;
-    let mut turns = 0u64;
-    let result = run_agent_loop(client, env, config, task, &mut |event| {
-        if matches!(event, LoopEvent::TurnComplete { .. }) {
-            turns = turns.saturating_add(1);
+    if resumed {
+        if record.model != model {
+            if let Err(error) = store.set_model(&record.id, model) {
+                eprintln!("greppy -p: session save failed: {error}");
+            }
+            record.model = model.to_string();
         }
-        handle_loop_event(event, &mut stdout, &mut stderr, &mut tool_line_open);
-    })
-    .map_err(|error| error.to_string())?;
-
-    if tool_line_open {
-        let _ = writeln!(stderr);
+    } else if let Err(error) = store.create(record) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            eprintln!("greppy -p: session save failed: {error}");
+        }
     }
-    if !result.final_text.is_empty() && !result.final_text.ends_with('\n') {
-        let _ = writeln!(stdout);
-    }
-    let _ = stdout.flush();
 
-    Ok(SessionSummary {
-        usage: result.usage,
-        turns,
-        last_stop: Some(result.stop),
-    })
+    let history = protocol_from_persisted(&record.messages);
+    let previous_message_count = history.len();
+    let mut summary = SessionSummary {
+        usage: record.usage,
+        turns: record.turns,
+        last_stop: None,
+        session_id: record.id.clone(),
+    };
+    if let Err(error) = store.append_turn_start(&record.id, "headless", task) {
+        eprintln!("greppy -p: session save failed: {error}");
+    }
+    if let Some(emitter) = json.as_mut() {
+        emitter.session(json_session);
+    }
+
+    let json_mode = json.is_some();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let mut tool_line_open = false;
+    let mut prompt_turns = 0u64;
+    let mut tool_started = std::collections::HashMap::<String, Instant>::new();
+    let result = run_agent_loop_with_history(client, env, config, &history, task, &mut |event| {
+        if matches!(event, LoopEvent::TurnComplete { .. }) {
+            prompt_turns = prompt_turns.saturating_add(1);
+        }
+        match &event {
+            LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
+                if let Some(emitter) = json.as_mut() {
+                    emitter.text(text);
+                }
+            }
+            LoopEvent::ToolStart {
+                call_id,
+                name,
+                arguments,
+            } => {
+                tool_started.insert(call_id.clone(), Instant::now());
+                let tool_summary = format_tool_start(name, arguments);
+                persist_session(
+                    &mut stderr,
+                    store.append_tool_start(&record.id, call_id, name, &tool_summary),
+                );
+                if let Some(emitter) = json.as_mut() {
+                    emitter.tool_start(call_id, name, &tool_summary);
+                }
+            }
+            LoopEvent::ToolFinish {
+                call_id, outcome, ..
+            } => {
+                let elapsed_ms = tool_started
+                    .remove(call_id)
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                persist_session(
+                    &mut stderr,
+                    store.append_tool_finish(
+                        &record.id,
+                        call_id,
+                        outcome.is_error,
+                        elapsed_ms,
+                        &outcome.content,
+                    ),
+                );
+                if let Some(emitter) = json.as_mut() {
+                    emitter.tool_finish(call_id, outcome.is_error, elapsed_ms, &outcome.content);
+                }
+            }
+            LoopEvent::TurnComplete {
+                stop_reason, usage, ..
+            } => {
+                if let Some(emitter) = json.as_mut() {
+                    emitter.turn_complete(&stop_reason_label(stop_reason), usage);
+                }
+            }
+            _ => {}
+        }
+        handle_loop_event(
+            event,
+            &mut stdout,
+            &mut stderr,
+            &mut tool_line_open,
+            json_mode,
+        );
+    });
+
+    match result {
+        Ok(result) => {
+            if tool_line_open {
+                let _ = writeln!(stderr);
+            }
+            if !json_mode && !result.final_text.is_empty() && !result.final_text.ends_with('\n') {
+                let _ = writeln!(stdout);
+            }
+            let _ = stdout.flush();
+
+            let new_messages = messages_from_protocol(
+                &result.messages[previous_message_count.min(result.messages.len())..],
+            );
+            persist_session(
+                &mut stderr,
+                store.append_messages(&record.id, &new_messages),
+            );
+            add_usage(&mut summary.usage, &result.usage);
+            summary.turns = summary.turns.saturating_add(prompt_turns);
+            persist_session(
+                &mut stderr,
+                store.append_usage(
+                    &record.id,
+                    &summary.usage,
+                    summary.turns,
+                    stop_label(&result.stop),
+                ),
+            );
+            persist_session(
+                &mut stderr,
+                store.append_turn_done(
+                    &record.id,
+                    stop_label(&result.stop),
+                    prompt_turns,
+                    &result.usage,
+                ),
+            );
+            summary.last_stop = Some(result.stop);
+            Ok(summary)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
+            Err(message)
+        }
+    }
 }
 
 struct InteractiveLaunch {
@@ -967,12 +1420,14 @@ fn run_interactive_session(
             .map_err(|error| format!("cannot continue session: {error}"))?
             .ok_or_else(|| "no previous interactive session for this project".to_string())?
     } else {
-        SessionRecord::new(
+        let mut record = SessionRecord::new(
             new_session_id(),
             launch.project.clone(),
             launch.model.clone(),
             launch.run_id.clone(),
-        )
+        );
+        record.source = "interactive".to_string();
+        record
     };
     record.model = launch.model.clone();
     record.run_id = launch.run_id.clone();
@@ -1062,6 +1517,7 @@ fn run_interactive_session(
                 usage: restored_usage,
                 turns: restored_turns,
                 last_stop: None,
+                session_id: session_id.clone(),
             };
             if cancel.load(Ordering::Relaxed) {
                 return Ok(summary);
@@ -1177,6 +1633,7 @@ fn run_interactive_session(
                                 summary.last_stop = None;
                                 config.model = next.model;
                                 session_id = next.id;
+                                summary.session_id = session_id.clone();
                                 cancel.store(false, Ordering::Relaxed);
                             }
                             Err(error) => {
@@ -1204,6 +1661,15 @@ fn run_interactive_session(
                         cancel.store(false, Ordering::Relaxed);
                         let mut prompt_turns = 0u64;
                         let previous_message_count = history.len();
+                        if let Err(error) = store_for_worker.append_turn_start(
+                            &session_id,
+                            "interactive",
+                            &prompt,
+                        ) {
+                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                "session save failed: {error}"
+                            )));
+                        }
                         let result = run_agent_loop_with_history(
                             &mut client,
                             &mut env,
@@ -1229,6 +1695,16 @@ fn run_interactive_session(
                                         tool_started.insert(call_id.clone(), Instant::now());
                                         let summary =
                                             format_tool_start(&name, &redact_json(&arguments));
+                                        if let Err(error) = store_for_worker.append_tool_start(
+                                            &session_id,
+                                            &call_id,
+                                            &name,
+                                            &summary,
+                                        ) {
+                                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
                                         bridge.send_discrete(SessionEvent::ToolStart {
                                             id: call_id,
                                             summary,
@@ -1241,6 +1717,17 @@ fn run_interactive_session(
                                             .remove(&call_id)
                                             .map(|started| started.elapsed().as_millis() as u64)
                                             .unwrap_or(0);
+                                        if let Err(error) = store_for_worker.append_tool_finish(
+                                            &session_id,
+                                            &call_id,
+                                            outcome.is_error,
+                                            elapsed_ms,
+                                            &outcome.content,
+                                        ) {
+                                            bridge.send_discrete(SessionEvent::Warning(format!(
+                                                "session save failed: {error}"
+                                            )));
+                                        }
                                         bridge.send_discrete(SessionEvent::ToolFinish {
                                             id: call_id,
                                             failed: outcome.is_error,
@@ -1280,6 +1767,16 @@ fn run_interactive_session(
                                         "session save failed: {error}"
                                     )));
                                 }
+                                if let Err(error) = store_for_worker.append_turn_done(
+                                    &session_id,
+                                    stop_label(&result.stop),
+                                    prompt_turns,
+                                    &result.usage,
+                                ) {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {error}"
+                                    )));
+                                }
                                 bridge.send_discrete(SessionEvent::Done {
                                     input_tokens: result.usage.input_tokens,
                                     output_tokens: result.usage.output_tokens,
@@ -1292,6 +1789,13 @@ fn run_interactive_session(
                             }
                             Err(error) => {
                                 let message = error.to_string();
+                                if let Err(persist_error) =
+                                    store_for_worker.append_turn_error(&session_id, &message)
+                                {
+                                    bridge.send_discrete(SessionEvent::Warning(format!(
+                                        "session save failed: {persist_error}"
+                                    )));
+                                }
                                 bridge.send_discrete(SessionEvent::Error(message.clone()));
                                 return Err(message);
                             }
@@ -1440,14 +1944,27 @@ fn report_stop(
     }
 }
 
+fn stop_reason_label(reason: &StopReason) -> String {
+    match reason {
+        StopReason::EndTurn => "end_turn".to_string(),
+        StopReason::ToolUse => "tool_use".to_string(),
+        StopReason::MaxTokens => "max_tokens".to_string(),
+        StopReason::Other(other) => other.clone(),
+    }
+}
+
 fn handle_loop_event(
     event: LoopEvent,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     tool_line_open: &mut bool,
+    json_mode: bool,
 ) {
     match event {
         LoopEvent::Stream(StreamEvent::TextDelta { text }) => {
+            if json_mode {
+                return;
+            }
             let _ = write!(stdout, "{text}");
             let _ = stdout.flush();
         }
@@ -1795,7 +2312,7 @@ fn home_dir() -> std::path::PathBuf {
 /// `<current_exe> index` (incremental) with credential scrub and no sandbox,
 /// then re-checks doctor. Failure warns with the consequence and continues —
 /// the agent can still work via name/text search while embeddings catch up.
-fn ensure_semantic_index(worktree_path: &Path) {
+fn ensure_semantic_index(worktree_path: &Path, json_mode: bool) {
     if doctor_reports_embedding_complete(worktree_path) {
         return;
     }
@@ -1814,9 +2331,27 @@ fn ensure_semantic_index(worktree_path: &Path) {
     cmd.arg("index")
         .current_dir(worktree_path)
         .stdin(std::process::Stdio::null());
+    if json_mode {
+        cmd.stdout(std::process::Stdio::piped());
+    }
     scrub_credential_env(&mut cmd);
 
-    match cmd.status() {
+    let status = if json_mode {
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdout) = child.stdout.take() {
+                    let mut stderr = io::stderr();
+                    let _ = io::copy(&mut stdout, &mut stderr);
+                }
+                child.wait()
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        cmd.status()
+    };
+
+    match status {
         Ok(status) if status.success() => {
             if !doctor_reports_embedding_complete(worktree_path) {
                 eprintln!(
@@ -2226,6 +2761,7 @@ mod tests {
             skip_selfcheck: false,
             continue_session: false,
             resume: None,
+            json: false,
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -2246,6 +2782,7 @@ mod tests {
             skip_selfcheck: false,
             continue_session: false,
             resume: None,
+            json: false,
         };
         assert_eq!(validate_args(&a, false), Err(EXIT_USAGE));
     }
@@ -2303,6 +2840,7 @@ mod tests {
             help.contains("--resume"),
             "help must mention --resume: {help}"
         );
+        assert!(help.contains("--json"), "help must mention --json: {help}");
         assert!(
             help.contains("ignored build caches") || help.contains("ignored files"),
             "help must document ignored-cache default: {help}"
@@ -2455,6 +2993,7 @@ mod tests {
             skip_selfcheck: false,
             continue_session: false,
             resume: None,
+            json: false,
         };
         let wt = unique("sb-off");
         fs::create_dir_all(&wt).unwrap();
@@ -2490,6 +3029,7 @@ mod tests {
             skip_selfcheck: false,
             continue_session: false,
             resume: None,
+            json: false,
         };
         let wt = unique("sb-on");
         fs::create_dir_all(&wt).unwrap();
@@ -2769,8 +3309,47 @@ mod tests {
         assert_eq!(b.resume.as_deref(), Some("sess-1"));
         assert!(parse(&["--model", "m", "--continue", "--resume", "x"]).is_err());
         let headless = parse(&["task", "--model", "m", "--continue"]).expect("parse");
-        assert_eq!(validate_args(&headless, false), Err(EXIT_USAGE));
+        assert_eq!(validate_args(&headless, false), Ok(()));
         assert_eq!(validate_args(&headless, true), Ok(()));
+        let resumed = parse(&["task", "--model", "m", "--resume", "sess-1"]).expect("parse");
+        assert_eq!(validate_args(&resumed, false), Ok(()));
+        let json = parse(&["task", "--model", "m", "--json"]).expect("parse");
+        assert!(json.json);
+        assert_eq!(validate_args(&json, false), Ok(()));
+        assert_eq!(validate_args(&json, true), Err(EXIT_USAGE));
+    }
+
+    #[test]
+    fn resolve_headless_session_errors_are_usage() {
+        let root = unique("headless-session");
+        let _ = fs::create_dir_all(&root);
+        let store = SessionStore::new(&root, "demo");
+        let missing = resolve_headless_session_record(
+            &store,
+            "demo",
+            "m",
+            "run",
+            false,
+            Some("does-not-exist"),
+        )
+        .unwrap_err();
+        assert_eq!(missing.0, EXIT_USAGE);
+        assert!(
+            missing
+                .1
+                .starts_with("greppy -p: cannot resume session does-not-exist:"),
+            "{}",
+            missing.1
+        );
+        let none =
+            resolve_headless_session_record(&store, "demo", "m", "run", true, None).unwrap_err();
+        assert_eq!(none.0, EXIT_USAGE);
+        assert_eq!(none.1, "greppy -p: no previous session for this project");
+        let (fresh, resumed) =
+            resolve_headless_session_record(&store, "demo", "m", "run", false, None).unwrap();
+        assert!(!resumed);
+        assert_eq!(fresh.source, "headless");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

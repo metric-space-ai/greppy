@@ -4,6 +4,18 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Agent session events
+
+Interactive session JSONL now records additive `tool` and `turn` event lines
+(start/finish/done/error) plus a `source` field on `meta` (`interactive` /
+`headless`). Unknown or new line types still load without marking the session
+recovered.
+
+`greppy -p` persists a session in the same store, prints `session: <id>` as
+the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
+`greppy -p --json` streams newline-delimited JSON events on stdout; `greppy
+agent --json` is rejected.
+
 ### Agent session readers
 
 `greppy agent sessions list|show|tail|path` reads persisted JSONL session logs

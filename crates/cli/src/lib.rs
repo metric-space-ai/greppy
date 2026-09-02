@@ -96,6 +96,7 @@ use context::*;
 mod agent;
 pub use agent::agent_session_store_identity;
 mod agent_sessions;
+mod agent_json;
 mod agent_tui;
 mod store_cow;
 

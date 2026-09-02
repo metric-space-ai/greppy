@@ -55,6 +55,8 @@ greppy patch --verify < refactor.diff          # coordinated all-or-nothing patc
 
 # And since 0.3.1, a one-shot coding agent on the same binary — local gateway, review-patch:
 greppy -p "add tests for clamp_value"          # uses a private portable CoW workspace, returns a proposal ref
+greppy -p "keep going" --continue              # resume this project's most recent -p/agent session
+
 
 # And since 0.3.4, the same agent in an interactive terminal UI:
 greppy agent --model MODEL                     # full-screen session, same isolated workspace
@@ -428,7 +430,16 @@ Slash commands: `/help`, `/clear`, `/model`, `/usage`, `/tools`, `/copy`,
 messages and an extractive summary of earlier turns. Sessions are append-only
 JSONL under the Greppy data root (`…/agent-sessions/<project>/`); a truncated
 tail restores the valid prefix. `--continue` and `--resume SESSION_ID` reload
-them. Other programs can read the same files without a running agent:
+them. The one-shot `greppy -p "TASK"` path persists a session in that same
+store, prints `session: <session_id>` as the first stderr line, and accepts
+`--continue` / `--resume SESSION_ID` to keep going from prior messages.
+`greppy -p --json` streams newline-delimited JSON events on stdout (`session`,
+`text`, `tool_start`, `tool_finish`, `turn_complete`, `error`, `result`) and
+keeps human diagnostics on stderr; `result` is always the last stdout line.
+Plain stdout/stderr/exit-code behavior without `--json` is otherwise unchanged
+except for that session line; `greppy -e -p` still reaches grep passthrough.
+
+Other programs can read the same files without a running agent:
 
 ```bash
 greppy agent sessions list [--json] [--all-projects]
@@ -442,8 +453,7 @@ greppy agent sessions path ID
 truncated to 400 characters unless `--full`). `tail --follow` polls every
 200 ms until SIGINT (exit 0). `path` prints the absolute JSONL path. Session
 ids may be unique prefixes; unknown or ambiguous ids exit 2. These commands
-never write the store. The one-shot `greppy -p "TASK"` stdout/stderr/exit-code
-contract is unchanged; `greppy -e -p` still reaches grep passthrough.
+never write the store.
 
 Deterministic TUI previews (production renderer, not a mock layout):
 
