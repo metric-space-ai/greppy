@@ -31,7 +31,7 @@ use crate::agent::EXIT_USAGE;
 
 pub use bootstrap::BootstrapScreen;
 pub use events::{bounded_pair, EventBridge, EventIntake, SessionCommand, SessionEvent};
-pub use redaction::redact_json;
+pub use redaction::{redact_json, redact_text};
 pub use session::{
     compact_messages, messages_from_protocol, new_session_id, protocol_from_persisted,
     SessionRecord, SessionStore,

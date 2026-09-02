@@ -433,8 +433,11 @@ tail restores the valid prefix. `--continue` and `--resume SESSION_ID` reload
 them. The one-shot `greppy -p "TASK"` path persists a session in that same
 store, prints `session: <session_id>` as the first stderr line, and accepts
 `--continue` / `--resume SESSION_ID` to keep going from prior messages.
-Plain stdout/stderr/exit-code behavior is otherwise unchanged except for that
-session line; `greppy -e -p` still reaches grep passthrough.
+`greppy -p --json` streams newline-delimited JSON events on stdout (`session`,
+`text`, `tool_start`, `tool_finish`, `turn_complete`, `error`, `result`) and
+keeps human diagnostics on stderr; `result` is always the last stdout line.
+Plain stdout/stderr/exit-code behavior without `--json` is otherwise unchanged
+except for that session line; `greppy -e -p` still reaches grep passthrough.
 
 Deterministic TUI previews (production renderer, not a mock layout):
 

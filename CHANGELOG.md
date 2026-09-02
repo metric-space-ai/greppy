@@ -13,6 +13,8 @@ recovered.
 
 `greppy -p` persists a session in the same store, prints `session: <id>` as
 the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
+`greppy -p --json` streams newline-delimited JSON events on stdout; `greppy
+agent --json` is rejected.
 
 ## [0.4.0] — 2026-09-02
 

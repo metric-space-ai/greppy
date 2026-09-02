@@ -94,6 +94,7 @@ mod context;
 mod workspace_setup;
 use context::*;
 mod agent;
+mod agent_json;
 mod agent_tui;
 mod store_cow;
 
