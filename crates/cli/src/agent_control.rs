@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::agent_tui::SessionStore;
 
@@ -480,7 +481,15 @@ fn io_rpc_error(error: io::Error) -> RpcError {
 }
 
 pub fn socket_path_for(store: &SessionStore, session_id: &str) -> PathBuf {
-    store.path_for(session_id).with_extension("sock")
+    let user_key = format!("control-{}", unsafe { libc::geteuid() });
+    let mut hasher = Sha256::new();
+    hasher.update(store.project().as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    crate::agent::agent_runtime_dir(&user_key)
+        .join("s")
+        .join(format!("{}.sock", &digest[..16]))
 }
 
 pub fn is_live(path: &Path) -> bool {
@@ -496,6 +505,7 @@ pub fn not_live_message(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -526,6 +536,22 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("request not received")
+    }
+
+    #[test]
+    fn socket_paths_are_short_and_session_specific() {
+        let store = SessionStore::new(
+            "/Users/example/Library/Application Support/greppy",
+            "p".repeat(60),
+        );
+        let first = socket_path_for(&store, "20260902-172554-abcdef12");
+        let second = socket_path_for(&store, "20260902-172554-fedcba21");
+        assert!(
+            first.as_os_str().as_bytes().len() <= 100,
+            "socket path is too long: {}",
+            first.display()
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

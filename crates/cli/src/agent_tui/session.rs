@@ -86,6 +86,10 @@ impl SessionStore {
         self.root.join(&self.project)
     }
 
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
     pub fn path_for(&self, session_id: &str) -> PathBuf {
         self.project_dir().join(format!("{session_id}.jsonl"))
     }
