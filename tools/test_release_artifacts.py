@@ -526,6 +526,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("session daemon three-run stability", web_runtime_ci)
         self.assertIn("for attempt in 1 2 3", web_runtime_ci)
+        self.assertIn("branches: ['**']", web_runtime_ci)
         self.assertNotIn("RIFT-MIT", workflow)
         cow_workflow = (
             REPOSITORY_ROOT / ".github/workflows/filesystem-cow.yml"
