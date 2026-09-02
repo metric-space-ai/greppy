@@ -14,7 +14,9 @@ recovered.
 `greppy -p` persists a session in the same store, prints `session: <id>` as
 the first stderr line, and accepts `--continue` / `--resume SESSION_ID`.
 `greppy -p --json` streams newline-delimited JSON events on stdout; `greppy
-agent --json` is rejected.
+agent --json` is rejected. The first SIGINT/SIGTERM cancels at a safe
+boundary and still emits `result` with status `cancelled` and exit 130; a
+second signal exits immediately.
 
 ### Agent session readers
 

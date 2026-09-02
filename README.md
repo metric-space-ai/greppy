@@ -436,6 +436,10 @@ store, prints `session: <session_id>` as the first stderr line, and accepts
 `greppy -p --json` streams newline-delimited JSON events on stdout (`session`,
 `text`, `tool_start`, `tool_finish`, `turn_complete`, `error`, `result`) and
 keeps human diagnostics on stderr; `result` is always the last stdout line.
+The first SIGINT or SIGTERM cancels the loop at the next safe boundary and
+still emits `result` with `status: "cancelled"` and `exit_code: 130` (plain
+mode prints `stopped: cancelled` on stderr and exits 130); a second signal
+exits immediately.
 Plain stdout/stderr/exit-code behavior without `--json` is otherwise unchanged
 except for that session line; `greppy -e -p` still reaches grep passthrough.
 

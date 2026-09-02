@@ -177,8 +177,12 @@ pub(crate) fn attach(id: &str, json: bool, since_start: bool, root: Option<&str>
         if since_start {
             print_session_tail(&session, json, 40);
         }
-        stream_events(&mut client, json, 0, |_| None)
+        stream_events(&mut client, json, stream_interrupt_exit_code(), |_| None)
     }
+}
+
+fn stream_interrupt_exit_code() -> i32 {
+    130
 }
 
 fn read_prompt(text: &str) -> std::result::Result<String, i32> {
@@ -379,7 +383,7 @@ fn subscribe(client: &mut ControlClient) -> std::result::Result<(), i32> {
 #[cfg(unix)]
 fn stream_until_turn(client: &mut ControlClient, prompt_id: &str, json: bool) -> Result<i32> {
     let mut saw_start = false;
-    stream_events(client, json, 130, |event| {
+    stream_events(client, json, stream_interrupt_exit_code(), |event| {
         let event_type = event.get("type").and_then(Value::as_str);
         if !saw_start {
             if event_type == Some("turn_start")
@@ -463,6 +467,11 @@ mod tests {
             "escape leaked: {rendered:?}"
         );
         assert!(rendered.contains("safe"), "{rendered:?}");
+    }
+
+    #[test]
+    fn ctrl_c_maps_to_exit_130() {
+        assert_eq!(stream_interrupt_exit_code(), 130);
     }
 
     #[test]

@@ -942,13 +942,28 @@ fn run_agent(
         None => (None, None),
     };
 
-    let config = AgentConfig {
+    let mut config = AgentConfig {
         max_turns: args.max_turns,
         system: Some(system_prompt()),
         model: model.clone(),
         deadline,
         deadline_total,
         ..AgentConfig::default()
+    };
+    #[cfg(unix)]
+    let _headless_signals = if !interactive && !serve {
+        let cancel = Arc::new(AtomicBool::new(false));
+        config.cancel = Some(Arc::clone(&cancel));
+        Some(headless_signals::Guard::install(cancel))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let _headless_signals = if !interactive && !serve {
+        config.cancel = Some(Arc::new(AtomicBool::new(false)));
+        Some(())
+    } else {
+        None
     };
 
     let repository = cwd
@@ -1084,7 +1099,7 @@ fn run_agent(
             .map(|session| (session, false))
         }
     };
-    let (session, interactive_cancelled) = match session {
+    let (mut session, interactive_cancelled) = match session {
         Ok(session) => session,
         Err(error) => {
             let message = format!(
@@ -1108,6 +1123,9 @@ fn run_agent(
             EXIT_CANCELLED,
             "stopped: cancelled by user",
         );
+    }
+    if run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref()) {
+        session.last_stop = Some(LoopStop::Cancelled);
     }
 
     eprintln!(
@@ -1234,7 +1252,8 @@ fn run_agent(
                 }
             }
 
-            if args.apply {
+            if args.apply && !run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref())
+            {
                 match workspace.apply_to(workspace.repo_root(), &commit) {
                     Ok(()) => {
                         applied = true;
@@ -1319,26 +1338,25 @@ fn run_agent(
 
     drop(stdout);
     drop(stderr);
+    let cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    let (exit, status) = result_exit_and_status(cancelled, exit, result_status);
     if let Some(emitter) = json.as_mut() {
-        let status = if exit == EXIT_OK {
-            result_status
-        } else if exit == EXIT_CANCELLED {
-            "cancelled"
-        } else {
-            "error"
-        };
         emitter.session(&json_session);
         emitter.result(&crate::agent_json::JsonResult {
             status,
             exit_code: exit,
             session_id: json_session.session_id.clone(),
             run_id: json_session.run_id.clone(),
-            stop: session
-                .last_stop
-                .as_ref()
-                .map(stop_label)
-                .unwrap_or("")
-                .to_string(),
+            stop: if cancelled {
+                "cancelled".to_string()
+            } else {
+                session
+                    .last_stop
+                    .as_ref()
+                    .map(stop_label)
+                    .unwrap_or("")
+                    .to_string()
+            },
             turns: session.turns,
             usage: session.usage,
             proposal_ref,
@@ -1382,6 +1400,78 @@ pub(crate) struct SessionWorkerHandle {
     pub(crate) record: SessionRecord,
     pub(crate) bridge: crate::agent_tui::EventBridge,
     start: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(unix)]
+mod headless_signals {
+    use super::*;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize};
+
+    static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+    static CANCEL: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+
+    extern "C" fn record_signal(_: libc::c_int) {
+        let ptr = CANCEL.load(Ordering::SeqCst);
+        if !ptr.is_null() {
+            unsafe {
+                (*ptr).store(true, Ordering::Relaxed);
+            }
+        }
+        let prior = SIGNALS.fetch_add(1, Ordering::SeqCst);
+        if prior > 0 {
+            unsafe { libc::_exit(130) };
+        }
+    }
+
+    pub(super) struct Guard {
+        previous_int: libc::sighandler_t,
+        previous_term: libc::sighandler_t,
+        _cancel: Arc<AtomicBool>,
+    }
+
+    impl Guard {
+        pub(super) fn install(cancel: Arc<AtomicBool>) -> Self {
+            SIGNALS.store(0, Ordering::SeqCst);
+            CANCEL.store(Arc::as_ptr(&cancel) as *mut AtomicBool, Ordering::SeqCst);
+            let handler = record_signal as *const () as libc::sighandler_t;
+            let previous_int = unsafe { libc::signal(libc::SIGINT, handler) };
+            let previous_term = unsafe { libc::signal(libc::SIGTERM, handler) };
+            Self {
+                previous_int,
+                previous_term,
+                _cancel: cancel,
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CANCEL.store(std::ptr::null_mut(), Ordering::SeqCst);
+            unsafe {
+                libc::signal(libc::SIGINT, self.previous_int);
+                libc::signal(libc::SIGTERM, self.previous_term);
+            }
+        }
+    }
+}
+
+fn run_was_cancelled(stop: Option<&LoopStop>, cancel: Option<&Arc<AtomicBool>>) -> bool {
+    matches!(stop, Some(LoopStop::Cancelled))
+        || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn result_exit_and_status(
+    cancelled: bool,
+    exit: u8,
+    ok_status: &'static str,
+) -> (u8, &'static str) {
+    if cancelled || exit == EXIT_CANCELLED {
+        (EXIT_CANCELLED, "cancelled")
+    } else if exit == EXIT_OK {
+        (exit, ok_status)
+    } else {
+        (exit, "error")
+    }
 }
 
 fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
@@ -1543,7 +1633,16 @@ fn run_headless_session(
         Err(error) => {
             let message = error.to_string();
             persist_session(&mut stderr, store.append_turn_error(&record.id, &message));
-            Err(message)
+            if config
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                summary.last_stop = Some(LoopStop::Cancelled);
+                Ok(summary)
+            } else {
+                Err(message)
+            }
         }
     }
 }
@@ -2831,7 +2930,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -3116,6 +3216,26 @@ mod tests {
             help.contains("between turns") || help.contains("never cut in half"),
             "help must state deadline stops between turns: {help}"
         );
+    }
+
+    #[test]
+    fn cancelled_loop_maps_to_exit_130() {
+        assert_eq!(
+            result_exit_and_status(true, EXIT_OK, "clean"),
+            (EXIT_CANCELLED, "cancelled")
+        );
+        assert_eq!(
+            result_exit_and_status(false, EXIT_CANCELLED, "clean"),
+            (EXIT_CANCELLED, "cancelled")
+        );
+        assert_eq!(
+            result_exit_and_status(false, EXIT_OK, "proposal"),
+            (EXIT_OK, "proposal")
+        );
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(run_was_cancelled(Some(&LoopStop::EndTurn), Some(&flag)));
+        assert!(run_was_cancelled(Some(&LoopStop::Cancelled), None));
+        assert!(!run_was_cancelled(Some(&LoopStop::EndTurn), None));
     }
 
     #[test]

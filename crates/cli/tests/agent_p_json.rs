@@ -1,6 +1,6 @@
 //! Integration: `greppy -p --json` against a loopback Anthropic-Messages stub.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -58,6 +58,12 @@ fn init_repo(root: &std::path::Path) {
 }
 
 fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_stub_gateway_with_delay(Duration::ZERO)
+}
+
+fn spawn_stub_gateway_with_delay(
+    delay: Duration,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
         .set_nonblocking(true)
@@ -106,6 +112,9 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
                         );
                         let _ = stream.write_all(resp.as_bytes());
                     } else if first_line.starts_with("POST /v1/messages") {
+                        if !delay.is_zero() {
+                            thread::sleep(delay);
+                        }
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             sse.len(),
@@ -436,4 +445,85 @@ fn greppy_agent_json_is_usage_error() {
         "stderr={stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn greppy_p_json_sigint_emits_cancelled_result_last() {
+    let repo = unique_temp("sigint-repo");
+    init_repo(&repo);
+    let store = unique_temp("sigint-store");
+    let provider_root = unique_temp("sigint-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, handle) = spawn_stub_gateway_with_delay(Duration::from_secs(3));
+
+    let mut child = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "say hi",
+            "--json",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "2",
+            "--private-store",
+            "--skip-selfcheck",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn greppy -p --json");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        let mut handle = stderr;
+        handle.read_to_string(&mut buf).ok();
+        buf
+    });
+    let mut reader = BufReader::new(stdout);
+    let mut session_line = String::new();
+    reader
+        .read_line(&mut session_line)
+        .expect("read session line");
+    let session: serde_json::Value =
+        serde_json::from_str(session_line.trim()).unwrap_or_else(|error| {
+            panic!("first stdout line is not JSON ({error}): {session_line:?}")
+        });
+    assert_eq!(session["type"].as_str(), Some("session"), "{session_line}");
+
+    let _ = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    let status = child.wait().expect("wait greppy -p");
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).ok();
+    let stdout = format!("{session_line}{rest}");
+    let stderr = stderr_thread.join().unwrap();
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+
+    assert_eq!(status.code(), Some(130), "stdout={stdout}\nstderr={stderr}");
+    let events = parse_json_lines(stdout.as_bytes());
+    let last = events.last().unwrap();
+    assert_eq!(last["type"].as_str(), Some("result"), "stdout={stdout}");
+    assert_eq!(
+        last["status"].as_str(),
+        Some("cancelled"),
+        "stdout={stdout}"
+    );
+    assert_eq!(last["exit_code"].as_u64(), Some(130), "stdout={stdout}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
