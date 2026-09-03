@@ -144,19 +144,28 @@ under 6 s); a detached HEAD reports only the paths that actually drift.
    the Web tool and portable CoW workspaces remain unavailable there until the
    signed driver is delivered.
 
-3. **Four tests use debug-only fault or certificate injection.**
-   `GREPPY_WEB_TEST_IGNORE_CERTS` and `GREPPY_TEST_BASE_SUMMARY_FAIL` are
-   honored only with debug assertions. Consequently,
+3. **Six tests use debug-only fault or certificate injection.**
+   `GREPPY_WEB_TEST_IGNORE_CERTS`, `GREPPY_TEST_BASE_SUMMARY_FAIL`, and
+   `GREPPY_TEST_INDEX_FAILPOINT` are honored only with debug assertions.
+   Consequently,
    `extra_http_headers_are_sent_on_goto`,
    `route_continue_sends_extra_headers_on_http_and_https`,
    `greppy_p_aborts_before_model_turn_when_base_preparation_fails`, and
-   `index_agent_worktree_fails_closed_when_base_summary_cache_publication_fails`
+   `index_agent_worktree_fails_closed_when_base_summary_cache_publication_fails`,
+   `committed_task_delta_status_uses_base_union_across_worktrees`, and
+   `overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_files`
    are expected to fail when the test harness itself is compiled in the
-   release profile; all four pass in the debug profile.
+   release profile; all six pass in the debug profile.
 
 4. **Task T12 depends on external resources.** The T12 case in the Web task
    set loads external resources and is environment-dependent in long runs.
    The reference runtime exhibits the same behavior.
+
+5. **The set-content oracle needs its pinned Playwright browser.**
+   `oracle_matches_playwright_chromium_on_setcontent` requires the cached
+   `chromium-1234` runtime. A machine with only `chromium-1223` reports a
+   missing test dependency; with the pinned browser installed, the test
+   passes.
 
 ## [0.3.4] — 2026-08-30
 
