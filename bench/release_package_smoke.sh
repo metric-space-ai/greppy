@@ -55,9 +55,11 @@ dir_digest() {
 
 # Inference daemons (crates/cli/src/embed_daemon.rs / summarize_daemon.rs)
 # outlive the CLI call that spawned them (GREPPY_*_DAEMON_EXIT_TTL_S). Cache
-# purity and cache-clear assertions must not race their lock files / socket
-# teardown. Wait only for sockets and lock files in this smoke's owned runtime
-# directory: a global pgrep would couple the release to unrelated agents.
+# purity assertions must not race socket teardown. Stable `.owner` lock files
+# are deliberately retained after flock unlock so another process that already
+# opened the same inode cannot race an unlink/recreate cycle. `cache clear`
+# below detects a lock that is still held and retries on exit 75. A global
+# pgrep would couple the release to unrelated agents.
 dump_daemon_residue() {
   local now path mtime kind size age
   now="$(date +%s)"
@@ -82,7 +84,7 @@ dump_daemon_residue() {
 
 drain_daemons() {
   local deadline=$(( $(date +%s) + 180 ))
-  while find "$RUNTIME_BASE" \( -type f -o -type s \) -print -quit 2>/dev/null | grep -q .; do
+  while find "$RUNTIME_BASE" -type s -print -quit 2>/dev/null | grep -q .; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
       dump_daemon_residue
       fail "inference daemons did not exit within 180s"
@@ -567,9 +569,17 @@ done
 # Nothing may be left in the redirected TMPDIR once the daemons exited.
 [ -z "$(find "$FAKE_TMP" -mindepth 1 2>/dev/null)" ] \
   || fail "installed binary left residue in TMPDIR: $(find "$FAKE_TMP" -mindepth 1 | tr '\n' ' ')"
-# Daemon sockets must be gone from the runtime dir after drain (empty dirs ok).
-[ -z "$(find "$RUNTIME_BASE" -type f -o -type s 2>/dev/null)" ] \
-  || fail "daemon runtime dir still holds files after drain: $(find "$RUNTIME_BASE" -mindepth 1 | tr '\n' ' ')"
+# Daemon sockets must be gone after drain. Empty, unlocked `.owner` files are
+# the intentional stable flock inode; no other regular runtime residue is
+# permitted.
+while IFS= read -r path; do
+  case "$path" in
+    "$RUNTIME_BASE"/greppy/daemon-state/locks/*.owner)
+      [ ! -s "$path" ] || fail "daemon owner lock is unexpectedly nonempty: $path"
+      ;;
+    *) fail "daemon runtime dir holds unexpected residue after drain: $path" ;;
+  esac
+done < <(find "$RUNTIME_BASE" \( -type f -o -type s \) -print 2>/dev/null)
 
 # Removal: delete the prefix and both documented roots; nothing else of
 # the product may remain anywhere in the fake HOME.
