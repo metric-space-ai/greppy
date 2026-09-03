@@ -95,6 +95,21 @@ fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Opti
 }
 
 pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String)>> {
+    overlay_environment_inner(root, false)
+}
+
+/// Read a persisted Delta binding while permitting its Base file to be
+/// absent. This is only for the explicit index recovery path: steady-state
+/// readers must continue to fail closed instead of opening an incomplete
+/// overlay.
+fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
+    overlay_environment_inner(root, true)
+}
+
+fn overlay_environment_inner(
+    root: &Path,
+    allow_missing_persisted_base: bool,
+) -> Result<Option<(PathBuf, String)>> {
     if let Ok(mode) = std::env::var(ENV_MODE) {
         if mode != MODE_OVERLAY {
             return Ok(None);
@@ -152,7 +167,7 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
         .ok_or_else(|| Error::Invalid("linked-worktree Delta binding lacks base_path".into()))?;
-    if !base_path.is_file() {
+    if !base_path.is_file() && !allow_missing_persisted_base {
         return Err(Error::Invalid(format!(
             "linked-worktree Base Store is missing: {}; run `greppy index` to rebuild it",
             base_path.display()
@@ -786,49 +801,33 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         // Keep an existing worktree pinned to its verified Base. Advancing the
         // primary checkout must not force every already-indexed worktree to
         // build a new repository-wide Base on its next Delta refresh.
-        let persisted = overlay_environment(root)?;
-        let reused_persisted = match persisted {
-            Some((_, commit)) => {
-                reuse_verified_base_store(&primary, &commit, shared_data_root, &project)?
-                    .map(|prepared| (commit, prepared))
-            }
-            None => None,
+        let base_commit = match overlay_environment_for_recovery(root)? {
+            Some((_, commit)) => commit,
+            None => git_output(&primary, &["rev-parse", "HEAD"])?,
         };
-        let (base_commit, prepared) = match reused_persisted {
-            Some(binding) => binding,
-            None => {
-                let base_commit = git_output(&primary, &["rev-parse", "HEAD"])?;
-                let prepared = match reuse_verified_base_store(
-                    &primary,
-                    &base_commit,
-                    shared_data_root,
-                    &project,
-                )? {
-                    Some(prepared) => prepared,
-                    None => {
-                        // Only the first worktree for this immutable Git tree
-                        // needs a clean materialization. Every later worktree
-                        // opens the hash-verified published Base directly.
-                        report_base_phase(progress_path, "preparing_base_checkout");
-                        let clean = TemporaryBaseWorktree::create(
-                            &primary,
-                            shared_data_root,
-                            &base_commit,
-                        )?;
-                        prepare_base_store_paths(
-                            &primary,
-                            clean.path(),
-                            clean.path(),
-                            &base_commit,
-                            shared_data_root,
-                            embedding_args,
-                            progress_path,
-                        )?
-                    }
-                };
-                (base_commit, prepared)
-            }
-        };
+        let prepared =
+            match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
+                Some(prepared) => prepared,
+                None => {
+                    // Only the first worktree for this immutable Git tree needs a
+                    // clean materialization. Every later worktree opens the
+                    // hash-verified published Base directly. When recovery began
+                    // from a stale Delta binding, rebuild that binding's pinned
+                    // commit rather than silently moving it to the primary HEAD.
+                    report_base_phase(progress_path, "preparing_base_checkout");
+                    let clean =
+                        TemporaryBaseWorktree::create(&primary, shared_data_root, &base_commit)?;
+                    prepare_base_store_paths(
+                        &primary,
+                        clean.path(),
+                        clean.path(),
+                        &base_commit,
+                        shared_data_root,
+                        embedding_args,
+                        progress_path,
+                    )?
+                }
+            };
         configure_overlay_environment(&prepared, &base_commit);
         eprintln!(
             "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",

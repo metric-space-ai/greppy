@@ -565,6 +565,43 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("first_untracked_symbol"));
+
+    // A persisted Delta may outlive an evicted or manually removed shared
+    // Base. The recovery command named by diagnostics must rebuild the exact
+    // pinned Base instead of recursively failing while reading the stale
+    // binding. The primary branch has advanced above, so this also proves the
+    // recovery preserves the worktree's original Base commit.
+    let missing_base = PathBuf::from(
+        refreshed_status["store_cow"]["base_path"]
+            .as_str()
+            .expect("persisted Base path"),
+    );
+    std::fs::remove_file(&missing_base).expect("remove regenerable shared Base graph");
+    let (recovery_code, recovery_stdout, recovery_stderr) =
+        run(&first, &store, &["index", "."], None);
+    assert_eq!(
+        recovery_code, 0,
+        "missing linked Base recovery failed\nstdout={recovery_stdout}\nstderr={recovery_stderr}"
+    );
+    assert!(
+        recovery_stderr.contains("linked worktree uses shared Base")
+            && recovery_stderr.contains("(created)"),
+        "missing linked Base must be rebuilt: {recovery_stderr}"
+    );
+    let recovered_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(recovered_status["healthy"], true, "{recovered_status:#}");
+    assert_eq!(recovered_status["fresh"], true, "{recovered_status:#}");
+    assert_eq!(
+        recovered_status["store_cow"]["base_identity"], shared_identity,
+        "recovery must retain the persisted Base commit"
+    );
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "first_untracked_symbol"],
+        None,
+    )
+    .contains("first_untracked_symbol"));
 }
 
 #[test]
