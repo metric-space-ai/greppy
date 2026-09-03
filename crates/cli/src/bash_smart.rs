@@ -218,10 +218,10 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     };
     let spool_dir = spool_dir()?;
     let token = spool_token();
-    let stdout_path = spool_dir.path().join(format!("{token}.stdout"));
-    let stderr_path = spool_dir.path().join(format!("{token}.stderr"));
-    let stdout_times = spool_dir.path().join(format!("{token}.stdout.times"));
-    let stderr_times = spool_dir.path().join(format!("{token}.stderr.times"));
+    let stdout_path = spool_dir.join(format!("{token}.stdout"));
+    let stderr_path = spool_dir.join(format!("{token}.stderr"));
+    let stdout_times = spool_dir.join(format!("{token}.stdout.times"));
+    let stderr_times = spool_dir.join(format!("{token}.stderr.times"));
 
     let mut command = command_for_argv(argv)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -873,17 +873,18 @@ struct CapturedStream {
     sha256: String,
 }
 
-fn spool_dir() -> Result<tempfile::TempDir> {
+fn spool_dir() -> Result<PathBuf> {
     // Captured stdout/stderr is scratch state, not workspace state. Keeping it
     // below the graph store coupled command execution to that store's ACLs and
     // lifecycle: a concurrently published/replaced store could make the drain
     // threads fail with EPERM even though the child command itself was valid.
-    // A private 0700 temp directory also makes cleanup unconditional on every
-    // return path through `run`.
-    tempfile::Builder::new()
-        .prefix("greppy-bash-smart-")
-        .tempdir()
-        .map_err(|error| Error::io("create private bash-smart spool directory", error))
+    // Keep one hardened user-global namespace instead. The files must outlive
+    // this process because an expansion command reads their paths from the
+    // durable expand pack until that pack's TTL expires.
+    let dir = greppy_core::cache::data_root().join("bash-smart");
+    workspace_locator::ensure_store_dir(&dir)
+        .map_err(|error| Error::io("create private bash-smart spool directory", error))?;
+    Ok(dir)
 }
 
 fn spool_token() -> String {
@@ -1987,17 +1988,6 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spool_directory_is_private_per_invocation_and_removed_on_drop() {
-        let first = spool_dir().expect("first private spool");
-        let first_path = first.path().to_path_buf();
-        let second = spool_dir().expect("second private spool");
-        assert_ne!(first.path(), second.path());
-        assert!(first_path.exists());
-        drop(first);
-        assert!(!first_path.exists());
-    }
 
     #[test]
     fn bare_counters_do_not_template_collapse() {
