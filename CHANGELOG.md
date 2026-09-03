@@ -114,17 +114,37 @@ background refresh no longer reports an old snapshot as newly published;
 overlay navigation uses indexed Base/Delta queries (`path` from >120 s to
 under 6 s); a detached HEAD reports only the paths that actually drift.
 
-**Known limits.** A JavaScript search component that intercepts Enter (for
-example Wikipedia's) still needs the button; the agent finds it, at roughly
-five times the turns. Windows: the Web tool is not included in 0.4.0; Windows
-web-runtime localization follows in 0.4.1. The Windows CLI reports that scope
-explicitly instead of attempting runtime discovery. Live agent serve/control
-is Unix-only in 0.4.0; Windows retains local one-shot and interactive agents.
-The HTTPS extra-header tests trust the fixture certificate only in debug builds. On macOS, replacing
-or updating the signed app can require one renewed approval of `Greppy
-Workspace FS`. `workspace setup` detects approval for the exact current bundle
-before mounting, opens the File System Extensions pane directly when needed,
-and remains fail-closed until the user enables the named switch and reruns it.
+### Known limits
+
+1. **macOS requires an approved file-system extension.** `greppy workspace
+   setup`, and therefore `greppy -p`, require the “Greppy Workspace FS” system
+   extension to be enabled once under System Settings › General › Login Items
+   & Extensions › File System Extensions. Replacing or updating the app bundle
+   makes macOS request approval again. `workspace setup` detects this before
+   mounting, opens the settings page, and fails closed; after enabling the
+   switch, rerun the command. The mount, `workspace doctor`, and `workspace
+   status` have been verified on macOS 26.2 with the notarized application.
+
+2. **Windows packaging depends on the final owner decision.** No
+   Microsoft-HLK-/Dashboard-signed driver exists yet for the private WinFsp
+   fork. Unless the release is held until that signature is available, 0.4.0
+   will ship no Windows package. Windows users can build the CLI from source;
+   the Web tool and portable CoW workspaces remain unavailable there until the
+   signed driver is delivered.
+
+3. **Four tests use debug-only fault or certificate injection.**
+   `GREPPY_WEB_TEST_IGNORE_CERTS` and `GREPPY_TEST_BASE_SUMMARY_FAIL` are
+   honored only with debug assertions. Consequently,
+   `extra_http_headers_are_sent_on_goto`,
+   `route_continue_sends_extra_headers_on_http_and_https`,
+   `greppy_p_aborts_before_model_turn_when_base_preparation_fails`, and
+   `index_agent_worktree_fails_closed_when_base_summary_cache_publication_fails`
+   are expected to fail when the test harness itself is compiled in the
+   release profile; all four pass in the debug profile.
+
+4. **Task T12 depends on external resources.** The T12 case in the Web task
+   set loads external resources and is environment-dependent in long runs.
+   The reference runtime exhibits the same behavior.
 
 ## [0.3.4] — 2026-08-30
 
