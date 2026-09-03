@@ -4051,6 +4051,12 @@ fn engine_preferences(proxy_uri: &str) -> Preferences {
     preferences.network_http_no_proxy = String::new();
     preferences.network_enforce_tls_enabled = false;
     preferences.dom_intersection_observer_enabled = true;
+    // Servo 0.5.0 reaches rsa 0.10.0-rc.18 for RSA-OAEP private-key
+    // decryption (RUSTSEC-2023-0071). There is no fixed rsa release on this
+    // dependency line. Fail closed by removing SubtleCrypto from page script
+    // until Servo ships a constant-time backend; getRandomValues/randomUUID
+    // remain available on `crypto`.
+    preferences.dom_crypto_subtle_enabled = false;
     preferences
 }
 
@@ -4388,13 +4394,17 @@ mod serialize_tests {
     }
 
     #[test]
-    fn engine_enables_intersection_observer_and_pins_the_proxy() {
+    fn engine_enables_required_dom_features_and_pins_the_proxy() {
         let preferences = engine_preferences("http://127.0.0.1:4242");
         // Off by default in Servo; every modern framework dies without it.
         assert!(preferences.dom_intersection_observer_enabled);
         assert_eq!(preferences.network_http_proxy_uri, "http://127.0.0.1:4242");
         assert_eq!(preferences.network_https_proxy_uri, "http://127.0.0.1:4242");
         assert!(preferences.network_http_no_proxy.is_empty());
+        assert!(
+            !preferences.dom_crypto_subtle_enabled,
+            "Servo's vulnerable RSA-OAEP implementation must not be script-reachable"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -11,6 +11,53 @@ use url::Url;
 
 const HEADER_LIMIT: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PER_PROXY_CONNECTION_LIMIT: usize = 32;
+const GLOBAL_CONNECTION_LIMIT: usize = 128;
+static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct ConnectionPermit {
+    local: Arc<AtomicUsize>,
+}
+
+impl ConnectionPermit {
+    fn acquire(local: &Arc<AtomicUsize>) -> Option<Self> {
+        if !increment_below(local, PER_PROXY_CONNECTION_LIMIT) {
+            return None;
+        }
+        if !increment_below(&GLOBAL_ACTIVE_CONNECTIONS, GLOBAL_CONNECTION_LIMIT) {
+            local.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            local: Arc::clone(local),
+        })
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.local.fetch_sub(1, Ordering::AcqRel);
+        GLOBAL_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn increment_below(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 fn connect_allowed(
     profile: crate::policy::NetworkProfile,
@@ -45,6 +92,7 @@ pub struct PolicyProxy {
     addr: SocketAddr,
     _profile: SharedProfile,
     transferred: Arc<AtomicU64>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl PolicyProxy {
@@ -60,14 +108,25 @@ impl PolicyProxy {
         let addr = listener.local_addr()?;
         let thread_profile = profile.clone();
         let transferred = Arc::new(AtomicU64::new(0));
+        let active_connections = Arc::new(AtomicUsize::new(0));
         let thread_transferred = Arc::clone(&transferred);
+        let thread_active_connections = Arc::clone(&active_connections);
         thread::Builder::new()
             .name("greppy-policy-proxy".into())
-            .spawn(move || accept_loop(listener, thread_profile, resolve, thread_transferred))?;
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    thread_profile,
+                    resolve,
+                    thread_transferred,
+                    thread_active_connections,
+                )
+            })?;
         Ok(Self {
             addr,
             _profile: profile,
             transferred,
+            active_connections,
         })
     }
 
@@ -86,6 +145,11 @@ impl PolicyProxy {
     /// stub the session budget uses.
     pub fn bytes_transferred(&self) -> u64 {
         self.transferred.load(Ordering::Relaxed)
+    }
+
+    /// Connections currently holding a bounded proxy worker slot.
+    pub fn active_connections(&self) -> usize {
+        self.active_connections.load(Ordering::Acquire)
     }
 }
 
@@ -115,15 +179,26 @@ fn accept_loop(
     profile: SharedProfile,
     resolve: ConnectResolve,
     transferred: Arc<AtomicU64>,
+    active_connections: Arc<AtomicUsize>,
 ) {
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(mut stream) = stream else { continue };
+        let Some(permit) = ConnectionPermit::acquire(&active_connections) else {
+            // Reject before allocating an OS thread. A hostile page can open
+            // arbitrary subresource/WebSocket connections, so queueing here
+            // merely turns memory pressure into unbounded latency.
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+            continue;
+        };
         let profile = profile.clone();
         let resolve = Arc::clone(&resolve);
         let transferred = Arc::clone(&transferred);
         let _ = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
+                let _permit = permit;
                 let _ = handle_client(stream, profile, resolve, transferred);
             });
     }
@@ -737,5 +812,36 @@ mod tests {
         assert_eq!(status, 403, "keep-alive rebind must re-pin and deny: {hop}");
         assert!(!hop.contains("first-hop"), "{hop}");
         assert!(lookups.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn proxy_caps_idle_connections_before_allocating_more_threads() {
+        let proxy = PolicyProxy::spawn(SharedProfile::new(NetworkProfile::Project)).unwrap();
+        let clients = (0..PER_PROXY_CONNECTION_LIMIT)
+            .map(|_| TcpStream::connect(proxy.addr()).unwrap())
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while proxy.active_connections() != PER_PROXY_CONNECTION_LIMIT
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(proxy.active_connections(), PER_PROXY_CONNECTION_LIMIT);
+
+        let mut rejected = TcpStream::connect(proxy.addr()).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = String::new();
+        rejected.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response:?}");
+        assert_eq!(proxy.active_connections(), PER_PROXY_CONNECTION_LIMIT);
+
+        drop(clients);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while proxy.active_connections() != 0 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(proxy.active_connections(), 0);
     }
 }

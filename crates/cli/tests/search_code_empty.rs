@@ -47,6 +47,14 @@ fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+fn assert_indexed(repo: &Path, store: &Path) {
+    let (code, stdout, stderr) = run(repo, store, &["index", "."]);
+    assert_eq!(
+        code, 0,
+        "fixture index must complete; stdout={stdout}\nstderr={stderr}"
+    );
+}
+
 /// The pre-0.3.0 `search-code` subcommand is dead-listed vocabulary: like
 /// `edit change-signature` (edit_m4) it must be REFUSED as an unknown
 /// subcommand — an agent with a stale habit learns immediately instead of
@@ -80,6 +88,7 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
     let (repo, store) = fresh_workspace("empty-filter");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    assert_indexed(&repo, &store);
 
     let (code, stdout, _stderr) = run(
         &repo,
@@ -101,6 +110,39 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
         "{stdout}"
     );
     assert!(stdout.contains("greppy index ."), "{stdout}");
+    assert!(
+        stdout.contains("next: search excluded or unindexed source directly: greppy rg -n absent_value ."),
+        "a graph no-match must disclose the direct source recovery for vendor/ignored files; got: {stdout}"
+    );
+}
+
+/// A repository-wide miss must not claim that excluded vendor/ignored files
+/// were searched. It names the graph discovery boundary and gives the exact
+/// direct-source recovery instead of sending the caller into a futile reindex.
+#[test]
+fn empty_repository_search_pattern_discloses_discovery_exclusions() {
+    let (repo, store) = fresh_workspace("empty-repository-scope");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    assert_indexed(&repo, &store);
+
+    let (code, stdout, _stderr) = run(
+        &repo,
+        &store,
+        &["search-pattern", "vendor_only_marker", "--fixed"],
+    );
+
+    assert_eq!(code, 1, "stdout={stdout}");
+    assert!(
+        stdout.contains("scope: live Greppy-discovered source files in the repository"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "next: search excluded or unindexed source directly: greppy rg -n -F vendor_only_marker ."
+        ),
+        "{stdout}"
+    );
 }
 
 /// `search-pattern` is regex-native: `absent.*value` is simply a pattern that
@@ -111,6 +153,7 @@ fn metacharacter_pattern_is_just_a_pattern_without_teaching() {
     let (repo, store) = fresh_workspace("metacharacters");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    assert_indexed(&repo, &store);
 
     let (code, stdout, _stderr) = run(
         &repo,
@@ -139,6 +182,7 @@ fn empty_search_pattern_reports_the_case_insensitive_fact() {
     let (repo, store) = fresh_workspace("case-fact");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn present() {}\n").unwrap();
+    assert_indexed(&repo, &store);
 
     let (code, stdout, _stderr) = run(
         &repo,

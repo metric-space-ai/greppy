@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use greppy_workspace_core::{
-    AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState, WorkspaceCore,
-    PROVIDER_PROTOCOL_VERSION,
+    AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState, RepositoryTrackerState,
+    WorkspaceCore, PROVIDER_PROTOCOL_VERSION,
 };
 
 pub struct FakeProvider {
@@ -64,10 +64,10 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
         let mut core = None;
         let tracked_repo = std::fs::canonicalize(&repo_thread).unwrap();
         let git_dir = tracked_repo.join(".git");
-        let mut tracker_active = false;
         let mut tracker_fences = HashSet::new();
         let mut mirrored = HashSet::new();
         let mut last_heartbeat = 0;
+        let mut last_tracker_heartbeat = 0;
         while !stop_thread.load(Ordering::SeqCst) {
             let now = unix_milliseconds();
             if now.saturating_sub(last_heartbeat) >= 500 {
@@ -86,11 +86,19 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                 // that split here so the fixture and the macOS child cannot
                 // race to replace each other's tracker owner PID.
                 if !cfg!(target_os = "macos") {
-                    if !tracker_active {
-                        core.request_repository_tracker(&tracked_repo).unwrap();
-                        core.activate_repository_tracker(&tracked_repo, unix_milliseconds())
+                    if now.saturating_sub(last_tracker_heartbeat) >= 250 {
+                        let tracker = core.repository_tracker_status(&tracked_repo).unwrap();
+                        if !tracker.as_ref().is_some_and(|status| {
+                            status.state == RepositoryTrackerState::Active
+                                && status.owner_pid == std::process::id()
+                        }) {
+                            core.request_repository_tracker(&tracked_repo).unwrap();
+                            core.activate_repository_tracker(&tracked_repo, now)
+                                .unwrap();
+                        }
+                        core.heartbeat_repository_tracker(&tracked_repo, now)
                             .unwrap();
-                        tracker_active = true;
+                        last_tracker_heartbeat = now;
                     }
                     let current_fences = std::fs::read_dir(&git_dir)
                         .unwrap()

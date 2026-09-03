@@ -1174,6 +1174,47 @@ fn semantic_stale_index_refuses_vector_hits() {
     assert!(v["hits"].as_array().unwrap().is_empty());
 }
 
+/// Definition lookup must never turn a stale partial graph into a successful,
+/// incomplete answer. This is especially dangerous when a cfg-gated sibling
+/// definition was added after the active graph generation.
+#[test]
+fn search_symbol_refuses_stale_partial_definition_hits() {
+    let (repo, store_dir, _scratch) = make_repo("symbol-stale-partial", "ensure_private_dir");
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+    std::fs::write(
+        repo.join("lib.rs"),
+        "#[cfg(unix)]\npub fn ensure_private_dir() -> i32 { 7 }\n\
+         #[cfg(windows)]\npub fn ensure_private_dir() -> i32 { 9 }\n",
+    )
+    .unwrap();
+    let _writer = hold_index_before_publish(&repo, &store_dir, "symbol-stale-partial");
+
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "ensure_private_dir", "--json", "--all"],
+        &repo,
+        &store_dir,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    assert_eq!(
+        code, 75,
+        "stale definition lookup must refuse instead of serving one old hit; stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|error| panic!("invalid json: {error}; stdout={out:?}"));
+    assert_eq!(value["status"], "skipped_stale_index");
+    assert!(
+        value["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("index drift")),
+        "{value}"
+    );
+    assert!(value["hits"].as_array().is_some_and(Vec::is_empty));
+}
+
 #[test]
 fn diagnostics_json_exposes_provider_incompleteness() {
     let (repo, store, _scratch) = make_repo("diag", "diagnostics_unique_marker");

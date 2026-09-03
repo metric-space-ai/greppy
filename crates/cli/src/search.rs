@@ -263,7 +263,7 @@ fn search_pattern_no_match_status(
 ) {
     println!("status: no_matches");
     if path_filters.is_empty() {
-        println!("scope: live source files in the repository");
+        println!("scope: live Greppy-discovered source files in the repository");
         println!("message: no matches");
     } else {
         println!("scope: path filter {}", path_filters.shown());
@@ -284,6 +284,11 @@ fn search_pattern_no_match_status(
             shell_example_arg(query)
         );
     }
+    let mode = if fixed { "-F " } else { "" };
+    println!(
+        "next: search excluded or unindexed source directly: greppy rg -n {mode}{} .",
+        shell_example_arg(query)
+    );
     // `--fixed` takes the pattern literally, so a pattern written as a regular
     // expression cannot match whatever the file holds -- the miss is caused by
     // the flag, not by the code. Nothing here said so, and the two suggestions

@@ -141,6 +141,16 @@ connection caps, slow-subscriber disconnects, cancellation and stale-path
 cleanup fail closed. Windows exposes an explicit unsupported result for this
 Unix-socket control surface rather than silently changing behavior.
 
+**Web security hardening.** The embedded Servo runtime now honors its HSTS
+preload database on first navigation instead of globally bypassing it.
+`SubtleCrypto` is temporarily unavailable because Servo 0.5.0 reaches the
+timing-vulnerable `rsa` 0.10.0-rc.18 RSA-OAEP private-key path
+(RUSTSEC-2023-0071); `crypto.getRandomValues` and `crypto.randomUUID` remain
+available. The API will be restored when the engine has a constant-time
+backend. The policy proxy also admits at most 32 concurrent connections per
+content worker and 128 per process, rejecting excess connections before an OS
+thread is allocated.
+
 ### Known limits
 
 1. **macOS requires an approved file-system extension.** `greppy workspace

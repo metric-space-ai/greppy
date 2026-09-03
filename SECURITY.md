@@ -108,8 +108,11 @@ check fails.
 
 ## Dependency audit policy
 
-Every Cargo dependency change and the weekly scheduled audit are checked
-against RustSec. Vulnerability advisories are never allowlisted.
+Every Cargo dependency change and the weekly scheduled audit check both the
+primary and embedded-Web-Runtime lockfiles against RustSec. Vulnerability
+advisories are not allowlisted unless the affected capability is made
+unreachable in the shipped binary and that fail-closed boundary has a release
+test.
 
 `RUSTSEC-2024-0436` is the sole informational exception. It reports that the
 `paste` proc-macro crate is no longer maintained; it does not describe a
@@ -120,6 +123,15 @@ runtime code. The exception must be removed as soon as those upstream crates
 offer a compatible maintained replacement. Any source, version, or dependency
 path change remains visible in `Cargo.lock`, Dependency Review, SBOMs, and the
 release provenance checks.
+
+`RUSTSEC-2023-0071` is a temporary, capability-disabled exception for the
+embedded Servo 0.5.0 dependency line. Servo pins `rsa 0.10.0-rc.18` and no
+fixed upgrade is available. Greppy ships that engine with
+`dom_crypto_subtle_enabled=false`, so page scripts cannot reach RSA-OAEP (or
+another `SubtleCrypto` operation); `crypto.getRandomValues` and
+`crypto.randomUUID` remain available. The engine-preferences regression test
+fails if that gate is re-enabled. Remove the exception and restore
+`SubtleCrypto` as soon as Servo provides a constant-time RSA backend.
 
 ## Reporting a vulnerability
 
