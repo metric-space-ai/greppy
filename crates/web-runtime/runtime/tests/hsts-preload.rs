@@ -1,6 +1,5 @@
 use fst::MapBuilder;
-use net::hsts::HstsPreloadList;
-use servo as _;
+use servo::HstsPreloadList;
 
 #[test]
 fn preload_lookup_enforces_exact_and_include_subdomain_entries() {

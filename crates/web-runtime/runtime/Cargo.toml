@@ -28,7 +28,6 @@ libc = "0.2"
 
 [dev-dependencies]
 fst = "0.4"
-servo-net = { path = "../vendor/servo-net" }
 
 [[bin]]
 name = "web-runtime"
