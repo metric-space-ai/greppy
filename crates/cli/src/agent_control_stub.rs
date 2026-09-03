@@ -57,7 +57,7 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-const UNSUPPORTED: &str = "agent remote control needs Unix domain sockets";
+const UNSUPPORTED: &str = "live agent control is not available on Windows in 0.4.0";
 
 fn unsupported() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, UNSUPPORTED)
