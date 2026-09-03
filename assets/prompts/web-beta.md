@@ -1,11 +1,12 @@
-<!-- greppy web — BETA prompt block.
+<!-- greppy web — 0.4.0 BETA prompt block.
 
-This is not part of the shipped system prompt. The browser runtime works, but
-its command surface is still moving: append this file to AGENTS.md only when
-you want an agent to drive a browser, and expect the verbs to change.
+This is the canonical browser portion of the shipped system prompt. The
+built-in agent includes it directly and AGENTS.md carries the same block for
+external coding agents. prompt_contract.rs enforces that the two public prompt
+surfaces remain byte-identical from BROWSER: through END BROWSER.
 
-Everything greppy does without a browser is unaffected by whether this block
-is present.
+The browser command surface remains beta and may change in later releases.
+Everything greppy does without a browser is unaffected by this block.
 -->
 
 BROWSER:

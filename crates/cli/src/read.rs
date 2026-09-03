@@ -822,7 +822,16 @@ pub(crate) fn dispatch_read_symbols(
     let mut previous_ended_with_newline = true;
     for query in symbols {
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
-        let ids = resolve_symbol_nodes(&store, Some(query))?;
+        let resolved_ids = resolve_symbol_nodes(&store, Some(query))?;
+        let mut ids = Vec::with_capacity(resolved_ids.len());
+        for id in resolved_ids {
+            let Some(node) = store.get_node(id)? else {
+                continue;
+            };
+            if path_filters.matches(&node.file_path) {
+                ids.push(id);
+            }
+        }
         if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
             previous_ended_with_newline = true;
             failed = true;

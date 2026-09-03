@@ -392,9 +392,8 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // browser_section_names_only_existing_web_subcommands is the work list
     // that fails until the last of those subcommands exists. Owner decision.
     // Owner-approved 2026-08-31: the browser block moved out of the shipped
-    // prompt into assets/prompts/web-beta.md, so the web runtime can ship as
-    // beta without the default prompt advertising a surface that is still
-    // moving. AGENTS.md keeps a four-line pointer and nothing else.
+    // prompt into assets/prompts/web-beta.md while its command surface was
+    // still moving. AGENTS.md kept only a pointer during that stabilization.
     // 01.09.2026 (merge of 0.3.4 main and the web branch): the frozen text is
     // now the plain union of two individually owner-approved states - main's
     // 26.08 bash-smart execution contract wording plus the branch's 31.08
@@ -405,8 +404,11 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // is deliberately a bounded call-site tree. The owner-approved correction
     // names the exception and the exact `read` recovery instead of adding a
     // new path output mode to the 0.3.x stability line.
+    // 03.09.2026: the owner approved the stabilized browser block for the
+    // 0.4.0 public prompt. AGENTS.md now enables it for external agents while
+    // the built-in agent includes the byte-identical canonical asset.
     const APPROVED_SHA256: &str =
-        "8bf151473a1ef3d02db20986059c309a7e9e28e82c03229ce1b4b00c24a43f17";
+        "f9957e033efbd4ec40a038e150a52d2252ca1969648e97dc96d1e8ebd62ba0c1";
 
     let text = prompt();
     let digest = {
@@ -558,9 +560,7 @@ fn web_subcommands_from_help() -> std::collections::BTreeSet<String> {
     out
 }
 
-/// The beta prompt block. It is not part of the shipped system prompt -- the
-/// browser surface is still moving -- but it is still a promise to whoever
-/// appends it, so it gets the same guard.
+/// The canonical browser portion of both shipped prompt surfaces.
 fn beta_web_prompt() -> Option<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets/prompts/web-beta.md")
@@ -571,7 +571,7 @@ fn beta_web_prompt() -> Option<String> {
 
 #[test]
 fn browser_section_names_only_existing_web_subcommands() {
-    // The browser block lives in the beta prompt; AGENTS.md only points at it.
+    // The canonical browser block names only commands the binary ships.
     let Some(text) = beta_web_prompt() else {
         return; // beta prompt not present; nothing to guard
     };
@@ -598,6 +598,28 @@ fn browser_section_names_only_existing_web_subcommands() {
          --help`. Do not shorten the prompt to make it pass.",
         invented.len(),
         named.len()
+    );
+}
+
+fn delimited_browser_block(text: &str) -> Option<&str> {
+    let start = if text.starts_with("BROWSER:") {
+        0
+    } else {
+        text.find("\nBROWSER:")? + 1
+    };
+    let tail = &text[start..];
+    let end = tail.find("END BROWSER")? + "END BROWSER".len();
+    Some(&tail[..end])
+}
+
+#[test]
+fn public_and_builtin_browser_prompts_are_byte_identical() {
+    let public = prompt();
+    let beta = beta_web_prompt().expect("canonical browser prompt must ship");
+    assert_eq!(
+        delimited_browser_block(&public),
+        delimited_browser_block(&beta),
+        "AGENTS.md and assets/prompts/web-beta.md must expose one browser contract"
     );
 }
 

@@ -161,6 +161,22 @@ fn read_smart_applies_path_filters_before_ambiguity_resolution() {
 }
 
 #[test]
+fn read_applies_path_filters_before_ambiguity_resolution() {
+    let (repo, store) = fresh_workspace("read-path");
+    std::fs::create_dir_all(repo.join("a")).unwrap();
+    std::fs::create_dir_all(repo.join("b")).unwrap();
+    std::fs::write(repo.join("a/lib.rs"), "fn target() { a(); }\n").unwrap();
+    std::fs::write(repo.join("b/lib.rs"), "fn target() { b(); }\n").unwrap();
+    index(&repo, &store);
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "target", "--path", "a"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.starts_with("a/lib.rs:1-1  target\n"), "{stdout}");
+    assert!(!stdout.contains("b/lib.rs"), "{stdout}");
+    assert!(!stdout.contains("is 2 definitions"), "{stdout}");
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)

@@ -2,18 +2,22 @@
 
 ## Release targets
 
-The `v0.3.x` release gate covers:
+The `v0.4.0` release gate covers:
 
-| Platform | Inference backend | Daemon transport |
-|---|---|---|
-| macOS Apple Silicon | CPU and Metal | Unix-domain socket |
-| Linux x86_64 | CPU and NVIDIA CUDA | Unix-domain socket |
-| Windows x86_64 | CPU | named pipe with user ACL |
+| Platform | Inference backend | Daemon transport | Web tool | Portable CoW |
+|---|---|---|---|---|
+| macOS Apple Silicon | CPU and Metal | Unix-domain socket | yes (beta) | FSKit |
+| Linux x86_64 | CPU and NVIDIA CUDA | Unix-domain socket | yes (beta) | FUSE3 |
+| Windows x86_64 | CPU | named pipe with user ACL | not in 0.4.0 | private WinFsp fork |
 
-Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.3.x`.
+Windows CUDA, macOS Intel, and Linux ARM64 are not release-gated for `v0.4.0`.
 An unsupported accelerator must not prevent CPU operation in automatic mode.
 An explicitly selected unavailable backend fails with a diagnostic instead of
 silently switching devices.
+
+The Windows package is released only after Microsoft Hardware Dev Center has
+returned the exact HLK/dashboard-signed WinFsp driver and catalog bound by the
+release contract. A source build or test-signed driver is not release evidence.
 
 ## Language support
 

@@ -63,8 +63,10 @@ re-embeds a repository the primary checkout has already embedded.
 block from `assets/prompts/web-beta.md` via `include_str!`; the headless path
 installs the attach token like the interactive one, and the runtime is started
 by the unsandboxed parent before the tool children are sandboxed (macOS forbids
-a nested sandbox). External agents still get only the pointer in AGENTS.md; the
-verb surface is beta and may change.
+a nested sandbox). The owner-approved public `AGENTS.md` now carries the same
+byte-checked browser block, so copying the canonical prompt activates the Web
+tool for external agents without a second file or feature flag. The verb
+surface remains beta and may change.
 
 Measured on the fourteen-task set `greppy-web-tasks-v1` (five repetitions each,
 one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
@@ -126,6 +128,19 @@ background refresh no longer reports an old snapshot as newly published;
 overlay navigation uses indexed Base/Delta queries (`path` from >120 s to
 under 6 s); a detached HEAD reports only the paths that actually drift.
 
+**Persistent and remote-controlled agents.** `greppy -p --json` emits
+newline-delimited session, text, tool, turn, error and terminal result events;
+the result remains the final stdout record, including cancellation. Sessions
+persist across `--continue` and `--resume` and have stable
+`greppy://sessions/<id>` handles. `greppy agent sessions list|show|tail|path`
+provides read-only transcript access. `greppy agent serve` hosts a headless
+session on a per-user Unix socket, while `status`, `send`, `attach`,
+`interrupt`, and `quit` act as clients; the interactive TUI exposes the same
+control surface and visibly marks remote prompts. Socket ownership, size and
+connection caps, slow-subscriber disconnects, cancellation and stale-path
+cleanup fail closed. Windows exposes an explicit unsupported result for this
+Unix-socket control surface rather than silently changing behavior.
+
 ### Known limits
 
 1. **macOS requires an approved file-system extension.** `greppy workspace
@@ -137,12 +152,13 @@ under 6 s); a detached HEAD reports only the paths that actually drift.
    switch, rerun the command. The mount, `workspace doctor`, and `workspace
    status` have been verified on macOS 26.2 with the notarized application.
 
-2. **Windows packaging depends on the final owner decision.** No
-   Microsoft-HLK-/Dashboard-signed driver exists yet for the private WinFsp
-   fork. Unless the release is held until that signature is available, 0.4.0
-   will ship no Windows package. Windows users can build the CLI from source;
-   the Web tool and portable CoW workspaces remain unavailable there until the
-   signed driver is delivered.
+2. **Windows packaging waits for Microsoft driver approval.** The private
+   WinFsp fork requires an HLK-tested, Hardware-Dev-Center-signed driver and
+   catalog. Greppy's release workflow rejects attestation-only, self-signed or
+   unbound substitutes and remains blocked until Microsoft returns the exact
+   signed payload and the MSI passes installation, upgrade, uninstall, mounted
+   CoW and performance gates. The Web tool is not included on Windows in
+   0.4.0; its linked runtime follows in a later release.
 
 3. **Six tests use debug-only fault or certificate injection.**
    `GREPPY_WEB_TEST_IGNORE_CERTS`, `GREPPY_TEST_BASE_SUMMARY_FAIL`, and

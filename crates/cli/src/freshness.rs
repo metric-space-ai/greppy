@@ -681,9 +681,12 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
             let started = spawn_background_index(root, "first-use");
-            if started || workspace_writer_active(root) {
-                wait_for_active_index_refresh(root);
-            }
+            // First use has no snapshot that can become usable during a
+            // bounded join. Return as soon as the durable background job is
+            // launched instead of adding the stale-refresh wait to process
+            // spawn/dynamic-link latency. The caller gets the job status
+            // command below and can retry while the indexer continues in its
+            // independent process group.
             if !path.exists() {
                 return Err(Error::Lock(format!(
                     "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
