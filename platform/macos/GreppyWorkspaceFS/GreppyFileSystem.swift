@@ -33,7 +33,9 @@ import FSKit
         }
         do {
             let dataRoot = try Self.dataRoot()
-            let core = try RustWorkspaceCore(dataRoot: dataRoot)
+            let core = try RustWorkspaceCore(
+                dataRoot: dataRoot.appendingPathComponent("core", isDirectory: true)
+            )
             loadedResource = blockResource
             containerStatus = .ready
             replyHandler(

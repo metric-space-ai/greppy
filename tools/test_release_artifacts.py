@@ -134,6 +134,14 @@ class ReleaseArtifactTests(unittest.TestCase):
             / "platform/macos/GreppyWorkspaceApp/GreppyWorkspaceApp.swift"
         ).read_text(encoding="utf-8")
         self.assertIn("openFileSystemExtensionsSettings", host)
+        filesystem = (
+            REPOSITORY_ROOT
+            / "platform/macos/GreppyWorkspaceFS/GreppyFileSystem.swift"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'dataRoot: dataRoot.appendingPathComponent("core", isDirectory: true)',
+            filesystem,
+        )
 
     def test_training_archive_is_deterministic_and_self_verifying(self) -> None:
         _, manifest = self.make_training_tree()
