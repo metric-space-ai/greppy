@@ -816,13 +816,22 @@ impl OwnedTempDir {
     fn for_content_worker() -> io::Result<Self> {
         static SEQUENCE: AtomicU32 = AtomicU32::new(1);
         reap_stale_content_worker_dirs();
-        let path = std::env::temp_dir().join(format!(
-            "greppy-web-content-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        for _ in 0..32 {
+            let path = std::env::temp_dir().join(format!(
+                "greppy-web-content-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve an exclusive content-worker temp directory",
+        ))
     }
 }
 
