@@ -950,6 +950,18 @@ fn sealed_capability_pipe(capability: &str) -> io::Result<std::os::fd::OwnedFd> 
 }
 
 #[cfg(unix)]
+fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let minimum = crate::worker::CAPABILITY_FD.max(crate::worker::PROTOCOL_FD) + 1;
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(unix)]
 fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProcess> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
@@ -972,24 +984,24 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
         // Seal the tiny token into the pipe before spawn. A child may read FD 3
         // immediately after exec; writing after spawn leaves a race where it can
         // observe EOF before the parent has published any capability bytes.
-        let cap_read = sealed_capability_pipe(&capability)?;
-        let cap_read_fd = cap_read.into_raw_fd();
+        let cap_read_source = sealed_capability_pipe(&capability)?;
+        let cap_read = duplicate_above_worker_protocol_fds(cap_read_source.as_raw_fd())?;
+        drop(cap_read_source);
 
         let mut proto = [0; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, proto.as_mut_ptr()) } != 0
         {
-            unsafe {
-                libc::close(cap_read_fd);
-            }
             return Err(io::Error::last_os_error());
         }
-        let proto_child = unsafe { OwnedFd::from_raw_fd(proto[0]) };
+        let proto_child_source = unsafe { OwnedFd::from_raw_fd(proto[0]) };
         let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
+        let proto_child = duplicate_above_worker_protocol_fds(proto_child_source.as_raw_fd())?;
+        drop(proto_child_source);
+        let cap_read_fd = cap_read.into_raw_fd();
+        let proto_child_fd = proto_child.into_raw_fd();
         unsafe {
-            libc::fcntl(proto_child.as_raw_fd(), libc::F_SETFD, 0);
             libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let proto_child_fd = proto_child.into_raw_fd();
         let proto_parent_fd = proto_parent.into_raw_fd();
 
         let mut command = Command::new(&path);
@@ -1832,6 +1844,26 @@ mod tests {
         let mut read = File::from(read);
         let mut payload = String::new();
         read.read_to_string(&mut payload).unwrap();
+        assert_eq!(payload, "worker-capability\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_fd_sources_are_kept_above_the_reserved_child_slots() {
+        use std::os::fd::AsRawFd;
+
+        let source = sealed_capability_pipe("worker-capability").unwrap();
+        let duplicated = duplicate_above_worker_protocol_fds(source.as_raw_fd()).unwrap();
+        assert!(
+            duplicated.as_raw_fd() > crate::worker::CAPABILITY_FD
+                && duplicated.as_raw_fd() > crate::worker::PROTOCOL_FD,
+            "source fd {} can alias a reserved child fd",
+            duplicated.as_raw_fd()
+        );
+        drop(source);
+        let mut duplicated = File::from(duplicated);
+        let mut payload = String::new();
+        duplicated.read_to_string(&mut payload).unwrap();
         assert_eq!(payload, "worker-capability\n");
     }
 

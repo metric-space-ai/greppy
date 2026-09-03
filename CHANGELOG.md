@@ -377,6 +377,15 @@ not a Playwright-compatibility claim.
   contracts, while a dedicated exact-SHA gate requires three serial passes of
   the complete session-daemon suite instead of treating one load-sensitive
   failure snapshot as a stable defect list.
+- Worker bootstrap now duplicates both capability and protocol sources above
+  their reserved child descriptors before `dup2`. Their allocation order can
+  therefore no longer alias descriptor 3 or 4 and intermittently replace the
+  protocol socket with the capability stream, which previously surfaced as a
+  broken-pipe supervisor exit in repeated session-daemon runs.
+- Actionability event-loop pumps now cancel late JavaScript evaluations with a
+  monotonic document watermark and reclaim each temporary token before the
+  operation returns. A timed-out evaluation can no longer recreate a token
+  after cleanup and make a later locator action fail nondeterministically.
 - Cancelling the interactive agent during its visible startup phase now returns
   exit 130 deterministically. The terminal UI's cancellation result is no
   longer discarded in a race with a worker that can finish cleanly first.

@@ -1093,12 +1093,16 @@ impl ContentEngine {
     fn sweep_pump_namespace(&self, webview: &WebView) -> bool {
         let script = r#"(function() {
           var names = Object.getOwnPropertyNames(window);
+          var floor = Number(window.__greppyInternalPumpFloor) || 0;
           for (var i = 0; i < names.length; i++) {
             var k = names[i];
             if (k.indexOf('__greppyPump') === 0) {
+              var generation = Number(k.slice('__greppyPump'.length));
+              if (Number.isFinite(generation)) floor = Math.max(floor, generation);
               try { delete window[k]; } catch (_err) {}
             }
           }
+          window.__greppyInternalPumpFloor = floor;
           var left = 0;
           names = Object.getOwnPropertyNames(window);
           for (var j = 0; j < names.length; j++) {
@@ -1138,6 +1142,22 @@ impl ContentEngine {
         }
     }
 
+    fn settle_pump_token(&self, webview: &WebView, token: &str) {
+        let generation = token
+            .strip_prefix("__greppyPump")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let script = format!(
+            "(function() {{ var floor = Number(window.__greppyInternalPumpFloor) || 0; window.__greppyInternalPumpFloor = Math.max(floor, {generation}); try {{ delete window['{token}']; }} catch (_err) {{}} return !Object.prototype.hasOwnProperty.call(window, '{token}'); }})()"
+        );
+        if matches!(
+            self.evaluate_until(webview.clone(), &script, Duration::from_millis(200)),
+            Ok(JSValue::Boolean(true))
+        ) {
+            reclaim_tracked_token(&self.pump_pending, token);
+        }
+    }
+
     fn pump_servo(&self, webview: &WebView, min: Duration, deadline: Instant) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining < Duration::from_millis(4) {
@@ -1157,22 +1177,28 @@ impl ContentEngine {
         deadline: Instant,
     ) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        let generation = token
+            .strip_prefix("__greppyPump")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
         let schedule = format!(
-            "(function() {{ window['{token}'] = 0; setTimeout(function() {{ window['{token}'] = 1; }}, {ms}); return 0; }})()"
+            "(function() {{ var floor = Number(window.__greppyInternalPumpFloor) || 0; if (floor >= {generation}) {{ delete window['{token}']; return 0; }} window['{token}'] = 0; setTimeout(function() {{ var currentFloor = Number(window.__greppyInternalPumpFloor) || 0; if (currentFloor >= {generation}) {{ delete window['{token}']; }} else {{ window['{token}'] = 1; }} }}, {ms}); return 0; }})()"
         );
         let schedule_budget = remaining.min(Duration::from_millis(200));
         if self
             .evaluate_until(webview.clone(), &schedule, schedule_budget)
             .is_err()
         {
+            self.settle_pump_token(webview, token);
             return false;
         }
         let poll = format!("window['{token}']");
         let min_until = Instant::now() + wait;
         let mut next_poll = min_until;
+        let mut completed = false;
         while Instant::now() < deadline {
             if self.parent_dead() {
-                return false;
+                break;
             }
             webview.paint();
             self.servo.spin_event_loop();
@@ -1181,18 +1207,22 @@ impl ContentEngine {
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(80));
                 if poll_budget.is_zero() {
-                    return false;
+                    break;
                 }
                 match self.evaluate_until(webview.clone(), &poll, poll_budget) {
-                    Ok(JSValue::Number(value)) if value >= 1.0 => return true,
-                    Err(_) => return false,
+                    Ok(JSValue::Number(value)) if value >= 1.0 => {
+                        completed = true;
+                        break;
+                    }
+                    Err(_) => break,
                     _ => {}
                 }
                 next_poll = Instant::now() + Duration::from_millis(8);
             }
             thread::sleep(Duration::from_millis(2));
         }
-        false
+        self.settle_pump_token(webview, token);
+        completed
     }
 
     fn page(&self, page_id: &str) -> io::Result<&(WebView, Rc<Delegate>)> {
