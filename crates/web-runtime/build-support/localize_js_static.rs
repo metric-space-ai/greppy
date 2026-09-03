@@ -87,18 +87,38 @@ pub fn localize_mozjs_js_static() {
         }
         println!("cargo:rerun-if-changed={}", rlib.display());
     }
-    let Some(v8) = find_rusty_v8() else {
+    let Some(rusty_v8) = find_rusty_v8() else {
         panic!("librusty_v8.a not found; cannot run defined-symbol intersection gate");
     };
-    println!("cargo:rerun-if-changed={}", v8.display());
+    let mut v8_symbol_sources = vec![rusty_v8];
     if cfg!(target_os = "linux") {
-        if let Err(error) = namespace_linux_engine_symbols(&archives, &rlibs, &v8) {
+        let v8_rlibs = find_rlibs("libv8-");
+        if v8_rlibs.is_empty() {
+            panic!(
+                "libv8-*.rlib not found; the final Linux link takes bundled ICU symbols from the rlib"
+            );
+        }
+        v8_symbol_sources.extend(v8_rlibs);
+    }
+    for source in &v8_symbol_sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    if cfg!(target_os = "linux") {
+        if let Err(error) =
+            namespace_linux_engine_symbols(&archives, &rlibs, &v8_symbol_sources)
+        {
             panic!("namespace Linux SpiderMonkey symbols: {error}");
         }
     }
     for archive in &archives {
-        if let Err(error) = assert_symbol_intersection(archive, &v8) {
-            panic!("symbol intersection {}: {error}", archive.display());
+        for v8_source in &v8_symbol_sources {
+            if let Err(error) = assert_symbol_intersection(archive, v8_source) {
+                panic!(
+                    "symbol intersection {} versus {}: {error}",
+                    archive.display(),
+                    v8_source.display()
+                );
+            }
         }
     }
 }
@@ -131,9 +151,12 @@ fn find_rlibs(prefix: &str) -> Vec<PathBuf> {
 fn namespace_linux_engine_symbols(
     js_static_archives: &[PathBuf],
     mozjs_rlibs: &[PathBuf],
-    rusty_v8: &Path,
+    v8_symbol_sources: &[PathBuf],
 ) -> Result<(), String> {
-    let v8_globals = defined_globals(rusty_v8)?;
+    let mut v8_globals = BTreeSet::new();
+    for source in v8_symbol_sources {
+        v8_globals.extend(defined_globals(source)?);
+    }
 
     // Both engines embed ICU 77. ELF does not coalesce those strong C/C++
     // definitions as ld64 does, so merely calling the overlap "permitted"
