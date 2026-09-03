@@ -411,7 +411,14 @@ def _sanitize_doctor(
             field: _integer(stats.get(field), phase, f"stats.{field}")
             for field in ("files", "nodes", "edges")
         }
-    inference = _dict(value.get("inference"), phase, "inference")
+    inference_value = value.get("inference")
+    if inference_value is None:
+        # A foreground first-use index can hand embedding work to a background
+        # job.  During that transition `doctor` intentionally returns the
+        # compact progress document rather than probing inference daemons.
+        result["inference"] = None
+        return result, set()
+    inference = _dict(inference_value, phase, "inference")
     daemons, pids = _sanitize_daemons(inference.get("daemons"), phase)
     result["inference"] = {
         "registry": _sanitize_registry(inference.get("registry"), phase),
@@ -871,7 +878,7 @@ def measure(config: Config) -> dict[str, Any]:
             phase="doctor_after_index",
             env=env,
             timeout_seconds=config.timeout_seconds,
-            accepted_exit_codes=(0, 1, 73),
+            accepted_exit_codes=(0, 1, 73, 75),
             publication_replacements=publication_replacements,
         )
         command_records.append(after_index_run.record)
@@ -879,8 +886,9 @@ def measure(config: Config) -> dict[str, Any]:
         doctor_after_index, index_pids = _sanitize_doctor(
             after_index_json, "doctor_after_index"
         )
-        daemon_pids.update(index_pids)
-        daemon_pids.update(_doctor_background_pids(after_index_json))
+        embedding_pids = set(index_pids)
+        embedding_pids.update(_doctor_background_pids(after_index_json))
+        daemon_pids.update(embedding_pids)
 
         embedding_wait_started = time.perf_counter_ns()
         embedding_wait_polls = 0
@@ -901,7 +909,7 @@ def measure(config: Config) -> dict[str, Any]:
                 phase="embedding_wait",
                 env=env,
                 timeout_seconds=min(config.timeout_seconds, max(remaining, 0.001)),
-                accepted_exit_codes=(0, 1, 73),
+                accepted_exit_codes=(0, 1, 73, 75),
                 iteration=embedding_wait_polls,
                 publication_replacements=publication_replacements,
             )
@@ -911,14 +919,15 @@ def measure(config: Config) -> dict[str, Any]:
             doctor_after_embedding, poll_pids = _sanitize_doctor(
                 after_embedding_json, "embedding_wait"
             )
-            daemon_pids.update(poll_pids)
-            daemon_pids.update(_doctor_background_pids(after_embedding_json))
+            embedding_pids.update(poll_pids)
+            embedding_pids.update(_doctor_background_pids(after_embedding_json))
+            daemon_pids.update(embedding_pids)
         embedding_wait_ms = round(
             (time.perf_counter_ns() - embedding_wait_started) / 1_000_000,
             3,
         )
-        _terminate_daemons(index_pids, config.greppy, strict=True)
-        daemon_pids.difference_update(index_pids)
+        _terminate_daemons(embedding_pids, config.greppy, strict=True)
+        daemon_pids.difference_update(embedding_pids)
 
         semantic_argv = [
             binary,

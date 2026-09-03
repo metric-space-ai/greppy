@@ -52,6 +52,20 @@ if command == "doctor":
             embedding_pending.write_text(str(polls), encoding="ascii")
             embedding_complete = False
     healthy = indexed and embedding_complete
+    if indexed and not embedding_complete and os.environ.get("FAKE_TRANSITIONAL_DOCTOR"):
+        print(json.dumps({
+            "command": "doctor",
+            "status": "indexing",
+            "healthy": False,
+            "store_exists": True,
+            "store_bytes": 4096,
+            "background_job": {
+                "pid": 99999999,
+                "state": "indexing",
+            },
+            "inference": None,
+        }))
+        raise SystemExit(75)
     daemon = {
         "endpoint": str(store / "TOP-SECRET.sock"),
         "protocol": "greppy-inference-v1",
@@ -341,6 +355,21 @@ class RuntimeFootprintTests(unittest.TestCase):
         self.assertEqual(build["poll_count"], 1)
         self.assertGreaterEqual(build["wait_wall_time_ms"], 0)
         self.assertFalse(value["doctor"]["after_index"]["embedding_complete"])
+        self.assertTrue(value["doctor"]["after_embedding"]["embedding_complete"])
+
+    def test_transitional_doctor_shape_is_polled_until_embedding_completes(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_DEFER_EMBEDDING": "1",
+                "FAKE_TRANSITIONAL_DOCTOR": "1",
+            },
+            clear=False,
+        ):
+            self.assertEqual(runtime_footprint.main(self._argv()), 0)
+        value = json.loads(self.output.read_text(encoding="utf-8"))
+        self.assertEqual(value["doctor"]["after_index"]["status"], "indexing")
+        self.assertIsNone(value["doctor"]["after_index"]["inference"])
         self.assertTrue(value["doctor"]["after_embedding"]["embedding_complete"])
 
     def test_timeout_kills_command_group_and_cleans_store(self) -> None:
