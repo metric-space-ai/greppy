@@ -615,16 +615,7 @@ fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<Strin
         let Some(kind) = parts.nth(1) else {
             continue;
         };
-        if kind != "T"
-            && kind != "t"
-            && kind != "S"
-            && kind != "s"
-            && kind != "D"
-            && kind != "d"
-            && kind != "B"
-            && kind != "b"
-            && kind != "C"
-        {
+        if !is_defined_symbol_kind(kind) {
             continue;
         }
         if let Some(name) = parts.next() {
@@ -632,6 +623,28 @@ fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<Strin
         }
     }
     Ok(names)
+}
+
+fn is_defined_symbol_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "T" | "t"
+            | "S"
+            | "s"
+            | "D"
+            | "d"
+            | "B"
+            | "b"
+            | "R"
+            | "r"
+            | "G"
+            | "g"
+            | "V"
+            | "v"
+            | "W"
+            | "w"
+            | "C"
+    )
 }
 
 fn rename_v8_overlap_symbols(object: &Path) -> Result<(), String> {
@@ -782,8 +795,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_permitted_overlap, is_permitted_windows_crt_overlap, reject_mixed_icu_versions,
-        LINUX_RENAME_SYMBOLS,
+        is_defined_symbol_kind, is_permitted_overlap, is_permitted_windows_crt_overlap,
+        reject_mixed_icu_versions, LINUX_RENAME_SYMBOLS,
     };
     use std::collections::BTreeSet;
 
@@ -828,5 +841,15 @@ mod tests {
     fn mixed_icu_overlap_is_rejected_before_namespacing() {
         let symbols = BTreeSet::from(["_ZN6icu_7613UnicodeStringD1Ev".to_owned()]);
         assert!(reject_mixed_icu_versions(&symbols).is_err());
+    }
+
+    #[test]
+    fn nm_parser_keeps_read_only_small_and_weak_definitions() {
+        for kind in ["R", "r", "G", "g", "V", "v", "W", "w"] {
+            assert!(is_defined_symbol_kind(kind), "missing nm kind {kind}");
+        }
+        for kind in ["U", "u", "?"] {
+            assert!(!is_defined_symbol_kind(kind), "accepted nm kind {kind}");
+        }
     }
 }
