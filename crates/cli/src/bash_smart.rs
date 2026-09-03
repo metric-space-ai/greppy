@@ -878,19 +878,14 @@ fn spool_dir() -> Result<PathBuf> {
     // below the graph store coupled command execution to that store's ACLs and
     // lifecycle: a concurrently published/replaced store could make the drain
     // threads fail with EPERM even though the child command itself was valid.
-    // Keep one hardened user-global namespace in the OS shared-temp root.
-    // Agent sandboxes commonly permit `/tmp` while intentionally denying
-    // metadata writes below the user's persistent Greppy data root. The files
-    // must outlive this process because an expansion command reads their paths
-    // from the durable expand pack until that pack's TTL expires.
+    // Keep one hardened namespace below the process' effective TMPDIR. Agent
+    // sandboxes grant their run-specific TMPDIR, not the whole OS temp root;
+    // using `/private/tmp` directly therefore fails closed on macOS. The run
+    // scratch directory outlives individual tool subprocesses, so a later
+    // expansion command can still consume the durable pack during the run.
     #[cfg(unix)]
-    let dir = {
-        #[cfg(target_os = "macos")]
-        let base = PathBuf::from("/private/tmp");
-        #[cfg(not(target_os = "macos"))]
-        let base = PathBuf::from("/tmp");
-        base.join(format!("greppy-bash-smart-{}", unsafe { libc::geteuid() }))
-    };
+    let dir =
+        std::env::temp_dir().join(format!("greppy-bash-smart-{}", unsafe { libc::geteuid() }));
     #[cfg(not(unix))]
     let dir = std::env::temp_dir().join("greppy-bash-smart");
     workspace_locator::ensure_store_dir(&dir)
@@ -2015,14 +2010,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn spool_directory_uses_sandbox_shared_private_temp_namespace() {
+    fn spool_directory_uses_effective_private_temp_namespace() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = spool_dir().expect("sandbox-shared spool");
-        #[cfg(target_os = "macos")]
-        assert!(dir.starts_with("/private/tmp"));
-        #[cfg(not(target_os = "macos"))]
-        assert!(dir.starts_with("/tmp"));
+        assert!(dir.starts_with(std::env::temp_dir()));
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
