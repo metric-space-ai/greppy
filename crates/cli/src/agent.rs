@@ -1069,27 +1069,34 @@ fn run_agent(
         json_session.branch = record.branch.clone();
         json_session.model = model.clone();
         if serve {
-            let Some(emitter) = json.as_mut() else {
-                return EXIT_AGENT;
-            };
-            crate::agent_serve::run(
-                client,
-                env,
-                config.clone(),
-                &session_store,
-                record,
-                resumed,
-                emitter,
-                crate::agent_serve::ServeLaunch {
-                    task: &task,
-                    endpoint: &endpoint,
-                    model: &model,
-                    sandbox: &json_session.sandbox,
-                    idle_timeout_secs,
-                    json_session: &json_session,
-                },
-            )
-            .map(|session| (session, false))
+            #[cfg(unix)]
+            {
+                let Some(emitter) = json.as_mut() else {
+                    return EXIT_AGENT;
+                };
+                crate::agent_serve::run(
+                    client,
+                    env,
+                    config.clone(),
+                    &session_store,
+                    record,
+                    resumed,
+                    emitter,
+                    crate::agent_serve::ServeLaunch {
+                        task: &task,
+                        endpoint: &endpoint,
+                        model: &model,
+                        sandbox: &json_session.sandbox,
+                        idle_timeout_secs,
+                        json_session: &json_session,
+                    },
+                )
+                .map(|session| (session, false))
+            }
+            #[cfg(not(unix))]
+            {
+                Err("greppy agent serve is not available on Windows in 0.4.0".to_string())
+            }
         } else {
             run_headless_session(
                 &mut client,

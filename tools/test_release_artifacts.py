@@ -41,6 +41,26 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         return training, manifest
 
+    def test_windows_agent_control_scope_is_explicit_and_buildable(self) -> None:
+        cli_root = REPOSITORY_ROOT / "crates/cli/src"
+        lib = (cli_root / "lib.rs").read_text(encoding="utf-8")
+        stub = (cli_root / "agent_control_stub.rs").read_text(encoding="utf-8")
+        agent = (cli_root / "agent.rs").read_text(encoding="utf-8")
+        sessions = (cli_root / "agent_sessions.rs").read_text(encoding="utf-8")
+
+        self.assertIn(
+            '#[cfg(not(unix))]\n#[path = "agent_control_stub.rs"]\npub mod agent_control;',
+            lib,
+        )
+        self.assertIn("io::ErrorKind::Unsupported", stub)
+        self.assertIn(
+            "live agent control is not available on Windows in 0.4.0", stub
+        )
+        self.assertIn(
+            "greppy agent serve is not available on Windows in 0.4.0", agent
+        )
+        self.assertIn("#[cfg(not(unix))]\n    {\n        let _ = session;", sessions)
+
     def test_winfsp_fork_builder_pins_and_imports_complete_wdk_dependency_set(
         self,
     ) -> None:

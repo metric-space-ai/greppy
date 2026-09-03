@@ -114,8 +114,9 @@ under 6 s); a detached HEAD reports only the paths that actually drift.
 example Wikipedia's) still needs the button; the agent finds it, at roughly
 five times the turns. Windows: the Web tool is not included in 0.4.0; Windows
 web-runtime localization follows in 0.4.1. The Windows CLI reports that scope
-explicitly instead of attempting runtime discovery. The HTTPS extra-header
-tests trust the fixture certificate only in debug builds. On macOS, replacing
+explicitly instead of attempting runtime discovery. Live agent serve/control
+is Unix-only in 0.4.0; Windows retains local one-shot and interactive agents.
+The HTTPS extra-header tests trust the fixture certificate only in debug builds. On macOS, replacing
 or updating the signed app can require one renewed approval of `Greppy
 Workspace FS`. `workspace setup` detects approval for the exact current bundle
 before mounting, opens the File System Extensions pane directly when needed,

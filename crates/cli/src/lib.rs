@@ -97,6 +97,9 @@ mod agent;
 mod agent_clients;
 #[cfg(unix)]
 pub mod agent_control;
+#[cfg(not(unix))]
+#[path = "agent_control_stub.rs"]
+pub mod agent_control;
 #[cfg(unix)]
 mod agent_serve;
 pub use agent::agent_session_store_identity;
