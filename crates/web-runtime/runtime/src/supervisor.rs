@@ -803,7 +803,73 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
+    content_config_dir: Option<OwnedTempDir>,
     reaped: bool,
+}
+
+#[derive(Debug)]
+struct OwnedTempDir {
+    path: PathBuf,
+}
+
+impl OwnedTempDir {
+    fn for_content_worker() -> io::Result<Self> {
+        static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        reap_stale_content_worker_dirs();
+        let path = std::env::temp_dir().join(format!(
+            "greppy-web-content-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn reap_stale_content_worker_dirs() {
+    const PREFIX: &str = "greppy-web-content-";
+    let self_pid = std::process::id();
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(owner) = name
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if owner != self_pid && !process_is_alive(owner) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+impl Drop for OwnedTempDir {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "web-runtime: could not remove worker temp directory {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 }
 
 fn inherited_worker_env() -> Vec<(OsString, OsString)> {
@@ -889,6 +955,11 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
+        let content_config_dir = if worker == WorkerKind::Content {
+            Some(OwnedTempDir::for_content_worker()?)
+        } else {
+            None
+        };
         // Seal the tiny token into the pipe before spawn. A child may read FD 3
         // immediately after exec; writing after spawn leaves a race where it can
         // observe EOF before the parent has published any capability bytes.
@@ -921,6 +992,9 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if let Some(dir) = content_config_dir.as_ref() {
+            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", &dir.path);
+        }
         command.process_group(0);
         let sandbox_exe = path.clone();
         unsafe {
@@ -1046,6 +1120,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
+            content_config_dir,
             reaped: false,
         })
 }
@@ -1730,10 +1805,10 @@ impl WorkerProcess {
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        if self.reaped {
-            return;
+        if !self.reaped {
+            self.kill_tree();
         }
-        self.kill_tree();
+        self.content_config_dir.take();
     }
 }
 
@@ -1749,6 +1824,34 @@ mod tests {
         let mut payload = String::new();
         read.read_to_string(&mut payload).unwrap();
         assert_eq!(payload, "worker-capability\n");
+    }
+
+    #[test]
+    fn content_worker_temp_dir_is_removed_with_its_owner() {
+        let path;
+        {
+            let dir = OwnedTempDir::for_content_worker().unwrap();
+            path = dir.path.clone();
+            fs::write(path.join("clientstorage"), b"fixture").unwrap();
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_content_worker_temp_dir_is_reaped() {
+        let path = std::env::temp_dir().join(format!(
+            "greppy-web-content-{}-1",
+            i32::MAX
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("clientstorage"), b"fixture").unwrap();
+
+        reap_stale_content_worker_dirs();
+
+        assert!(!path.exists(), "{}", path.display());
     }
 
     #[test]

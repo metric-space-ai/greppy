@@ -78,6 +78,10 @@ one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
 - The controller waits for the next script instead of a 120 s idle clock
   that killed a live controller during session create/close cycles; the
   1000-cycle gate finishes with a `test result:` line again (027).
+- Each content worker uses an explicit supervisor-owned Servo profile directory.
+  Normal shutdown removes it, failed spawns roll it back, and the next
+  supervisor reaps directories left by a dead owner instead of accumulating
+  anonymous `clientstorage` trees in the system temp volume.
 - The runtime removes its socket and attach token on shutdown and heals a
   stale endpoint on bind only after a connect proves nobody listens; a live
   runtime keeps its socket and the caller gets a real address-in-use error

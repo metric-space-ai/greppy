@@ -11,7 +11,7 @@ use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, RenderingContext, RgbaImage,
-    Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent, TouchEventType,
+    Opts, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent, TouchEventType,
     TouchId, TouchPointerType,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
 const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 
@@ -884,7 +885,14 @@ impl ContentEngine {
         let proxy = PolicyProxy::spawn(profile.clone())?;
         let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
+        let mut opts = Opts::default();
+        if let Some(path) = std::env::var_os(CONTENT_CONFIG_DIR_ENV) {
+            let path = PathBuf::from(path);
+            std::fs::create_dir_all(&path)?;
+            opts.config_dir = Some(path);
+        }
         let servo = ServoBuilder::default()
+            .opts(opts)
             .preferences(preferences)
             .event_loop_waker(Box::new(wake.clone()))
             .build();

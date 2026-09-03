@@ -56,13 +56,16 @@ fn supervisor_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn harness_escalated() -> &'static std::sync::atomic::AtomicBool {
-    static FLAG: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
-    FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+fn harness_escalations() -> &'static Mutex<HashSet<String>> {
+    static RUN_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    RUN_IDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn take_harness_escalation() -> bool {
-    harness_escalated().swap(false, Ordering::SeqCst)
+fn take_harness_escalation(run_id: &str) -> bool {
+    harness_escalations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(run_id)
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
@@ -384,7 +387,10 @@ impl Drop for Supervisor {
             }
         }
         if !reaped {
-            harness_escalated().store(true, Ordering::SeqCst);
+            harness_escalations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(self.run_id.clone());
             eprintln!("web-runtime: phase harness-drop ESCALATION pid={pid}");
             let _ = self.child.kill();
             let _ = self.child.try_wait();
@@ -647,10 +653,23 @@ fn leftover_matches_this_image_ignores_other_trees_and_copy_scripts() {
     );
 }
 
-fn assert_no_leftover_web_runtime_processes() {
+#[test]
+fn harness_escalation_is_consumed_only_by_its_own_run() {
+    let failed = "run_escalation_failed";
+    harness_escalations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(failed.to_string());
+
+    assert!(!take_harness_escalation("run_escalation_other"));
+    assert!(take_harness_escalation(failed));
+    assert!(!take_harness_escalation(failed));
+}
+
+fn assert_no_leftover_web_runtime_processes(run_id: &str) {
     thread::sleep(Duration::from_millis(100));
     let leftover = leftover_web_runtime_processes();
-    let escalated = take_harness_escalation();
+    let escalated = take_harness_escalation(run_id);
     assert!(
         leftover.is_empty(),
         "leftover web-runtime/internal-role/cliparent processes: {leftover:?}"
@@ -4569,7 +4588,7 @@ await browser.close();
         Duration::from_secs(5),
     );
     drop(guard);
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_wfeload");
     assert_eq!(ran.status, "ok", "{ran:?}");
     assert!(
         started.elapsed() < Duration::from_secs(40),
@@ -4609,7 +4628,7 @@ await browser.close();
         Duration::from_secs(5),
     );
     drop(guard);
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_wfehang");
     assert!(
         elapsed < Duration::from_secs(40),
         "waitForEvent frameattached hung for {elapsed:?}"
@@ -4642,7 +4661,7 @@ fn graceful_shutdown_reaps_workers_without_harness_escalation() {
         elapsed < Duration::from_secs(20),
         "graceful shutdown hung for {elapsed:?}"
     );
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_raii");
 }
 
 #[test]
@@ -4674,7 +4693,7 @@ fn attach_capability_rejects_missing_wrong_and_endpoint_only() {
         "{denied:?}"
     );
     drop(guard);
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_cap");
 }
 
 #[test]
@@ -5042,7 +5061,7 @@ fn cancel_is_bound_to_request_id_and_heartbeat_updates_busy_session() {
         "{follow:?}"
     );
     drop(guard);
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_cancel");
 }
 
 #[test]
@@ -5887,7 +5906,7 @@ fn supervisor_exits_after_typed_idle_ttl() {
         status.success(),
         "supervisor idle-exit must be success, got {status}"
     );
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes("run_idleex");
 }
 
 #[test]
@@ -6466,7 +6485,7 @@ fn run_named_fixture(name: &str, run_id: &str) {
         Duration::from_secs(5),
     );
     drop(guard);
-    assert_no_leftover_web_runtime_processes();
+    assert_no_leftover_web_runtime_processes(run_id);
     assert_eq!(ran.status, "ok", "{name}: {ran:?}");
 }
 
