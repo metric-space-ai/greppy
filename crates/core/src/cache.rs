@@ -1368,6 +1368,14 @@ pub fn secure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Sandboxed clients may be allowed to read a pre-populated shared
+        // cache while writes remain owned by the unsandboxed daemon.  Avoid a
+        // redundant chmod in that case: chmod(2) is a write-like operation on
+        // macOS and would make otherwise valid embedded assets look missing.
+        // A namespace with any broader mode still goes through chmod below.
+        if fs::symlink_metadata(path)?.permissions().mode() & 0o777 == 0o700 {
+            return Ok(());
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
     }
     #[cfg(windows)]
@@ -1712,6 +1720,36 @@ mod tests {
         );
         assert_eq!(models_root(), shared.join("models").join("v1"));
         std::env::remove_var(ENV_SHARED_INFERENCE_ROOT);
+        std::env::remove_var("GREPPY_STORE_DIR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_private_model_namespace_does_not_require_permission_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("existing-private-model");
+        let data = base.join("data");
+        std::env::set_var("GREPPY_STORE_DIR", &data);
+        let entry = ensure_model_entry("model", &"a".repeat(64)).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(data.join("models"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            data.join("models").join("v1"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(entry.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(ensure_model_entry("model", &"a".repeat(64)).unwrap(), entry);
+        assert_eq!(
+            fs::metadata(&entry).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
         std::env::remove_var("GREPPY_STORE_DIR");
         let _ = fs::remove_dir_all(base);
     }

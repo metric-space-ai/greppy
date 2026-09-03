@@ -878,10 +878,21 @@ fn spool_dir() -> Result<PathBuf> {
     // below the graph store coupled command execution to that store's ACLs and
     // lifecycle: a concurrently published/replaced store could make the drain
     // threads fail with EPERM even though the child command itself was valid.
-    // Keep one hardened user-global namespace instead. The files must outlive
-    // this process because an expansion command reads their paths from the
-    // durable expand pack until that pack's TTL expires.
-    let dir = greppy_core::cache::data_root().join("bash-smart");
+    // Keep one hardened user-global namespace in the OS shared-temp root.
+    // Agent sandboxes commonly permit `/tmp` while intentionally denying
+    // metadata writes below the user's persistent Greppy data root. The files
+    // must outlive this process because an expansion command reads their paths
+    // from the durable expand pack until that pack's TTL expires.
+    #[cfg(unix)]
+    let dir = {
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = PathBuf::from("/tmp");
+        base.join(format!("greppy-bash-smart-{}", unsafe { libc::geteuid() }))
+    };
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("greppy-bash-smart");
     workspace_locator::ensure_store_dir(&dir)
         .map_err(|error| Error::io("create private bash-smart spool directory", error))?;
     Ok(dir)
@@ -906,7 +917,10 @@ where
     std::thread::spawn(move || {
         use std::io::{Seek, SeekFrom};
 
-        let tail_path = path.with_extension("tail-ring");
+        // stdout and stderr drain concurrently. Replacing the extension made
+        // both `<token>.stdout` and `<token>.stderr` target the same
+        // `<token>.tail-ring`, so the two writers could truncate one another.
+        let tail_path = tail_ring_path(&path);
         let mut output = std::fs::File::create(&path)?;
         let mut tail = std::fs::File::create(&tail_path)?;
         let mut timestamps = std::fs::File::create(&timestamps_path)?;
@@ -986,6 +1000,16 @@ where
             sha256,
         })
     })
+}
+
+fn tail_ring_path(path: &Path) -> PathBuf {
+    let tail_name = format!(
+        "{}.tail-ring",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("stream")
+    );
+    path.with_file_name(tail_name)
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -1989,6 +2013,22 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn spool_directory_uses_sandbox_shared_private_temp_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = spool_dir().expect("sandbox-shared spool");
+        #[cfg(target_os = "macos")]
+        assert!(dir.starts_with("/private/tmp"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(dir.starts_with("/tmp"));
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     #[test]
     fn bare_counters_do_not_template_collapse() {
         let raw = b"1\n2\n3\n";
@@ -2220,6 +2260,22 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"one\ntwo\nlast");
         assert_eq!(std::fs::read_to_string(times).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_streams_use_distinct_tail_rings() {
+        let dir = std::env::temp_dir().join(format!("greppy-tail-ring-test-{}", spool_token()));
+        let stdout = dir.join("capture.stdout");
+        let stderr = dir.join("capture.stderr");
+        assert_ne!(tail_ring_path(&stdout), tail_ring_path(&stderr));
+        assert_eq!(
+            tail_ring_path(&stdout).file_name().unwrap(),
+            "capture.stdout.tail-ring"
+        );
+        assert_eq!(
+            tail_ring_path(&stderr).file_name().unwrap(),
+            "capture.stderr.tail-ring"
+        );
     }
 
     #[test]
