@@ -69,6 +69,12 @@ pub fn localize_mozjs_js_static() {
         panic!("mozjs_sys js_static archive not found; cannot localize V8/SpiderMonkey overlap");
     }
     for archive in &archives {
+        println!(
+            "cargo:warning=engine namespace input: SpiderMonkey js_static {}",
+            archive.display()
+        );
+    }
+    for archive in &archives {
         if let Err(error) = localize_archive(archive) {
             panic!("localize {}: {error}", archive.display());
         }
@@ -80,6 +86,12 @@ pub fn localize_mozjs_js_static() {
     let rlibs = find_mozjs_sys_rlibs();
     if rlibs.is_empty() {
         panic!("libmozjs_sys-*.rlib not found; irregexp objects are linked from the rlib, not only libjs_static.a");
+    }
+    for rlib in &rlibs {
+        println!(
+            "cargo:warning=engine namespace input: SpiderMonkey rlib {}",
+            rlib.display()
+        );
     }
     for rlib in &rlibs {
         if let Err(error) = localize_archive(rlib) {
@@ -101,12 +113,14 @@ pub fn localize_mozjs_js_static() {
         v8_symbol_sources.extend(v8_rlibs);
     }
     for source in &v8_symbol_sources {
+        println!(
+            "cargo:warning=engine namespace input: V8 symbol source {}",
+            source.display()
+        );
         println!("cargo:rerun-if-changed={}", source.display());
     }
     if cfg!(target_os = "linux") {
-        if let Err(error) =
-            namespace_linux_engine_symbols(&archives, &rlibs, &v8_symbol_sources)
-        {
+        if let Err(error) = namespace_linux_engine_symbols(&archives, &rlibs, &v8_symbol_sources) {
             panic!("namespace Linux SpiderMonkey symbols: {error}");
         }
     }
@@ -155,7 +169,13 @@ fn namespace_linux_engine_symbols(
 ) -> Result<(), String> {
     let mut v8_globals = BTreeSet::new();
     for source in v8_symbol_sources {
-        v8_globals.extend(defined_globals(source)?);
+        let globals = defined_globals(source)?;
+        println!(
+            "cargo:warning=engine namespace scan: V8 source {} has {} defined globals",
+            source.display(),
+            globals.len()
+        );
+        v8_globals.extend(globals);
     }
 
     // Both engines embed ICU 77. ELF does not coalesce those strong C/C++
@@ -173,6 +193,13 @@ fn namespace_linux_engine_symbols(
         reject_mixed_icu_versions(&overlaps)?;
         redefine_linux_archive_symbols(archive, &overlaps, "__greppy_sm_")?;
         verify_symbols_absent(archive, &overlaps, "ICU")?;
+        let renamed = verify_symbols_renamed(archive, &overlaps, "__greppy_sm_", "ICU")?;
+        println!(
+            "cargo:warning=engine namespace result: SpiderMonkey archive {} had {} ICU overlaps and {} renamed definitions",
+            archive.display(),
+            overlaps.len(),
+            renamed
+        );
     }
 
     // mozjs_sys uses diplomat-runtime 0.8 through icu_capi while V8's
@@ -275,6 +302,27 @@ fn verify_symbols_absent(
         "{family} symbols remain globally defined in {}: {:?}",
         archive.display(),
         remaining.iter().take(20).collect::<Vec<_>>()
+    ))
+}
+
+fn verify_symbols_renamed(
+    archive: &Path,
+    symbols: &BTreeSet<String>,
+    prefix: &str,
+    family: &str,
+) -> Result<usize, String> {
+    let defined = defined_globals(archive)?;
+    let missing = symbols
+        .iter()
+        .filter(|name| !defined.contains(&format!("{prefix}{name}")))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(symbols.len());
+    }
+    Err(format!(
+        "{family} renamed definitions are missing from {}: {:?}",
+        archive.display(),
+        missing.iter().take(20).collect::<Vec<_>>()
     ))
 }
 

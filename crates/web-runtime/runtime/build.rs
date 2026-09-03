@@ -1,6 +1,7 @@
 include!("../build-support/localize_js_static.rs");
 
 fn main() {
+    println!("cargo:rerun-if-changed=../build-support/localize_js_static.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CONTROLLER_RUNTIME");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CONTENT_RUNTIME");
 
