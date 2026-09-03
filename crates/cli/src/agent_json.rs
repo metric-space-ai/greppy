@@ -125,6 +125,7 @@ pub(crate) fn session_event(session: &JsonSession) -> Value {
     json!({
         "type": "session",
         "session_id": session.session_id,
+        "uri": crate::agent_sessions::session_uri(&session.session_id),
         "run_id": session.run_id,
         "project": session.project,
         "worktree": session.worktree,

@@ -96,6 +96,25 @@ pub(crate) struct ListedSession {
     lines: Vec<SessionLogLine>,
 }
 
+/// The copy-pasteable handle for a session: `greppy://sessions/<id>`.
+///
+/// Other agents hand this string around the way Codex hands around
+/// `codex://threads/<uuid>`; every place that takes a session id accepts it.
+pub(crate) const SESSION_URI_PREFIX: &str = "greppy://sessions/";
+
+pub(crate) fn session_uri(id: &str) -> String {
+    format!("{SESSION_URI_PREFIX}{id}")
+}
+
+/// Accept either a bare id/prefix or a `greppy://sessions/<id>` handle.
+pub(crate) fn session_id_from_ref(input: &str) -> &str {
+    let trimmed = input.trim();
+    match trimmed.strip_prefix(SESSION_URI_PREFIX) {
+        Some(rest) => rest.trim_end_matches('/'),
+        None => trimmed,
+    }
+}
+
 pub(crate) fn resolve_from_root(
     root: Option<&str>,
     id: &str,
@@ -251,6 +270,7 @@ pub(crate) fn resolve_session(
     logical_project: &str,
     id: &str,
 ) -> std::result::Result<ListedSession, i32> {
+    let id = session_id_from_ref(id);
     let sessions = match load_project(data_root, logical_project) {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -371,6 +391,7 @@ fn list_json_row(session: &ListedSession) -> Value {
     let (live, socket) = live_socket(session);
     json!({
         "id": session.record.id,
+        "uri": session_uri(&session.record.id),
         "project": session.record.project,
         "title": session.record.title,
         "model": session.record.model,
@@ -420,6 +441,7 @@ fn show_json(session: &ListedSession) -> Value {
         .collect();
     json!({
         "id": session.record.id,
+        "uri": session_uri(&session.record.id),
         "project": session.record.project,
         "title": session.record.title,
         "model": session.record.model,
@@ -446,6 +468,7 @@ fn show_json(session: &ListedSession) -> Value {
 fn print_show_header(session: &ListedSession) {
     let record = &session.record;
     println!("id: {}", record.id);
+    println!("uri: {}", session_uri(&record.id));
     println!("title: {}", record.title);
     println!("project: {}", record.project);
     println!("model: {}", record.model);

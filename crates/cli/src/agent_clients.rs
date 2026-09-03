@@ -209,6 +209,10 @@ fn print_status(description: &Value, session: &ListedSession) {
         )
     );
     println!(
+        "uri: {}",
+        crate::agent_sessions::session_uri(&session.record.id)
+    );
+    println!(
         "phase: {}",
         sanitize_human(
             description
