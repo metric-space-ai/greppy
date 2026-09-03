@@ -58,10 +58,35 @@ dir_digest() {
 # purity and cache-clear assertions must not race their lock files / socket
 # teardown. Wait only for sockets and lock files in this smoke's owned runtime
 # directory: a global pgrep would couple the release to unrelated agents.
+dump_daemon_residue() {
+  local now path mtime kind size age
+  now="$(date +%s)"
+  printf 'daemon drain diagnostics: embed_exit_ttl_s=%s summarize_exit_ttl_s=%s runtime_base=%s\n' \
+    "${GREPPY_EMBED_DAEMON_EXIT_TTL_S:-<unset>}" \
+    "${GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S:-<unset>}" \
+    "$RUNTIME_BASE" >&2
+  while IFS= read -r path; do
+    if mtime="$(stat -f '%m' "$path" 2>/dev/null)"; then
+      kind="$(stat -f '%HT' "$path" 2>/dev/null || printf unknown)"
+      size="$(stat -f '%z' "$path" 2>/dev/null || printf unknown)"
+    else
+      mtime="$(stat -c '%Y' "$path" 2>/dev/null || printf 0)"
+      kind="$(stat -c '%F' "$path" 2>/dev/null || printf unknown)"
+      size="$(stat -c '%s' "$path" 2>/dev/null || printf unknown)"
+    fi
+    case "$mtime" in ''|*[!0-9]*) age=unknown ;; *) age=$(( now - mtime )) ;; esac
+    printf 'daemon drain residue: path=%s type=%s age_s=%s size=%s\n' \
+      "$path" "$kind" "$age" "$size" >&2
+  done < <(find "$RUNTIME_BASE" \( -type f -o -type s -o -type l \) -print 2>/dev/null)
+}
+
 drain_daemons() {
   local deadline=$(( $(date +%s) + 180 ))
   while find "$RUNTIME_BASE" \( -type f -o -type s \) -print -quit 2>/dev/null | grep -q .; do
-    [ "$(date +%s)" -lt "$deadline" ] || fail "inference daemons did not exit within 180s"
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      dump_daemon_residue
+      fail "inference daemons did not exit within 180s"
+    fi
     sleep 1
   done
 }
