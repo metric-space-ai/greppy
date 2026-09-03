@@ -334,6 +334,15 @@ pub fn run_agent_loop_with_history(
         messages.push(turn.message.clone());
         final_text = extract_text(&turn.message);
 
+        // A model request is not interrupted mid-frame, but its completion is
+        // a safe boundary. Without this check an interrupt received while an
+        // EndTurn response was in flight was acknowledged and then silently
+        // reported as a successful turn.
+        if cancel_requested(config) && !matches!(&turn.stop_reason, StopReason::ToolUse) {
+            last_stop = LoopStop::Cancelled;
+            break;
+        }
+
         match turn.stop_reason {
             StopReason::ToolUse => {
                 let tool_calls = collect_tool_calls(&turn.message);

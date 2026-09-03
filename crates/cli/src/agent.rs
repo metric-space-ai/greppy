@@ -299,31 +299,34 @@ pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
 }
 
 fn run_agent_serve_invocation(rest: &[std::ffi::OsString]) -> u8 {
+    let mut argv = vec![std::ffi::OsString::from("greppy agent serve")];
+    argv.extend(rest.iter().skip(2).cloned());
+    let mut serve = match ServeArgs::try_parse_from(argv) {
+        Ok(args) => args,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = error.print();
+                return EXIT_OK;
+            }
+            let _ = error.print();
+            return EXIT_USAGE;
+        }
+    };
     #[cfg(not(unix))]
     {
-        let _ = rest;
+        let _ = serve;
         eprintln!("greppy agent serve: Unix domain sockets are unsupported on this platform");
-        return EXIT_USAGE;
+        EXIT_USAGE
     }
     #[cfg(unix)]
     {
-        let mut argv = vec![std::ffi::OsString::from("greppy agent serve")];
-        argv.extend(rest.iter().skip(2).cloned());
-        let serve = match ServeArgs::try_parse_from(argv) {
-            Ok(args) => args,
-            Err(error) => {
-                use clap::error::ErrorKind;
-                if matches!(
-                    error.kind(),
-                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-                ) {
-                    let _ = error.print();
-                    return EXIT_OK;
-                }
-                let _ = error.print();
-                return EXIT_USAGE;
-            }
-        };
+        if let Some(resume) = serve.resume.as_deref() {
+            serve.resume = Some(crate::agent_sessions::session_id_from_ref(resume).to_string());
+        }
         if serve
             .model
             .as_deref()
@@ -1861,7 +1864,6 @@ pub(crate) fn spawn_session_worker(
                         });
                     }
                     SessionCommand::Prompt(prompt) => {
-                        cancel.store(false, Ordering::Relaxed);
                         let mut prompt_turns = 0u64;
                         let previous_message_count = history.len();
                         if let Some(source) = remote_source.as_deref().or(prompt_source.as_deref()) {

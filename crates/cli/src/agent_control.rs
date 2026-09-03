@@ -88,15 +88,26 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn bind(path: &Path) -> io::Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "control socket has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+        greppy_core::cache::secure_private_directory(parent)?;
+        // Serialize the probe/remove/bind transaction across processes. A
+        // probe followed by an unlink is otherwise a TOCTOU race: a second
+        // host can bind after our probe and have its live socket unlinked.
+        let _bind_lock = greppy_core::cache::acquire_named_lock_in(
+            parent,
+            "agent-control-bind",
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )?
+        .ok_or_else(|| io::Error::other("control socket bind lock unavailable"))?;
         if probe_live(path)? {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "session already hosted",
             ));
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-            greppy_core::cache::secure_private_directory(parent)?;
         }
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -402,6 +413,7 @@ fn read_connection(conn: ConnId, mut stream: UnixStream, tx: mpsc::Sender<WireIn
 pub struct ControlClient {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
+    partial: Vec<u8>,
     next_id: u64,
     events: VecDeque<Value>,
 }
@@ -413,12 +425,17 @@ impl ControlClient {
         Ok(Self {
             writer,
             reader,
+            partial: Vec::new(),
             next_id: 1,
             events: VecDeque::new(),
         })
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(None)
+            .map_err(io_rpc_error)?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
@@ -488,20 +505,33 @@ impl ControlClient {
     }
 
     fn read_value(&mut self) -> io::Result<Value> {
-        let mut line = Vec::new();
-        let count = self.reader.read_until(b'\n', &mut line)?;
+        let count = match self.reader.read_until(b'\n', &mut self.partial) {
+            Ok(count) => count,
+            Err(error) => {
+                if self.partial.len() > MAX_LINE + 1 {
+                    self.partial.clear();
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "control line exceeds 1 MiB",
+                    ));
+                }
+                return Err(error);
+            }
+        };
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "control socket closed",
             ));
         }
-        if line.len() > MAX_LINE + 1 {
+        if self.partial.len() > MAX_LINE + 1 {
+            self.partial.clear();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "control line exceeds 1 MiB",
             ));
         }
+        let line = std::mem::take(&mut self.partial);
         serde_json::from_slice(&line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
@@ -621,7 +651,7 @@ mod tests {
         );
         drop(server);
         assert!(!path.exists());
-        fs::remove_dir(path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -633,6 +663,41 @@ mod tests {
         assert_eq!(error.to_string(), "session already hosted");
         assert!(is_live(&path));
         drop(server);
+    }
+
+    #[test]
+    fn concurrent_bind_keeps_one_live_owner() {
+        let path = temp_socket("concurrent-bind");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                tx.send(ControlServer::bind(&path)).unwrap();
+            });
+        }
+        barrier.wait();
+        drop(tx);
+        let results = rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        let mut owner = None;
+        let mut refused = 0;
+        for result in results {
+            match result {
+                Ok(server) => owner = Some(server),
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(refused, 1);
+        assert!(owner.is_some());
+        assert!(is_live(&path));
+        drop(owner);
     }
 
     #[test]
@@ -706,6 +771,32 @@ mod tests {
         server.reply(conn, id, Ok(json!({"subscribed":true})));
         server.broadcast(&json!({"type":"phase","phase":"idle"}));
         assert_eq!(client.join().unwrap()["phase"], "idle");
+    }
+
+    #[test]
+    fn event_frame_survives_a_read_timeout_between_chunks() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut client = ControlClient {
+            writer: stream.try_clone().unwrap(),
+            reader: BufReader::new(stream),
+            partial: Vec::new(),
+            next_id: 1,
+            events: VecDeque::new(),
+        };
+        let sender = thread::spawn(move || {
+            peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":")
+                .unwrap();
+            thread::sleep(Duration::from_millis(80));
+            peer.write_all(b"{\"type\":\"phase\",\"phase\":\"idle\"}}\n")
+                .unwrap();
+        });
+        assert_eq!(client.next_event(Duration::from_millis(20)).unwrap(), None);
+        let event = client
+            .next_event(Duration::from_secs(1))
+            .unwrap()
+            .expect("complete event after the delayed frame suffix");
+        assert_eq!(event["phase"], "idle");
+        sender.join().unwrap();
     }
 
     #[test]

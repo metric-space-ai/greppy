@@ -131,6 +131,11 @@ pub(crate) fn run(
 
     let cancel = Arc::new(AtomicBool::new(false));
     config.cancel = Some(Arc::clone(&cancel));
+    let socket_path = socket_path_for(store, &record.id);
+    // Publish the control endpoint before starting gateway/model discovery so
+    // a slow setup remains observable and interruptible.
+    let mut server = ControlServer::bind(&socket_path)
+        .map_err(|error| format!("cannot bind control socket: {error}"))?;
     let handle = spawn_session_worker(SessionWorkerParts {
         client,
         env,
@@ -141,15 +146,6 @@ pub(crate) fn run(
         prompt_source: None,
         start_paused: false,
     })?;
-    let socket_path = socket_path_for(store, &record.id);
-    let mut server = match ControlServer::bind(&socket_path) {
-        Ok(server) => server,
-        Err(error) => {
-            let _ = handle.commands.send(SessionCommand::Quit);
-            let _ = handle.join.join();
-            return Err(format!("cannot bind control socket: {error}"));
-        }
-    };
     emitter.serve_session(launch.json_session, &socket_path.display().to_string());
     let _signals = SignalGuard::install();
 
@@ -352,9 +348,19 @@ pub(crate) fn run(
         if SIGNALS.load(Ordering::SeqCst) > 0 {
             quit = true;
             queue.clear();
+            if matches!(phase, Phase::Busy | Phase::Cancelling) {
+                cancel.store(true, Ordering::Relaxed);
+                set_phase(&mut server, emitter, &mut phase, Phase::Cancelling);
+            }
         }
         if phase == Phase::Idle && !quit {
             if let Some(prompt) = queue.pop_front() {
+                // Establish Busy and clear only cancellation from a completed
+                // earlier turn before publishing turn_start. Once a client
+                // can observe this turn, a confirmed interrupt must remain
+                // set until the worker observes it.
+                cancel.store(false, Ordering::Relaxed);
+                set_phase(&mut server, emitter, &mut phase, Phase::Busy);
                 store
                     .append_turn_start(&record.id, &prompt.source, &prompt.text)
                     .map_err(|error| format!("session save failed: {error}"))?;
@@ -367,7 +373,6 @@ pub(crate) fn run(
                     .commands
                     .send(SessionCommand::Prompt(prompt.text))
                     .map_err(|_| "session worker disconnected".to_string())?;
-                set_phase(&mut server, emitter, &mut phase, Phase::Busy);
                 last_activity = Instant::now();
             }
         }

@@ -322,6 +322,8 @@ fn control_socket_hosts_queued_turns_and_quits_cleanly() {
     let mut client = ControlClient::connect(&socket).unwrap();
     let description = wait_idle(&mut client);
     assert_eq!(description["session_id"], hosted.session["session_id"]);
+    let session_uri = description["uri"].as_str().unwrap().to_string();
+    assert_eq!(session_uri, hosted.session["uri"]);
     assert_eq!(description["phase"], "idle");
     client.subscribe().unwrap();
     assert_eq!(
@@ -394,6 +396,25 @@ fn control_socket_hosts_queued_turns_and_quits_cleanly() {
     }));
     assert!(!socket.exists());
 
+    let mut resumed = spawn_serve(
+        &repo,
+        &store,
+        &provider.data,
+        &endpoint,
+        &["--resume", session_uri.as_str()],
+    );
+    assert_eq!(resumed.session["session_id"], hosted.session["session_id"]);
+    assert_eq!(resumed.session["uri"], session_uri);
+    let resumed_socket = PathBuf::from(resumed.session["socket"].as_str().unwrap());
+    let mut resumed_client = ControlClient::connect(&resumed_socket).unwrap();
+    wait_idle(&mut resumed_client);
+    assert_eq!(
+        resumed_client.call("session/quit", json!({})).unwrap(),
+        json!({"accepted":true})
+    );
+    assert_eq!(resumed.child.wait().unwrap().code(), Some(0));
+    assert!(!resumed_socket.exists());
+
     stop_gateway(stop, gateway);
     drop(provider);
 }
@@ -458,6 +479,79 @@ fn sigterm_during_idle_emits_result_and_unlinks_socket() {
     hosted.stdout.read_to_string(&mut rest).unwrap();
     assert_eq!(status.code(), Some(0), "stdout remainder={rest}");
     assert!(rest.contains(r#""type":"result""#));
+    assert!(!socket.exists());
+    stop_gateway(stop, gateway);
+    drop(provider);
+}
+
+#[test]
+fn accepted_interrupt_after_turn_start_is_not_cleared_by_worker() {
+    let repo = unique_temp("interrupt-repo");
+    init_repo(&repo);
+    let store = unique_temp("interrupt-store");
+    let provider_root = unique_temp("interrupt-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::from_secs(2), false);
+    let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
+    let socket = PathBuf::from(hosted.session["socket"].as_str().unwrap());
+    let mut client = ControlClient::connect(&socket).unwrap();
+    wait_idle(&mut client);
+    client.subscribe().unwrap();
+    assert_eq!(
+        client
+            .call("turn/start", json!({"text":"cancel me"}))
+            .unwrap()["accepted"],
+        true
+    );
+    next_type(&mut client, "turn_start");
+    assert_eq!(
+        client.call("turn/interrupt", json!({})).unwrap(),
+        json!({"accepted":true})
+    );
+    let complete = next_type(&mut client, "turn_complete");
+    assert_eq!(complete["stop"], "cancelled", "{complete}");
+    assert_eq!(
+        client.call("session/quit", json!({})).unwrap(),
+        json!({"accepted":true})
+    );
+    let status = hosted.child.wait().unwrap();
+    let mut rest = String::new();
+    hosted.stdout.read_to_string(&mut rest).unwrap();
+    assert_eq!(status.code(), Some(130), "stdout remainder={rest}");
+    assert!(!socket.exists());
+    stop_gateway(stop, gateway);
+    drop(provider);
+}
+
+#[test]
+fn sigterm_during_busy_turn_cancels_before_quit() {
+    let repo = unique_temp("busy-signal-repo");
+    init_repo(&repo);
+    let store = unique_temp("busy-signal-store");
+    let provider_root = unique_temp("busy-signal-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, gateway) = spawn_gateway(Duration::from_secs(2), false);
+    let mut hosted = spawn_serve(&repo, &store, &provider.data, &endpoint, &[]);
+    let socket = PathBuf::from(hosted.session["socket"].as_str().unwrap());
+    let mut client = ControlClient::connect(&socket).unwrap();
+    wait_idle(&mut client);
+    client.subscribe().unwrap();
+    assert_eq!(
+        client
+            .call("turn/start", json!({"text":"signal me"}))
+            .unwrap()["accepted"],
+        true
+    );
+    next_type(&mut client, "turn_start");
+    unsafe { libc::kill(hosted.child.id() as i32, libc::SIGTERM) };
+    let status = hosted.child.wait().unwrap();
+    let mut rest = String::new();
+    hosted.stdout.read_to_string(&mut rest).unwrap();
+    assert_eq!(status.code(), Some(130), "stdout remainder={rest}");
+    let result: Value = serde_json::from_str(rest.lines().last().expect("final result line"))
+        .unwrap_or_else(|error| panic!("final stdout line is not JSON: {error}: {rest:?}"));
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["status"], "cancelled");
     assert!(!socket.exists());
     stop_gateway(stop, gateway);
     drop(provider);

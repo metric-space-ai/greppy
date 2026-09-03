@@ -119,6 +119,7 @@ fn handle_remote(app: &mut App, request: RemoteRequest) -> Vec<Effect> {
     let result = match method.as_str() {
         "session/describe" => Ok(json!({
             "session_id": app.session_id,
+            "uri": crate::agent_sessions::session_uri(&app.session_id),
             "run_id": app.session_run_id,
             "project": app.session_project,
             "worktree": app.header.worktree,
@@ -1209,6 +1210,7 @@ mod tests {
             assert_eq!(value["phase"], label);
             assert_eq!(value["pending"], 2);
             assert_eq!(value["session_id"], "sess");
+            assert_eq!(value["uri"], "greppy://sessions/sess");
         }
     }
 

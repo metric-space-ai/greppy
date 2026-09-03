@@ -376,6 +376,15 @@ fn dispatch_effects(
         }
     }
     for command in apply_effects(&effects) {
+        if matches!(
+            &command,
+            SessionCommand::Prompt(_) | SessionCommand::RemotePrompt { .. }
+        ) {
+            // Reset only before publishing the next prompt. An interrupt that
+            // arrives after this send must not be cleared by the worker.
+            app.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         if commands.send(command).is_err() {
             app.push_error("The agent worker stopped unexpectedly.");
             app.request_exit = true;
