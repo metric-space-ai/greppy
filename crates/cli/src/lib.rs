@@ -101,9 +101,6 @@ pub mod agent_control;
 #[cfg(not(unix))]
 #[path = "agent_control_stub.rs"]
 pub mod agent_control;
-#[cfg(not(unix))]
-#[path = "agent_control_stub.rs"]
-pub mod agent_control;
 #[cfg(unix)]
 #[path = "agent_serve.rs"]
 mod agent_serve;
