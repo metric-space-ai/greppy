@@ -163,6 +163,8 @@ fn sessions_list_show_path_and_dispatch() {
     assert_eq!(rows[1]["id"], "sess-1");
     assert_eq!(rows[0]["source"], "headless");
     assert_eq!(rows[1]["source"], "interactive");
+    assert_eq!(rows[0]["uri"], "greppy://sessions/sess-2");
+    assert_eq!(rows[1]["uri"], "greppy://sessions/sess-1");
 
     let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "list"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
@@ -391,4 +393,50 @@ fn sessions_show_and_tail_strip_terminal_control_sequences() {
         stdout.contains(evil),
         "json tail must stay byte-faithful: {stdout}"
     );
+}
+
+/// A `greppy://sessions/<id>` handle works wherever a session id works, so the
+/// string another agent copies out of `sessions list --json` can be pasted back.
+#[test]
+fn session_uri_handle_is_accepted_like_an_id() {
+    let fx = setup_fixture();
+
+    let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "path", "sess-1"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let by_id = stdout.trim().to_string();
+
+    for handle in ["greppy://sessions/sess-1", "greppy://sessions/sess-1/"] {
+        let (code, stdout, stderr) = run(&fx, &["agent", "sessions", "path", handle]);
+        assert_eq!(code, 0, "{handle}: stdout={stdout}\nstderr={stderr}");
+        assert_eq!(stdout.trim(), by_id, "{handle}");
+    }
+
+    let (code, stdout, _) = run(
+        &fx,
+        &["agent", "sessions", "show", "greppy://sessions/sess-1"],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("uri: greppy://sessions/sess-1"),
+        "show header must print the handle: {stdout}"
+    );
+
+    // Prefix semantics carry over: an ambiguous handle is rejected like an
+    // ambiguous id.
+    let (code, _, stderr) = run(
+        &fx,
+        &["agent", "sessions", "path", "greppy://sessions/sess-"],
+    );
+    assert_eq!(code, 2, "ambiguous handle must fail: {stderr}");
+    assert!(
+        stderr.contains("ambiguous session prefix sess-"),
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = run(
+        &fx,
+        &["agent", "sessions", "path", "greppy://sessions/nope"],
+    );
+    assert_eq!(code, 2, "unknown handle must fail like an unknown id");
+    assert!(stderr.contains("no session nope"), "{stderr}");
 }

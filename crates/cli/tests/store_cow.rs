@@ -571,7 +571,9 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     // user to run `greppy index`, but that command opened the same missing
     // persisted Base before reaching the rebuilding path. Status must now be
     // structured and the documented foreground recovery must recreate the
-    // immutable Base and republish a healthy Delta binding.
+    // exact immutable Base and republish a healthy Delta binding. The primary
+    // branch has advanced above, so this also proves recovery preserves the
+    // worktree's original Base commit.
     let missing_base = PathBuf::from(
         refreshed_status["store_cow"]["base_path"]
             .as_str()
@@ -593,18 +595,32 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         .as_str()
         .unwrap()
         .contains("run `greppy index` to rebuild it"));
-
     let (recovery_code, recovery_stdout, recovery_stderr) =
         run(&first, &store, &["index", "."], None);
     assert_eq!(
         recovery_code, 0,
         "missing Base recovery failed\nstdout={recovery_stdout}\nstderr={recovery_stderr}"
     );
-    assert!(recovery_stderr.contains("(created)"), "{recovery_stderr}");
+    assert!(
+        recovery_stderr.contains("linked worktree uses shared Base")
+            && recovery_stderr.contains("(created)"),
+        "missing linked Base must be rebuilt: {recovery_stderr}"
+    );
     let recovered_status = query_json_raw(&first, &store, &["index", "status"], None);
     assert_eq!(recovered_status["healthy"], true, "{recovered_status:#}");
     assert_eq!(recovered_status["fresh"], true, "{recovered_status:#}");
     assert_eq!(recovered_status["store_cow"]["base_complete"], true);
+    assert_eq!(
+        recovered_status["store_cow"]["base_identity"], shared_identity,
+        "recovery must retain the persisted Base commit"
+    );
+    assert!(query_text(
+        &first,
+        &store,
+        &["search-symbol", "first_untracked_symbol"],
+        None,
+    )
+    .contains("first_untracked_symbol"));
 }
 
 #[test]

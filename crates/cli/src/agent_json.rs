@@ -56,6 +56,8 @@ impl JsonEmitter {
         write_line(&session_event(session));
     }
 
+    // Only the socket host emits these, and it is Unix-only.
+    #[allow(dead_code)]
     pub fn serve_session(&mut self, session: &JsonSession, socket: &str) {
         if self.session_emitted {
             return;
@@ -69,6 +71,8 @@ impl JsonEmitter {
         write_line(&event);
     }
 
+    // Only the socket host emits these, and it is Unix-only.
+    #[allow(dead_code)]
     pub(crate) fn emit(&mut self, event: &Value) {
         write_line(event);
     }
@@ -121,6 +125,7 @@ pub(crate) fn session_event(session: &JsonSession) -> Value {
     json!({
         "type": "session",
         "session_id": session.session_id,
+        "uri": crate::agent_sessions::session_uri(&session.session_id),
         "run_id": session.run_id,
         "project": session.project,
         "worktree": session.worktree,

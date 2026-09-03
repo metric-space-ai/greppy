@@ -431,6 +431,7 @@ fn describe(
 ) -> Value {
     json!({
         "session_id": record.id,
+        "uri": crate::agent_sessions::session_uri(&record.id),
         "run_id": record.run_id,
         "project": record.project,
         "worktree": record.worktree,

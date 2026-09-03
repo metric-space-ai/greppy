@@ -473,6 +473,11 @@ greppy agent quit      ID [--json]
 ```
 
 `ID` resolves like `sessions` (exact id or unique prefix; `--root` honored).
+Every command that takes an `ID` also accepts the session's handle,
+`greppy://sessions/<id>` — the string `sessions list --json` reports as `uri`,
+`sessions show` prints as `uri:`, and `-p --json` / `session/describe` carry in
+their `uri` field. It is the copy-pasteable address of a session: hand it to
+another agent and it can read, attach to, or steer that session.
 Control sockets use a short per-user runtime path under `/tmp` rather than the
 long data-root path; `sessions list --json` reports the authoritative `socket`
 path. A session without a live socket exits 3. `send` queues a turn (`TEXT` may be
@@ -481,6 +486,14 @@ completes. `attach` subscribes and streams events until Ctrl+C (exit 130);
 `--since-start` first reprints recent log lines. `interrupt` cancels an
 in-flight turn; `quit` asks the host to exit. Ctrl+C on `send --wait` and
 `attach` exits 130.
+
+**Trust model.** The control socket is mode 0600 in a 0700 directory, so the
+boundary is the user account: every process running as that user can drive a
+live session — other agents, scripts, and the agent's own sandboxed tool
+subprocesses (they can read the store and the network is open to them). That is
+deliberate. Remote control is a collaboration channel between agents, not a
+privilege boundary, and an agent may steer itself. Treat a hosted session the
+way you treat a shell: anything that can run as you can talk to it.
 
 Deterministic TUI previews (production renderer, not a mock layout):
 

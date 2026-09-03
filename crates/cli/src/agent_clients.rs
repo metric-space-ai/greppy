@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 
 #[cfg(unix)]
 use crate::agent_control::{is_live, not_live_message, ControlClient};
-use crate::agent_sessions::{
-    print_session_tail, render_tail_line, resolve_from_root, ListedSession,
-};
+#[cfg(unix)]
+use crate::agent_sessions::{print_session_tail, resolve_from_root};
+use crate::agent_sessions::{render_tail_line, ListedSession};
 use crate::agent_tui::sanitize_terminal_text;
 
 const EVENT_POLL: Duration = Duration::from_millis(200);
@@ -207,6 +207,10 @@ fn print_status(description: &Value, session: &ListedSession) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         )
+    );
+    println!(
+        "uri: {}",
+        crate::agent_sessions::session_uri(&session.record.id)
     );
     println!(
         "phase: {}",

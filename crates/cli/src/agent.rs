@@ -403,6 +403,11 @@ fn run_agent_invocation(argv: &[std::ffi::OsString], interactive: bool) -> u8 {
         }
     };
 
+    // `--resume` takes either a bare id or a `greppy://sessions/<id>` handle.
+    if let Some(resume) = args.resume.as_deref() {
+        args.resume = Some(crate::agent_sessions::session_id_from_ref(resume).to_string());
+    }
+
     let mut settings = crate::agent_tui::AgentSettings::default();
     if interactive {
         settings = crate::agent_tui::AgentSettings::load();

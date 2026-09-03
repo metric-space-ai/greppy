@@ -1,15 +1,18 @@
-//! Non-Unix boundary for the optional live-session control transport.
+//! Windows placeholder for the Unix-socket control transport.
 //!
-//! Windows 0.4.0 keeps the local interactive and one-shot agents, but does not
-//! claim a Unix-domain-socket control endpoint. The CLI control subcommands
-//! already report that scope explicitly. These inert server types let the
-//! platform-neutral TUI retain one implementation without inventing a second
-//! transport contract during the release freeze.
+//! Remote control rides on Unix domain sockets (`agent_control.rs`). Every
+//! caller — the readers, the CLI clients and the TUI — is otherwise
+//! platform-independent, so Windows builds get the same API with a transport
+//! that reports "unsupported" instead of connecting. `is_live` is always
+//! `false`, so sessions list as not live and the clients exit with their
+//! regular "not live" message.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::agent_tui::SessionStore;
 
@@ -47,21 +50,30 @@ impl RpcError {
 }
 
 impl std::fmt::Display for RpcError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ({})", self.message, self.code)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
     }
 }
 
 impl std::error::Error for RpcError {}
 
-pub struct ControlServer;
+const UNSUPPORTED: &str = "agent remote control needs Unix domain sockets";
+
+fn unsupported() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, UNSUPPORTED)
+}
+
+pub struct ControlServer {
+    path: PathBuf,
+}
 
 impl ControlServer {
     pub fn bind(_path: &Path) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "live agent control is not available on Windows in 0.4.0",
-        ))
+        Err(unsupported())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn poll(&mut self) -> Vec<Incoming> {
@@ -73,6 +85,43 @@ impl ControlServer {
     pub fn broadcast(&mut self, _event: &Value) {}
 }
 
-pub fn socket_path_for(_store: &SessionStore, _session_id: &str) -> PathBuf {
-    PathBuf::new()
+pub struct ControlClient;
+
+impl ControlClient {
+    pub fn connect(_path: &Path) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub fn call(&mut self, _method: &str, _params: Value) -> Result<Value, RpcError> {
+        Err(RpcError::new(-32000, UNSUPPORTED))
+    }
+
+    pub fn subscribe(&mut self) -> Result<(), RpcError> {
+        Err(RpcError::new(-32000, UNSUPPORTED))
+    }
+
+    pub fn next_event(&mut self, _timeout: Duration) -> io::Result<Option<Value>> {
+        Err(unsupported())
+    }
+}
+
+/// Where the socket *would* live: the same hashed shape the Unix transport
+/// uses, so `sessions list` reports a stable path. Nothing binds it here.
+pub fn socket_path_for(store: &SessionStore, session_id: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(store.project().as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    std::env::temp_dir().join(format!("greppy-agent-control-{}.sock", &digest[..16]))
+}
+
+pub fn is_live(_path: &Path) -> bool {
+    false
+}
+
+pub fn not_live_message(session_id: &str) -> String {
+    format!(
+        "session {session_id} is not live (no control socket); start it with greppy agent serve --resume {session_id}"
+    )
 }

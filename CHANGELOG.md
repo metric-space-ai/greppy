@@ -38,6 +38,18 @@ runtime directory so they fit the macOS Unix-socket limit; `sessions list
 completes; without `--wait` it prints the queued prompt id and returns.
 `attach` streams live events until Ctrl+C (exit 130).
 
+### Session handles and the remote-control trust model
+
+Sessions have a copy-pasteable handle, `greppy://sessions/<id>`, accepted
+wherever a session id is (`sessions show|tail|path`, the control clients,
+`-p`/`agent`/`serve` `--resume`) and reported as `uri` by `sessions list
+--json`, `sessions show`, `-p --json` and `session/describe`.
+
+The control socket's boundary is documented as the user account: any process
+running as that user — including the agent's own tool subprocesses — may drive
+a live session. Remote control is a collaboration channel between agents, not a
+privilege boundary.
+
 ## [0.4.0] — 2026-09-02
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache
