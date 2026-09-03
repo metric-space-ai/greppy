@@ -379,7 +379,7 @@ not a Playwright-compatibility claim.
   failure snapshot as a stable defect list.
 - Worker bootstrap now duplicates both capability and protocol sources above
   their reserved child descriptors before `dup2`. Their allocation order can
-  therefore no longer alias descriptor 3 or 4 and intermittently replace the
+  therefore no longer alias descriptor 3 or 5 and intermittently replace the
   protocol socket with the capability stream, which previously surfaced as a
   broken-pipe supervisor exit in repeated session-daemon runs.
 - Actionability event-loop pumps now cancel late JavaScript evaluations with a
