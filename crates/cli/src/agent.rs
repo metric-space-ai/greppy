@@ -3393,11 +3393,11 @@ mod tests {
             unique("runtime-cleanup").display()
         );
         let runtime_dir = agent_runtime_dir(&run_id);
-        fs::create_dir(&runtime_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
         drop(AgentRuntimeDirCleanup::new(&run_id));
         assert!(!runtime_dir.exists());
 
-        fs::create_dir(&runtime_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
         fs::write(runtime_dir.join("unexpected-owner"), b"preserve").unwrap();
         drop(AgentRuntimeDirCleanup::new(&run_id));
         assert!(runtime_dir.join("unexpected-owner").is_file());
