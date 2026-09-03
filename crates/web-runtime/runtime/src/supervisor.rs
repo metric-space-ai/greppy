@@ -854,6 +854,27 @@ impl WorkerProcess {
 }
 
 #[cfg(unix)]
+fn sealed_capability_pipe(capability: &str) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut cap = [0; 2];
+    if unsafe { libc::pipe(cap.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let cap_read = unsafe { OwnedFd::from_raw_fd(cap[0]) };
+    let cap_write = unsafe { OwnedFd::from_raw_fd(cap[1]) };
+    unsafe {
+        libc::fcntl(cap_read.as_raw_fd(), libc::F_SETFD, 0);
+        libc::fcntl(cap_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let mut cap_write = File::from(cap_write);
+    cap_write.write_all(capability.as_bytes())?;
+    cap_write.write_all(b"\n")?;
+    drop(cap_write);
+    Ok(cap_read)
+}
+
+#[cfg(unix)]
 fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProcess> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
@@ -868,18 +889,11 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
-        let mut cap = [0; 2];
-        if unsafe { libc::pipe(cap.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let cap_read = unsafe { OwnedFd::from_raw_fd(cap[0]) };
-        let cap_write = unsafe { OwnedFd::from_raw_fd(cap[1]) };
-        unsafe {
-            libc::fcntl(cap_read.as_raw_fd(), libc::F_SETFD, 0);
-            libc::fcntl(cap_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        }
+        // Seal the tiny token into the pipe before spawn. A child may read FD 3
+        // immediately after exec; writing after spawn leaves a race where it can
+        // observe EOF before the parent has published any capability bytes.
+        let cap_read = sealed_capability_pipe(&capability)?;
         let cap_read_fd = cap_read.into_raw_fd();
-        let mut cap_write = std::fs::File::from(cap_write);
 
         let mut proto = [0; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, proto.as_mut_ptr()) } != 0
@@ -948,10 +962,6 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             libc::close(cap_read_fd);
             libc::close(proto_child_fd);
         }
-        use std::io::Write as _;
-        cap_write.write_all(capability.as_bytes())?;
-        cap_write.write_all(b"\n")?;
-        drop(cap_write);
         image.prove_child_or_kill(&mut child)?;
         if let Err(error) = prove_same_executable(child.id()) {
             unsafe {
@@ -1730,6 +1740,16 @@ impl Drop for WorkerProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_pipe_is_filled_and_sealed_before_spawn() {
+        let read = sealed_capability_pipe("worker-capability").unwrap();
+        let mut read = File::from(read);
+        let mut payload = String::new();
+        read.read_to_string(&mut payload).unwrap();
+        assert_eq!(payload, "worker-capability\n");
+    }
 
     #[test]
     fn digest_from_sha256sums_reads_bin_web_runtime() {
