@@ -28,7 +28,7 @@ pub use provider::{
 pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
-pub use repository_tracker_service::spawn_repository_tracker;
+pub use repository_tracker_service::{spawn_repository_tracker, spawn_repository_tracker_for};
 pub use snapshot::{
     capture_overlay_directory, capture_repository, capture_repository_incremental,
     capture_repository_with_observer, BaselineDirectory, BaselineEntry, BaselineSnapshot,

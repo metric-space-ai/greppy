@@ -65,10 +65,27 @@ pub fn spawn_repository_tracker(data_root: PathBuf) -> io::Result<thread::JoinHa
     let core = Arc::new(WorkspaceCore::open(data_root.join("core")).map_err(io::Error::other)?);
     thread::Builder::new()
         .name("greppy-repository-tracker".into())
-        .spawn(move || supervise(core))
+        .spawn(move || supervise(core, None))
 }
 
-fn supervise(core: Arc<WorkspaceCore>) {
+/// Starts a tracker that owns only `repository`.
+///
+/// The macOS provider runs in a sandboxed FSKit extension and cannot watch
+/// arbitrary source repositories, so each unsandboxed agent process hosts the
+/// watcher for its own repository. It must not claim stale requests left by
+/// unrelated processes or repositories in the shared workspace database.
+pub fn spawn_repository_tracker_for(
+    data_root: PathBuf,
+    repository: PathBuf,
+) -> io::Result<thread::JoinHandle<()>> {
+    let repository = std::fs::canonicalize(repository)?;
+    let core = Arc::new(WorkspaceCore::open(data_root.join("core")).map_err(io::Error::other)?);
+    thread::Builder::new()
+        .name("greppy-repository-tracker".into())
+        .spawn(move || supervise(core, Some(repository)))
+}
+
+fn supervise(core: Arc<WorkspaceCore>, repository_scope: Option<PathBuf>) {
     let mut watchers = HashMap::<PathBuf, LiveWatcher>::new();
     let mut last_heartbeat = Instant::now();
     loop {
@@ -79,7 +96,11 @@ fn supervise(core: Arc<WorkspaceCore>) {
                 continue;
             }
         };
-        for repository in requests {
+        for repository in requests.into_iter().filter(|repository| {
+            repository_scope
+                .as_ref()
+                .is_none_or(|scope| scope == repository)
+        }) {
             watchers.remove(&repository);
             let git_dir = match repository_git_dir(&repository) {
                 Ok(git_dir) => git_dir,
@@ -820,6 +841,47 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn scoped_service_does_not_claim_an_unrelated_repository_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("selected");
+        let unrelated = temp.path().join("unrelated");
+        for repository in [&selected, &unrelated] {
+            std::fs::create_dir(repository).unwrap();
+            std::fs::create_dir(repository.join(".git")).unwrap();
+        }
+        let selected = std::fs::canonicalize(selected).unwrap();
+        let unrelated = std::fs::canonicalize(unrelated).unwrap();
+        let core = WorkspaceCore::open(temp.path().join("core")).unwrap();
+        core.request_repository_tracker(&unrelated).unwrap();
+        core.request_repository_tracker(&selected).unwrap();
+        let _tracker =
+            spawn_repository_tracker_for(temp.path().to_path_buf(), selected.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let selected_status = core.repository_tracker_status(&selected).unwrap();
+            if selected_status
+                .as_ref()
+                .is_some_and(|status| status.state == RepositoryTrackerState::Active)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scoped tracker did not activate selected repository: {selected_status:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            core.repository_tracker_status(&unrelated)
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTrackerState::Requested
+        );
     }
 
     #[test]
