@@ -475,6 +475,22 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
         self.assertIn("target/web-runtime-dist", workflow)
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
+        self.assertEqual(
+            workflow.count(
+                "--entitlements crates/web-runtime/scripts/entitlements.plist"
+            ),
+            2,
+        )
+        web_runtime_entitlements = (
+            REPOSITORY_ROOT / "crates/web-runtime/scripts/entitlements.plist"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "com.apple.security.cs.allow-jit", web_runtime_entitlements
+        )
+        self.assertIn(
+            "com.apple.security.cs.allow-unsigned-executable-memory",
+            web_runtime_entitlements,
+        )
         self.assertIn(
             "- name: Build the linked web runtime\n        if: runner.os != 'Windows'",
             workflow,
