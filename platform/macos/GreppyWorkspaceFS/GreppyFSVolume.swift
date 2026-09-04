@@ -217,10 +217,8 @@ extension GreppyFSVolume: FSVolume.Operations {
         var mtime: Int64 = 0
         var consumed: FSItem.Attribute = []
         if request.isValid(.mode) {
-            let (_, inode) = try privateInode(for: item)
-            let metadata = try core.metadata(workspace: workspaceID, inode: inode)
             valid |= 1
-            mode = (metadata.mode & UInt32(S_IFMT)) | (request.mode & 0o7777)
+            mode = request.mode & 0o7777
             consumed.insert(.mode)
         }
         if request.isValid(.accessTime) {
@@ -332,16 +330,13 @@ extension GreppyFSVolume: FSVolume.Operations {
         }
         guard let (workspaceID, _) = directory.workspaceAndPath else { throw posix(EPERM) }
         let relative = try relativePath(parent: directory, name: name)
-        let permissions = request.isValid(.mode)
+        let mode = request.isValid(.mode)
             ? request.mode & 0o7777
             : (type == .directory ? 0o755 : 0o644)
-        let mode: UInt32
         switch type {
         case .file:
-            mode = UInt32(S_IFREG) | permissions
             try core.createFile(workspace: workspaceID, path: relative, mode: mode)
         case .directory:
-            mode = UInt32(S_IFDIR) | permissions
             try core.createDirectory(workspace: workspaceID, path: relative, mode: mode)
         default:
             throw posix(EINVAL)
