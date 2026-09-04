@@ -416,6 +416,13 @@ fn active_index_writer_never_blocks_command_execution() {
         &["bash-smart", "--", "sh", "-c", "printf ran > command-ran"],
     );
     let elapsed = started.elapsed();
+    let long_output = run(
+        &workspace,
+        &[
+            "bash-smart", "--", "sh", "-c",
+            "i=0; while [ $i -lt 500 ]; do printf 'test case_%s ... ok\\n' \"$i\"; printf 'detail case_%s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ],
+    );
     let _ = index.kill();
     let _ = index.wait();
 
@@ -439,4 +446,36 @@ fn active_index_writer_never_blocks_command_execution() {
         "stderr={}",
         text(&output.stderr)
     );
+    assert_eq!(long_output.status.code(), Some(0), "{long_output:?}");
+    for (bytes, expected) in [
+        (
+            &long_output.stdout,
+            (0..500)
+                .map(|i| format!("test case_{i} ... ok\n"))
+                .collect::<String>(),
+        ),
+        (
+            &long_output.stderr,
+            (0..500)
+                .map(|i| format!("detail case_{i}\n"))
+                .collect::<String>(),
+        ),
+    ] {
+        let rendered = text(bytes);
+        assert!(
+            rendered.lines().count() < 100,
+            "uncompressed output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("greppy expand "),
+            "invented pack ID: {rendered}"
+        );
+        let path_json = rendered
+            .split("raw log ")
+            .nth(1)
+            .and_then(|s| s.split("; read with greppy read-file").next())
+            .unwrap_or_else(|| panic!("missing raw-log recovery: {rendered}"));
+        let path: String = serde_json::from_str(path_json).expect("quoted spool path");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
 }

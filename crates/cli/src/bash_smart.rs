@@ -210,7 +210,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         Ok(store) => Some(store),
         Err(Error::Lock(_)) => {
             eprintln!(
-                "bash-smart: index writer active; command execution continues without expansion storage"
+                "bash-smart: index writer active; command execution continues without expansion storage; long output stays compact with raw-log paths instead of expand IDs"
             );
             None
         }
@@ -405,9 +405,23 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
             let gated = byte_gate(store, id, "stdout", &lifted_stdout);
-            render_folded(false, &stdout_lines, exit_code, id, &stdout_groups, &gated);
+            render_folded(
+                false,
+                &stdout_lines,
+                exit_code,
+                &format!("greppy expand {id}"),
+                &stdout_groups,
+                &gated,
+            );
         } else {
-            write_stream(false, &raw.stdout);
+            render_without_pack(
+                false,
+                &raw,
+                &stdout_lines,
+                exit_code,
+                &stdout_groups,
+                &lifted_stdout,
+            );
         }
     } else {
         write_stream(false, &raw.stdout);
@@ -416,9 +430,23 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     if stderr_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stderr_id.as_deref()) {
             let gated = byte_gate(store, id, "stderr", &lifted_stderr);
-            render_folded(true, &stderr_lines, exit_code, id, &stderr_groups, &gated);
+            render_folded(
+                true,
+                &stderr_lines,
+                exit_code,
+                &format!("greppy expand {id}"),
+                &stderr_groups,
+                &gated,
+            );
         } else {
-            write_stream(true, &raw.stderr);
+            render_without_pack(
+                true,
+                &raw,
+                &stderr_lines,
+                exit_code,
+                &stderr_groups,
+                &lifted_stderr,
+            );
         }
     } else {
         write_stream(true, &raw.stderr);
@@ -1626,11 +1654,32 @@ fn display_line_ranges(ranges: &[(usize, usize)]) -> String {
     format!("lines {joined}")
 }
 
+fn render_without_pack(
+    stderr: bool,
+    raw: &StoredRaw,
+    lines: &[RawLine<'_>],
+    exit_code: i32,
+    groups: &[CollapseGroup],
+    lifted: &[LiftedLine],
+) {
+    let stream = if stderr { "stderr" } else { "stdout" };
+    if let Some(path) = raw.payload[stream]["path"].as_str() {
+        // The spool already exists independently of SQLite and remains available
+        // after this command exits. Never invent an expand ID or hide raw output
+        // without a recovery location. Debug formatting quotes the path as data,
+        // not as a shell command (TMPDIR may contain shell metacharacters).
+        let recovery = format!("raw log {path:?}; read with greppy read-file");
+        render_folded(stderr, lines, exit_code, &recovery, groups, lifted);
+    } else {
+        write_stream(stderr, if stderr { &raw.stderr } else { &raw.stdout });
+    }
+}
+
 fn render_folded(
     stderr: bool,
     lines: &[RawLine<'_>],
     exit_code: i32,
-    id: &str,
+    recovery: &str,
     groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) {
@@ -1679,18 +1728,18 @@ fn render_folded(
             };
             let _ = writeln!(
                 writer,
-                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — greppy expand {id}",
+                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — {recovery}",
                 groups[0].template
             );
         } else {
             let noun = if hidden_count == 1 { "line" } else { "lines" };
             let _ = writeln!(
                 writer,
-                "… {range_text} ({hidden_count} collapsed {noun}) — greppy expand {id}"
+                "… {range_text} ({hidden_count} collapsed {noun}) — {recovery}"
             );
         }
     } else {
-        let _ = writeln!(writer, "… partial output — greppy expand {id}");
+        let _ = writeln!(writer, "… partial output — {recovery}");
     }
 
     for line in &lines[tail_start..] {
