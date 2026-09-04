@@ -600,13 +600,35 @@ fn record_macos_fskit_activation_required(data_root: &Path) -> Result<(), String
 
 #[cfg(target_os = "macos")]
 fn locate_macos_app(current_exe: &Path) -> Result<PathBuf, String> {
+    locate_macos_app_with_fallback(
+        current_exe,
+        Path::new("/Applications/GreppyWorkspaceFS.app"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn locate_macos_app_with_fallback(
+    current_exe: &Path,
+    installed_app: &Path,
+) -> Result<PathBuf, String> {
     if let Some(bundle) = current_exe.ancestors().find(|path| {
         path.file_name()
             .is_some_and(|name| name == "GreppyWorkspaceFS.app")
     }) {
         return Ok(bundle.to_path_buf());
     }
-    sibling(current_exe, "GreppyWorkspaceFS.app")
+    let bundled_app = sibling(current_exe, "GreppyWorkspaceFS.app")?;
+    if bundled_app.is_dir() {
+        return Ok(bundled_app);
+    }
+    if installed_app.is_dir() {
+        return Ok(installed_app.to_path_buf());
+    }
+    Err(format!(
+        "signed FSKit application is missing beside {} and at {}; install the notarized GreppyWorkspaceFS.app in /Applications or place it beside this development binary, then rerun `greppy workspace setup`",
+        current_exe.display(),
+        installed_app.display()
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -942,16 +964,36 @@ mod tests {
     #[test]
     fn locates_installed_or_sibling_fskit_application() {
         assert_eq!(
-            locate_macos_app(Path::new(
-                "/Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy"
-            ))
+            locate_macos_app_with_fallback(
+                Path::new("/Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy"),
+                Path::new("/unused/GreppyWorkspaceFS.app"),
+            )
             .unwrap(),
             Path::new("/Applications/GreppyWorkspaceFS.app")
         );
+
+        let root = tempfile::tempdir().unwrap();
+        let debug_dir = root.path().join("target/debug");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        let debug_binary = debug_dir.join("greppy");
+        let installed = root.path().join("Applications/GreppyWorkspaceFS.app");
+        std::fs::create_dir_all(&installed).unwrap();
         assert_eq!(
-            locate_macos_app(Path::new("/tmp/release/greppy")).unwrap(),
-            Path::new("/tmp/release/GreppyWorkspaceFS.app")
+            locate_macos_app_with_fallback(&debug_binary, &installed).unwrap(),
+            installed
         );
+
+        let sibling_app = debug_dir.join("GreppyWorkspaceFS.app");
+        std::fs::create_dir_all(&sibling_app).unwrap();
+        assert_eq!(
+            locate_macos_app_with_fallback(&debug_binary, &installed).unwrap(),
+            sibling_app
+        );
+
+        std::fs::remove_dir_all(&sibling_app).unwrap();
+        std::fs::remove_dir_all(&installed).unwrap();
+        let error = locate_macos_app_with_fallback(&debug_binary, &installed).unwrap_err();
+        assert!(error.contains("install the notarized GreppyWorkspaceFS.app"));
     }
 
     #[cfg(target_os = "macos")]
