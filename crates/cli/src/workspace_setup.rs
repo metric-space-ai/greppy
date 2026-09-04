@@ -517,7 +517,8 @@ fn parse_macos_fskit_extension_status(
         ));
     }
     const BUNDLE_ID: &str = "ai.metricspace.greppy.workspacefs.extension";
-    let expected = expected_extension.to_string_lossy();
+    let expected =
+        fs::canonicalize(expected_extension).unwrap_or_else(|_| expected_extension.to_path_buf());
     let output = String::from_utf8_lossy(stdout);
     let mut saw_bundle = false;
     let mut matching_line = None;
@@ -526,11 +527,10 @@ fn parse_macos_fskit_extension_status(
             continue;
         }
         saw_bundle = true;
-        if line
-            .split('\t')
-            .next_back()
-            .is_some_and(|path| path.trim() == expected)
-        {
+        if line.split('\t').next_back().is_some_and(|path| {
+            let registered = Path::new(path.trim());
+            fs::canonicalize(registered).unwrap_or_else(|_| registered.to_path_buf()) == expected
+        }) {
             matching_line = Some(line.trim_start());
             break;
         }
@@ -1051,6 +1051,42 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("exited with 1"));
         assert!(error.contains("connection invalid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_fskit_registration_through_sibling_app_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let installed_extension = root
+            .path()
+            .join("Applications/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex");
+        fs::create_dir_all(&installed_extension).unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        symlink(
+            root.path().join("Applications/GreppyWorkspaceFS.app"),
+            bin.join("GreppyWorkspaceFS.app"),
+        )
+        .unwrap();
+        let sibling_extension =
+            bin.join("GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex");
+        let output = format!(
+            "+    ai.metricspace.greppy.workspacefs.extension(0.4.0)\tUUID\tDATE\t{}\n",
+            installed_extension.display()
+        );
+
+        assert_eq!(
+            parse_macos_fskit_extension_status(
+                Some(0),
+                output.as_bytes(),
+                b"",
+                &sibling_extension,
+            )
+            .unwrap(),
+            MacosFsKitExtensionStatus::Enabled
+        );
     }
 
     #[cfg(target_os = "macos")]
