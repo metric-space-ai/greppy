@@ -5,8 +5,39 @@ import ObjectiveC
 @main
 enum GreppyWorkspaceApp {
     static func main() {
+        if CommandLine.arguments.dropFirst().contains("--fskit-status") {
+            reportFileSystemExtensionStatus()
+            dispatchMain()
+        }
         guard openFileSystemExtensionsSettings() else {
             fatalError("macOS refused to open File System Extensions settings")
+        }
+    }
+
+    private static func reportFileSystemExtensionStatus() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+            fputs("FSClient installedExtensions query timed out\n", stderr)
+            exit(75)
+        }
+        Task {
+            do {
+                let modules = try await FSClient.shared.installedExtensions
+                let matches = modules.filter {
+                    $0.bundleIdentifier == "ai.metricspace.greppy.workspacefs.extension"
+                }.map {
+                    ["bundle_id": $0.bundleIdentifier, "path": $0.url.path,
+                     "enabled": $0.isEnabled] as [String: Any]
+                }
+                let data = try JSONSerialization.data(
+                    withJSONObject: ["schema": "greppy.fskit-status.v1", "modules": matches],
+                    options: [.sortedKeys]
+                )
+                print(String(decoding: data, as: UTF8.self))
+                exit(0)
+            } catch {
+                fputs("FSClient installedExtensions query failed: \(error)\n", stderr)
+                exit(1)
+            }
         }
     }
 

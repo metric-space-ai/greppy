@@ -429,6 +429,13 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
     validate_macos_fskit_installation(&app)?;
     match macos_fskit_extension_status(&app) {
         Ok(MacosFsKitExtensionStatus::Enabled) => {}
+        Ok(MacosFsKitExtensionStatus::UnavailableToFsKit) => {
+            record_macos_fskit_activation_required(data_root)?;
+            return Err(format!(
+                "Greppy Workspace FS is registered in pluginkit, but FSKit does not enumerate this extension. A checked switch is not proof that macOS can mount it. No mount was attempted. Capture native status with `{}/Contents/MacOS/GreppyWorkspaceFS --fskit-status` and inspect the macOS fskitd logs; do not repeatedly reinstall the app or toggle the switch without resolving this registration mismatch",
+                app.display()
+            ));
+        }
         Ok(status) => {
             record_macos_fskit_activation_required(data_root)?;
             open_macos_fskit_settings(&app)?;
@@ -439,9 +446,8 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
         }
         Err(error) => {
             record_macos_fskit_activation_required(data_root)?;
-            open_macos_fskit_settings(&app)?;
             return Err(format!(
-                "cannot verify approval of Greppy Workspace FS for this exact application bundle: {error}; the File System Extensions dialog was opened. Enable `Greppy Workspace FS`, then rerun `greppy workspace setup`"
+                "cannot verify native FSKit availability for this exact application bundle: {error}; no mount was attempted. Use the matching notarized CLI and GreppyWorkspaceFS.app bundle, then rerun `greppy workspace setup`"
             ));
         }
     }
@@ -481,6 +487,7 @@ enum MacosFsKitExtensionStatus {
     Disabled,
     Missing,
     StaleRegistration,
+    UnavailableToFsKit,
 }
 
 #[cfg(target_os = "macos")]
@@ -491,6 +498,7 @@ impl MacosFsKitExtensionStatus {
             Self::Disabled => "disabled",
             Self::Missing => "not registered",
             Self::StaleRegistration => "registered without a valid version",
+            Self::UnavailableToFsKit => "not enumerated by FSKit",
         }
     }
 }
@@ -567,12 +575,89 @@ fn macos_fskit_extension_status(app: &Path) -> Result<MacosFsKitExtensionStatus,
         ])
         .output()
         .map_err(|error| format!("cannot query FSKit registration with pluginkit: {error}"))?;
-    parse_macos_fskit_extension_status(
+    let registration = parse_macos_fskit_extension_status(
         output.status.code(),
         &output.stdout,
         &output.stderr,
         &expected_extension,
-    )
+    )?;
+    if registration != MacosFsKitExtensionStatus::Enabled {
+        return Ok(registration);
+    }
+    // pluginkit's election and FSKit's mount eligibility are different state.
+    // Ask the signed host through the public FSClient API before allocating a
+    // disk image or attempting a mount.
+    let protocol = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :GreppyFSKitStatusProtocolVersion"])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .map_err(|error| format!("cannot inspect FSKit status-helper contract: {error}"))?;
+    if !protocol.status.success() || protocol.stdout.trim_ascii() != b"1" {
+        return Err("installed app lacks the native FSKit status helper; install the matching notarized app bundle (the existing app was not modified)".into());
+    }
+    let helper = app.join("Contents/MacOS/GreppyWorkspaceFS");
+    require_bundled_file(&helper, "native FSKit status helper")?;
+    let output = Command::new(&helper)
+        .arg("--fskit-status")
+        .output()
+        .map_err(|error| format!("cannot invoke native FSKit status helper: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "native FSKit status helper exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_native_fskit_status(&output.stdout, &expected_extension)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_native_fskit_status(
+    bytes: &[u8],
+    expected_extension: &Path,
+) -> Result<MacosFsKitExtensionStatus, String> {
+    #[derive(serde::Deserialize)]
+    struct Module {
+        bundle_id: String,
+        path: PathBuf,
+        enabled: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct Status {
+        schema: String,
+        modules: Vec<Module>,
+    }
+    let status: Status = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid native FSKit status: {error}"))?;
+    if status.schema != "greppy.fskit-status.v1" {
+        return Err("unsupported native FSKit status schema".into());
+    }
+    let modules: Vec<_> = status
+        .modules
+        .iter()
+        .filter(|module| module.bundle_id == "ai.metricspace.greppy.workspacefs.extension")
+        .collect();
+    let [module] = modules.as_slice() else {
+        return if modules.is_empty() {
+            Ok(MacosFsKitExtensionStatus::UnavailableToFsKit)
+        } else {
+            Err(
+                "FSKit enumerated multiple Greppy extensions; exact registration is ambiguous"
+                    .into(),
+            )
+        };
+    };
+    let expected =
+        fs::canonicalize(expected_extension).unwrap_or_else(|_| expected_extension.to_path_buf());
+    let actual = fs::canonicalize(&module.path).unwrap_or_else(|_| module.path.clone());
+    if actual != expected {
+        return Ok(MacosFsKitExtensionStatus::StaleRegistration);
+    }
+    Ok(if module.enabled {
+        MacosFsKitExtensionStatus::Enabled
+    } else {
+        MacosFsKitExtensionStatus::Disabled
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1051,6 +1136,53 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("exited with 1"));
         assert!(error.contains("connection invalid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_fskit_status_requires_exact_available_enabled_module() {
+        let expected = Path::new(
+            "/Applications/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex",
+        );
+        let module = serde_json::json!({
+            "bundle_id": "ai.metricspace.greppy.workspacefs.extension",
+            "path": expected,
+            "enabled": true,
+        });
+        let evaluate = |modules| {
+            parse_native_fskit_status(
+                &serde_json::to_vec(
+                    &serde_json::json!({"schema": "greppy.fskit-status.v1", "modules": modules}),
+                )
+                .unwrap(),
+                expected,
+            )
+        };
+        assert_eq!(
+            evaluate(vec![module.clone()]).unwrap(),
+            MacosFsKitExtensionStatus::Enabled
+        );
+        assert_eq!(
+            evaluate(Vec::<serde_json::Value>::new()).unwrap(),
+            MacosFsKitExtensionStatus::UnavailableToFsKit
+        );
+        let mut disabled = module.clone();
+        disabled["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            evaluate(vec![disabled]).unwrap(),
+            MacosFsKitExtensionStatus::Disabled
+        );
+        let mut wrong_bundle = module.clone();
+        wrong_bundle["path"] = serde_json::json!("/Old/GreppyWorkspaceFS.appex");
+        assert_eq!(
+            evaluate(vec![wrong_bundle]).unwrap(),
+            MacosFsKitExtensionStatus::StaleRegistration
+        );
+        assert!(evaluate(vec![module.clone(), module]).is_err());
+        assert!(parse_native_fskit_status(b"{}", expected).is_err());
+        assert!(
+            parse_native_fskit_status(br#"{"schema":"unknown","modules":[]}"#, expected).is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]

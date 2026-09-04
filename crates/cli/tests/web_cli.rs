@@ -362,6 +362,14 @@ fn web_fixture_url_env_is_not_a_production_path() {
 
 #[test]
 fn web_status_resolves_packaged_dist_env() {
+    let runtime_root = tempfile::Builder::new()
+        .prefix("g-diag-")
+        .tempdir_in(if cfg!(unix) {
+            std::path::Path::new("/tmp")
+        } else {
+            std::path::Path::new(".")
+        })
+        .unwrap();
     let pid = std::process::id();
     let dist = std::env::temp_dir().join(format!("greppy-web-dist-cli-{pid}"));
     let _ = std::fs::remove_dir_all(&dist);
@@ -372,7 +380,11 @@ fn web_status_resolves_packaged_dist_env() {
     )
     .unwrap();
     let dummy = dist.join("bin").join("web-runtime");
-    std::fs::write(&dummy, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::write(
+        &dummy,
+        "#!/bin/sh\necho 'fixture worker initialization failed' >&2\nexit 1\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -385,6 +397,8 @@ fn web_status_resolves_packaged_dist_env() {
         .env_remove("GREPPY_WEB_RUNTIME")
         .env_remove("GREPPY_WEB_FIXTURE_URL")
         .env("GREPPY_WEB_RUNTIME_DIST", &dist)
+        .env("GREPPY_RUNTIME_DIR", runtime_root.path())
+        .env_remove("GREPPY_WEB_RUNTIME_DIR")
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -452,6 +466,30 @@ fn web_status_resolves_packaged_dist_env() {
             || stdout.contains("greppy.web-runtime.v1"),
         "expected a spawn/runtime failure against the dummy dist, stdout={stdout} stderr={stderr}"
     );
+    #[cfg(unix)]
+    {
+        assert!(stdout.contains("startup stderr retained at"), "{stdout}");
+        assert!(stdout.contains("exit status: 1"), "{stdout}");
+        let logs: Vec<_> = std::fs::read_dir(runtime_root.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("web-startup-")
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "failed startup needs one inspectable log");
+        assert!(std::fs::read_to_string(logs[0].path())
+            .unwrap()
+            .contains("fixture worker initialization failed"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            logs[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]

@@ -151,16 +151,36 @@ backend. The policy proxy also admits at most 32 concurrent connections per
 content worker and 128 per process, rejecting excess connections before an OS
 thread is allocated.
 
+### Release-candidate corrections
+
+- Agent browser directories no longer split shared inference endpoints and
+  model-owner locks. Read-confined clients can resolve an existing private
+  daemon directory without trying to change its permissions.
+- A symlinked CLI resolves its bundled Web runtime beside the actual executable,
+  not beside a launcher that may still have an older runtime installed.
+- Failed Web starts retain private stderr diagnostics and report the selected
+  executable and child exit status (or readiness deadline), rather than only
+  reporting a missing socket.
+- The browser prompt now uses `session create`, `script save --file` and
+  `dom html`. It distinguishes successful action dispatch from verified page
+  state. Regression tests check nested command paths, not only top-level verbs.
+
+These corrections do not replace the required real-device, parallel-agent or
+exact-SHA release gates.
+
 ### Known limits
 
 1. **macOS requires an approved file-system extension.** `greppy workspace
    setup`, and therefore `greppy -p`, require the “Greppy Workspace FS” system
    extension to be enabled once under System Settings › General › Login Items
    & Extensions › File System Extensions. Replacing or updating the app bundle
-   makes macOS request approval again. `workspace setup` detects this before
-   mounting, opens the settings page, and fails closed; after enabling the
-   switch, rerun the command. The mount, `workspace doctor`, and `workspace
-   status` have been verified on macOS 26.2 with the notarized application.
+   can require approval again. `workspace setup` detects missing or stale
+   registration before mounting and opens the settings page. A checked switch
+   or an enabled `pluginkit` record alone is not proof of readiness: the actual
+   mount must succeed and `workspace doctor --json` must report healthy. If
+   macOS still reports the module disabled, retain that diagnostic rather than
+   repeatedly replacing the app. Earlier notarized builds were mounted on
+   macOS 26.2; each final release bundle still needs its own device acceptance.
 
 2. **Windows packaging waits for Microsoft driver approval.** The private
    WinFsp fork requires an HLK-tested, Hardware-Dev-Center-signed driver and

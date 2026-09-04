@@ -16,6 +16,7 @@ const CRASH_COOLDOWN: Duration = Duration::from_secs(2);
 const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
 const ENV_RUNTIME_DIR: &str = "GREPPY_RUNTIME_DIR";
+const ENV_WEB_RUNTIME_DIR: &str = "GREPPY_WEB_RUNTIME_DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOutcome<T> {
@@ -94,7 +95,29 @@ struct RuntimeScope {
 
 impl RuntimeScope {
     fn from_env() -> Self {
-        let explicit_runtime = env_absolute_path(ENV_RUNTIME_DIR);
+        Self::for_kind("embedding")
+    }
+
+    fn for_kind(kind: &str) -> Self {
+        Self::from_roots(
+            kind,
+            env_absolute_path(ENV_RUNTIME_DIR),
+            env_absolute_path(ENV_WEB_RUNTIME_DIR),
+        )
+    }
+
+    fn from_roots(
+        kind: &str,
+        shared: Option<std::path::PathBuf>,
+        browser: Option<std::path::PathBuf>,
+    ) -> Self {
+        // Browser isolation must never create another model owner. The legacy
+        // runtime override still isolates an entire explicit test harness.
+        let explicit_runtime = if kind == "web-runtime" {
+            browser.or(shared)
+        } else {
+            shared
+        };
         let identity = explicit_runtime
             .as_ref()
             .map(|path| runtime_identity(b"runtime-dir\0", path));
@@ -197,7 +220,7 @@ pub(super) struct Endpoint {
 
 impl Endpoint {
     pub(super) fn for_identity(kind: &'static str, identity: &str) -> Option<Self> {
-        let runtime = RuntimeScope::from_env();
+        let runtime = RuntimeScope::for_kind(kind);
         let digest = endpoint_digest(kind, identity, runtime.identity.as_deref());
         #[cfg(unix)]
         let address = {
@@ -1451,7 +1474,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(unix)]
 fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    std::fs::create_dir_all(path)?;
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::new(
@@ -1459,7 +1484,11 @@ fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
             "daemon runtime directory is not an owned directory",
         ));
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    // Clients in a write-confined sandbox may connect to an existing shared
+    // daemon. Do not require a chmod merely to resolve its endpoint.
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
     let secured = std::fs::symlink_metadata(path)?;
     if secured.permissions().mode() & 0o077 != 0 {
         return Err(std::io::Error::new(
@@ -2008,6 +2037,107 @@ mod tests {
             legacy,
             endpoint_digest("summary", "model|prompt|cpu", None),
             "workspace/store selection must not split the machine daemon"
+        );
+    }
+
+    #[test]
+    fn private_browser_roots_do_not_split_inference_ownership() {
+        for kind in ["embedding", "summary"] {
+            for shared in [None, Some(std::path::PathBuf::from("/tmp/release-harness"))] {
+                let a = RuntimeScope::from_roots(
+                    kind,
+                    shared.clone(),
+                    Some("/tmp/greppy-agent-a".into()),
+                );
+                let b = RuntimeScope::from_roots(kind, shared, Some("/tmp/greppy-agent-b".into()));
+                assert_eq!(a.identity, b.identity);
+                assert_eq!(a.state_dir, b.state_dir, "model locks must be shared");
+                assert_eq!(
+                    endpoint_digest(kind, "same-model|cpu", a.identity.as_deref()),
+                    endpoint_digest(kind, "same-model|cpu", b.identity.as_deref()),
+                );
+            }
+        }
+        let a = RuntimeScope::from_roots("web-runtime", None, Some("/tmp/browser-a".into()));
+        let b = RuntimeScope::from_roots("web-runtime", None, Some("/tmp/browser-b".into()));
+        assert_ne!(a.identity, b.identity);
+        assert_ne!(a.state_dir, b.state_dir);
+    }
+
+    #[test]
+    fn separate_agent_processes_contend_for_the_same_model_owner() {
+        const CHILD: &str = "GREPPY_TEST_SHARED_OWNER_CHILD";
+        const TEST: &str =
+            "inference_daemon::tests::separate_agent_processes_contend_for_the_same_model_owner";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = RuntimeScope::from_env();
+            let lock = greppy_core::cache::acquire_named_lock_in(
+                &runtime.state_dir,
+                "inference-embedding-cpu.owner",
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            )
+            .unwrap();
+            assert!(
+                lock.is_none(),
+                "private browser root bypassed the shared owner"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("daemon-state");
+        let _owner = greppy_core::cache::acquire_named_lock_in(
+            &state,
+            "inference-embedding-cpu.owner",
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        for agent in ["first-agent", "second-agent"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ENV_RUNTIME_DIR, temp.path())
+                .env(ENV_WEB_RUNTIME_DIR, temp.path().join(agent))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{agent}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_client_can_resolve_an_existing_shared_endpoint_without_writes() {
+        const CHILD: &str = "GREPPY_TEST_READ_ONLY_ENDPOINT_CHILD";
+        const TEST: &str = "inference_daemon::tests::sandboxed_client_can_resolve_an_existing_shared_endpoint_without_writes";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(Endpoint::for_identity("embedding", "same-model|cpu").is_some());
+            return;
+        }
+        let temp = tempfile::Builder::new()
+            .prefix("g-endpoint-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        ensure_private_dir(temp.path()).unwrap();
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)(deny file-write*)"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ENV_RUNTIME_DIR, temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "read-only endpoint resolution failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

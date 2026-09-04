@@ -452,6 +452,7 @@ pub(super) fn screenshot(
 
 pub(super) fn artifact_store_root(run_id: &str) -> PathBuf {
     let base = std::env::var("GREPPY_STORE_DIR")
+        .or_else(|_| std::env::var("GREPPY_WEB_RUNTIME_DIR"))
         .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"));
@@ -785,7 +786,31 @@ pub(super) fn ensure_supervisor(
         let issued_for_child = capability.clone();
         let mut attach_pass = None;
         let mut attach_error = None;
+        let mut startup_log = None;
+        let mut spawn_error = None;
         let spawned = crate::inference_daemon::spawn_once(&endpoint, || {
+            // A regular private file cannot backpressure a worker like an
+            // inherited stderr pipe. Retain it only on failure; its path makes
+            // engine startup errors inspectable instead of discarding them.
+            let log = match tempfile::Builder::new()
+                .prefix("web-startup-")
+                .suffix(".log")
+                .tempfile_in(socket.parent()?)
+            {
+                Ok(log) => log,
+                Err(error) => {
+                    spawn_error = Some(format!("cannot create private startup log: {error}"));
+                    return None;
+                }
+            };
+            let stderr = match log.reopen() {
+                Ok(file) => file,
+                Err(error) => {
+                    spawn_error = Some(format!("cannot open private startup log: {error}"));
+                    return None;
+                }
+            };
+            startup_log = Some(log);
             let mut command = ProcessCommand::new(&executable);
             command
                 .arg("--socket")
@@ -804,7 +829,7 @@ pub(super) fn ensure_supervisor(
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stderr(Stdio::from(stderr));
             crate::inference_daemon::detach_command(&mut command);
             match crate::web_attach::give_child_attach_token(&mut command, &issued_for_child) {
                 Ok(pass) => attach_pass = Some(pass),
@@ -818,7 +843,10 @@ pub(super) fn ensure_supervisor(
                     *spawned_child.borrow_mut() = Some(child);
                     Some(())
                 }
-                Err(_) => None,
+                Err(error) => {
+                    spawn_error = Some(error.to_string());
+                    None
+                }
             }
         });
         drop(attach_pass);
@@ -838,11 +866,18 @@ pub(super) fn ensure_supervisor(
             }
             crate::inference_daemon::SpawnOutcome::SpawnFailed => {
                 crate::inference_daemon::record_spawn_failure(&endpoint, true);
-                return Err(unavailable("failed to spawn web-runtime"));
+                return Err(unavailable(&format!(
+                    "failed to spawn web-runtime {}: {}",
+                    executable.display(),
+                    spawn_error
+                        .as_deref()
+                        .unwrap_or("spawn coordination failed")
+                )));
             }
         }
         let started = Instant::now();
         let budget = Duration::from_secs(60);
+        let mut startup_exit = None;
         loop {
             if socket_is_live(&socket, &run_id, &capability) {
                 return Ok(SupervisorCtx {
@@ -857,7 +892,14 @@ pub(super) fn ensure_supervisor(
             if started.elapsed() >= Duration::from_secs(1) {
                 if let Some(child) = spawned_child.borrow_mut().as_mut() {
                     match child.try_wait() {
-                        Ok(Some(_)) | Err(_) => break,
+                        Ok(Some(status)) => {
+                            startup_exit = Some(status.to_string());
+                            break;
+                        }
+                        Err(error) => {
+                            startup_exit = Some(format!("cannot inspect child: {error}"));
+                            break;
+                        }
                         Ok(None) => {}
                     }
                 }
@@ -868,7 +910,16 @@ pub(super) fn ensure_supervisor(
             reap_detached_runtime(&mut child, &socket, &run_id, &capability);
         }
         crate::inference_daemon::record_spawn_failure(&endpoint, spawned.attempted());
-        Err(unavailable("web-runtime did not create its socket"))
+        let retained_log = startup_log.and_then(|log| log.keep().ok().map(|(_, path)| path));
+        Err(unavailable(&format!(
+            "web-runtime did not create its socket; executable: {}; {}; {}",
+            executable.display(),
+            startup_exit.unwrap_or_else(|| "startup readiness deadline exceeded".to_owned()),
+            retained_log.map_or_else(
+                || "no startup log available; run greppy web doctor to inspect the installed bundle".to_owned(),
+                |path| format!("startup stderr retained at {}; inspect this log before retrying", path.display()),
+            )
+        )))
     }
 }
 
@@ -1124,22 +1175,61 @@ pub(super) fn resolve_runtime() -> std::result::Result<ResolvedRuntime, ErrorObj
             .ok_or_else(|| unavailable("GREPPY_WEB_RUNTIME is not a usable executable"));
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling_dist = dir.join("web-runtime");
-            if sibling_dist.join(".greppy-web-runtime-dist").is_file() {
-                return images_from_dist(&sibling_dist);
-            }
-            if let Some(runtime) = runtime_from_file(&dir.join(runtime_executable_name()), None) {
-                return Ok(runtime);
-            }
-            if exe.file_name().is_some_and(|name| name == "web-runtime") {
-                if let Some(runtime) = runtime_from_file(&exe, None) {
-                    return Ok(runtime);
-                }
-            }
+        if let Some(runtime) = resolve_bundled_runtime(&exe) {
+            return runtime;
         }
     }
     images_from_path_env().ok_or_else(|| unavailable("web-runtime distributable is not installed"))
+}
+
+fn resolve_bundled_runtime(
+    exe: &Path,
+) -> Option<std::result::Result<ResolvedRuntime, ErrorObject>> {
+    // On macOS current_exe may retain the launcher symlink. Resolve the CLI
+    // before finding its siblings, otherwise an old ~/.local/bin/web-runtime
+    // silently overrides the runtime shipped inside the current signed app.
+    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let dir = exe.parent()?;
+    let sibling_dist = dir.join("web-runtime");
+    if sibling_dist.join(".greppy-web-runtime-dist").is_file() {
+        return Some(images_from_dist(&sibling_dist));
+    }
+    if let Some(runtime) = runtime_from_file(&dir.join(runtime_executable_name()), None) {
+        return Some(Ok(runtime));
+    }
+    if exe.file_name().is_some_and(|name| name == "web-runtime") {
+        return runtime_from_file(&exe, None).map(Ok);
+    }
+    None
+}
+
+#[cfg(all(test, unix))]
+mod installation_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_symlink_uses_the_target_bundle_not_a_stale_launcher_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let app_bin = root
+            .path()
+            .join("GreppyWorkspaceFS.app/Contents/Resources/bin");
+        let launcher_bin = root.path().join("local/bin");
+        for bin in [&app_bin, &launcher_bin] {
+            let dist = bin.join("web-runtime");
+            std::fs::create_dir_all(dist.join("bin")).unwrap();
+            std::fs::write(dist.join(".greppy-web-runtime-dist"), b"package\n").unwrap();
+            std::fs::write(dist.join("bin/web-runtime"), b"runtime\n").unwrap();
+        }
+        std::fs::write(app_bin.join("greppy"), b"cli\n").unwrap();
+        std::os::unix::fs::symlink(app_bin.join("greppy"), launcher_bin.join("greppy")).unwrap();
+        let resolved = resolve_bundled_runtime(&launcher_bin.join("greppy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.dist.unwrap(),
+            app_bin.canonicalize().unwrap().join("web-runtime")
+        );
+    }
 }
 
 pub(super) fn images_from_dist(

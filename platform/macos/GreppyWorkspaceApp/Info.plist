@@ -16,6 +16,8 @@
     <string>0.4.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>GreppyFSKitStatusProtocolVersion</key>
+    <integer>1</integer>
     <key>LSMinimumSystemVersion</key>
     <string>15.4</string>
     <key>LSUIElement</key>
