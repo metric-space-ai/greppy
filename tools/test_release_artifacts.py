@@ -803,6 +803,9 @@ class ReleaseArtifactTests(unittest.TestCase):
             self.assertNotRegex(probe, r'\$BIN[^\n]*\bsemantic-search\b')
             self.assertIn(" search --json ", probe)
 
+        self.assertIn('"$BIN" web status --json', unix_smoke)
+        self.assertIn(".result.process_health.healthy == true", unix_smoke)
+
 
 if __name__ == "__main__":
     unittest.main()
