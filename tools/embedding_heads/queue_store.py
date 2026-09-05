@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from contracts import RUBRIC_VERSION, canonical, digest, sanitized_example, validate_annotations
+from contracts import RUBRIC_VERSION, canonical, digest, sanitized_example, validate_annotations, prompt_for, teacher_configuration, response_schema
 
 
 class QueueStore:
@@ -32,6 +32,10 @@ class QueueStore:
                 CREATE TABLE IF NOT EXISTS groups (
                   group_key TEXT PRIMARY KEY, split TEXT NOT NULL);
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            for column, default in [('configuration','{}'),('prompt',''),('output_schema','{}')]:
+                if column not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
 
     @contextmanager
     def connect(self):
@@ -69,8 +73,10 @@ class QueueStore:
         now = time.time() if now is None else now
         payload = [sanitized_example(x) for x in examples]
         # Version binds prompt as well as label rules; changing either creates new jobs.
-        from contracts import RUBRIC
-        key = digest({'provider':provider,'model':model,'rubric':rubric,'rules':RUBRIC,'examples':payload})
+        configuration = teacher_configuration(provider)
+        prompt = prompt_for(payload); schema = response_schema(payload)
+        key = digest({'provider':provider,'model':model,'rubric':rubric,
+                      'prompt_sha256':digest(prompt), 'configuration':configuration})
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             for x in examples:
@@ -79,8 +85,16 @@ class QueueStore:
                     raise ValueError('source must be registered with matching split before enqueue')
                 if x.get('privacy_review') not in ('public-redacted','synthetic'):
                     raise ValueError('external annotation requires explicit privacy admission')
-            db.execute('INSERT OR IGNORE INTO jobs(id,provider,model,rubric,payload,status,created_at) VALUES(?,?,?,?,?,?,?)',
-                       (key,provider,model,rubric,canonical(payload),'queued',now))
+            db.execute('INSERT OR IGNORE INTO jobs(id,provider,model,rubric,payload,status,created_at,configuration,prompt,output_schema) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (key,provider,model,rubric,canonical(payload),'queued',now,canonical(configuration),prompt,canonical(schema)))
+            # Exact cache-key equality proves this reconstructed prompt/configuration
+            # matches an older job. Preserve its result and never dispatch it again.
+            old = db.execute('SELECT prompt,output_schema FROM jobs WHERE id=?',(key,)).fetchone()
+            if old['prompt'] == '':
+                db.execute('UPDATE jobs SET prompt=?,output_schema=? WHERE id=?',(prompt,canonical(schema),key))
+                self.event(db,key,'binding_recovered_from_exact_cache_key',{},now)
+            elif old['prompt'] != prompt or old['output_schema'] != canonical(schema):
+                raise ValueError('stored job binding does not match cache key')
         return key
 
     def claim(self, provider, *, lease_seconds=900, now=None):
@@ -103,6 +117,8 @@ class QueueStore:
             self.event(db,row['id'],'started',{'attempt':row['attempts']+1},now)
             job = dict(row); job.update(owner=owner,attempts=row['attempts']+1)
             job['examples'] = json.loads(job.pop('payload'))
+            job['configuration'] = json.loads(job['configuration'])
+            job['output_schema'] = json.loads(job['output_schema'])
             return job
 
     def complete(self, job, result, usage=None, now=None):
@@ -117,7 +133,7 @@ class QueueStore:
                        (canonical(result),now,job['id']))
             self.event(db,job['id'],'completed',{'result_sha256':digest(result),'usage':usage or {}},now)
 
-    def fail(self, job, kind, *, retry_after=None, now=None):
+    def fail(self, job, kind, *, retry_after=None, now=None, diagnostic=None, usage=None):
         if kind not in ('quota','auth','transient','schema','permanent','uncertain'):
             raise ValueError('unknown failure kind')
         now = time.time() if now is None else now
@@ -134,13 +150,14 @@ class QueueStore:
                 db.execute('INSERT INTO providers VALUES(?,?,?) ON CONFLICT(provider) DO UPDATE SET paused_until=max(providers.paused_until,excluded.paused_until),reason=excluded.reason',
                            (job['provider'],until,kind))
                 status = 'queued'; available = until
-            elif kind in ('transient','schema') and retries < 3:
+            elif kind == 'transient' and retries < 3:
                 retries += 1; status = 'queued'; available = now+min(60,2**retries)
             else:
                 status = 'uncertain' if kind == 'uncertain' else 'failed'
             db.execute('UPDATE jobs SET status=?,retry_count=?,available_at=?,owner=NULL,lease_until=NULL,error_code=? WHERE id=?',
                        (status,retries,available,kind,job['id']))
-            self.event(db,job['id'],kind,{'retry_count':retries,'status':status,'available_at':available},now)
+            self.event(db,job['id'],kind,{'retry_count':retries,'status':status,'available_at':available,
+                       'diagnostic':diagnostic,'usage':usage or {}},now)
 
     def resume_provider(self, provider):
         with self.connect() as db:

@@ -34,19 +34,40 @@ and irreplaceable results belong on durable storage.
 
 Quota pauses the entire provider and resumes after Retry-After (30 minutes when
 unavailable). Authentication pauses until `resume-provider PROVIDER` is explicitly
-called after recovery. Transient/schema errors allow at most three retries.
+called after recovery. Transient provider errors allow at most three retries.
+Invalid annotation/schema responses fail immediately for explicit review; repeating
+an idempotent request is not a repair for an invalid result. Each new job stores its
+exact prompt and output schema, and adapters verify the bound request before dispatch.
 Expired worker leases become `uncertain`, never automatically replayed: a request
 may already have completed. A completed job is immutable and not reenqueued when
-restarting. Changing input, rubric or provider/model creates a different cache key.
+restarting. Changing input, the full prompt/schema, rubric, provider/model or bound
+call configuration creates a different cache key. Legacy jobs remain stored; jobs
+without a bound configuration cannot dispatch through the new adapters.
 
 A worker exiting zero means it completed its processing loop, not that labels
 passed semantic review. Inspect persisted statuses; queued, failed or uncertain
-jobs are not admissible training data. The independent audit/admission stage and
-large corpus import are still under implementation.
+jobs are not admissible training data. `admission.py` compares blind teacher jobs
+and requires matching independent evidence receipts; conflicts and missing evidence
+are held. A receipt must itself be verified against its referenced artifact. This
+review report does not certify production readiness or automatically export labels.
+
+`corpus.py` partitions log lines into byte-exact target spans, preserves full
+context, and joins content/template/lineage relations before assigning splits.
+Frozen split conflicts fail closed; existing source-group IDs survive extensions.
+Oversized full contexts are held rather than truncated. `catalog_archive.py`
+creates a source-offset/hash inventory without exporting private trace metadata.
+Archive presence alone does not establish capture completeness or privacy admission.
+
+`web_records.py` preserves the actual typed observation, including unknown fields
+and absent state. Explicit goal/version and last action are required. Source record
+IDs stay independent of goal versions; example IDs invalidate goal-dependent work.
+`prepare_observations.py` checks source checksums and creates reviewable candidate
+JSONL from an explicitly authored manifest. These are training preparation helpers;
+the product session-goal API and runtime head integration are still outstanding.
 
 ## Verification to date
 
-- 21 Python tests cover coverage, evidence integrity, blind prompts, common
+- 45 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
   secret redaction, restart idempotency, concurrent claims, bounded retries,
   quota/auth pauses, worker expiry and split leakage refusal.
 - Live synthetic smoke: one M3 batch and one independently judged Grok batch,

@@ -18,11 +18,18 @@ def work_one(store, provider):
         store.complete(job,response,usage)
         print(canonical({'job':job['id'],'provider':provider,'status':'done','usage':usage}),flush=True)
     except ProviderFailure as error:
-        store.fail(job,error.kind,retry_after=error.retry_after)
-        print(canonical({'job':job['id'],'provider':provider,'status':error.kind}),flush=True)
-    except (ValueError,TypeError,KeyError):
-        store.fail(job,'schema')
-        print(canonical({'job':job['id'],'provider':provider,'status':'schema'}),flush=True)
+        store.fail(job,error.kind,retry_after=error.retry_after,diagnostic=error.diagnostic,usage=error.usage)
+        print(canonical({'job':job['id'],'provider':provider,'status':error.kind,'diagnostic':error.diagnostic}),flush=True)
+    except (ValueError,TypeError,KeyError) as error:
+        # Validator messages are a fixed allowlist; never print rejected source/model text.
+        known = {'unexpected or duplicate annotation ID','incomplete annotation coverage',
+                 'invented or duplicate evidence','invalid annotation fields','invalid observable reason',
+                 'Web severity must be null','invalid log severity','invalid relevance',
+                 'evidence must be nonempty source IDs','ambiguous must be boolean',
+                 'response must contain only annotations array','annotation IDs must be strings'}
+        diagnostic = str(error) if str(error) in known else 'invalid_response_shape'
+        store.fail(job,'schema',diagnostic=diagnostic,usage=locals().get('usage',{}))
+        print(canonical({'job':job['id'],'provider':provider,'status':'schema','diagnostic':diagnostic}),flush=True)
     return True
 
 

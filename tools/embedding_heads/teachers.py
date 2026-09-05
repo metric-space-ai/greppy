@@ -8,13 +8,29 @@ import tempfile
 import urllib.error
 import urllib.request
 
-from contracts import canonical, prompt_for, response_schema
+from contracts import canonical, prompt_for, response_schema, strict_json, teacher_configuration
 
 
 class ProviderFailure(Exception):
-    def __init__(self, kind, retry_after=None):
+    def __init__(self, kind, retry_after=None, *, diagnostic=None, usage=None):
         super().__init__(kind)
         self.kind, self.retry_after = kind, retry_after
+        self.diagnostic, self.usage = diagnostic, usage or {}
+
+
+def bound_prompt(job):
+    """Dispatch exactly the stored request even if preparation code changed."""
+    from contracts import digest
+    prompt = job.get('prompt')
+    schema = job.get('output_schema')
+    if not isinstance(prompt,str) or not prompt or not isinstance(schema,dict):
+        raise ProviderFailure('permanent',diagnostic='job_binding_missing')
+    expected = digest({'provider':job['provider'],'model':job['model'],'rubric':job['rubric'],
+                       'prompt_sha256':digest(prompt),'configuration':job['configuration']})
+    marker = '\nOUTPUT_SCHEMA\n'+canonical(schema)+'\nUNTRUSTED_EXAMPLES_JSON\n'
+    if expected != job['id'] or marker not in prompt:
+        raise ProviderFailure('permanent',diagnostic='job_binding_invalid')
+    return prompt
 
 
 def safe_usage(value):
@@ -40,19 +56,24 @@ def visible_response_text(value):
 
 
 def minimax(job):
+    configuration = job.get('configuration')
+    if configuration != teacher_configuration('minimax'):
+        raise ProviderFailure('permanent')
     key = os.environ.get('MINIMAX_API_KEY')
     if not key:
         raise ProviderFailure('auth')
-    body = {'model':job['model'],'input':[{'role':'user','content':prompt_for(job['examples'])}],
-            'max_output_tokens':16384, 'store':False}
-    request = urllib.request.Request('https://api.minimax.io/v1/responses', data=canonical(body).encode(),
+    body = {'model':job['model'],'input':[{'role':'user','content':bound_prompt(job)}],
+            'max_output_tokens':configuration['max_output_tokens'], 'store':configuration['store']}
+    request = urllib.request.Request(configuration['endpoint'], data=canonical(body).encode(),
         headers={'Authorization':'Bearer '+key,'Content-Type':'application/json','Idempotency-Key':job['id']})
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
             raw = response.read(8*1024*1024+1)
         if len(raw)>8*1024*1024:
             raise ProviderFailure('schema')
-        value = json.loads(raw)
+        value = strict_json(raw)
+        if not isinstance(value,dict):
+            raise ProviderFailure('schema',diagnostic='provider_envelope_not_object')
     except urllib.error.HTTPError as error:
         if error.code in (401,403):
             raise ProviderFailure('auth') from None
@@ -66,18 +87,21 @@ def minimax(job):
         # Delivery/completion is unknown; do not silently replay a possibly completed request.
         raise ProviderFailure('uncertain') from None
     if value.get('status') in ('incomplete','failed') or value.get('error'):
-        code = str((value.get('error') or {}).get('code','')).lower()
+        failure = value.get('error')
+        code = str(failure.get('code','') if isinstance(failure,dict) else failure or '').lower()
         if 'quota' in code or 'rate' in code:
             raise ProviderFailure('quota')
-        raise ProviderFailure('schema')
+        raise ProviderFailure('schema',diagnostic='provider_incomplete_or_failed',usage=safe_usage(value.get('usage')))
     try:
-        annotations = json.loads(visible_response_text(value))
+        annotations = strict_json(visible_response_text(value))
     except (ValueError,TypeError):
-        raise ProviderFailure('schema') from None
+        raise ProviderFailure('schema',diagnostic='visible_annotation_json_invalid',usage=safe_usage(value.get('usage'))) from None
     return annotations, safe_usage(value.get('usage'))
 
 
 def grok(job, *, executable=None, workdir=None):
+    if job.get('configuration') != teacher_configuration('grok'):
+        raise ProviderFailure('permanent')
     executable = executable or os.environ.get('GROK_BIN', str(Path.home()/'.grok/bin/grok'))
     if sys.platform == 'darwin':
         if not Path('/Volumes/tmp').is_mount():
@@ -90,9 +114,9 @@ def grok(job, *, executable=None, workdir=None):
     # Isolated cwd prevents repository instructions, side inputs and previous sessions
     # from contaminating a blind annotation. No tools or subagents are enabled.
     with tempfile.TemporaryDirectory(prefix='grok-head-audit-',dir=workdir) as temp:
-        prompt = Path(temp)/'prompt.txt'; prompt.write_text(prompt_for(job['examples']),encoding='utf-8')
+        prompt = Path(temp)/'prompt.txt'; prompt.write_text(bound_prompt(job),encoding='utf-8')
         argv = [executable,'--model',job['model'],'--prompt-file',str(prompt),
-                '--json-schema',canonical(response_schema(job['examples'])),
+                '--json-schema',canonical(job['output_schema']),
                 '--output-format','json','--max-turns','1','--no-subagents',
                 '--disable-web-search','--tools','','--verbatim','--cwd',temp]
         try:
@@ -110,7 +134,7 @@ def grok(job, *, executable=None, workdir=None):
             raise ProviderFailure('transient')
         if len(result.stdout)>8*1024*1024:
             raise ProviderFailure('schema')
-        try: value = json.loads(result.stdout)
+        try: value = strict_json(result.stdout)
         except ValueError: raise ProviderFailure('schema') from None
         if isinstance(value,dict) and set(value)=={'annotations'}:
             return value, {}
@@ -118,7 +142,7 @@ def grok(job, *, executable=None, workdir=None):
         for name in ('structuredOutput','structured_output','result','text'):
             content = value.get(name) if isinstance(value,dict) else None
             if isinstance(content,str):
-                try: content = json.loads(content)
+                try: content = strict_json(content)
                 except ValueError: continue
             if isinstance(content,dict) and set(content)=={'annotations'}:
                 return content, safe_usage(value.get('usage'))

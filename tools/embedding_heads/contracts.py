@@ -63,8 +63,9 @@ def validate_example(example):
 
 def response_schema(examples):
     # Conditional ID/evidence membership and exact coverage are checked independently.
+    count = sum(len(example['records']) for example in examples)
     return {'type': 'object', 'additionalProperties': False, 'required': ['annotations'],
-            'properties': {'annotations': {'type': 'array', 'items': {
+            'properties': {'annotations': {'type': 'array', 'minItems': count, 'maxItems': count, 'items': {
                 'type': 'object', 'additionalProperties': False,
                 'required': ['example_id', 'record_id', 'severity', 'relevance', 'evidence_ids', 'reason', 'ambiguous'],
                 'properties': {
@@ -125,7 +126,11 @@ def validate_annotations(result, examples):
 def prompt_for(examples):
     for example in examples:
         validate_example(example)
-    return RUBRIC + '\nOUTPUT_SCHEMA\n' + canonical(response_schema(examples)) + '\nUNTRUSTED_EXAMPLES_JSON\n' + canonical(examples)
+    coverage = [{'example_id':x['id'], 'target_ids':[r['id'] for r in x['records']]} for x in examples]
+    return (RUBRIC + '\nReturn an annotation for EVERY target ID below, including irrelevant and protected records. '
+            'Do not omit targets that also appear as context in another example.\nTARGET_COVERAGE\n'
+            + canonical(coverage) + '\nOUTPUT_SCHEMA\n' + canonical(response_schema(examples))
+            + '\nUNTRUSTED_EXAMPLES_JSON\n' + canonical(examples))
 
 
 REDACTIONS = [
@@ -162,3 +167,36 @@ def sanitized_example(example):
         out['last_action'], n = redact_text(str(example['last_action'])); count += n
     out['redaction_count'] = count
     return out
+
+
+def strict_json(raw):
+    """Reject duplicate object keys and non-finite numbers before schema validation."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate JSON object key')
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError('non-finite JSON number')
+    def finite_float(value):
+        import math
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError('non-finite JSON number')
+        return number
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid_constant, parse_float=finite_float)
+
+
+
+def teacher_configuration(provider):
+    if provider == 'minimax':
+        return {'adapter_version': 2, 'endpoint': 'https://api.minimax.io/v1/responses',
+                'max_output_tokens': 16384, 'store': False,
+                'sampling': 'provider-default'}
+    if provider == 'grok':
+        return {'adapter_version': 2, 'max_turns': 1, 'tools': [],
+                'subagents': False, 'web_search': False, 'verbatim': True,
+                'sampling': 'provider-default'}
+    raise ValueError('unknown teacher provider')
