@@ -33,7 +33,7 @@ class Page(BaseHTTPRequestHandler):
         pass
 
 
-def run(cli, runtime, scratch, evidence):
+def run(cli, runtime, scratch, evidence, backend='native'):
     evidence.mkdir(parents=True, exist_ok=False)
     aliases = scratch / 'aliases'
     aliases.mkdir(parents=True)
@@ -44,7 +44,7 @@ def run(cli, runtime, scratch, evidence):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     calls, checks = [], []
-    terminal = dict(schema='greppy.native-wait-cli-proof.v1', passed=False,
+    terminal = dict(schema='greppy.native-wait-cli-proof.v1', passed=False, backend=backend,
                     efficiency_acceptance=False, checks=checks)
 
     def call(*args, expected=0):
@@ -67,8 +67,21 @@ def run(cli, runtime, scratch, evidence):
         return reply
 
     def check(name, condition):
-        assert condition, name
-        checks.append(name)
+        if condition:
+            checks.append(name)
+        else:
+            terminal.setdefault('failed_checks', []).append(name)
+
+    def wait(*args, expected=0):
+        switches = ['--native'] if backend == 'native' else []
+        reply = call('wait', *args, *switches, expected=expected)
+        if expected in (0, 13):
+            assert reply['result']['held'] is (expected == 0), reply
+            if backend == 'native':
+                assert reply['result']['wait_backend'] == 'native_v1', reply
+                if expected == 13:
+                    assert reply['error']['code'] == 'TIMEOUT', reply
+        return reply
 
     try:
         call('open', f'http://127.0.0.1:{server.server_port}/')
@@ -81,40 +94,41 @@ def run(cli, runtime, scratch, evidence):
         check('initial Observe has usable option values', len(choices) == 1 and
               choices[0]['select_choices']['choices'][1]['value'] == 'ascending')
         inspected = call('inspect', 'css=#order')['result']['value']['node']
-        check('compiled native Inspect shares choices', inspected['select_choices']['choices'][1]['value'] == 'ascending')
-        timeout = call('wait', 'css=#late', '--native', '--timeout', '80', expected=13)
-        check('native timeout keeps typed error and false verdict', timeout['error']['code'] == 'TIMEOUT' and
-              timeout['result']['held'] is False and timeout['result']['wait_backend'] == 'native_v1')
+        inspect_choices = inspected.get('select_choices', {}).get('choices', [])
+        terminal['inspect_choices_present'] = any(option.get('value') == 'ascending' for option in inspect_choices)
+        if backend == 'native':
+            check('compiled Inspect shares choices', terminal['inspect_choices_present'])
+        timeout = wait('css=#late', '--timeout', '80', expected=13)
+        check('timeout retains a false verdict', timeout['result']['held'] is False)
         call('assert', 'css=#start', '--tab', tab)
         check('timeout preserves original page', True)
         call('click', 'css=#start', '--tab', tab)
-        ready = call('wait', 'css=#late', '--native', '--timeout', '5000', '--tab', tab)
-        check('native wait confirms delayed DOM state', ready['result']['held'] is True and
-              ready['result']['wait_backend'] == 'native_v1' and ready['operation'] == 'web.wait')
+        ready = wait('css=#late', '--timeout', '5000', '--tab', tab)
+        check('wait confirms delayed DOM state', ready['result']['held'] is True and ready['operation'] == 'web.wait')
         call('assert', 'css=#late', '--tab', tab)
         call('tab', 'new')
         tabs = call('tab', 'list')['result']['tabs']
         other = [item['tab'] for item in tabs if item['tab'] != tab]
         assert len(other) == 1, tabs
-        inactive = call('wait', 'css=#late', '--native', '--tab', tab, '--timeout', '1000')
-        check('native wait honors inactive explicit tab', inactive['result']['held'] is True)
-        missing = call('wait', 'css=#late', '--native', '--tab', other[0], '--timeout', '80', expected=13)
+        inactive = wait('css=#late', '--tab', tab, '--timeout', '1000')
+        check('wait honors inactive explicit tab', inactive['result']['held'] is True)
+        missing = wait('css=#late', '--tab', other[0], '--timeout', '80', expected=13)
         check('other tab cannot satisfy original condition', missing['result']['held'] is False)
         call('click', 'css=#clear', '--tab', tab)
-        absent = call('wait', 'css=#late', '--absent', '--native', '--tab', tab, '--timeout', '1000')
-        check('native absence requires a valid false condition', absent['result']['held'] is True)
+        absent = wait('css=#late', '--absent', '--tab', tab, '--timeout', '1000')
+        check('absence requires a valid false condition', absent['result']['held'] is True)
         call('click', 'css=#replace', '--tab', tab)
-        stale = call('wait', original_ref, '--absent', '--native', '--tab', tab, '--timeout', '1000', expected=34)
+        stale = wait(original_ref, '--absent', '--tab', tab, '--timeout', '1000', expected=34)
         check('stale reference cannot prove absence', stale['error']['code'] == 'STALE_REF')
         call('assert', 'css=#value', '--tab', tab)
         check('stale-ref failure preserves usable page', True)
         call('click', 'css=#navigate', '--tab', tab)
         landed_url = f'http://127.0.0.1:{server.server_port}/landed'
-        navigated = call('wait', '--url', landed_url, '--native', '--tab', tab, '--timeout', '5000')
+        navigated = wait('--url', landed_url, '--tab', tab, '--timeout', '5000')
         check('URL wait survives a later document navigation', navigated['result']['held'] is True)
         call('assert', 'css=#landed', '--tab', tab)
         check('candidate bytes unchanged', capture(cli, runtime) == context['candidate'])
-        terminal['passed'] = True
+        terminal['passed'] = not terminal.get('failed_checks')
     except BaseException as error:
         terminal['failure'] = repr(error)
         raise
@@ -139,5 +153,6 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('cli', 'runtime', 'scratch', 'evidence'):
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument('--backend', choices=('native', 'legacy'), default='native')
     a = p.parse_args()
-    run(a.cli, a.runtime, a.scratch, a.evidence)
+    run(a.cli, a.runtime, a.scratch, a.evidence, a.backend)
