@@ -118,9 +118,11 @@ Die Findings wurden an die bestehende Aufgabe „greppy bug fixing“
 (01a02118-0d61-7e10-a9d4-be496fa34879) gemeldet.
 Root bearbeitet nach expliziter Abstimmung CLI-Validierung und Erklärung
 in expect.rs/see.rs; der Worker bearbeitet native Zustands-/Fehlerpfade.
-Der aktuelle Root-Patch ist angewendet, **noch ungetestet** und wurde nicht
-für einen besseren Messwert verwendet. Die schwere Build-Spur ist für
-den nativen NO_MATCH-Test des Workers freigegeben.
+Die CLI-Validierung ist inzwischen in Commit d00c675f implementiert und mit
+13 Unit- sowie drei Integrationstests und separaten nativen Abfragen geprüft.
+Sie wurde nicht in die unveränderten S05-/S06-Messkandidaten aufgenommen.
+Diese Funktionsprüfung belegt noch keinen geringeren Tokenverbrauch;
+ein nativer Wait mit aktuellen Referenzen ist weiterhin separat abzusichern.
 
 Die nächste Untersuchung muss Verbesserungen getrennt prüfen und erneut
 tatsächliche Provider-Tokens einschließlich aller Fehlversuche erfassen.
