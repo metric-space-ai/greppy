@@ -40,3 +40,18 @@ all prompts and hash the installed skill/client before dispatch; include their
 normal setup and documentation costs in the actual provider totals. This changes
 the standard-tool condition and must not be represented as the same historical
 baseline or as an isolated Greppy fix ablation. Old v1 plans and prompts stay intact.
+
+After the S07 isolation finding, newly prepared contexts use a distinct runtime
+owner for every participant (`per_trial_owner_v1`). Empty working directories
+alone do not prevent `session list` and recovery from reaching another trial in
+the same owner. Existing aliases/plans are never rewritten. New runtime owners
+change startup conditions; report them separately from shared warm-runtime runs.
+The summary refuses a token-pass verdict when session evidence is missing or
+reused, even if all numeric token comparisons and binary hashes would pass.
+This conservative ID check is not a full browser-profile isolation proof.
+
+Use `--onboarding browser_plugin_synthetic_v3` for the next synthetic development
+series. Both arms receive the same explicit fact that reservations are local
+test records, with no order, payment or contract. The business goal and allowed
+UI APIs remain the same. V1/V2 prompts and their recorded outcomes remain intact;
+this is a declared new harness condition, not a retrospective repair of S07.

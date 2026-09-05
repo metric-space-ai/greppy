@@ -30,6 +30,9 @@ def prepare(scratch: Path, cli: Path, alias_dir: Path, trial_id: str, runtime_id
         raise ValueError('view and chain_view must be default or compact')
     candidate = capture(cli, runtime)
     runtime_executable = candidate['runtime']['path']
+    # A separate cwd does not isolate sessions in a shared runtime owner.
+    # Include both group and participant identity before creating the wrapper.
+    owner = 'study-' + hashlib.sha256((runtime_id + ':' + trial_id).encode()).hexdigest()[:32]
     alias_dir = alias_dir.resolve(strict=True)
     trial = scratch.resolve() / trial_id
     alias = alias_dir / ('gw-' + trial_id)
@@ -48,7 +51,7 @@ def prepare(scratch: Path, cli: Path, alias_dir: Path, trial_id: str, runtime_id
         '# Study transport only; argv and exit status are unchanged.',
         'unset GREPPY_WEB_SESSION GREPPY_WEB_TAB GREPPY_WEB_AGENT GREPPY_WEB_VIEW GREPPY_WEB_CHAIN_VIEW GREPPY_WEB_RUNTIME_DIST',
         'export TMPDIR=' + q(str(temporary)),
-        'export GREPPY_RUN_ID=' + q('study-' + runtime_id),
+        'export GREPPY_RUN_ID=' + q(owner),
         'export GREPPY_WEB_RUNTIME_DIR=' + q(str(runtime)),
         'export GREPPY_WEB_RUNTIME=' + q(runtime_executable),
         *(['export GREPPY_WEB_VIEW=compact'] if view == 'compact' else []),
@@ -63,13 +66,15 @@ def prepare(scratch: Path, cli: Path, alias_dir: Path, trial_id: str, runtime_id
     alias.symlink_to(wrapper)
     record = {
         'schema': 'greppy.web-study.context.v1',
-        'condition': 'short_alias_isolated_cwd_native_open',
+        'condition': 'short_alias_isolated_cwd_trial_owner_v2',
         'trial_id': trial_id, 'alias': str(alias), 'command': alias.name,
         'workspace': str(workspace), 'wrapper': str(wrapper), 'cli': str(cli),
         'candidate': candidate,
         'rendering': {'view': view, 'chain_view': chain_view},
         'wrapper_sha256': hashlib.sha256(source.encode()).hexdigest(),
-        'runtime_id': 'study-' + runtime_id,
+        'runtime_id': owner,
+        'requested_runtime_group': runtime_id,
+        'runtime_isolation': 'per_trial_owner_v1',
         'browser_actions_during_setup': 0,
         'session_setup': 'participant invokes native web open or explicit session create',
         'cost_attribution': 'harness correction; no product efficiency claim',

@@ -65,12 +65,17 @@ def summarize(series):
     integrity = all(r.get('candidate_integrity', {}).get('ok') is True
                     for r in records if r['arm'] == 'C') if plan.get('candidate_integrity_required') else None
     token_win = token_win and (integrity is True if plan.get('candidate_integrity_required') else True)
+    isolation = all(r.get('session_isolation', {}).get('fresh_vs_prior') is True
+                    for r in records if r['arm'] == 'C')
+    token_win = token_win and isolation
     return {
         'schema': 'greppy.basic-paired-summary.v1', 'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
         'condition': plan.get('harness_condition'),
         'onboarding_condition': plan.get('onboarding_condition', 'legacy'),
         'medians': medians, 'pairs': pairs,
         'candidate_integrity': integrity,
+        'session_isolation': isolation,
+        'session_isolation_scope': 'Conservative trace ID audit; missing or reused session evidence cannot pass. Not a proof of full storage/profile isolation.',
         'median_paired_change_percent': changes, 'traces': traces,
         'token_gate': 'passes this development block only' if token_win and all(p['both_passed'] for p in pairs) else 'failed_or_unproven',
         'acceptance': 'not established; one development case, no arm B or controlled end-to-end latency',

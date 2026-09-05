@@ -52,11 +52,12 @@ for case_index,case in enumerate(a.cases):
                 trial['cli_context']=prepare(a.scratch/'contexts',a.isolated_cli,a.alias_dir,rid,a.runtime_id,runtime=a.runtime,view=a.view,chain_view=a.chain_view)
             trials.append(trial)
 manifest={'schema':'greppy.basic-series.plan.v1','purpose':'development, never held-out acceptance or training final evaluation','model':'gpt-5.6-luna','effort':'medium','repeats':a.repeats,'state':'prepared_not_run','fixture':pins,'trials':trials,'constraints':['fresh contexts, isolated runs, serial execution','C must create a fresh explicit project session per participant; session identities audited','same frozen facts within each pair','all errors/recovery and failures retained','no solution scripts or host-state access by participants','B is separate; A/C does not claim actual Greppy-agent comparison','record provider usage; missing data remains null','do not infer verified end-to-end time from participant turn duration']}
-manifest['harness_condition']='short_alias_isolated_cwd_native_open' if a.isolated_cli else 'explicit_session_long_wrapper'
+manifest['harness_condition']='short_alias_isolated_cwd_trial_owner_v2' if a.isolated_cli else 'explicit_session_long_wrapper'
 if a.isolated_cli:
     manifest['candidate_integrity_required']=True
+    manifest['runtime_isolation']='per_trial_owner_v1'
     manifest['rendering']={'view':a.view,'chain_view':a.chain_view}
-    manifest['constraints'][1]='C has its own empty workspace and short CLI alias; native open may create the session; actual session identities audited'
+    manifest['constraints'][1]='C has its own empty workspace, short CLI alias and runtime owner; native open may create the session; actual session identities audited'
     manifest['constraints'].append('Harness change, not a product optimization; compare separately with earlier series')
 if a.latency_limitation: manifest['constraints'].append(a.latency_limitation)
 if a.onboarding != 'legacy': manifest['onboarding_condition'] = a.onboarding

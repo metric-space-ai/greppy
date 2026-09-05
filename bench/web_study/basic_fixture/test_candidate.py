@@ -17,7 +17,7 @@ def executables(tmp_path):
     cli = tmp_path / 'fake cli'
     cli.write_text('''#!/usr/bin/python3
 import json, os, sys
-keys = ['GREPPY_WEB_RUNTIME', 'GREPPY_WEB_RUNTIME_DIST', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT', 'GREPPY_WEB_VIEW', 'GREPPY_WEB_CHAIN_VIEW']
+keys = ['GREPPY_RUN_ID', 'GREPPY_WEB_RUNTIME', 'GREPPY_WEB_RUNTIME_DIST', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT', 'GREPPY_WEB_VIEW', 'GREPPY_WEB_CHAIN_VIEW']
 print(json.dumps({'argv':sys.argv[1:], 'env':{k:os.environ.get(k) for k in keys}}))
 sys.exit(17)
 ''')
@@ -43,11 +43,32 @@ def test_wrapper_sets_candidate_and_options_without_changing_argv(tmp_path, view
     assert result.returncode == 17
     output = json.loads(result.stdout)
     assert output['argv'] == argv
-    assert output['env'] == {'GREPPY_WEB_RUNTIME': str(runtime.resolve()), 'GREPPY_WEB_RUNTIME_DIST': None,
+    assert output['env'] == {'GREPPY_RUN_ID': context['runtime_id'], 'GREPPY_WEB_RUNTIME': str(runtime.resolve()), 'GREPPY_WEB_RUNTIME_DIST': None,
         'GREPPY_WEB_SESSION': None, 'GREPPY_WEB_TAB': None, 'GREPPY_WEB_AGENT': None,
         'GREPPY_WEB_VIEW': 'compact' if view == 'compact' else None,
         'GREPPY_WEB_CHAIN_VIEW': 'compact' if chain == 'compact' else None}
     assert verify(context['candidate'])['ok']
+
+
+def test_participants_cannot_share_runtime_owner_through_group_id(tmp_path):
+    cli, runtime = executables(tmp_path)
+    aliases = tmp_path / 'aliases'
+    aliases.mkdir()
+    contexts = [prepare(tmp_path / 'scratch', cli, aliases, trial, 'same-group',
+                        runtime=runtime) for trial in ('one', 'two')]
+    actual = []
+    for context in contexts:
+        result = subprocess.run([context['alias'], 'web', 'session', 'list'],
+                                env={**os.environ, 'GREPPY_RUN_ID': 'inherited-shared-owner'},
+                                capture_output=True, text=True)
+        assert result.returncode == 17
+        observed = json.loads(result.stdout)
+        assert observed['argv'] == ['web', 'session', 'list']
+        actual.append(observed['env']['GREPPY_RUN_ID'])
+        assert actual[-1] == context['runtime_id']
+        assert context['runtime_isolation'] == 'per_trial_owner_v1'
+    assert actual[0] != actual[1]
+    assert 'inherited-shared-owner' not in actual
 
 
 @pytest.mark.parametrize('changed', ['cli', 'runtime'])
@@ -70,7 +91,8 @@ def test_unusable_runtime_fails_before_creating_context(tmp_path):
 
 
 @pytest.mark.parametrize('integrity', [True, False, None])
-def test_token_win_requires_candidate_integrity_when_preregistered(tmp_path, integrity):
+@pytest.mark.parametrize('isolation', [True, False, None])
+def test_token_win_requires_candidate_integrity_and_session_evidence(tmp_path, integrity, isolation):
     trials = [{'position': n, 'arm': arm, 'case': 'dialog', 'repeat': 1, 'run_id': arm}
               for n, arm in enumerate(('A', 'C'), 1)]
     plan = {'trials': trials, 'model': 'gpt-5.6-luna', 'effort': 'medium',
@@ -90,8 +112,11 @@ def test_token_win_requires_candidate_integrity_when_preregistered(tmp_path, int
                'artifacts': {'metadata': str(metadata)}}
         if integrity is not None:
             row['candidate_integrity'] = {'ok': integrity}
+        if isolation is not None:
+            row['session_isolation'] = {'fresh_vs_prior': isolation}
         (out / 'trial.json').write_text(json.dumps(row))
     result = summarize(tmp_path)
     assert result['candidate_integrity'] is (integrity is True)
-    assert (result['token_gate'] == 'passes this development block only') is (integrity is True)
+    assert result['session_isolation'] is (isolation is True)
+    assert (result['token_gate'] == 'passes this development block only') is (integrity is True and isolation is True)
     assert result['medians']['C']['runs'] == 1  # Invalid provenance never drops the run.
