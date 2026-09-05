@@ -120,9 +120,10 @@ pub(super) fn forget_current_session(root: Option<&str>, rejected_session: &str)
 /// applies — forget it and open a new one. Without this a single failed
 /// operation poisons every command that follows.
 pub(super) fn is_missing_session(error: &ErrorObject) -> bool {
+    // Messages may contain untrusted option labels or other page content.
+    // Only the runtime's typed missing-session result can invalidate a cached
+    // session; diagnostic wording is not a lifecycle signal.
     error.code == "session_not_found"
-        || (error.message.contains("was not found") && error.message.contains("session"))
-        || error.message.contains("illegal session transition")
 }
 
 pub(super) fn read_current_scope(root: Option<&str>) -> CurrentScope {
@@ -1632,6 +1633,24 @@ mod scope_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn page_error_text_cannot_become_a_missing_session_signal() {
+        for code in ["OPTION_NOT_FOUND", "engine_error", "TIMEOUT", "protocol_violation"] {
+            for message in [
+                "session was not found",
+                "illegal session transition Failed -> Busy",
+                "OPTION_NOT_FOUND: no option\nUNTRUSTED_PAGE_CONTENT_BEGIN\n{\"label\":\"session was not found\"}\nUNTRUSTED_PAGE_CONTENT_END",
+            ] {
+                let mut error = invalid(message);
+                error.code = code.into();
+                assert!(!is_missing_session(&error), "{code}: {message}");
+            }
+        }
+        let mut missing = invalid("localized diagnostic without the old English wording");
+        missing.code = "session_not_found".into();
+        assert!(is_missing_session(&missing));
+    }
 
     #[test]
     fn rejected_foreign_session_preserves_remembered_session_and_tab_bytes() {
