@@ -305,6 +305,27 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn write_accepts_borrow_of_raw_identifier_and_still_rejects_broken_rust() {
+    let fixture = Fixture::new("write-rust-raw");
+    let source = b"fn main() { let raw = 1; let _ = &raw; }\n";
+    let dry_run = fixture.run_with_stdin(&["write", "--dry-run", "valid.rs"], source);
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert!(!fixture.repo.join("valid.rs").exists());
+    let written = fixture.run_with_stdin(&["write", "valid.rs"], source);
+    assert!(written.status.success(), "{}", combined(&written));
+    assert_eq!(
+        std::fs::read(fixture.repo.join("valid.rs")).unwrap(),
+        source
+    );
+    let refused = fixture.run_with_stdin(&["write", "valid.rs"], b"fn main( {}\n");
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert_eq!(
+        std::fs::read(fixture.repo.join("valid.rs")).unwrap(),
+        source
+    );
+}
+
+#[test]
 fn patch_creation_refusal_explains_recovery_and_preserves_transaction() {
     let fixture = Fixture::new("patch-create");
     std::fs::write(fixture.repo.join("existing.txt"), "before\n").unwrap();
