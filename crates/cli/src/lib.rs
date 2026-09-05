@@ -1717,6 +1717,49 @@ fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32
     }
 }
 
+fn workspace_doctor_failure(
+    data_root: &std::path::Path,
+    error: &dyn std::fmt::Display,
+    smoke_status: &str,
+    json: bool,
+) -> Result<i32> {
+    let diagnostics = greppy_workspace_core::ProviderInstallation::diagnose(data_root);
+    let next_actions = workspace_setup::doctor_recovery_steps();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "healthy": false,
+                "error": error.to_string(),
+                "data_root": data_root,
+                "provider": diagnostics.provider,
+                "diagnostics": diagnostics,
+                "smoke_status": smoke_status,
+                "next_actions": next_actions
+            }))
+            .map_err(|error| Error::Invalid(error.to_string()))?
+        );
+    } else {
+        eprintln!("workspace provider unhealthy: {error}");
+        for (name, check) in &diagnostics.checks {
+            eprintln!(
+                "  {name}: {}{}",
+                check.status,
+                check
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" — {detail}"))
+                    .unwrap_or_default()
+            );
+        }
+        eprintln!("  I/O smoke: {smoke_status}");
+        for action in next_actions {
+            eprintln!("next: {action}");
+        }
+    }
+    Ok(EXIT_IO as i32)
+}
+
 fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
     let data_root = greppy_agent::workspace::workspace_data_root()
         .map_err(|error| Error::Invalid(error.to_string()))?;
@@ -1734,34 +1777,12 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             let provider =
                 match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
                     Ok(provider) => provider,
-                    Err(error) if json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "healthy": false,
-                                "error": error.to_string(),
-                                "data_root": data_root
-                            }))
-                            .map_err(|error| Error::Invalid(error.to_string()))?
-                        );
-                        return Ok(EXIT_IO as i32);
+                    Err(error) => {
+                        return workspace_doctor_failure(&data_root, &error, "not_run", json);
                     }
-                    Err(error) => return Err(Error::Invalid(error.to_string())),
                 };
             if let Err(error) = provider.doctor_io(&format!("doctor-{}", std::process::id())) {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "healthy": false,
-                            "provider": provider.manifest(),
-                            "error": error.to_string()
-                        }))
-                        .map_err(|error| Error::Invalid(error.to_string()))?
-                    );
-                    return Ok(EXIT_IO as i32);
-                }
-                return Err(Error::Invalid(error.to_string()));
+                return workspace_doctor_failure(&data_root, &error, "failed", json);
             }
             let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
                 .map_err(|error| Error::Invalid(error.to_string()))?;
