@@ -470,7 +470,27 @@ fn run_chain(
     let mut ran = 0usize;
     let mut failed = 0usize;
     let mut last_code = 0i32;
+    // Mixed machine output is deliberately left untouched, including when a
+    // step requests JSON explicitly. A literal --json argument may conservatively
+    // disable aggregation; it must never accidentally enable it.
+    let _machine_mode = super::chain_output::machine_mode(json_out);
+    let mut output = super::chain_output::start(
+        !json_out
+            && compact_chain_enabled()
+            && super::view::enabled()
+            && !parsed
+                .iter()
+                .flatten()
+                .any(|arg| arg == "--json" || arg == "--jsonl"),
+        super::view::cache_dir(),
+    );
     for (index, command) in commands.into_iter().enumerate() {
+        if let Some(output) = &output {
+            output.step(
+                index + 1,
+                parsed[index].first().map(String::as_str).unwrap_or("step"),
+            );
+        }
         // `dispatch_inner`, not `dispatch`: the outer guard already owns the
         // runtime lifetime for the whole chain.
         let code = super::dispatch_inner(command, root)?;
@@ -492,7 +512,7 @@ fn run_chain(
                     "exit_code": code,
                 }),
             )?;
-        } else {
+        } else if code != 0 || !output.as_ref().is_some_and(|output| output.deferred()) {
             let verb = parsed[index].first().map(String::as_str).unwrap_or("step");
             if code == 0 {
                 println!("step {}/{} {verb}: ok", index + 1, parsed.len());
@@ -508,6 +528,9 @@ fn run_chain(
             failed += 1;
             last_code = code;
             if !continue_on_error {
+                if let Some(output) = output.take() {
+                    output.finish()?;
+                }
                 emit_chain_summary(
                     json_out,
                     parsed.len(),
@@ -519,6 +542,9 @@ fn run_chain(
                 return Ok(code);
             }
         }
+    }
+    if let Some(output) = output.take() {
+        output.finish()?;
     }
     emit_chain_summary(json_out, parsed.len(), ran, failed, None, None)?;
     Ok(if failed == 0 { 0 } else { last_code })

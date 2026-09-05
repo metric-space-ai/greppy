@@ -6,6 +6,7 @@
 
 mod act;
 mod chain;
+mod chain_output;
 mod common;
 mod diagnose;
 mod expect;

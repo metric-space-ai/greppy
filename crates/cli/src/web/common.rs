@@ -1078,7 +1078,18 @@ fn emit_web_with_scope(
     payload: &serde_json::Value,
     scope: super::view::Scope,
 ) -> Result<()> {
-    if !json_out && super::view::enabled() {
+    if super::chain_output::capture(json_out, payload, &scope)? {
+        return Ok(());
+    }
+    emit_web_uncaptured(json_out, payload, scope)
+}
+
+pub(super) fn emit_web_uncaptured(
+    json_out: bool,
+    payload: &serde_json::Value,
+    scope: super::view::Scope,
+) -> Result<()> {
+    if !json_out && super::view::enabled() && !super::chain_output::machine_active() {
         match super::view::render(payload, scope, &super::view::cache_dir()) {
             Ok(text) => {
                 print!("{text}");

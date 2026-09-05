@@ -15,7 +15,7 @@ const PREFIX: &str = "view1:";
 const OPEN: &str = "UNTRUSTED_PAGE_CONTENT\n";
 const CLOSE: &str = "\nEND_UNTRUSTED_PAGE_CONTENT\n";
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scope {
     pub session: Option<String>,
     pub tab: Option<String>,
@@ -300,6 +300,27 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(super) fn archive_chain(records: &Value, scope: Scope, dir: &Path) -> Result<String, String> {
+    let snapshot = Snapshot {
+        version: 1,
+        created: now(),
+        scope: scope.clone(),
+        header: "Earlier chain observations — not current page state; references may be stale\n"
+            .into(),
+        body: serde_json::to_string(records).map_err(|error| error.to_string())?,
+    };
+    let id = save(dir, &snapshot)?;
+    let cursor = format!("{PREFIX}{id}:0");
+    let mut command = format!("greppy web result next {}", shell_quote(&cursor));
+    if let Some(session) = scope.session {
+        command.push_str(&format!(" --session {}", shell_quote(&session)));
+    }
+    if let Some(tab) = scope.tab {
+        command.push_str(&format!(" --tab {}", shell_quote(&tab)));
+    }
+    Ok(command)
 }
 
 fn save(dir: &Path, snapshot: &Snapshot) -> Result<String, String> {

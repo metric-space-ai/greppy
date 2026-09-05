@@ -6,13 +6,17 @@ fn run(args: &[&str]) -> (i32, String, String) {
 }
 
 fn run_with_view(args: &[&str], compact: bool) -> (i32, String, String) {
+    run_with_modes(args, compact, false)
+}
+
+fn run_with_modes(args: &[&str], compact: bool, view: bool) -> (i32, String, String) {
     let dir = tempfile::tempdir().expect("isolated workspace");
     let output = Command::new(env!("CARGO_BIN_EXE_greppy"))
         .args(args)
         .current_dir(dir.path())
         .env_remove("GREPPY_WEB_RUNTIME")
         .env_remove("GREPPY_WEB_RUNTIME_DIST")
-        .env_remove("GREPPY_WEB_VIEW")
+        .env("GREPPY_WEB_VIEW", if view { "compact" } else { "" })
         .env(
             "GREPPY_WEB_CHAIN_VIEW",
             if compact { "compact" } else { "" },
@@ -73,6 +77,21 @@ fn json_chain_retains_complete_machine_readable_step_records() {
 }
 
 #[test]
+fn json_chain_is_byte_identical_with_the_compact_view_enabled() {
+    let args = [
+        "web", "do", "--json", "script", "list", "::", "script", "list",
+    ];
+    let (code, expected, _) = run_with_modes(&args, true, false);
+    assert_eq!(code, 0);
+    let (code, actual, stderr) = run_with_modes(&args, true, true);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(actual, expected);
+    for line in actual.lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("JSON line");
+    }
+}
+
+#[test]
 fn compact_chain_stops_at_failure_and_preserves_exit_status() {
     let (code, stdout, stderr) = run(&[
         "web", "do", "script", "list", "::", "script", "show", "missing", "::", "script", "list",
@@ -84,9 +103,7 @@ fn compact_chain_stops_at_failure_and_preserves_exit_status() {
     );
     assert!(!stdout.contains("step 3/3"), "{stdout}");
     assert!(
-        stdout.contains(
-            "chain: 2/3 steps executed, 1 failed; stopped at 2; no rollback attempted"
-        ),
+        stdout.contains("chain: 2/3 steps executed, 1 failed; stopped at 2; no rollback attempted"),
         "{stdout}"
     );
 }
