@@ -10,6 +10,8 @@
   if (e.value !== undefined) out.value = e.value;
   if (e.checked !== undefined) out.checked = e.checked;
   if (e.disabled !== undefined) out.disabled = e.disabled;
+  var choices = greppySelectChoicesSnapshot(e);
+  if (choices !== null) out.select_choices = choices;
   if (e.href) out.href = e.href;
   if (withAttrs) {
     out.attrs = {};

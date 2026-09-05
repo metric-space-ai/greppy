@@ -280,6 +280,27 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
                 }
             }
         }
+    } else if operation == "web.inspect"
+        && payload.get("status").and_then(Value::as_str) == Some("ok")
+        && result.get("value").is_some_and(|value| {
+            value.get("node").is_some_and(Value::is_object)
+                && value.get("count").is_some_and(Value::is_number)
+        })
+    {
+        // Inspect value is the DOM description; serialized is its transport
+        // encoding. Machine-readable output never uses this human formatter.
+        body.push_str(&format!("element: {}\n", result["value"]));
+        for (key, value) in result.as_object().expect("inspect object") {
+            if ["value", "serialized"].contains(&key.as_str())
+                || (key == "session_id" && value.as_str() == scope.session.as_deref())
+                || (key == "tab_id" && value.as_str() == scope.tab.as_deref())
+                || (key == "untrusted_content_boundary"
+                    && value.as_str() == Some("UNTRUSTED_PAGE_CONTENT"))
+            {
+                continue;
+            }
+            body.push_str(&format!("{}: {value}\n", quote(key)));
+        }
     } else {
         body.push_str(&format!("{result}\n"));
     }
@@ -673,6 +694,45 @@ mod tests {
             assert!(out.contains(expected), "missing {expected}");
         }
     }
+    #[test]
+    fn inspect_shows_decoded_state_once_and_preserves_new_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = json!({"operation":"web.inspect", "status":"ok", "result":{
+            "session_id":"session-a", "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT",
+            "serialized":{"o":[{"k":"node","v":{"o":[{"k":"value","v":{"s":"ascending"}}]}}]},
+            "value":{"count":1.0,"node":{"value":"ascending","disabled":false,
+                "select_choices":{"schema":"greppy.web.select-choices.v99",
+                    "choices":[{"value":null,"value_truncated":true,"label":"Choice"}],
+                    "future":false}}},
+            "future_receipt":{"pending":true}
+        }});
+        let before = payload.clone();
+        let output = render(&payload, scope(), tmp.path()).unwrap();
+        assert!(!output.contains("\"serialized\""));
+        assert_eq!(output.matches("ascending").count(), 1);
+        for expected in ["\"disabled\":false", "\"value\":null", "\"value_truncated\":true",
+            "greppy.web.select-choices.v99", "\"future\":false", "future_receipt", "\"pending\":true"] {
+            assert!(output.contains(expected), "lost {expected}: {output}");
+        }
+        assert_eq!(payload, before);
+        assert!(output.contains(OPEN) && output.contains(CLOSE));
+    }
+
+    #[test]
+    fn inspect_compaction_does_not_hide_errors_or_change_other_operations() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (operation, status) in [("web.inspect", "error"), ("web.evaluate", "ok")] {
+            let payload = json!({"operation":operation,"status":status,
+                "result":{"serialized":{"diagnostic":"keep me"},
+                    "value":{"count":1,"node":{"disabled":true}}}});
+            let output = render(&payload, scope(), tmp.path()).unwrap();
+            assert!(output.contains("\"serialized\"") && output.contains("keep me"));
+        }
+        let malformed = json!({"operation":"web.inspect","status":"ok",
+            "result":{"serialized":{"diagnostic":"missing node"},"value":{"count":0}}});
+        assert!(render(&malformed, scope(), tmp.path()).unwrap().contains("missing node"));
+    }
+
     #[test]
     fn page_text_cannot_forge_output_boundaries() {
         let tmp = tempfile::tempdir().unwrap();
