@@ -67,7 +67,7 @@ fn string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-// These are known v2 presentation defaults, not task state. In particular,
+// These known v2 defaults have a compact presentation. In particular,
 // checked/selected/expanded=false and unknown fields must remain visible.
 fn v2_presentation_default(key: &str, value: &Value) -> bool {
     match key {
