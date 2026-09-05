@@ -18,6 +18,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod backend;
+pub mod block_classifier;
 pub mod cpu_features;
 pub mod gguf;
 pub mod matmul;
@@ -37,6 +38,7 @@ pub use backend::{
     DeviceInfo, DeviceType, InferenceBackendRegistry, InferenceModelKind, InferencePolicy,
     BACKEND_REGISTRY_VERSION, GPU_MEMORY_SAFETY_MARGIN,
 };
+pub use block_classifier::{BlockClassifier, BLOCK_CLASSIFIER_LABELS};
 pub use gguf::{GgufModel, TensorInfo, TensorView, Value, ValueType, VersionedMagic};
 pub use model::{CpuEmbeddingModel, StageOutput};
 pub use quant::GgmlDType;
