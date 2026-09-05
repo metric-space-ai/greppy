@@ -22,7 +22,8 @@ pub use namespace::{
     WorkspaceHandle, WorkspaceOperationLease, WorkspacePairLease, WorkspaceStatus,
 };
 pub use provider::{
-    AdapterKind, ProviderCapabilities, ProviderInstallation, ProviderManifest, ProviderState,
+    AdapterKind, ProviderCapabilities, ProviderDiagnosticCheck, ProviderDiagnostics,
+    ProviderInstallation, ProviderManifest, ProviderState,
     PROVIDER_PROTOCOL_VERSION,
 };
 pub use repository_tracker::{

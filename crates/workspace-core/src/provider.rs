@@ -82,7 +82,134 @@ pub struct ProviderInstallation {
     manifest: ProviderManifest,
 }
 
+/// Read-only evidence, not permission to use a provider or a successful I/O smoke.
+#[derive(Debug, Serialize)]
+pub struct ProviderDiagnostics {
+    pub control_path: PathBuf,
+    pub provider: Option<ProviderManifest>,
+    pub checks: std::collections::BTreeMap<&'static str, ProviderDiagnosticCheck>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderDiagnosticCheck {
+    pub status: &'static str,
+    pub detail: Option<String>,
+}
+
+impl ProviderDiagnosticCheck {
+    fn from_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self {
+                status: "passed",
+                detail: None,
+            },
+            Err(error) => Self {
+                status: "failed",
+                detail: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn not_checked(reason: &str) -> Self {
+        Self {
+            status: "not_checked",
+            detail: Some(reason.into()),
+        }
+    }
+}
+
 impl ProviderInstallation {
+    /// Keep diagnosis available when liveness fails. This never creates a core,
+    /// starts an adapter, writes through the mount, or relaxes require_healthy.
+    pub fn diagnose(data_root: impl AsRef<Path>) -> ProviderDiagnostics {
+        Self::diagnose_at(data_root.as_ref(), SystemTime::now())
+    }
+
+    fn diagnose_at(data_root: &Path, now: SystemTime) -> ProviderDiagnostics {
+        let mut report = ProviderDiagnostics {
+            control_path: data_root.join("provider.json"),
+            provider: None,
+            checks: [
+                "control_manifest",
+                "identity",
+                "heartbeat",
+                "capabilities",
+                "mounted_identity",
+            ]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    ProviderDiagnosticCheck::not_checked("no readable control manifest"),
+                )
+            })
+            .collect(),
+        };
+        let control = (|| -> Result<ProviderManifest> {
+            absolute_clean(data_root)?;
+            let bytes = fs::read(&report.control_path).map_err(|error| {
+                Error::AdapterUnavailable(format!(
+                    "cannot read {}: {error}",
+                    report.control_path.display()
+                ))
+            })?;
+            Ok(serde_json::from_slice(&bytes)?)
+        })();
+        let manifest = match control {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                report.checks.insert(
+                    "control_manifest",
+                    ProviderDiagnosticCheck::from_result(Err(error)),
+                );
+                return report;
+            }
+        };
+        report.checks.insert(
+            "control_manifest",
+            ProviderDiagnosticCheck::from_result(Ok(())),
+        );
+        let identity = validate_manifest_identity(&manifest, data_root);
+        let may_read_marker = identity.is_ok();
+        report
+            .checks
+            .insert("identity", ProviderDiagnosticCheck::from_result(identity));
+        report.checks.insert(
+            "heartbeat",
+            ProviderDiagnosticCheck::from_result(validate_manifest_heartbeat(&manifest, now)),
+        );
+        report.checks.insert(
+            "capabilities",
+            ProviderDiagnosticCheck::from_result(manifest.capabilities.validate()),
+        );
+        let marker = if may_read_marker {
+            ProviderDiagnosticCheck::from_result((|| -> Result<()> {
+                let path = manifest.mount_root.join(".greppy-provider.json");
+                let bytes = read_mount_marker(&path).map_err(|error| {
+                    Error::AdapterUnhealthy(format!(
+                        "mount marker {} is unavailable: {error}",
+                        path.display()
+                    ))
+                })?;
+                let marker: ProviderManifest = serde_json::from_slice(&bytes)?;
+                validate_manifest_identity(&marker, data_root)?;
+                if !same_provider_identity(&marker, &manifest) {
+                    return Err(Error::AdapterUnhealthy(
+                        "control manifest and mounted provider identity differ".into(),
+                    ));
+                }
+                Ok(())
+            })())
+        } else {
+            ProviderDiagnosticCheck::not_checked(
+                "control identity is invalid; mount path was not followed",
+            )
+        };
+        report.checks.insert("mounted_identity", marker);
+        report.provider = Some(manifest);
+        report
+    }
+
     pub fn require_healthy(data_root: impl AsRef<Path>) -> Result<Self> {
         Self::require_healthy_at(data_root, SystemTime::now())
     }
@@ -421,6 +548,65 @@ mod tests {
             ProviderInstallation::require_healthy_at(&data, now),
             Err(Error::AdapterUnhealthy(_))
         ));
+    }
+
+    #[test]
+    fn diagnoses_stale_control_and_mount_identity_independently_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let heartbeat = UNIX_EPOCH + Duration::from_secs(1_000);
+        let control = manifest(&data, &mount, heartbeat);
+        publish(&control);
+        let before = fs::read(data.join("provider.json")).unwrap();
+        let now = heartbeat + MAX_HEARTBEAT_AGE + Duration::from_secs(1);
+        let report = ProviderInstallation::diagnose_at(&data, now);
+        assert_eq!(report.checks["control_manifest"].status, "passed");
+        assert_eq!(report.checks["heartbeat"].status, "failed");
+        assert_eq!(report.checks["mounted_identity"].status, "passed");
+        assert!(ProviderInstallation::require_healthy_at(&data, now).is_err());
+        assert_eq!(fs::read(data.join("provider.json")).unwrap(), before);
+        assert!(!mount.join("doctor").exists());
+        assert!(!data.join("core").exists());
+
+        let mut other = control;
+        other.instance_id = "different-provider".into();
+        fs::write(
+            mount.join(".greppy-provider.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        let report = ProviderInstallation::diagnose_at(&data, now);
+        assert_eq!(report.checks["heartbeat"].status, "failed");
+        assert_eq!(report.checks["mounted_identity"].status, "failed");
+    }
+
+    #[test]
+    fn diagnosis_distinguishes_missing_corrupt_and_invalid_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = SystemTime::now();
+        let missing = ProviderInstallation::diagnose_at(&data, now);
+        assert_eq!(missing.checks["control_manifest"].status, "failed");
+        assert_eq!(missing.checks["heartbeat"].status, "not_checked");
+        assert!(!data.exists());
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("provider.json"), b"not json").unwrap();
+        let corrupt = ProviderInstallation::diagnose_at(&data, now);
+        assert_eq!(corrupt.checks["control_manifest"].status, "failed");
+        assert!(corrupt.provider.is_none());
+        let mut invalid = manifest(&data, &mount, now);
+        invalid.data_root = temp.path().join("wrong");
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let report = ProviderInstallation::diagnose_at(&data, now);
+        assert_eq!(report.checks["identity"].status, "failed");
+        assert_eq!(report.checks["mounted_identity"].status, "not_checked");
+        assert!(!mount.exists());
     }
 
     #[test]

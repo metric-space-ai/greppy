@@ -683,6 +683,29 @@ fn record_macos_fskit_activation_required(data_root: &Path) -> Result<(), String
         .map_err(|error| format!("cannot record FSKit activation state: {error}"))
 }
 
+/// Diagnostic guidance only: do not register, launch, mount or request approval.
+pub(crate) fn doctor_recovery_steps() -> Vec<String> {
+    let mut steps = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        match std::env::current_exe()
+            .map_err(|error| format!("cannot locate this CLI: {error}"))
+            .and_then(|exe| locate_macos_app(&exe))
+        {
+            Ok(app) => steps.push(format!(
+                "Run `greppy workspace setup` to validate registration and activation of {} before mounting. A stale heartbeat alone does not prove that the extension is disabled.",
+                app.display()
+            )),
+            Err(error) => steps.push(error),
+        }
+        steps.push("Extension approval and process liveness were not probed by this diagnostic; do not repeatedly toggle approval or replace the app based only on a heartbeat error.".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    steps.push("Run `greppy workspace setup` from the installed package to validate and start its portable workspace provider.".into());
+    steps.push("Then rerun `greppy workspace doctor --json`; do not start an agent until healthy=true. If it still fails, retain this diagnostic and the setup error; do not delete the workspace store.".into());
+    steps
+}
+
 #[cfg(target_os = "macos")]
 fn locate_macos_app(current_exe: &Path) -> Result<PathBuf, String> {
     locate_macos_app_with_fallback(
