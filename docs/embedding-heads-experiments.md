@@ -110,7 +110,11 @@ five bit-identical interruption/restart checks. Its receipt is
 its GPU3 artifacts are under `experiment-smoke-v2/` beside the v1 directory.
 These results validate the revised grouping contract, not native model quality.
 
-Still outstanding: admitted broad corpora, shared native input extraction,
+Shared native target/context extraction now has CPU/CUDA raw-text probe evidence;
+see `docs/embedding-heads-native-inputs.md`. The new representation has not been
+admitted into real training bundles.
+
+Still outstanding: admitted broad corpora, the admission-to-feature bundle bridge,
 rubric/data ablations, genuine head selection, calibration per backend, portable
 production loading, complete log/Web runtime use, and independent agent
 workflow acceptance. This work does not establish production readiness.

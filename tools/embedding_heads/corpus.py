@@ -16,7 +16,10 @@ def source_spans(text, source_id):
         raise ValueError('source text must be nonempty')
     offset = 0
     result = []
-    for number, line in enumerate(text.splitlines(keepends=True), 1):
+    # Match Rust head_input::log_spans: only LF ends a physical log line.
+    # Preserve CR progress updates, form feeds and Unicode separators as bytes.
+    for number, match in enumerate(re.finditer(r'[^\n]*\n|[^\n]+', text), 1):
+        line = match.group()
         raw = line.encode('utf-8')
         end = offset + len(raw)
         result.append({'id': digest([source_id, offset, end, hashlib.sha256(raw).hexdigest()]),

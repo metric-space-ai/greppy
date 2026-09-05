@@ -71,6 +71,14 @@ JSONL from an explicitly authored manifest. These are training preparation helpe
 the product session-goal API is prepared and tested separately. Daemon/action
 wiring and runtime head integration are still outstanding.
 
+## Shared native inputs
+
+`docs/embedding-heads-native-inputs.md` describes exact source/target preparation,
+strict tokenization, CPU/CUDA raw-text probes and their limits. Python log target
+construction and Rust now share LF-only physical boundaries. This is a new
+experimental representation and needs fresh span annotations and embeddings;
+it is not the unchanged R5 rubric ablation.
+
 ## Verification to date
 
 - 64 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
