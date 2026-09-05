@@ -1015,6 +1015,17 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             return EXIT_USAGE;
         }
     };
+    // A delegated Base index must retain its staging independently of the
+    // parent before cache maintenance or any writes can begin. Missing/reaped
+    // staging is a refusal, never a request to recreate its ownership marker.
+    let _base_build_staging_leases =
+        match greppy_core::cache::retain_base_build_staging_leases_from_env() {
+            Ok(leases) => leases,
+            Err(error) => {
+                eprintln!("greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command");
+                return 73;
+            }
+        };
     // Only a successfully parsed command may perform cache maintenance.
     // Help, version and refused usage must not create gc.state/lock files or
     // reclaim unrelated caches while the user is asking how to configure them.
