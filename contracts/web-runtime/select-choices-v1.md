@@ -2,7 +2,8 @@
 
 This additive diagnostic projection is not a selection command. The shared
 `greppySelectChoicesSnapshot(node)` implementation lives in
-`runtime/js/select-choices-runtime.js`. Native error construction and node
+`crates/web-client/src/select-choices.js`, exported as
+`greppy_web_client::SELECT_CHOICES_JS`. Native error construction and node
 descriptors should reuse it rather than build separate option projections.
 Integration into those callers is a separate acceptance step.
 
