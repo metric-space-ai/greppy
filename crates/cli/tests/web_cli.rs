@@ -25,6 +25,87 @@ fn run(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn inspect_ref_reports_query_recovery_before_runtime_start() {
+    for reference in ["@1", "@14"] {
+        let (code, stdout, stderr) = run(&[
+            "web",
+            "inspect",
+            reference,
+            "--session",
+            "wrs_unstarted",
+            "--json",
+        ]);
+        assert_eq!(code, 30, "stdout={stdout} stderr={stderr}");
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["error"]["code"], "unsupported_ref");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("inspect"));
+        assert!(value["error"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("css="));
+        assert!(!stdout.contains("engine_error"));
+        assert!(!stdout.contains("SyntaxError"));
+    }
+    let (code, stdout, stderr) = run(&["web", "inspect", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("does not resolve @N"), "{stdout}");
+}
+
+#[test]
+fn session_new_refusal_names_create_and_nested_usage() {
+    let (code, stdout, stderr) = run(&["web", "session", "new", "--profile", "project"]);
+    assert_eq!(code, 64, "stdout={stdout} stderr={stderr}");
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains("greppy web session create --profile project"),
+        "{text}"
+    );
+    assert!(text.contains("usage: greppy web session"), "{text}");
+    assert!(!text.contains("usage: greppy web status|doctor"), "{text}");
+}
+
+#[test]
+fn chain_session_position_refusal_names_per_step_recovery() {
+    let (code, stdout, stderr) = run(&[
+        "web",
+        "do",
+        "--explain",
+        "--session",
+        "STUDY",
+        "click",
+        "@1",
+        "::",
+        "observe",
+    ]);
+    assert_eq!(code, 30, "stdout={stdout} stderr={stderr}");
+    let text = format!("{stdout}{stderr}");
+    assert!(text.contains("after each step's command"), "{text}");
+    assert!(
+        text.contains("click @1 --session SID :: observe --session SID"),
+        "{text}"
+    );
+    let (code, stdout, stderr) = run(&[
+        "web",
+        "do",
+        "--explain",
+        "click",
+        "@1",
+        "--session",
+        "STUDY",
+        "::",
+        "observe",
+        "--session",
+        "STUDY",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("STUDY"), "{stdout}");
+}
+
+#[test]
 fn web_is_not_grep_passthrough() {
     let (code, stdout, stderr) = run(&["web", "status", "--json"]);
     assert_ne!(code, 2, "web must not be unknown clap usage: {stderr}");

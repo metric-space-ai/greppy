@@ -42,6 +42,17 @@ pub(crate) fn closest_valid_invocation(
     subcommand: &str,
     clap_message: &str,
 ) -> Option<String> {
+    let invocation = grep_passthrough_args(argv);
+    if subcommand == "web"
+        && invocation.get(1).and_then(|arg| arg.to_str()) == Some("session")
+        && invocation.get(2).and_then(|arg| arg.to_str()) == Some("new")
+        && clap_message.contains("unrecognized subcommand 'new'")
+    {
+        return Some(
+            "use `greppy web session create --profile project`; `new` is not a session command"
+                .into(),
+        );
+    }
     let unknown = unknown_flag_name(clap_message)?;
     let unknown = unknown.as_str();
     let candidates = subcommand_flag_candidates(argv, subcommand);

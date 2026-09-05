@@ -403,14 +403,20 @@ fn run_chain(
             Err(error) => {
                 let first = error.to_string();
                 let first = first.lines().next().unwrap_or("unparsable step");
-                return emit_error(
-                    json_out,
-                    invalid(&format!(
-                        "web do: step {} (`{}`) is not a valid command: {first}",
-                        index + 1,
-                        step.join(" ")
-                    )),
-                );
+                let mut error = invalid(&format!(
+                    "web do: step {} (`{}`) is not a valid command: {first}",
+                    index + 1,
+                    step.join(" ")
+                ));
+                if step
+                    .first()
+                    .is_some_and(|arg| arg == "--session" || arg.starts_with("--session="))
+                {
+                    let hint = "place --session SID after each step's command, not before it: `greppy web do --explain click @1 --session SID :: observe --session SID`";
+                    error.message = format!("{}; {hint}", error.message).into();
+                    error.next_action = hint.into();
+                }
+                return emit_error(json_out, error);
             }
         }
     }

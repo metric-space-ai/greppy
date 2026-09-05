@@ -1002,7 +1002,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .lines()
                 .find(|line| line.trim_start().starts_with("Usage:"))
                 .map(|line| line.trim().trim_start_matches("Usage:").trim());
-            if let Some(usage) = subcommand_usage(sub).or(clap_usage) {
+            let usage = if sub == "web" {
+                // Nested session/tab commands need their own grammar, not
+                // the top-level browser command list.
+                clap_usage.or_else(|| subcommand_usage(sub))
+            } else {
+                subcommand_usage(sub).or(clap_usage)
+            };
+            if let Some(usage) = usage {
                 println!("usage: {usage}");
             } else {
                 println!(

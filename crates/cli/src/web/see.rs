@@ -5,6 +5,7 @@
 use super::common::*;
 use clap::Subcommand;
 use greppy_core::error::Result;
+use greppy_web_client::{new_request_id, ErrorObject};
 use regex::Regex;
 use serde_json::Value;
 use std::io::{BufRead, Write};
@@ -66,6 +67,7 @@ pub enum SeeCommand {
     /// Describe one node in detail.
     Inspect {
         /// Node query, same grammar as `find`.
+        /// This verb does not resolve @N references; use css=, id= or another query.
         query: String,
         /// Include every attribute.
         #[arg(long)]
@@ -198,8 +200,17 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
-            if let Err(message) = validate_query(&query) {
-                return emit_error(json, invalid(&format!("web inspect: {message}")));
+            if query.trim().starts_with('@') {
+                return emit_error(
+                    json,
+                    ErrorObject::new(
+                        "unsupported_ref",
+                        "web inspect does not resolve @N references; it requires a node query",
+                        new_request_id(),
+                        EXIT_WEB_INVALID,
+                        "use `greppy web inspect css=SELECTOR --session SID` (for example css=#country), or id=ID, using an attribute from the current observation; do not retry the same @N or restart the runtime",
+                    ),
+                );
             }
             if let Err(message) = validate_query(&query) {
                 return emit_error(json, invalid(&format!("web inspect: {message}")));
