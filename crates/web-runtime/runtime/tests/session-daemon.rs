@@ -3963,6 +3963,123 @@ fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
 }
 
 #[test]
+fn keyboard_refs_bind_the_observed_node_before_focusing() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body><label for="postcode">Postcode</label><input id="postcode">
+<script>window.keyEvents = []; document.addEventListener('keydown', e => window.keyEvents.push(e.key));</script>
+</body></html>"#,
+    );
+    let socket = std::env::temp_dir().join(format!("greppy-key-ref-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_keyboard_ref", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_keyboard_ref", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("keyboard ref request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
+    let css_control = call(
+        "web.type",
+        json!({"session_id":session,"selector":{"type":"css","value":"#postcode"},"text":"10115"}),
+    );
+    assert_eq!(css_control.status, "ok", "{css_control:?}");
+    let css_value = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"document.getElementById('postcode').value"}),
+    );
+    assert_eq!(css_value.result.as_ref().unwrap()["value"], "10115");
+    let cleared = call(
+        "web.fill",
+        json!({"session_id":session,"selector":{"type":"css","value":"#postcode"},"value":""}),
+    );
+    assert_eq!(cleared.status, "ok", "{cleared:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        "@1"
+    );
+    let type_ref = |sid: &str| {
+        call(
+            "web.type",
+            json!({"session_id":sid,"selector":{"type":"ref","value":1},"text":"10115"}),
+        )
+    };
+    let press_ref = |sid: &str| {
+        call(
+            "web.press",
+            json!({"session_id":sid,"selector":{"type":"ref","value":1},"key":"ArrowLeft"}),
+        )
+    };
+    let typed = type_ref(session);
+    assert_eq!(
+        typed.status, "ok",
+        "fresh observed ref must type: {typed:?}"
+    );
+    let pressed = press_ref(session);
+    assert_eq!(
+        pressed.status, "ok",
+        "fresh observed ref must focus for a key: {pressed:?}"
+    );
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"document.getElementById('postcode').value === '10115' && window.keyEvents.includes('ArrowLeft')"}),
+    );
+    assert_eq!(state.result.as_ref().unwrap()["value"], true);
+
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other_session = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    for response in [type_ref(other_session), press_ref(other_session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+    let replaced = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"const original = document.getElementById('postcode'); original.replaceWith(original.cloneNode(true)); true"}),
+    );
+    assert_eq!(replaced.status, "ok", "{replaced:?}");
+    for response in [type_ref(session), press_ref(session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+    assert_eq!(
+        call("web.observe", json!({"session_id":session})).status,
+        "ok"
+    );
+    assert_eq!(press_ref(session).status, "ok");
+    assert_eq!(
+        call("web.reload", json!({"session_id":session})).status,
+        "ok"
+    );
+    for response in [type_ref(session), press_ref(session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
 fn project_profile_can_load_an_allowed_http_host() {
     let fixture_html: &'static str = Box::leak(
         format!(
