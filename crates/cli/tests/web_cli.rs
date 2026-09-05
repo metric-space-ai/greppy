@@ -25,34 +25,44 @@ fn run(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
-fn inspect_ref_reports_query_recovery_before_runtime_start() {
-    for reference in ["@1", "@14"] {
+fn inspect_ref_validates_syntax_before_runtime_start() {
+    for reference in ["@0", "@invalid"] {
         let (code, stdout, stderr) = run(&[
             "web",
             "inspect",
             reference,
             "--session",
             "wrs_unstarted",
+            "--tab",
+            "tab_unstarted",
             "--json",
         ]);
         assert_eq!(code, 30, "stdout={stdout} stderr={stderr}");
         let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(value["error"]["code"], "unsupported_ref");
+        assert_eq!(value["error"]["code"], "QUERY_SYNTAX");
         assert_eq!(value["error"]["retryable"], false);
-        assert!(value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("inspect"));
-        assert!(value["error"]["next_action"]
-            .as_str()
-            .unwrap()
-            .contains("css="));
+        assert!(value["error"]["message"].as_str().unwrap().contains("ref"));
         assert!(!stdout.contains("engine_error"));
         assert!(!stdout.contains("SyntaxError"));
     }
     let (code, stdout, stderr) = run(&["web", "inspect", "--help"]);
     assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("does not resolve @N"), "{stdout}");
+    assert!(stdout.contains("accepts @N"), "{stdout}");
+}
+
+#[test]
+fn session_create_help_explains_both_profiles_without_relaxing_policy() {
+    let (code, stdout, stderr) = run(&["web", "session", "create", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("research: public web"), "{stdout}");
+    assert!(
+        stdout.contains("project: public web plus loopback"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("LAN and cloud metadata remain blocked"),
+        "{stdout}"
+    );
 }
 
 #[test]

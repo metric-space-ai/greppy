@@ -1709,7 +1709,7 @@ impl ContentEngine {
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
         let source = format!(
-            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
+            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (!greppyObservedRefMatches(selector, nodes)) throw new Error('STALE_REF: observed node no longer belongs to the active document'); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
         );
         self.evaluate(webview, &source)
     }
@@ -2269,6 +2269,15 @@ impl ContentEngine {
                     self.screenshot_png(&webview, clip)?
                 };
                 screenshot_engine_result(&png)
+            }
+            "locator.inspect" => {
+                let attrs = params.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false);
+                let html = params.get("html").and_then(|v| v.as_bool()).unwrap_or(false);
+                let describe = greppy_web_client::DESCRIBE_NODE_JS;
+                let source = format!(
+                    "var describe = {describe}; var out = {{ count: 1, node: describe(nodes[0], {attrs}) }}; if ({html}) out.html = nodes[0].outerHTML.slice(0, 20000); return out;"
+                );
+                Ok(json!({ "serialized": serialize_jsvalue(self.locator_eval(&params, &source)?)? }))
             }
             "locator.count" => {
                 let page_id = required_str(&params, "page")?;
@@ -3861,6 +3870,14 @@ function greppyResolveIn(root, selector) {
   }
   return [];
 }
+function greppyObservedRefMatches(selector, nodes) {
+  if (selector.snapshot == null) return true;
+  const registry = window.__greppyObservedRefs;
+  return !!(registry && registry.snapshot === selector.snapshot &&
+    document.documentElement && document.documentElement.getAttribute('data-greppy-ref-snapshot') === selector.snapshot &&
+    nodes.length === 1 && registry.nodes[selector.observed_ref - 1] === nodes[0] &&
+    nodes[0].ownerDocument === document && nodes[0].isConnected);
+}
 function greppyResolveNodes(selector) {
   if (selector.type === 'filter') {
     let nodes = greppyResolveNodes(selector.scope);
@@ -3926,7 +3943,7 @@ fn resolve_script(selector: &serde_json::Value) -> String {
             return {{ staleRef: true, count: 0 }};
           }}
           const nodes = greppyResolveNodes(selector);
-          if (selector.snapshot != null && nodes.length !== 1) {{
+          if (!greppyObservedRefMatches(selector, nodes)) {{
             return {{ staleRef: true, count: nodes.length }};
           }}
           if (nodes.length !== 1) {{
@@ -4936,25 +4953,97 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
   }
   const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
-    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[contenteditable="true"]'
+    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
   )).filter(function(node) {
     const style = getComputedStyle(node);
     const rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   });
   const capped = candidates.slice(0, 200);
+  // Retain actual node identities, not just clonable DOM attributes. A replacement
+  // with copied attributes must not inherit an observed ref. Bound to one snapshot.
+  if (snapshot != null) window.__greppyObservedRefs = { snapshot: snapshot, nodes: capped };
+  const compact = function(value) { return String(value || '').replace(/\s+/g, ' ').trim(); };
+  const accessibleName = function(node, tag, type) {
+    const labelledBy = (node.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
+    const labels = labelledBy.map(function(id) { return document.getElementById(id); }).filter(Boolean);
+    if (labels.length) {
+      return { name: compact(labels.map(function(label) { return label.textContent || ''; }).join(' ')), source: 'aria-labelledby' };
+    }
+    const aria = compact(node.getAttribute('aria-label'));
+    if (aria) return { name: aria, source: 'aria-label' };
+    const nativeLabels = Array.from(node.labels || []);
+    if (nativeLabels.length) return { name: compact(nativeLabels.map(function(label) { return label.textContent || ''; }).join(' ')), source: 'label' };
+    if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
+      const text = compact(node.innerText || node.textContent);
+      if (text) return { name: text, source: 'contents' };
+    }
+    if (tag === 'input' && ['button', 'submit', 'reset'].includes(type)) {
+      return { name: compact(node.value || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '')), source: 'value' };
+    }
+    const title = compact(node.getAttribute('title'));
+    if (title) return { name: title, source: 'title' };
+    return { name: null, source: null };
+  };
+  const implicitRole = function(node, tag, type) {
+    if (tag === 'a' && node.hasAttribute('href')) return 'link';
+    if (tag === 'button' || tag === 'summary') return 'button';
+    if (tag === 'select') return node.multiple || node.size > 1 ? 'listbox' : 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'input') {
+      if (['checkbox', 'radio'].includes(type)) return type;
+      if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+      if (type === 'number') return 'spinbutton';
+      if (type === 'range') return 'slider';
+      if (type === 'search') return 'searchbox';
+      if (['text', 'email', 'tel', 'url'].includes(type)) return 'textbox';
+    }
+    return null;
+  };
+  const ariaBoolean = function(node, attribute) {
+    const value = node.getAttribute(attribute);
+    return value === 'true' ? true : value === 'false' ? false : null;
+  };
   const actionables = capped.map(function(node, index) {
     const ref = index + 1;
     node.setAttribute(refAttr, snapshot + ':' + ref);
-    const text = ((node.innerText || node.textContent || node.value || '') + '').trim().slice(0, 160);
+    const tag = node.tagName.toLowerCase();
+    const type = tag === 'input' || tag === 'button' ? node.type : null;
+    const autocomplete = (node.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
+    // Credential and file values must never enter either the new value field or the legacy text fallback.
+    const sensitive = type === 'password' || type === 'file' || autocomplete.some(function(token) {
+      return ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc'].includes(token);
+    });
+    const text = sensitive ? '' : ((node.innerText || node.textContent || node.value || '') + '').trim().slice(0, 160);
+    const name = accessibleName(node, tag, type);
+    const hasValue = tag === 'input' || tag === 'select' || tag === 'textarea';
+    const rawValue = hasValue && !sensitive ? String(node.value || '') : null;
+    const checkable = tag === 'input' && (type === 'checkbox' || type === 'radio');
+    const ariaChecked = node.getAttribute('aria-checked');
+    const selectedOptions = tag === 'select' && !sensitive ? Array.from(node.options).filter(function(option) { return option.selected; }) : null;
+    const ariaInvalid = node.getAttribute('aria-invalid');
     return {
       ref: '@' + ref,
-      tag: node.tagName.toLowerCase(),
-      role: node.getAttribute('role') || null,
-      name: (node.getAttribute('aria-label') || '').trim() || null,
+      tag: tag,
+      role: node.getAttribute('role') || implicitRole(node, tag, type),
+      name: name.name === null ? null : name.name.slice(0, 160),
+      name_source: name.source,
+      name_truncated: name.name !== null && name.name.length > 160,
       text: text,
       href: node.href || null,
-      disabled: !!(node.disabled || node.getAttribute('aria-disabled') === 'true')
+      disabled: !!(node.disabled || node.matches(':disabled') || node.getAttribute('aria-disabled') === 'true'),
+      type: type,
+      value: rawValue === null ? null : rawValue.slice(0, 160),
+      value_redacted: sensitive,
+      value_truncated: rawValue !== null && rawValue.length > 160,
+      checked: checkable ? (node.indeterminate ? 'mixed' : !!node.checked) : (ariaChecked === 'mixed' ? 'mixed' : ariaBoolean(node, 'aria-checked')),
+      selected: ariaBoolean(node, 'aria-selected'),
+      selected_options: selectedOptions === null ? null : selectedOptions.slice(0, 20).map(function(option) {
+        return { value: String(option.value).slice(0, 160), label: compact(option.label).slice(0, 160) };
+      }),
+      selected_options_truncated: selectedOptions !== null && (selectedOptions.length > 20 || selectedOptions.some(function(option) { return String(option.value).length > 160 || String(option.label).length > 160; })),
+      expanded: ariaBoolean(node, 'aria-expanded'),
+      invalid: (ariaInvalid !== null && ariaInvalid !== 'false') || (node.validity && !node.validity.valid) ? true : (node.validity || ariaInvalid !== null ? false : null)
     };
   });
   return JSON.stringify({
@@ -4967,6 +5056,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
       return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
     }),
+    actionable_schema: 'greppy.web.actionable.v2',
     actionables: actionables,
     ref_count: actionables.length,
     refs_truncated: candidates.length > capped.length

@@ -48,6 +48,15 @@ static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
 });
+// tsc/tsgo place the source location before the severity, unlike Rust's
+// leading `error:`. Require a numeric location and TS code, not arbitrary
+// prose containing the word "error". Match both plain compiler layouts.
+static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+error[\t ]+TS[0-9]+:",
+    )
+    .expect("bash-smart TypeScript error regex")
+});
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -638,7 +647,9 @@ fn detect_blocks(
     ] {
         let mut index = 0usize;
         while index < lines.len() {
-            let kind = if ERROR_MARKER_RE.is_match(lines[index].content) {
+            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+                || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
+            {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
@@ -2206,6 +2217,27 @@ mod tests {
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn typescript_file_prefixed_errors_count_in_either_stream() {
+        let diagnostics = b"apps/server/one.ts(12,3): error TS2375: incompatible value\n  property details\nC:\\project files\\two.ts(4,1): error TS377004: type failure\napps/web/three.ts:7:9 - error TS2322: bad assignment\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 3, "{blocks:?}");
+            assert!(blocks.iter().all(|block| block.kind == BlockKind::Error));
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(blocks[0].lines[1].bytes, b"  property details");
+        }
+    }
+
+    #[test]
+    fn typescript_words_without_a_compiler_location_are_not_errors() {
+        let text = split_lines(b"the docs mention error TS2322\nexample.ts(x,y): error TS2322: not a location\nexample.ts(1,1): error TSfoo: not a numeric code\nexample.ts(1,1): no error TS2322: all good\n");
+        assert!(detect_blocks(&text, &[]).is_empty());
     }
 
     #[test]

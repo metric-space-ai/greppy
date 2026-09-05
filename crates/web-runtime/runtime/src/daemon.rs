@@ -929,6 +929,10 @@ impl Daemon {
             "web.network" => self.web_records(&request, "network"),
             "web.events" => self.web_records(&request, "all"),
             "web.click" => self.web_locator_method(&request, "locator.click", json!({})),
+            "web.inspect" => self.web_locator_method(&request, "locator.inspect", json!({
+                "attrs": request.payload.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false),
+                "html": request.payload.get("html").and_then(|v| v.as_bool()).unwrap_or(false),
+            })),
             "web.fill" => self.web_fill(&request),
             "web.type" => self.web_type(&request),
             "web.check" => self.web_locator_method(&request, "locator.check", json!({})),
@@ -2781,6 +2785,7 @@ impl Daemon {
                             snapshot, ref_number
                         ),
                         "snapshot": snapshot,
+                        "observed_ref": ref_number,
                     });
                 }
                 let timeout = request
@@ -2803,6 +2808,15 @@ impl Daemon {
                 match self.engine_call(method, params) {
                     Ok(result) => {
                         self.finish_session(&session_id);
+                        if method == "locator.inspect" {
+                            let tagged = result.get("serialized").cloned().unwrap_or(json!(null));
+                            return Response::ok(request, json!({
+                                "session_id": session_id,
+                                "value": Self::plain_value(&tagged),
+                                "serialized": tagged,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }));
+                        }
                         let dispatch = result.get("dispatch").cloned();
                         let mut response = json!({
                             "session_id": session_id,
@@ -3075,6 +3089,32 @@ impl Daemon {
             self.recover_content("content worker exited before session operation")
                 .map_err(|error| engine_error(request, error, 33))?;
         }
+        // An explicit tab is a scoped target, not a request to silently use or
+        // switch the session's active page. Validate ownership before any work.
+        let requested_page = match request.payload.get("tab_id") {
+            None => None,
+            Some(value) => {
+                let Some(tab) = value.as_str().filter(|tab| !tab.is_empty()) else {
+                    return Err(protocol_error(request, "tab_id must be a non-empty string"));
+                };
+                let known = self.sessions.get(&session_id).is_some_and(|session| {
+                    session.page_id.as_deref() == Some(tab)
+                        || session.tabs.iter().any(|page| page == tab)
+                });
+                if !known {
+                    let mut error = ErrorObject::new(
+                        "TAB_NOT_FOUND",
+                        "the requested tab does not belong to this session (or was reset)",
+                        request.request_id.clone(),
+                        30,
+                        "run greppy web tab list --session SID and use a tab from that session",
+                    );
+                    error.session_id = Some(session_id.clone());
+                    return Err(Response::error(request, error));
+                }
+                Some(tab.to_owned())
+            }
+        };
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
         let content_pid = self.content.pid();
@@ -3135,10 +3175,9 @@ impl Daemon {
             Some(_) => unreachable!(),
             None => {}
         }
-        let page = self
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.page_id.clone());
+        let page = requested_page.or_else(|| {
+            self.sessions.get(&session_id).and_then(|session| session.page_id.clone())
+        });
         let page = match page {
             Some(page) => page,
             None => {
@@ -3205,7 +3244,7 @@ impl Daemon {
                     format!("{reason}: {}", redact_secrets(url)),
                     request.request_id.clone(),
                     36,
-                    "use the project profile for loopback fixtures",
+                    policy_recovery(reason),
                 );
                 error.session_id = Some(session_id.to_owned());
                 Response::error(request, error)
@@ -3851,8 +3890,28 @@ fn missing_session(request: &Request, session_id: &str) -> Response {
     Response::error(request, error)
 }
 
+fn policy_recovery(reason: &str) -> &'static str {
+    if reason.starts_with("research profile denies loopback and private networks") {
+        "do not retry this URL in the unchanged research session. For explicitly requested local development only, run `greppy web session create --profile project --json`, then pass the returned session ID with `--session SID` to the local operation. Project permits loopback; LAN and cloud metadata remain blocked"
+    } else {
+        "choose a permitted public HTTP(S) URL; do not retry the unchanged denied operation or restart the runtime. LAN and cloud metadata remain blocked in both profiles"
+    }
+}
+
 fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
     let message = message.into();
+    if let Some(reason) = message.strip_prefix("policy_denied:") {
+        let mut error = ErrorObject::new(
+            "policy_denied",
+            redact_secrets(&message),
+            request.request_id.clone(),
+            exit_code,
+            policy_recovery(reason.trim_start()),
+        );
+        error.session_id = request.session_id.clone();
+        error.retryable = false;
+        return Response::error(request, error);
+    }
     // The call is lost here on purpose: the worker died at an unknown point,
     // so replaying it could repeat a half-applied action. What the caller
     // needs is a signal it can branch on (finding 030): the CLI forgets the
@@ -4752,6 +4811,46 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn policy_denial_has_nonretrying_profile_guidance() {
+        let mut request = super::Request::new("policy-test", "web.open", json!({}));
+        request.session_id = Some("wrs_policy_test".into());
+        let response = super::engine_error(
+            &request,
+            "policy_denied: research profile denies loopback and private networks",
+            34,
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "policy_denied");
+        assert_eq!(error.exit_code, 34);
+        assert!(!error.retryable);
+        assert_eq!(error.session_id, request.session_id);
+        assert!(error
+            .next_action
+            .contains("session create --profile project --json"));
+        assert!(error.next_action.contains("explicitly requested local"));
+        assert!(error
+            .next_action
+            .contains("LAN and cloud metadata remain blocked"));
+        assert!(!error.next_action.contains("retry the operation"));
+    }
+
+    #[test]
+    fn policy_denial_never_suggests_project_as_metadata_bypass() {
+        for reason in [
+            "cloud metadata endpoint denied",
+            "LAN and non-public endpoints denied",
+        ] {
+            let request = super::Request::new("policy-test", "web.open", json!({}));
+            let response = super::engine_error(&request, format!("policy_denied: {reason}"), 34);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, "policy_denied");
+            assert!(!error.retryable);
+            assert!(!error.next_action.contains("session create"));
+            assert!(error.next_action.contains("permitted public"));
+        }
+    }
 
     #[test]
     fn parse_ps_time_minutes_and_seconds() {

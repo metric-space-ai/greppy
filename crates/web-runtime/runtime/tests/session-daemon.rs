@@ -3707,6 +3707,262 @@ fn observed_refs_drive_locators_and_expire_on_navigation() {
 }
 
 #[test]
+fn observed_form_state_tracks_properties_labels_and_redacts_credentials() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+<label for="choose">Choose Linen shirt</label><input id="choose" type="checkbox" value="on">
+<span id="qty">Quantity</span><span id="units">in units</span>
+<input id="quantity" type="number" aria-label="wrong precedence" aria-labelledby="qty units" value="2" disabled>
+<select id="size" aria-label="Size"><option value="s">Small</option><option value="m" selected>Medium</option></select>
+<button id="details" aria-expanded="false">Details</button>
+<input id="email" type="email" aria-label="Email" value="bad" required>
+<div role="option" aria-selected="true">Special shipping</div>
+<input type="password" aria-label="Password" value="PASSWORD-MUST-NOT-LEAK">
+<input autocomplete="one-time-code" aria-label="Verification code" value="OTP-MUST-NOT-LEAK">
+</body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-form-state-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_form_state", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, params| {
+        let response = unix_request(
+            &socket,
+            &Request::new("run_form_state", method, params),
+            Duration::from_secs(30),
+        )
+        .expect("form state request");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.expect("form state result")
+    };
+    let created = call("web.session.create", json!({"profile": "project"}));
+    let session = created["session_id"].as_str().unwrap();
+    call("web.goto", json!({"session_id": session, "url": fixture}));
+    let before = call("web.observe", json!({"session_id": session}));
+    let named = |view: &serde_json::Value, name: &str| {
+        view["actionables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {view}"))
+            .clone()
+    };
+    assert_eq!(before["actionable_schema"], "greppy.web.actionable.v2");
+    let checkbox = named(&before, "Choose Linen shirt");
+    assert_eq!(checkbox["role"], "checkbox");
+    assert_eq!(checkbox["type"], "checkbox");
+    assert_eq!(checkbox["checked"], false);
+    assert_eq!(checkbox["value"], "on", "value is not the checked state");
+    let quantity = named(&before, "Quantity in units");
+    assert_eq!(quantity["role"], "spinbutton");
+    assert_eq!(quantity["name_source"], "aria-labelledby");
+    assert_eq!(quantity["value"], "2");
+    assert_eq!(quantity["disabled"], true);
+    assert_eq!(
+        named(&before, "Size")["selected_options"],
+        json!([{"value":"m", "label":"Medium"}])
+    );
+    assert_eq!(named(&before, "Special shipping")["selected"], true);
+    assert_eq!(named(&before, "Details")["expanded"], false);
+    assert_eq!(named(&before, "Email")["invalid"], true);
+    for name in ["Password", "Verification code"] {
+        let item = named(&before, name);
+        assert!(item["value"].is_null());
+        assert_eq!(item["value_redacted"], true);
+    }
+    let serialized = before.to_string();
+    assert!(!serialized.contains("PASSWORD-MUST-NOT-LEAK"));
+    assert!(!serialized.contains("OTP-MUST-NOT-LEAK"));
+    let reference = checkbox["ref"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches('@')
+        .parse::<u64>()
+        .unwrap();
+    call(
+        "web.check",
+        json!({"session_id": session, "selector": {"type":"ref", "value":reference}}),
+    );
+    call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "document.getElementById('quantity').disabled = false; document.getElementById('quantity').value = '3'; document.getElementById('size').value = 's'; document.getElementById('details').setAttribute('aria-expanded', 'true'); document.getElementById('email').value = 'ada@example.com'; true"
+        }),
+    );
+    let after = call("web.observe", json!({"session_id":session}));
+    assert_eq!(named(&after, "Choose Linen shirt")["checked"], true);
+    assert_eq!(named(&after, "Quantity in units")["disabled"], false);
+    assert_eq!(named(&after, "Quantity in units")["value"], "3");
+    assert_eq!(
+        named(&after, "Size")["selected_options"],
+        json!([{"value":"s", "label":"Small"}])
+    );
+    assert_eq!(named(&after, "Details")["expanded"], true);
+    assert_eq!(named(&after, "Email")["invalid"], false);
+    call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "document.getElementById('choose').indeterminate = true; const size = document.getElementById('size'); size.multiple = true; for (let i = 0; i < 25; i++) { const option = document.createElement('option'); option.value = 'value-' + i; option.textContent = 'Option ' + i; size.appendChild(option); option.selected = true; } const email = document.getElementById('email'); email.type = 'text'; email.value = 'x'.repeat(200); document.getElementById('details').removeAttribute('aria-expanded'); true"
+        }),
+    );
+    let bounded = call("web.observe", json!({"session_id":session}));
+    assert_eq!(named(&bounded, "Choose Linen shirt")["checked"], "mixed");
+    let multiple = named(&bounded, "Size");
+    assert_eq!(multiple["role"], "listbox");
+    assert_eq!(multiple["selected_options"].as_array().unwrap().len(), 20);
+    assert_eq!(multiple["selected_options_truncated"], true);
+    let long_value = named(&bounded, "Email");
+    assert_eq!(long_value["value"].as_str().unwrap().len(), 160);
+    assert_eq!(long_value["value_truncated"], true);
+    assert!(named(&bounded, "Details")["expanded"].is_null());
+}
+
+#[test]
+fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+<label for="country">Country</label><select id="country" disabled data-proof="original"><option value="DE" selected>Germany</option></select>
+<script>window.inputEvents = 0; document.addEventListener('input', () => window.inputEvents++);</script>
+</body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-inspect-ref-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_inspect_ref", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_inspect_ref", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("inspect request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session, "url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        "@1"
+    );
+    let inspect = |sid: &str| {
+        call(
+            "web.inspect",
+            json!({"session_id":sid, "selector":{"type":"ref", "value":1}, "attrs":true, "html":true}),
+        )
+    };
+    let inspected = inspect(session);
+    assert_eq!(inspected.status, "ok", "{inspected:?}");
+    let result = inspected.result.as_ref().unwrap();
+    assert_eq!(result["value"]["count"].as_f64(), Some(1.0));
+    assert_eq!(result["value"]["node"]["id"], "country");
+    assert_eq!(result["value"]["node"]["value"], "DE");
+    assert_eq!(result["value"]["node"]["disabled"], true);
+    assert_eq!(result["value"]["node"]["attrs"]["data-proof"], "original");
+    assert!(result["value"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("Germany"));
+    assert_eq!(
+        result["untrusted_content_boundary"],
+        "UNTRUSTED_PAGE_CONTENT"
+    );
+    let tabs = call("web.tab.list", json!({"session_id":session}));
+    let first_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"]
+        .as_str()
+        .unwrap();
+    let new_tab = call("web.tab.new", json!({"session_id":session}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let explicit_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":first_tab, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        explicit_tab.status, "ok",
+        "explicit old tab must not become the active new tab: {explicit_tab:?}"
+    );
+    assert_eq!(
+        explicit_tab.result.as_ref().unwrap()["value"]["node"]["value"],
+        "DE"
+    );
+    let wrong_tab = inspect(session);
+    assert_eq!(
+        wrong_tab.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_tab:?}"
+    );
+    let unknown_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":"not-this-session-tab", "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        unknown_tab.error.as_ref().unwrap().code,
+        "TAB_NOT_FOUND",
+        "{unknown_tab:?}"
+    );
+    let switched = call(
+        "web.tab.switch",
+        json!({"session_id":session, "tab":first_tab}),
+    );
+    assert_eq!(switched.status, "ok", "{switched:?}");
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other_session = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let wrong_session = inspect(other_session);
+    assert_eq!(
+        wrong_session.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_session:?}"
+    );
+    let evaluated = call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "const original = document.getElementById('country'); const clone = original.cloneNode(true); original.replaceWith(clone); window.inputEvents"
+        }),
+    );
+    assert_eq!(
+        evaluated.result.as_ref().unwrap()["value"].as_f64(),
+        Some(0.0)
+    );
+    let replaced = inspect(session);
+    assert_eq!(
+        replaced.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{replaced:?}"
+    );
+    let stale_click = call(
+        "web.click",
+        json!({"session_id":session, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        stale_click.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{stale_click:?}"
+    );
+    let refreshed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(refreshed.status, "ok", "{refreshed:?}");
+    assert_eq!(inspect(session).status, "ok");
+    let reloaded = call("web.reload", json!({"session_id":session}));
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    let navigated = inspect(session);
+    assert_eq!(
+        navigated.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{navigated:?}"
+    );
+}
+
+#[test]
 fn project_profile_can_load_an_allowed_http_host() {
     let fixture_html: &'static str = Box::leak(
         format!(

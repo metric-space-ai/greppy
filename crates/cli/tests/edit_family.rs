@@ -305,6 +305,61 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_accepts_git_metadata_between_files_without_changing_payload_lines() {
+    let fixture = Fixture::new("patch-git-metadata");
+    let one = "diff --git is file content\nindex is file content\none\n";
+    std::fs::write(fixture.repo.join("one.txt"), one).unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let diff = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1,3 +1,3 @@\n diff --git is file content\n index is file content\n-one\n+ONE\ndiff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-two\n+TWO\n";
+
+    let dry_run = fixture.run_with_stdin(&["patch", "--dry-run"], diff.as_bytes());
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert_file(&fixture.repo.join("one.txt"), one);
+    assert_file(&fixture.repo.join("two.txt"), "two\n");
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(
+        &fixture.repo.join("one.txt"),
+        "diff --git is file content\nindex is file content\nONE\n",
+    );
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+}
+
+#[test]
+fn patch_git_metadata_keeps_late_context_refusal_atomic() {
+    let fixture = Fixture::new("patch-git-atomic");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let diff = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\ndiff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-missing\n+TWO\n";
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    assert!(combined(&output).contains("nothing written"));
+    assert_file(&fixture.repo.join("one.txt"), "one\n");
+    assert_file(&fixture.repo.join("two.txt"), "two\n");
+}
+
+#[test]
+fn patch_git_unsupported_sections_are_not_silently_dropped() {
+    let fixture = Fixture::new("patch-git-unsupported");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    let edit = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
+    for suffix in [
+        "diff --git a/two.txt b/two.txt\nold mode 100644\nnew mode 100755\n",
+        "diff --git a/two.bin b/two.bin\nindex 3333333..4444444 100644\nBinary files a/two.bin and b/two.bin differ\n",
+        "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+        "diff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n",
+    ] {
+        let diff = format!("{edit}{suffix}");
+        let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(20), "{text}");
+        assert!(text.contains("Git patch section"), "{text}");
+        assert!(text.contains("nothing written"), "{text}");
+        assert_file(&fixture.repo.join("one.txt"), "one\n");
+    }
+}
+
+#[test]
 fn write_accepts_borrow_of_raw_identifier_and_still_rejects_broken_rust() {
     let fixture = Fixture::new("write-rust-raw");
     let source = b"fn main() { let raw = 1; let _ = &raw; }\n";
