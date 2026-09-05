@@ -18,6 +18,7 @@ p.add_argument('--view', choices=('default','compact'), default='default')
 p.add_argument('--chain-view', choices=('default','compact'), default='default')
 p.add_argument('--runtime-id')
 p.add_argument('--latency-limitation')
+p.add_argument('--onboarding', choices=('legacy', 'explicit_transport_v1'), default='legacy')
 a=p.parse_args()
 if a.repeats < 1: p.error('repeats must be positive')
 if a.isolated_cli and not (a.alias_dir and a.runtime_id and a.runtime):
@@ -57,5 +58,6 @@ if a.isolated_cli:
     manifest['constraints'][1]='C has its own empty workspace and short CLI alias; native open may create the session; actual session identities audited'
     manifest['constraints'].append('Harness change, not a product optimization; compare separately with earlier series')
 if a.latency_limitation: manifest['constraints'].append(a.latency_limitation)
+if a.onboarding != 'legacy': manifest['onboarding_condition'] = a.onboarding
 (a.output/'plan.json').write_text(json.dumps(manifest,indent=2))
 print(json.dumps({'plan':str(a.output/'plan.json'),'trial_count':len(trials),'first':trials[0]}))
