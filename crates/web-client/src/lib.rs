@@ -5,6 +5,9 @@
 mod frame;
 mod protocol;
 
+/// Pure bounded select-choice projection shared by diagnostics and descriptions.
+pub const SELECT_CHOICES_JS: &str = include_str!("select-choices.js");
+
 /// Shared DOM description for native ref inspection and CLI query inspection.
 pub const DESCRIBE_NODE_JS: &str = include_str!("describe-node.js");
 
