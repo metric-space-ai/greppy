@@ -47,3 +47,20 @@ CLI association is lost. Probe 02 therefore remains failed even though its
 13 preceding checks passed. Evidence is in sibling directory
 `isolation-descriptor-20260905-02`; cleanup stopped both runtimes and HTTP thread.
 The fix worker received the exact reproduction and verified recovery path.
+
+A prospective Observe integration is retained as
+`bench/web_study/basic_fixture/observe_select_choices.patch`. It applies cleanly
+in dry-run against the fix worker's current content_worker.rs and was applied
+only to a separate scratch copy. It injects the single shared helper and adds
+`select_choices` only where applicable. No worker source was edited by Root.
+
+`observe_choices_test.cjs` executes that patched OBSERVE_JS with DOM-shaped
+objects. Three tests passed: initial actionable values and disabled groups,
+unchanged non-select state, and sensitive-option non-enumeration. Use explicit
+`GREPPY_OBSERVE_PROBE_SOURCE` pointing at patched content_worker.rs. This harness
+probe is deliberately separate from the crate's ordinary unit tests because
+Root's runtime branch does not yet contain the worker's E1 Observe generator.
+
+Existing selected_options still scans node.options; no reduction in full
+traversals is claimed. Native Observe integration and subsequent agent-token
+measurements remain pending.
