@@ -6,6 +6,7 @@ import unittest
 
 from contracts import canonical
 from study_corpus import index_trial, sha
+from test_web_goal_binding import artifacts
 
 
 class StudyCorpusTests(unittest.TestCase):
@@ -113,6 +114,25 @@ class StudyCorpusTests(unittest.TestCase):
         envelopes[1]['page_text'] = canonical(self.envelopes[1])
         self.fixture(envelopes)
         self.assertEqual(self.run_index()['observations'], [])
+
+    def test_prepared_goal_stays_separate_from_observation_and_delivery(self):
+        self.fixture()
+        _, prepared = artifacts(self.root)
+        dispatch = self.root / 'dispatch.json'
+        dispatch.write_text(canonical(prepared))
+        trial = json.loads(self.trial.read_text())
+        trial.update(run_id='run-a', position=1, arm='A', case='text',
+                     plan_sha256=prepared['plan_sha256'])
+        self.trial.write_text(canonical(trial))
+        binding = {'dispatch': str(dispatch), 'plan': str(self.root / 'plan.json')}
+        result = index_trial(self.trial, family='text', prepared_goal=binding)
+        self.assertFalse(result['prospective_goal_binding']['delivery_verified'])
+        self.assertIsNone(result['observations'][0]['goal'])
+        self.assertEqual(result['observations'][0]['admission'], 'held')
+        trial['plan_sha256'] = '0' * 64
+        self.trial.write_text(canonical(trial))
+        with self.assertRaisesRegex(ValueError, 'completed trial plan'):
+            index_trial(self.trial, family='text', prepared_goal=binding)
 
     def test_explicit_adapter_pair_retains_action_without_inventing_verb(self):
         wrapper = {'schema': 'greppy.web-study.action-observe.v1', 'action_exit_code': 0,

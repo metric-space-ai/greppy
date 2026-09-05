@@ -66,6 +66,25 @@ Durable receipts:
 - `/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/web-study-import-v1.json`
 - `/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/web-study-index-v3.json`
 
+## Prospective goal artifacts
+
+For future series, an import entry can include `prepared_goal` with `dispatch`
+and `plan` paths. `web_goal_binding.py` checks the study's versioned task-goal and
+prepared-dispatch schemas, exact goal/message/plan hashes, matching run, position,
+arm, case and execution configuration. The outcome trial must bind the same plan.
+All trials of the same case must carry an identical goal across arms and repeats.
+
+The resulting binding remains `prepared_not_sent`, with `delivery_verified: false`
+and `admission: held`. Only hashes and source pointers enter the index; neither
+the full harness prompt nor goal text is copied. Existing observation goals remain
+null. Claimed delivery embedded into a prepared artifact is refused; a separate
+validated delivery contract is still required. Historical plans without explicit
+goals cannot be backfilled through this interface. These checks establish internal
+consistency, not proof of when a file was created or that a message was sent.
+
+Seven goal-contract tests and one integrated study-index test exercise this
+boundary. No new study, dispatch or teacher call was started for these tests.
+
 Thirteen regression tests cover original-line addressing, corrupt traces, forged
 metadata, private-content exclusion, unknown/cross-session actions, unscoped
 protocol errors, result-only records and missing state. No episode is admitted

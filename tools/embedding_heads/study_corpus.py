@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 
 from contracts import canonical, digest, strict_json
+from web_goal_binding import prospective_goal
 
 TRIAL_SCHEMAS = {'greppy.web-study.pilot.v1', 'greppy.web-study.basic.v1'}
 ACTIONS = {'web.goto', 'web.back', 'web.forward', 'web.reload', 'web.click',
@@ -20,12 +21,21 @@ def load(path):
     return strict_json(raw), sha(raw)
 
 
-def index_trial(path, *, family, exclusion=None):
+def index_trial(path, *, family, exclusion=None, prepared_goal=None):
     path = Path(path).resolve()
     trial, trial_hash = load(path)
     if trial.get('schema') not in TRIAL_SCHEMAS:
         raise ValueError('unsupported completed study trial')
     artifacts = trial['artifacts']
+    goal_binding = None
+    if prepared_goal is not None:
+        if set(prepared_goal) != {'dispatch', 'plan'}:
+            raise ValueError('prepared goal requires exact dispatch and plan paths')
+        goal_binding = prospective_goal(prepared_goal['dispatch'], prepared_goal['plan'],
+                                      run_id=trial['run_id'], position=trial['position'],
+                                      arm=trial['arm'], case=trial['case'])
+        if goal_binding['plan_sha256'] != trial.get('plan_sha256'):
+            raise ValueError('prepared goal does not match completed trial plan')
     trace_path = Path(artifacts['trace']).resolve()
     metadata_path = Path(artifacts['metadata']).resolve()
     manifest_path = Path(artifacts['manifest']).resolve()
@@ -189,6 +199,7 @@ def index_trial(path, *, family, exclusion=None):
     return {'schema': 'greppy.heads.study-episode-index.v1', 'episode_id': episode_id,
             'family': family, 'group_key': family, 'split': 'development',
             'previously_exposed': True, 'final_eligible': False, 'production_eligible': False,
+            'prospective_goal_binding': goal_binding,
             'exclusion': exclusion, 'source': {'trial': str(path), 'trial_sha256': trial_hash,
                 'trace': str(trace_path), 'trace_sha256': manifest['sha256'],
                 'metadata': str(metadata_path), 'metadata_sha256': metadata_hash,
@@ -209,7 +220,8 @@ def main():
     source, source_hash = load(args.manifest)
     if source.get('schema') != 'greppy.heads.study-import.v1':
         raise ValueError('unsupported study import manifest')
-    episodes = [index_trial(item['trial'], family=item['family'], exclusion=item.get('exclusion'))
+    episodes = [index_trial(item['trial'], family=item['family'], exclusion=item.get('exclusion'),
+                            prepared_goal=item.get('prepared_goal'))
                 for item in source['trials']]
     if len({item['episode_id'] for item in episodes}) != len(episodes):
         raise ValueError('duplicate source episodes')
