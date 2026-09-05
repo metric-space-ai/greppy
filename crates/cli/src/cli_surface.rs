@@ -444,7 +444,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Apply a unified diff to every named file as one transaction.
+    /// Apply a unified diff to existing files as one transaction.
+    ///
+    /// File creation and deletion are not supported. To create a file, use
+    /// `greppy write PATH` with content on stdin; it is a separate transaction,
+    /// not atomic with edits in a patch.
     Patch {
         #[arg(value_name = "DIFF", allow_hyphen_values = true)]
         diff: Option<String>,

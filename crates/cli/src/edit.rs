@@ -1878,6 +1878,7 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             index += 1;
             continue;
         }
+        let creates_file = lines[index][4..].split_whitespace().next() == Some("/dev/null");
         index += 1;
         let Some(next) = lines.get(index).filter(|line| line.starts_with("+++ ")) else {
             return Err(EditRefusal::new(
@@ -1889,10 +1890,19 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
         let Some(path) = trained_patch_path(&next[4..]) else {
             return Err(EditRefusal::new(
                 "invalid_patch",
-                "file creation and deletion are not supported by patch",
+                "patch only edits existing files; file deletion is not supported — nothing written",
                 20,
             ));
         };
+        if creates_file {
+            return Err(EditRefusal::new(
+                "invalid_patch",
+                format!(
+                    "{path}: patch only edits existing files; to create a file, use `greppy write PATH` with its content on stdin. This is a separate transaction, not atomic with edits in this patch — nothing written"
+                ),
+                20,
+            ));
+        }
         index += 1;
         let mut hunks = Vec::new();
         while index < lines.len() && !lines[index].starts_with("--- ") {

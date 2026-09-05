@@ -305,6 +305,60 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_creation_refusal_explains_recovery_and_preserves_transaction() {
+    let fixture = Fixture::new("patch-create");
+    std::fs::write(fixture.repo.join("existing.txt"), "before\n").unwrap();
+    let creation = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+new\n";
+    let mixed = format!(
+        "--- a/existing.txt\n+++ b/existing.txt\n@@ -1,1 +1,1 @@\n-before\n+after\n{creation}"
+    );
+    for diff in [creation, mixed.as_str()] {
+        for args in [vec!["patch", "--dry-run"], vec!["patch"]] {
+            let output = fixture.run_with_stdin(&args, diff.as_bytes());
+            let text = combined(&output);
+            assert_eq!(output.status.code(), Some(20), "{text}");
+            assert!(text.contains("patch only edits existing files"), "{text}");
+            assert!(text.contains("greppy write"), "{text}");
+            assert!(text.contains("separate transaction"), "{text}");
+            assert!(text.contains("nothing written"), "{text}");
+            assert!(!fixture.repo.join("new.txt").exists());
+            assert_file(&fixture.repo.join("existing.txt"), "before\n");
+        }
+    }
+}
+
+#[test]
+fn patch_deletion_and_contextless_edit_remain_explicit_refusals() {
+    let fixture = Fixture::new("patch-delete");
+    std::fs::write(fixture.repo.join("existing.txt"), "before\n").unwrap();
+    let deletion = "--- a/existing.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-before\n";
+    let output = fixture.run_with_stdin(&["patch"], deletion.as_bytes());
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(20), "{text}");
+    assert!(text.contains("file deletion is not supported"), "{text}");
+    assert!(text.contains("nothing written"), "{text}");
+    assert_file(&fixture.repo.join("existing.txt"), "before\n");
+
+    let insertion = "--- a/existing.txt\n+++ b/existing.txt\n@@ -0,0 +1,1 @@\n+new\n";
+    let output = fixture.run_with_stdin(&["patch"], insertion.as_bytes());
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(20), "{text}");
+    assert!(text.contains("no context line to anchor on"), "{text}");
+    assert_file(&fixture.repo.join("existing.txt"), "before\n");
+}
+
+#[test]
+fn patch_help_discloses_existing_file_only_contract() {
+    let fixture = Fixture::new("patch-help");
+    let output = fixture.run(&["patch", "--help"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("existing files"), "{text}");
+    assert!(text.contains("greppy write"), "{text}");
+    assert!(text.contains("separate transaction"), "{text}");
+}
+
+#[test]
 fn dead_edit_prefix_is_refused_and_double_dash_preserves_hyphen_payloads() {
     let fixture = Fixture::new("dead-prefix");
 
