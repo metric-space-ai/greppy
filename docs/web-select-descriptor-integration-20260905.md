@@ -41,3 +41,16 @@ change, and no comparison gate passes on the basis of these tests. Native
 Select refusal/postcondition fixes are owned by the fix worker. Full Observe
 integration is a separate pending change: Inspect alone does not remove the
 first lookup when the initial page observation lacks option values.
+
+Follow-up native probe 02 (Exec 6183, exit 1) completed the descriptor checks:
+actual Servo DOM produced the exact empty/ascending/descending value-to-label
+mapping and marked the disabled optgroup option unavailable. Candidate hashes
+remained unchanged. This still used explicit `web js`, not rebuilt Inspect.
+
+The context regression is now isolated: both implicit own observations worked
+before the foreign access, both failed afterward, and both explicit own-session
+observations still read the original pages. Engine state survives; the implicit
+CLI association is lost. Probe 02 therefore remains failed even though its
+13 preceding checks passed. Evidence is in sibling directory
+`isolation-descriptor-20260905-02`; cleanup stopped both runtimes and HTTP thread.
+The fix worker received the exact reproduction and verified recovery path.
