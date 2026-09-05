@@ -1203,6 +1203,12 @@ impl ContentEngine {
         }
     }
 
+    fn has_live_pages(&self) -> bool {
+        self.pages
+            .values()
+            .any(|slot| matches!(slot, PageSlot::Live { .. }))
+    }
+
     fn dispose_all_pages(&mut self) {
         let live: Vec<(String, u64)> = self
             .pages
@@ -4972,11 +4978,13 @@ pub fn run() -> io::Result<()> {
         if engine.parent_dead() {
             return Ok(());
         }
-        // Protocol first. Spinning Servo before recv starved engine calls when
-        // browser.close left a wake bit with no pages and spin_event_loop
-        // blocked; the supervisor then sat in session.setProfile until the
-        // client Unix read deadline expired as EAGAIN.
-        let wait = if engine.pages.is_empty() {
+        // Protocol first. Spin only while a live WebView exists.
+        // dispose_page keeps Disposed tombstones in `pages` for generation
+        // checks, so `pages.is_empty()` stays false after browser.close.
+        // Spinning in that state blocked on a wake bit with no pages, and
+        // the next web.run sat in session.setProfile until the client Unix
+        // read deadline expired as EAGAIN.
+        let wait = if !engine.has_live_pages() {
             Duration::from_millis(200)
         } else if engine.wake.take_pending() {
             Duration::ZERO
@@ -5041,7 +5049,7 @@ pub fn run() -> io::Result<()> {
             Ok(Err(error)) if is_parent_eof(&error) => return Ok(()),
             Ok(Err(error)) => return Err(error),
             Err(RecvTimeoutError::Timeout) => {
-                if !engine.pages.is_empty() {
+                if engine.has_live_pages() {
                     let started = Instant::now();
                     engine.servo.spin_event_loop();
                     let elapsed = started.elapsed();
