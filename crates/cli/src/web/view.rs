@@ -67,6 +67,22 @@ fn string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+// These are known v2 presentation defaults, not task state. In particular,
+// checked/selected/expanded=false and unknown fields must remain visible.
+fn v2_presentation_default(key: &str, value: &Value) -> bool {
+    match key {
+        "disabled"
+        | "invalid"
+        | "name_truncated"
+        | "selected_options_truncated"
+        | "value_redacted"
+        | "value_truncated" => value == &Value::Bool(false),
+        "selected_options" => value.is_null(),
+        "name_source" => matches!(value.as_str(), Some("label" | "contents" | "aria-label")),
+        _ => false,
+    }
+}
+
 fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
     let receipt = payload
         .get("result")
@@ -177,6 +193,8 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
         }
         body.push_str("A failed operation does not imply rollback of earlier actions.\n");
     } else if let Some(actions) = result.get("actionables").and_then(Value::as_array) {
+        let actionable_v2 = result.get("actionable_schema").and_then(Value::as_str)
+            == Some("greppy.web.actionable.v2");
         for key in ["title", "url"] {
             if let Some(value) = result.get(key).filter(|v| !v.is_null()) {
                 body.push_str(&format!("{key}: {value}\n"));
@@ -212,6 +230,9 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
                     continue;
                 }
                 if let Some(value) = a.get(key).filter(|v| !v.is_null()) {
+                    if actionable_v2 && v2_presentation_default(key, value) {
+                        continue;
+                    }
                     body.push_str(&format!(" {key}={value}"));
                 }
             }
@@ -223,6 +244,7 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
                         "selected", "disabled", "expanded", "invalid", "href",
                     ]
                     .contains(&key.as_str())
+                        && !(actionable_v2 && v2_presentation_default(key, value))
                     {
                         body.push_str(&format!(" {}={value}", quote(key)));
                     }
@@ -248,6 +270,11 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
                 .contains(&key.as_str())
                     && !value.is_null()
                     && value != &json!([])
+                    && !(actionable_v2
+                        && (key == "actionable_schema"
+                            || (key == "ref_count"
+                                && value.as_u64() == Some(actions.len() as u64))
+                            || (key == "refs_truncated" && value == &Value::Bool(false))))
                 {
                     body.push_str(&format!("{}: {value}\n", quote(key)));
                 }
@@ -502,6 +529,88 @@ mod tests {
     fn observed(text: &str) -> Value {
         json!({"operation":"web.observe", "request_id":"request-a", "status":"ok", "result":{"title":"Checkout", "url":"https://fixture.invalid/", "text":text, "actionables":[{"ref":"@1", "role":"checkbox", "tag":"input", "name":"Choose", "text":"on", "checked":false, "disabled":false}, {"ref":"@2", "tag":"input", "name":"Quantity", "value":"2", "invalid":true}], "refs_truncated":false}})
     }
+    #[test]
+    fn v2_compacts_defaults_but_keeps_decision_states_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut payload = observed("Inventory");
+        payload["result"]["actionable_schema"] = json!("greppy.web.actionable.v2");
+        payload["result"]["ref_count"] = json!(2);
+        let control = &mut payload["result"]["actionables"][0];
+        for key in [
+            "invalid",
+            "name_truncated",
+            "selected_options_truncated",
+            "value_redacted",
+            "value_truncated",
+        ] {
+            control[key] = json!(false);
+        }
+        control["name_source"] = json!("label");
+        control["selected_options"] = Value::Null;
+        control["selected"] = json!(false);
+        control["expanded"] = json!(false);
+        control["future_state"] = json!(false);
+        payload["result"]["actionables"][1]["selected_options"] =
+            json!([{"label":"EU","value":"EU"}]);
+        payload["result"]["actionables"][1]["value_redacted"] = json!(true);
+        payload["result"]["actionables"][1]["name_truncated"] = json!(true);
+        let out = render(&payload, scope(), tmp.path()).unwrap();
+        for expected in [
+            "checked=false",
+            "selected=false",
+            "expanded=false",
+            "invalid=true",
+            "\"future_state\"=false",
+            "\"value_redacted\"=true",
+            "\"name_truncated\"=true",
+            "\"selected_options\"=[{\"label\":\"EU\",\"value\":\"EU\"}]",
+        ] {
+            assert!(out.contains(expected), "missing {expected}: {out}");
+        }
+        for omitted in [
+            "disabled=false",
+            "invalid=false",
+            "\"name_source\"",
+            "\"selected_options\"=null",
+            "\"value_redacted\"=false",
+            "\"name_truncated\"=false",
+            "\"ref_count\"",
+            "\"refs_truncated\": false",
+            "\"actionable_schema\"",
+        ] {
+            assert!(!out.contains(omitted), "repeated default {omitted}: {out}");
+        }
+        // Inconsistent counts and a truncation warning must never disappear.
+        payload["result"]["ref_count"] = json!(100);
+        payload["result"]["refs_truncated"] = json!(true);
+        let out = render(&payload, scope(), tmp.path()).unwrap();
+        assert!(out.contains("\"ref_count\": 100"));
+        assert!(out.contains("\"refs_truncated\": true"));
+    }
+
+    #[test]
+    fn future_actionable_schema_does_not_inherit_v2_default_omissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut payload = observed("Future schema");
+        payload["result"]["actionable_schema"] = json!("greppy.web.actionable.v99");
+        payload["result"]["actionables"][0]["name_source"] = json!("label");
+        payload["result"]["actionables"][0]["name_truncated"] = json!(false);
+        payload["result"]["actionables"][0]["selected_options"] = Value::Null;
+        let out = render(&payload, scope(), tmp.path()).unwrap();
+        for expected in [
+            "disabled=false",
+            "\"name_source\"=\"label\"",
+            "\"name_truncated\"=false",
+            "\"selected_options\"=null",
+            "greppy.web.actionable.v99",
+        ] {
+            assert!(
+                out.contains(expected),
+                "missing future field {expected}: {out}"
+            );
+        }
+    }
+
     #[test]
     fn states_are_evidence_not_inferred_from_on_or_ok() {
         let tmp = tempfile::tempdir().unwrap();
