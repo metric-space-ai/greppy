@@ -34,6 +34,28 @@ mod response_tests {
     }
 
     #[test]
+    fn reference_conditions_use_bound_nodes_not_css_and_reject_bad_refs() {
+        use clap::Parser;
+        let parsed = TestCli::try_parse_from(["test", "assert", "@3", "--absent"]).unwrap();
+        let ExpectCommand::Assert { condition } = parsed.command else {
+            panic!("assert")
+        };
+        let source = condition_expression(&condition).unwrap();
+        assert!(source.contains("__greppyConditionNodes"));
+        assert!(!source.contains("querySelector"));
+        let mut payload = json!({});
+        bind_condition_payload(&condition, &mut payload).unwrap();
+        assert_eq!(payload["condition_ref"], json!({"type":"ref", "value":3}));
+        for malformed in ["@", "@0", "@-1", "@3x", "@18446744073709551616"] {
+            let parsed = TestCli::try_parse_from(["test", "assert", malformed]).unwrap();
+            let ExpectCommand::Assert { condition } = parsed.command else {
+                panic!("assert")
+            };
+            assert!(condition_expression(&condition).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
     fn native_wait_is_explicit_and_rejects_a_conflicting_poll_interval() {
         use clap::Parser;
         let native = TestCli::try_parse_from(["test", "wait", "css=#late", "--native"]).unwrap();
@@ -183,7 +205,8 @@ mod response_tests {
 pub struct Condition {
     /// Node query: css=, xpath=, text=, text~/re/, role=, id=, tag=.
     /// text= matches normalized whole-element text; text~/re/ matches a part.
-    /// A bare argument is a CSS selector. Time durations are not conditions.
+    /// @N is a node from this tab's observation; stale refs remain errors,
+    /// including with --absent. A bare argument is a CSS selector.
     pub query: Option<String>,
     /// Match on the document URL instead of a node, e.g. `--url '~/\/done$/'`.
     #[arg(long)]
@@ -255,9 +278,16 @@ pub(super) fn dispatch(command: ExpectCommand, root: Option<&str>) -> Result<i32
 fn condition_expression(condition: &Condition) -> std::result::Result<String, String> {
     let mut checks: Vec<String> = Vec::new();
     if let Some(query) = &condition.query {
-        super::see::validate_condition_query(query)?;
-        let body = "return { holds: nodes.length > 0, detail: { matched: nodes.length } };";
-        checks.push(super::see::query_expression_pub(query, body));
+        if condition_ref_selector(condition)?.is_some() {
+            // This lexical binding is supplied by the runtime only after
+            // session/page/snapshot and live node identity have been checked.
+            // An older runtime must fail, not treat an unbound ref as absent.
+            checks.push("(function(){ if (typeof __greppyConditionNodes === 'undefined') throw new Error('REF_CONDITION_UNSUPPORTED: use a matching CLI and runtime'); return { holds: __greppyConditionNodes.length > 0, detail: { matched: __greppyConditionNodes.length } }; })()".into());
+        } else {
+            super::see::validate_condition_query(query)?;
+            let body = "return { holds: nodes.length > 0, detail: { matched: nodes.length } };";
+            checks.push(super::see::query_expression_pub(query, body));
+        }
     }
     if let Some(pattern) = &condition.url {
         checks.push(text_check("location.href", pattern)?);
@@ -279,6 +309,33 @@ fn condition_expression(condition: &Condition) -> std::result::Result<String, St
             ))
         }
     }
+}
+
+fn condition_ref_selector(
+    condition: &Condition,
+) -> std::result::Result<Option<serde_json::Value>, String> {
+    let Some(query) = condition
+        .query
+        .as_deref()
+        .filter(|q| q.trim().starts_with('@'))
+    else {
+        return Ok(None);
+    };
+    parse_target(query, false, false, None)
+        .map(|target| Some(target.selector))
+        .map_err(|error| error.message)
+}
+
+fn bind_condition_payload(
+    condition: &Condition,
+    payload: &mut serde_json::Value,
+) -> std::result::Result<(), ErrorObject> {
+    if let Some(selector) =
+        condition_ref_selector(condition).map_err(|message| query_syntax(&message))?
+    {
+        payload["condition_ref"] = selector;
+    }
+    Ok(())
 }
 
 /// `value` compared against either `/regex/flags` or an exact string.
@@ -317,13 +374,13 @@ fn text_check(accessor: &str, pattern: &str) -> std::result::Result<String, Stri
 /// Ask the selected page once. Invalid replies cannot prove presence or absence.
 fn evaluate_condition(
     root: Option<&str>,
-    session: Option<String>,
-    tab: Option<String>,
+    condition: &Condition,
     source: &str,
 ) -> std::result::Result<(bool, serde_json::Value), ErrorObject> {
-    let session = resolve_session(root, session)?;
+    let session = resolve_session(root, condition.session.clone())?;
     let mut payload = json!({ "session_id": session, "source": source });
-    if let Some(tab) = resolve_tab(root, tab) {
+    bind_condition_payload(condition, &mut payload)?;
+    if let Some(tab) = resolve_tab(root, condition.tab.clone()) {
         payload["tab_id"] = json!(tab);
     }
     let response = rpc_response(root, "web.evaluate", payload, Some(session))?;
@@ -438,12 +495,15 @@ fn wait_native(root: Option<&str>, condition: Condition, timeout: u64) -> Result
             invalid("web wait: timeout exceeds the supported monotonic clock range"),
         );
     }
-    let session = match resolve_session(root, condition.session) {
+    let session = match resolve_session(root, condition.session.clone()) {
         Ok(session) => session,
         Err(error) => return emit_error(condition.json, error),
     };
     let mut payload = json!({"session_id": session, "source": source, "timeout_ms": timeout});
-    if let Some(tab) = resolve_tab(root, condition.tab) {
+    if let Err(error) = bind_condition_payload(&condition, &mut payload) {
+        return emit_error(condition.json, error);
+    }
+    if let Some(tab) = resolve_tab(root, condition.tab.clone()) {
         payload["tab_id"] = json!(tab);
     }
     let started = Instant::now();
@@ -470,12 +530,7 @@ fn wait(root: Option<&str>, condition: Condition, timeout: u64, interval: u64) -
     let started = Instant::now();
     let mut last_detail = json!(null);
     loop {
-        match evaluate_condition(
-            root,
-            condition.session.clone(),
-            condition.tab.clone(),
-            &source,
-        ) {
+        match evaluate_condition(root, &condition, &source) {
             Err(error) => return emit_error(condition.json, error),
             Ok((holds, detail)) => {
                 last_detail = detail;
@@ -517,12 +572,7 @@ fn assert_once(root: Option<&str>, condition: Condition) -> Result<i32> {
             return emit_error(condition.json, invalid(&format!("web assert: {message}")));
         }
     };
-    match evaluate_condition(
-        root,
-        condition.session.clone(),
-        condition.tab.clone(),
-        &source,
-    ) {
+    match evaluate_condition(root, &condition, &source) {
         Err(error) => emit_error(condition.json, error),
         Ok((holds, detail)) => {
             let satisfied = holds != condition.absent;
