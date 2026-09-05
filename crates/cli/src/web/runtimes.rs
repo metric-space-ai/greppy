@@ -130,6 +130,16 @@ fn pw(
     } else {
         format!("return ({trimmed});")
     };
+    let result_marker = format!(
+        "PWRESULT-{}-{} ",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let marker_literal = serde_json::to_string(&result_marker)
+        .expect("a string result marker is always JSON serializable");
     let program = format!(
         "import {{ chromium }} from \"playwright\";\n\
          const browser = await chromium.launch();\n\
@@ -141,7 +151,7 @@ fn pw(
          }} finally {{\n\
            try {{ await browser.close(); }} catch {{}}\n\
          }}\n\
-         throw new Error(\"PWRESULT \" + JSON.stringify(__value === undefined ? null : __value));\n"
+         console.log({marker_literal} + JSON.stringify(__value === undefined ? null : __value));\n"
     );
     let dir = std::path::Path::new(root.unwrap_or(".")).join(".greppy/web/pw");
     if let Err(error) = std::fs::create_dir_all(&dir) {
@@ -172,25 +182,14 @@ fn pw(
         Some(session),
     );
     let _ = std::fs::remove_file(&path);
-    // web.run reports completion, not a value, so the snippet hands its result
-    // back by throwing a marker. Unpack it here: a snippet that returned a
-    // value is a success, not the failure the raw response looks like.
+    // Successful snippets return through captured controller stdout, never by
+    // throwing an exception. An engine/script failure remains a failure even
+    // if its message contains something that looks like a result marker.
     match response {
         Err(error) => emit_error(json_out, error),
         Ok(response) => {
-            let message = response
-                .error
-                .as_ref()
-                .map(|error| error.message.clone())
-                .unwrap_or_default();
-            match message.find("PWRESULT ") {
-                Some(at) => {
-                    let tail = &message[at + 9..];
-                    let value = serde_json::Deserializer::from_str(tail)
-                        .into_iter::<serde_json::Value>()
-                        .next()
-                        .and_then(std::result::Result::ok)
-                        .unwrap_or(json!(null));
+            match decode_pw_response(&response, &result_marker) {
+                Ok(value) => {
                     // Carry the runtime's measurements through. Unpacking the
                     // result must not cost the caller the numbers that came
                     // with it -- they are the only view of what the snippet
@@ -207,24 +206,96 @@ fn pw(
                     )?;
                     Ok(0)
                 }
-                // No marker means the snippet failed before it could return.
-                None => match response.error {
-                    Some(error) => emit_error(json_out, error),
-                    None => {
-                        emit_web(
-                            json_out,
-                            &json!({
-                                "schema": "greppy.web-runtime.v1",
-                                "status": "ok",
-                                "operation": "web.pw",
-                                "result": { "value": null },
-                            }),
-                        )?;
-                        Ok(0)
-                    }
-                },
+                Err(error) => emit_error(json_out, error),
             }
         }
+    }
+}
+
+fn decode_pw_response(
+    response: &greppy_web_client::Response,
+    marker: &str,
+) -> std::result::Result<serde_json::Value, greppy_web_client::ErrorObject> {
+    if let Some(error) = &response.error {
+        return Err(error.clone());
+    }
+    if response.status != "ok" {
+        return Err(invalid(
+            "web pw: runtime did not report successful completion",
+        ));
+    }
+    let stdout = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("stdout"))
+        .and_then(|stdout| stdout.as_str())
+        .unwrap_or("");
+    let mut values = stdout.lines().filter_map(|line| line.strip_prefix(marker));
+    let Some(value) = values.next() else {
+        return Err(invalid(
+            "web pw: completed without a result receipt; preserve the runtime log and retry",
+        ));
+    };
+    if values.next().is_some() {
+        return Err(invalid(
+            "web pw: duplicate result receipts from the controller",
+        ));
+    }
+    serde_json::from_str(value)
+        .map_err(|_| invalid("web pw: malformed result receipt from the controller"))
+}
+
+#[cfg(test)]
+mod pw_result_tests {
+    use super::*;
+
+    fn response(stdout: &str) -> greppy_web_client::Response {
+        greppy_web_client::Response {
+            schema: "greppy.web-runtime.v1".into(),
+            request_id: "test".into(),
+            operation: "web.run".into(),
+            status: "ok".into(),
+            result: Some(json!({"stdout": stdout})),
+            artifacts: vec![],
+            metrics: Default::default(),
+            error: None,
+            handshake: None,
+        }
+    }
+
+    #[test]
+    fn pw_decodes_only_its_successful_result_receipt() {
+        assert_eq!(
+            decode_pw_response(&response("user log\nreceipt {\"value\":3}"), "receipt ").unwrap(),
+            json!({"value":3})
+        );
+        assert_eq!(
+            decode_pw_response(&response("receipt null"), "receipt ").unwrap(),
+            json!(null)
+        );
+        for stdout in [
+            "",
+            "other null",
+            "receipt broken",
+            "receipt null trailing",
+            "receipt 1\nreceipt 2",
+        ] {
+            assert!(
+                decode_pw_response(&response(stdout), "receipt ").is_err(),
+                "{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn pw_never_converts_a_script_error_into_success() {
+        let mut failed = response("receipt 42");
+        let error = invalid("controller script failed: PWRESULT 42");
+        failed.error = Some(error.clone());
+        failed.status = "error".into();
+        assert_eq!(decode_pw_response(&failed, "receipt ").unwrap_err(), error);
+        failed.error = None;
+        assert!(decode_pw_response(&failed, "receipt ").is_err());
     }
 }
 
