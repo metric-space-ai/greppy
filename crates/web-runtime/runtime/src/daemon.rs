@@ -2742,52 +2742,66 @@ impl Daemon {
         }
     }
 
+    // All native target-taking paths must bind refs before the content worker
+    // resolves a node. Type/targeted press focus first, but that is not a reason
+    // to bypass the same session/page/snapshot validation used by other actions.
+    fn bind_observed_selector(
+        &self,
+        request: &Request,
+        session_id: &str,
+        page: &str,
+        mut selector: serde_json::Value,
+    ) -> Result<serde_json::Value, Response> {
+        if selector.get("type").and_then(|value| value.as_str()) != Some("ref") {
+            return Ok(selector);
+        }
+        let Some(ref_number) = selector.get("value").and_then(|value| value.as_u64()) else {
+            return Err(protocol_error(
+                request,
+                "ref selector requires a positive integer value",
+            ));
+        };
+        let snapshot = self.sessions.get(session_id).and_then(|session| {
+            session.locator_snapshot.as_ref().and_then(|snapshot| {
+                (snapshot.page_id == page && ref_number > 0 && ref_number <= snapshot.ref_count)
+                    .then(|| snapshot.token.clone())
+            })
+        });
+        let Some(snapshot) = snapshot else {
+            return Err(locator_error(
+                request,
+                "STALE_REF: run web.observe and use a ref from its current page snapshot",
+            ));
+        };
+        selector = json!({
+            "type": "css",
+            "value": format!("[data-greppy-ref=\"{}:{}\"]", snapshot, ref_number),
+            "snapshot": snapshot,
+            "observed_ref": ref_number,
+        });
+        Ok(selector)
+    }
+
     fn web_locator_method(
         &mut self,
         request: &Request,
         method: &str,
         extra: serde_json::Value,
     ) -> Response {
-        let Some(mut selector) = request.payload.get("selector").cloned() else {
-            return protocol_error(
-                request,
-                &format!("{} requires selector", request.operation),
-            );
+        let Some(selector) = request.payload.get("selector").cloned() else {
+            return protocol_error(request, &format!("{} requires selector", request.operation));
         };
         match self.with_session_page(request, &request.operation) {
             Err(response) => response,
             Ok((session_id, page)) => {
-                if selector.get("type").and_then(|value| value.as_str()) == Some("ref") {
-                    let Some(ref_number) = selector.get("value").and_then(|value| value.as_u64())
-                    else {
-                        self.finish_session(&session_id);
-                        return protocol_error(request, "ref selector requires a positive integer value");
+                let selector =
+                    match self.bind_observed_selector(request, &session_id, &page, selector) {
+                        Ok(selector) => selector,
+                        Err(response) => {
+                            self.finish_session(&session_id);
+                            return response;
+                        }
                     };
-                    let snapshot = self.sessions.get(&session_id).and_then(|session| {
-                        session.locator_snapshot.as_ref().and_then(|snapshot| {
-                            (snapshot.page_id == page
-                                && ref_number > 0
-                                && ref_number <= snapshot.ref_count)
-                                .then(|| snapshot.token.clone())
-                        })
-                    });
-                    let Some(snapshot) = snapshot else {
-                        self.finish_session(&session_id);
-                        return locator_error(
-                            request,
-                            "STALE_REF: run web.observe and use a ref from its current page snapshot",
-                        );
-                    };
-                    selector = json!({
-                        "type": "css",
-                        "value": format!(
-                            "[data-greppy-ref=\"{}:{}\"]",
-                            snapshot, ref_number
-                        ),
-                        "snapshot": snapshot,
-                        "observed_ref": ref_number,
-                    });
-                }
                 let timeout = request
                     .payload
                     .get("timeout")
@@ -2810,12 +2824,15 @@ impl Daemon {
                         self.finish_session(&session_id);
                         if method == "locator.inspect" {
                             let tagged = result.get("serialized").cloned().unwrap_or(json!(null));
-                            return Response::ok(request, json!({
-                                "session_id": session_id,
-                                "value": Self::plain_value(&tagged),
-                                "serialized": tagged,
-                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
-                            }));
+                            return Response::ok(
+                                request,
+                                json!({
+                                    "session_id": session_id,
+                                    "value": Self::plain_value(&tagged),
+                                    "serialized": tagged,
+                                    "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                                }),
+                            );
                         }
                         let dispatch = result.get("dispatch").cloned();
                         let mut response = json!({
@@ -2823,7 +2840,8 @@ impl Daemon {
                             "ok": true,
                             "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
                         });
-                        if let (Some(dispatch), Some(object)) = (dispatch, response.as_object_mut()) {
+                        if let (Some(dispatch), Some(object)) = (dispatch, response.as_object_mut())
+                        {
                             object.insert("dispatch".into(), dispatch);
                         }
                         Response::ok(request, response)
@@ -2870,6 +2888,14 @@ impl Daemon {
         match self.with_session_page(request, "web.type") {
             Err(response) => response,
             Ok((session_id, page)) => {
+                let selector =
+                    match self.bind_observed_selector(request, &session_id, &page, selector) {
+                        Ok(selector) => selector,
+                        Err(response) => {
+                            self.finish_session(&session_id);
+                            return response;
+                        }
+                    };
                 let timeout = request
                     .payload
                     .get("timeout")
@@ -2883,10 +2909,8 @@ impl Daemon {
                     self.finish_session(&session_id);
                     return locator_error(request, error);
                 }
-                match self.engine_call(
-                    "page.keyboard.type",
-                    json!({ "page": page, "text": text }),
-                ) {
+                match self.engine_call("page.keyboard.type", json!({ "page": page, "text": text }))
+                {
                     Ok(_) => {
                         self.finish_session(&session_id);
                         Response::ok(
@@ -2921,6 +2945,14 @@ impl Daemon {
             Err(response) => response,
             Ok((session_id, page)) => {
                 if let Some(selector) = request.payload.get("selector").cloned() {
+                    let selector =
+                        match self.bind_observed_selector(request, &session_id, &page, selector) {
+                            Ok(selector) => selector,
+                            Err(response) => {
+                                self.finish_session(&session_id);
+                                return response;
+                            }
+                        };
                     let timeout = request
                         .payload
                         .get("timeout")
