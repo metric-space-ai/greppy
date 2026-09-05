@@ -4,7 +4,8 @@ import json
 import time
 from pathlib import Path
 
-from contracts import RUBRIC_VERSION, canonical, prompt_for
+from contracts import RUBRIC_VERSION, canonical, prompt_for, sanitized_example, digest, strict_json
+from audit_sampling import verify_plan
 from queue_store import QueueStore
 from teachers import ProviderFailure, grok, minimax
 
@@ -57,6 +58,42 @@ def enqueue_file(store, path, providers, max_chars):
     return {'jobs':len(ids),'ids':ids,'batches_per_provider':len(batches),'rubric':RUBRIC_VERSION}
 
 
+def enqueue_audit_file(store, path, providers, max_chars, plan, sources):
+    """Route a shard against a frozen roster, with stable one-example job identity.
+
+    Each valid example is committed independently. A later invalid row stops the
+    shard without removing already queued work; restarting reuses those jobs.
+    """
+    verify_plan(plan, sources)
+    assignments = {x['example_id']: x for x in plan['assignments']}
+    seen = set(); ids = []; counts = {provider: 0 for provider in providers}
+    with open(path, encoding='utf-8') as stream:
+        for raw in stream:
+            example = strict_json(raw)
+            safe = sanitized_example(example)
+            eid = example['id']
+            if eid in seen or eid not in assignments:
+                raise ValueError('duplicate or unregistered audit example')
+            seen.add(eid)
+            assignment = assignments[eid]
+            if (digest(safe) != assignment['example_sha256']
+                    or example['source_id'] != assignment['source_id']
+                    or example['domain'] != assignment['domain']
+                    or example['split'] != assignment['split']):
+                raise ValueError('audit example differs from frozen sanitized input')
+            if len(prompt_for([example])) > max_chars or len(example['records']) > 48:
+                raise ValueError('audit example exceeds batch input limit')
+            store.register_source(example['source_id'], example['split'], example['group_key'])
+            for provider in providers:
+                if assignment[provider + '_required']:
+                    model = 'MiniMax-M3' if provider == 'minimax' else 'grok-4.6'
+                    ids.append(store.enqueue(provider, model, [example]))
+                    counts[provider] += 1
+    return {'jobs': len(ids), 'ids': ids, 'jobs_by_provider': counts,
+            'rubric': RUBRIC_VERSION, 'audit_plan_sha256': digest(plan),
+            'random_selection_sha256': plan['random_selection_sha256']}
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--db',type=Path,required=True)
@@ -64,6 +101,10 @@ def main():
     enqueue=commands.add_parser('enqueue'); enqueue.add_argument('input',type=Path)
     enqueue.add_argument('--provider',choices=['minimax','grok','both'],default='both')
     enqueue.add_argument('--max-input-chars',type=int,default=48000)
+    audit=commands.add_parser('enqueue-audit'); audit.add_argument('input',type=Path)
+    audit.add_argument('--plan',type=Path,required=True); audit.add_argument('--sources',type=Path,required=True)
+    audit.add_argument('--provider',choices=['minimax','grok','both'],default='both')
+    audit.add_argument('--max-input-chars',type=int,default=48000)
     worker=commands.add_parser('work'); worker.add_argument('--provider',choices=['minimax','grok'],required=True)
     worker.add_argument('--max-jobs',type=int,default=0); worker.add_argument('--watch',action='store_true')
     commands.add_parser('status')
@@ -72,6 +113,10 @@ def main():
     if args.command=='enqueue':
         providers=['minimax','grok'] if args.provider=='both' else [args.provider]
         print(canonical(enqueue_file(store,args.input,providers,args.max_input_chars)))
+    elif args.command=='enqueue-audit':
+        providers=['minimax','grok'] if args.provider=='both' else [args.provider]
+        print(canonical(enqueue_audit_file(store,args.input,providers,args.max_input_chars,
+              strict_json(args.plan.read_bytes()),strict_json(args.sources.read_bytes()))))
     elif args.command=='status': print(canonical(store.status()))
     elif args.command=='resume-provider': store.resume_provider(args.provider); print(canonical(store.status()))
     else:

@@ -114,6 +114,35 @@ class StudyCorpusTests(unittest.TestCase):
         self.fixture(envelopes)
         self.assertEqual(self.run_index()['observations'], [])
 
+    def test_explicit_adapter_pair_retains_action_without_inventing_verb(self):
+        wrapper = {'schema': 'greppy.web-study.action-observe.v1', 'action_exit_code': 0,
+                   'action': {'ok': True, 'session_id': 'session-a'},
+                   'observation_exit_code': 0, 'observation': self.envelopes[1],
+                   'task_success': 'not_evaluated', 'subprocess_count': 2}
+        self.fixture([wrapper])
+        result = self.run_index()
+        action = result['observations'][0]['last_action']
+        self.assertEqual(result['observations'][0]['action_context_status'], 'explicit_adapter_pair')
+        self.assertIsNone(action['operation'])
+        self.assertEqual(action['task_success'], 'not_evaluated')
+        self.assertEqual(result['events'][0]['adapter']['decoded_json_pointer'], '/observation')
+
+    def test_adapter_exit_status_contradiction_rejected(self):
+        wrapper = {'schema': 'greppy.web-study.action-observe.v1', 'action_exit_code': 0,
+                   'action': {'ok': True}, 'observation_exit_code': 34,
+                   'observation': self.envelopes[1], 'task_success': 'not_evaluated', 'subprocess_count': 2}
+        self.fixture([wrapper])
+        with self.assertRaisesRegex(ValueError, 'contradicts'):
+            self.run_index()
+
+    def test_adapter_cannot_claim_task_success(self):
+        wrapper = {'schema': 'greppy.web-study.action-observe.v1', 'action_exit_code': 0,
+                   'action': {}, 'observation_exit_code': 0, 'observation': self.envelopes[1],
+                   'task_success': True, 'subprocess_count': 2}
+        self.fixture([wrapper])
+        with self.assertRaisesRegex(ValueError, 'invalid explicit'):
+            self.run_index()
+
     def test_result_only_observation_has_no_fabricated_envelope(self):
         result = {'actionables': [], 'headings': [], 'links': [], 'ref_count': 0,
                   'refs_truncated': False, 'text': '', 'title': '', 'url': 'http://fixture',

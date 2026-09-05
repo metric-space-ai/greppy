@@ -2,11 +2,13 @@
 import argparse
 import json
 from pathlib import Path
-from contracts import RUBRIC_VERSION, canonical, digest, validate_annotations
+from contracts import RUBRIC_VERSION, canonical, digest, validate_annotations, strict_json
 from queue_store import QueueStore
+from audit_sampling import verify_plan
 
 
-def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None):
+def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None,
+                audit_plan=None, source_roster=None):
     """mechanical maps example IDs to an independently produced evidence receipt.
 
     Receipt: example_sha256 (the exact sanitized teacher input), status pass/fail/
@@ -14,6 +16,14 @@ def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None)
     The caller must independently verify the artifact; this function cannot certify
     an oracle simply from its self-reported receipt.
     """
+    assignments = None
+    if audit_plan is not None:
+        if not isinstance(source_roster, list):
+            raise ValueError('audit plan requires its complete source roster')
+        verify_plan(audit_plan, source_roster)
+        assignments = {x['example_id']: x for x in audit_plan['assignments']}
+    elif source_roster is not None:
+        raise ValueError('source roster requires its frozen audit plan')
     grouped = {}
     with store.connect() as db:
         jobs = list(db.execute("SELECT id,provider,model,rubric,payload,result,status FROM jobs"))
@@ -45,9 +55,19 @@ def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None)
     report = []
     for key, item in sorted(grouped.items()):
         example = item['example']; reasons = []
+        assignment = assignments.get(example['id']) if assignments is not None else None
+        if assignments is not None and (assignment is None
+                or assignment['example_sha256'] != key
+                or assignment['source_id'] != example['source_id']
+                or assignment['domain'] != example['domain']
+                or assignment['split'] != example['split']):
+            raise ValueError('queue example does not match the frozen audit plan')
+        grok_required = assignment['grok_required'] if assignment is not None else True
         selected = {}
         for provider, model in [('minimax','MiniMax-M3'), ('grok','grok-4.6')]:
             jobs = item['providers'].get(provider, [])
+            if provider == 'grok' and not grok_required and not jobs:
+                continue
             if len(jobs) != 1:
                 reasons.append(provider + ('_missing' if not jobs else '_multiple_versions'))
             elif jobs[0]['model'] != model or jobs[0]['status'] != 'done':
@@ -55,6 +75,11 @@ def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None)
             else:
                 selected[provider] = {r['record_id']:r for r in jobs[0]['annotations']}
         conflicts = []
+        if 'minimax' in selected and any(r['ambiguous'] for r in selected['minimax'].values()):
+            grok_required = True
+            reasons.append('minimax_uncertainty_requires_adjudication')
+            if assignment is not None and not assignment['targeted_cohort']:
+                reasons.append('audit_plan_missing_uncertainty_escalation')
         if len(selected) == 2:
             for record in example['records']:
                 rid = record['id']; a = selected['minimax'][rid]; b = selected['grok'][rid]
@@ -85,8 +110,15 @@ def audit_queue(store, mechanical, *, rubric=RUBRIC_VERSION, selected_jobs=None)
                        'source_id': example['source_id'], 'domain': example['domain'],
                        'split': example['split'], 'status': 'review_complete' if not reasons else 'held',
                        'reasons': reasons, 'conflicts': conflicts,
+                       'grok_required': grok_required,
+                       'random_cohort': assignment['random_cohort'] if assignment else None,
+                       'targeted_cohort': assignment['targeted_cohort'] if assignment else None,
                        'teacher_jobs': {p:[j['job_id'] for j in js] for p,js in item['providers'].items()}})
     return {'schema': 'greppy.heads.admission-review.v1', 'rubric': rubric,
+            'audit_plan_sha256': digest(audit_plan) if audit_plan is not None else None,
+            'missing_planned_examples': sorted(set(assignments or {}) - {r['example_id'] for r in report}),
+            'all_planned_examples_review_complete': (assignments is not None
+                and {r['example_id'] for r in report if r['status'] == 'review_complete'} == set(assignments)),
             'note': 'Review receipts require artifact verification; this report is not production acceptance.',
             'counts': {status: sum(r['status']==status for r in report) for status in ('review_complete','held')},
             'examples': report}
@@ -99,10 +131,15 @@ def main():
     parser.add_argument('--rubric',default=RUBRIC_VERSION,help='Explicit rubric for historical queue reviews')
     parser.add_argument('--job-selection',type=Path,help='Explicit JSON array of immutable teacher job IDs; never choose a version silently')
     parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--audit-plan',type=Path)
+    parser.add_argument('--source-roster',type=Path)
     args = parser.parse_args()
-    receipts = json.loads(args.mechanical.read_text()) if args.mechanical else {}
-    selection = json.loads(args.job_selection.read_text()) if args.job_selection else None
-    report = audit_queue(QueueStore(args.db), receipts, selected_jobs=selection, rubric=args.rubric)
+    receipts = strict_json(args.mechanical.read_bytes()) if args.mechanical else {}
+    selection = strict_json(args.job_selection.read_bytes()) if args.job_selection else None
+    plan = strict_json(args.audit_plan.read_bytes()) if args.audit_plan else None
+    roster = strict_json(args.source_roster.read_bytes()) if args.source_roster else None
+    report = audit_queue(QueueStore(args.db), receipts, selected_jobs=selection, rubric=args.rubric,
+                         audit_plan=plan, source_roster=roster)
     with args.out.open('x') as f:
         f.write(canonical(report)+'\n')
     print(canonical(report['counts']))

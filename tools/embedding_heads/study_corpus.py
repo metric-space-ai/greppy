@@ -97,6 +97,33 @@ def index_trial(path, *, family, exclusion=None):
                 continue
             if not isinstance(envelope, dict):
                 continue
+            adapter = None
+            if envelope.get('schema') == 'greppy.web-study.action-observe.v1':
+                if (type(envelope.get('action_exit_code')) is not int or envelope['action_exit_code'] != 0
+                        or type(envelope.get('observation_exit_code')) is not int
+                        or envelope.get('subprocess_count') != 2
+                        or envelope.get('task_success') != 'not_evaluated'
+                        or not isinstance(envelope.get('action'), dict)
+                        or not isinstance(envelope.get('observation'), dict)):
+                    raise ValueError('invalid explicit action-observation adapter envelope')
+                adapter = {'container_sha256': digest(envelope),
+                           'container_schema': envelope['schema'],
+                           'decoded_json_pointer': '/observation',
+                           'action': {'source_sha256': digest(envelope['action']),
+                                      'decoded_json_pointer': '/action', 'exit_code': 0,
+                                      'operation': envelope['action'].get('operation'),
+                                      'request_id': envelope['action'].get('request_id'),
+                                      'session_id': envelope['action'].get('session_id'),
+                                      'task_success': 'not_evaluated'},
+                           'observation_exit_code': envelope['observation_exit_code']}
+                envelope = envelope['observation']
+                if envelope.get('schema') == 'greppy.web-runtime.v1':
+                    if (envelope.get('status') == 'ok') != (adapter['observation_exit_code'] == 0):
+                        raise ValueError('adapter exit code contradicts native observation status')
+                elif adapter['observation_exit_code'] != 0:
+                    # Keep no successful observation from a failed result-only
+                    # capture; its full source remains available for diagnosis.
+                    continue
             # Some study adapters emitted the native observation result only.
             # Record its shape explicitly; do not fabricate a runtime envelope,
             # request ID, operation, status, session or action attribution.
@@ -109,14 +136,15 @@ def index_trial(path, *, family, exclusion=None):
             if envelope.get('schema') != 'greppy.web-runtime.v1':
                 if result_only:
                     event_id = digest([episode_id, line, pointer])
-                    events.append({'id': event_id, 'source_line': line,
+                    events.append({'id': event_id, 'source_line': line, 'adapter': adapter,
                                    'export_line': line - bounds['first'] + 1, 'json_pointer': pointer,
                                    'source_text_sha256': sha(text.encode()), 'snapshot_sha256': digest(envelope),
                                    'format': 'observation_result_only', 'operation': None,
                                    'request_id': None, 'status': None, 'session_id': None})
                     observations.append({'id': event_id, 'event_id': event_id,
                                          'snapshot_sha256': digest(envelope), 'format': 'observation_result_only',
-                                         'last_action': None, 'action_context_status': 'unknown',
+                                         'last_action': adapter['action'] if adapter else None,
+                                         'action_context_status': 'explicit_adapter_pair' if adapter else 'unknown',
                                          'goal': None, 'privacy_review': None, 'admission': 'held'})
                 continue
             operation = envelope.get('operation')
@@ -130,6 +158,7 @@ def index_trial(path, *, family, exclusion=None):
             session = result.get('session_id') if isinstance(result, dict) else None
             pointer = '/payload/output' + (f'/{index}/text' if isinstance(output, list) else '')
             event = {'id': digest([episode_id, line, pointer]), 'source_line': line,
+                     'adapter': adapter,
                      'export_line': line - bounds['first'] + 1, 'json_pointer': pointer,
                      'source_text_sha256': sha(text.encode()), 'envelope_sha256': digest(envelope),
                      'format': 'native_envelope',
@@ -146,10 +175,13 @@ def index_trial(path, *, family, exclusion=None):
                     last_actions.clear()  # Unknown scope may affect any active session.
             if operation == 'web.observe' and envelope['status'] == 'ok' and isinstance(result, dict):
                 action = last_actions.get(session) if isinstance(session, str) else None
+                if adapter:
+                    action = adapter['action']
                 observations.append({'id': event['id'], 'event_id': event['id'],
                                      'format': 'native_envelope',
                                      'snapshot_sha256': digest(envelope), 'last_action': action,
-                                     'action_context_status': 'observed_same_session' if action else 'unknown',
+                                     'action_context_status': ('explicit_adapter_pair' if adapter else
+                                                               'observed_same_session' if action else 'unknown'),
                                      'goal': None, 'privacy_review': None, 'admission': 'held'})
     oracle = trial.get('oracle')
     if not isinstance(oracle, dict) or type(oracle.get('ok')) is not bool:

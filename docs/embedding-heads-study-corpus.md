@@ -22,6 +22,13 @@ Two source formats remain distinct:
   supplies a missing operation, request ID, status or session.
 
 An action receipt is associated only through an explicit matching session ID.
+The one supported parent wrapper, `greppy.web-study.action-observe.v1`, also
+provides an explicit action/observation pair. Its exact parent hash and decoded
+JSON pointers are retained. This proves paired capture, not the cause of every
+page change or a task outcome. Missing action verbs remain null; exit/status
+contradictions and an asserted task-success value are refused. Arbitrary nested
+objects are never interpreted as such a wrapper.
+
 Missing scope, unknown protocol errors and result-only observations cannot inherit
 an action from temporal proximity. Receipt success means tool completion only.
 No missing `checked` or other page field is defaulted. The eventual teacher input
@@ -39,14 +46,16 @@ explicitly excluded because of its adapter/install confound.
 
 | Family | Episodes | Captured observation objects | Failed end oracle |
 | --- | ---: | ---: | ---: |
-| Order-Draft | 16 | 62 | 0 |
+| Order-Draft | 16 | 125 | 0 |
 | Text | 10 | 10 | 0 |
 | Checkbox | 10 | 14 | 0 |
 | Address | 4 | 25 | 1 |
 | Dialog | 20 | 25 | 0 |
 
-Of 136 observations, 10 retain a full native envelope and 126 contain the result
-only. All 136 currently lack a verified action association. The Address-C2 rollback
+Of 199 observations, 73 retain a full native envelope (63 inside an explicit
+adapter pair) and 126 contain the result only. The 63 adapter pairs have explicit
+paired action capture; the other 136 lack a verified action association.
+No explicit task-goal binder has been admitted. The Address-C2 rollback
 is retained as a failed outcome. An end oracle is stored separately as a hash and
 boolean; it is never injected into an earlier observation's teacher context.
 These counts describe recoverable direct JSON objects, not complete browser
@@ -55,9 +64,9 @@ coverage: other arms/formats and multiline tool text are not guessed into record
 Durable receipts:
 
 - `/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/web-study-import-v1.json`
-- `/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/web-study-index-v2.json`
+- `/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/web-study-index-v3.json`
 
-Ten regression tests cover original-line addressing, corrupt traces, forged
+Thirteen regression tests cover original-line addressing, corrupt traces, forged
 metadata, private-content exclusion, unknown/cross-session actions, unscoped
 protocol errors, result-only records and missing state. No episode is admitted
 for training or eligible for the final test. Task binding, privacy review,
