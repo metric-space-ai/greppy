@@ -6,6 +6,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "read_tests.rs"]
+mod tests;
+
 pub(crate) fn read_background_job(path: &std::path::Path) -> Option<serde_json::Value> {
     let raw = std::fs::read(path).ok()?;
     serde_json::from_slice(&raw).ok()
@@ -228,6 +232,7 @@ fn read_definition_start(content: &str, definition_start: usize) -> usize {
 }
 
 fn read_definition(
+    store: &greppy_store::Store,
     root_path: &std::path::Path,
     node: greppy_store::Node,
 ) -> Result<Option<DefinitionRead>> {
@@ -236,6 +241,16 @@ fn read_definition(
         Ok(content) => content,
         Err(_) => return Ok(None),
     };
+    // The freshness gate precedes I/O. Bind the bytes we actually return to
+    // this graph snapshot as well, so an edit after that gate cannot pair
+    // fresh source with an old node span.
+    let indexed = store.get_file_state(&node.project, &node.file_path)?;
+    if indexed.is_none_or(|state| state.sha256 != read_sha256(content.as_bytes())) {
+        return Err(Error::Workspace(format!(
+            "read: source for {} no longer matches the indexed definition {}; no stale span emitted. Run `greppy index .` or wait for the active refresh, then retry; `greppy read-file` reads current bytes without indexed spans",
+            node.file_path, node.qualified_name
+        )));
+    }
     let line_count = read_line_count(&content);
     let node_start = usize::try_from(node.start_line.max(1)).unwrap_or(1);
     if node_start > line_count.max(1) {
@@ -660,6 +675,17 @@ pub(crate) fn dispatch_read_symbols(
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
+    if let Some(code) = graph_stale_gate(
+        &store,
+        root,
+        &project,
+        "read",
+        json,
+        serde_json::json!({ "targets": symbols }),
+        "hits",
+    )? {
+        return Ok(code);
+    }
     let root_path = resolve_root(root)?;
     let path_filters = prepare_query_path_filters(root, "read", "", paths)?;
 
@@ -680,7 +706,7 @@ pub(crate) fn dispatch_read_symbols(
                     "read: `{query}` is not a definition in this repository"
                 )));
             };
-            let Some(definition) = read_definition(&root_path, node)? else {
+            let Some(definition) = read_definition(&store, &root_path, node)? else {
                 return Err(Error::Invalid(format!(
                     "read: definition span for `{query}` is stale"
                 )));
@@ -768,7 +794,7 @@ pub(crate) fn dispatch_read_symbols(
             );
             return Ok(1);
         }
-        let Some(definition) = read_definition(&root_path, nodes[0].clone())? else {
+        let Some(definition) = read_definition(&store, &root_path, nodes[0].clone())? else {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&read_json_miss(&store, &project, query)).unwrap()
@@ -844,7 +870,7 @@ pub(crate) fn dispatch_read_symbols(
             failed = true;
             continue;
         };
-        let Some(definition) = read_definition(&root_path, node)? else {
+        let Some(definition) = read_definition(&store, &root_path, node)? else {
             nav_report_missing(&store, &project, query);
             previous_ended_with_newline = true;
             failed = true;
@@ -1101,10 +1127,21 @@ pub(crate) fn dispatch_read_smart(
     if depth == 0 {
         return Err(Error::Invalid("read-smart --depth must be positive".into()));
     }
-    prewarm_summary_daemon();
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
+    if let Some(code) = graph_stale_gate(
+        &store,
+        root,
+        &project,
+        "read-smart",
+        false,
+        serde_json::json!({ "targets": symbols }),
+        "hits",
+    )? {
+        return Ok(code);
+    }
+    prewarm_summary_daemon();
     let root_path = resolve_root(root)?;
     let path_filters = prepare_query_path_filters(root, "read-smart", "", paths)?;
     let mut failed = false;
@@ -1127,7 +1164,7 @@ pub(crate) fn dispatch_read_smart(
             failed = true;
             continue;
         };
-        let Some(definition) = read_definition(&root_path, node)? else {
+        let Some(definition) = read_definition(&store, &root_path, node)? else {
             nav_report_missing(&store, &project, query);
             previous_ended_with_newline = true;
             failed = true;
