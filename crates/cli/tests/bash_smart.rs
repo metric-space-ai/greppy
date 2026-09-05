@@ -120,6 +120,32 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
 }
 
 #[test]
+fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
+    let workspace = fresh_workspace("typescript-diagnostic");
+    for redirect in ["", " >&2"] {
+        let script = format!(
+            "printf '%s\\n' 'example.ts(1,1): error TS2322: Type string is not assignable to type number.'{redirect}; exit 1"
+        );
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.starts_with("FAILED — exit 1: 1 error, 0 warnings\n"),
+            "stdout={stdout}; stderr={}",
+            text(&output.stderr)
+        );
+        let diagnostic =
+            "example.ts(1,1): error TS2322: Type string is not assignable to type number.";
+        let raw_stream = if redirect.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(text(raw_stream).lines().any(|line| line == diagnostic));
+    }
+}
+
+#[test]
 fn child_flags_after_delimiter_pass_through_unchanged() {
     let workspace = fresh_workspace("child-flag");
     let output = run(
