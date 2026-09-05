@@ -47,10 +47,11 @@ The native implementation still must:
    closure during a bound script must reconcile with the same session tab list;
    explicit close calls remain real actions. Automatically closing borrowed
    browser/context/page objects at snippet completion is prohibited.
-4. Pass returned values through a typed completion channel. The existing PW
-   wrapper searches exception text for `PWRESULT`; that mechanism is under
-   separate negative-test investigation and must not establish success for the
-   new path.
+4. Preserve an explicit distinction between real script completion and failure.
+   The mainline PW fix is now integrated: CLI2f64 passes the same three native
+   negative probes that CLI154d failed. It checks runtime success before parsing
+   a per-invocation stdout receipt. Reuse this verified error gate; any future
+   direct typed-value channel must preserve these checks and the recorded metrics.
 5. Exercise CLI fill/click → bound script → CLI observe on the same unsaved
    state, including inactive tabs, another session, stale handles, explicit
    close, navigation, script errors and subsequent usability. Check that no

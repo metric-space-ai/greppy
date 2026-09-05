@@ -1,5 +1,11 @@
 # Untrusted error text invalidates a healthy CLI session
 
+Verified correction: Root CLI82f3 with the unchanged preserved runtime d8f
+passes the same negative fixture in error-text-context-20260906-02. The invalid
+Select remains OPTION_NOT_FOUND; subsequent implicit observe succeeds, the
+original field value remains, both binary hashes match, and owned runtime/HTTP
+cleanup completes. This specifically validates the typed-session-error fix.
+
 The preserved CLI 0.4.0 (SHA256
 1d53d0a71c443f0f7fdff0ae569b89e08cd50af1f5a85308e308325124110281)
 and runtime d8f437c493d7780f39bb8868da9227ce8600dadaa7a7e393936954cf1877277b

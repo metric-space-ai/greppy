@@ -23,9 +23,13 @@ unit tests passed in the compiled CLI library, including the three new native
 adapter cases. The same linked test binary then passed all 79 web tests,
 including scoped typed-error recovery and compact output. Evidence and source
 hashes: `/Users/michaelwelsch/.local/state/greppy-web-study/native-wait-unit-20260906-01`.
-The CLI executable still needs linking in the shared compiler queue before the
-native integration probe. There is no native adapter acceptance or measured
-efficiency improvement yet. A real probe must cover
+The CLI executable was linked and preserved as CLI82f3 on 2026-09-06. Its real
+native probe passed nine checks, including delayed DOM, timeout recovery and
+explicit inactive tabs. The stale-ref diagnostic and full-navigation waiter
+still failed, reproducing the separately reported runtime defects. Evidence:
+`/Users/michaelwelsch/.local/state/greppy-web-study/wait-native-20260906-01`.
+There is no native adapter acceptance or measured efficiency improvement yet.
+The completed acceptance probe must cover
 later content, absence, stale refs, explicit inactive tabs, timeout budgets and
 continued usability of other sessions before agent trials use this switch.
 
