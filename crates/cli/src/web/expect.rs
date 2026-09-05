@@ -19,7 +19,8 @@ const EXIT_WAIT_TIMEOUT: i32 = 13;
 #[derive(Debug, Args, Clone)]
 pub struct Condition {
     /// Node query: css=, xpath=, text=, text~/re/, role=, id=, tag=.
-    /// A bare argument is read as a CSS selector.
+    /// text= matches normalized whole-element text; text~/re/ matches a part.
+    /// A bare argument is a CSS selector. Time durations are not conditions.
     pub query: Option<String>,
     /// Match on the document URL instead of a node, e.g. `--url '~/\/done$/'`.
     #[arg(long)]
@@ -77,6 +78,7 @@ pub(super) fn dispatch(command: ExpectCommand, root: Option<&str>) -> Result<i32
 fn condition_expression(condition: &Condition) -> std::result::Result<String, String> {
     let mut checks: Vec<String> = Vec::new();
     if let Some(query) = &condition.query {
+        super::see::validate_condition_query(query)?;
         let body = "return { holds: nodes.length > 0, detail: { matched: nodes.length } };";
         checks.push(super::see::query_expression_pub(query, body));
     }
@@ -170,7 +172,7 @@ fn wait(root: Option<&str>, condition: Condition, timeout: u64, interval: u64) -
     let source = match condition_expression(&condition) {
         Ok(source) => source,
         Err(message) => {
-            return emit_error(condition.json, invalid(&format!("web wait: {message}")))
+            return emit_error(condition.json, invalid(&format!("web wait: {message}")));
         }
     };
     let deadline = Instant::now() + Duration::from_millis(timeout);
@@ -216,7 +218,7 @@ fn assert_once(root: Option<&str>, condition: Condition) -> Result<i32> {
     let source = match condition_expression(&condition) {
         Ok(source) => source,
         Err(message) => {
-            return emit_error(condition.json, invalid(&format!("web assert: {message}")))
+            return emit_error(condition.json, invalid(&format!("web assert: {message}")));
         }
     };
     match evaluate_condition(root, condition.session.clone(), &source) {
