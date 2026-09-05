@@ -91,6 +91,31 @@ class ExperimentContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'mixes sources or tasks'):
             load_bundle(self.path)
 
+    def test_web_comparisons_cannot_mix_observations(self):
+        self.mutate_rows('web_ranker', 'train', lambda rows: rows[0].update(observation_id='other-observation'))
+        with self.assertRaisesRegex(ValueError, 'observations or action context'):
+            load_bundle(self.path)
+
+    def test_same_candidate_can_have_different_action_conditioning(self):
+        def change(rows):
+            rows[1].update(candidate_id=rows[0]['candidate_id'],
+                           conditioning_sha256=digest('different condition'),
+                           action_sha256=digest('different action'),
+                           observation_id='different-observation', comparison_id='different-comparison')
+        self.mutate_rows('web_ranker', 'train', change)
+        load_bundle(self.path)
+
+    def test_same_prepared_input_cannot_have_conflicting_labels(self):
+        self.mutate_rows('log_classifier', 'train',
+                         lambda rows: rows[1].update(input_sha256=rows[0]['input_sha256']))
+        with self.assertRaisesRegex(ValueError, 'conflicting labels'):
+            load_bundle(self.path)
+
+    def test_source_identity_cannot_change_captured_content(self):
+        self.mutate_rows('web_ranker', 'train', lambda rows: rows[0].update(source_sha256=digest('other source')))
+        with self.assertRaisesRegex(ValueError, 'changed its captured content'):
+            load_bundle(self.path)
+
     def test_missing_class_is_rejected(self):
         self.mutate_rows('log_classifier', 'train',
                          lambda rows: [row.update(label=0) for row in rows if row['label'] == 1])

@@ -30,15 +30,22 @@ or establish agent task success. Calibration is explicitly unfitted.
 
 ## Feature bundle boundary
 
-The bundle schema is `greppy.heads.feature-bundle.v1`. Every head has exactly
+The bundle schema is `greppy.heads.feature-bundle.v2`. Version 1 remains readable
+only for historical synthetic pipeline fixtures. Every head has exactly
 train and development partitions, each with hash-bound JSONL rows and float32
 NumPy arrays of shape [rows, 768]. Other partitions are rejected; final test data
 must never be supplied. Native feature extraction remains a separate prerequisite.
 
 Rows bind candidate/source/comparison/group identities, the exact input-contract
 hash, input/annotation/evidence hashes, split, head, admission status and label.
-Ranking rows additionally bind the task hash. Equal inputs, sources and declared
-related groups cannot cross splits. Comparison scopes cannot mix sources or tasks.
+Every row binds the captured source content hash; one source ID cannot change
+content within a bundle. Ranking rows additionally bind task and full conditioning
+hashes. Web rows bind observation identity and the actual action-context hash.
+Comparison scopes cannot mix observations or action contexts even when the
+episode and task are identical. The same candidate can have different labels
+under different conditioning, but identical prepared inputs cannot carry
+conflicting labels. Equal inputs, source contents and declared related groups
+cannot cross splits.
 Unadmitted rows, missing classes, corrupt arrays, wrong dimensions, non-finite
 values and files escaping the bundle directory are refused.
 
@@ -96,7 +103,14 @@ Evidence is retained at:
 Full synthetic runs remain on GPU3 at
 `/mnt/nvme1/greppy-heads-optimization-20260905/experiment-smoke-v1/`.
 
+With feature-bundle v2, 68 Python tests passed on GPU3. A fresh independent
+synthetic runner check again completed 45 variants, 45 immutable replays and
+five bit-identical interruption/restart checks. Its receipt is
+`/Users/michaelwelsch/.local/state/greppy-heads/2026-09-05/experiment-smoke-v2-verification.json`;
+its GPU3 artifacts are under `experiment-smoke-v2/` beside the v1 directory.
+These results validate the revised grouping contract, not native model quality.
+
 Still outstanding: admitted broad corpora, shared native input extraction,
 rubric/data ablations, genuine head selection, calibration per backend, portable
-export/loader integration, complete log/Web runtime use, and independent agent
+production loading, complete log/Web runtime use, and independent agent
 workflow acceptance. This work does not establish production readiness.

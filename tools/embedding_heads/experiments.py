@@ -20,7 +20,8 @@ from contracts import canonical, digest, strict_json
 
 LABELS = ['error', 'warning', 'progress', 'text']
 HEADS = ('log_classifier', 'log_ranker', 'web_ranker')
-SCHEMA = 'greppy.heads.feature-bundle.v1'
+SCHEMA = 'greppy.heads.feature-bundle.v2'
+LEGACY_SCHEMA = 'greppy.heads.feature-bundle.v1'
 DIMENSION = 768
 GPU_HOST = 'gpu3-a4500'
 
@@ -58,11 +59,14 @@ def load_bundle(path):
     import numpy as np
     path = Path(path)
     manifest = read_json(path)
-    if manifest.get('schema') != SCHEMA or set(manifest.get('heads', {})) != set(HEADS):
+    if manifest.get('schema') not in (SCHEMA, LEGACY_SCHEMA) or set(manifest.get('heads', {})) != set(HEADS):
         raise ValueError('unsupported feature bundle')
     role = manifest.get('role')
     if role not in ('synthetic_pipeline_test', 'development_candidate'):
         raise ValueError('unsupported experiment role')
+    legacy = manifest['schema'] == LEGACY_SCHEMA
+    if legacy and role != 'synthetic_pipeline_test':
+        raise ValueError('native candidates require the v2 observation/conditioning contract')
     representation = manifest['representation']
     if representation.get('dimension') != DIMENSION:
         raise ValueError('expected 768 native dimensions')
@@ -105,6 +109,9 @@ def load_bundle(path):
     seen_groups = {}
     seen_sources = {}
     seen_inputs = {}
+    seen_labels = {}
+    source_bindings = {}
+    seen_source_hashes = {}
     data = {}
     for head in HEADS:
         item = manifest['heads'][head]
@@ -123,7 +130,19 @@ def load_bundle(path):
                 for key in ('candidate_id', 'source_id', 'group_key', 'comparison_id'):
                     if not isinstance(row.get(key), str) or not row[key]:
                         raise ValueError('missing row identity')
-                row_key = (row['candidate_id'], row.get('task_sha256'))
+                if not legacy:
+                    require_hash(row.get('source_sha256'))
+                    if source_bindings.setdefault(row['source_id'], row['source_sha256']) != row['source_sha256']:
+                        raise ValueError('source ID changed its captured content')
+                    if seen_source_hashes.setdefault(row['source_sha256'], split) != split:
+                        raise ValueError('identical source content crosses splits')
+                    if head != 'log_classifier':
+                        require_hash(row.get('conditioning_sha256'))
+                    if head == 'web_ranker':
+                        if not isinstance(row.get('observation_id'), str) or not row['observation_id']:
+                            raise ValueError('Web features require an observation identity')
+                        require_hash(row.get('action_sha256'))
+                row_key = (row['candidate_id'], row.get('task_sha256') if legacy else row.get('conditioning_sha256'))
                 if row_key in seen_rows:
                     raise ValueError('duplicate candidate/task row')
                 seen_rows.add(row_key)
@@ -145,6 +164,8 @@ def load_bundle(path):
                 y = row['label']
                 if type(y) is not int or not 0 <= y < 4:
                     raise ValueError('invalid class/ordinal label')
+                if not legacy and seen_labels.setdefault((head, row['input_sha256']), y) != y:
+                    raise ValueError('identical prepared input has conflicting labels')
             vectors_path = bound_file(path.parent, files['vectors'])
             vectors = np.load(vectors_path, allow_pickle=False, mmap_mode='r')
             if vectors.dtype != np.dtype('float32') or vectors.shape != (len(rows), DIMENSION):
@@ -158,8 +179,10 @@ def load_bundle(path):
             scopes = {}
             for row in rows:
                 scope = (row['source_id'], row['group_key'], row.get('task_sha256'))
+                if not legacy:
+                    scope += (row.get('conditioning_sha256'), row.get('observation_id'), row.get('action_sha256'))
                 if scopes.setdefault(row['comparison_id'], scope) != scope:
-                    raise ValueError('comparison scope mixes sources or tasks')
+                    raise ValueError('comparison scope mixes sources or tasks, observations or action context')
             data[head][split] = (vectors, rows)
     return manifest, data
 

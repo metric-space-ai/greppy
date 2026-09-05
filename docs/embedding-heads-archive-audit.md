@@ -40,3 +40,24 @@ and hashes, are retained under
 The full Python suite now has 61 passing tests. Source acquisition and admission
 must be completed before these archives can contribute to the planned pilot or
 broad training stage.
+
+## Independent archive-origin verification
+
+Both archives were subsequently downloaded anonymously through Hugging Face Hub
+0.35.3 using its HTTP transport. Their SHA256 hashes matched the previously
+inventoried local archives exactly. The downloads resolve to immutable revisions:
+
+- Cargo: `4ad00ebc1ec578362ddc34c082eb4bc708a911de`
+- Go: `a07fdc87ecd3e86cbed28a4f8a3cbe9846bce60e`
+
+`tools/embedding_heads/verify_archive_origin.py` records revision, anonymous
+retrieval, transport, downloaded size and hash, cache location and immutable URL.
+It refuses to overwrite an existing receipt. The initial Xet transport attempt
+failed with a local file-exists cache error; HTTP retrieval then passed. No shared
+cache was deleted. Browser navigation to the public API was not used as evidence
+because it timed out.
+
+The matching origin receipts are `pkgforge-cargo-origin-v1.json` and
+`pkgforge-go-origin-v1.json` under the same durable evidence directory. They prove
+origin of these archive bytes. They do not grant privacy admission, prove complete
+build execution, establish independent source lineages or make old data a final test.

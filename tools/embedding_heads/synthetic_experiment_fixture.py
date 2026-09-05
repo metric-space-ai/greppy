@@ -31,6 +31,8 @@ def create_fixture(root):
                 label = index % 4
                 vectors[index, label] += 1.0
                 source = f'{split}-output-{index // 4}'
+                if head == 'web_ranker':
+                    source = 'web-' + source
                 rows.append({'head': head, 'split': split, 'candidate_id': f'{source}-record-{label}',
                              'source_id': source, 'group_key': source, 'comparison_id': source,
                              'task_sha256': digest('test task'),
@@ -39,6 +41,13 @@ def create_fixture(root):
                              'annotation_sha256': digest(['synthetic', label]),
                              'evidence_sha256': digest(['synthetic', source, index]),
                              'admission': 'synthetic_test', 'label': label})
+            for row in rows:
+                row['source_sha256'] = digest(['synthetic source', row['source_id']])
+                if head != 'log_classifier':
+                    row['conditioning_sha256'] = digest({'task': 'test task', 'action': None})
+                if head == 'web_ranker':
+                    row['observation_id'] = row['source_id'] + '-observation'
+                    row['action_sha256'] = digest(None)
             row_path = root / f'{head}-{split}.jsonl'
             row_path.write_text(''.join(canonical(row) + '\n' for row in rows))
             vector_path = root / f'{head}-{split}.npy'
