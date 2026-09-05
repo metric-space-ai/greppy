@@ -6,7 +6,7 @@ use super::common::*;
 use clap::Subcommand;
 use greppy_core::error::Result;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +66,7 @@ pub enum SeeCommand {
     /// Describe one node in detail.
     Inspect {
         /// Node query, same grammar as `find`.
+        /// Also accepts @N from the current page's observe snapshot.
         query: String,
         /// Include every attribute.
         #[arg(long)]
@@ -75,6 +76,9 @@ pub enum SeeCommand {
         html: bool,
         #[arg(long)]
         session: Option<String>,
+        /// Inspect this tab within the selected session.
+        #[arg(long)]
+        tab: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -196,10 +200,26 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             attrs,
             html,
             session,
+            tab,
             json,
         } => {
-            if let Err(message) = validate_query(&query) {
-                return emit_error(json, invalid(&format!("web inspect: {message}")));
+            if query.trim().starts_with('@') {
+                let parsed = match parse_target(&query, false, false, None) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return emit_error(json, error),
+                };
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
+                };
+                let mut payload = json!({
+                    "session_id": session, "selector": parsed.selector,
+                    "attrs": attrs, "html": html,
+                });
+                if let Some(tab) = resolve_tab(root, tab) {
+                    payload["tab_id"] = json!(tab);
+                }
+                return rpc(root, json, "web.inspect", payload, Some(session));
             }
             if let Err(message) = validate_query(&query) {
                 return emit_error(json, invalid(&format!("web inspect: {message}")));
@@ -214,7 +234,13 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                  var out = {{ count: nodes.length, node: describe(nodes[0], {attrs}) }}; \
                  {with_html} return out;"
             );
-            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+            super::runtimes::evaluate_on_tab(
+                root,
+                json,
+                session,
+                resolve_tab(root, tab),
+                &query_expression(&query, &body),
+            )
         }
         SeeCommand::Dom { command } => match command {
             DomCommand::Html {
@@ -677,27 +703,7 @@ pub(super) const RESOLVER_JS: &str = r#"
 "#;
 
 /// Serialize one node the way `find` and `inspect` report it.
-pub(super) const DESCRIBE_JS: &str = r#"
-(function(e, withAttrs) {
-  var r = e.getBoundingClientRect();
-  var out = {
-    tag: e.tagName.toLowerCase(),
-    id: e.id || null,
-    text: String(e.textContent == null ? "" : e.textContent).replace(/\s+/g, " ").trim().slice(0, 120),
-    visible: !!(r.width || r.height) && getComputedStyle(e).visibility !== "hidden" && getComputedStyle(e).display !== "none",
-    box: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
-  };
-  if (e.value !== undefined) out.value = e.value;
-  if (e.checked !== undefined) out.checked = e.checked;
-  if (e.disabled !== undefined) out.disabled = e.disabled;
-  if (e.href) out.href = e.href;
-  if (withAttrs) {
-    out.attrs = {};
-    for (var i = 0; i < e.attributes.length; i++) out.attrs[e.attributes[i].name] = e.attributes[i].value;
-  }
-  return out;
-})
-"#;
+pub(super) const DESCRIBE_JS: &str = greppy_web_client::DESCRIBE_NODE_JS;
 
 /// Check a node query before it reaches the page.
 ///

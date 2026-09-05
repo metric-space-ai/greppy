@@ -239,19 +239,27 @@ pub(super) fn evaluate(
     session: Option<String>,
     source: &str,
 ) -> Result<i32> {
+    evaluate_on_tab(root, json_out, session, None, source)
+}
+
+pub(super) fn evaluate_on_tab(
+    root: Option<&str>,
+    json_out: bool,
+    session: Option<String>,
+    tab: Option<String>,
+    source: &str,
+) -> Result<i32> {
     // The runtime needs the session in the payload, not only as routing
     // metadata — resolve the current one so callers need no --session.
     let session = match resolve_session(root, session) {
         Ok(session) => session,
         Err(error) => return emit_error(json_out, error),
     };
-    rpc(
-        root,
-        json_out,
-        "web.evaluate",
-        json!({ "session_id": session, "source": source }),
-        Some(session),
-    )
+    let mut payload = json!({ "session_id": session, "source": source });
+    if let Some(tab) = tab {
+        payload["tab_id"] = json!(tab);
+    }
+    rpc(root, json_out, "web.evaluate", payload, Some(session))
 }
 
 fn js(
