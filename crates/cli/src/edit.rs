@@ -22,7 +22,46 @@ pub(crate) fn dispatch_edit_inner(
     root: Option<&str>,
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
+    // All grammar verbs share pending.json and the undo stack. Hold one
+    // workspace-store lock across planning, publication, rollback and close;
+    // file-level CAS alone cannot protect those shared transaction records.
+    // A dry run must remain free of journal/lock side effects.
+    let dry_run = match &command {
+        EditCommand::Replace { dry_run, .. }
+        | EditCommand::ReplaceText { dry_run, .. }
+        | EditCommand::ReplaceLines { dry_run, .. }
+        | EditCommand::ReplaceSpan { dry_run, .. }
+        | EditCommand::Write { dry_run, .. }
+        | EditCommand::Delete { dry_run, .. }
+        | EditCommand::DeleteLines { dry_run, .. }
+        | EditCommand::InsertLines { dry_run, .. }
+        | EditCommand::Rename { dry_run, .. }
+        | EditCommand::Undo { dry_run, .. }
+        | EditCommand::Patch { dry_run, .. } => *dry_run,
+    };
+    let _transaction_lock = if dry_run {
+        None
+    } else {
+        Some(acquire_edit_transaction_lock(&edit_journal_dir(
+            &root_path,
+        ))?)
+    };
     Ok(dispatch_edit_grammar(command, json, root, &root_path)?.0)
+}
+
+fn acquire_edit_transaction_lock(
+    journal: &std::path::Path,
+) -> Result<greppy_core::cache::FileLock> {
+    greppy_core::cache::acquire_named_lock_in(
+        journal,
+        "transaction",
+        greppy_core::cache::LockMode::Exclusive,
+        true,
+    )
+    .map_err(|error| Error::io("acquire edit transaction lock", error))?
+    .ok_or_else(|| Error::Lock(
+        "another Greppy edit is active for this workspace; nothing written. Wait for that edit to finish, re-read the affected files, then retry".into(),
+    ))
 }
 
 pub(crate) fn edit_sha256_hex(data: &[u8]) -> String {
@@ -2086,11 +2125,101 @@ fn apply_trained_patch_file(
     Ok(edit_splice(content, &mut edits))
 }
 
+/// Undo only writes this invocation actually published. A failed CAS target
+/// belongs to another writer and must never be restored from our pre-image.
+fn rollback_patch_file(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    before: &[u8],
+    published: &[u8],
+) -> std::result::Result<(), String> {
+    greppy_edit::publish::publish_atomic(root, path, before, &edit_sha256_hex(published))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod patch_rollback_tests {
+    use super::*;
+
+    #[test]
+    fn failed_patch_never_rolls_back_the_unpublished_conflict_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let last = dir.path().join("last.txt");
+        std::fs::write(&first, b"before\n").unwrap();
+        std::fs::write(&last, b"original\n").unwrap();
+        let diff = b"--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-before\n+after\n--- a/last.txt\n+++ b/last.txt\n@@ -1 +1 @@\n-original\n+patched\n";
+        let result =
+            run_trained_patch_with_publish_hook(dir.path(), diff.to_vec(), false, false, |index| {
+                if index == 1 {
+                    std::fs::write(&last, b"concurrent-success\n").unwrap();
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&first).unwrap(), b"before\n");
+        assert_eq!(std::fs::read(&last).unwrap(), b"concurrent-success\n");
+        assert!(!edit_journal_dir(dir.path())
+            .join(EDIT_JOURNAL_PENDING)
+            .exists());
+        // This test alone created the journal under its unique temporary root hash.
+        std::fs::remove_dir_all(edit_journal_dir(dir.path())).unwrap();
+    }
+
+    #[test]
+    fn transaction_lock_excludes_another_writer_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_edit_transaction_lock(dir.path()).unwrap();
+        assert!(matches!(
+            acquire_edit_transaction_lock(dir.path()),
+            Err(Error::Lock(_))
+        ));
+        drop(first);
+        assert!(acquire_edit_transaction_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn rollback_restores_our_published_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"our patch").unwrap();
+        rollback_patch_file(dir.path(), &path, b"before", b"our patch").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"before");
+    }
+
+    #[test]
+    fn rollback_preserves_a_later_writers_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"someone else").unwrap();
+        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"someone else");
+    }
+
+    #[test]
+    fn rollback_does_not_recreate_a_concurrently_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
+        assert!(!path.exists());
+    }
+}
+
 pub(crate) fn run_trained_patch(
     root_path: &std::path::Path,
     diff: Vec<u8>,
     dry_run: bool,
     verify: bool,
+) -> EditResult<EditRecord> {
+    run_trained_patch_with_publish_hook(root_path, diff, dry_run, verify, |_| {})
+}
+
+fn run_trained_patch_with_publish_hook(
+    root_path: &std::path::Path,
+    diff: Vec<u8>,
+    dry_run: bool,
+    verify: bool,
+    mut before_publish: impl FnMut(usize),
 ) -> EditResult<EditRecord> {
     let parsed = parse_trained_patch(&diff)?;
     let mut planned = Vec::new();
@@ -2163,19 +2292,49 @@ pub(crate) fn run_trained_patch(
         .collect();
     let transaction = edit_journal_open(root_path, &before);
     edit_journal_crash_hook()?;
-    for (_, abs, content, after, _) in &planned {
+    for (published_count, (_, abs, content, after, _)) in planned.iter().enumerate() {
+        before_publish(published_count);
         if let Err(error) =
             greppy_edit::publish::publish_atomic(root_path, abs, after, &edit_sha256_hex(content))
         {
-            if let Some(pending) =
-                edit_journal_read(&edit_journal_dir(root_path).join(EDIT_JOURNAL_PENDING))
-            {
-                let _ = edit_journal_restore(root_path, &pending, false);
+            let mut conflicts = Vec::new();
+            for (rel, path, before, published, _) in planned[..published_count].iter().rev() {
+                if let Err(reason) = rollback_patch_file(root_path, path, before, published) {
+                    conflicts.push(format!("{rel}: {reason}"));
+                }
             }
-            edit_journal_abort(root_path);
+            let journal = edit_journal_dir(root_path);
+            if let Some(pending) = edit_journal_read(&journal.join(EDIT_JOURNAL_PENDING)) {
+                // Another invocation can replace pending.json. Never remove or
+                // restore its journal on behalf of this failed transaction.
+                if transaction
+                    .as_deref()
+                    .is_some_and(|id| pending["id"].as_str() == Some(id))
+                {
+                    if !conflicts.is_empty() {
+                        // Keep evidence, but do not leave an unsafe automatic
+                        // recovery candidate that could overwrite the conflict.
+                        let id = transaction.as_deref().unwrap_or_default();
+                        edit_journal_write(
+                            &journal.join(format!("rollback-conflict-{id}.json")),
+                            &serde_json::json!({
+                                "transaction": pending,
+                                "published_count": published_count,
+                                "conflicts": conflicts,
+                            }),
+                        );
+                    }
+                    edit_journal_abort(root_path);
+                }
+            }
+            let recovery = if conflicts.is_empty() {
+                "earlier files written by this patch were rolled back; the failed target was left unchanged. Re-read the affected files before retrying".to_string()
+            } else {
+                format!("rollback refused to overwrite changed files: {}. Some patch writes may remain; inspect the affected files and rollback-conflict evidence in {} before retrying", conflicts.join("; "), journal.display())
+            };
             return Err(EditRefusal::new(
                 "publish_failed",
-                format!("patch transaction failed: {error} — nothing written"),
+                format!("patch transaction failed: {error}; {recovery}"),
                 16,
             ));
         }
