@@ -3821,6 +3821,148 @@ fn observed_form_state_tracks_properties_labels_and_redacts_credentials() {
 }
 
 #[test]
+fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+<label for="country">Country</label><select id="country" disabled data-proof="original"><option value="DE" selected>Germany</option></select>
+<script>window.inputEvents = 0; document.addEventListener('input', () => window.inputEvents++);</script>
+</body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-inspect-ref-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_inspect_ref", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_inspect_ref", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("inspect request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session, "url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        "@1"
+    );
+    let inspect = |sid: &str| {
+        call(
+            "web.inspect",
+            json!({"session_id":sid, "selector":{"type":"ref", "value":1}, "attrs":true, "html":true}),
+        )
+    };
+    let inspected = inspect(session);
+    assert_eq!(inspected.status, "ok", "{inspected:?}");
+    let result = inspected.result.as_ref().unwrap();
+    assert_eq!(result["value"]["count"].as_f64(), Some(1.0));
+    assert_eq!(result["value"]["node"]["id"], "country");
+    assert_eq!(result["value"]["node"]["value"], "DE");
+    assert_eq!(result["value"]["node"]["disabled"], true);
+    assert_eq!(result["value"]["node"]["attrs"]["data-proof"], "original");
+    assert!(result["value"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("Germany"));
+    assert_eq!(
+        result["untrusted_content_boundary"],
+        "UNTRUSTED_PAGE_CONTENT"
+    );
+    let tabs = call("web.tab.list", json!({"session_id":session}));
+    let first_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"]
+        .as_str()
+        .unwrap();
+    let new_tab = call("web.tab.new", json!({"session_id":session}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let explicit_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":first_tab, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        explicit_tab.status, "ok",
+        "explicit old tab must not become the active new tab: {explicit_tab:?}"
+    );
+    assert_eq!(
+        explicit_tab.result.as_ref().unwrap()["value"]["node"]["value"],
+        "DE"
+    );
+    let wrong_tab = inspect(session);
+    assert_eq!(
+        wrong_tab.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_tab:?}"
+    );
+    let unknown_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":"not-this-session-tab", "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        unknown_tab.error.as_ref().unwrap().code,
+        "TAB_NOT_FOUND",
+        "{unknown_tab:?}"
+    );
+    let switched = call(
+        "web.tab.switch",
+        json!({"session_id":session, "tab":first_tab}),
+    );
+    assert_eq!(switched.status, "ok", "{switched:?}");
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other_session = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let wrong_session = inspect(other_session);
+    assert_eq!(
+        wrong_session.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_session:?}"
+    );
+    let evaluated = call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "const original = document.getElementById('country'); const clone = original.cloneNode(true); original.replaceWith(clone); window.inputEvents"
+        }),
+    );
+    assert_eq!(
+        evaluated.result.as_ref().unwrap()["value"].as_f64(),
+        Some(0.0)
+    );
+    let replaced = inspect(session);
+    assert_eq!(
+        replaced.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{replaced:?}"
+    );
+    let stale_click = call(
+        "web.click",
+        json!({"session_id":session, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        stale_click.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{stale_click:?}"
+    );
+    let refreshed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(refreshed.status, "ok", "{refreshed:?}");
+    assert_eq!(inspect(session).status, "ok");
+    let reloaded = call("web.reload", json!({"session_id":session}));
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    let navigated = inspect(session);
+    assert_eq!(
+        navigated.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{navigated:?}"
+    );
+}
+
+#[test]
 fn project_profile_can_load_an_allowed_http_host() {
     let fixture_html: &'static str = Box::leak(
         format!(

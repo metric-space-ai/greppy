@@ -929,6 +929,10 @@ impl Daemon {
             "web.network" => self.web_records(&request, "network"),
             "web.events" => self.web_records(&request, "all"),
             "web.click" => self.web_locator_method(&request, "locator.click", json!({})),
+            "web.inspect" => self.web_locator_method(&request, "locator.inspect", json!({
+                "attrs": request.payload.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false),
+                "html": request.payload.get("html").and_then(|v| v.as_bool()).unwrap_or(false),
+            })),
             "web.fill" => self.web_fill(&request),
             "web.type" => self.web_type(&request),
             "web.check" => self.web_locator_method(&request, "locator.check", json!({})),
@@ -2781,6 +2785,7 @@ impl Daemon {
                             snapshot, ref_number
                         ),
                         "snapshot": snapshot,
+                        "observed_ref": ref_number,
                     });
                 }
                 let timeout = request
@@ -2803,6 +2808,15 @@ impl Daemon {
                 match self.engine_call(method, params) {
                     Ok(result) => {
                         self.finish_session(&session_id);
+                        if method == "locator.inspect" {
+                            let tagged = result.get("serialized").cloned().unwrap_or(json!(null));
+                            return Response::ok(request, json!({
+                                "session_id": session_id,
+                                "value": Self::plain_value(&tagged),
+                                "serialized": tagged,
+                                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                            }));
+                        }
                         let dispatch = result.get("dispatch").cloned();
                         let mut response = json!({
                             "session_id": session_id,
@@ -3075,6 +3089,32 @@ impl Daemon {
             self.recover_content("content worker exited before session operation")
                 .map_err(|error| engine_error(request, error, 33))?;
         }
+        // An explicit tab is a scoped target, not a request to silently use or
+        // switch the session's active page. Validate ownership before any work.
+        let requested_page = match request.payload.get("tab_id") {
+            None => None,
+            Some(value) => {
+                let Some(tab) = value.as_str().filter(|tab| !tab.is_empty()) else {
+                    return Err(protocol_error(request, "tab_id must be a non-empty string"));
+                };
+                let known = self.sessions.get(&session_id).is_some_and(|session| {
+                    session.page_id.as_deref() == Some(tab)
+                        || session.tabs.iter().any(|page| page == tab)
+                });
+                if !known {
+                    let mut error = ErrorObject::new(
+                        "TAB_NOT_FOUND",
+                        "the requested tab does not belong to this session (or was reset)",
+                        request.request_id.clone(),
+                        30,
+                        "run greppy web tab list --session SID and use a tab from that session",
+                    );
+                    error.session_id = Some(session_id.clone());
+                    return Err(Response::error(request, error));
+                }
+                Some(tab.to_owned())
+            }
+        };
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
         let content_pid = self.content.pid();
@@ -3135,10 +3175,9 @@ impl Daemon {
             Some(_) => unreachable!(),
             None => {}
         }
-        let page = self
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.page_id.clone());
+        let page = requested_page.or_else(|| {
+            self.sessions.get(&session_id).and_then(|session| session.page_id.clone())
+        });
         let page = match page {
             Some(page) => page,
             None => {

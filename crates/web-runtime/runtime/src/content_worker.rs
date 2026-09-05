@@ -1709,7 +1709,7 @@ impl ContentEngine {
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
         let source = format!(
-            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
+            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (!greppyObservedRefMatches(selector, nodes)) throw new Error('STALE_REF: observed node no longer belongs to the active document'); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
         );
         self.evaluate(webview, &source)
     }
@@ -2269,6 +2269,15 @@ impl ContentEngine {
                     self.screenshot_png(&webview, clip)?
                 };
                 screenshot_engine_result(&png)
+            }
+            "locator.inspect" => {
+                let attrs = params.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false);
+                let html = params.get("html").and_then(|v| v.as_bool()).unwrap_or(false);
+                let describe = greppy_web_client::DESCRIBE_NODE_JS;
+                let source = format!(
+                    "var describe = {describe}; var out = {{ count: 1, node: describe(nodes[0], {attrs}) }}; if ({html}) out.html = nodes[0].outerHTML.slice(0, 20000); return out;"
+                );
+                Ok(json!({ "serialized": serialize_jsvalue(self.locator_eval(&params, &source)?)? }))
             }
             "locator.count" => {
                 let page_id = required_str(&params, "page")?;
@@ -3861,6 +3870,14 @@ function greppyResolveIn(root, selector) {
   }
   return [];
 }
+function greppyObservedRefMatches(selector, nodes) {
+  if (selector.snapshot == null) return true;
+  const registry = window.__greppyObservedRefs;
+  return !!(registry && registry.snapshot === selector.snapshot &&
+    document.documentElement && document.documentElement.getAttribute('data-greppy-ref-snapshot') === selector.snapshot &&
+    nodes.length === 1 && registry.nodes[selector.observed_ref - 1] === nodes[0] &&
+    nodes[0].ownerDocument === document && nodes[0].isConnected);
+}
 function greppyResolveNodes(selector) {
   if (selector.type === 'filter') {
     let nodes = greppyResolveNodes(selector.scope);
@@ -3926,7 +3943,7 @@ fn resolve_script(selector: &serde_json::Value) -> String {
             return {{ staleRef: true, count: 0 }};
           }}
           const nodes = greppyResolveNodes(selector);
-          if (selector.snapshot != null && nodes.length !== 1) {{
+          if (!greppyObservedRefMatches(selector, nodes)) {{
             return {{ staleRef: true, count: nodes.length }};
           }}
           if (nodes.length !== 1) {{
@@ -4943,6 +4960,9 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   });
   const capped = candidates.slice(0, 200);
+  // Retain actual node identities, not just clonable DOM attributes. A replacement
+  // with copied attributes must not inherit an observed ref. Bound to one snapshot.
+  if (snapshot != null) window.__greppyObservedRefs = { snapshot: snapshot, nodes: capped };
   const compact = function(value) { return String(value || '').replace(/\s+/g, ' ').trim(); };
   const accessibleName = function(node, tag, type) {
     const labelledBy = (node.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
