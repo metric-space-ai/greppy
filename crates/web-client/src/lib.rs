@@ -9,7 +9,13 @@ mod protocol;
 pub const SELECT_CHOICES_JS: &str = include_str!("select-choices.js");
 
 /// Shared DOM description for native ref inspection and CLI query inspection.
-pub const DESCRIBE_NODE_JS: &str = include_str!("describe-node.js");
+pub const DESCRIBE_NODE_JS: &str = concat!(
+    "(function() {\n",
+    include_str!("select-choices.js"),
+    "\nreturn ",
+    include_str!("describe-node.js"),
+    ";\n})()",
+);
 
 pub use frame::{read_frame, write_frame, FrameError, MAX_FRAME_BYTES};
 pub use protocol::{
