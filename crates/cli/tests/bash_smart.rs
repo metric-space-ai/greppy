@@ -146,6 +146,29 @@ fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
 }
 
 #[test]
+fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
+    let workspace = fresh_workspace("compiler-diagnostic");
+    let diagnostics = "/example/header.h:41:8: error: #error \"incompatible headers\"\n/example/main.c:9: warning: unused variable\n";
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 2");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.starts_with("FAILED — exit 2: 1 error, 1 warning\n"),
+            "stdout={stdout}; stderr={}",
+            text(&output.stderr)
+        );
+        let raw_stream = if redirect.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(raw_stream.ends_with(diagnostics.as_bytes()));
+    }
+}
+
+#[test]
 fn child_flags_after_delimiter_pass_through_unchanged() {
     let workspace = fresh_workspace("child-flag");
     let output = run(

@@ -57,6 +57,15 @@ static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     )
     .expect("bash-smart TypeScript error regex")
 });
+// GCC/Clang put a numeric file location before the severity. Keep the
+// classifier byte-oriented (paths need not be UTF-8) and require the complete
+// location/severity syntax rather than promoting arbitrary stderr prose.
+static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning):(?:[\t ]|$)",
+    )
+    .expect("bash-smart source diagnostic regex")
+});
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -654,7 +663,15 @@ fn detect_blocks(
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
             } else {
-                None
+                SOURCE_DIAGNOSTIC_RE
+                    .captures(lines[index].content)
+                    .map(|captures| {
+                        if captures[1].eq_ignore_ascii_case(b"warning") {
+                            BlockKind::Warning
+                        } else {
+                            BlockKind::Error
+                        }
+                    })
             };
             let Some(kind) = kind else {
                 index += 1;
@@ -2237,6 +2254,36 @@ mod tests {
     #[test]
     fn typescript_words_without_a_compiler_location_are_not_errors() {
         let text = split_lines(b"the docs mention error TS2322\nexample.ts(x,y): error TS2322: not a location\nexample.ts(1,1): error TSfoo: not a numeric code\nexample.ts(1,1): no error TS2322: all good\n");
+        assert!(detect_blocks(&text, &[]).is_empty());
+    }
+
+    #[test]
+    fn source_prefixed_compiler_diagnostics_count_in_either_stream() {
+        let diagnostics = b"/example/header.h:41:8: error: #error \"incompatible headers\"\n  41 | #error \"incompatible headers\"\n     |        ^~~~~\nC:\\project files\\source.cpp:9: fatal error: missing.h: No such file\nsrc/main.c:12:4: warning: unused variable\nsrc/\xff.c:13: error: invalid declaration\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 4, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Error);
+            assert_eq!(blocks[0].lines.len(), 3);
+            assert_eq!(blocks[1].kind, BlockKind::Error);
+            assert_eq!(blocks[2].kind, BlockKind::Warning);
+            assert_eq!(blocks[3].kind, BlockKind::Error);
+            let errors = blocks.iter().filter(|b| b.kind == BlockKind::Error).count();
+            assert_eq!(
+                verdict_line(1, errors, blocks.len() - errors, None),
+                "FAILED — exit 1: 3 errors, 1 warning"
+            );
+        }
+    }
+
+    #[test]
+    fn source_prefixed_compiler_diagnostics_require_location_and_severity() {
+        // Colons are valid path bytes, so `header.h:x:8:` could legitimately
+        // mean line 8 of a file named `header.h:x`; use no numeric suffix here.
+        let text = split_lines(b"header.h: error: no source line\nheader.h:x:y: error: not a numeric location\nheader.h:41:8: no error: successful\nheader.h:41:8: error_count: 0\nheader.h:41:8: note: informational\nheader.h:41:8: warning_count: 0\n");
         assert!(detect_blocks(&text, &[]).is_empty());
     }
 
