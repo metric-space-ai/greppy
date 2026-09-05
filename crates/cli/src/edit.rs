@@ -2004,7 +2004,10 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                     _ => {
                         return Err(EditRefusal::new(
                             "invalid_patch",
-                            "a hunk contains a line without a unified-diff prefix",
+                            format!(
+                                "{path}: patch input line {} has no unified-diff prefix; each hunk line must start with a space (context), '-' (removal), or '+' (addition). Regenerate the patch with `git diff --no-color -- PATH`; preserve prefixes on empty lines too — nothing written",
+                                index + 1
+                            ),
                             20,
                         ))
                     }

@@ -86,6 +86,26 @@ fn assert_file(path: &Path, expected: &str) {
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
 }
 
+#[test]
+fn malformed_patch_reports_input_line_and_preserves_the_file() {
+    let fixture = Fixture::new("patch-prefix-diagnostic");
+    let original = "fn before() {}\n";
+    std::fs::write(fixture.repo.join("item.rs"), original).unwrap();
+    let output = fixture.run_with_stdin(
+        &["patch"],
+        b"--- a/item.rs\n+++ b/item.rs\n@@ -1 +1 @@\n-fn before() {}\nfn after() {}\n",
+    );
+    assert_eq!(output.status.code(), Some(20), "{}", combined(&output));
+    let diagnostic = combined(&output);
+    assert!(
+        diagnostic.contains("item.rs: patch input line 5"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("git diff --no-color"), "{diagnostic}");
+    assert!(diagnostic.contains("nothing written"), "{diagnostic}");
+    assert_file(&fixture.repo.join("item.rs"), original);
+}
+
 #[cfg(unix)]
 fn install_fake_tsc(fixture: &Fixture, script: &str) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -357,6 +377,34 @@ fn patch_git_unsupported_sections_are_not_silently_dropped() {
         assert!(text.contains("nothing written"), "{text}");
         assert_file(&fixture.repo.join("one.txt"), "one\n");
     }
+}
+
+#[test]
+fn replace_text_accepts_raw_borrows_and_preserves_syntax_refusal_atomicity() {
+    let fixture = Fixture::new("replace-text-rust-raw");
+    let source = "fn before() {}\n";
+    let replacement = "fn inserted() { let raw = 1; let _ = &raw; }\nfn before()";
+    let expected = format!("{replacement} {{}}\n");
+    std::fs::write(fixture.repo.join("valid.rs"), source).unwrap();
+
+    let dry_run = fixture.run(&[
+        "replace-text",
+        "valid.rs",
+        "fn before()",
+        replacement,
+        "--dry-run",
+    ]);
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert_file(&fixture.repo.join("valid.rs"), source);
+
+    let written = fixture.run(&["replace-text", "valid.rs", "fn before()", replacement]);
+    assert!(written.status.success(), "{}", combined(&written));
+    assert_file(&fixture.repo.join("valid.rs"), &expected);
+
+    let refused = fixture.run(&["replace-text", "valid.rs", "let _ = &raw;", "let _ = ;"]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert!(combined(&refused).contains("nothing written"));
+    assert_file(&fixture.repo.join("valid.rs"), &expected);
 }
 
 #[test]
