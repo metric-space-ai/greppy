@@ -843,25 +843,6 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
         };
     }
-    // Structured Greppy commands perform throttled cache maintenance. This
-    // intentionally runs after passthrough detection so an ordinary grep
-    // invocation cannot touch Greppy state.
-    // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
-    // their own store + lock namespace, not trash/other workspaces that GC needs.
-    // `web doctor` is facts-only: it must not spawn engines and must not scan
-    // the Greppy store. Other structured commands still run throttled GC.
-    let skip_gc = is_trial_invocation(&argv)
-        || is_web_doctor_invocation(&argv)
-        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
-    startup_trace(if skip_gc {
-        "run_os.gc_skipped"
-    } else {
-        "run_os.gc_begin"
-    });
-    if !skip_gc {
-        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
-        startup_trace("run_os.gc_end");
-    }
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
@@ -885,6 +866,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            if sub == "expand"
+                && unknown_flag_name(first)
+                    .as_deref()
+                    .is_some_and(|flag| matches!(flag, "--lines" | "--line"))
+            {
+                println!(
+                    "`expand` prints a prepared evidence page; it does not accept a line range. \
+                     Run `greppy expand ID --json` and follow `next.command` when another page exists. \
+                     To read a source-file range instead, use `greppy read-file PATH --lines A:B`."
+                );
+                println!("usage: greppy expand ID [--json] [--root DIR]");
+                return 64;
+            }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
                 first,
@@ -1021,6 +1015,23 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             return EXIT_USAGE;
         }
     };
+    // Only a successfully parsed command may perform cache maintenance.
+    // Help, version and refused usage must not create gc.state/lock files or
+    // reclaim unrelated caches while the user is asking how to configure them.
+    // Passthrough already returned above. Agent children retain their scoped
+    // store permissions; trial and web doctor remain facts-only.
+    let skip_gc = is_trial_invocation(&argv)
+        || is_web_doctor_invocation(&argv)
+        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
+    startup_trace(if skip_gc {
+        "run_os.gc_skipped"
+    } else {
+        "run_os.gc_begin"
+    });
+    if !skip_gc {
+        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+        startup_trace("run_os.gc_end");
+    }
     dispatch_to_code(cli)
 }
 
