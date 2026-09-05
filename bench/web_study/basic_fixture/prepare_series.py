@@ -9,7 +9,7 @@ p.add_argument('output',type=Path)
 p.add_argument('--scratch',type=Path,required=True,help='Disposable fixture/state/runtime root on /Volumes/tmp')
 p.add_argument('--base-url',required=True)
 p.add_argument('--repeats',type=int,default=5)
-p.add_argument('--cases', nargs='+', choices=['text','checkbox','address','dialog'], default=['text','checkbox','address','dialog'])
+p.add_argument('--cases', nargs='+', choices=['text','checkbox','address','dialog','table'], default=['text','checkbox','address','dialog'])
 p.add_argument('--isolated-cli', type=Path, help='Opt into short aliases and isolated cwd; native open handles session creation')
 p.add_argument('--alias-dir', type=Path)
 p.add_argument('--runtime', type=Path, help='Explicit candidate runtime; do not use a shared mutable build target')
@@ -32,7 +32,7 @@ for name in ('fixture','runs','runtime'):
 freeze=a.output/'fixture'
 source=Path(__file__).parent
 pins=[]
-for name in ['server.py','static/index.html','static/app.js','static/styles.css','test_server.py','README.md']:
+for name in ['server.py','table_case.py','static/index.html','static/app.js','static/table.js','static/styles.css','test_server.py','test_table_case.py','README.md']:
     raw=(source/name).read_bytes(); target=freeze/name; target.parent.mkdir(exist_ok=True,parents=True); target.write_bytes(raw)
     pins.append({'path':name,'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)})
 server.set_dir(a.output/'runs')

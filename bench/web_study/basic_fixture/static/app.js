@@ -62,7 +62,7 @@ async function refresh() {
   const response = await fetch('/api/state?run_id=' + encodeURIComponent(runId));
   if (!response.ok) { document.getElementById('events').textContent = await response.text(); return; }
   state = await response.json(); document.getElementById('run').textContent = `Run ${state.run_id} · ${state.case} · revision ${state.revision}`;
-  ({text: renderText, checkbox: renderCheckbox, address: renderAddress, dialog: renderDialog}[state.case])();
+  ({text: renderText, checkbox: renderCheckbox, address: renderAddress, dialog: renderDialog, table: renderTable}[state.case])();
   document.getElementById('events').textContent = `Revision events: ${state.events.length}`;
 }
 refresh();

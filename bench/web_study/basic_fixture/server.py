@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Bounded local browser fixture and host-side oracle."""
-import argparse, json, os, re, secrets, tempfile
+import argparse, json, os, re, secrets, sys, tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import table_case
 RUN_DIR = Path(os.environ["GREPPY_BASIC_FIXTURE_RUN_DIR"]) if os.environ.get("GREPPY_BASIC_FIXTURE_RUN_DIR") else Path(tempfile.gettempdir()) / "greppy-basic-fixture"
-CASES = {"text", "checkbox", "address", "dialog"}
+CASES = {"text", "checkbox", "address", "dialog", "table"}
 RUN_RE = re.compile(r"^[0-9a-f]{12}$")
 
 def facts(seed):
@@ -15,6 +17,7 @@ def facts(seed):
     return {"text": f"Invoice note {n % 97:02d}", "countries": {"Germany": ["Berlin", "Hamburg"], "France": ["Paris", "Lyon"]}, "postcodes": {"Germany": {"Berlin": "10115", "Hamburg": "20095"}, "France": {"Paris": "75001", "Lyon": "69001"}}}
 
 def new_state(run_id, seed, case):
+    if case == 'table': return table_case.new_state(run_id, seed)
     f = facts(seed)
     return {"run_id": run_id, "seed": seed, "case": case, "facts": f, "revision": 0, "values": {"note": f["text"], "note_saved": False, "enabled": False, "quantity": 1, "country": "", "city": "", "postcode": "", "postcode_valid": False, "saved": False, "save_origin": ""}, "events": []}
 
@@ -37,9 +40,10 @@ def mutate(s, action, payload):
     if not isinstance(payload, dict): raise ValueError("payload must be an object")
     case, v, f = s["case"], s["values"], s["facts"]
     value = payload.get("value")
-    allowed = {"text": {"set_note"}, "checkbox": {"set_enabled", "set_quantity"}, "address": {"set_country", "set_city", "set_postcode"}, "dialog": {"save"}}[case]
+    allowed = {"text": {"set_note"}, "checkbox": {"set_enabled", "set_quantity"}, "address": {"set_country", "set_city", "set_postcode"}, "dialog": {"save"}, "table": table_case.ACTIONS}[case]
     if action not in allowed: raise ValueError("action is not valid for this case")
-    if action == "set_note":
+    if case == 'table': table_case.apply(s, action, payload)
+    elif action == "set_note":
         if not isinstance(value, str): raise ValueError("note must be text")
         v["note"], v["note_saved"] = value, True
     elif action == "set_enabled": v["enabled"] = boolean(value)
@@ -63,7 +67,8 @@ def mutate(s, action, payload):
 
 def verify(s):
     v, f, case = s["values"], s["facts"], s["case"]
-    if case == "text": checks = {"exact_note": v["note_saved"] and v["note"] == "Ready for review"}
+    if case == 'table': checks = table_case.checks(s)
+    elif case == "text": checks = {"exact_note": v["note_saved"] and v["note"] == "Ready for review"}
     elif case == "checkbox": checks = {"enabled": v["enabled"], "quantity": v["quantity"] == 3}
     elif case == "address": checks = {"exact_location": v["country"] == "Germany" and v["city"] == "Berlin", "postcode": v["postcode"] == "10115" and v["postcode_valid"]}
     else: checks = {"scoped_save": v["saved"] and v["save_origin"] == "task4-dialog"}

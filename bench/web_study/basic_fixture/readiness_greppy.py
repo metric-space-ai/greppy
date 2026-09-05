@@ -44,10 +44,21 @@ for case,rid in runs.items():
             run('fill','fill','css=#postcode','10115')
             run('blur','press','Tab')
             revision=3
-        else:
+        elif case=='table':
+            run('region','select','css=#inventory-region','EU')
+            run('capacity','check','css=#inventory-capacity')
+            run('sort','select','css=#inventory-order','ascending')
+            run('sorted','wait','css=#price-heading[aria-sort="ascending"]','--timeout','5000')
+            run('reserve','click','css=#inventory-table tbody tr:first-child button')
+            run('quantity','fill','css=#reservation-quantity','3')
+            run('confirm','click','text=Confirm reservation')
+            revision=4
+        elif case=='dialog':
             run('dialog','click','text=Open Complete basic task dialog')
             run('save','click','css=dialog[open] button:first-of-type')
             revision=1
+        else:
+            raise ValueError('Unsupported prepared readiness case: '+case)
         run('persisted','wait','text=Revision events: '+str(revision),'--timeout','5000')
         run('after','observe')
         proc=subprocess.run(['/usr/bin/python3',str(Path(__file__).with_name('server.py')),'verify-run',rid,'--run-dir',str(a.run_dir)],capture_output=True,text=True)
