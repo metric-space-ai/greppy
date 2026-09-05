@@ -64,3 +64,15 @@ Root's runtime branch does not yet contain the worker's E1 Observe generator.
 Existing selected_options still scans node.options; no reduction in full
 traversals is claimed. Native Observe integration and subsequent agent-token
 measurements remain pending.
+
+Native integration follow-up on 2026-09-06: probe 04 passed 18 checks against
+preserved CLI 1d53d0a71c443f0f7fdff0ae569b89e08cd50af1f5a85308e308325124110281
+and runtime d8f437c493d7780f39bb8868da9227ce8600dadaa7a7e393936954cf1877277b.
+With `--check-native-choices`, both isolated owners returned exactly the shared
+choice projection through actual `web observe` and native `web inspect` calls.
+The context-preservation checks also passed. Both runtimes stopped and the HTTP
+thread ended; executable hashes were unchanged. Evidence is retained at
+`/Users/michaelwelsch/.local/state/greppy-web-study/isolation-descriptor-20260906-04`.
+This establishes the compiled projection for this fixture. It does not yet prove
+the Root human renderer in a newly built CLI, the opt-in native Wait adapter,
+or reduced model input/output tokens in paired agent trials.

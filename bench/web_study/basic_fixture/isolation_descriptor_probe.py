@@ -1,7 +1,7 @@
 """Native owner-isolation and descriptor DOM probe; no efficiency claim.
 
-Uses unchanged candidate binaries. The new descriptor is evaluated explicitly;
-this does not prove its integration into a newly compiled web.inspect.
+Uses unchanged candidate binaries. The descriptor is evaluated explicitly;
+--check-native-choices additionally checks compiled Observe and Inspect replies.
 """
 from __future__ import annotations
 import argparse
@@ -35,7 +35,7 @@ class Page(BaseHTTPRequestHandler):
         pass
 
 
-def run(cli, runtime, scratch, evidence):
+def run(cli, runtime, scratch, evidence, check_native_choices=False):
     evidence.mkdir(parents=True, exist_ok=False)
     aliases = scratch / 'aliases'
     aliases.mkdir(parents=True)
@@ -114,6 +114,16 @@ def run(cli, runtime, scratch, evidence):
               [('', 'Unsorted', False), ('ascending', 'Low to high', False), ('descending', 'High to low', True)])
         check('native DOM descriptor schema and state', choices['schema'] == 'greppy.web.select-choices.v1' and
               choices['choices_total'] == 3 and choices['choices_truncated'] is False and result['value'] == '')
+        if check_native_choices:
+            for context, session in zip(contexts, sessions):
+                observed = ok(context, 'observe', '--session', session)['result']
+                controls = [node for node in observed['actionables'] if node.get('name') == 'Price order']
+                check('compiled native Observe choices ' + session, len(controls) == 1 and
+                      controls[0].get('select_choices') == choices)
+                inspected = ok(context, 'inspect', 'css=#order', '--session', session)['result']['value']['node']
+                check('compiled native Inspect choices ' + session, inspected.get('select_choices') == choices)
+            terminal['compiled_inspect_integration'] = True
+            terminal['compiled_observe_choices_integration'] = True
         check('candidate bytes unchanged', capture(cli, runtime) == contexts[0]['candidate'])
         check('implicit current sessions preserved', all(implicit_preserved))
         terminal['passed'] = True
@@ -143,8 +153,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('cli', 'runtime', 'scratch', 'evidence'):
         p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument("--check-native-choices", action="store_true", help="Also require choices from compiled native Observe and Inspect")
     a = p.parse_args()
-    run(a.cli, a.runtime, a.scratch, a.evidence)
+    run(a.cli, a.runtime, a.scratch, a.evidence, a.check_native_choices)
 
 
 if __name__ == '__main__':
