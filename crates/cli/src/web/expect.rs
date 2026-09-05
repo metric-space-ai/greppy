@@ -1,7 +1,6 @@
-//! Waiting and checking. Both verbs ask the same question — does the page
-//! satisfy a condition — so both are polls over `web.evaluate` rather than
-//! separate engine operations. `wait` polls until the deadline, `assert`
-//! asks once and turns the answer into an exit code.
+//! Waiting and checking share a condition compiler. Assert evaluates once.
+//! Wait retains its legacy polling backend unless --native explicitly selects
+//! the experimental single-request runtime wait. No automatic fallback occurs.
 
 use super::common::*;
 use clap::{Args, Subcommand};
@@ -26,6 +25,100 @@ mod response_tests {
             &Request::new("condition-test", "web.evaluate", json!({})),
             result,
         )
+    }
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: ExpectCommand,
+    }
+
+    #[test]
+    fn native_wait_is_explicit_and_rejects_a_conflicting_poll_interval() {
+        use clap::Parser;
+        let native = TestCli::try_parse_from(["test", "wait", "css=#late", "--native"]).unwrap();
+        assert!(matches!(
+            native.command,
+            ExpectCommand::Wait { native: true, .. }
+        ));
+        let legacy = TestCli::try_parse_from(["test", "wait", "css=#late"]).unwrap();
+        assert!(matches!(
+            legacy.command,
+            ExpectCommand::Wait { native: false, .. }
+        ));
+        let error =
+            TestCli::try_parse_from(["test", "wait", "css=#late", "--native", "--interval", "20"])
+                .err()
+                .expect("an explicit polling option cannot be silently ignored");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn native_wait_preserves_result_evidence_and_never_accepts_missing_confirmation() {
+        let state = json!({"status":"available", "snapshot":{"title":"Saved"}});
+        let result = normalize_native_wait_response(
+            reply(json!({
+                "held": true, "waited_ms": 7, "page_state": state, "future_detail": {"value":false}
+            })),
+            100,
+            9,
+        )
+        .unwrap();
+        let value = result.result.unwrap();
+        assert_eq!(value["page_state"], state);
+        assert_eq!(value["future_detail"]["value"], false);
+        assert_eq!(value["waited_ms"], 7);
+        assert_eq!(value["wait_backend"], "native_v1");
+        for invalid in [
+            json!(null),
+            json!({}),
+            json!({"held":false}),
+            json!({"held":"true"}),
+        ] {
+            assert_eq!(
+                normalize_native_wait_response(reply(invalid), 100, 9)
+                    .unwrap_err()
+                    .code,
+                "INVALID_WAIT_RESULT"
+            );
+        }
+    }
+
+    #[test]
+    fn native_timeout_keeps_recovery_and_legacy_timeout_status() {
+        let request = Request::new("wait-test", "web.wait", json!({}));
+        for code in [
+            "TIMEOUT",
+            "STALE_REF",
+            "resource_limit",
+            "INVALID_WAIT_SOURCE",
+        ] {
+            let response = Response::error(
+                &request,
+                ErrorObject::new(
+                    code,
+                    "specific runtime failure",
+                    request.request_id.clone(),
+                    34,
+                    "specific recovery",
+                ),
+            );
+            let normalized = normalize_native_wait_response(response, 50, 51).unwrap();
+            assert_eq!(normalized.status, "error");
+            let error = normalized.error.unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.next_action, "specific recovery");
+            assert_eq!(error.operation_id, request.request_id);
+            if code == "TIMEOUT" {
+                assert_eq!(error.exit_code, EXIT_WAIT_TIMEOUT);
+                let result = normalized.result.unwrap();
+                assert_eq!(result["held"], false);
+                assert_eq!(result["timeout_ms"], 50);
+            } else {
+                assert_eq!(error.exit_code, 34);
+                assert!(normalized.result.is_none());
+            }
+        }
     }
 
     #[test]
@@ -122,9 +215,13 @@ pub enum ExpectCommand {
         /// Deadline in milliseconds.
         #[arg(long, default_value_t = 10_000)]
         timeout: u64,
-        /// Poll interval in milliseconds.
-        #[arg(long, default_value_t = 120)]
+        /// Poll interval in milliseconds for the legacy backend.
+        #[arg(long, default_value_t = 120, conflicts_with = "native")]
         interval: u64,
+        /// Experimental single-request native wait; requires a matching runtime.
+        /// Runtime errors remain errors; this mode never falls back to polling.
+        #[arg(long)]
+        native: bool,
     },
     /// Check a condition once. Exit 18 when it does not hold.
     ///
@@ -142,7 +239,14 @@ pub(super) fn dispatch(command: ExpectCommand, root: Option<&str>) -> Result<i32
             condition,
             timeout,
             interval,
-        } => wait(root, condition, timeout, interval),
+            native,
+        } => {
+            if native {
+                wait_native(root, condition, timeout)
+            } else {
+                wait(root, condition, timeout, interval)
+            }
+        }
         ExpectCommand::Assert { condition } => assert_once(root, condition),
     }
 }
@@ -255,6 +359,104 @@ fn decode_condition_response(
         .ok_or_else(invalid_result)?;
     let detail = value.get("detail").cloned().unwrap_or(json!(null));
     Ok((holds, detail))
+}
+
+/// Adapt the existing typed condition result to the native Boolean contract.
+/// Validate before IPC; neither a missing value nor an object can prove absence.
+fn native_condition_source(condition: &Condition) -> std::result::Result<String, String> {
+    let source = condition_expression(condition)?;
+    Ok(format!(
+        "(function(){{ var r = ({source}); \
+         if (!r || typeof r.holds !== 'boolean') throw new Error('INVALID_WAIT_PREDICATE'); \
+         return r.holds !== {}; }})()",
+        condition.absent
+    ))
+}
+
+fn normalize_native_wait_response(
+    mut response: greppy_web_client::Response,
+    timeout: u64,
+    waited_ms: u64,
+) -> std::result::Result<greppy_web_client::Response, ErrorObject> {
+    if let Some(error) = response.error.as_mut() {
+        if error.code == "TIMEOUT" {
+            // Keep the CLI's existing wait-timeout exit code and fields while
+            // retaining the runtime's typed error, metrics and recovery text.
+            error.exit_code = EXIT_WAIT_TIMEOUT;
+            let result = response.result.get_or_insert_with(|| json!({}));
+            if let Some(result) = result.as_object_mut() {
+                result.insert("held".into(), json!(false));
+                result.insert("timeout_ms".into(), json!(timeout));
+                result.insert("waited_ms".into(), json!(waited_ms));
+                result.entry("detail").or_insert(json!(null));
+                result.insert("wait_backend".into(), json!("native_v1"));
+            }
+        }
+        // Other errors are never inverted or used to trigger another backend.
+        return Ok(response);
+    }
+    if response.status != "ok"
+        || response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("held"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(ErrorObject::new(
+            "INVALID_WAIT_RESULT",
+            "native wait returned an invalid reply; expected status=ok and held=true",
+            response.request_id.clone(),
+            EXIT_WEB_ENGINE,
+            "inspect the runtime response contract; no condition was confirmed",
+        ));
+    }
+    let result = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("a held field requires an object");
+    result.entry("detail").or_insert(json!(null));
+    result.entry("waited_ms").or_insert(json!(waited_ms));
+    result.insert("wait_backend".into(), json!("native_v1"));
+    Ok(response)
+}
+
+fn wait_native(root: Option<&str>, condition: Condition, timeout: u64) -> Result<i32> {
+    let source = match native_condition_source(&condition) {
+        Ok(source) => source,
+        Err(message) => {
+            return emit_error(condition.json, invalid(&format!("web wait: {message}")))
+        }
+    };
+    if Instant::now()
+        .checked_add(Duration::from_millis(timeout.saturating_add(5_000)))
+        .is_none()
+    {
+        return emit_error(
+            condition.json,
+            invalid("web wait: timeout exceeds the supported monotonic clock range"),
+        );
+    }
+    let session = match resolve_session(root, condition.session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(condition.json, error),
+    };
+    let mut payload = json!({"session_id": session, "source": source, "timeout_ms": timeout});
+    if let Some(tab) = resolve_tab(root, condition.tab) {
+        payload["tab_id"] = json!(tab);
+    }
+    let started = Instant::now();
+    match rpc_response(root, "web.wait", payload, Some(session)).and_then(|response| {
+        normalize_native_wait_response(
+            response,
+            timeout,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        )
+    }) {
+        Ok(response) => emit_response(condition.json, response),
+        Err(error) => emit_error(condition.json, error),
+    }
 }
 
 fn wait(root: Option<&str>, condition: Condition, timeout: u64, interval: u64) -> Result<i32> {

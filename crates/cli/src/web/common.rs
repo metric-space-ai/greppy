@@ -714,7 +714,16 @@ pub(super) fn rpc_on_response(
         let mut request = Request::new(&ctx.run_id, operation, payload.clone());
         request.session_id = session_id;
         request.capability = ctx.capability.clone();
-        let wait = if operation == "web.run" {
+        let wait = if operation == "web.wait" {
+            let deadline_ms = payload
+                .get("timeout_ms")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(10_000);
+            request.deadline_ms = deadline_ms;
+            // The extra transport margin delivers the native deadline result;
+            // it does not extend the engine condition budget.
+            Duration::from_millis(deadline_ms.saturating_add(5_000))
+        } else if operation == "web.run" {
             let deadline_ms = payload
                 .get("timeout_seconds")
                 .and_then(|value| value.as_u64())
