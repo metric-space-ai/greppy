@@ -63,6 +63,10 @@ jobs:
 
       - name: Require three stable serial suite passes
         shell: bash
+        env:
+          # Preserve the last initialization phase on a Content handshake timeout.
+          # Do not enable the much noisier per-operation trace or relax deadlines.
+          GREPPY_WEB_TRACE_STARTUP: '1'
         run: |
           for attempt in 1 2 3; do
             echo "::group::session-daemon stability pass $attempt/3"
