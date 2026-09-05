@@ -46,7 +46,7 @@ def prepare(scratch: Path, cli: Path, alias_dir: Path, trial_id: str, runtime_id
     source = '\n'.join([
         '#!/bin/sh',
         '# Study transport only; argv and exit status are unchanged.',
-        'unset GREPPY_WEB_SESSION GREPPY_WEB_TAB GREPPY_WEB_AGENT GREPPY_WEB_VIEW GREPPY_WEB_CHAIN_VIEW',
+        'unset GREPPY_WEB_SESSION GREPPY_WEB_TAB GREPPY_WEB_AGENT GREPPY_WEB_VIEW GREPPY_WEB_CHAIN_VIEW GREPPY_WEB_RUNTIME_DIST',
         'export TMPDIR=' + q(str(temporary)),
         'export GREPPY_RUN_ID=' + q('study-' + runtime_id),
         'export GREPPY_WEB_RUNTIME_DIR=' + q(str(runtime)),

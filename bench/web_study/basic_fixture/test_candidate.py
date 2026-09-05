@@ -17,7 +17,7 @@ def executables(tmp_path):
     cli = tmp_path / 'fake cli'
     cli.write_text('''#!/usr/bin/python3
 import json, os, sys
-keys = ['GREPPY_WEB_RUNTIME', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT', 'GREPPY_WEB_VIEW', 'GREPPY_WEB_CHAIN_VIEW']
+keys = ['GREPPY_WEB_RUNTIME', 'GREPPY_WEB_RUNTIME_DIST', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT', 'GREPPY_WEB_VIEW', 'GREPPY_WEB_CHAIN_VIEW']
 print(json.dumps({'argv':sys.argv[1:], 'env':{k:os.environ.get(k) for k in keys}}))
 sys.exit(17)
 ''')
@@ -36,14 +36,14 @@ def test_wrapper_sets_candidate_and_options_without_changing_argv(tmp_path, view
     context = prepare(tmp_path / 'scratch', cli, aliases, 'test', 'test-runtime',
                       runtime=runtime, view=view, chain_view=chain)
     dirty = {**os.environ, **{k: 'inherited-wrong-value' for k in (
-        'GREPPY_WEB_RUNTIME', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT',
+        'GREPPY_WEB_RUNTIME', 'GREPPY_WEB_RUNTIME_DIST', 'GREPPY_WEB_SESSION', 'GREPPY_WEB_TAB', 'GREPPY_WEB_AGENT',
         'GREPPY_WEB_VIEW', 'GREPPY_WEB_CHAIN_VIEW')}}
     argv = ['web', 'open', 'http://example.invalid/?a=1&b=2', 'literal $(not-a-command)']
     result = subprocess.run([context['alias'], *argv], env=dirty, capture_output=True, text=True)
     assert result.returncode == 17
     output = json.loads(result.stdout)
     assert output['argv'] == argv
-    assert output['env'] == {'GREPPY_WEB_RUNTIME': str(runtime.resolve()),
+    assert output['env'] == {'GREPPY_WEB_RUNTIME': str(runtime.resolve()), 'GREPPY_WEB_RUNTIME_DIST': None,
         'GREPPY_WEB_SESSION': None, 'GREPPY_WEB_TAB': None, 'GREPPY_WEB_AGENT': None,
         'GREPPY_WEB_VIEW': 'compact' if view == 'compact' else None,
         'GREPPY_WEB_CHAIN_VIEW': 'compact' if chain == 'compact' else None}
