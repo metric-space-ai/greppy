@@ -51,6 +51,11 @@ and requires matching independent evidence receipts; conflicts and missing evide
 are held. A receipt must itself be verified against its referenced artifact. This
 review report does not certify production readiness or automatically export labels.
 
+Rubric v2 explicitly fixes the zero-based relevance mapping and the boundary
+between irrelevant controls and relevant background. Domain-specific severity,
+nonempty evidence and known source IDs are also bound in the response schema.
+Use admission.py --rubric with the recorded version when reviewing an old queue.
+
 `corpus.py` partitions log lines into byte-exact target spans, preserves full
 context, and joins content/template/lineage relations before assigning splits.
 Frozen split conflicts fail closed; existing source-group IDs survive extensions.
@@ -68,7 +73,7 @@ wiring and runtime head integration are still outstanding.
 
 ## Verification to date
 
-- 57 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
+- 64 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
   secret redaction, restart idempotency, concurrent claims, bounded retries,
   quota/auth pauses, worker expiry and split leakage refusal.
 - Live synthetic smoke: one M3 batch and one independently judged Grok batch,
@@ -81,6 +86,11 @@ wiring and runtime head integration are still outstanding.
   completed runs on replay, and reproduced bit-identical weights after injected
   interruptions for five head/objective combinations. See
   `docs/embedding-heads-experiments.md` for the contract and remaining work.
+- All 45 candidates passed 720 same-vector PyTorch/Rust reference cases with a
+  maximum absolute difference of 1.430511474609375e-6. Six loader tests passed.
+  The candidate format cannot authorize production activation.
+- Archive audit found 337 retrieval-error payloads among 424 Cargo/Go members;
+  only 87 text captures remain for source/admission review, none reaching 100k lines.
 
 Run checks through greppy as required by the repository instructions:
 

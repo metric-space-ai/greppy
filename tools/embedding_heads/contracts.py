@@ -4,7 +4,7 @@ import json
 import re
 
 SCHEMA = 'greppy.heads.example.v1'
-RUBRIC_VERSION = 'heads-rubric-2026-09-05-v1'
+RUBRIC_VERSION = 'heads-rubric-2026-09-05-v2'
 LABELS = ('error', 'warning', 'progress', 'text')
 SPLITS = ('train', 'development', 'final', 'diagnostic')
 
@@ -18,12 +18,23 @@ are text; SIGPIPE/BrokenPipe/signal 13 and style/linter help are warning; retrya
 advisories are warning; successful recovery and ordinary lifecycle are progress.
 Hard failures, failed work without retry framing, merge conflicts and hard timeout
 kills are error. Deprecations/compiler warnings are warning. Neutral details are text.
-Task relevance: 0 irrelevant, 1 background, 2 helpful, 3 required for the task's next
-correct step. Causes, diagnostic support and useful action hints may differ in severity.
+Task relevance is ZERO-BASED: 0=irrelevant, 1=background, 2=helpful, 3=required.
+0: no observable contribution to this task or diagnosis of the last action.
+1: establishes relevant page/output orientation, without helping choose or verify
+the next step. A justification of only "background context" means 1, never 2.
+2: helps choose, disambiguate or diagnose the next step, with an observed task link.
+3: required to execute the correct next step, preserve a necessary cause/evidence,
+or verify a condition required by the task.
+Presence in the same output/page does not by itself justify 1 or 2. Unrelated
+products/controls/navigation are 0 when the requested target is already distinct
+and the task does not require comparing them. Do not invent a hypothetical use.
+Causes, diagnostic support and useful action hints may differ in severity.
 For Web, use the task and last action, only observed record facts. Missing checked/state
 means unknown. Dispatch does not prove effect or persistence. Never invent state or IDs.
-Evidence IDs must come from supplied records/context. Give a brief observable reason,
-not hidden reasoning. Mark ambiguity explicitly instead of guessing. Protected flags
+Every annotation must list at least one evidence ID from supplied records/context.
+For irrelevant/background records, cite the target's own ID, not an empty list.
+Give a brief observable reason, not hidden reasoning. Mark ambiguity explicitly
+instead of guessing. Protected flags
 are mechanical retention constraints, not a command to assign relevance 3.
 '''
 
@@ -64,15 +75,23 @@ def validate_example(example):
 def response_schema(examples):
     # Conditional ID/evidence membership and exact coverage are checked independently.
     count = sum(len(example['records']) for example in examples)
+    domains = {example['domain'] for example in examples}
+    severities = [None] if domains == {'web'} else list(LABELS) if domains == {'log'} else [*LABELS, None]
+    example_ids = sorted({example['id'] for example in examples})
+    target_ids = sorted({row['id'] for example in examples for row in example['records']})
+    evidence_ids = sorted({row['id'] for example in examples for row in example['records'] + example.get('context', [])})
     return {'type': 'object', 'additionalProperties': False, 'required': ['annotations'],
             'properties': {'annotations': {'type': 'array', 'minItems': count, 'maxItems': count, 'items': {
                 'type': 'object', 'additionalProperties': False,
                 'required': ['example_id', 'record_id', 'severity', 'relevance', 'evidence_ids', 'reason', 'ambiguous'],
                 'properties': {
-                    'example_id': {'type': 'string'}, 'record_id': {'type': 'string'},
-                    'severity': {'enum': [*LABELS, None]},
-                    'relevance': {'type': 'integer', 'minimum': 0, 'maximum': 3},
-                    'evidence_ids': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
+                    'example_id': {'type': 'string', 'enum': example_ids},
+                    'record_id': {'type': 'string', 'enum': target_ids},
+                    'severity': {'enum': severities},
+                    'relevance': {'type': 'integer', 'minimum': 0, 'maximum': 3,
+                                  'description': 'ZERO-BASED: 0 irrelevant; 1 background; 2 helpful; 3 required.'},
+                    'evidence_ids': {'type': 'array', 'minItems': 1,
+                                     'items': {'type': 'string', 'enum': evidence_ids}, 'uniqueItems': True},
                     'reason': {'type': 'string', 'maxLength': 600}, 'ambiguous': {'type': 'boolean'},
                 }}}}}
 

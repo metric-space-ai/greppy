@@ -19,6 +19,7 @@
 
 pub mod backend;
 pub mod block_classifier;
+pub mod head_candidate;
 pub mod cpu_features;
 pub mod gguf;
 pub mod matmul;

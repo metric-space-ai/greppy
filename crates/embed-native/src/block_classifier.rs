@@ -229,7 +229,7 @@ fn read_f32(bytes: &[u8], offset: usize) -> Result<f32> {
 
 // Abramowitz-Stegun 7.1.26, max |error| ~= 1.5e-7. PyTorch's exported head
 // uses exact GELU (erf form), not the tanh approximation.
-fn gelu(value: f32) -> f32 {
+pub(crate) fn gelu(value: f32) -> f32 {
     let x = value * std::f32::consts::FRAC_1_SQRT_2;
     0.5 * value * (1.0 + erf(x))
 }

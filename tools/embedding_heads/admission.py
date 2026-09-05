@@ -96,12 +96,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--db',type=Path,required=True)
     parser.add_argument('--mechanical',type=Path)
+    parser.add_argument('--rubric',default=RUBRIC_VERSION,help='Explicit rubric for historical queue reviews')
     parser.add_argument('--job-selection',type=Path,help='Explicit JSON array of immutable teacher job IDs; never choose a version silently')
     parser.add_argument('--out',type=Path,required=True)
     args = parser.parse_args()
     receipts = json.loads(args.mechanical.read_text()) if args.mechanical else {}
     selection = json.loads(args.job_selection.read_text()) if args.job_selection else None
-    report = audit_queue(QueueStore(args.db), receipts, selected_jobs=selection)
+    report = audit_queue(QueueStore(args.db), receipts, selected_jobs=selection, rubric=args.rubric)
     with args.out.open('x') as f:
         f.write(canonical(report)+'\n')
     print(canonical(report['counts']))
