@@ -408,6 +408,20 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 session,
                 json,
             } => {
+                if super::view::is_cursor(&cursor) {
+                    return match super::view::resume(
+                        &cursor,
+                        session.as_deref(),
+                        &super::view::cache_dir(),
+                        json,
+                    ) {
+                        Ok(text) => {
+                            println!("{text}");
+                            Ok(0)
+                        }
+                        Err(message) => emit_error(json, invalid(&message)),
+                    };
+                }
                 let session = match resolve_session(root, session) {
                     Ok(session) => session,
                     Err(error) => return emit_error(json, error),

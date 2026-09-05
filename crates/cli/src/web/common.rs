@@ -653,8 +653,20 @@ pub(super) fn rpc_on(
     payload: serde_json::Value,
     session_id: Option<String>,
 ) -> Result<i32> {
+    let scope = super::view::Scope {
+        session: session_id.clone().or_else(|| {
+            payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        }),
+        tab: payload
+            .get("tab_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    };
     match rpc_on_response(ctx, operation, payload, session_id) {
-        Ok(response) => emit_response(json_out, response),
+        Ok(response) => emit_response_with_scope(json_out, response, scope),
         Err(error) => emit_error(json_out, error),
     }
 }
@@ -1024,14 +1036,23 @@ pub(super) fn reap_detached_runtime(
 }
 
 pub(super) fn emit_response(json_out: bool, response: Response) -> Result<i32> {
+    emit_response_with_scope(json_out, response, super::view::Scope::default())
+}
+
+fn emit_response_with_scope(
+    json_out: bool,
+    response: Response,
+    scope: super::view::Scope,
+) -> Result<i32> {
     let code = response
         .error
         .as_ref()
         .map(|error| error.exit_code)
         .unwrap_or(0);
-    emit_web(
+    emit_web_with_scope(
         json_out,
         &serde_json::to_value(&response).unwrap_or(json!({})),
+        scope,
     )?;
     Ok(code)
 }
@@ -1049,6 +1070,26 @@ pub(super) fn emit_error(json_out: bool, error: ErrorObject) -> Result<i32> {
 }
 
 pub(super) fn emit_web(json_out: bool, payload: &serde_json::Value) -> Result<()> {
+    emit_web_with_scope(json_out, payload, super::view::Scope::default())
+}
+
+fn emit_web_with_scope(
+    json_out: bool,
+    payload: &serde_json::Value,
+    scope: super::view::Scope,
+) -> Result<()> {
+    if !json_out && super::view::enabled() {
+        match super::view::render(payload, scope, &super::view::cache_dir()) {
+            Ok(text) => {
+                print!("{text}");
+                return Ok(());
+            }
+            Err(error) => {
+                // Output storage must never turn a dispatched action into a silent retry.
+                eprintln!("compact web view unavailable: {error}; returning the unabridged reply (byte budget not applied); no action repeated");
+            }
+        }
+    }
     if json_out {
         println!(
             "{}",
