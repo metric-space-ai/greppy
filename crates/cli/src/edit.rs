@@ -1874,6 +1874,32 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
     let mut files = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
+        if lines[index].starts_with("diff --git ") {
+            // Git's next-file envelope is outside the preceding hunk. Accept
+            // the optional object-ID line, but never silently omit a binary,
+            // rename or mode-only section from an otherwise valid transaction.
+            let section = lines[index];
+            index += 1;
+            if lines
+                .get(index)
+                .is_some_and(|line| line.starts_with("index "))
+            {
+                index += 1;
+            }
+            if !lines
+                .get(index)
+                .is_some_and(|line| line.starts_with("--- "))
+            {
+                let found = lines.get(index).copied().unwrap_or("end of input");
+                return Err(EditRefusal::new(
+                    "invalid_patch",
+                    format!(
+                        "Git patch section `{section}` requires textual ---/+++ headers after its optional index line; found `{found}`. Patch only edits existing file contents, not binary data, modes, renames or Git file creation/deletion metadata. Supply a text-only existing-file patch and handle unsupported operations separately; nothing written"
+                    ),
+                    20,
+                ));
+            }
+        }
         if !lines[index].starts_with("--- ") {
             index += 1;
             continue;
@@ -1905,7 +1931,10 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
         }
         index += 1;
         let mut hunks = Vec::new();
-        while index < lines.len() && !lines[index].starts_with("--- ") {
+        while index < lines.len()
+            && !lines[index].starts_with("--- ")
+            && !lines[index].starts_with("diff --git ")
+        {
             if !lines[index].starts_with("@@") {
                 index += 1;
                 continue;
@@ -1922,6 +1951,7 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             while index < lines.len()
                 && !lines[index].starts_with("@@")
                 && !lines[index].starts_with("--- ")
+                && !lines[index].starts_with("diff --git ")
             {
                 let line = lines[index];
                 match line.as_bytes().first() {
