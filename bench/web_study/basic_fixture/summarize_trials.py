@@ -67,7 +67,9 @@ def summarize(series):
     token_win = token_win and (integrity is True if plan.get('candidate_integrity_required') else True)
     return {
         'schema': 'greppy.basic-paired-summary.v1', 'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
-        'condition': plan.get('harness_condition'), 'medians': medians, 'pairs': pairs,
+        'condition': plan.get('harness_condition'),
+        'onboarding_condition': plan.get('onboarding_condition', 'legacy'),
+        'medians': medians, 'pairs': pairs,
         'candidate_integrity': integrity,
         'median_paired_change_percent': changes, 'traces': traces,
         'token_gate': 'passes this development block only' if token_win and all(p['both_passed'] for p in pairs) else 'failed_or_unproven',
@@ -84,4 +86,4 @@ if __name__ == '__main__':
     result = summarize(a.series)
     with a.output.open('x') as f:
         json.dump(result, f, indent=2)
-    print(json.dumps({k: result[k] for k in ('condition', 'medians', 'median_paired_change_percent', 'token_gate', 'acceptance')}))
+    print(json.dumps({k: result[k] for k in ('condition', 'onboarding_condition', 'medians', 'median_paired_change_percent', 'token_gate', 'acceptance')}))
