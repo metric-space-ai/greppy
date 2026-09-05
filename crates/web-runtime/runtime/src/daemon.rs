@@ -651,6 +651,7 @@ struct Daemon {
     sessions: HashMap<String, Session>,
     profile_locks: HashMap<String, crate::profile_lock::ProfileLock>,
     next_engine_id: AtomicU64,
+    observed_refs: crate::observed_refs::RefAllocator,
     last_crash: Option<String>,
     crash_receipts: Vec<serde_json::Value>,
     last_request: Instant,
@@ -719,6 +720,7 @@ impl Daemon {
             sessions: HashMap::new(),
             profile_locks: HashMap::new(),
             next_engine_id: AtomicU64::new(1),
+            observed_refs: crate::observed_refs::RefAllocator::default(),
             last_crash: None,
             crash_receipts: Vec::new(),
             last_request: Instant::now(),
@@ -1796,44 +1798,107 @@ impl Daemon {
         }
     }
 
+    /// Observe without beginning/finishing another operation. Action callers
+    /// use this while their original operation is still Busy.
+    fn observe_page(&mut self, session_id: &str, page: &str) -> Result<serde_json::Value, String> {
+        let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
+        let elapsed = session.started.elapsed();
+        session.limits.check_wall_time(elapsed)?;
+        let content_cpu = Duration::from_millis(session_cpu_delta_ms(
+            &mut session.content_cpu_baseline, self.content.pid(),
+        ));
+        session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
+        let timeout = session.limits.wall_time.saturating_sub(elapsed).min(Duration::from_secs(60));
+        if timeout.is_zero() {
+            return Err("observation has no remaining session wall budget".into());
+        }
+        let range = self.observed_refs.reserve().map_err(str::to_owned)?;
+        let proposed = format!(
+            "gref-{}-{}",
+            std::process::id(),
+            self.next_engine_id.fetch_add(1, Ordering::Relaxed)
+        );
+        // Keep the last confirmed scope on observation failure. Otherwise a
+        // transient page error would strand the worker's still-live registry
+        // and make every subsequent observation reject its document token.
+        let previous = self.sessions.get(session_id)
+            .and_then(|session| session.locator_snapshots.get(page)).cloned();
+        let mut tree = self.engine_call_timed("page.observe", json!({
+            "page": page, "snapshot": proposed,
+            "ref_first": range.first, "ref_last": range.last,
+        }), timeout)?;
+        let object = tree.as_object_mut().ok_or("observe returned no page object")?;
+        let token = object.remove("ref_snapshot")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or("observe returned no document scope")?;
+        // The worker can retain an unchanged document's token, but page data
+        // must never invent a CSS selector scope or another tab's token.
+        let retained = previous.as_ref().filter(|previous| previous.token == token);
+        if token != proposed && retained.is_none() {
+            return Err("observe returned an unrecognized document scope".into());
+        }
+        let actionables = object.get("actionables").and_then(|value| value.as_array())
+            .ok_or("observe returned no actionable list")?;
+        if actionables.len() > crate::observed_refs::OBSERVED_REF_LIMIT as usize {
+            return Err("observe exceeded the actionable limit".into());
+        }
+        for actionable in actionables {
+            let reference = actionable.get("ref").and_then(|value| value.as_str())
+                .and_then(|value| value.strip_prefix('@'))
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("observe returned an invalid reference")?;
+            if !range.contains(reference)
+                && !retained.is_some_and(|previous| reference > 0 && reference <= previous.ref_ceiling)
+            {
+                return Err("observe returned an unallocated reference".into());
+            }
+        }
+        if let Some(url) = object.get("url").and_then(|value| value.as_str()) {
+            let redacted = redact_secrets(url);
+            object.insert("url".into(), json!(redacted));
+        }
+        object.insert("untrusted_content_boundary".into(), json!("UNTRUSTED_PAGE_CONTENT"));
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.locator_snapshots.insert(page.to_owned(), LocatorSnapshot {
+                token, page_id: page.to_owned(), ref_ceiling: range.last,
+            });
+        }
+        Ok(tree)
+    }
+
+    fn finish_action_with_page_state(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        page: &str,
+        mut result: serde_json::Value,
+    ) -> Response {
+        // Observe exactly once, before the original operation becomes idle.
+        // Observation failure cannot replay or erase a completed side effect.
+        let state = match self.observe_page(session_id, page) {
+            Ok(snapshot) => json!({
+                "schema": "greppy.web.page-state.v1",
+                "status": "available", "snapshot": snapshot,
+            }),
+            Err(error) => json!({
+                "schema": "greppy.web.page-state.v1",
+                "status": "unavailable",
+                "error": {"code": "OBSERVATION_UNAVAILABLE", "message": redact_secrets(&error)},
+            }),
+        };
+        if let Some(object) = result.as_object_mut() {
+            object.insert("page_state".into(), state);
+        }
+        self.finish_session(session_id);
+        Response::ok(request, result)
+    }
+
     fn web_observe(&mut self, request: &Request) -> Response {
         match self.with_session_page(request, "web.observe") {
             Err(response) => response,
             Ok((session_id, page)) => {
-                let snapshot = format!(
-                    "gref-{}-{}",
-                    std::process::id(),
-                    self.next_engine_id.fetch_add(1, Ordering::Relaxed)
-                );
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    session.locator_snapshot = None;
-                }
-                match self.engine_call(
-                    "page.observe",
-                    json!({ "page": page, "snapshot": snapshot }),
-                ) {
-                    Ok(mut tree) => {
-                        let ref_count = tree
-                            .get("ref_count")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(0);
-                        if let Some(session) = self.sessions.get_mut(&session_id) {
-                            session.locator_snapshot = Some(LocatorSnapshot {
-                                token: snapshot,
-                                page_id: page.clone(),
-                                ref_count,
-                            });
-                        }
-                        if let Some(object) = tree.as_object_mut() {
-                            if let Some(url) = object.get("url").and_then(|value| value.as_str()) {
-                                let redacted = redact_secrets(url);
-                                object.insert("url".into(), json!(redacted));
-                            }
-                            object.insert(
-                                "untrusted_content_boundary".into(),
-                                json!("UNTRUSTED_PAGE_CONTENT"),
-                            );
-                        }
+                match self.observe_page(&session_id, &page) {
+                    Ok(tree) => {
                         let format = request
                             .payload
                             .get("format")
@@ -2427,9 +2492,10 @@ impl Daemon {
                 json!({ "page": page, "url": url, "timeout": 30_000 }),
             ) {
                 Ok(result) => {
-                    self.finish_session(&session_id);
-                    Response::ok(
+                    self.finish_action_with_page_state(
                         request,
+                        &session_id,
+                        &page,
                         json!({
                             "session_id": session_id,
                             "url": result.get("url").cloned().unwrap_or(json!(url)),
@@ -2510,6 +2576,7 @@ impl Daemon {
                                 None => Vec::new(),
                                 Some(session) => {
                                     session.tabs.retain(|id| id != &tab);
+                                    session.locator_snapshots.remove(&tab);
                                     session.pages = session.tabs.len() as u32;
                                     if session.page_id.as_deref() == Some(tab.as_str()) {
                                         session.page_id = session.tabs.last().cloned();
@@ -2718,13 +2785,14 @@ impl Daemon {
             Ok((session_id, page)) => {
                 match self.engine_call(method, json!({ "page": page, "timeout": 30_000 })) {
                     Ok(result) => {
-                        self.finish_session(&session_id);
                         let url = result
                             .get("url")
                             .cloned()
                             .unwrap_or(json!(""));
-                        Response::ok(
+                        self.finish_action_with_page_state(
                             request,
+                            &session_id,
+                            &page,
                             json!({
                                 "session_id": session_id,
                                 "url": url,
@@ -2762,8 +2830,8 @@ impl Daemon {
             ));
         };
         let snapshot = self.sessions.get(session_id).and_then(|session| {
-            session.locator_snapshot.as_ref().and_then(|snapshot| {
-                (snapshot.page_id == page && ref_number > 0 && ref_number <= snapshot.ref_count)
+            session.locator_snapshots.get(page).and_then(|snapshot| {
+                (snapshot.page_id == page && ref_number > 0 && ref_number <= snapshot.ref_ceiling)
                     .then(|| snapshot.token.clone())
             })
         });
@@ -2821,8 +2889,8 @@ impl Daemon {
                 }
                 match self.engine_call(method, params) {
                     Ok(result) => {
-                        self.finish_session(&session_id);
                         if method == "locator.inspect" {
+                            self.finish_session(&session_id);
                             let tagged = result.get("serialized").cloned().unwrap_or(json!(null));
                             return Response::ok(
                                 request,
@@ -2844,7 +2912,7 @@ impl Daemon {
                         {
                             object.insert("dispatch".into(), dispatch);
                         }
-                        Response::ok(request, response)
+                        self.finish_action_with_page_state(request, &session_id, &page, response)
                     }
                     Err(error) => {
                         self.finish_session(&session_id);
@@ -2912,9 +2980,10 @@ impl Daemon {
                 match self.engine_call("page.keyboard.type", json!({ "page": page, "text": text }))
                 {
                     Ok(_) => {
-                        self.finish_session(&session_id);
-                        Response::ok(
+                        self.finish_action_with_page_state(
                             request,
+                            &session_id,
+                            &page,
                             json!({
                                 "session_id": session_id,
                                 "ok": true,
@@ -2968,9 +3037,10 @@ impl Daemon {
                 }
                 match self.engine_call("page.keyboard.press", json!({ "page": page, "key": key })) {
                     Ok(_) => {
-                        self.finish_session(&session_id);
-                        Response::ok(
+                        self.finish_action_with_page_state(
                             request,
+                            &session_id,
+                            &page,
                             json!({
                                 "session_id": session_id,
                                 "ok": true,
@@ -3032,9 +3102,10 @@ impl Daemon {
                                 )
                             })
                             .unwrap_or(json!(null));
-                        self.finish_session(&session_id);
-                        Response::ok(
+                        self.finish_action_with_page_state(
                             request,
+                            &session_id,
+                            &page,
                             json!({
                                 "session_id": session_id,
                                 "ok": true,
@@ -3078,9 +3149,10 @@ impl Daemon {
                     json!({ "page": page, "selector": css, "files": files }),
                 ) {
                     Ok(_) => {
-                        self.finish_session(&session_id);
-                        Response::ok(
+                        self.finish_action_with_page_state(
                             request,
+                            &session_id,
+                            &page,
                             json!({
                                 "session_id": session_id,
                                 "ok": true,
@@ -3152,12 +3224,6 @@ impl Daemon {
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
-            if matches!(
-                operation,
-                "web.goto" | "web.back" | "web.forward" | "web.reload"
-            ) {
-                session.locator_snapshot = None;
-            }
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
             // Budget the CPU this SESSION used, not the worker lifetime
             // (finding 039); a respawned worker resets the baseline.
@@ -3613,6 +3679,8 @@ impl Daemon {
         let ids = self.replace_content_worker(reason)?;
         for session in self.sessions.values_mut() {
             session.page_id = None;
+            session.tabs.clear();
+            session.locator_snapshots.clear();
             session.pages = 0;
         }
         Ok(ids)
@@ -3623,6 +3691,8 @@ impl Daemon {
         let mut recovered = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;
+            session.tabs.clear();
+            session.locator_snapshots.clear();
             session.pages = 0;
             if session.state == SessionState::Busy {
                 let request_id = session.operation_id.clone().unwrap_or_default();

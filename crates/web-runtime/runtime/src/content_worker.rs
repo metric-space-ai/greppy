@@ -2218,8 +2218,10 @@ impl ContentEngine {
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
+                let first = params.get("ref_first").and_then(|value| value.as_u64()).unwrap_or(0);
+                let last = params.get("ref_last").and_then(|value| value.as_u64()).unwrap_or(0);
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(webview, &observe_script(snapshot))? {
+                match self.evaluate(webview, &observe_script(snapshot, first, last))? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -3715,13 +3717,13 @@ struct ResolvedNode {
     offset_top: f64,
 }
 
-const SELECTOR_RUNTIME: &str = r#"
+const SELECTOR_RUNTIME: &str = concat!(include_str!("native-label-text.js"), r#"
 function greppyAccessibleName(el) {
   const labelled = el.getAttribute('aria-label');
   if (labelled) return labelled.trim();
-  if (el.id) {
-    const by = document.querySelector('label[for="' + el.id + '"]');
-    if (by) return (by.textContent || '').trim();
+  const labels = Array.from(el.labels || []);
+  if (labels.length) {
+    return labels.map((label) => greppyNativeLabelText(label, el)).join(' ').trim();
   }
   return ((el.innerText || el.textContent || el.value || '') + '').trim();
 }
@@ -3797,7 +3799,7 @@ function greppyResolveIn(root, selector) {
   }
   if (selector.type === 'label') {
     const labels = greppyQueryAll(root === document ? document : root, 'label');
-    const match = labels.find((label) => (label.textContent || '').trim() === selector.name);
+    const match = labels.find((label) => greppyNativeLabelText(label, greppyControlForLabel(label)).trim() === selector.name);
     if (!match) return [];
     if (match.control) return [match.control];
     if (match.htmlFor) {
@@ -3875,7 +3877,7 @@ function greppyObservedRefMatches(selector, nodes) {
   const registry = window.__greppyObservedRefs;
   return !!(registry && registry.snapshot === selector.snapshot &&
     document.documentElement && document.documentElement.getAttribute('data-greppy-ref-snapshot') === selector.snapshot &&
-    nodes.length === 1 && registry.nodes[selector.observed_ref - 1] === nodes[0] &&
+    nodes.length === 1 && registry.matches(nodes[0], selector.observed_ref) &&
     nodes[0].ownerDocument === document && nodes[0].isConnected);
 }
 function greppyResolveNodes(selector) {
@@ -3914,7 +3916,7 @@ function greppyResolveNodes(selector) {
   }
   return nodes;
 }
-"#;
+"#);
 
 fn resolve_script(selector: &serde_json::Value) -> String {
     format!(
@@ -4943,13 +4945,15 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
+  __GREPPY_NATIVE_LABEL_TEXT__
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
+  let registry = null;
   if (snapshot != null) {
-    Array.from(document.querySelectorAll('[' + refAttr + ']')).forEach(function(node) {
-      node.removeAttribute(refAttr);
-    });
+    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
+    window.__greppyObservedRefs = registry;
+    snapshot = registry.snapshot;
     if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
   }
   const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
@@ -4959,10 +4963,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     const rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   });
-  const capped = candidates.slice(0, 200);
-  // Retain actual node identities, not just clonable DOM attributes. A replacement
-  // with copied attributes must not inherit an observed ref. Bound to one snapshot.
-  if (snapshot != null) window.__greppyObservedRefs = { snapshot: snapshot, nodes: capped };
+  const capped = candidates.slice(0, __GREPPY_REF_LIMIT__);
   const compact = function(value) { return String(value || '').replace(/\s+/g, ' ').trim(); };
   const accessibleName = function(node, tag, type) {
     const labelledBy = (node.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
@@ -4973,7 +4974,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     const aria = compact(node.getAttribute('aria-label'));
     if (aria) return { name: aria, source: 'aria-label' };
     const nativeLabels = Array.from(node.labels || []);
-    if (nativeLabels.length) return { name: compact(nativeLabels.map(function(label) { return label.textContent || ''; }).join(' ')), source: 'label' };
+    if (nativeLabels.length) return { name: compact(nativeLabels.map(function(label) { return greppyNativeLabelText(label, node); }).join(' ')), source: 'label' };
     if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
       const text = compact(node.innerText || node.textContent);
       if (text) return { name: text, source: 'contents' };
@@ -5004,8 +5005,8 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     const value = node.getAttribute(attribute);
     return value === 'true' ? true : value === 'false' ? false : null;
   };
-  const actionables = capped.map(function(node, index) {
-    const ref = index + 1;
+  const actionables = capped.map(function(node) {
+    const ref = registry.refFor(node);
     node.setAttribute(refAttr, snapshot + ':' + ref);
     const tag = node.tagName.toLowerCase();
     const type = tag === 'input' || tag === 'button' ? node.type : null;
@@ -5057,15 +5058,22 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
       return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
     }),
     actionable_schema: 'greppy.web.actionable.v2',
+    ref_snapshot: snapshot,
     actionables: actionables,
     ref_count: actionables.length,
     refs_truncated: candidates.length > capped.length
   });
-})(__GREPPY_SNAPSHOT__)"#;
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__)"#;
 
-fn observe_script(snapshot: Option<&str>) -> String {
+fn observe_script(snapshot: Option<&str>, first: u64, last: u64) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
-    OBSERVE_JS.replace("__GREPPY_SNAPSHOT__", &encoded)
+    OBSERVE_JS
+        .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
+        .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
+        .replace("__GREPPY_REF_LIMIT__", &crate::observed_refs::OBSERVED_REF_LIMIT.to_string())
+        .replace("__GREPPY_REF_FIRST__", &first.to_string())
+        .replace("__GREPPY_REF_LAST__", &last.to_string())
+        .replace("__GREPPY_SNAPSHOT__", &encoded)
 }
 
 static CLICK_PROBE_SEQ: AtomicU64 = AtomicU64::new(1);

@@ -2,13 +2,14 @@
 
 use crate::limits::SessionLimits;
 use crate::policy::NetworkProfile;
+use std::collections::HashMap;
 use std::time::Instant;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocatorSnapshot {
     pub token: String,
     pub page_id: String,
-    pub ref_count: u64,
+    pub ref_ceiling: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,10 +37,9 @@ pub struct Session {
     /// active one; a session with several tabs keeps them all here so a
     /// caller can switch without losing the others.
     pub tabs: Vec<String>,
-    /// Locator recipes created by the most recent `web.observe`. Recipes are
-    /// deliberately session-, page-, and document-bound; the content worker
-    /// independently verifies the document token before resolving a ref.
-    pub locator_snapshot: Option<LocatorSnapshot>,
+    /// Document-bound recipes per page. Observing one tab must not replace
+    /// another tab's scope. The worker independently checks actual node identity.
+    pub locator_snapshots: HashMap<String, LocatorSnapshot>,
     pub pages: u32,
     pub contexts: u32,
     pub requests: u64,
@@ -76,7 +76,7 @@ impl Session {
             limits: SessionLimits::for_profile(profile.as_str()),
             page_id: None,
             tabs: Vec::new(),
-            locator_snapshot: None,
+            locator_snapshots: HashMap::new(),
             pages: 0,
             contexts: 0,
             requests: 0,

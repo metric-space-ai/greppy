@@ -7,6 +7,7 @@ pub mod content_worker;
 pub mod daemon;
 pub mod limits;
 pub mod linux_sandbox;
+mod observed_refs;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;

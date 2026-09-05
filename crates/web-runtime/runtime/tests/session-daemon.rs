@@ -3882,6 +3882,8 @@ fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
         .unwrap();
     let new_tab = call("web.tab.new", json!({"session_id":session}));
     assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let other_observation = call("web.observe", json!({"session_id":session}));
+    assert_eq!(other_observation.status, "ok", "{other_observation:?}");
     let explicit_tab = call(
         "web.inspect",
         json!({"session_id":session, "tab_id":first_tab, "selector":{"type":"ref", "value":1}}),
@@ -3951,7 +3953,12 @@ fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
     );
     let refreshed = call("web.observe", json!({"session_id":session}));
     assert_eq!(refreshed.status, "ok", "{refreshed:?}");
-    assert_eq!(inspect(session).status, "ok");
+    let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+    assert_eq!(inspect(session).error.as_ref().unwrap().code, "STALE_REF");
+    assert_eq!(call("web.inspect", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref}})).status, "ok");
     let reloaded = call("web.reload", json!({"session_id":session}));
     assert_eq!(reloaded.status, "ok", "{reloaded:?}");
     let navigated = inspect(session);
@@ -3960,6 +3967,75 @@ fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
         "STALE_REF",
         "{navigated:?}"
     );
+}
+
+#[test]
+fn observed_refs_keep_node_identity_across_followup_snapshots() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body><label for="choice">Choice</label><input id="choice" type="checkbox" value="before"></body></html>"#,
+    );
+    let socket = std::env::temp_dir()
+        .join(format!("greppy-ref-identity-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_ref_identity", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_ref_identity", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("identity request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let observe = || {
+        let response = call("web.observe", json!({"session_id":session}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["actionables"][0]["ref"]
+            .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap()
+    };
+    let inspect = |reference: u64| {
+        call("web.inspect", json!({"session_id":session,
+            "selector":{"type":"ref","value":reference}}))
+    };
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let original = observe();
+    let changed = call("web.evaluate", json!({"session_id":session,"source":
+        "(() => { const node = document.getElementById('choice'); node.value = 'after'; node.checked = true; node.focus(); return node.checked && node.value === 'after' && document.activeElement === node; })()"
+    }));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    assert_eq!(changed.result.as_ref().unwrap()["value"], true);
+    assert_eq!(observe(), original, "same node must keep its ref after property changes");
+    let same_node = inspect(original);
+    assert_eq!(same_node.status, "ok", "{same_node:?}");
+    assert_eq!(same_node.result.as_ref().unwrap()["value"]["node"]["value"], "after");
+
+    let replaced = call("web.evaluate", json!({"session_id":session,"source":
+        "(() => { const node = document.getElementById('choice'); node.replaceWith(node.cloneNode(true)); return true; })()"
+    }));
+    assert_eq!(replaced.status, "ok", "{replaced:?}");
+    let replacement = observe();
+    assert_ne!(replacement, original, "new snapshot must not recycle the replaced node's ref");
+    let stale = inspect(original);
+    assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
+    let fresh = inspect(replacement);
+    assert_eq!(fresh.status, "ok", "{fresh:?}");
+
+    let navigated = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(navigated.status, "ok", "{navigated:?}");
+    let new_document = observe();
+    assert_ne!(new_document, original);
+    assert_ne!(new_document, replacement, "navigation must not recycle refs after observation");
+    for old in [original, replacement] {
+        let stale = inspect(old);
+        assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
+    }
+    let fresh = inspect(new_document);
+    assert_eq!(fresh.status, "ok", "{fresh:?}");
 }
 
 #[test]
@@ -4061,11 +4137,14 @@ fn keyboard_refs_bind_the_observed_node_before_focusing() {
             "{response:?}"
         );
     }
-    assert_eq!(
-        call("web.observe", json!({"session_id":session})).status,
-        "ok"
-    );
-    assert_eq!(press_ref(session).status, "ok");
+    let refreshed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(refreshed.status, "ok", "{refreshed:?}");
+    let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+    assert_eq!(press_ref(session).error.as_ref().unwrap().code, "STALE_REF");
+    assert_eq!(call("web.press", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref},"key":"ArrowLeft"})).status, "ok");
     assert_eq!(
         call("web.reload", json!({"session_id":session})).status,
         "ok"
@@ -4077,6 +4156,117 @@ fn keyboard_refs_bind_the_observed_node_before_focusing() {
             "{response:?}"
         );
     }
+}
+
+#[test]
+fn observed_native_labels_exclude_their_own_control_contents() {
+    let fixture = serve_fixture(r#"<!doctype html><html><body>
+<label>Region<select id="region"><option value="all">All regions</option><option value="eu">EU</option></select></label>
+<label>Unit <b>price</b> order<select id="price"><option value="none">Unsorted</option><option value="asc">Low to high</option></select></label>
+<label for="external">External region</label><select id="external"><option>Europe</option></select>
+<label>Ignored<select aria-label="Override"><option>Hidden option name</option></select></label>
+</body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-label-own-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_label_own", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_label_own", method, payload), Duration::from_secs(30))
+            .expect("native label request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let state = &went.result.as_ref().unwrap()["page_state"];
+    assert_eq!(state["status"], "available");
+    let selects: Vec<_> = state["snapshot"]["actionables"].as_array().unwrap()
+        .iter().filter(|node| node["tag"] == "select").collect();
+    assert_eq!(selects.len(), 4);
+    assert_eq!(selects[0]["name"], "Region", "a control's own options must not enter its label");
+    assert_eq!(selects[0]["name_source"], "label");
+    assert_eq!(selects[0]["selected_options"][0]["label"], "All regions");
+    assert_eq!(selects[1]["name"], "Unit price order");
+    assert_eq!(selects[1]["selected_options"][0]["label"], "Unsorted");
+    assert_eq!(selects[2]["name"], "External region");
+    assert_eq!(selects[3]["name"], "Override");
+    assert_eq!(selects[3]["name_source"], "aria-label");
+    let inspected = call("web.inspect", json!({
+        "session_id":session, "selector":{"type":"label","name":"Region"}
+    }));
+    assert_eq!(inspected.status, "ok", "the displayed label must also resolve: {inspected:?}");
+    let unchanged = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"(() => { const select = document.getElementById('region'); return { labelText: select.parentElement.textContent, value: select.value, options: Array.from(select.options, option => option.textContent) }; })()"
+    }));
+    assert_eq!(unchanged.status, "ok", "{unchanged:?}");
+    assert_eq!(unchanged.result.as_ref().unwrap()["value"], json!({
+        "labelText":"RegionAll regionsEU", "value":"all", "options":["All regions","EU"]
+    }), "label extraction must not rewrite the live DOM: {unchanged:?}");
+}
+
+#[test]
+fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Ready</title></head><body>
+<button id="once" onclick="window.clicks++; document.title='Clicks '+window.clicks">Once</button>
+<button id="poison" onclick="window.clicks++; Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation fixture failure')}})">Poison observation</button>
+<input type="password" value="never-disclose-this">
+<script>window.clicks=0;</script></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-page-state-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_page_state", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| unix_request(
+        &socket, &Request::new("run_page_state", method, payload), Duration::from_secs(30),
+    ).expect("page state request");
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let state = &went.result.as_ref().unwrap()["page_state"];
+    assert_eq!(state["schema"], "greppy.web.page-state.v1");
+    assert_eq!(state["status"], "available");
+    assert_eq!(state["snapshot"]["title"], "Ready");
+    assert!(!state.to_string().contains("never-disclose-this"));
+    let reference = state["snapshot"]["actionables"][0]["ref"].as_str().unwrap()
+        .strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    let tabs = call("web.tab.list", json!({"session_id":session}));
+    let target_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"].as_str().unwrap();
+    let new_tab = call("web.tab.new", json!({"session_id":session}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    // Use the navigation's ref on an explicitly targeted, now inactive tab,
+    // without a caller-initiated observe or an implicit active-tab switch.
+    let clicked = call("web.click", json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"ref","value":reference}}));
+    assert_eq!(clicked.status, "ok", "{clicked:?}");
+    let receipt = clicked.result.as_ref().unwrap();
+    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(receipt["page_state"]["status"], "available");
+    assert_eq!(receipt["page_state"]["snapshot"]["title"], "Clicks 1");
+    assert_eq!(receipt["page_state"]["snapshot"]["actionables"][0]["ref"], format!("@{reference}"));
+    let poisoned = call("web.click", json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"css","value":"#poison"}}));
+    assert_eq!(poisoned.status, "ok", "successful click must not be recast as failure: {poisoned:?}");
+    let receipt = poisoned.result.as_ref().unwrap();
+    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(receipt["ok"], true);
+    assert_eq!(receipt["page_state"]["status"], "unavailable");
+    assert_eq!(receipt["page_state"]["error"]["code"], "OBSERVATION_UNAVAILABLE");
+    let checked = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,"source":"window.clicks"}));
+    assert_eq!(checked.status, "ok", "{checked:?}");
+    assert_eq!(checked.result.as_ref().unwrap()["value"].as_f64(), Some(2.0), "no action replay");
+    assert!(checked.result.as_ref().unwrap().get("page_state").is_none(), "explicit evaluation keeps its contract");
+    let repaired = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,
+        "source":"delete document.title; document.title = 'Recovered'; true"}));
+    assert_eq!(repaired.status, "ok", "{repaired:?}");
+    let observed = call("web.observe", json!({"session_id":session,"tab_id":target_tab}));
+    assert_eq!(observed.status, "ok", "temporary observation failure must recover: {observed:?}");
+    assert_eq!(observed.result.as_ref().unwrap()["title"], "Recovered");
+    assert_eq!(observed.result.as_ref().unwrap()["actionables"][0]["ref"], format!("@{reference}"));
 }
 
 #[test]
