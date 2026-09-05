@@ -3,6 +3,7 @@ import argparse, hashlib, json, secrets
 from pathlib import Path
 import server
 from prepare_context import prepare
+from dispatch import task_goal
 
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
@@ -44,6 +45,7 @@ for case_index,case in enumerate(a.cases):
         for arm in order:
             rid=secrets.token_hex(6); server.write_state(server.new_state(rid,seed,case))
             trial={'position':len(trials)+1,'case':case,'repeat':repeat,'arm':arm,'seed':seed,'run_id':rid,'url':a.base_url.rstrip('/')+'/?run_id='+rid}
+            trial['task_goal'] = task_goal(trial)
             if arm == 'C' and a.isolated_cli:
                 trial['cli_context']=prepare(a.scratch/'contexts',a.isolated_cli,a.alias_dir,rid,a.runtime_id,runtime=a.runtime,view=a.view,chain_view=a.chain_view)
             trials.append(trial)
