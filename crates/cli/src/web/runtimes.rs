@@ -245,60 +245,6 @@ fn decode_pw_response(
         .map_err(|_| invalid("web pw: malformed result receipt from the controller"))
 }
 
-#[cfg(test)]
-mod pw_result_tests {
-    use super::*;
-
-    fn response(stdout: &str) -> greppy_web_client::Response {
-        greppy_web_client::Response {
-            schema: "greppy.web-runtime.v1".into(),
-            request_id: "test".into(),
-            operation: "web.run".into(),
-            status: "ok".into(),
-            result: Some(json!({"stdout": stdout})),
-            artifacts: vec![],
-            metrics: Default::default(),
-            error: None,
-            handshake: None,
-        }
-    }
-
-    #[test]
-    fn pw_decodes_only_its_successful_result_receipt() {
-        assert_eq!(
-            decode_pw_response(&response("user log\nreceipt {\"value\":3}"), "receipt ").unwrap(),
-            json!({"value":3})
-        );
-        assert_eq!(
-            decode_pw_response(&response("receipt null"), "receipt ").unwrap(),
-            json!(null)
-        );
-        for stdout in [
-            "",
-            "other null",
-            "receipt broken",
-            "receipt null trailing",
-            "receipt 1\nreceipt 2",
-        ] {
-            assert!(
-                decode_pw_response(&response(stdout), "receipt ").is_err(),
-                "{stdout}"
-            );
-        }
-    }
-
-    #[test]
-    fn pw_never_converts_a_script_error_into_success() {
-        let mut failed = response("receipt 42");
-        let error = invalid("controller script failed: PWRESULT 42");
-        failed.error = Some(error.clone());
-        failed.status = "error".into();
-        assert_eq!(decode_pw_response(&failed, "receipt ").unwrap_err(), error);
-        failed.error = None;
-        assert!(decode_pw_response(&failed, "receipt ").is_err());
-    }
-}
-
 /// Evaluate `source` in the current page.
 ///
 /// Shared by `js` and by every query verb in `see` and `expect`: they all ask
@@ -355,4 +301,58 @@ fn js(
         return emit_error(json_out, invalid("web js: empty source"));
     }
     evaluate(root, json_out, session, &source)
+}
+
+#[cfg(test)]
+mod pw_result_tests {
+    use super::*;
+
+    fn response(stdout: &str) -> greppy_web_client::Response {
+        greppy_web_client::Response {
+            schema: "greppy.web-runtime.v1".into(),
+            request_id: "test".into(),
+            operation: "web.run".into(),
+            status: "ok".into(),
+            result: Some(json!({"stdout": stdout})),
+            artifacts: vec![],
+            metrics: Default::default(),
+            error: None,
+            handshake: None,
+        }
+    }
+
+    #[test]
+    fn pw_decodes_only_its_successful_result_receipt() {
+        assert_eq!(
+            decode_pw_response(&response("user log\nreceipt {\"value\":3}"), "receipt ").unwrap(),
+            json!({"value":3})
+        );
+        assert_eq!(
+            decode_pw_response(&response("receipt null"), "receipt ").unwrap(),
+            json!(null)
+        );
+        for stdout in [
+            "",
+            "other null",
+            "receipt broken",
+            "receipt null trailing",
+            "receipt 1\nreceipt 2",
+        ] {
+            assert!(
+                decode_pw_response(&response(stdout), "receipt ").is_err(),
+                "{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn pw_never_converts_a_script_error_into_success() {
+        let mut failed = response("receipt 42");
+        let error = invalid("controller script failed: PWRESULT 42");
+        failed.error = Some(error.clone());
+        failed.status = "error".into();
+        assert_eq!(decode_pw_response(&failed, "receipt ").unwrap_err(), error);
+        failed.error = None;
+        assert!(decode_pw_response(&failed, "receipt ").is_err());
+    }
 }
