@@ -79,6 +79,70 @@ fn search_symbol_path_keeps_only_hits_under_the_filter() {
 }
 
 #[test]
+fn search_symbol_accepts_the_qualified_method_name_it_displays() {
+    let (repo, store) = fresh_workspace("qualified-method");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "struct EmbeddingGemma;\nimpl EmbeddingGemma {\n    fn states_for_chunk(&self) {}\n}\nstruct Other;\nimpl Other {\n    fn states_for_chunk(&self) {}\n}\n",
+    ).unwrap();
+    let (code, out, err) = run(&repo, &store, &["index"]);
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "search-symbol",
+            "EmbeddingGemma::states_for_chunk",
+            "--code",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(!out.contains("no_matches"), "{out}");
+    assert!(!out.contains("similar names:"), "{out}");
+    assert!(out.contains("EmbeddingGemma::states_for_chunk"), "{out}");
+    assert!(out.contains("fn states_for_chunk"), "{out}");
+    assert!(!out.contains("Other::states_for_chunk"), "{out}");
+
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "search-symbol",
+            "EmbeddingGemma::states_for_chunk",
+            "--json",
+            "--diagnostics",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "ok", "{out}");
+    assert_eq!(value["total_exact"], 1, "{out}");
+    let hits = value["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{out}");
+    assert!(
+        hits[0]["qualified_name"]
+            .as_str()
+            .unwrap()
+            .contains("EmbeddingGemma"),
+        "{out}"
+    );
+
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "search-symbol",
+            "EmbeddingGemma::states_for_chunk",
+            "--path",
+            "absent",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={out}\nstderr={err}");
+    assert!(!out.contains("lib.rs:"), "{out}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn search_symbol_path_with_no_hit_returns_bounded_status() {
     let (repo, store) = indexed_two_tree_repo("symbol-empty");
 

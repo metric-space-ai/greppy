@@ -221,6 +221,12 @@ fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
     });
 }
 
+fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
+    // Match the same qualified name printed in a successful navigation row,
+    // not only the bare method name stored in `name`.
+    node.name.contains(query) || (query.contains("::") && nav_short_name(node).contains(query))
+}
+
 fn search_symbol_no_match_status(
     query: &str,
     path_filters: &QueryPathFilters,
@@ -514,7 +520,7 @@ pub(crate) fn dispatch_search_symbols(
                 .ok()
                 .flatten()
                 .is_some_and(|node| {
-                    node.name.contains(q)
+                    search_symbol_name_contains(&node, q)
                         && path_filters.matches(&node.file_path)
                         && search_kind_matches(&root_path, &node, kind)
                 })
@@ -542,7 +548,9 @@ pub(crate) fn dispatch_search_symbols(
     all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
     let matches_outside_filter = all_nodes
         .iter()
-        .filter(|node| node.name.contains(q) && !path_filters.matches(&node.file_path))
+        .filter(|node| {
+            search_symbol_name_contains(node, q) && !path_filters.matches(&node.file_path)
+        })
         .count();
     let nodes = all_nodes
         .into_iter()
@@ -550,7 +558,7 @@ pub(crate) fn dispatch_search_symbols(
         .collect::<Vec<_>>();
     let mut contained = nodes
         .iter()
-        .filter(|node| node.name.contains(q))
+        .filter(|node| search_symbol_name_contains(node, q))
         .cloned()
         .collect::<Vec<_>>();
     search_sort_name_rows(q, &mut contained);
