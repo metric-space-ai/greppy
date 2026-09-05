@@ -2,6 +2,10 @@ use crate::protocol::{read_message, write_message, Message, WorkerKind};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 
+#[cfg(unix)]
+#[path = "capability_frame.rs"]
+mod capability_frame;
+
 pub const CAPABILITY_FD: i32 = 3;
 /// Parent-issued client/supervisor attach token. Not derivable from the socket path.
 pub const ATTACH_TOKEN_FD: i32 = 4;
@@ -688,17 +692,19 @@ pub fn require_inherited_capability() -> io::Result<String> {
                 "missing inherited capability FD",
             ));
         }
-        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(CAPABILITY_FD) });
-        let mut token = String::new();
-        file.read_to_string(&mut token)?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty capability from inherited FD",
-            ));
+        if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+            let mut available: libc::c_int = 0;
+            let inspected = unsafe { libc::ioctl(CAPABILITY_FD, libc::FIONREAD, &mut available) };
+            eprintln!(
+                "web-runtime: capability-frame pid={} fd={} available_bytes={} inspected={}",
+                std::process::id(),
+                CAPABILITY_FD,
+                available,
+                inspected == 0
+            );
         }
-        Ok(token.to_owned())
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(CAPABILITY_FD) });
+        capability_frame::read_frame(file)
     }
     #[cfg(not(unix))]
     {

@@ -905,6 +905,8 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        // Bounded, opt-in initialization milestones; no page data or secrets.
+        "GREPPY_WEB_TRACE_STARTUP",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))

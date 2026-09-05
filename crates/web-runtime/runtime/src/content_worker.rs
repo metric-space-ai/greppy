@@ -870,6 +870,7 @@ struct ContentEngine {
 
 impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
+        trace_startup("renderer-create");
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
                 width: 1280,
@@ -877,11 +878,13 @@ impl ContentEngine {
             })
             .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
         );
+        trace_startup("renderer-make-current");
         rendering_context.make_current().map_err(|error| {
             io::Error::other(format!("renderer make_current failed: {error:?}"))
         })?;
 
         let profile = SharedProfile::new(NetworkProfile::Research);
+        trace_startup("policy-proxy-spawn");
         let proxy = PolicyProxy::spawn(profile.clone())?;
         let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
@@ -891,11 +894,13 @@ impl ContentEngine {
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
+        trace_startup("servo-build");
         let servo = ServoBuilder::default()
             .opts(opts)
             .preferences(preferences)
             .event_loop_waker(Box::new(wake.clone()))
             .build();
+        trace_startup("user-content-init");
         let user_content = Rc::new(UserContentManager::new(&servo));
         user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Self {
@@ -5101,15 +5106,30 @@ fn is_parent_eof(error: &io::Error) -> bool {
     )
 }
 
+// Startup-only diagnostics deliberately avoid the per-operation tracing path:
+// a failed handshake needs a last-known phase, not an unbounded event log.
+fn trace_startup(stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: startup worker=content pid={} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
 pub fn run() -> io::Result<()> {
+    trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
+    trace_startup("sandbox");
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
     )?;
+    trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
+    trace_startup("read-hello");
     match read_message(&mut protocol_in)? {
         Message::Hello {
             worker: WorkerKind::Content,
@@ -5124,6 +5144,7 @@ pub fn run() -> io::Result<()> {
         }
     }
     write_message(&mut protocol_out, &Message::ready(WorkerKind::Content))?;
+    trace_startup("ready-sent");
 
     let (tx, rx) = mpsc::channel();
     let parent_for_reader = Arc::clone(&parent_alive);

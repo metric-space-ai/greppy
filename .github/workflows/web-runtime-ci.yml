@@ -33,6 +33,14 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      - name: Check bounded worker capability framing
+        shell: bash
+        run: >-
+          cargo test --locked
+          --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --no-default-features
+          --lib capability_frame -- --test-threads=1
+
       - name: Build exact Greppy CLI test asset
         shell: bash
         env:
@@ -63,6 +71,10 @@ jobs:
 
       - name: Require three stable serial suite passes
         shell: bash
+        env:
+          # Preserve the last initialization phase on a Content handshake timeout.
+          # Do not enable the much noisier per-operation trace or relax deadlines.
+          GREPPY_WEB_TRACE_STARTUP: '1'
         run: |
           for attempt in 1 2 3; do
             echo "::group::session-daemon stability pass $attempt/3"
