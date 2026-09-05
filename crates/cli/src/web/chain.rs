@@ -370,6 +370,43 @@ fn split_steps(steps: &[String]) -> Vec<Vec<String>> {
     out
 }
 
+fn compact_chain_enabled() -> bool {
+    std::env::var("GREPPY_WEB_CHAIN_VIEW").as_deref() == Ok("compact")
+}
+
+fn emit_chain_summary(
+    json_out: bool,
+    total: usize,
+    ran: usize,
+    failed: usize,
+    stopped_at: Option<usize>,
+    argv: Option<&Vec<String>>,
+) -> Result<()> {
+    let mut result = json!({"steps_total": total, "steps_ran": ran, "steps_failed": failed});
+    if let Some(step) = stopped_at {
+        result["stopped_at"] = json!(step);
+        result["argv"] = json!(argv);
+    }
+    if json_out || !compact_chain_enabled() {
+        emit_web(
+            json_out,
+            &json!({
+                "schema": "greppy.web-runtime.v1",
+                "status": if failed == 0 { "ok" } else { "error" },
+                "operation": "web.do", "result": result,
+            }),
+        )
+    } else {
+        println!(
+            "chain: {ran}/{total} steps executed, {failed} failed{}",
+            stopped_at
+                .map(|step| format!("; stopped at {step}; no rollback attempted"))
+                .unwrap_or_default()
+        );
+        Ok(())
+    }
+}
+
 fn run_chain(
     root: Option<&str>,
     steps: &[String],
@@ -403,14 +440,20 @@ fn run_chain(
             Err(error) => {
                 let first = error.to_string();
                 let first = first.lines().next().unwrap_or("unparsable step");
-                return emit_error(
-                    json_out,
-                    invalid(&format!(
-                        "web do: step {} (`{}`) is not a valid command: {first}",
-                        index + 1,
-                        step.join(" ")
-                    )),
-                );
+                let mut error = invalid(&format!(
+                    "web do: step {} (`{}`) is not a valid command: {first}",
+                    index + 1,
+                    step.join(" ")
+                ));
+                if step
+                    .first()
+                    .is_some_and(|arg| arg == "--session" || arg.starts_with("--session="))
+                {
+                    let hint = "place --session SID after each step's command, not before it: `greppy web do --explain click @1 --session SID :: observe --session SID`";
+                    error.message = format!("{}; {hint}", error.message).into();
+                    error.next_action = hint.into();
+                }
+                return emit_error(json_out, error);
             }
         }
     }
@@ -432,59 +475,52 @@ fn run_chain(
         // runtime lifetime for the whole chain.
         let code = super::dispatch_inner(command, root)?;
         ran += 1;
-        // A typed record after every step, so a reader can attribute the
-        // output above it to a specific step instead of guessing from
-        // position. Without this a chain prints a stream of payloads and one
-        // summary, and nothing says which payload belonged to which command.
-        emit_web(
-            json_out,
-            &json!({
-                "schema": "greppy.web-runtime.v1",
-                "kind": "step",
-                "operation": "web.do.step",
-                "status": if code == 0 { "ok" } else { "error" },
-                "step": index + 1,
-                "steps_total": parsed.len(),
-                "argv": parsed[index],
-                "exit_code": code,
-            }),
-        )?;
+        // Keep each payload attributable without repeating the protocol and
+        // complete command (including filled text) in the human-readable view.
+        // Machine consumers still receive the complete typed step record.
+        if json_out || !compact_chain_enabled() {
+            emit_web(
+                json_out,
+                &json!({
+                    "schema": "greppy.web-runtime.v1",
+                    "kind": "step",
+                    "operation": "web.do.step",
+                    "status": if code == 0 { "ok" } else { "error" },
+                    "step": index + 1,
+                    "steps_total": parsed.len(),
+                    "argv": parsed[index],
+                    "exit_code": code,
+                }),
+            )?;
+        } else {
+            let verb = parsed[index].first().map(String::as_str).unwrap_or("step");
+            if code == 0 {
+                println!("step {}/{} {verb}: ok", index + 1, parsed.len());
+            } else {
+                println!(
+                    "step {}/{} {verb}: FAILED (exit {code})",
+                    index + 1,
+                    parsed.len()
+                );
+            }
+        }
         if code != 0 {
             failed += 1;
             last_code = code;
             if !continue_on_error {
-                emit_web(
+                emit_chain_summary(
                     json_out,
-                    &json!({
-                        "schema": "greppy.web-runtime.v1",
-                        "status": "error",
-                        "operation": "web.do",
-                        "result": {
-                            "steps_total": parsed.len(),
-                            "steps_ran": ran,
-                            "steps_failed": failed,
-                            "stopped_at": index + 1,
-                            "argv": parsed[index],
-                        },
-                    }),
+                    parsed.len(),
+                    ran,
+                    failed,
+                    Some(index + 1),
+                    Some(&parsed[index]),
                 )?;
                 return Ok(code);
             }
         }
     }
-    emit_web(
-        json_out,
-        &json!({
-            "schema": "greppy.web-runtime.v1",
-            "status": if failed == 0 { "ok" } else { "error" },
-            "operation": "web.do",
-            "result": {
-                "steps_total": parsed.len(),
-                "steps_ran": ran,
-                "steps_failed": failed,
-            },
-        }),
-    )?;
+    emit_chain_summary(json_out, parsed.len(), ran, failed, None, None)?;
     Ok(if failed == 0 { 0 } else { last_code })
 }
 
