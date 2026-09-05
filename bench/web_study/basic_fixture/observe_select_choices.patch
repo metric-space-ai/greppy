@@ -1,0 +1,27 @@
+--- a/crates/web-runtime/runtime/src/content_worker.rs
++++ b/crates/web-runtime/runtime/src/content_worker.rs
+@@ -4988,3 +4988,4 @@
+ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
+   __GREPPY_NATIVE_LABEL_TEXT__
++  __GREPPY_SELECT_CHOICES__
+   const refAttr = 'data-greppy-ref';
+@@ -5066,5 +5067,6 @@
+     const ariaChecked = node.getAttribute('aria-checked');
+     const selectedOptions = tag === 'select' && !sensitive ? Array.from(node.options).filter(function(option) { return option.selected; }) : null;
++    const selectChoices = sensitive ? null : greppySelectChoicesSnapshot(node);
+     const ariaInvalid = node.getAttribute('aria-invalid');
+-    return {
++    const actionable = {
+       ref: '@' + ref,
+@@ -5088,4 +5090,6 @@
+       invalid: (ariaInvalid !== null && ariaInvalid !== 'false') || (node.validity && !node.validity.valid) ? true : (node.validity || ariaInvalid !== null ? false : null)
+     };
++    if (selectChoices !== null) actionable.select_choices = selectChoices;
++    return actionable;
+   });
+   return JSON.stringify({
+@@ -5111,3 +5115,4 @@
+     OBSERVE_JS
+         .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
++        .replace("__GREPPY_SELECT_CHOICES__", greppy_web_client::SELECT_CHOICES_JS)
+         .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
