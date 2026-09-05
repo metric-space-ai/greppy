@@ -102,6 +102,15 @@ def run_probe(cli: Path, runtime: Path, scratch: Path, evidence: Path):
         check('explicit original tab survives active-tab switch', again['value'] == '1')
         query = call('inspect', 'css=#quantity', '--tab', original_tab)['result']['value']['node']
         check('query path also respects explicit tab', query['value'] == '1')
+        present = call('assert', 'css=#quantity', '--tab', original_tab)
+        check('assert uses selected original tab', present['result']['held'] is True)
+        missing = call('assert', 'css=#quantity', '--tab', other_tabs[0], expected_exit=18)
+        check('assert on other tab does not prove presence', missing['result']['held'] is False)
+        waited = call('wait', 'css=#quantity', '--tab', original_tab, '--timeout', '1000')
+        check('wait uses selected original tab', waited['result']['held'] is True)
+        absent = call('wait', 'css=#quantity', '--absent', '--tab', original_tab,
+                      '--timeout', '150', expected_exit=13)
+        check('present field cannot satisfy absent wait', absent['result']['held'] is False)
         wrong = call('inspect', ref, '--tab', other_tabs[0], expected_exit=34)
         check('wrong-tab identity refused', wrong['error']['code'] == 'STALE_REF')
         call('click', 'css=#replace', '--tab', original_tab)

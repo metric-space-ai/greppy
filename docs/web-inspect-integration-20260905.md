@@ -22,12 +22,27 @@ Queries behalten ihren bisherigen Ausgabevertrag und berücksichtigen den Tab.
 
 ## Verifikation
 
-Nach der Übernahme: git diff --check erfolgreich. Die neue Python-Probe ist
-syntaktisch geprüft, ihr Browserlauf steht aus. Der neue Rust-Diagnosetest
-und die integrierten CLI-Tests sind in dieser Kombination noch UNGEPRÜFT.
-Alte Testergebnisse des Fix-Workers ersetzen diese Integrationsprüfung nicht.
+Am 5. September wurden am integrierten Root-Kandidaten abgeschlossen:
 
-Vorbereitete Tests:
+- Vier Unit-Tests für strikt boolesche Condition-Antworten bestanden. Fehlende,
+  nicht boolesche oder fehlerhafte Runtime-Antworten dürfen insbesondere mit
+  --absent keinen Erfolg ergeben. Bestehende typisierte Fehler bleiben erhalten.
+- 49 CLI-Tests bestanden: web_cli 39, web_chain_compact 6,
+  web_condition_diagnostics 3, web_inspect_diagnostics 1. Optional übersprungene
+  native Prüfungen in web_cli sind dabei kein Nachweis der Runtime-Funktion.
+- Die tatsächliche CLI/Runtime-Probe beendete sich mit Exit 0, allen 13 Checks
+  und erfolgreichem Stop ihres eigenen Runtime-Kontexts. Sie prüfte native
+  Inspect-Ausgabe, deaktivierte Formularwerte, ausdrückliche Tab-Zuordnung bei
+  Inspect/Assert/Wait, abgelehnte falsche Tab-Identität, abgelehnte ersetzte
+  Knoten, den aktuellen Ersatzwert und unveränderte Kandidatenbytes.
+
+Build- und Testbelege: /Users/michaelwelsch/.local/state/greppy-web-study/cli-inspect-integration-20260905-01.
+Native Einzelaufrufe, Kontext und Terminalbeleg: /Users/michaelwelsch/.local/state/greppy-web-study/inspect-proof-20260905-01.
+Die Build-Test-Zusammenfassung ist kein Ersatz für einen vollständigen Rohlog;
+ursprüngliche Tool-Ausgaben bleiben im Root-Trace erhalten.
+
+Geprüfte Tests:
+
 
 - crates/cli/tests/web_inspect_diagnostics.rs: ungültige @-Identitäten vor
   Session/RPC ablehnen, ohne verschluckte --tab-Argumente oder JS-Fehler.
@@ -42,9 +57,17 @@ Vorgesehener bestehender Runtimekandidat:
 /Volumes/tmp/dev-artifacts/greppy/e1-label-native-candidate.THEPk0/preserved-bin/web-runtime
 SHA256 3ee1f2e17a697b29fac40791028228d085b819af9c4d2a2042b34e877b3cdfb8.
 Der Hash wurde in dieser Runde erneut am tatsächlichen Artefakt bestätigt.
-Der neue Root-CLI-Kandidat muss erst kompiliert, separat eingefroren und geprüft
-werden. Der aktive native Wait-Build des Workers wird nicht durch einen
-parallelen Root-Cargo-/Browserlauf gestört.
+Der geprüfte Root-CLI-Kandidat ist separat eingefroren:
+/Volumes/tmp/dev-artifacts/greppy/web-efficiency/cli-candidate-inspect-154d1a775f41/greppy
+SHA256 154d1a775f4156c6d33742ac309e063a49563a57e16cfb6a92c97a20a8082471.
+Die dortige provenance.json enthält Quell-HEAD 89f4abeb und den beim Build
+zusätzlich enthaltenen Condition-/Probe-Patch. Die native Probe bestätigt die
+Binäridentität vor und nach dem Lauf. Build und Browserprobe liefen seriell
+zur nativen Worker-Lane und erst nach dem vereinbarten Archivfenster.
+
+Die Condition-Prüfung enthält weiterhin den vorhandenen Polling-Weg; dieser
+Funktionstest ist weder der neue native Wait noch ein Token-/Zeitnachweis.
+
 
 ## Ausstehende Arbeit
 
