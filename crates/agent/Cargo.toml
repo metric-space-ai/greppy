@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 description = "greppy agent wire layer: provider-neutral protocol types and Anthropic Messages SSE client"
 
+[features]
+# TLS is linked only when a host opts into local-model downloading; no weights.
+local-model-download = ["ureq/tls"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

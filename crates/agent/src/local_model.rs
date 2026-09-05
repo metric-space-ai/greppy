@@ -12,10 +12,64 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 use crate::{ClientError, ModelRequest, ModelStream, StreamEvent, TurnResult};
+
+/// Cooperative provisioning cancellation; independent of an active socket read.
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionCancel(Arc<AtomicBool>);
+
+impl ProvisionCancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn check(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            // Interrupted would be retried indefinitely by Write::write_all.
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "model provisioning cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn wait(&self, delay: Duration) -> io::Result<()> {
+        let started = Instant::now();
+        loop {
+            self.check()?;
+            let remaining = delay.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+    }
+}
+
+/// Artifact progress, separate from signed release admission and engine readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionEvent {
+    WaitingForCache,
+    CheckingCache,
+    Downloading { received: u64, total: u64 },
+    Verifying,
+    ArtifactReady { cached: bool },
+    Retrying { next_attempt: u32 },
+}
 
 /// Expected bytes of one artifact from an authenticated release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +117,15 @@ impl ArtifactCache {
     /// A partial download is never returned. The check streams the whole
     /// artifact with bounded memory; it must not be used as a cheap UI poll.
     pub fn lookup_verified(&self, spec: &ArtifactSpec) -> io::Result<Option<PathBuf>> {
+        self.lookup_controlled(spec, &ProvisionCancel::default())
+    }
+
+    fn lookup_controlled(
+        &self,
+        spec: &ArtifactSpec,
+        cancel: &ProvisionCancel,
+    ) -> io::Result<Option<PathBuf>> {
+        cancel.check()?;
         let path = self.object_path(spec);
         let mut file = match File::open(&path) {
             Ok(file) => file,
@@ -81,12 +144,14 @@ impl ArtifactCache {
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
+            cancel.check()?;
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             hash.update(&buffer[..read]);
         }
+        cancel.check()?;
         let digest: [u8; 32] = hash.finalize().into();
         Ok((digest == spec.sha256).then_some(path))
     }
@@ -108,6 +173,24 @@ impl ArtifactCache {
         fetch: impl FnOnce(&mut dyn Write) -> io::Result<()>,
         mut progress: impl FnMut(u64, u64),
     ) -> io::Result<PathBuf> {
+        self.ensure_controlled(spec, &ProvisionCancel::default(), fetch, |event| {
+            if let ProvisionEvent::Downloading { received, total } = event {
+                progress(received, total);
+            }
+        })
+    }
+
+    /// Explicit first-use provisioning with cancellation during lock waits,
+    /// hashing and writes. The fetcher must bound its own blocking I/O.
+    /// Cancellation uses ConnectionAborted so write_all never retries it.
+    pub fn ensure_controlled(
+        &self,
+        spec: &ArtifactSpec,
+        cancel: &ProvisionCancel,
+        fetch: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+        mut progress: impl FnMut(ProvisionEvent),
+    ) -> io::Result<PathBuf> {
+        cancel.check()?;
         let objects = self.root.join("objects");
         let locks = self.root.join("locks");
         fs::create_dir_all(&objects)?;
@@ -118,24 +201,48 @@ impl ArtifactCache {
             .create(true)
             .truncate(false)
             .open(locks.join(spec.key()))?;
-        lock.lock()?;
+        let mut waiting_reported = false;
+        loop {
+            cancel.check()?;
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {
+                    if !waiting_reported {
+                        progress(ProvisionEvent::WaitingForCache);
+                        waiting_reported = true;
+                    }
+                    cancel.wait(Duration::from_millis(25))?;
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
         // Always recheck under the lock: another caller may have installed it.
-        if let Some(path) = self.lookup_verified(spec)? {
+        progress(ProvisionEvent::CheckingCache);
+        if let Some(path) = self.lookup_controlled(spec, cancel)? {
+            cancel.check()?;
+            progress(ProvisionEvent::ArtifactReady { cached: true });
             return Ok(path);
         }
+        cancel.check()?;
 
         let mut staging = tempfile::Builder::new()
             .prefix(".download-")
             .tempfile_in(&objects)?;
-        progress(0, spec.size_bytes);
+        progress(ProvisionEvent::Downloading {
+            received: 0,
+            total: spec.size_bytes,
+        });
         let mut writer = VerifiedWriter {
             output: staging.as_file_mut(),
             expected: spec.size_bytes,
             written: 0,
             hash: Sha256::new(),
             progress: &mut progress,
+            cancel,
         };
+        cancel.check()?;
         fetch(&mut writer)?;
+        cancel.check()?;
         writer.flush()?;
         if writer.written != spec.size_bytes {
             return Err(io::Error::new(
@@ -144,6 +251,8 @@ impl ArtifactCache {
             ));
         }
         let digest: [u8; 32] = writer.hash.finalize().into();
+        progress(ProvisionEvent::Verifying);
+        cancel.check()?;
         if digest != spec.sha256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -151,8 +260,10 @@ impl ArtifactCache {
             ));
         }
         staging.as_file().sync_all()?;
+        cancel.check()?;
         let path = self.object_path(spec);
         staging.persist(&path).map_err(|error| error.error)?;
+        progress(ProvisionEvent::ArtifactReady { cached: false });
         Ok(path)
     }
 }
@@ -162,11 +273,13 @@ struct VerifiedWriter<'a> {
     expected: u64,
     written: u64,
     hash: Sha256,
-    progress: &'a mut dyn FnMut(u64, u64),
+    progress: &'a mut dyn FnMut(ProvisionEvent),
+    cancel: &'a ProvisionCancel,
 }
 
 impl Write for VerifiedWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.cancel.check()?;
         if bytes.len() as u64 > self.expected.saturating_sub(self.written) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -176,11 +289,15 @@ impl Write for VerifiedWriter<'_> {
         let written = self.output.write(bytes)?;
         self.hash.update(&bytes[..written]);
         self.written += written as u64;
-        (self.progress)(self.written, self.expected);
+        (self.progress)(ProvisionEvent::Downloading {
+            received: self.written,
+            total: self.expected,
+        });
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.cancel.check()?;
         self.output.flush()
     }
 }

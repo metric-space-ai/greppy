@@ -30,12 +30,14 @@ fn construction_lookup_and_drop_do_not_create_a_cache_or_fetch() {
     let dir = tempfile::tempdir().unwrap();
     let cache = cache(dir.path());
     assert_eq!(cache.lookup_verified(&spec()).unwrap(), None);
-    let model = OnDemandModel::<ScriptedModel, _>::new(|| -> Result<ScriptedModel, ClientError> {
-        panic!("optional feature was not used")
-    });
-    assert!(!model.is_initialized());
-    assert!(format!("{model:?}").contains("false"));
-    drop(model);
+    {
+        let model =
+            OnDemandModel::<ScriptedModel, _>::new(|| -> Result<ScriptedModel, ClientError> {
+                panic!("optional feature was not used")
+            });
+        assert!(!model.is_initialized());
+        assert!(format!("{model:?}").contains("false"));
+    }
     assert!(!dir.path().join("persistent-models").exists());
 }
 
@@ -370,4 +372,137 @@ fn cancelled_agent_before_first_turn_does_not_initialize_the_optional_feature() 
     .unwrap();
     assert_eq!(result.stop, LoopStop::Cancelled);
     assert!(!model.is_initialized());
+}
+
+#[test]
+fn cancelled_provisioning_does_not_create_directories() {
+    use greppy_agent::local_model::ProvisionCancel;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    let cancel = ProvisionCancel::default();
+    cancel.cancel();
+    let error = cache
+        .ensure_controlled(
+            &spec(),
+            &cancel,
+            |_| panic!("fetch after cancel"),
+            |_| panic!("progress after cancel"),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    assert!(!dir.path().join("persistent-models").exists());
+}
+
+#[test]
+fn lock_wait_is_observable_and_cancellable_without_waiting_for_the_owner() {
+    use greppy_agent::local_model::{ProvisionCancel, ProvisionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let owner = cache.clone();
+        scope.spawn(move || {
+            owner
+                .ensure_with(
+                    &spec(),
+                    |out| {
+                        holding_tx.send(()).unwrap();
+                        release_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        out.write_all(BYTES)
+                    },
+                    |_, _| {},
+                )
+                .unwrap();
+        });
+        holding_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let cancel = ProvisionCancel::default();
+        let started = std::time::Instant::now();
+        let result = cache.ensure_controlled(
+            &spec(),
+            &cancel,
+            |_| panic!("second fetch while owner active"),
+            |event| {
+                if event == ProvisionEvent::WaitingForCache {
+                    cancel.cancel();
+                }
+            },
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    });
+}
+
+#[test]
+fn cancelling_on_last_byte_or_verification_never_publishes() {
+    use greppy_agent::local_model::{ProvisionCancel, ProvisionEvent};
+    for at_verification in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        let cancel = ProvisionCancel::default();
+        let mut ready = false;
+        let result = cache.ensure_controlled(&spec(), &cancel, |out| {
+            out.write_all(BYTES)?;
+            // A write_all after cancellation must fail instead of looping on Interrupted.
+            out.write_all(b"")
+        }, |event| {
+            if (at_verification && event == ProvisionEvent::Verifying)
+                || (!at_verification && matches!(event, ProvisionEvent::Downloading { received, total } if received == total))
+            { cancel.cancel(); }
+            ready |= matches!(event, ProvisionEvent::ArtifactReady { .. });
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!ready);
+        assert!(cache.lookup_verified(&spec()).unwrap().is_none());
+    }
+}
+
+#[test]
+fn cache_verification_can_be_cancelled_without_fetching_or_ready_event() {
+    use greppy_agent::local_model::{ProvisionCancel, ProvisionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    cache
+        .ensure_with(&spec(), |out| out.write_all(BYTES), |_, _| {})
+        .unwrap();
+    let cancel = ProvisionCancel::default();
+    let result = cache.ensure_controlled(
+        &spec(),
+        &cancel,
+        |_| panic!("cache hit fetched"),
+        |event| {
+            assert!(!matches!(event, ProvisionEvent::ArtifactReady { .. }));
+            if event == ProvisionEvent::CheckingCache {
+                cancel.cancel();
+            }
+        },
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+}
+
+#[test]
+fn cancellation_from_write_progress_cannot_spin_inside_write_all() {
+    use greppy_agent::local_model::{ProvisionCancel, ProvisionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache(dir.path());
+    let cancel = ProvisionCancel::default();
+    let result = cache.ensure_controlled(
+        &spec(),
+        &cancel,
+        |out| {
+            out.write_all(&BYTES[..1])?;
+            out.write_all(&BYTES[1..])
+        },
+        |event| {
+            if matches!(event, ProvisionEvent::Downloading { received: 1, .. }) {
+                cancel.cancel();
+            }
+        },
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
 }

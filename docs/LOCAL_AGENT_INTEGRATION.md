@@ -34,9 +34,10 @@ The root is supplied as an absolute persistent path. Test fixtures and build
 caches belong on disposable development storage; installed user model assets
 must not default there. Normal transfer failures clean their staging files;
 hard-crash staging leftovers are ignored. Resume/range requests and crash-file
-garbage collection are not implemented in this preparation. Lock acquisition
-is blocking: use a worker thread, and add cancellable lock waits and waiting
-progress before connecting this primitive to an interactive first-use flow.
+garbage collection are not implemented. The controlled entry point uses
+cancellable lock polling, reports WaitingForCache and checks cancellation while
+hashing and writing. Run provisioning on a worker thread. Cancellation uses
+ConnectionAborted so standard write_all cannot retry forever on Interrupted.
 
 `OnDemandModel` implements the existing `ModelStream` contract. Constructing,
 inspecting or dropping an unused adapter does not invoke its factory. The first
@@ -88,10 +89,37 @@ The next adapter must:
    once. Reset invalid sessions and surface cancellation distinctly. Respect
    the engine's unload residue checks before claiming memory was released.
 
-The localhost client remains unchanged. CLI/TUI backend selection, HTTPS
-fetching/retries/cancellation, release signature/catalog verification, release
-assembly, daemon streaming transport and the actual CTOX executor dependency
-remain follow-up work. These primitives alone do not enable local inference.
+The localhost client remains unchanged. CLI/TUI backend selection, release
+signature/catalog verification, release assembly, daemon streaming transport
+and the actual CTOX executor dependency remain follow-up work. These components
+alone do not enable local inference.
+
+## Explicit HTTPS download
+
+The optional Cargo feature `greppy-agent/local-model-download` exposes
+`ModelDownloader`. Its constructor does no I/O; `ensure` must be called only
+from the explicit local agent first-use path. No model URL or candidate hash is
+hardcoded. TLS is backed by rustls and public roots, independently of the
+gateway client. The HTTPS-only policy also covers redirects; credentials from
+the gateway are never passed to it. Errors do not echo potentially signed URLs.
+
+Responses must be HTTP 200 with identity encoding and, when declared, the
+expected Content-Length. The cache still verifies the complete byte length and
+SHA-256. Transient transport/body failures and HTTP 408/429/5xx retry a bounded
+number of times with cancellable waits and fresh staging files. Other HTTP,
+integrity and local filesystem failures do not retry. Default limits are three
+attempts, 500 ms retry delay, 10 s connect and 2 s read/write timeouts.
+Cancellation is checked between chunks and during lock/hash/retry work; active
+network operations finish at their I/O timeout, except OS DNS resolution which
+can exceed that bound. Receiving all bytes is not engine readiness.
+
+Tests exercise a real loopback TLS server using an explicitly trusted test-only
+certificate. They verify trusted/untrusted TLS, cache reuse without another
+request, HTTPS downgrade rejection, retry/short-body handling, size/encoding
+rejection, cancellation and stalled-peer timeouts. A dedicated CI workflow runs
+the cache and TLS contracts and Clippy on Linux, macOS and Windows without model
+assets. This demonstrates provisioning portability, not native inference
+readiness on those platforms.
 
 ## Delivery sequence and hardware evidence
 
