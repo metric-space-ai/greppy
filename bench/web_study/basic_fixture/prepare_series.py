@@ -12,12 +12,15 @@ p.add_argument('--repeats',type=int,default=5)
 p.add_argument('--cases', nargs='+', choices=['text','checkbox','address','dialog'], default=['text','checkbox','address','dialog'])
 p.add_argument('--isolated-cli', type=Path, help='Opt into short aliases and isolated cwd; native open handles session creation')
 p.add_argument('--alias-dir', type=Path)
+p.add_argument('--runtime', type=Path, help='Explicit candidate runtime; do not use a shared mutable build target')
+p.add_argument('--view', choices=('default','compact'), default='default')
+p.add_argument('--chain-view', choices=('default','compact'), default='default')
 p.add_argument('--runtime-id')
 p.add_argument('--latency-limitation')
 a=p.parse_args()
 if a.repeats < 1: p.error('repeats must be positive')
-if a.isolated_cli and not (a.alias_dir and a.runtime_id):
-    p.error('--isolated-cli requires --alias-dir and --runtime-id')
+if a.isolated_cli and not (a.alias_dir and a.runtime_id and a.runtime):
+    p.error('--isolated-cli requires --alias-dir, --runtime-id and --runtime')
 if len(set(a.cases)) != len(a.cases): p.error('cases must be unique')
 a.output.mkdir(parents=True,exist_ok=False)
 if not Path('/Volumes/tmp').is_mount() or not a.scratch.resolve().is_relative_to(Path('/Volumes/tmp')):
@@ -42,11 +45,13 @@ for case_index,case in enumerate(a.cases):
             rid=secrets.token_hex(6); server.write_state(server.new_state(rid,seed,case))
             trial={'position':len(trials)+1,'case':case,'repeat':repeat,'arm':arm,'seed':seed,'run_id':rid,'url':a.base_url.rstrip('/')+'/?run_id='+rid}
             if arm == 'C' and a.isolated_cli:
-                trial['cli_context']=prepare(a.scratch/'contexts',a.isolated_cli,a.alias_dir,rid,a.runtime_id)
+                trial['cli_context']=prepare(a.scratch/'contexts',a.isolated_cli,a.alias_dir,rid,a.runtime_id,runtime=a.runtime,view=a.view,chain_view=a.chain_view)
             trials.append(trial)
 manifest={'schema':'greppy.basic-series.plan.v1','purpose':'development, never held-out acceptance or training final evaluation','model':'gpt-5.6-luna','effort':'medium','repeats':a.repeats,'state':'prepared_not_run','fixture':pins,'trials':trials,'constraints':['fresh contexts, isolated runs, serial execution','C must create a fresh explicit project session per participant; session identities audited','same frozen facts within each pair','all errors/recovery and failures retained','no solution scripts or host-state access by participants','B is separate; A/C does not claim actual Greppy-agent comparison','record provider usage; missing data remains null','do not infer verified end-to-end time from participant turn duration']}
 manifest['harness_condition']='short_alias_isolated_cwd_native_open' if a.isolated_cli else 'explicit_session_long_wrapper'
 if a.isolated_cli:
+    manifest['candidate_integrity_required']=True
+    manifest['rendering']={'view':a.view,'chain_view':a.chain_view}
     manifest['constraints'][1]='C has its own empty workspace and short CLI alias; native open may create the session; actual session identities audited'
     manifest['constraints'].append('Harness change, not a product optimization; compare separately with earlier series')
 if a.latency_limitation: manifest['constraints'].append(a.latency_limitation)

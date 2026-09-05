@@ -62,9 +62,13 @@ def summarize(series):
             'tool_response_json_bytes': sum(t['result_json_bytes'] for t in responses),
         })
     token_win = all(changes[m] is not None and changes[m] < 0 for m in ('input_tokens', 'output_tokens'))
+    integrity = all(r.get('candidate_integrity', {}).get('ok') is True
+                    for r in records if r['arm'] == 'C') if plan.get('candidate_integrity_required') else None
+    token_win = token_win and (integrity is True if plan.get('candidate_integrity_required') else True)
     return {
         'schema': 'greppy.basic-paired-summary.v1', 'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
         'condition': plan.get('harness_condition'), 'medians': medians, 'pairs': pairs,
+        'candidate_integrity': integrity,
         'median_paired_change_percent': changes, 'traces': traces,
         'token_gate': 'passes this development block only' if token_win and all(p['both_passed'] for p in pairs) else 'failed_or_unproven',
         'acceptance': 'not established; one development case, no arm B or controlled end-to-end latency',

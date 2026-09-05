@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from export_codex_trace import export_turn
 from summarize_series import token_totals
+from candidate import verify as verify_candidate
 
 p=argparse.ArgumentParser()
 p.add_argument('series',type=Path);p.add_argument('position',type=int)
@@ -45,5 +46,8 @@ if bounds['started'] and bounds['ended']:
 (out/'verified-state.json').write_bytes(raw)
 result={'schema':'greppy.web-study.basic.v1',**trial,'agent_path':a.agent_path,'turn_id':turn_id,'context':metadata['turn_context'],'oracle':oracle,'oracle_exit_code':proc.returncode,'verified_at':verified_at.isoformat(),'verifier_seconds':verifier_seconds,'agent_turn_wall_seconds':duration,'end_to_end_verified_seconds':None,'latency_limit':'Independent post-hoc verification. No controlled completion-to-oracle dispatch latency; no main study end-to-end claim.','tokens':tokens,'telemetry_limits':limits,'host_tool_envelopes':metadata['tool_response_status'],'completion':metadata['completion_boundary'],'artifacts':{k:str(v) for k,v in exported.items()},'verified_state_sha256':hashlib.sha256(raw).hexdigest(),'plan_sha256':hashlib.sha256((a.series/'plan.json').read_bytes()).hexdigest()}
 result.update(observed_session_ids=session_ids,session_isolation=session_isolation)
+if trial['arm']=='C' and plan.get('candidate_integrity_required'):
+    candidate=trial.get('cli_context',{}).get('candidate',{})
+    result['candidate_integrity']=verify_candidate(candidate)
 (out/'trial.json').write_text(json.dumps(result,indent=2))
 print(json.dumps({'trial':str(out),'oracle':oracle,'context':metadata['turn_context'],'tokens':tokens,'agent_turn_seconds':duration,'tool_calls':metadata['tool_response_status']['request_count']}))
