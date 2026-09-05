@@ -1,0 +1,75 @@
+{
+  "schema": "greppy.model-asset.r5-classifier.1",
+  "asset": "classifier-v1.f32le",
+  "sha256": "523c23339149d0cae8f30d15c422d10d82b7be5fcc9935aba3bcc805790a6a1c",
+  "size": 797840,
+  "source_checkpoint": {
+    "path": "/mnt/nvme1/greppy-traces/diversity-5/head1-classifier.pt",
+    "sha256": "6ac254d427e077ce9a67bde5888bc88a8eba39e9629413f58537973f9e92803b"
+  },
+  "frozen_thresholds": {
+    "path": "/mnt/nvme1/greppy-traces/diversity-5/frozen-thresholds.json",
+    "sha256": "f154cde4f2958dd578ff859b13963b9ed026ade6c3b899fc2b21205bfe5aae0a",
+    "error": 0.03357132524251938,
+    "warning": 0.7533782720565796
+  },
+  "labels": [
+    "error",
+    "warning",
+    "progress",
+    "text"
+  ],
+  "layout": {
+    "endianness": "little",
+    "header_bytes": 128,
+    "arrays": [
+      [
+        "scaler_mean",
+        [
+          768
+        ]
+      ],
+      [
+        "scaler_scale",
+        [
+          768
+        ]
+      ],
+      [
+        "linear1_weight",
+        [
+          256,
+          768
+        ]
+      ],
+      [
+        "linear1_bias",
+        [
+          256
+        ]
+      ],
+      [
+        "linear2_weight",
+        [
+          4,
+          256
+        ]
+      ],
+      [
+        "linear2_bias",
+        [
+          4
+        ]
+      ]
+    ],
+    "weight_order": "row-major"
+  },
+  "golden": {
+    "asset": "golden-v1.f32le",
+    "sha256": "b922a254670028da5a413e12a74bdf0697d8175656a980b940a7aed6317f7e6e",
+    "size": 198720,
+    "n": 64,
+    "blocks": "golden-blocks-v1.json",
+    "blocks_sha256": "60941fe959751144bb3930f7c271d1f2704f7ddb1305106c4b1a3140342e8167"
+  }
+}

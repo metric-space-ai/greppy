@@ -18,8 +18,11 @@
 #![deny(rust_2018_idioms)]
 
 pub mod backend;
+pub mod block_classifier;
 pub mod cpu_features;
 pub mod gguf;
+pub mod head_candidate;
+pub mod head_input;
 pub mod matmul;
 pub mod model;
 pub mod performance;
@@ -37,6 +40,7 @@ pub use backend::{
     DeviceInfo, DeviceType, InferenceBackendRegistry, InferenceModelKind, InferencePolicy,
     BACKEND_REGISTRY_VERSION, GPU_MEMORY_SAFETY_MARGIN,
 };
+pub use block_classifier::{BlockClassifier, BLOCK_CLASSIFIER_LABELS};
 pub use gguf::{GgufModel, TensorInfo, TensorView, Value, ValueType, VersionedMagic};
 pub use model::{CpuEmbeddingModel, StageOutput};
 pub use quant::GgmlDType;
@@ -240,15 +244,30 @@ impl EmbeddingGemma {
         I: IntoIterator<Item = S>,
     {
         let batch = self.tokenizer.encode_prompts(prompts)?;
+        self.forward_tokenized(&batch)
+    }
+
+    /// Exact bounded prompts for source-spanned heads. Unlike generic retrieval
+    /// embedding, overflowing inputs are rejected rather than silently clipped.
+    pub fn embed_prompts_exact<S, I>(&self, prompts: I) -> Result<Vec<Vec<f32>>>
+    where
+        S: AsRef<str>,
+        I: IntoIterator<Item = S>,
+    {
+        let batch = self.tokenizer.encode_prompts_exact(prompts)?;
+        self.forward_tokenized(&batch)
+    }
+
+    fn forward_tokenized(&self, batch: &TokenizedBatch) -> Result<Vec<Vec<f32>>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
         match &self.backend {
-            EmbeddingBackend::Cpu(model) => model.forward_batch(&batch),
+            EmbeddingBackend::Cpu(model) => model.forward_batch(batch),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            EmbeddingBackend::Metal(model) => model.forward_batch(&batch),
+            EmbeddingBackend::Metal(model) => model.forward_batch(batch),
             #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-            EmbeddingBackend::Cuda(model) => model.forward_batch(&batch),
+            EmbeddingBackend::Cuda(model) => model.forward_batch(batch),
         }
     }
 

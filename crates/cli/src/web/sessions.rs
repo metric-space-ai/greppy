@@ -39,6 +39,22 @@ pub enum SessionCommand {
     Create {
         #[arg(long, default_value = "research")]
         profile: String,
+        /// Explicit goal for task-conditioned observation ranking.
+        #[arg(long, value_parser = parse_goal_arg)]
+        goal: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly set or clear the session goal using a version precondition.
+    SetGoal {
+        #[arg(long, value_parser = parse_goal_arg, conflicts_with = "clear", required_unless_present = "clear")]
+        goal: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        expected_goal_version: u64,
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -51,6 +67,16 @@ pub enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+fn parse_goal_arg(value: &str) -> std::result::Result<String, String> {
+    greppy_web_client::observation_context::validate_goal(value).map_err(|_| {
+        format!(
+            "goal must be nonempty and at most {} UTF-8 bytes",
+            greppy_web_client::observation_context::MAX_GOAL_BYTES
+        )
+    })?;
+    Ok(value.to_owned())
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,13 +104,16 @@ pub(super) fn dispatch(command: SessionsCommand, root: Option<&str>) -> Result<i
         SessionsCommand::Status { json } => status(json, root),
         SessionsCommand::Doctor { json } => doctor(json, root),
         SessionsCommand::Session { command } => match command {
-            SessionCommand::Create { profile, json } => {
-                match rpc_response(
-                    root,
-                    "web.session.create",
-                    json!({ "profile": profile }),
-                    None,
-                ) {
+            SessionCommand::Create {
+                profile,
+                goal,
+                json,
+            } => {
+                let mut params = json!({ "profile": profile });
+                if let Some(goal) = goal {
+                    params["goal"] = json!(goal);
+                }
+                match rpc_response(root, "web.session.create", params, None) {
                     Err(error) => emit_error(json, error),
                     Ok(response) => {
                         if response.status == "ok" {
@@ -100,6 +129,30 @@ pub(super) fn dispatch(command: SessionsCommand, root: Option<&str>) -> Result<i
                         emit_response(json, response)
                     }
                 }
+            }
+            SessionCommand::SetGoal {
+                goal,
+                clear: _,
+                expected_goal_version,
+                session,
+                json,
+            } => {
+                let session = match resolve_session(root, session) {
+                    Ok(session) => session,
+                    Err(error) => return emit_error(json, error),
+                };
+                let request = greppy_web_client::SetGoalRequest {
+                    session_id: session.clone(),
+                    goal,
+                    expected_goal_version,
+                };
+                rpc(
+                    root,
+                    json,
+                    "web.session.set_goal",
+                    json!(request),
+                    Some(session),
+                )
             }
             SessionCommand::List { json } => rpc(root, json, "web.session.list", json!({}), None),
             SessionCommand::Close { session, json } => rpc(
@@ -177,4 +230,80 @@ pub(super) fn dispatch_tab(command: TabCommand, root: Option<&str>) -> Result<i3
         object.insert("tab".into(), serde_json::json!(tab));
     }
     rpc(root, json_out, operation, payload, Some(session))
+}
+
+#[cfg(test)]
+mod goal_argument_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct Args {
+        #[command(subcommand)]
+        command: SessionCommand,
+    }
+
+    #[test]
+    fn create_accepts_optional_explicit_goal() {
+        let args =
+            Args::try_parse_from(["session", "create", "--goal", "Choose a product"]).unwrap();
+        assert!(
+            matches!(args.command,SessionCommand::Create { goal:Some(goal),.. } if goal=="Choose a product")
+        );
+        let args = Args::try_parse_from(["session", "create"]).unwrap();
+        assert!(matches!(
+            args.command,
+            SessionCommand::Create { goal: None, .. }
+        ));
+        assert!(Args::try_parse_from(["session", "create", "--goal", " "]).is_err());
+    }
+
+    #[test]
+    fn update_requires_version_and_exactly_one_set_or_clear() {
+        assert!(Args::try_parse_from(["session", "set-goal", "--goal", "Save"]).is_err());
+        assert!(
+            Args::try_parse_from(["session", "set-goal", "--expected-goal-version", "1"]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "session",
+            "set-goal",
+            "--goal",
+            "Save",
+            "--clear",
+            "--expected-goal-version",
+            "1"
+        ])
+        .is_err());
+        let args = Args::try_parse_from([
+            "session",
+            "set-goal",
+            "--clear",
+            "--expected-goal-version",
+            "2",
+            "--session",
+            "wrs_1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            SessionCommand::SetGoal {
+                goal: None,
+                clear: true,
+                expected_goal_version: 2,
+                ..
+            }
+        ));
+        let args = Args::try_parse_from([
+            "session",
+            "set-goal",
+            "--goal",
+            "Save",
+            "--expected-goal-version",
+            "2",
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.command,SessionCommand::SetGoal { goal:Some(goal),clear:false,expected_goal_version:2,.. } if goal=="Save")
+        );
+    }
 }

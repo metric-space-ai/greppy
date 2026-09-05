@@ -116,7 +116,12 @@ impl PromptTokenizer {
     pub fn from_file(path: impl AsRef<Path>, config: TokenizerConfig) -> Result<Self> {
         let mut tokenizer =
             Tokenizer::from_file(path).map_err(|e| Error::Tokenizer(e.to_string()))?;
-        let raw_tokenizer = tokenizer.clone();
+        let mut raw_tokenizer = tokenizer.clone();
+        // Serialized tokenizer settings must never truncate or pad raw counts.
+        raw_tokenizer.with_padding(None);
+        raw_tokenizer
+            .with_truncation(None)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
         configure_tokenizer(&mut tokenizer, config)?;
         Ok(Self {
             tokenizer,
@@ -159,6 +164,52 @@ impl PromptTokenizer {
 
     pub fn max_length(&self) -> usize {
         self.config.max_length
+    }
+
+    /// Encode without allowing either the byte pre-limit or token truncation to
+    /// alter a source-spanned head input. Compare actual nonpadding token IDs.
+    pub fn encode_prompts_exact<S, I>(&self, prompts: I) -> Result<TokenizedBatch>
+    where
+        S: AsRef<str>,
+        I: IntoIterator<Item = S>,
+    {
+        let prompts = prompts.into_iter().collect::<Vec<_>>();
+        let expected = prompts
+            .iter()
+            .map(|p| self.encode_ids(p.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        if expected
+            .iter()
+            .any(|ids| ids.is_empty() || ids.len() > self.config.max_length)
+        {
+            return Err(Error::Tokenizer(
+                "exact head input exceeds native token limit or is empty".into(),
+            ));
+        }
+        let batch = self.encode_prompts(prompts.iter().map(|p| p.as_ref()))?;
+        if batch.batch_size() != expected.len() {
+            return Err(Error::Tokenizer(
+                "exact head input batch size changed".into(),
+            ));
+        }
+        for ((ids, mask), expected) in batch
+            .token_ids
+            .iter()
+            .zip(&batch.attention_mask)
+            .zip(expected)
+        {
+            let actual = ids
+                .iter()
+                .zip(mask)
+                .filter_map(|(id, active)| (*active == 1).then_some(*id))
+                .collect::<Vec<_>>();
+            if actual != expected || mask.iter().any(|v| *v > 1) {
+                return Err(Error::Tokenizer(
+                    "exact head input was altered by tokenizer truncation or padding".into(),
+                ));
+            }
+        }
+        Ok(batch)
     }
 
     pub fn encode_prompts<S, I>(&self, prompts: I) -> Result<TokenizedBatch>
