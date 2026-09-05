@@ -1344,6 +1344,7 @@ mod tests {
     }
 
     /// Prepare once (as the CLI does) so Apply sees pre-resolved roots + FDs.
+    #[cfg(unix)]
     fn resolved_spec(raw: &[PathBuf]) -> SandboxSpec {
         let roots = prepare_writable_roots(raw).expect("prepare roots");
         SandboxSpec::from_prepared_roots(roots).expect("open prepared roots")
@@ -1435,9 +1436,9 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("target");
         std::fs::create_dir_all(&target).unwrap();
-        let link = base.join("link");
         #[cfg(unix)]
         {
+            let link = base.join("link");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             let err = prepare_writable_roots(std::slice::from_ref(&link)).unwrap_err();
             let msg = err.to_string();
@@ -1457,9 +1458,9 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let real_dir = base.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
-        let link = base.join("link");
         #[cfg(unix)]
         {
+            let link = base.join("link");
             std::os::unix::fs::symlink(&real_dir, &link).unwrap();
             // Root path walks through the symlink ancestor: …/link/child
             let nested = link.join("child");
