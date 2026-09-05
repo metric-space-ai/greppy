@@ -67,7 +67,10 @@ function greppyWaitForFunction(source, token, timeoutMs) {
   }
 
   function scheduleRaf() {
-    if (finished) {
+    // MutationObserver may deliver repeatedly before the next paint. Keep a
+    // single outstanding frame; otherwise each delivery starts another
+    // recurring chain and cleanup can cancel only the last recorded handle.
+    if (finished || rafId) {
       return;
     }
     rafId = window.requestAnimationFrame(function () {

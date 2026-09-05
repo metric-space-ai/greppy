@@ -6,8 +6,30 @@ await page.setContent("<!DOCTYPE html><html><body><div id='app'>boot</div></body
 const readyScheduledAt = await page.evaluate(() => {
   window.__waitFinishCount = 0;
   window.__predicateCalls = 0;
+  const requestFrame = window.requestAnimationFrame.bind(window);
+  const cancelFrame = window.cancelAnimationFrame.bind(window);
+  const frames = new Set();
+  window.__waitFrames = frames;
+  window.__waitPeakFrames = 0;
+  window.requestAnimationFrame = function (callback) {
+    const id = requestFrame(function (timestamp) {
+      frames.delete(id);
+      callback(timestamp);
+    });
+    frames.add(id);
+    window.__waitPeakFrames = Math.max(window.__waitPeakFrames, frames.size);
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    frames.delete(id);
+    cancelFrame(id);
+  };
+  window.__waitMutationTimer = setInterval(function () {
+    document.querySelector("#app").textContent += ".";
+  }, 1);
   const scheduledAt = Date.now();
   setTimeout(function () {
+    clearInterval(window.__waitMutationTimer);
     window.__readyValue = { answer: 42, nested: { ok: true } };
   }, 80);
   window.__forgeTimer = setInterval(function () {
@@ -53,6 +75,13 @@ if (callsAfterIdle !== calls) {
 const finishesAfterIdle = await page.evaluate(() => window.__waitFinishCount);
 if (finishesAfterIdle !== 1) {
   throw new Error("second completion after idle: " + finishesAfterIdle);
+}
+const frameState = await page.evaluate(() => ({
+  peak: window.__waitPeakFrames,
+  pending: window.__waitFrames.size,
+}));
+if (frameState.peak > 1 || frameState.pending !== 0) {
+  throw new Error("waiter accumulated animation frames: " + JSON.stringify(frameState));
 }
 
 let errorText = "";
