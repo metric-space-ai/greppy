@@ -32,3 +32,11 @@ The create-only `prepared-dispatches/NN.json` pins the goal, full message and pl
 For new C conditions, the full participant prompt must preserve host command telemetry: use `text(await tools.exec_command({cmd: COMMAND}))`, not output-only forwarding; if it returns a session handle, poll that handle to its terminal exit code before proceeding. Quote shell arguments normally. `web status` is not a replacement for a host-process completion result. Declare this as a transport correction against Series 04 and test it with the unchanged browser candidate before attributing any difference to E1. The probe and exact historical call references are in `docs/web-response-cost-findings-20260905.md`.
 
 To isolate onboarding costs, preregister a new plan with `prepare_series.py --onboarding explicit_transport_v1` and freeze every prompt before the first participant with `python3 onboarding.py SERIES --name-prefix s06`. Both arms receive a concrete supported opening call, including a retained CUA tab binding with `visible:false` and complete Greppy shell-result forwarding. The template contains no task-specific selectors or interaction sequence. It refuses an unregistered condition or existing dispatch directory. Use the unchanged previous candidate for this ablation; new engine code is a separate condition. Prepared prompts still require separately recorded actual spawn receipts.
+
+For the currently installed Browser plugin, preregister `--onboarding browser_plugin_transport_v2`.
+This uses `mcp__node_repl__js` and the installed Browser skill instead of the historical
+`mcp__cua_repl` interface. Greppy's transport instructions stay unchanged. Freeze
+all prompts and hash the installed skill/client before dispatch; include their
+normal setup and documentation costs in the actual provider totals. This changes
+the standard-tool condition and must not be represented as the same historical
+baseline or as an isolated Greppy fix ablation. Old v1 plans and prompts stay intact.

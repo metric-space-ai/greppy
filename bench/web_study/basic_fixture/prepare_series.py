@@ -4,6 +4,7 @@ from pathlib import Path
 import server
 from prepare_context import prepare
 from dispatch import task_goal
+from onboarding import CONDITIONS
 
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
@@ -18,7 +19,7 @@ p.add_argument('--view', choices=('default','compact'), default='default')
 p.add_argument('--chain-view', choices=('default','compact'), default='default')
 p.add_argument('--runtime-id')
 p.add_argument('--latency-limitation')
-p.add_argument('--onboarding', choices=('legacy', 'explicit_transport_v1'), default='legacy')
+p.add_argument('--onboarding', choices=('legacy', *CONDITIONS), default='legacy')
 a=p.parse_args()
 if a.repeats < 1: p.error('repeats must be positive')
 if a.isolated_cli and not (a.alias_dir and a.runtime_id and a.runtime):

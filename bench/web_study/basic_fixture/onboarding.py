@@ -8,6 +8,8 @@ import shlex
 from dispatch import freeze_dispatch, task_goal
 
 CONDITION = 'explicit_transport_v1'
+CURRENT_BROWSER_CONDITION = 'browser_plugin_transport_v2'
+CONDITIONS = (CONDITION, CURRENT_BROWSER_CONDITION)
 COMMON = (
     'Work only through the visible browser UI and documented browser APIs. '
     'Do not read fixture source, host state files or application APIs. '
@@ -17,11 +19,26 @@ COMMON = (
 )
 
 
-def participant_message(trial):
+def participant_message(trial, condition=CONDITION):
+    if condition not in CONDITIONS:
+        raise ValueError('unsupported onboarding condition')
     goal = task_goal(trial)
     if trial.get('task_goal') != goal:
         raise ValueError('requires a prospectively recorded business goal')
     prefix = f"Complete this browser task on {trial['url']}\n\n{goal['text']}\n\n{COMMON}\n\n"
+    if trial['arm'] == 'A' and condition == CURRENT_BROWSER_CONDITION:
+        return prefix + (
+            'Use only the standard Codex in-app Browser through mcp__node_repl__js. '
+            'This study explicitly authorizes the standard browser despite repository defaults. '
+            'Read and follow the installed Browser skill at '
+            '/Users/michaelwelsch/.codex/plugins/cache/openai-bundled/browser/26.901.22334/skills/control-in-app-browser/SKILL.md. '
+            'You may use the shell solely to read this skill, not for browser interaction. '
+            'Initialize its browser-client runtime, select the in-app browser with agent.browsers.get("iab"), '
+            'and emit its complete documentation before creating your own tab through iab.tabs.new(). '
+            'Keep the browser in the background and retain its browser and tab bindings. '
+            'Use the documented AX or Playwright APIs, including batching where useful. '
+            'Do not use the former cua.createBrowserTab API, Greppy Web, application APIs, or another browser.'
+        )
     if trial['arm'] == 'A':
         start = 'let tab = await cua.createBrowserTab("iab", ' + json.dumps(trial['url']) + ', {visible:false});'
         return prefix + (
@@ -57,12 +74,13 @@ def prepare_messages(series, name_prefix):
         raise ValueError('use a lowercase task-name prefix')
     series = Path(series)
     plan = json.loads((series / 'plan.json').read_text())
-    if plan.get('onboarding_condition') != CONDITION:
+    condition = plan.get('onboarding_condition')
+    if condition not in CONDITIONS:
         raise ValueError('onboarding condition must be registered in the plan before dispatch')
     folder = series / 'prepared-dispatches'
     if folder.exists():
         raise FileExistsError('refusing to change or partially refill existing dispatches')
-    messages = [(t, participant_message(t)) for t in plan['trials']]
+    messages = [(t, participant_message(t, condition)) for t in plan['trials']]
     return [freeze_dispatch(series, t['position'],
                             f"{name_prefix}_{t['case']}_{t['arm'].lower()}{t['repeat']}", message)
             for t, message in messages]
@@ -75,4 +93,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     records = prepare_messages(args.series, args.name_prefix)
     print(json.dumps({'state': 'prepared_not_sent', 'count': len(records),
-                      'onboarding_condition': CONDITION}))
+                      'onboarding_condition': json.loads((args.series / 'plan.json').read_text())['onboarding_condition']}))
