@@ -69,5 +69,5 @@ Six shared-context tests pass and all five engine-free Session tests pass on
 macOS. They cover CAS/clear/isolation, immutable failure paths, ticket fencing,
 bounded pending work, reader exclusion, unknown wire fields and explicit null.
 The Session test build has existing warnings in untouched daemon/supervisor
-code. CLI parser tests and daemon integration have separate validation status;
+code. Both CLI parser tests also pass. Daemon integration remains unvalidated;
 these unit tests are not backend calibration or agent-flow acceptance.

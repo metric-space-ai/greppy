@@ -63,11 +63,12 @@ and absent state. Explicit goal/version and last action are required. Source rec
 IDs stay independent of goal versions; example IDs invalidate goal-dependent work.
 `prepare_observations.py` checks source checksums and creates reviewable candidate
 JSONL from an explicitly authored manifest. These are training preparation helpers;
-the product session-goal API and runtime head integration are still outstanding.
+the product session-goal API is prepared and tested separately. Daemon/action
+wiring and runtime head integration are still outstanding.
 
 ## Verification to date
 
-- 45 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
+- 57 Python tests pass on GPU3's Python runtime and cover coverage, evidence integrity, blind prompts, common
   secret redaction, restart idempotency, concurrent claims, bounded retries,
   quota/auth pauses, worker expiry and split leakage refusal.
 - Live synthetic smoke: one M3 batch and one independently judged Grok batch,
@@ -76,6 +77,10 @@ the product session-goal API and runtime head integration are still outstanding.
 - Historical R5 counts reproduced exactly on hash-pinned native CUDA vectors.
 - Restored portable Rust classifier golden passes in CPU and Metal builds.
   Current raw-text Metal still differs on 3/64 old CUDA threshold decisions.
+- The GPU3-only experiment runner completed 45 synthetic variants, preserved all
+  completed runs on replay, and reproduced bit-identical weights after injected
+  interruptions for five head/objective combinations. See
+  `docs/embedding-heads-experiments.md` for the contract and remaining work.
 
 Run checks through greppy as required by the repository instructions:
 
