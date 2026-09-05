@@ -19,6 +19,7 @@ p.add_argument('--view', choices=('default','compact'), default='default')
 p.add_argument('--chain-view', choices=('default','compact'), default='default')
 p.add_argument('--runtime-id')
 p.add_argument('--latency-limitation')
+p.add_argument('--live-verification', action='store_true', help='Preregister host-completion observation and immediate independent verification')
 p.add_argument('--onboarding', choices=('legacy', *CONDITIONS), default='legacy')
 a=p.parse_args()
 if a.repeats < 1: p.error('repeats must be positive')
@@ -59,6 +60,9 @@ if a.isolated_cli:
     manifest['rendering']={'view':a.view,'chain_view':a.chain_view}
     manifest['constraints'][1]='C has its own empty workspace, short CLI alias and runtime owner; native open may create the session; actual session identities audited'
     manifest['constraints'].append('Harness change, not a product optimization; compare separately with earlier series')
+if a.live_verification:
+    manifest['verification']={'mode':'host_completion_observer_v1','poll_seconds':0.1,'max_lag_seconds':2.0,'max_clock_drift_seconds':0.25,'scope':'host task_started through independent oracle completion; pre-task dispatch queue excluded'}
+    manifest['constraints'].append('Start a live observer while each participant is running; missing or invalid timing never becomes an inferred latency')
 if a.latency_limitation: manifest['constraints'].append(a.latency_limitation)
 if a.onboarding != 'legacy': manifest['onboarding_condition'] = a.onboarding
 (a.output/'plan.json').write_text(json.dumps(manifest,indent=2))

@@ -5,10 +5,12 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from export_codex_trace import export_turn
 from summarize_series import token_totals
 from candidate import verify as verify_candidate
+from verify_on_completion import bind_timing
 
 p=argparse.ArgumentParser()
 p.add_argument('series',type=Path);p.add_argument('position',type=int)
 p.add_argument('--agent-path',required=True);p.add_argument('--session-dir',type=Path,required=True)
+p.add_argument('--live-verification',type=Path,help='Prospective observer terminal.json; never backfill a historical timing')
 a=p.parse_args()
 plan=json.loads((a.series/'plan.json').read_text())
 trial=next(t for t in plan['trials'] if t['position']==a.position)
@@ -46,6 +48,11 @@ if bounds['started'] and bounds['ended']:
 (out/'verified-state.json').write_bytes(raw)
 result={'schema':'greppy.web-study.basic.v1',**trial,'agent_path':a.agent_path,'turn_id':turn_id,'context':metadata['turn_context'],'oracle':oracle,'oracle_exit_code':proc.returncode,'verified_at':verified_at.isoformat(),'verifier_seconds':verifier_seconds,'agent_turn_wall_seconds':duration,'end_to_end_verified_seconds':None,'latency_limit':'Independent post-hoc verification. No controlled completion-to-oracle dispatch latency; no main study end-to-end claim.','tokens':tokens,'telemetry_limits':limits,'host_tool_envelopes':metadata['tool_response_status'],'completion':metadata['completion_boundary'],'artifacts':{k:str(v) for k,v in exported.items()},'verified_state_sha256':hashlib.sha256(raw).hexdigest(),'plan_sha256':hashlib.sha256((a.series/'plan.json').read_bytes()).hexdigest()}
 result.update(observed_session_ids=session_ids,session_isolation=session_isolation)
+if a.live_verification:
+    timing=bind_timing(a.live_verification,result)
+    result['live_verification']=timing
+    result['end_to_end_verified_seconds']=timing['end_to_end_verified_seconds']
+    result['latency_limit']=timing['time_scope'] + ' Independent browser/model load and main-study acceptance remain separate.'
 if trial['arm']=='C' and plan.get('candidate_integrity_required'):
     candidate=trial.get('cli_context',{}).get('candidate',{})
     result['candidate_integrity']=verify_candidate(candidate)
