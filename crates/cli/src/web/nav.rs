@@ -107,8 +107,11 @@ fn goto_url(
     // the file by hand -- and nothing tells them that is the cure.
     let response = rpc_response(root, "web.goto", payload.clone(), Some(session.clone()));
     let (session, response) = match response {
-        Ok(ref answer) if create && answer.error.as_ref().is_some_and(is_missing_session) => {
-            forget_current_session(root);
+        Ok(ref answer)
+            if create
+                && answer.error.as_ref().is_some_and(is_missing_session)
+                && forget_current_session(root, &session) =>
+        {
             let fresh = match resolve_or_create_session(root, None, json, true) {
                 Ok(fresh) => fresh,
                 Err(code) => return Ok(code),

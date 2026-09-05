@@ -92,21 +92,23 @@ pub(super) struct CurrentScope {
     pub tab: Option<String>,
 }
 
-/// Drop the remembered session after the runtime says it does not exist.
+/// Drop only the remembered session that the runtime actually rejected.
 ///
 /// A stored session belongs to a runtime that may be gone -- after a crash,
 /// a `runtime stop`, a rebuilt binary or a reboot. Passing the dead id on
-/// makes every command fail, including `open`, which is the one command that
-/// should recover. Forgetting it is safe: it is a cache, not the truth.
-pub(super) fn forget_current_session(root: Option<&str>) {
-    let path = current_scope_path(root);
+/// makes every command fail, including `open`, which should recover. A failed
+/// explicit request for some other session is not evidence against this cache.
+pub(super) fn forget_current_session(root: Option<&str>, rejected_session: &str) -> bool {
     let scope = read_current_scope(root);
-    if scope.tab.is_none() {
-        let _ = std::fs::remove_file(&path);
-        return;
+    if scope.session.as_deref() != Some(rejected_session) {
+        return false;
     }
-    // Keep an explicitly chosen tab; only the session was stale.
-    let _ = std::fs::write(&path, "{}\n");
+    let path = current_scope_path(root);
+    if scope.tab.is_none() {
+        return std::fs::remove_file(&path).is_ok();
+    }
+    // A tab belongs to the rejected session; do not retain an orphan tab id.
+    std::fs::write(&path, "{}\n").is_ok()
 }
 
 /// Did the runtime reject the request because the remembered session is
@@ -617,6 +619,13 @@ pub(super) fn rpc_with_spawn(
     session_id: Option<String>,
     spawn: SupervisorSpawn,
 ) -> Result<i32> {
+    // Match the runtime's payload-first resolution, not a user-controlled
+    // error message or an unrelated currently selected session.
+    let rejected_session = payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| session_id.clone());
     match ensure_supervisor(root, &spawn) {
         Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
             Ok(response) => {
@@ -626,13 +635,17 @@ pub(super) fn rpc_with_spawn(
                 // and the next one starts clean, without the caller having to
                 // know that a state file exists.
                 if response.error.as_ref().is_some_and(is_missing_session) {
-                    forget_current_session(root);
+                    if let Some(session) = rejected_session.as_deref() {
+                        forget_current_session(root, session);
+                    }
                 }
                 emit_response(json_out, response)
             }
             Err(error) => {
                 if is_missing_session(&error) {
-                    forget_current_session(root);
+                    if let Some(session) = rejected_session.as_deref() {
+                        forget_current_session(root, session);
+                    }
                 }
                 emit_error(json_out, error)
             }
@@ -1619,6 +1632,53 @@ mod scope_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rejected_foreign_session_preserves_remembered_session_and_tab_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_current_scope(Some(root), "own", Some("own_tab")).unwrap();
+        let path = current_scope_path(Some(root));
+        let before = std::fs::read(&path).unwrap();
+        assert!(!forget_current_session(Some(root), "foreign"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let scope = read_current_scope(Some(root));
+        assert_eq!(scope.session.as_deref(), Some("own"));
+        assert_eq!(scope.tab.as_deref(), Some("own_tab"));
+    }
+
+    #[test]
+    fn rejected_remembered_session_clears_its_orphan_tab_and_allows_recovery() {
+        for tab in [None, Some("orphan_tab")] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            write_current_scope(Some(root), "stale", tab).unwrap();
+            assert!(forget_current_session(Some(root), "stale"));
+            let scope = read_current_scope(Some(root));
+            assert!(scope.session.is_none());
+            assert!(scope.tab.is_none());
+            assert!(!forget_current_session(Some(root), "stale"));
+        }
+    }
+
+    #[test]
+    fn delayed_rejection_does_not_clear_a_newly_selected_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_current_scope(Some(root), "old", Some("old_tab")).unwrap();
+        // The outstanding request targets old, but selection changes before
+        // its rejection is processed. Compare against the current cache.
+        write_current_scope(Some(root), "new", Some("new_tab")).unwrap();
+        assert!(!forget_current_session(Some(root), "old"));
+        assert_eq!(
+            read_current_scope(Some(root)).session.as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            read_current_scope(Some(root)).tab.as_deref(),
+            Some("new_tab")
+        );
+    }
 
     fn restore(name: &str, value: Option<String>) {
         match value {
