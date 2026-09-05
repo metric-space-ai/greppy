@@ -339,6 +339,12 @@ fn install_platform_autostart(data_root: &Path, mount_root: &Path) -> Result<(),
 fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
+    let app = locate_macos_app(&current)?;
+    let cli = macos_autostart_cli(&app)?;
+    // Even the already-healthy setup path can be invoked by a development
+    // binary. Never persist that caller as the next login's provider launcher.
+    // Bind startup to the CLI sealed into the same validated FSKit application.
+    validate_macos_fskit_installation(&app)?;
     let home = PathBuf::from(
         std::env::var_os("HOME")
             .ok_or_else(|| "HOME is unavailable for LaunchAgent installation".to_string())?,
@@ -350,8 +356,47 @@ fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<()
     fs::create_dir_all(&agents)
         .map_err(|error| format!("cannot create {}: {error}", agents.display()))?;
     let plist = agents.join("ai.metric-space.greppy.workspace.plist");
-    atomic_write_autostart(&plist, &render_macos_launch_agent(&current, data_root)?)?;
+    atomic_write_autostart(&plist, &render_macos_launch_agent(&cli, data_root)?)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autostart_cli(app: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app = fs::canonicalize(app).map_err(|error| {
+        format!(
+            "cannot resolve FSKit application {}: {error}",
+            app.display()
+        )
+    })?;
+    let cli = app.join("Contents/Resources/bin/greppy");
+    let recovery = "install the complete notarized Greppy application package before registering workspace autostart; no LaunchAgent was changed";
+    let metadata = fs::symlink_metadata(&cli).map_err(|error| {
+        format!(
+            "FSKit application has no bundled CLI at {}: {error}; {recovery}",
+            cli.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "bundled autostart CLI must be a regular executable, not a symlink or directory: {}; {recovery}",
+            cli.display()
+        ));
+    }
+    let resolved = fs::canonicalize(&cli).map_err(|error| {
+        format!(
+            "cannot resolve bundled CLI {}: {error}; {recovery}",
+            cli.display()
+        )
+    })?;
+    if !resolved.starts_with(&app) {
+        return Err(format!(
+            "bundled autostart CLI escapes the FSKit application: {}; {recovery}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 #[cfg(target_os = "windows")]
@@ -1056,6 +1101,62 @@ mod tests {
         assert!(plist.contains("/Users/test/Greppy &amp; Data"));
         assert!(plist.contains("<string>workspace</string><string>setup</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_uses_the_packaged_cli_even_for_development_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let debug = root.path().join("target/debug/greppy");
+        let installed = root.path().join("Applications/GreppyWorkspaceFS.app");
+        let bundled = installed.join("Contents/Resources/bin/greppy");
+        fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        fs::write(&bundled, "fixture").unwrap();
+        fs::set_permissions(&bundled, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = locate_macos_app_with_fallback(&debug, &installed).unwrap();
+        let cli = macos_autostart_cli(&app).unwrap();
+        assert_eq!(cli, fs::canonicalize(&bundled).unwrap());
+        let plist = render_macos_launch_agent(&cli, root.path()).unwrap();
+        assert!(plist.contains(&xml_escape(cli.to_str().unwrap())));
+        assert!(!plist.contains("target/debug"));
+        assert!(!plist.contains(debug.to_str().unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_refuses_missing_nonexecutable_and_escaped_clis() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("GreppyWorkspaceFS.app");
+        let bin = app.join("Contents/Resources/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cli = bin.join("greppy");
+        let error = macos_autostart_cli(&app).unwrap_err();
+        assert!(error.contains("complete notarized"));
+        assert!(error.contains("no LaunchAgent was changed"));
+        fs::write(&cli, "fixture").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(macos_autostart_cli(&app)
+            .unwrap_err()
+            .contains("regular executable"));
+
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_cli = outside.join("greppy");
+        fs::write(&outside_cli, "outside fixture").unwrap();
+        fs::set_permissions(&outside_cli, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&cli).unwrap();
+        symlink(&outside_cli, &cli).unwrap();
+        assert!(macos_autostart_cli(&app).unwrap_err().contains("symlink"));
+        fs::remove_file(&cli).unwrap();
+        fs::remove_dir(&bin).unwrap();
+        symlink(&outside, &bin).unwrap();
+        assert!(macos_autostart_cli(&app).unwrap_err().contains("escapes"));
+        assert_eq!(fs::read_to_string(outside_cli).unwrap(), "outside fixture");
     }
 
     #[cfg(target_os = "macos")]
