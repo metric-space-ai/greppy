@@ -56,6 +56,21 @@ fn inspect_ref_reports_query_recovery_before_runtime_start() {
 }
 
 #[test]
+fn session_create_help_explains_both_profiles_without_relaxing_policy() {
+    let (code, stdout, stderr) = run(&["web", "session", "create", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("research: public web"), "{stdout}");
+    assert!(
+        stdout.contains("project: public web plus loopback"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("LAN and cloud metadata remain blocked"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn session_new_refusal_names_create_and_nested_usage() {
     let (code, stdout, stderr) = run(&["web", "session", "new", "--profile", "project"]);
     assert_eq!(code, 64, "stdout={stdout} stderr={stderr}");

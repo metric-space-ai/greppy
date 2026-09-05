@@ -3205,7 +3205,7 @@ impl Daemon {
                     format!("{reason}: {}", redact_secrets(url)),
                     request.request_id.clone(),
                     36,
-                    "use the project profile for loopback fixtures",
+                    policy_recovery(reason),
                 );
                 error.session_id = Some(session_id.to_owned());
                 Response::error(request, error)
@@ -3851,8 +3851,28 @@ fn missing_session(request: &Request, session_id: &str) -> Response {
     Response::error(request, error)
 }
 
+fn policy_recovery(reason: &str) -> &'static str {
+    if reason.starts_with("research profile denies loopback and private networks") {
+        "do not retry this URL in the unchanged research session. For explicitly requested local development only, run `greppy web session create --profile project --json`, then pass the returned session ID with `--session SID` to the local operation. Project permits loopback; LAN and cloud metadata remain blocked"
+    } else {
+        "choose a permitted public HTTP(S) URL; do not retry the unchanged denied operation or restart the runtime. LAN and cloud metadata remain blocked in both profiles"
+    }
+}
+
 fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
     let message = message.into();
+    if let Some(reason) = message.strip_prefix("policy_denied:") {
+        let mut error = ErrorObject::new(
+            "policy_denied",
+            redact_secrets(&message),
+            request.request_id.clone(),
+            exit_code,
+            policy_recovery(reason.trim_start()),
+        );
+        error.session_id = request.session_id.clone();
+        error.retryable = false;
+        return Response::error(request, error);
+    }
     // The call is lost here on purpose: the worker died at an unknown point,
     // so replaying it could repeat a half-applied action. What the caller
     // needs is a signal it can branch on (finding 030): the CLI forgets the
@@ -4752,6 +4772,46 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn policy_denial_has_nonretrying_profile_guidance() {
+        let mut request = super::Request::new("policy-test", "web.open", json!({}));
+        request.session_id = Some("wrs_policy_test".into());
+        let response = super::engine_error(
+            &request,
+            "policy_denied: research profile denies loopback and private networks",
+            34,
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "policy_denied");
+        assert_eq!(error.exit_code, 34);
+        assert!(!error.retryable);
+        assert_eq!(error.session_id, request.session_id);
+        assert!(error
+            .next_action
+            .contains("session create --profile project --json"));
+        assert!(error.next_action.contains("explicitly requested local"));
+        assert!(error
+            .next_action
+            .contains("LAN and cloud metadata remain blocked"));
+        assert!(!error.next_action.contains("retry the operation"));
+    }
+
+    #[test]
+    fn policy_denial_never_suggests_project_as_metadata_bypass() {
+        for reason in [
+            "cloud metadata endpoint denied",
+            "LAN and non-public endpoints denied",
+        ] {
+            let request = super::Request::new("policy-test", "web.open", json!({}));
+            let response = super::engine_error(&request, format!("policy_denied: {reason}"), 34);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, "policy_denied");
+            assert!(!error.retryable);
+            assert!(!error.next_action.contains("session create"));
+            assert!(error.next_action.contains("permitted public"));
+        }
+    }
 
     #[test]
     fn parse_ps_time_minutes_and_seconds() {
