@@ -604,6 +604,43 @@ mod tests {
             "text=Save draft"
         );
     }
+
+    #[test]
+    fn node_queries_preserve_bare_css_operators() {
+        for query in [
+            "input[name=quantity]",
+            "[data-x=y]",
+            "input[class~=quantity]",
+            "div~span",
+            "div ~ span",
+            "input:has(+ input[value='3'])",
+            "css=div~span",
+        ] {
+            assert!(validate_query(query).is_ok(), "{query}");
+        }
+    }
+
+    #[test]
+    fn node_queries_reject_unknown_conditions_and_malformed_regexes() {
+        for query in [
+            "time=500ms",
+            "unknown=value",
+            "text~/[bad/",
+            "text~/x/z",
+            "css~div",
+            "",
+        ] {
+            assert!(validate_query(query).is_err(), "{query}");
+        }
+        for query in [
+            "text=Quantity:",
+            "text~/Quantity:/",
+            "role=checkbox",
+            "css=#absent",
+        ] {
+            assert!(validate_query(query).is_ok(), "{query}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +662,11 @@ pub(super) const RESOLVER_JS: &str = r#"
 (function(q) {
   function esc(s) { return String(s).replace(/"/g, '\\"'); }
   var m = /^([a-z]+)(=|~)([\s\S]*)$/.exec(q);
+  // A bare CSS sibling combinator such as div~span is not a query prefix.
+  if (m && m[2] === "~" && ["css", "xpath", "text", "role", "id", "tag"].indexOf(m[1]) < 0) m = null;
   var kind = m ? m[1] : "css";
   var op = m ? m[2] : "=";
   var val = m ? m[3] : q;
-  var all = Array.prototype.slice.call(document.querySelectorAll("*"));
   function norm(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
   function reOf(v) {
     var r = /^\/([\s\S]*)\/([imsu]*)$/.exec(v);
@@ -642,6 +680,7 @@ pub(super) const RESOLVER_JS: &str = r#"
   }
   if (kind === "id") return Array.prototype.slice.call(document.querySelectorAll(String.fromCharCode(35) + val));
   if (kind === "tag") return Array.prototype.slice.call(document.getElementsByTagName(val));
+  var all = Array.prototype.slice.call(document.querySelectorAll("*"));
   if (kind === "role") {
     return all.filter(function (e) {
       var r = e.getAttribute("role");
@@ -673,6 +712,17 @@ pub(super) const DESCRIBE_JS: &str = greppy_web_client::DESCRIBE_NODE_JS;
 /// is the dangerous one — a caller reads `count: 0` as "the page has no such
 /// element" when in truth the query was never understood.
 pub(super) fn validate_query(query: &str) -> std::result::Result<(), String> {
+    validate_query_impl(query, true)
+}
+
+/// Conditions already use the JavaScript regex dialect in the page. Validate
+/// the query kind here without narrowing that dialect to Rust regex syntax.
+/// A malformed native regex is returned as an evaluation error, not polled.
+pub(super) fn validate_condition_query(query: &str) -> std::result::Result<(), String> {
+    validate_query_impl(query, false)
+}
+
+fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result<(), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("empty query; expected css=, xpath=, text=, role=, id= or tag=".into());
@@ -684,9 +734,18 @@ pub(super) fn validate_query(query: &str) -> std::result::Result<(), String> {
         return Ok(());
     };
     let (kind, rest) = trimmed.split_at(split);
+    // Match the resolver's anchored lowercase prefix grammar. Operators
+    // inside CSS attributes or after a combinator are not query kinds.
+    if kind.is_empty() || !kind.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return Ok(());
+    }
     let op = &rest[..1];
     let value = &rest[1..];
-    if !kind.is_empty() && !KINDS.contains(&kind) {
+    if op == "~" && !KINDS.contains(&kind) {
+        // div~span remains a bare CSS general-sibling selector.
+        return Ok(());
+    }
+    if !KINDS.contains(&kind) {
         return Err(format!(
             "unknown query kind `{kind}`; expected one of {}",
             KINDS.join(", ")
@@ -695,6 +754,9 @@ pub(super) fn validate_query(query: &str) -> std::result::Result<(), String> {
     if op == "~" {
         if kind != "text" {
             return Err(format!("`~` needs a text query, not `{kind}`"));
+        }
+        if !validate_regex {
+            return Ok(());
         }
         let body = value
             .strip_prefix('/')
