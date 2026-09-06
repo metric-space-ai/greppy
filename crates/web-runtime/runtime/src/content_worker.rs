@@ -5057,6 +5057,7 @@ mod serialize_tests {
 const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
   __GREPPY_NATIVE_LABEL_TEXT__
   __GREPPY_SELECT_CHOICES__
+  __GREPPY_WORKING_SCOPE__
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
   let registry = null;
@@ -5066,14 +5067,18 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
     snapshot = registry.snapshot;
     if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
   }
-  const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
-    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
-  )).filter(function(node) {
+  const visible = function(node) {
     const style = getComputedStyle(node);
     const rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-  });
-  const capped = candidates.slice(0, __GREPPY_REF_LIMIT__);
+  };
+  const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
+    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
+  )).filter(visible);
+  const scopePlan = snapshot == null ? null : greppyWorkingScopePlan(document, visible);
+  // Container/focus refs share the exact same bounded document allocation.
+  // Reserve space before capping controls; do not invent unallocated refs.
+  const capped = candidates.slice(0, __GREPPY_REF_LIMIT__ - (scopePlan ? scopePlan.extraNodes.length : 0));
   const compact = function(value) { return String(value || '').replace(/\s+/g, ' ').trim(); };
   const accessibleName = function(node, tag, type) {
     const labelledBy = (node.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
@@ -5160,6 +5165,17 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
     if (selectChoices !== null) actionable.select_choices = selectChoices;
     return actionable;
   });
+  const describe = function(node) {
+    const ref = registry.refFor(node);
+    node.setAttribute(refAttr, snapshot + ':' + ref);
+    const tag = node.tagName.toLowerCase();
+    const type = tag === 'input' || tag === 'button' ? node.type : null;
+    const name = accessibleName(node, tag, type);
+    return { ref: '@' + ref, tag: tag,
+      role: node.getAttribute('role') || (tag === 'dialog' ? 'dialog' : tag === 'form' ? 'form' : implicitRole(node, tag, type)),
+      name: name.name === null ? null : name.name.slice(0, 160),
+      name_source: name.source, name_truncated: name.name !== null && name.name.length > 160 };
+  };
   return JSON.stringify({
     url: location.href,
     title: document.title,
@@ -5171,6 +5187,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
       return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
     }),
     actionable_schema: 'greppy.web.actionable.v2',
+    working_scope: scopePlan ? greppyWorkingScopeSnapshot(scopePlan, candidates, capped, actionables, describe) : null,
     ref_snapshot: snapshot,
     actionables: actionables,
     ref_count: actionables.length,
@@ -5183,6 +5200,7 @@ fn observe_script(snapshot: Option<&str>, first: u64, last: u64) -> String {
     OBSERVE_JS
         .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
         .replace("__GREPPY_SELECT_CHOICES__", greppy_web_client::SELECT_CHOICES_JS)
+        .replace("__GREPPY_WORKING_SCOPE__", include_str!("observed-working-scope.js"))
         .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
         .replace("__GREPPY_REF_LIMIT__", &crate::observed_refs::OBSERVED_REF_LIMIT.to_string())
         .replace("__GREPPY_REF_FIRST__", &first.to_string())

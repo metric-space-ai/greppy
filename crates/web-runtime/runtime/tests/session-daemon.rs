@@ -4053,6 +4053,87 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
 }
 
 #[test]
+fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog() {
+    let fixture = serve_fixture(r#"<!doctype html><html><body>
+      <button id="background">Background</button>
+      <dialog id="reservation" aria-labelledby="title"><h2 id="title">Reserve Ember</h2>
+        <form id="form" aria-label="Reservation"><label>Quantity <input id="quantity" type="number" value="1"></label>
+          <button type="button">Confirm</button><button type="button">Cancel</button>
+        </form>
+      </dialog>
+      </body></html>"#);
+    let socket = std::env::temp_dir()
+        .join(format!("greppy-working-scope-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_working_scope", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_working_scope", method, payload),
+            Duration::from_secs(30)).expect("working scope request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let evaluate = |source: &str| {
+        let response = call("web.evaluate", json!({"session_id":session,"source":source}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["value"].clone()
+    };
+    let observe = || {
+        let response = call("web.observe", json!({"session_id":session}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()
+    };
+
+    assert_eq!(evaluate("(() => { reservation.show(); quantity.focus(); return reservation.open; })()"), true);
+    let nonmodal = observe();
+    assert_eq!(nonmodal["working_scope"]["kind"], "page", "{nonmodal}");
+    assert!(nonmodal["working_scope"]["provenance"].is_null());
+    assert_eq!(nonmodal["actionables"].as_array().unwrap().len(), 4);
+
+    assert_eq!(evaluate("(() => { reservation.close(); reservation.showModal(); quantity.focus(); return document.activeElement === quantity; })()"), true);
+    let modal = observe();
+    let scope = &modal["working_scope"];
+    assert_eq!(scope["schema"], "greppy.web.working-scope.v1");
+    assert_eq!(scope["kind"], "modal", "{modal}");
+    assert_eq!(scope["provenance"], "native_modal", "{modal}");
+    assert_eq!(scope["name"], "Reserve Ember");
+    assert_eq!(scope["role"], "dialog");
+    assert_eq!(scope["background_count"], 1);
+    assert_eq!(scope["background_returned"], 1);
+    assert_eq!(scope["actionable_refs"].as_array().unwrap().len(), 3);
+    assert_eq!(modal["actionables"].as_array().unwrap().len(), 4,
+        "background must remain available, not disappear from the snapshot");
+    let quantity = modal["actionables"].as_array().unwrap().iter()
+        .find(|node| node["name"] == "Quantity").unwrap();
+    assert_eq!(scope["focus_ref"], quantity["ref"]);
+    assert_eq!(scope["ancestry"][0]["role"], "dialog");
+    assert_eq!(scope["ancestry"][1]["role"], "form");
+    assert_eq!(scope["ancestry"][1]["name"], "Reservation");
+    let scope_ref = scope["scope_ref"].as_str().unwrap()
+        .strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    let inspected = call("web.inspect", json!({"session_id":session,
+        "selector":{"type":"ref","value":scope_ref}}));
+    assert_eq!(inspected.status, "ok", "scope refs must resolve: {inspected:?}");
+    let again = observe();
+    assert_eq!(again["working_scope"]["scope_ref"], scope["scope_ref"]);
+    assert_eq!(again["working_scope"]["focus_ref"], scope["focus_ref"]);
+
+    assert_eq!(evaluate("(() => { reservation.close(); reservation.show(); reservation.setAttribute('aria-modal','true'); quantity.focus(); return true; })()"), true);
+    let declared = observe();
+    assert_eq!(declared["working_scope"]["provenance"], "declared_aria_modal");
+    assert_eq!(declared["working_scope"]["background_count"], 1);
+    assert_eq!(evaluate("(() => { reservation.removeAttribute('aria-modal'); reservation.close(); background.focus(); return true; })()"), true);
+    let closed = observe();
+    assert_eq!(closed["working_scope"]["kind"], "page");
+    assert!(closed["working_scope"]["scope_ref"].is_null());
+    assert_eq!(closed["actionables"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn keyboard_refs_bind_the_observed_node_before_focusing() {
     let fixture = serve_fixture(
         r#"<!doctype html><html><body><label for="postcode">Postcode</label><input id="postcode">
