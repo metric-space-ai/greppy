@@ -55,3 +55,28 @@ The stricter gate was then executed against the unchanged candidate in
 It detects two content blocks, obsolete confirmation state and32 redundant false
 choice flags in5557bytes. All source/binary hashes and cleanup checks pass. This
 retained failing receipt is the before-case for the formatter fix.
+
+The fix worker's compact-choice and fresh-wait formatter changes were reviewed
+and integrated in91c57523. Coalescing now requires nonempty session and tab
+identities; missing identity never acts as a wildcard. Native action receipts in
+runtime0c5838 still omit the resolved tab, so the full native feedback gate needs
+that separate runtime metadata fix. The formatter must not hide this gap.
+
+All88 compiled CLI web tests passed with unchanged source hashes and no guard
+termination. Receipt: `/Volumes/tmp/dev-artifacts/greppy/web-efficiency/cli-guarded-zn5s_16s/receipt.json`.
+This includes the new choice/default/unknown/truncation tests, native wait evidence,
+unknown/different scopes, and the corrected CLI reference compiler. A fresh CLI
+executable build follows; no native formatter or Luna-token win is inferred from
+these component tests.
+
+The matching frozen CLI f6ef88b549cfeb43544bd42c660c168d29087f14239428145260c2c1fb54254e
+and runtime4a707070c99aac304db7795b40037bbe659b7fa6a01412e837197e7211a7b110
+now pass the actual native gate in `table-feedback-20260906-05`: exactly one
+Confirm, all five independent oracle checks including reload, one current content
+block, no obsolete confirmation state and zero redundant false choice flags.
+The chain response is2350bytes versus5557bytes in the retained failing case.
+Both binary hashes and cleanup passed. Bytes are not provider tokens.
+The same executable pair passes all12 native wait/reference checks in
+`wait-native-20260906-03`, including full navigation and stale-ref absence refusal.
+S08 freezes this pair for five new Luna/medium A/C development pairs; acceptance
+requires independently measured provider input and output savings.

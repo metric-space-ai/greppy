@@ -21,3 +21,10 @@ function returns String. Build receipt:
 Cargo exited101, sources were unchanged, and no timeout/disk guard fired. This
 compile issue was sent back to the fix worker for a narrow conversion fix. No new
 CLI candidate or complete Ref acceptance is claimed from this failed build.
+
+The worker's conversion fix was integrated as917d04d7. The resulting CLI f6ef88
+with runtime4a7070 passes all 12 checks in `wait-native-20260906-03`, including
+typed stale-reference refusal before absence inversion and full navigation.
+CLI web tests: 88 passed; build and probe source/binary checks and cleanup passed.
+This closes the tested CLI/runtime combination's Ref/navigation regression,
+while Page.url, full native suite and signed release gates remain separate.

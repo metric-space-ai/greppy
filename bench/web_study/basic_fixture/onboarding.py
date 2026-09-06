@@ -11,8 +11,9 @@ CONDITION = 'explicit_transport_v1'
 CURRENT_BROWSER_CONDITION = 'browser_plugin_transport_v2'
 SYNTHETIC_BROWSER_CONDITION = 'browser_plugin_synthetic_v3'
 COORDINATED_BROWSER_CONDITION = 'browser_plugin_coordinated_v4'
+NATIVE_WAIT_BROWSER_CONDITION = 'browser_plugin_native_wait_v5'
 CONDITIONS = (CONDITION, CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION,
-              COORDINATED_BROWSER_CONDITION)
+              COORDINATED_BROWSER_CONDITION, NATIVE_WAIT_BROWSER_CONDITION)
 COMMON = (
     'Work only through the visible browser UI and documented browser APIs. '
     'Do not read fixture source, host state files or application APIs. '
@@ -23,6 +24,16 @@ COMMON = (
 
 
 def participant_message(trial, condition=CONDITION):
+    if condition == NATIVE_WAIT_BROWSER_CONDITION:
+        message = participant_message(trial, COORDINATED_BROWSER_CONDITION)
+        if trial['arm'] == 'C':
+            message += (
+                '\n\nAvailable Greppy capabilities: `web wait QUERY --native` checks a condition '
+                'through the native runtime and returns its current page state. '
+                '`web do ACTION ... :: wait QUERY --native` can combine known actions with that check. '
+                'Choose your own targets and conditions.'
+            )
+        return message
     if condition not in CONDITIONS:
         raise ValueError('unsupported onboarding condition')
     goal = task_goal(trial)

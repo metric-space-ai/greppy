@@ -56,3 +56,18 @@ def test_exact_future_dispatches_are_frozen_without_claiming_delivery(tmp_path):
         assert record['message'] == participant_message(spec, COORDINATED_BROWSER_CONDITION)
     with pytest.raises(FileExistsError):
         prepare_messages(tmp_path, 'different')
+
+
+@pytest.mark.parametrize('arm', ['A', 'C'])
+def test_native_wait_documentation_is_generic_and_preserves_previous_conditions(arm):
+    from onboarding import NATIVE_WAIT_BROWSER_CONDITION
+    before = participant_message(trial(arm), COORDINATED_BROWSER_CONDITION)
+    after = participant_message(trial(arm), NATIVE_WAIT_BROWSER_CONDITION)
+    if arm == 'A':
+        assert after == before
+    else:
+        assert after.startswith(before + '\n\nAvailable Greppy capabilities:')
+        assert 'web wait QUERY --native' in after
+        assert 'Choose your own targets and conditions.' in after
+        for solution in ('#inventory', '#reservation', 'Ember', 'ascending', '--absent'):
+            assert solution not in after

@@ -21,5 +21,15 @@ claiming delivery. An initial local test fixture omitted `repeat`; this harness
 mistake was corrected before the passing run. A prior unittest invocation ran
 zero tests and is not counted as validation.
 
-The next series remains unprepared until the new CLI/runtime hashes and compact
-feedback preflight are valid. No participant was started for this condition yet.
+S08 was prepared after the matching CLI/runtime passed compact native feedback
+and all 12 native wait/reference checks. Its frozen condition is
+`browser_plugin_native_wait_v5`: v4 unchanged for A, with generic native wait and
+action-plus-wait capability documentation for C. It gives no fixture selectors,
+answers or task-specific wait predicate. This instruction cost remains counted.
+All 19 onboarding/dispatch tests passed before participant dispatch.
+
+Five serial A/C pairs now run with frozen CLI f6ef88 and runtime4a7070 on port
+51084. Data: `/Users/michaelwelsch/.local/state/greppy-web-study/table-series-20260906-08`.
+Actual delivery is evidenced by Root spawn calls and participant prompts;
+prepared-dispatch files alone are not delivery proof. Tokens and independent
+oracle results are required; this development series is not final acceptance.
