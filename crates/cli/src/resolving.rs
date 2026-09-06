@@ -798,7 +798,8 @@ mod positional_recovery_tests {
     #[test]
     fn browser_scope_operands_are_never_dropped_before_reparse() {
         for arguments in [
-            vec!["greppy", "web", "observe", "role=dialog", "--help"],
+            vec!["greppy", "web", "fill", "@invalid", "3", "::", "greppy", "web", "click", "@invalid"],
+            vec!["greppy", "web", "observe", "role=dialog", "extra", "--help"],
             vec![
                 "greppy",
                 "--root",
@@ -806,6 +807,7 @@ mod positional_recovery_tests {
                 "web",
                 "observe",
                 "css=dialog[open]",
+                "extra",
                 "--help",
             ],
             vec![

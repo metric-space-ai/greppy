@@ -954,7 +954,13 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                if sub == "web"
+                if sub == "web" && stray == "::" {
+                    println!(
+                        "`::` chains browser steps only after `web do`. No browser action was run. \
+                         Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
+                         the executable or `web` after `::`."
+                    );
+                } else if sub == "web"
                     && grep_passthrough_args(&argv)
                         .get(1)
                         .and_then(|arg| arg.to_str())
@@ -962,9 +968,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                     && !stray.starts_with('-')
                 {
                     println!(
-                        "`web observe` currently observes the whole page and does not accept a query; \
-                         no observation was run. Use `greppy web find QUERY` to resolve matching nodes, \
-                         or `greppy web observe` for the unfiltered page."
+                        "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
+                         No observation was run. Use `greppy web observe QUERY` for matching visible \
+                         regions, or omit QUERY for the unfiltered page."
                     );
                 } else if sub == "path" && stray == "--code" {
                     println!(

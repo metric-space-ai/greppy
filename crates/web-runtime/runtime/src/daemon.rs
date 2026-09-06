@@ -1813,6 +1813,13 @@ impl Daemon {
         budget: Duration,
         recover_worker: bool,
     ) -> Result<serde_json::Value, String> {
+        self.observe_page_scoped(session_id, page, budget, recover_worker, None, false)
+    }
+
+    fn observe_page_scoped(
+        &mut self, session_id: &str, page: &str, budget: Duration,
+        recover_worker: bool, query: Option<&str>, include_html: bool,
+    ) -> Result<serde_json::Value, String> {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
@@ -1838,6 +1845,7 @@ impl Daemon {
         let mut tree = self.engine_call_timed_with_recovery("page.observe", json!({
             "page": page, "snapshot": proposed,
             "ref_first": range.first, "ref_last": range.last,
+            "query": query, "include_html": include_html,
         }), timeout, recover_worker)?;
         let object = tree.as_object_mut().ok_or("observe returned no page object")?;
         let token = object.remove("ref_snapshot")
@@ -1937,11 +1945,32 @@ impl Daemon {
     }
 
     fn web_observe(&mut self, request: &Request) -> Response {
+        let query = match request.payload.get("query") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+            _ => return protocol_error(request, "observe query must be a nonempty string"),
+        };
+        let format = request.payload.get("format").and_then(|value| value.as_str()).unwrap_or("agent-tree");
         match self.with_session_page(request, "web.observe") {
             Err(response) => response,
             Ok((session_id, page)) => {
-                match self.observe_page(&session_id, &page) {
+                match self.observe_page_scoped(&session_id, &page, Duration::from_secs(60), true, query, format == "html") {
                     Ok(tree) => {
+                        if let Some(query) = query {
+                            if greppy_web_client::observation_scope_roots(&tree, query).is_err() {
+                                self.finish_session(&session_id);
+                                return engine_error(request, "scoped observation returned no matching scope evidence; refusing an unfiltered result", 34);
+                            }
+                        }
+                        if query.is_some() && tree.pointer("/observation_scope/roots_returned").and_then(|value| value.as_u64()) == Some(0) {
+                            self.finish_session(&session_id);
+                            let mut response = Response::error(request, ErrorObject::new(
+                                "NO_MATCH", "observation query matched no visible region", request.request_id.clone(), 32,
+                                "inspect the query or open the intended region; use unfiltered observe only when the whole page is intended",
+                            ));
+                            response.result = Some(tree);
+                            return response;
+                        }
                         let format = request
                             .payload
                             .get("format")
@@ -1968,14 +1997,26 @@ impl Daemon {
                                     Ok(manifest) => match model_facing_observe_payload(
                                         "text", "text", &text, &manifest,
                                     ) {
-                                        Ok(payload) => Response::ok(request, payload),
+                                        Ok(mut payload) => {
+                                            if let Some(scope) = tree.get("observation_scope") {
+                                                payload["observation_scope"] = scope.clone();
+                                            }
+                                            Response::ok(request, payload)
+                                        }
                                         Err(error) => engine_error(request, error, 39),
                                     },
                                     Err(response) => response,
                                 }
                             }
                             "html" => {
-                                match self.engine_call("page.content", json!({ "page": page })) {
+                                let content = if query.is_some() {
+                                    tree.get("scoped_html").and_then(|value| value.as_str())
+                                        .map(|html| json!({"html":html}))
+                                        .ok_or_else(|| "scoped observation returned no HTML".to_owned())
+                                } else {
+                                    self.engine_call("page.content", json!({ "page": page }))
+                                };
+                                match content {
                                     Ok(value) => match Self::html_from_page_content(&value) {
                                         Ok(html) => {
                                             let stored = self.store_bytes(
@@ -1991,7 +2032,12 @@ impl Daemon {
                                                 Ok(manifest) => match model_facing_observe_payload(
                                                     "html", "html", &html, &manifest,
                                                 ) {
-                                                    Ok(payload) => Response::ok(request, payload),
+                                                    Ok(mut payload) => {
+                                                        if let Some(scope) = tree.get("observation_scope") {
+                                                            payload["observation_scope"] = scope.clone();
+                                                        }
+                                                        Response::ok(request, payload)
+                                                    }
                                                     Err(error) => engine_error(request, error, 39),
                                                 },
                                                 Err(response) => response,

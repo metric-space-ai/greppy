@@ -2324,7 +2324,9 @@ impl ContentEngine {
                 let first = params.get("ref_first").and_then(|value| value.as_u64()).unwrap_or(0);
                 let last = params.get("ref_last").and_then(|value| value.as_u64()).unwrap_or(0);
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(webview, &observe_script(snapshot, first, last))? {
+                let query = params.get("query").and_then(|value| value.as_str());
+                let include_html = params.get("include_html").and_then(|value| value.as_bool()).unwrap_or(false);
+                match self.evaluate(webview, &observe_script(snapshot, first, last, query, include_html))? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -5054,10 +5056,20 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml) {
   __GREPPY_NATIVE_LABEL_TEXT__
   __GREPPY_SELECT_CHOICES__
   __GREPPY_WORKING_SCOPE__
+  __GREPPY_OBSERVATION_SCOPE__
+  const visible = function(node) {
+    const style = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  // Resolve syntax before changing the document's reference registry.
+  const selectedScope = query == null ? null : greppyObservationScope(
+    document, query, (__GREPPY_QUERY_RESOLVER__)(query), visible, 20);
+  const inScope = function(node) { return !selectedScope || selectedScope.includes(node); };
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
   let registry = null;
@@ -5067,15 +5079,10 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
     snapshot = registry.snapshot;
     if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
   }
-  const visible = function(node) {
-    const style = getComputedStyle(node);
-    const rect = node.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-  };
   const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
     'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
-  )).filter(visible);
-  const scopePlan = snapshot == null ? null : greppyWorkingScopePlan(document, visible);
+  )).filter(function(node) { return inScope(node) && visible(node); });
+  const scopePlan = snapshot == null || selectedScope ? null : greppyWorkingScopePlan(document, visible);
   // Container/focus refs share the exact same bounded document allocation.
   // Reserve space before capping controls; do not invent unallocated refs.
   const capped = candidates.slice(0, __GREPPY_REF_LIMIT__ - (scopePlan ? scopePlan.extraNodes.length : 0));
@@ -5176,14 +5183,19 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
       name: name.name === null ? null : name.name.slice(0, 160),
       name_source: name.source, name_truncated: name.name !== null && name.name.length > 160 };
   };
-  return JSON.stringify({
+  const text = selectedScope ? selectedScope.roots.map(function(node) { return node.innerText || ''; }).join('\n') : ((document.body && document.body.innerText) || '');
+  const headingNodes = Array.from(document.querySelectorAll('h1,h2,h3,h4'));
+  const linkNodes = Array.from(document.querySelectorAll('a[href]'));
+  const scopedHeadings = selectedScope ? selectedScope.collect(headingNodes, 20) : null;
+  const scopedLinks = selectedScope ? selectedScope.collect(linkNodes, 20) : null;
+  const tree = {
     url: location.href,
     title: document.title,
-    text: ((document.body && document.body.innerText) || '').slice(0, 8000),
-    headings: Array.from(document.querySelectorAll('h1,h2,h3,h4')).map(function(h) {
+    text: text.slice(0, 8000),
+    headings: (scopedHeadings ? scopedHeadings.nodes : headingNodes).map(function(h) {
       return (h.innerText || '').trim();
     }).filter(Boolean).slice(0, 20),
-    links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
+    links: (scopedLinks ? scopedLinks.nodes : linkNodes).slice(0, 20).map(function(a) {
       return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
     }),
     actionable_schema: 'greppy.web.actionable.v2',
@@ -5192,20 +5204,32 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
     actionables: actionables,
     ref_count: actionables.length,
     refs_truncated: candidates.length > capped.length
-  });
-})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__)"#;
+  };
+  if (selectedScope) {
+    tree.observation_scope = selectedScope.metadata;
+    tree.observation_scope.text_truncated = text.length > 8000;
+    tree.observation_scope.headings_truncated = scopedHeadings.truncated;
+    tree.observation_scope.links_truncated = scopedLinks.truncated;
+    if (includeHtml) tree.scoped_html = selectedScope.roots.map(function(node) { return node.outerHTML; }).join('\n');
+  }
+  return JSON.stringify(tree);
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__)"#;
 
-fn observe_script(snapshot: Option<&str>, first: u64, last: u64) -> String {
+fn observe_script(snapshot: Option<&str>, first: u64, last: u64, query: Option<&str>, include_html: bool) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS
         .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
         .replace("__GREPPY_SELECT_CHOICES__", greppy_web_client::SELECT_CHOICES_JS)
         .replace("__GREPPY_WORKING_SCOPE__", include_str!("observed-working-scope.js"))
+        .replace("__GREPPY_OBSERVATION_SCOPE__", include_str!("observation-scope.js"))
+        .replace("__GREPPY_QUERY_RESOLVER__", greppy_web_client::NODE_QUERY_RESOLVER_JS)
         .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
         .replace("__GREPPY_REF_LIMIT__", &crate::observed_refs::OBSERVED_REF_LIMIT.to_string())
         .replace("__GREPPY_REF_FIRST__", &first.to_string())
         .replace("__GREPPY_REF_LAST__", &last.to_string())
         .replace("__GREPPY_SNAPSHOT__", &encoded)
+        .replace("__GREPPY_INCLUDE_HTML__", if include_html { "true" } else { "false" })
+        .replace("__GREPPY_QUERY__", &serde_json::to_string(&query).expect("query serializes"))
 }
 
 static CLICK_PROBE_SEQ: AtomicU64 = AtomicU64::new(1);

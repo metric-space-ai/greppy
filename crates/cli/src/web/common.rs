@@ -724,7 +724,14 @@ pub(super) fn rpc_on_response(
         } else {
             Duration::from_secs(120)
         };
-        greppy_web_client::unix_request(&ctx.socket, &request, wait).map_err(|error| {
+        greppy_web_client::unix_request(&ctx.socket, &request, wait).map(|response| {
+            if operation == "web.observe" {
+                if let Some(query) = payload.get("query").and_then(serde_json::Value::as_str) {
+                    return greppy_web_client::guard_scoped_observation(query, response);
+                }
+            }
+            response
+        }).map_err(|error| {
             ErrorObject::new(
                 "runtime_unavailable",
                 error.to_string(),

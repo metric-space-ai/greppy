@@ -106,18 +106,38 @@ fn run_with_env_and_inference(
 }
 
 #[test]
-fn browser_observe_query_is_refused_instead_of_widened() {
+fn malformed_browser_chain_is_not_recovered_as_system_grep() {
+    let (repo, store, _scratch) = make_repo("web-malformed-chain", "marker");
+    let (code, out, err) = run(&[
+        "web", "fill", "@invalid", "3", "::", "greppy", "web", "click", "@invalid",
+    ], &repo, &store);
+    assert_eq!(code, 64, "{out}\n{err}");
+    assert!(out.contains("only after `web do`"), "{out}");
+    assert!(out.contains("No browser action was run"), "{out}");
+    assert!(out.contains("do not repeat"), "{out}");
+    for output in [&out, &err] {
+        assert!(!output.contains("ignoring"), "{output}");
+        assert!(!output.contains("grep:"), "{output}");
+        assert!(!output.contains("No such file or directory"), "{output}");
+    }
+    assert!(!store.exists(), "syntax refusal must not create an index store");
+}
+
+#[test]
+fn browser_observe_accepts_one_query_but_never_discards_extra_scope() {
     let (repo, store, _scratch) = make_repo("observe-query", "marker");
-    for query in ["role=dialog", "css=dialog[open]"] {
-        // --help keeps the pre-fix repro free of browser side effects: the old
-        // repair drops QUERY and exits successfully via unfiltered help.
+    for query in ["role=dialog", "css=dialog[open]", "css=dialog button", "css=\"dialog button\"", "xpath=//dialog"] {
         let (code, out, err) = run(&["web", "observe", query, "--help"], &repo, &store);
-        assert_eq!(code, 64, "query must not be dropped: {out}\n{err}");
-        assert!(out.contains("no observation was run"), "{out}");
-        assert!(out.contains("greppy web find QUERY"), "{out}");
-        assert!(out.contains("unfiltered page"), "{out}");
+        assert_eq!(code, 0, "supported query grammar: {out}\n{err}");
+        assert!(out.contains("[QUERY]"), "{out}");
         assert!(!out.contains("ignoring"), "{out}");
         assert!(err.is_empty(), "{err}");
+        // --help also keeps the pre-fix repro free of browser side effects.
+        let (code, out, err) = run(&["web", "observe", query, "extra", "--help"], &repo, &store);
+        assert_eq!(code, 64, "extra scope must not be discarded: {out}\n{err}");
+        assert!(out.contains("No observation was run"), "{out}");
+        assert!(out.contains("quote a selector containing spaces"), "{out}");
+        assert!(!out.contains("ignoring"), "{out}");
     }
     let (code, out, err) = run(&["web", "observe", "--help"], &repo, &store);
     assert_eq!(
@@ -128,6 +148,40 @@ fn browser_observe_query_is_refused_instead_of_widened() {
         !store.exists(),
         "help/refusal must not create an index store"
     );
+}
+
+#[test]
+fn browser_observe_rejects_invalid_query_before_resolving_a_session() {
+    let (repo, store, _scratch) = make_repo("observe-invalid-query", "marker");
+    for (query, expected) in [
+        ("", "empty query"),
+        ("unknown=dialog", "unknown query kind"),
+        ("role~dialog", "needs a text query"),
+    ] {
+        let (code, out, err) = run(&["web", "observe", query, "--json"], &repo, &store);
+        assert_ne!(code, 0, "invalid query must fail: {out}\n{err}");
+        assert!(out.contains(expected) || err.contains(expected), "{out}\n{err}");
+        assert!(!out.contains("NO_SESSION"), "query validation must run before session lookup: {out}");
+    }
+    // Normal command startup may record opportunistic GC before dispatch.
+    // That is not an index or a browser session; reject every other artifact.
+    if store.exists() {
+        for entry in std::fs::read_dir(&store).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "gc.state" {
+                assert!(entry.file_type().unwrap().is_file());
+            } else {
+                assert_eq!(name, "locks", "query validation created an unexpected store artifact");
+                assert!(entry.file_type().unwrap().is_dir());
+                for lock in std::fs::read_dir(entry.path()).unwrap() {
+                    let lock = lock.unwrap();
+                    assert_eq!(lock.file_name(), "global.gc", "query validation acquired an unexpected lock");
+                    assert!(lock.file_type().unwrap().is_file());
+                }
+            }
+        }
+    }
 }
 
 #[test]

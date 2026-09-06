@@ -4134,6 +4134,86 @@ fn observed_working_scope_distinguishes_native_modal_declaration_and_open_dialog
 }
 
 #[test]
+fn explicit_observation_query_scopes_native_dom_and_preserves_ref_identity() {
+    let fixture = serve_fixture(r#"<!doctype html><html><body>
+      <h1>BACKGROUND_SENTINEL</h1><button id="background">BACKGROUND_SENTINEL</button>
+      <dialog id="reservation"><h2>Reservation</h2><a href="/help">Help</a>
+        <button id="save" type="button" onclick="this.dataset.saved='true'">Save</button>
+      </dialog></body></html>"#);
+    let socket = std::env::temp_dir()
+        .join(format!("greppy-observe-query-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_observe_query", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_observe_query", method, payload),
+            Duration::from_secs(30)).expect("scoped observation request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let evaluate = |source: &str| {
+        let response = call("web.evaluate", json!({"session_id":session,"source":source}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["value"].clone()
+    };
+    let observe = |query: &str, format: &str| {
+        call("web.observe", json!({"session_id":session,"query":query,"format":format}))
+    };
+
+    let closed = observe("role=dialog", "agent-tree");
+    assert_eq!(closed.status, "error", "{closed:?}");
+    assert_eq!(closed.error.as_ref().unwrap().code, "NO_MATCH");
+    let empty = closed.result.as_ref().unwrap();
+    assert_eq!(empty["observation_scope"]["roots_returned"], 0);
+    assert_eq!(empty["text"], "");
+    assert_eq!(empty["actionables"], json!([]));
+    assert_eq!(evaluate("(() => { reservation.show(); return reservation.open; })()"), true);
+
+    let scoped = observe("role=dialog", "agent-tree");
+    assert_eq!(scoped.status, "ok", "{scoped:?}");
+    let tree = scoped.result.unwrap();
+    assert!(!tree.to_string().contains("BACKGROUND_SENTINEL"), "{tree}");
+    assert_eq!(tree["headings"], json!(["Reservation"]));
+    assert_eq!(tree["links"].as_array().unwrap().len(), 1);
+    assert_eq!(tree["observation_scope"]["roots_returned"], 1);
+    let saved_ref = tree["actionables"].as_array().unwrap().iter()
+        .find(|node| node["name"] == "Save").unwrap()["ref"].as_str().unwrap().to_owned();
+    let reference = saved_ref.strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    let inspect = || call("web.inspect", json!({"session_id":session,
+        "selector":{"type":"ref","value":reference}}));
+    assert_eq!(inspect().status, "ok");
+    let invalid = observe("css=[", "agent-tree");
+    assert_eq!(invalid.status, "error", "{invalid:?}");
+    assert_eq!(inspect().status, "ok", "invalid syntax must not invalidate prior refs");
+
+    for query in ["css=#reservation", "xpath=//dialog", "id=reservation", "tag=dialog"] {
+        for format in ["agent-tree", "text", "html"] {
+            let response = observe(query, format);
+            assert_eq!(response.status, "ok", "{query}/{format}: {response:?}");
+            let result = response.result.unwrap();
+            assert!(!result.to_string().contains("BACKGROUND_SENTINEL"), "{result}");
+            assert_eq!(result["observation_scope"]["query"], query);
+            assert_eq!(result["observation_scope"]["roots_returned"], 1);
+        }
+    }
+    assert_eq!(evaluate("(() => { const n = save.cloneNode(true); save.replaceWith(n); return true; })()"), true);
+    assert_eq!(inspect().status, "error", "replacement must not inherit an old ref");
+    let replaced = observe("role=dialog", "agent-tree");
+    assert_eq!(replaced.status, "ok", "{replaced:?}");
+    assert!(!replaced.result.unwrap()["actionables"].as_array().unwrap().iter()
+        .any(|node| node["ref"] == saved_ref));
+    assert_eq!(evaluate("(() => { reservation.close(); return !reservation.open; })()"), true);
+    assert_eq!(observe("role=dialog", "agent-tree").error.unwrap().code, "NO_MATCH");
+    let whole = call("web.observe", json!({"session_id":session}));
+    assert_eq!(whole.status, "ok", "{whole:?}");
+    assert!(whole.result.unwrap()["text"].as_str().unwrap().contains("BACKGROUND_SENTINEL"));
+}
+
+#[test]
 fn keyboard_refs_bind_the_observed_node_before_focusing() {
     let fixture = serve_fixture(
         r#"<!doctype html><html><body><label for="postcode">Postcode</label><input id="postcode">
