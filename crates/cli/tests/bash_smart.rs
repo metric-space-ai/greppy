@@ -1,10 +1,8 @@
 //! End-to-end coverage for the training-free bash-smart delivery contract.
 //!
-//! bash-smart is compiled out of the shipped 0.3.0 surface, so these tests only
-//! run when the feature that provides the verb is enabled. Without the gate
-//! they invoke a verb the binary does not have, the call falls through to real
-//! grep, and every assertion fails — which is what turned CI red on the release
-//! candidate rather than reporting an absent feature.
+//! These tests require the feature that provides the verb. They exercise the
+//! actual CLI, including subprocesses, signal forwarding and raw-log recovery;
+//! fixture inference is disabled because the delivery contract is mechanical.
 
 #![cfg(all(unix, feature = "bash-smart"))]
 
@@ -68,6 +66,41 @@ fn expand_id(stdout: &str) -> &str {
         .nth(1)
         .unwrap_or_else(|| panic!("missing expand command in:\n{stdout}"));
     rest.split_whitespace().next().unwrap()
+}
+
+#[test]
+fn oversized_single_line_keeps_failure_and_exact_raw_log_recovery() {
+    for stream in ["stdout", "stderr"] {
+        let workspace = fresh_workspace(&format!("long-line-{stream}"));
+        let script = format!(
+            "{{ printf 'data:text/javascript;base64,'; head -c 160000 /dev/zero | tr '\\000' A; printf ':1:7\\nError: long-line-probe\\n'; }} {}; exit 1",
+            if stream == "stderr" { ">&2" } else { "" },
+        );
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            output.stdout.len() + output.stderr.len() < 12_000,
+            "one long line bypassed the preview bound: stdout={} stderr={}",
+            output.stdout.len(),
+            output.stderr.len()
+        );
+        let rendered = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        assert!(rendered.contains("Error: long-line-probe"));
+        assert!(rendered.contains("bytes omitted; full line in raw log"));
+        let path_json = rendered
+            .split("raw log ")
+            .nth(1)
+            .unwrap()
+            .split("; read with greppy read-file")
+            .next()
+            .unwrap();
+        let path: String = serde_json::from_str(path_json).unwrap();
+        let expected = format!(
+            "data:text/javascript;base64,{}:1:7\nError: long-line-probe\n",
+            "A".repeat(160_000)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+    }
 }
 
 #[test]
@@ -330,13 +363,15 @@ fn signal_forwards_to_child_group_and_keeps_expandable_partial_output() {
         .expect("warmup bash-smart");
 
     let child_pid_path = workspace.base.join("child.pid");
-    let script = format!(
-        "echo $$ > {}; i=1; while [ $i -le 100000 ]; do echo line $i; i=$((i + 1)); sleep 0.01; done",
-        child_pid_path.display()
-    );
+    // Creation of a redirected file precedes its write. Publish the complete
+    // PID by same-directory rename so exists() cannot expose an empty receipt.
+    // Pass the path as argv, including when TMPDIR contains spaces.
+    let script = "set -eu; printf '%s\\n' \"$$\" > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+        i=1; while [ $i -le 100000 ]; do echo line $i; i=$((i + 1)); sleep 0.01; done";
     let started = Instant::now();
     let greppy = command(&workspace)
-        .args(["bash-smart", "--", "sh", "-c", &script])
+        .args(["bash-smart", "--", "sh", "-c", script, "greppy-signal-test"])
+        .arg(&child_pid_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

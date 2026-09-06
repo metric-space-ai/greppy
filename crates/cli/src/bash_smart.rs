@@ -12,6 +12,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
 
+#[path = "bash_smart_preview.rs"]
+mod preview;
+
 const SHORT_TOTAL_LINES: usize = 80;
 const STDERR_VERBATIM_LINES: usize = 40;
 const HEAD_LINES: usize = 20;
@@ -361,6 +364,17 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         &matches,
         &verdict_line(exit_code, error_count, warning_count, annotation.as_deref()),
     );
+    // A line-count threshold alone does not bound a minified source or data
+    // URL stack. Preview such lines in every default display path, but retain
+    // the original spool and make recovery explicit, even without SQLite.
+    for (stream, lines) in [("stdout", &stdout_lines), ("stderr", &stderr_lines)] {
+        if lines.iter().any(|line| preview::oversized(line.raw)) {
+            if let Some(path) = raw.payload[stream]["path"].as_str() {
+                let _ = writeln!(std::io::stdout().lock(),
+                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file");
+            }
+        }
+    }
 
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
@@ -369,7 +383,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
 
     // Kills and timeouts always receive an id, even when the partial wall is
     // short. Normal short output keeps its raw skeleton bytes after the answer
-    // prefix.
+    // prefix. Oversized individual lines are previews with raw-log recovery.
     if short && !interrupted {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
@@ -785,7 +799,7 @@ fn write_answer_line(
         return;
     }
     let _ = write!(writer, "{}  ", line.line);
-    let _ = writer.write_all(&line.bytes);
+    let _ = preview::write_line(writer, &line.bytes);
     let _ = writer.write_all(b"\n");
 }
 
@@ -811,7 +825,7 @@ fn write_answer_prefix(
             continue;
         }
         let _ = write!(writer, "{}  ", line.line);
-        let _ = writer.write_all(&line.bytes);
+        let _ = preview::write_line(writer, &line.bytes);
         if group.count > 1 {
             let _ = write!(writer, " ({} matches)", group.count);
         }
@@ -1718,15 +1732,15 @@ fn render_folded(
     };
     let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
 
-    // Layer 1 is invariant: head and tail are literal raw bytes, even when a
-    // repeated middle block has the same shape.
+    // Head and tail are literal raw bytes unless an individual line exceeds
+    // the display bound; the raw spool and explicit expansion remain exact.
     for line in &lines[..head_end] {
-        let _ = writer.write_all(line.raw);
+        let _ = preview::write_line(&mut writer, line.raw);
     }
     ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
 
     for group in groups.iter().filter(|group| group.count() > 1) {
-        let _ = writer.write_all(&group.representative);
+        let _ = preview::write_stream(&mut writer, &group.representative);
         if !group.representative.ends_with(b"\n") {
             let _ = writer.write_all(b"\n");
         }
@@ -1736,7 +1750,7 @@ fn render_folded(
         .filter(|line| line.line > head_end && line.line <= tail_start)
     {
         let _ = write!(writer, "{}:", line.line);
-        let _ = writer.write_all(&line.bytes);
+        let _ = preview::write_line(&mut writer, &line.bytes);
         let _ = writer.write_all(b"\n");
     }
 
@@ -1748,7 +1762,10 @@ fn render_folded(
             .map(|(start, end)| end - start + 1)
             .sum::<usize>();
         let range_text = display_line_ranges(&hidden_ranges);
-        if groups.len() == 1 && groups[0].count() > 1 {
+        if groups.len() == 1
+            && groups[0].count() > 1
+            && !preview::oversized(groups[0].template.as_bytes())
+        {
             let noun = if hidden_count == 1 {
                 "repeat"
             } else {
@@ -1771,7 +1788,7 @@ fn render_folded(
     }
 
     for line in &lines[tail_start..] {
-        let _ = writer.write_all(line.raw);
+        let _ = preview::write_line(&mut writer, line.raw);
     }
 }
 
@@ -2036,9 +2053,9 @@ fn split_lines(bytes: &[u8]) -> Vec<RawLine<'_>> {
 
 fn write_stream(stderr: bool, bytes: &[u8]) {
     if stderr {
-        let _ = std::io::stderr().lock().write_all(bytes);
+        let _ = preview::write_stream(&mut std::io::stderr().lock(), bytes);
     } else {
-        let _ = std::io::stdout().lock().write_all(bytes);
+        let _ = preview::write_stream(&mut std::io::stdout().lock(), bytes);
     }
 }
 

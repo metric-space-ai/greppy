@@ -235,6 +235,10 @@ embedded README snapshot, because command names and routing rules evolve with
 the binary. The prompt's compact rule is: choose one direct graph command for
 named symbols, one `search` for concept discovery, `search-pattern` for literal
 text, `read-file` for paths, and run builds/tests through `bash-smart`.
+`bash-smart` preserves the command's exit status and raw logs; its default
+display folds long output and previews oversized individual lines with an
+explicit raw-log recovery path. Short output may also appear after the verdict
+and diagnostics. See the [display contract](contracts/bash-smart-display-v1.md).
 
 The integrated agent allocates its portable Chunk-CoW workspace before the
 first model request. After installing the platform package, activate and verify
