@@ -1,8 +1,9 @@
 """Paired technical outcome-condition probe; never an agent/token benchmark.
 
 Five alternating pairs, fresh context/data per run, identical frozen fixture.
-Primary endpoint: does the first click on a ref from the filter receipt succeed?
-No retry or observation is inserted before that click. Failures remain results.
+Sort endpoint: first click on a ref from the filter receipt, without another read.
+Confirmation endpoint: saved-result and dialog state in the submit receipt.
+No failed action is retried. Failures remain results.
 """
 import argparse
 import hashlib
@@ -39,12 +40,16 @@ def run(a):
     hashes = lambda: {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
     source_before = hashes()
     binary_before = capture(a.cli, a.runtime)
-    plan = dict(schema='greppy.table-expectation-probe.v1', repeats=a.repeats,
+    conditions = ({'weak': 'text=3 matching items',
+                   'strong': 'css=#price-heading[aria-sort=ascending]'} if a.stage == 'sort'
+                  else {'weak': 'text={target}', 'strong': 'css=#reservation-status p'})
+    plan = dict(schema='greppy.table-expectation-probe.v1', repeats=a.repeats, stage=a.stage,
                 seed='basic-development-table-1', fixture=source_before,
                 candidate=binary_before, provider_tokens=None, agent_comparison=False,
-                conditions={'weak': 'text=3 matching items',
-                            'strong': 'css=#price-heading[aria-sort=ascending]'},
-                endpoint='first click of returned cheapest-item reference; no intervening UI read',
+                conditions=conditions,
+                endpoint=('first click of returned cheapest-item reference; no intervening UI read'
+                          if a.stage == 'sort' else
+                          'confirmation receipt exposes saved result and closed dialog; one submit only'),
                 recovery='none; failed first click is retained, not repaired',
                 order=[dict(pair=p, condition=c) for p in range(1, a.repeats + 1)
                        for c in (('weak', 'strong') if p % 2 else ('strong', 'weak'))])
@@ -99,7 +104,8 @@ def run(a):
                     'select', 'css=#inventory-region', 'EU', '::',
                     'check', 'css=#inventory-capacity', '::',
                     'select', 'css=#inventory-order', 'ascending', '--expect',
-                    plan['conditions'][entry['condition']], '--expect-timeout', '3000')
+                    (plan['conditions'][entry['condition']] if a.stage == 'sort' else
+                     'css=#price-heading[aria-sort=ascending]'), '--expect-timeout', '3000')
                 trial['filter_exit'] = code
                 if code == 0:
                     snap = filtered['result']['page_state']['snapshot']
@@ -117,11 +123,32 @@ def run(a):
                         trial['correct_modal'] = scope.get('kind') == 'modal' and scope.get('name') == 'Reserve ' + target['name']
                     else:
                         trial['correct_modal'] = False
+                if a.stage == 'confirmation':
+                    assert trial.get('correct_modal'), 'confirmation setup did not reach correct modal'
+                    condition = plan['conditions'][entry['condition']].format(target=target['name'])
+                    code, saved = call('do', '--native', 'fill', 'css=#reservation-quantity', '3',
+                        '::', 'click', 'css=#reservation-form button[type=submit]',
+                        '--expect', condition, '--expect-timeout', '3000')
+                    trial['confirmation_exit'] = code
+                    trial['confirmation_expectation'] = saved['result']['steps'][-1].get('expectation')
+                    final_snap = saved['result']['page_state']['snapshot']
+                    trial['confirmation_snapshot_text'] = final_snap['text']
+                    trial['old_modal_returned'] = final_snap['working_scope'].get('kind') == 'modal'
+                    trial['saved_result_returned'] = ('Reserved 3 × ' + target['name'] + '.') in final_snap['text']
+                    immediate = fixture.load(run_id)
+                    write(folder / 'immediate-server-state.json', immediate)
+                    trial['immediate_oracle'] = fixture.verify(immediate)
+                    # One read-only reload for persistence verification, never resubmit.
+                    code, reloaded = call('reload')
+                    assert code == 0, reloaded
+                    trial['reloaded_result_visible'] = ('Reserved 3 × ' + target['name'] + '.') in reloaded['result']['page_state']['snapshot']['text']
                 state = fixture.load(run_id)
                 write(folder / 'server-state.json', state)
                 trial['server_filters_applied'] = (state['values']['region'] == 'EU' and
                     state['values']['capacity_only'] is True and state['values']['price_order'] == 'ascending')
                 trial['server_mutations'] = [e['action'] for e in state['events']]
+                if a.stage == 'confirmation':
+                    trial['final_oracle'] = fixture.verify(state)
                 trial['harness_ok'] = True
             except BaseException as error:
                 trial['harness_failure'] = repr(error)
@@ -133,14 +160,19 @@ def run(a):
                     trial['cleanup_failure'] = repr(error)
                 write(folder / 'result.json', trial)
                 write(a.evidence / 'progress.json', trials)
-                print(json.dumps({k:v for k,v in trial.items() if k not in ('filter_snapshot_text', 'expectation')}), flush=True)
+                print(json.dumps({k:v for k,v in trial.items() if k not in (
+                    'filter_snapshot_text', 'expectation', 'confirmation_snapshot_text',
+                    'confirmation_expectation')}), flush=True)
             if not trial['harness_ok'] or not trial.get('runtime_stopped'):
                 raise RuntimeError('harness or cleanup failure; remaining trials not started')
         terminal['candidate_unchanged'] = binary_before == capture(a.cli, a.runtime)
         terminal['fixture_unchanged'] = source_before == hashes()
         terminal['passed'] = terminal['candidate_unchanged'] and terminal['fixture_unchanged']
+        endpoints = ('first_click_ok', 'stale_ref', 'correct_modal', 'server_filters_applied')
+        if a.stage == 'confirmation':
+            endpoints += ('old_modal_returned', 'saved_result_returned', 'reloaded_result_visible')
         terminal['counts'] = {c: {k: sum(bool(t.get(k)) for t in trials if t['condition'] == c)
-                                  for k in ('first_click_ok', 'stale_ref', 'correct_modal', 'server_filters_applied')}
+                                  for k in endpoints}
                               for c in ('weak', 'strong')}
     except BaseException as error:
         terminal['failure'] = repr(error)
@@ -160,6 +192,7 @@ if __name__ == '__main__':
     for name in ('cli', 'runtime', 'fixture', 'scratch', 'evidence'):
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--repeats', type=int, default=5)
+    p.add_argument('--stage', choices=('sort', 'confirmation'), default='sort')
     args = p.parse_args()
     if args.repeats < 1:
         p.error('--repeats must be positive')

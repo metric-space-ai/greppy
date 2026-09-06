@@ -8,6 +8,22 @@ import statistics
 METRICS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'uncached_input_tokens')
 
 
+def regression_audit(pairs):
+    regressions, unproven = [], []
+    for pair in pairs:
+        for metric in ('input_tokens', 'output_tokens'):
+            value = pair[metric + '_change_percent']
+            item = dict(case=pair['case'], repeat=pair['repeat'], metric=metric,
+                        change_percent=value)
+            if value is None or value == 0:
+                unproven.append(item)
+            elif value > 0:
+                regressions.append(item)
+    return dict(regressions=regressions, not_strictly_improved=unproven,
+                every_pair_uses_fewer_input_and_output=bool(pairs) and
+                not regressions and not unproven and all(p['both_passed'] for p in pairs))
+
+
 def summarize(series):
     plan_bytes = (series / 'plan.json').read_bytes()
     plan = json.loads(plan_bytes)
@@ -68,6 +84,8 @@ def summarize(series):
     isolation = all(r.get('session_isolation', {}).get('fresh_vs_prior') is True
                     for r in records if r['arm'] == 'C')
     token_win = token_win and isolation
+    pair_audit = regression_audit(pairs)
+    median_passed = token_win and all(p['both_passed'] for p in pairs)
     return {
         'schema': 'greppy.basic-paired-summary.v1', 'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
         'condition': plan.get('harness_condition'),
@@ -77,7 +95,12 @@ def summarize(series):
         'session_isolation': isolation,
         'session_isolation_scope': 'Conservative trace ID audit; missing or reused session evidence cannot pass. Not a proof of full storage/profile isolation.',
         'median_paired_change_percent': changes, 'traces': traces,
-        'token_gate': 'passes this development block only' if token_win and all(p['both_passed'] for p in pairs) else 'failed_or_unproven',
+        'median_token_gate': 'passes this development block only' if median_passed else 'failed_or_unproven',
+        'paired_token_audit': pair_audit,
+        'token_gate': ('passes this development block only' if median_passed and
+                       pair_audit['every_pair_uses_fewer_input_and_output'] else
+                       'median_improved_but_pair_regressions_or_gaps_remain' if median_passed else
+                       'failed_or_unproven'),
         'acceptance': 'not established; one development case, no arm B or controlled end-to-end latency',
         'time_acceptance': None, 'token_source': 'provider-reported usage, all completed trials retained',
     }

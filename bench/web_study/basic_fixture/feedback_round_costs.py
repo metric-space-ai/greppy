@@ -30,7 +30,7 @@ REPEATED_SUBMISSION = {
 KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens')
 
 
-def audit(series):
+def audit(series, annotation_path=None):
     trials = []
     sources = {}
 
@@ -39,8 +39,12 @@ def audit(series):
         sources[str(path)] = hashlib.sha256(raw).hexdigest()
         return json.loads(raw)
 
+    plan = load(series / 'plan.json')
+    expected = {f"{t['position']:02d}-{t['case']}-{t['repeat']}-{t['arm']}" for t in plan['trials']}
+    annotations_by_trial = load(annotation_path) if annotation_path else REPEATED_SUBMISSION
+    assert not (set(annotations_by_trial) - expected), 'Annotations name unplanned trials'
     timelines = sorted((series / 'usage-timelines').glob('*.json'))
-    assert len(timelines) == 10, 'Expected the complete frozen ten-trial S08 block'
+    assert {p.stem for p in timelines} == expected, 'Require timelines for every planned trial'
     for path in timelines:
         timeline = load(path)
         assert timeline['complete'] and not timeline['problems'], path
@@ -52,8 +56,9 @@ def audit(series):
         rounds = timeline['responses']
         assert all(sum(r['tokens'][k] for r in rounds) == timeline['total'][k]
                    for k in KEYS), path
-        annotations = REPEATED_SUBMISSION.get(path.stem, [])
+        annotations = annotations_by_trial.get(path.stem, [])
         ids = {call_id for call_id, _ in annotations}
+        assert len(ids) == len(annotations), 'Duplicate annotated call IDs'
         for call_id, expected in annotations:
             call = public_calls[call_id]
             assert expected in call['arguments'], (path, call_id)
@@ -70,9 +75,9 @@ def audit(series):
                                              if timeline['total'][k] else None for k in KEYS}))
     return dict(schema='greppy.feedback-round-costs.v1', trials=trials,
                 source_sha256=sources,
-                interpretation='Observed generations associated with repeated submission attempts and their polling; NOT causal savings or removable token estimates.',
+                interpretation='Observed generations associated with manually annotated public interactions; NOT causal savings or removable token estimates.',
                 limits=['Manual public-call annotation, not an exhaustive failure classifier.',
-                        'Standard A retries are retained; A4 non-submission failure remains in the series.',
+                        'Unannotated rounds remain in trial totals; an empty annotation is not proof of no retries.',
                         'Ordinary outcome observations and reloads are not classified as avoidable.',
                         'Cached input remains input. No bytes-to-tokens conversion.',
                         'No model motive or private reasoning is inferred.'])
@@ -82,8 +87,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--series', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--annotations', type=Path,
+                        help='Public call annotations as trial -> [[call_id, expected argument substring]]; default is frozen S08 annotations')
     args = parser.parse_args()
-    report = audit(args.series)
+    report = audit(args.series, args.annotations)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('x') as stream:
         json.dump(report, stream, indent=2)
