@@ -30,6 +30,6 @@ All 19 onboarding/dispatch tests passed before participant dispatch.
 
 Five serial A/C pairs now run with frozen CLI f6ef88 and runtime4a7070 on port
 51084. Data: `/Users/michaelwelsch/.local/state/greppy-web-study/table-series-20260906-08`.
-Actual delivery is evidenced by Root spawn calls and participant prompts;
-prepared-dispatch files alone are not delivery proof. Tokens and independent
+Root spawn requests and returned task paths are visible in this conversation;
+opaque rollout assignment text prevents exact readback auditing. Tokens and independent
 oracle results are required; this development series is not final acceptance.

@@ -1,5 +1,8 @@
 # S08 ongoing empirical investigation
 
+Completed results and audit corrections are in `web-s08-results-20260906.md`.
+The following records the investigation sequence, including retained mistakes.
+
 Scope: five development A/C pairs on the table case, frozen Luna/medium, no
 history fork, alternating order, independent fixture oracle. B is still blocked
 by the unhealthy WorkspaceFS provider; no C trial is relabelled as B. Full

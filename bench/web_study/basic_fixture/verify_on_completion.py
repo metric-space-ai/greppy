@@ -161,7 +161,12 @@ def watch(series, position, source, turn_id, evidence, poll_seconds=0.1, timeout
         terminal['verifier_unchanged'] = verifier_hash == hashlib.sha256(verifier.read_bytes()).hexdigest()
         terminal['plan_unchanged'] = plan_raw == (series / 'plan.json').read_bytes()
         terminal['frozen_fixture_unchanged'] = fixture_matches()
-        drift = abs((verified - begin_utc).total_seconds() - (time.monotonic() - begin_mono))
+        # Compare both clocks at the same endpoint. Integrity hashes above can
+        # take time after `verified`; that work is not a wall-clock step.
+        # Keep the oracle completion boundary and drift threshold unchanged.
+        clock_check_utc, clock_check_mono = utc(), time.monotonic()
+        drift = abs((clock_check_utc - begin_utc).total_seconds()
+                    - (clock_check_mono - begin_mono))
         terminal['observer_clock_drift_seconds'] = drift
         terminal['timing_valid'] = (lag <= max_lag_seconds and drift <= 0.25 and
             terminal['fixture_state_unchanged_during_verification'] and terminal['verifier_unchanged'] and

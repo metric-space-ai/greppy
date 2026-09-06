@@ -226,3 +226,50 @@ def test_cli_preparation_observer_and_recording_join_without_invented_tokens(tmp
     assert trial['live_verification']['timing_valid'] is True
     assert trial['tokens']['input_tokens'] is None
     assert trial['tokens']['output_tokens'] is None
+
+
+def test_integrity_check_time_is_not_misclassified_as_clock_drift(tmp_path, monkeypatch):
+    series, source, evidence = fixture(tmp_path)
+    original_read = Path.read_bytes
+    verifier = series / 'fixture/server.py'
+    reads = 0
+
+    def slow_final_hash(path):
+        nonlocal reads
+        if path == verifier:
+            reads += 1
+            if reads == 3:
+                time.sleep(0.4)  # Work after the oracle's UTC completion sample.
+        return original_read(path)
+
+    monkeypatch.setattr(Path, 'read_bytes', slow_final_hash)
+    producer = complete_after_ready(source, evidence)
+    result = watch(series, 1, source, 't1', evidence, poll_seconds=0.01,
+                   timeout=2, python=sys.executable)
+    producer.join()
+    assert result['oracle']['ok']
+    assert reads >= 3
+    assert result['timing_valid'], result
+    assert result['observer_clock_drift_seconds'] <= 0.25
+
+
+def test_real_clock_step_still_invalidates_timing(tmp_path, monkeypatch):
+    import verify_on_completion as observer
+    series, source, evidence = fixture(tmp_path)
+    real_utc = observer.utc
+    samples = 0
+
+    def stepped_clock():
+        nonlocal samples
+        samples += 1
+        return real_utc() + dt.timedelta(seconds=1 if samples >= 3 else 0)
+
+    monkeypatch.setattr(observer, 'utc', stepped_clock)
+    producer = complete_after_ready(source, evidence)
+    result = watch(series, 1, source, 't1', evidence, poll_seconds=0.01,
+                   timeout=2, python=sys.executable)
+    producer.join()
+    assert result['oracle']['ok']
+    assert not result['timing_valid']
+    assert result['end_to_end_verified_seconds'] is None
+    assert result['observer_clock_drift_seconds'] > 0.25
