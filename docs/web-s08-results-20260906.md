@@ -48,6 +48,13 @@ not explain the remaining loop. All five C runs contain post-sort stale refusals
 four contain a subsequent confirmation timeout. Exact calls/verdicts and source
 positions are retained in `public-call-failures.json`; safe refusals are preserved.
 
+All five C runs use the exposed exact select values EU and ascending without an
+OPTION_NOT_FOUND recovery or a DOM/inspect/help fallback to discover the options.
+That earlier selection-discovery failure is absent in this block. The remaining
+loops occur at asynchronous table replacement and submission feedback. This is
+consistent with the option-view fix helping discovery; isolating its causal token
+contribution still requires an ablation rather than comparing whole old series.
+
 ## Timing and dispatch audit limits
 
 A1's late observer is not backfilled. The original timing code also compared

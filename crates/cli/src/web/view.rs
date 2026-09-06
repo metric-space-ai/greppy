@@ -210,14 +210,19 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
         header.push_str(&format!("request={}\n", quote(&id)));
     }
     let mut body = String::new();
-    if observed.is_some() && error.is_none() {
+    if observed.is_some() {
         if let Some(obj) = receipt.as_object() {
             let fields: serde_json::Map<String, Value> = obj
                 .iter()
                 .filter(|(key, _)| key.as_str() != "page_state")
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
-            body.push_str(&format!("receipt: {}\n", Value::Object(fields)));
+            let label = if error.is_some() {
+                "partial_result"
+            } else {
+                "receipt"
+            };
+            body.push_str(&format!("{label}: {}\n", Value::Object(fields)));
         }
         if let Some(obj) = page_state.and_then(Value::as_object) {
             for (key, value) in obj {
@@ -253,127 +258,139 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
                 body.push_str(&format!("{}: {value}\n", quote(key)));
             }
         }
-        if let Some(partial) = payload.get("result").filter(|v| !v.is_null()) {
+        if let Some(partial) = payload
+            .get("result")
+            .filter(|v| !v.is_null() && observed.is_none())
+        {
             body.push_str(&format!("partial_result: {partial}\n"));
         }
         body.push_str("A failed operation does not imply rollback of earlier actions.\n");
-    } else if let Some(actions) = result.get("actionables").and_then(Value::as_array) {
-        let actionable_v2 = result.get("actionable_schema").and_then(Value::as_str)
-            == Some("greppy.web.actionable.v2");
-        for key in ["title", "url"] {
-            if let Some(value) = result.get(key).filter(|v| !v.is_null()) {
-                body.push_str(&format!("{key}: {value}\n"));
-            }
+        if observed.is_some() {
+            body.push_str("Current page state — observation, not proof of the intended outcome:\n");
         }
-        body.push_str(&format!("controls: {} returned\n", actions.len()));
-        for a in actions {
-            if !a.is_object() {
-                body.push_str(&format!("unrecognized control record: {a}\n"));
-                continue;
-            }
-            let reference = a
-                .get("ref")
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".into());
-            let kind = a
-                .get("role")
-                .filter(|v| !v.is_null())
-                .or_else(|| a.get("tag"))
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".into());
-            body.push_str(&format!("{reference} {kind}"));
-            if a.get("role").is_some_and(|v| !v.is_null()) && a.get("tag") != a.get("role") {
-                if let Some(tag) = a.get("tag") {
-                    body.push_str(&format!(" tag={tag}"));
+    }
+    // Errors with a valid follow-up snapshot use exactly the same state view
+    // as successful actions. Keep the typed failure above; never replay an
+    // action, infer success, or duplicate the snapshot in partial-result JSON.
+    if error.is_none() || observed.is_some() {
+        if let Some(actions) = result.get("actionables").and_then(Value::as_array) {
+            let actionable_v2 = result.get("actionable_schema").and_then(Value::as_str)
+                == Some("greppy.web.actionable.v2");
+            for key in ["title", "url"] {
+                if let Some(value) = result.get(key).filter(|v| !v.is_null()) {
+                    body.push_str(&format!("{key}: {value}\n"));
                 }
             }
-            for key in [
-                "name", "text", "value", "type", "checked", "selected", "disabled", "expanded",
-                "invalid", "href",
-            ] {
-                if key == "text" && a.get("text") == a.get("name") {
+            body.push_str(&format!("controls: {} returned\n", actions.len()));
+            for a in actions {
+                if !a.is_object() {
+                    body.push_str(&format!("unrecognized control record: {a}\n"));
                     continue;
                 }
-                if let Some(value) = a.get(key).filter(|v| !v.is_null()) {
-                    if actionable_v2 && v2_presentation_default(key, value) {
+                let reference = a
+                    .get("ref")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".into());
+                let kind = a
+                    .get("role")
+                    .filter(|v| !v.is_null())
+                    .or_else(|| a.get("tag"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".into());
+                body.push_str(&format!("{reference} {kind}"));
+                if a.get("role").is_some_and(|v| !v.is_null()) && a.get("tag") != a.get("role") {
+                    if let Some(tag) = a.get("tag") {
+                        body.push_str(&format!(" tag={tag}"));
+                    }
+                }
+                for key in [
+                    "name", "text", "value", "type", "checked", "selected", "disabled", "expanded",
+                    "invalid", "href",
+                ] {
+                    if key == "text" && a.get("text") == a.get("name") {
                         continue;
                     }
-                    body.push_str(&format!(" {key}={value}"));
-                }
-            }
-            // Preserve newly introduced state fields without requiring a formatter release.
-            if let Some(obj) = a.as_object() {
-                for (key, value) in obj {
-                    if actionable_v2 && key == "select_choices" {
-                        if let Some(compact) = compact_select_choices(value) {
-                            body.push_str(&format!(" {}={compact}", quote(key)));
+                    if let Some(value) = a.get(key).filter(|v| !v.is_null()) {
+                        if actionable_v2 && v2_presentation_default(key, value) {
                             continue;
                         }
+                        body.push_str(&format!(" {key}={value}"));
                     }
+                }
+                // Preserve newly introduced state fields without requiring a formatter release.
+                if let Some(obj) = a.as_object() {
+                    for (key, value) in obj {
+                        if actionable_v2 && key == "select_choices" {
+                            if let Some(compact) = compact_select_choices(value) {
+                                body.push_str(&format!(" {}={compact}", quote(key)));
+                                continue;
+                            }
+                        }
+                        if ![
+                            "ref", "role", "tag", "name", "text", "value", "type", "checked",
+                            "selected", "disabled", "expanded", "invalid", "href",
+                        ]
+                        .contains(&key.as_str())
+                            && !(actionable_v2 && v2_presentation_default(key, value))
+                        {
+                            body.push_str(&format!(" {}={value}", quote(key)));
+                        }
+                    }
+                }
+                body.push('\n');
+            }
+            if let Some(text) = result.get("text").filter(|v| !v.is_null()) {
+                body.push_str(&format!("text: {text}\n"));
+            }
+            // Retain relations/links, truncation flags, cursors and future state fields.
+            if let Some(obj) = result.as_object() {
+                for (key, value) in obj {
                     if ![
-                        "ref", "role", "tag", "name", "text", "value", "type", "checked",
-                        "selected", "disabled", "expanded", "invalid", "href",
+                        "title",
+                        "url",
+                        "text",
+                        "actionables",
+                        "session_id",
+                        "tab_id",
+                        "untrusted_content_boundary",
                     ]
                     .contains(&key.as_str())
-                        && !(actionable_v2 && v2_presentation_default(key, value))
+                        && !value.is_null()
+                        && value != &json!([])
+                        && !(actionable_v2
+                            && (key == "actionable_schema"
+                                || (key == "ref_count"
+                                    && value.as_u64() == Some(actions.len() as u64))
+                                || (key == "refs_truncated" && value == &Value::Bool(false))))
                     {
-                        body.push_str(&format!(" {}={value}", quote(key)));
+                        body.push_str(&format!("{}: {value}\n", quote(key)));
                     }
                 }
             }
-            body.push('\n');
-        }
-        if let Some(text) = result.get("text").filter(|v| !v.is_null()) {
-            body.push_str(&format!("text: {text}\n"));
-        }
-        // Retain relations/links, truncation flags, cursors and future state fields.
-        if let Some(obj) = result.as_object() {
-            for (key, value) in obj {
-                if ![
-                    "title",
-                    "url",
-                    "text",
-                    "actionables",
-                    "session_id",
-                    "tab_id",
-                    "untrusted_content_boundary",
-                ]
-                .contains(&key.as_str())
-                    && !value.is_null()
-                    && value != &json!([])
-                    && !(actionable_v2
-                        && (key == "actionable_schema"
-                            || (key == "ref_count"
-                                && value.as_u64() == Some(actions.len() as u64))
-                            || (key == "refs_truncated" && value == &Value::Bool(false))))
+        } else if operation == "web.inspect"
+            && payload.get("status").and_then(Value::as_str) == Some("ok")
+            && result.get("value").is_some_and(|value| {
+                value.get("node").is_some_and(Value::is_object)
+                    && value.get("count").is_some_and(Value::is_number)
+            })
+        {
+            // Inspect value is the DOM description; serialized is its transport
+            // encoding. Machine-readable output never uses this human formatter.
+            body.push_str(&format!("element: {}\n", result["value"]));
+            for (key, value) in result.as_object().expect("inspect object") {
+                if ["value", "serialized"].contains(&key.as_str())
+                    || (key == "session_id" && value.as_str() == scope.session.as_deref())
+                    || (key == "tab_id" && value.as_str() == scope.tab.as_deref())
+                    || (key == "untrusted_content_boundary"
+                        && value.as_str() == Some("UNTRUSTED_PAGE_CONTENT"))
                 {
-                    body.push_str(&format!("{}: {value}\n", quote(key)));
+                    continue;
                 }
+                body.push_str(&format!("{}: {value}\n", quote(key)));
             }
+        } else {
+            body.push_str(&format!("{result}\n"));
         }
-    } else if operation == "web.inspect"
-        && payload.get("status").and_then(Value::as_str) == Some("ok")
-        && result.get("value").is_some_and(|value| {
-            value.get("node").is_some_and(Value::is_object)
-                && value.get("count").is_some_and(Value::is_number)
-        })
-    {
-        // Inspect value is the DOM description; serialized is its transport
-        // encoding. Machine-readable output never uses this human formatter.
-        body.push_str(&format!("element: {}\n", result["value"]));
-        for (key, value) in result.as_object().expect("inspect object") {
-            if ["value", "serialized"].contains(&key.as_str())
-                || (key == "session_id" && value.as_str() == scope.session.as_deref())
-                || (key == "tab_id" && value.as_str() == scope.tab.as_deref())
-                || (key == "untrusted_content_boundary"
-                    && value.as_str() == Some("UNTRUSTED_PAGE_CONTENT"))
-            {
-                continue;
-            }
-            body.push_str(&format!("{}: {value}\n", quote(key)));
-        }
-    } else {
-        body.push_str(&format!("{result}\n"));
     }
     if let Some(artifacts) = payload
         .get("artifacts")
@@ -832,6 +849,128 @@ mod tests {
             "does not imply rollback",
         ] {
             assert!(out.contains(expected), "missing {expected}");
+        }
+    }
+
+    // Normalized S08-C1 call_JbjtUG0cU3mjQhsj9exUgNTe: post-sort STALE_REF,
+    // revision 3, six current controls, both complete select-choice projections.
+    // Source: table-series-20260906-08/trials/02-table-1-C metadata response 67.
+    // Session/URL identifiers and prose are shortened; state/refs/order are not.
+    fn recorded_sort_stale_response() -> Value {
+        let choices = |pairs: &[(&str, &str)]| {
+            json!({
+                "schema":"greppy.web.select-choices.v1", "choices_total":pairs.len(),
+                "choices_truncated":false, "choices":pairs.iter().map(|(value,label)|
+                    json!({"value":value,"label":label,"disabled":false,
+                        "value_truncated":false,"label_truncated":false})).collect::<Vec<_>>()
+            })
+        };
+        let mut actions = vec![
+            json!({"ref":"@1","role":"combobox","tag":"select","name":"Region",
+                "text":"All regionsEUUSAPAC","value":"EU",
+                "select_choices":choices(&[("all","All regions"),("EU","EU"),("US","US"),("APAC","APAC")]),
+                "selected_options":[{"label":"EU","value":"EU"}]}),
+            json!({"ref":"@2","role":"checkbox","tag":"input","name":"At least 3 available",
+                "text":"on","type":"checkbox","value":"on","checked":true}),
+            json!({"ref":"@3","role":"combobox","tag":"select","name":"Unit price order",
+                "text":"UnsortedLow to highHigh to low","value":"ascending",
+                "select_choices":choices(&[("none","Unsorted"),("ascending","Low to high"),("descending","High to low")]),
+                "selected_options":[{"label":"Low to high","value":"ascending"}]}),
+        ];
+        for (reference, name) in [
+            ("@1401", "Reserve Ember"),
+            ("@1402", "Reserve Cedar"),
+            ("@1403", "Reserve Flint"),
+        ] {
+            actions.push(json!({"ref":reference,"role":"button","tag":"button",
+                "name":name,"text":"Reserve","type":"submit","name_source":"aria-label"}));
+        }
+        for action in &mut actions {
+            let mut fields = json!({"checked":null,"disabled":false,"expanded":null,
+                "href":null,"invalid":false,"name_source":"label","name_truncated":false,
+                "selected":null,"selected_options":null,"selected_options_truncated":false,
+                "type":null,"value":null,"value_redacted":false,"value_truncated":false});
+            fields
+                .as_object_mut()
+                .unwrap()
+                .extend(action.as_object().unwrap().clone());
+            *action = fields;
+        }
+        json!({"operation":"web.click","status":"error","request_id":"stale-sort",
+            "error":{"code":"STALE_REF","exit_code":34,"retryable":false,
+                "operation_id":"stale-sort","message":"STALE_REF: observed node no longer belongs to the active document",
+                "next_action":"run greppy web observe again and use a ref from the new snapshot"},
+            "result":{"session_id":"session-a","tab_id":"tab-a",
+                "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT",
+                "page_state":{"schema":"greppy.web.page-state.v1","status":"available",
+                    "snapshot":{"title":"Basic browser study","url":"http://fixture.invalid/",
+                        "actionable_schema":"greppy.web.actionable.v2","actionables":actions,
+                        "ref_count":6,"refs_truncated":false,"links":[],
+                        "headings":["Basic browser study","Inventory reservation","Reservations","Reserve item"],
+                        "text":"revision 3\nEmber\tEU\t4\tEUR 15.00\nCedar\tEU\t3\tEUR 18.00\nFlint\tEU\t3\tEUR 25.00\nNo reservations yet.",
+                        "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT"}}}})
+    }
+
+    #[test]
+    fn failed_sort_renders_current_choices_once_without_hiding_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut payload = recorded_sort_stale_response();
+        // Unknown receipt/state/error data must survive this same path.
+        payload["result"]["future_receipt"] = json!({"pending":true});
+        payload["result"]["page_state"]["revision"] = json!(3);
+        payload["error"]["future_error"] = json!({"retry_attempted":false});
+        let before = payload.clone();
+        let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+        assert!(out.starts_with("FAILED — \"STALE_REF\" (exit 34)"));
+        assert_eq!(out.matches("controls: 6 returned").count(), 1);
+        assert_eq!(out.matches("\"@1401\"").count(), 1);
+        assert_eq!(out.matches("\"select_choices\"=").count(), 2);
+        for expected in [
+            "checked=true",
+            "\"value\":\"ascending\"",
+            "\"label\":\"Low to high\"",
+            "\"choices_total\":4",
+            "\"choices_total\":3",
+            "No reservations yet.",
+            "partial_result:",
+            "future_receipt",
+            "future_error",
+            "retryable: false",
+            "page_state \"revision\": 3",
+            "does not imply rollback",
+            "operation_id:",
+            "session=\"session-a\"",
+            "tab=\"tab-a\"",
+            OPEN,
+            CLOSE,
+        ] {
+            assert!(out.contains(expected), "missing {expected}: {out}");
+        }
+        assert!(!out.contains("\"snapshot\":"));
+        assert!(!out.contains("\"disabled\":false"));
+        assert_eq!(
+            payload, before,
+            "human rendering must not rewrite the response"
+        );
+        assert_eq!(tmp.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_action_preserves_unavailable_malformed_and_future_state_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        for state in [
+            json!({"schema":"greppy.web.page-state.v1","status":"unavailable",
+                "error":{"code":"OBSERVATION_UNAVAILABLE","message":"budget exhausted"}}),
+            json!({"schema":"greppy.web.page-state.v1","status":"available","snapshot":false}),
+            json!({"schema":"future-v2","status":"available","snapshot":{"future":true}}),
+        ] {
+            let mut payload = recorded_sort_stale_response();
+            payload["result"]["page_state"] = state;
+            let out = render(&payload, scope(), tmp.path()).unwrap();
+            assert!(out.starts_with("FAILED"));
+            assert!(out.contains(&format!("partial_result: {}", payload["result"])));
+            assert!(!out.contains("controls:"));
+            assert!(out.contains("does not imply rollback"));
         }
     }
     #[test]
