@@ -1,6 +1,7 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
 use crate::artifacts::ArtifactStore;
+use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error};
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
 use crate::session::{LocatorSnapshot, Session, SessionState};
@@ -923,6 +924,7 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.wait" => self.web_wait(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
             "web.tab.list" => self.web_tab(&request, "list"),
             "web.tab.switch" => self.web_tab(&request, "switch"),
@@ -1801,6 +1803,16 @@ impl Daemon {
     /// Observe without beginning/finishing another operation. Action callers
     /// use this while their original operation is still Busy.
     fn observe_page(&mut self, session_id: &str, page: &str) -> Result<serde_json::Value, String> {
+        self.observe_page_bounded(session_id, page, Duration::from_secs(60), true)
+    }
+
+    fn observe_page_bounded(
+        &mut self,
+        session_id: &str,
+        page: &str,
+        budget: Duration,
+        recover_worker: bool,
+    ) -> Result<serde_json::Value, String> {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
@@ -1808,9 +1820,9 @@ impl Daemon {
             &mut session.content_cpu_baseline, self.content.pid(),
         ));
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
-        let timeout = session.limits.wall_time.saturating_sub(elapsed).min(Duration::from_secs(60));
+        let timeout = session.limits.wall_time.saturating_sub(elapsed).min(budget);
         if timeout.is_zero() {
-            return Err("observation has no remaining session wall budget".into());
+            return Err("observation has no remaining request/session budget".into());
         }
         let range = self.observed_refs.reserve().map_err(str::to_owned)?;
         let proposed = format!(
@@ -1823,10 +1835,10 @@ impl Daemon {
         // and make every subsequent observation reject its document token.
         let previous = self.sessions.get(session_id)
             .and_then(|session| session.locator_snapshots.get(page)).cloned();
-        let mut tree = self.engine_call_timed("page.observe", json!({
+        let mut tree = self.engine_call_timed_with_recovery("page.observe", json!({
             "page": page, "snapshot": proposed,
             "ref_first": range.first, "ref_last": range.last,
-        }), timeout)?;
+        }), timeout, recover_worker)?;
         let object = tree.as_object_mut().ok_or("observe returned no page object")?;
         let token = object.remove("ref_snapshot")
             .and_then(|value| value.as_str().map(str::to_owned))
@@ -1875,22 +1887,46 @@ impl Daemon {
     ) -> Response {
         // Observe exactly once, before the original operation becomes idle.
         // Observation failure cannot replay or erase a completed side effect.
-        let state = match self.observe_page(session_id, page) {
-            Ok(snapshot) => json!({
-                "schema": "greppy.web.page-state.v1",
-                "status": "available", "snapshot": snapshot,
-            }),
-            Err(error) => json!({
-                "schema": "greppy.web.page-state.v1",
-                "status": "unavailable",
-                "error": {"code": "OBSERVATION_UNAVAILABLE", "message": redact_secrets(&error)},
-            }),
-        };
+        let state = page_state_envelope(self.observe_page(session_id, page));
         if let Some(object) = result.as_object_mut() {
+            // Identity comes from the resolved native target, including an
+            // implicit active tab, not from an optional CLI request field.
+            object.insert("session_id".into(), json!(session_id));
+            object.insert("tab_id".into(), json!(page));
             object.insert("page_state".into(), state);
         }
         self.finish_session(session_id);
         Response::ok(request, result)
+    }
+
+    fn finish_failed_action_with_page_state(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        page: &str,
+        mut response: Response,
+        started: Instant,
+    ) -> Response {
+        // A read-only, best-effort observation is not an action retry. Keep the
+        // original error even if observation fails; never restart workers just
+        // to decorate an error, or grant a fresh operation/session budget.
+        let observable = response.error.as_ref().is_some_and(|error| {
+            matches!(error.code.as_str(), "NO_MATCH" | "AMBIGUOUS_TARGET" | "STALE_REF" | "TIMEOUT")
+        });
+        if observable {
+            let budget = failure_observation_budget(request.deadline_ms, started.elapsed());
+            let state = page_state_envelope(
+                self.observe_page_bounded(session_id, page, budget, false),
+            );
+            response.result = Some(json!({
+                "session_id": session_id,
+                "tab_id": page,
+                "page_state": state,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }));
+        }
+        self.finish_session(session_id);
+        response
     }
 
     fn web_observe(&mut self, request: &Request) -> Response {
@@ -2726,15 +2762,87 @@ impl Daemon {
         }
     }
 
-    /// Evaluate an expression in the page and return its serialized value.
-    ///
-    /// This is the primitive `find`, `extract`, `inspect`, `dom`, `wait` and
-    /// `assert` are built on: each of them is a query over the live document,
-    /// and one evaluation operation serves all of them instead of six
-    /// near-identical engine calls.
-    ///
-    /// The returned value comes from the page and is therefore untrusted, so
-    /// it carries the same boundary marker as `web.observe`.
+    /// Wait for an internal Boolean predicate within one request/session budget.
+    /// Never replace a shared worker merely because this wait expires. A true
+    /// result remains true if the bounded follow-up observation is unavailable.
+    fn web_wait(&mut self, request: &Request) -> Response {
+        let started = Instant::now();
+        let Some(source) = request.payload.get("source").and_then(|v| v.as_str())
+            .filter(|source| !source.trim().is_empty()).map(str::to_owned) else {
+            return protocol_error(request, "web.wait requires a non-empty internal Boolean source expression");
+        };
+        let Some(timeout_ms) = request.payload.get("timeout_ms").and_then(|v| v.as_u64()) else {
+            return protocol_error(request, "web.wait requires an unsigned integer timeout_ms");
+        };
+        let request_deadline = started.checked_add(Duration::from_millis(request.deadline_ms.min(timeout_ms)))
+            .unwrap_or(started);
+        let (session_id, page) = match self.with_session_page_until(request, "web.wait", Some(request_deadline)) {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
+        let source = match self.bind_condition_source(request, &session_id, &page, source) {
+            Ok(source) => source,
+            Err(response) => {
+                self.finish_session(&session_id);
+                return response;
+            }
+        };
+        let session_remaining = self.sessions.get(&session_id)
+            .map(|session| session.limits.wall_time.saturating_sub(session.started.elapsed()))
+            .unwrap_or(Duration::ZERO);
+        let budget = crate::wait_contract::remaining_wait_budget(
+            request.deadline_ms, timeout_ms, started.elapsed(), session_remaining,
+        );
+        let wait_deadline = Instant::now().checked_add(budget).unwrap_or_else(Instant::now);
+        let result = if budget.as_millis() == 0 {
+            Err("timeout: no remaining wait budget".to_string())
+        } else {
+            // One send/receive budget, without restarting a worker and thereby
+            // silently replacing the document the caller intended to wait on.
+            match crate::wait_contract::monotonic_ns() {
+                Ok(now) => self.engine_call_timed_with_recovery("page.waitForBoolean", json!({
+                    "page": page, "source": source,
+                    "timeout": budget.as_millis().min(u64::MAX as u128) as u64,
+                    "deadline_monotonic_ns": now.saturating_add(budget.as_nanos().min(u64::MAX as u128) as u64),
+                }), budget, false),
+                Err(error) => Err(format!("wait clock unavailable: {error}")),
+            }
+        };
+        match result {
+            Ok(value) if value.get("serialized").and_then(|v| v.get("b")) == Some(&json!(true)) => {
+                let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let observation_budget = wait_deadline.saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2));
+                let state = page_state_envelope(self.observe_page_bounded(
+                    &session_id, &page, observation_budget, false,
+                ));
+                let document = self.sessions.get(&session_id)
+                    .and_then(|session| session.locator_snapshots.get(&page))
+                    .map(|snapshot| snapshot.token.clone());
+                self.finish_session(&session_id);
+                Response::ok(request, json!({
+                    "session_id": session_id, "tab_id": page,
+                    "document_id": if state["status"] == "available" { document } else { None },
+                    "held": true,
+                    "waited_ms": waited_ms,
+                    "page_state": state,
+                    "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+                }))
+            }
+            other => {
+                let error = other.err().unwrap_or_else(|| "INVALID_WAIT_PREDICATE".into());
+                let (code, message, recovery) = crate::wait_contract::wait_error_detail(&error);
+                self.finish_session(&session_id);
+                Response::error(request, ErrorObject::new(
+                    code, message, request.request_id.clone(), 34, recovery,
+                ))
+            }
+        }
+    }
+
+    /// Evaluate a page expression and return its serialized, untrusted value.
+    /// Read/inspect commands use this primitive; the bounded Boolean wait has
+    /// its own operation so setup, evaluation and observation share a deadline.
     fn web_evaluate(&mut self, request: &Request) -> Response {
         let source = request
             .payload
@@ -2756,6 +2864,13 @@ impl Daemon {
         match self.with_session_page(request, "web.evaluate") {
             Err(response) => response,
             Ok((session_id, page)) => {
+                let source = match self.bind_condition_source(request, &session_id, &page, source) {
+                    Ok(source) => source,
+                    Err(response) => {
+                        self.finish_session(&session_id);
+                        return response;
+                    }
+                };
                 match self.engine_call("page.evaluate", json!({ "page": page, "source": source })) {
                     Ok(value) => {
                         self.finish_session(&session_id);
@@ -2772,11 +2887,32 @@ impl Daemon {
                     }
                     Err(error) => {
                         self.finish_session(&session_id);
-                        engine_error(request, error, 34)
+                        if request.payload.get("condition_ref").is_some() {
+                            locator_error(request, error)
+                        } else {
+                            engine_error(request, error, 34)
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn bind_condition_source(
+        &self,
+        request: &Request,
+        session_id: &str,
+        page: &str,
+        source: String,
+    ) -> Result<String, Response> {
+        let Some(selector) = request.payload.get("condition_ref") else {
+            return Ok(source);
+        };
+        if selector.get("type").and_then(|kind| kind.as_str()) != Some("ref") {
+            return Err(protocol_error(request, "condition_ref requires an observed ref selector"));
+        }
+        let bound = self.bind_observed_selector(request, session_id, page, selector.clone())?;
+        Ok(crate::content_worker::observed_ref_condition_source(&source, &bound))
     }
 
     fn web_history(&mut self, request: &Request, method: &str, operation: &str) -> Response {
@@ -2856,6 +2992,7 @@ impl Daemon {
         method: &str,
         extra: serde_json::Value,
     ) -> Response {
+        let started = Instant::now();
         let Some(selector) = request.payload.get("selector").cloned() else {
             return protocol_error(request, &format!("{} requires selector", request.operation));
         };
@@ -2866,8 +3003,13 @@ impl Daemon {
                     match self.bind_observed_selector(request, &session_id, &page, selector) {
                         Ok(selector) => selector,
                         Err(response) => {
-                            self.finish_session(&session_id);
-                            return response;
+                            if method == "locator.inspect" {
+                                self.finish_session(&session_id);
+                                return response;
+                            }
+                            return self.finish_failed_action_with_page_state(
+                                request, &session_id, &page, response, started,
+                            );
                         }
                     };
                 let timeout = request
@@ -2915,8 +3057,15 @@ impl Daemon {
                         self.finish_action_with_page_state(request, &session_id, &page, response)
                     }
                     Err(error) => {
-                        self.finish_session(&session_id);
-                        locator_error(request, error)
+                        let response = locator_error(request, error);
+                        if method == "locator.inspect" {
+                            self.finish_session(&session_id);
+                            response
+                        } else {
+                            self.finish_failed_action_with_page_state(
+                                request, &session_id, &page, response, started,
+                            )
+                        }
                     }
                 }
             }
@@ -2942,6 +3091,7 @@ impl Daemon {
     }
 
     fn web_type(&mut self, request: &Request) -> Response {
+        let started = Instant::now();
         let Some(text) = request
             .payload
             .get("text")
@@ -2960,8 +3110,9 @@ impl Daemon {
                     match self.bind_observed_selector(request, &session_id, &page, selector) {
                         Ok(selector) => selector,
                         Err(response) => {
-                            self.finish_session(&session_id);
-                            return response;
+                            return self.finish_failed_action_with_page_state(
+                                request, &session_id, &page, response, started,
+                            );
                         }
                     };
                 let timeout = request
@@ -2974,8 +3125,9 @@ impl Daemon {
                     json!({ "page": page, "selector": selector, "timeout": timeout }),
                 );
                 if let Err(error) = focus {
-                    self.finish_session(&session_id);
-                    return locator_error(request, error);
+                    return self.finish_failed_action_with_page_state(
+                        request, &session_id, &page, locator_error(request, error), started,
+                    );
                 }
                 match self.engine_call("page.keyboard.type", json!({ "page": page, "text": text }))
                 {
@@ -2992,8 +3144,9 @@ impl Daemon {
                         )
                     }
                     Err(error) => {
-                        self.finish_session(&session_id);
-                        locator_error(request, error)
+                        self.finish_failed_action_with_page_state(
+                            request, &session_id, &page, locator_error(request, error), started,
+                        )
                     }
                 }
             }
@@ -3001,6 +3154,7 @@ impl Daemon {
     }
 
     fn web_press(&mut self, request: &Request) -> Response {
+        let started = Instant::now();
         let Some(key) = request
             .payload
             .get("key")
@@ -3018,8 +3172,9 @@ impl Daemon {
                         match self.bind_observed_selector(request, &session_id, &page, selector) {
                             Ok(selector) => selector,
                             Err(response) => {
-                                self.finish_session(&session_id);
-                                return response;
+                                return self.finish_failed_action_with_page_state(
+                                    request, &session_id, &page, response, started,
+                                );
                             }
                         };
                     let timeout = request
@@ -3031,8 +3186,9 @@ impl Daemon {
                         "locator.focus",
                         json!({ "page": page, "selector": selector, "timeout": timeout }),
                     ) {
-                        self.finish_session(&session_id);
-                        return locator_error(request, error);
+                        return self.finish_failed_action_with_page_state(
+                            request, &session_id, &page, locator_error(request, error), started,
+                        );
                     }
                 }
                 match self.engine_call("page.keyboard.press", json!({ "page": page, "key": key })) {
@@ -3049,8 +3205,9 @@ impl Daemon {
                         )
                     }
                     Err(error) => {
-                        self.finish_session(&session_id);
-                        locator_error(request, error)
+                        self.finish_failed_action_with_page_state(
+                            request, &session_id, &page, locator_error(request, error), started,
+                        )
                     }
                 }
             }
@@ -3058,6 +3215,7 @@ impl Daemon {
     }
 
     fn web_scroll(&mut self, request: &Request) -> Response {
+        let started = Instant::now();
         if request.payload.get("selector").is_some() {
             return self.web_locator_method(
                 request,
@@ -3115,8 +3273,9 @@ impl Daemon {
                         )
                     }
                     Err(error) => {
-                        self.finish_session(&session_id);
-                        locator_error(request, error)
+                        self.finish_failed_action_with_page_state(
+                            request, &session_id, &page, locator_error(request, error), started,
+                        )
                     }
                 }
             }
@@ -3124,6 +3283,7 @@ impl Daemon {
     }
 
     fn web_upload(&mut self, request: &Request) -> Response {
+        let started = Instant::now();
         let Some(selector) = request.payload.get("selector").cloned() else {
             return protocol_error(request, "web.upload requires selector");
         };
@@ -3161,8 +3321,9 @@ impl Daemon {
                         )
                     }
                     Err(error) => {
-                        self.finish_session(&session_id);
-                        locator_error(request, error)
+                        self.finish_failed_action_with_page_state(
+                            request, &session_id, &page, locator_error(request, error), started,
+                        )
                     }
                 }
             }
@@ -3173,6 +3334,15 @@ impl Daemon {
         &mut self,
         request: &Request,
         operation: &str,
+    ) -> Result<(String, String), Response> {
+        self.with_session_page_until(request, operation, None)
+    }
+
+    fn with_session_page_until(
+        &mut self,
+        request: &Request,
+        operation: &str,
+        deadline: Option<Instant>,
     ) -> Result<(String, String), Response> {
         let session_id = request
             .payload
@@ -3190,6 +3360,9 @@ impl Daemon {
             return Err(missing_session(request, &session_id));
         }
         if !self.content.is_running() {
+            if deadline.is_some() {
+                return Err(engine_error(request, "content worker is unavailable; bounded wait did not restart or replace its document", 33));
+            }
             self.recover_content("content worker exited before session operation")
                 .map_err(|error| engine_error(request, error, 33))?;
         }
@@ -3239,7 +3412,7 @@ impl Daemon {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
                 let _ = session.transition(SessionState::Failed);
-                Some(("limit", message))
+                Some(("wall_limit", message))
             } else if let Err(message) = session.limits.check_content_rss(content_rss) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
@@ -3266,6 +3439,17 @@ impl Daemon {
         });
         match wall_time_error {
             Some(("engine", message)) => return Err(engine_error(request, message, 38)),
+            Some(("wall_limit", message)) if deadline.is_some() => {
+                // Expiring this session's elapsed-time quota says nothing
+                // about the health of the shared worker. A bounded wait must
+                // refuse without replacing other sessions' live documents.
+                // CPU and RSS violations still take the recovery path below.
+                return Err(limit_error(request, message));
+            }
+            Some(("wall_limit", message)) => {
+                let _ = self.recover_content(&format!("wall time exceeded: {message}"));
+                return Err(limit_error(request, message));
+            }
             Some(("limit", message)) => {
                 let _ = self.recover_content(&format!("wall time exceeded: {message}"));
                 return Err(limit_error(request, message));
@@ -3285,6 +3469,10 @@ impl Daemon {
                     {
                         return Err(limit_error(request, message));
                     }
+                }
+                if deadline.is_some() {
+                    self.finish_session(&session_id);
+                    return Err(protocol_error(request, "web.wait requires an existing page; open or select a tab first"));
                 }
                 match self.engine_call("session.ensurePage", json!({})) {
                     Ok(result) => {
@@ -3314,10 +3502,25 @@ impl Daemon {
             .get(&session_id)
             .map(|session| session.profile)
             .unwrap_or(NetworkProfile::Research);
-        if let Err(error) =
+        let profile_result = if let Some(end) = deadline {
+            let remaining = end.saturating_duration_since(Instant::now());
+            let remaining = self.sessions.get(&session_id)
+                .map(|session| remaining.min(session.limits.wall_time.saturating_sub(session.started.elapsed())))
+                .unwrap_or(Duration::ZERO);
+            if remaining < Duration::from_millis(1) {
+                Err("timeout: no remaining wait setup budget".into())
+            } else {
+                self.engine_call_timed_with_recovery("session.setProfile", json!({"profile":profile.as_str()}), remaining, false)
+            }
+        } else {
             self.engine_call("session.setProfile", json!({ "profile": profile.as_str() }))
-        {
+        };
+        if let Err(error) = profile_result {
             self.finish_session(&session_id);
+            if deadline.is_some() {
+                let (code, message, recovery) = crate::wait_contract::wait_error_detail(&error);
+                return Err(Response::error(request, ErrorObject::new(code, message, request.request_id.clone(), 34, recovery)));
+            }
             return Err(engine_error(request, error, 34));
         }
         Ok((session_id, page))
@@ -3482,7 +3685,21 @@ impl Daemon {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
+        self.engine_call_timed_with_recovery(method, params, timeout, true)
+    }
+
+    fn engine_call_timed_with_recovery(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        recover_worker: bool,
+    ) -> Result<serde_json::Value, String> {
+        let started = Instant::now();
         if !self.content.is_running() {
+            if !recover_worker {
+                return Err("content worker is unavailable; observation did not restart it".into());
+            }
             self.recover_content("content worker exited")?;
             return Err(
                 "content worker crashed and was restarted; session pages were reset".into(),
@@ -3499,10 +3716,14 @@ impl Daemon {
             &Message::engine_call(request_id, method.to_owned(), params),
             timeout,
         ) {
-            let _ = self.recover_content(&format!("content send failed: {error}"));
+            if recover_worker {
+                let _ = self.recover_content(&format!("content send failed: {error}"));
+            }
             return Err(error.to_string());
         }
-        let deadline = Instant::now() + timeout;
+        // Diagnostic reads spend one bounded budget across send and receive.
+        // Preserve the existing ordinary-call contract in this scoped change.
+        let deadline = if recover_worker { Instant::now() + timeout } else { started + timeout };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3543,6 +3764,9 @@ impl Daemon {
                 Err(error) => {
                     if error.kind() == io::ErrorKind::TimedOut {
                         if !self.content.is_running() {
+                            if !recover_worker {
+                                return Err("content worker exited during observation; it was not restarted".into());
+                            }
                             self.recover_content("content worker exited while handling request")?;
                             return Err(
                                 "content worker crashed and was restarted; session pages were reset"
@@ -3552,7 +3776,9 @@ impl Daemon {
                         continue;
                     }
                     let message = error.to_string();
-                    let _ = self.recover_content(&format!("content worker: {message}"));
+                    if recover_worker {
+                        let _ = self.recover_content(&format!("content worker: {message}"));
+                    }
                     return Err(message);
                 }
             }
@@ -4043,28 +4269,23 @@ fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -
     )
 }
 
+fn page_state_envelope(observation: Result<serde_json::Value, String>) -> serde_json::Value {
+    match observation {
+        Ok(snapshot) => json!({
+            "schema": "greppy.web.page-state.v1",
+            "status": "available", "snapshot": snapshot,
+        }),
+        Err(error) => json!({
+            "schema": "greppy.web.page-state.v1",
+            "status": "unavailable",
+            "error": {"code": "OBSERVATION_UNAVAILABLE", "message": redact_secrets(&error)},
+        }),
+    }
+}
+
 fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     let message = redact_secrets(&message.into());
-    let (code, next_action) = if message.contains("STALE_REF") {
-        (
-            "STALE_REF",
-            "run greppy web observe again and use a ref from the new snapshot",
-        )
-    } else if message.contains("strict mode") {
-        (
-            "AMBIGUOUS_TARGET",
-            "add --first, --nth N, or narrow the query",
-        )
-    } else if message.contains("timed out") && message.contains("failed_check=attached") {
-        ("NO_MATCH", "observe the page and use a narrower target")
-    } else if message.contains("timed out") {
-        ("TIMEOUT", "wait for the target to become actionable")
-    } else {
-        (
-            "engine_error",
-            "retry the operation or inspect web.doctor",
-        )
-    };
+    let (code, next_action) = recovery_for_locator_error(&message);
     Response::error(
         request,
         ErrorObject::new(
@@ -4913,6 +5134,36 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn missing_target_guidance_differs_from_ambiguous_target_guidance() {
+        let request = super::Request::new("locator-diagnostic", "web.click", json!({}));
+        let missing = super::locator_error(
+            &request, "timed out waiting for actionable locator target (failed_check=attached; count=0)",
+        );
+        assert_eq!(missing.status, "error");
+        let error = missing.error.unwrap();
+        assert_eq!(error.code, "NO_MATCH");
+        assert_eq!(error.exit_code, 34);
+        assert!(!error.retryable);
+        assert!(error.next_action.contains("no target matched"));
+        assert!(!error.next_action.contains("narrow"));
+        let ambiguous = super::locator_error(&request, "strict mode: selector matched 2 nodes");
+        let error = ambiguous.error.unwrap();
+        assert_eq!(error.code, "AMBIGUOUS_TARGET");
+        assert_eq!(error.exit_code, 34);
+        assert!(error.next_action.contains("narrow"));
+    }
+
+    #[test]
+    fn failed_action_observation_cannot_extend_its_request_budget() {
+        use std::time::Duration;
+        assert_eq!(super::failure_observation_budget(30_000, Duration::ZERO), Duration::from_secs(2));
+        assert_eq!(super::failure_observation_budget(1_000, Duration::from_millis(750)), Duration::from_millis(250));
+        assert_eq!(super::failure_observation_budget(1_000, Duration::from_secs(1)), Duration::ZERO);
+        assert_eq!(super::failure_observation_budget(1_000, Duration::from_secs(2)), Duration::ZERO);
+        assert_eq!(super::failure_observation_budget(0, Duration::ZERO), Duration::ZERO);
+    }
 
     #[test]
     fn policy_denial_has_nonretrying_profile_guidance() {

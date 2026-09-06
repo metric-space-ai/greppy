@@ -10,7 +10,7 @@ const source = fs.readFileSync(
   path.join(__dirname, "../js/wait-for-function-runtime.js"), "utf8",
 );
 
-function harness(expression = "ready") {
+function harness(expression = "ready", strictBoolean = false) {
   let nextId = 1;
   let mutation;
   let disconnected = 0;
@@ -44,11 +44,16 @@ function harness(expression = "ready") {
   });
   context.window = context;
   vm.runInContext(source, context);
-  context.greppyWaitForFunction(expression, "scheduler-test", 1000);
+  context.greppyWaitForFunction(expression, "scheduler-test", 1000, strictBoolean);
   return {
     context, frames, deadlines, listeners, notices,
     mutate: () => mutation(),
     disconnected: () => disconnected,
+    expire() {
+      const [id, callback] = Array.from(deadlines)[0];
+      deadlines.delete(id);
+      callback();
+    },
     frame() {
       const pending = Array.from(frames);
       for (const [id, callback] of pending) {
@@ -116,4 +121,48 @@ test("property-only changes are still noticed on the next animation frame", () =
   assert.equal(h.frames.size, 0);
   assert.equal(h.deadlines.size, 0);
   assert.deepEqual(h.notices, ["__greppyWaitDone:scheduler-test:ok"]);
+});
+
+test("Boolean waits reject object truthiness including holds:false", () => {
+  for (const source of ["({holds:false})", "({holds:true})", "'false'", "1", "null", "undefined"]) {
+    const h = harness(source, true);
+    const slot = h.context["__greppyWait_scheduler-test"];
+    assert.equal(slot.status, "error");
+    assert.match(slot.value, /INVALID_WAIT_PREDICATE/);
+    assert.equal(h.frames.size, 0);
+    assert.deepEqual(h.notices, ["__greppyWaitDone:scheduler-test:error"]);
+  }
+});
+
+test("strict Boolean false, absent and AND remain pending until true", () => {
+  for (const expression of ["ready", "!present", "ready && !present"]) {
+    // `present` is introduced by the source itself to start every case false.
+    const initial = expression.replaceAll("present", "!ready");
+    const h = harness(initial, true);
+    assert.equal(h.context["__greppyWait_scheduler-test"].done, 0);
+    h.context.ready = true;
+    h.mutate();
+    assert.equal(h.context["__greppyWait_scheduler-test"].status, "ok");
+    assert.equal(h.context["__greppyWait_scheduler-test"].value, true);
+  }
+});
+
+test("strict source syntax errors return a bounded actionable category", () => {
+  const h = harness("new RegExp('[bad')", true);
+  const slot = h.context["__greppyWait_scheduler-test"];
+  assert.equal(slot.status, "error");
+  assert.equal(slot.value, "INVALID_WAIT_SOURCE: invalid JavaScript predicate or regular expression");
+  assert.equal(h.frames.size, 0);
+});
+
+test("strict waits discard bookkeeping when the caller misses its final read", () => {
+  for (const expression of ["true", "false", "({holds:false})"]) {
+    const h = harness(expression, true);
+    h.expire();
+    assert.equal(h.context["__greppyWait_scheduler-test"], undefined);
+    assert.equal(h.frames.size, 0);
+    assert.equal(h.deadlines.size, 0);
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.notices.length, 1);
+  }
 });

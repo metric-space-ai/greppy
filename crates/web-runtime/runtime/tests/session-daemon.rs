@@ -4236,6 +4236,8 @@ fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
         .strip_prefix('@').unwrap().parse::<u64>().unwrap();
     let tabs = call("web.tab.list", json!({"session_id":session}));
     let target_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"].as_str().unwrap();
+    assert_eq!(went.result.as_ref().unwrap()["tab_id"], target_tab,
+        "implicit navigation must identify its actual native target");
     let new_tab = call("web.tab.new", json!({"session_id":session}));
     assert_eq!(new_tab.status, "ok", "{new_tab:?}");
     // Use the navigation's ref on an explicitly targeted, now inactive tab,
@@ -4244,6 +4246,8 @@ fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
         "selector":{"type":"ref","value":reference}}));
     assert_eq!(clicked.status, "ok", "{clicked:?}");
     let receipt = clicked.result.as_ref().unwrap();
+    assert_eq!(receipt["session_id"], session);
+    assert_eq!(receipt["tab_id"], target_tab, "inactive explicit target must not become active-tab metadata");
     assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
     assert_eq!(receipt["page_state"]["status"], "available");
     assert_eq!(receipt["page_state"]["snapshot"]["title"], "Clicks 1");
@@ -4252,6 +4256,7 @@ fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
         "selector":{"type":"css","value":"#poison"}}));
     assert_eq!(poisoned.status, "ok", "successful click must not be recast as failure: {poisoned:?}");
     let receipt = poisoned.result.as_ref().unwrap();
+    assert_eq!(receipt["tab_id"], target_tab, "observation failure must retain target identity");
     assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
     assert_eq!(receipt["ok"], true);
     assert_eq!(receipt["page_state"]["status"], "unavailable");
@@ -4267,6 +4272,331 @@ fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
     assert_eq!(observed.status, "ok", "temporary observation failure must recover: {observed:?}");
     assert_eq!(observed.result.as_ref().unwrap()["title"], "Recovered");
     assert_eq!(observed.result.as_ref().unwrap()["actionables"][0]["ref"], format!("@{reference}"));
+    let active = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(active.status, "ok", "{active:?}");
+    let active_tab = active.result.as_ref().unwrap()["tab_id"].as_str()
+        .filter(|tab| !tab.is_empty()).expect("implicit action identifies current tab");
+    assert_ne!(active_tab, target_tab, "explicit inactive action must not silently switch active tab");
+}
+
+#[test]
+fn failed_native_actions_return_current_state_without_replay_or_false_success() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before</title></head><body>
+<button class="duplicate" onclick="window.clicks++">Save</button>
+<button class="duplicate" onclick="window.clicks++">Save elsewhere</button>
+<input id="quantity" aria-label="Quantity" disabled><input type="password" value="never-disclose-this">
+<script>window.clicks=0;</script></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-errstate-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_errstate", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_errstate", method, payload), Duration::from_secs(30))
+            .expect("failed-action request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let changed = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"document.title='Changed before error'; document.getElementById('quantity').disabled=false; true"
+    }));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    for (method, extra) in [
+        ("web.click", json!({})), ("web.type", json!({"text":"not typed"})),
+        ("web.press", json!({"key":"Enter"})),
+    ] {
+        let mut payload = json!({"session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100});
+        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let missing = call(method, payload);
+        assert_eq!(missing.status, "error", "{missing:?}");
+        let error = missing.error.as_ref().unwrap();
+        assert_eq!(error.code, "NO_MATCH", "{missing:?}");
+        assert_eq!(error.exit_code, 34);
+        assert!(!error.next_action.contains("narrow"));
+        let state = &missing.result.as_ref().unwrap()["page_state"];
+        assert_eq!(missing.result.as_ref().unwrap()["tab_id"], went.result.as_ref().unwrap()["tab_id"],
+            "failed action diagnostic must identify its resolved target");
+        assert_eq!(state["status"], "available", "{missing:?}");
+        assert_eq!(state["snapshot"]["title"], "Changed before error", "must not reuse the old goto snapshot");
+        assert!(state["snapshot"]["actionables"].as_array().unwrap().iter()
+            .any(|node| node["name"] == "Quantity" && node["disabled"] == false));
+        assert!(!serde_json::to_string(&missing).unwrap().contains("never-disclose-this"));
+    }
+    let ambiguous = call("web.click", json!({
+        "session_id":session,"selector":{"type":"css","value":".duplicate"},"timeout":100
+    }));
+    assert_eq!(ambiguous.status, "error", "{ambiguous:?}");
+    assert_eq!(ambiguous.error.as_ref().unwrap().code, "AMBIGUOUS_TARGET");
+    assert_eq!(ambiguous.result.as_ref().unwrap()["page_state"]["status"], "available");
+    let poisoned = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"
+    }));
+    assert_eq!(poisoned.status, "ok");
+    let missing = call("web.click", json!({
+        "session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100
+    }));
+    assert_eq!(missing.status, "error");
+    assert_eq!(missing.error.as_ref().unwrap().code, "NO_MATCH");
+    assert_eq!(missing.error.as_ref().unwrap().exit_code, 34);
+    assert_eq!(missing.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
+    let clicks = call("web.evaluate", json!({"session_id":session,"source":"window.clicks"}));
+    assert_eq!(clicks.status, "ok", "{clicks:?}");
+    assert_eq!(clicks.result.as_ref().unwrap()["value"].as_f64(), Some(0.0), "no failed action may be replayed");
+}
+
+#[test]
+fn select_option_refuses_unknown_values_without_mutation_or_false_success() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-select-option-{}.sock",
+        std::process::id()
+    ));
+    let (path, source) = fixture_source("select-option-contract.mjs");
+    let _guard = Supervisor::spawn(&socket, "run_select_option", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_select_option",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before wait</title></head>
+<body><input id="ready" aria-label="Quantity" disabled><input type="password" value="wait-secret"></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-wait-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_wait", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_wait", method, payload), Duration::from_secs(30))
+            .expect("Boolean wait request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    for (source, code) in [
+        ("({holds:false,detail:'not ready'})", "INVALID_WAIT_PREDICATE"),
+        ("new RegExp('[bad')", "INVALID_WAIT_SOURCE"),
+        ("(() => {throw new Error('STALE_REF: replaced node')})()", "STALE_REF"),
+        ("false", "TIMEOUT"),
+    ] {
+        let response = call("web.wait", json!({"session_id":session,"source":source,"timeout_ms":250}));
+        assert_eq!(response.status, "error", "{response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
+        assert!(!serde_json::to_string(&response).unwrap().contains("JavaScriptErrorInfo"));
+    }
+    // No DOM-mutation signal is required for the property-only disabled change.
+    let changed = call("web.evaluate", json!({"session_id":session,"source":
+        "setTimeout(() => { document.getElementById('ready').disabled=false; document.title='After wait'; },50); true"}));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    let held = call("web.wait", json!({"session_id":session,"source":
+        "!document.getElementById('ready').disabled && !document.querySelector('#absent')","timeout_ms":2000}));
+    assert_eq!(held.status, "ok", "{held:?}");
+    let result = held.result.as_ref().unwrap();
+    assert_eq!(result["held"], true);
+    assert_eq!(result["session_id"], session);
+    assert!(result["tab_id"].as_str().is_some());
+    assert!(result["document_id"].as_str().is_some());
+    assert_eq!(result["page_state"]["status"], "available", "{held:?}");
+    assert_eq!(result["page_state"]["snapshot"]["title"], "After wait");
+    assert!(!serde_json::to_string(&held).unwrap().contains("wait-secret"));
+    let poisoned = call("web.evaluate", json!({"session_id":session,"source":
+        "Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"}));
+    assert_eq!(poisoned.status, "ok");
+    let held = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    assert_eq!(held.status, "ok", "{held:?}");
+    assert_eq!(held.result.as_ref().unwrap()["held"], true);
+    assert_eq!(held.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
+    assert!(held.result.as_ref().unwrap()["document_id"].is_null());
+    let zero = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":0}));
+    assert_eq!(zero.status, "error");
+    assert_eq!(zero.error.as_ref().unwrap().code, "TIMEOUT");
+}
+
+#[test]
+fn native_boolean_wait_rebinds_after_navigation_and_same_url_reload() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Navigation wait</title>
+<script>
+const loads = Number(sessionStorage.getItem('wait-loads') || 0) + 1;
+sessionStorage.setItem('wait-loads', String(loads));
+window.waitDocumentLoad = loads;
+</script></head><body>Navigation witness</body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-wait-nav-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_wait_nav", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_wait_nav", method, payload), Duration::from_secs(30))
+            .expect("navigation wait request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let before = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    assert_eq!(before.status, "ok", "{before:?}");
+    // Schedule from the first predicate sample: the navigation must occur
+    // while this very wait is pending, never between two test RPCs.
+    let navigated = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":
+        "(() => { if (location.search === '?wait-landed') return true; if (!window.waitNavScheduled) { window.waitNavScheduled = true; setTimeout(() => { location.search = '?wait-landed'; }, 50); } return false; })()"}));
+    assert_eq!(navigated.status, "ok", "{navigated:?}");
+    assert_eq!(navigated.result.as_ref().unwrap()["held"], true);
+    assert_ne!(before.result.as_ref().unwrap()["document_id"], navigated.result.as_ref().unwrap()["document_id"]);
+    let current = call("web.evaluate", json!({"session_id":session,"source":"window.waitDocumentLoad"}));
+    assert_eq!(current.status, "ok", "{current:?}");
+    // JavaScript Number is encoded as serde's f64, including integral values.
+    let loads = current.result.as_ref().unwrap()["value"].as_f64()
+        .unwrap_or_else(|| panic!("numeric document load counter: {current:?}"));
+    assert!(loads.is_finite() && loads.fract() == 0.0 && loads >= 2.0,
+        "both initial and navigated documents must have loaded: {current:?}");
+    let reloaded = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":format!(
+        "(() => {{ if (window.waitDocumentLoad > {loads}) return true; if (!window.waitReloadScheduled) {{ window.waitReloadScheduled = true; setTimeout(() => location.reload(), 50); }} return false; }})()"
+    )}));
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    assert_eq!(reloaded.result.as_ref().unwrap()["held"], true);
+    assert_ne!(navigated.result.as_ref().unwrap()["document_id"], reloaded.result.as_ref().unwrap()["document_id"]);
+}
+
+#[test]
+fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><p id='witness'>survived</p></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!("greppy-wait-limit-{}.sock", std::process::id()));
+    let supervisor = Supervisor::spawn(&socket, "run_wait_limit", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_wait_limit", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("bounded wait resource-limit request")
+    };
+    let healthy = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(healthy.status, "ok", "{healthy:?}");
+    let session = healthy.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let before = call("web.wait", json!({
+        "session_id":session,"source":"true","timeout_ms":2000,
+    }));
+    assert_eq!(before.status, "ok", "{before:?}");
+    let before = before.result.as_ref().unwrap();
+    let tab = before["tab_id"].as_str().unwrap();
+    let document = before["document_id"].as_str().unwrap();
+    let worker = content_worker_pid(supervisor.child.id()).expect("healthy content worker");
+
+    let expired = call("web.session.create", json!({
+        "profile":"project","limits":{"wall_ms":20},
+    }));
+    assert_eq!(expired.status, "ok", "{expired:?}");
+    let expired = expired.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    // Deliberately expire the fixture's quota, not a browser-readiness workaround.
+    thread::sleep(Duration::from_millis(80));
+    let rejected = call("web.wait", json!({
+        "session_id":expired,"source":"true","timeout_ms":2000,
+    }));
+    assert_eq!(rejected.status, "error", "{rejected:?}");
+    assert_eq!(rejected.error.as_ref().unwrap().code, "resource_limit");
+    assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
+    assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
+
+    let after = call("web.wait", json!({
+        "session_id":session,"tab_id":tab,"timeout_ms":2000,
+        "source":"document.querySelector('#witness')?.textContent === 'survived'",
+    }));
+    assert_eq!(after.status, "ok", "{after:?}");
+    let after = after.result.as_ref().unwrap();
+    assert_eq!(after["held"], true);
+    assert_eq!(after["tab_id"], tab);
+    assert_eq!(after["document_id"], document);
+}
+
+#[test]
+fn ref_conditions_preserve_identity_and_never_confirm_stale_absence() {
+    let fixture = serve_fixture("<!doctype html><html><body><input id='choice' aria-label='Choice'></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-ref-condition-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_ref_condition", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_ref_condition", method, payload), Duration::from_secs(30)).unwrap()
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    let observe = || {
+        let response = call("web.observe", json!({"session_id":session}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["actionables"][0]["ref"].as_str().unwrap()
+            .strip_prefix('@').unwrap().parse::<u64>().unwrap()
+    };
+    let original = observe();
+    for operation in ["web.evaluate", "web.wait"] {
+        let source = if operation == "web.wait" { "__greppyConditionNodes.length === 1" }
+            else { "({holds: __greppyConditionNodes.length === 1})" };
+        let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":original},"source":source,"timeout_ms":2000}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        let result = response.result.unwrap();
+        let confirmed = if operation == "web.wait" { &result["held"] } else { &result["value"]["holds"] };
+        assert_eq!(confirmed.as_bool(), Some(true));
+    }
+    let assert_stale = |session: &str, reference: u64| {
+        for operation in ["web.evaluate", "web.wait"] {
+            // Exactly the inverse/presence expression used for --absent. A
+            // missing identity must throw before this can produce true.
+            let source = if operation == "web.wait" { "__greppyConditionNodes.length === 0" }
+                else { "({holds: __greppyConditionNodes.length === 0})" };
+            let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":reference},"source":source,"timeout_ms":1000}));
+            assert_eq!(response.status, "error", "{response:?}");
+            assert_eq!(response.error.as_ref().unwrap().code, "STALE_REF", "{response:?}");
+            assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
+        }
+    };
+    // Trigger replacement from the first predicate sample, not before the
+    // wait starts: subsequent samples must revalidate identity, not cache it.
+    let replaced_during_wait = call("web.wait", json!({
+        "session_id":session,"condition_ref":{"type":"ref","value":original},
+        "source":"(function(){ if (!window.refReplacementScheduled) { window.refReplacementScheduled = true; setTimeout(() => { const old = document.getElementById('choice'); old.replaceWith(old.cloneNode(true)); }, 50); } return __greppyConditionNodes.length === 0; })()",
+        "timeout_ms":2000,
+    }));
+    assert_eq!(replaced_during_wait.error.as_ref().unwrap().code, "STALE_REF", "{replaced_during_wait:?}");
+    assert_stale(session, original);
+    let replacement = observe();
+    assert_ne!(replacement, original);
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other = other.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    assert_eq!(call("web.goto", json!({"session_id":other,"url":fixture})).status, "ok");
+    assert_eq!(call("web.observe", json!({"session_id":other})).status, "ok");
+    assert_stale(other, replacement);
+    assert_eq!(call("web.evaluate", json!({"session_id":session,"source":"document.getElementById('choice').remove(); true"})).status, "ok");
+    assert_stale(session, replacement);
+    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    let after_navigation = observe();
+    assert_ne!(after_navigation, replacement);
+    assert_stale(session, replacement);
+    let still_usable = call("web.wait", json!({"session_id":session,"condition_ref":{"type":"ref","value":after_navigation},"source":"__greppyConditionNodes.length === 1","timeout_ms":2000}));
+    assert_eq!(still_usable.status, "ok", "{still_usable:?}");
 }
 
 #[test]

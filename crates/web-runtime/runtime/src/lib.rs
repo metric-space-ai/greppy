@@ -8,6 +8,8 @@ pub mod daemon;
 pub mod limits;
 pub mod linux_sandbox;
 mod observed_refs;
+mod locator_diagnostics;
+mod wait_contract;
 pub mod policy;
 pub mod profile_lock;
 pub mod policy_proxy;

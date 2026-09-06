@@ -3,7 +3,14 @@
 Implementation status: in progress; not a release acceptance claim.
 
 Successful native navigation and user-input actions retain their existing
-result fields and add `result.page_state`:
+result fields and add `result.page_state`. Their `result.session_id` and
+`result.tab_id` identify the actual resolved native target even when the caller
+omitted a tab. Diagnostic failed-action snapshots carry these IDs too. An
+observation failure does not erase target identity; no extra lookup/RPC is
+needed. Consumers must not treat a missing tab or an equal URL as proof that
+two observations belong to the same page.
+
+The page-state envelope is:
 
 ```json
 {
@@ -48,6 +55,17 @@ must be redacted. An action that itself failed retains its original nonzero
 error contract; this envelope must not turn it into a successful action.
 Read-only inspection and explicitly requested script results keep their own
 contracts rather than silently performing another observation.
+
+Failed locator/input actions with `NO_MATCH`, `AMBIGUOUS_TARGET`, `STALE_REF`
+or `TIMEOUT` also attempt one diagnostic `result.page_state`. The response
+remains `status=error` with its original error and nonzero exit code. An
+`available` snapshot describes the current page, not a successful action.
+The read is capped at two seconds, the remaining request deadline and the
+remaining session budget; it cannot start/restart a worker or replay an action.
+If no budget remains or observation fails, report `unavailable` while retaining
+the original error. Failed read-only inspection does not add this observation.
+Null-match guidance suggests choosing an existing target or waiting for it;
+it must not recommend narrowing a query which already matched nothing.
 
 ## Reference identity
 
