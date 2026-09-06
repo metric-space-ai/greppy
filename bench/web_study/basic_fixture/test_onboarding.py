@@ -71,3 +71,17 @@ def test_native_wait_documentation_is_generic_and_preserves_previous_conditions(
         assert 'Choose your own targets and conditions.' in after
         for solution in ('#inventory', '#reservation', 'Ember', 'ascending', '--absent'):
             assert solution not in after
+
+
+@pytest.mark.parametrize('case', sorted(TASKS))
+def test_workflow_condition_preserves_standard_arm_and_no_solution(case):
+    from onboarding import WORKFLOW_BROWSER_CONDITION
+    assert participant_message(trial('A', case), WORKFLOW_BROWSER_CONDITION) == participant_message(
+        trial('A', case), COORDINATED_BROWSER_CONDITION)
+    message = participant_message(trial('C', case), WORKFLOW_BROWSER_CONDITION)
+    assert message.startswith(participant_message(trial('C', case), COORDINATED_BROWSER_CONDITION))
+    for fact in ('web do --native', '--expect QUERY', 'retains earlier effects',
+                 'not visibility', 'web do --json --native', 'full archived state'):
+        assert fact in message
+    for solution in ('#inventory', '#reservation', 'Ember', 'ascending', 'css=dialog[open]'):
+        assert solution not in message

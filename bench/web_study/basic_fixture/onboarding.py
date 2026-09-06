@@ -12,8 +12,9 @@ CURRENT_BROWSER_CONDITION = 'browser_plugin_transport_v2'
 SYNTHETIC_BROWSER_CONDITION = 'browser_plugin_synthetic_v3'
 COORDINATED_BROWSER_CONDITION = 'browser_plugin_coordinated_v4'
 NATIVE_WAIT_BROWSER_CONDITION = 'browser_plugin_native_wait_v5'
+WORKFLOW_BROWSER_CONDITION = 'browser_plugin_workflow_v6'
 CONDITIONS = (CONDITION, CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION,
-              COORDINATED_BROWSER_CONDITION, NATIVE_WAIT_BROWSER_CONDITION)
+              COORDINATED_BROWSER_CONDITION, NATIVE_WAIT_BROWSER_CONDITION, WORKFLOW_BROWSER_CONDITION)
 COMMON = (
     'Work only through the visible browser UI and documented browser APIs. '
     'Do not read fixture source, host state files or application APIs. '
@@ -24,6 +25,21 @@ COMMON = (
 
 
 def participant_message(trial, condition=CONDITION):
+    if condition == WORKFLOW_BROWSER_CONDITION:
+        message = participant_message(trial, COORDINATED_BROWSER_CONDITION)
+        if trial["arm"] == "C":
+            message += (
+                "\n\nAvailable Greppy capabilities: `web do --native ACTION ... :: ACTION ...` "
+                "executes known navigation/action/wait steps in one runtime request. "
+                "An action may use `--expect QUERY --expect-timeout MS` to return after "
+                "the stated condition holds; without an expectation its receipt does not prove a business outcome. "
+                "Conditions test DOM presence, URL or title, not visibility. "
+                "The chain stops at a failed step and retains earlier effects; do not replay completed mutations. "
+                "Place chain-wide flags before its first step, e.g. `web do --json --native ...`. "
+                "The compact view foregrounds an active modal and offers a continuation for the full archived state. "
+                "Choose your own targets, conditions and decision points."
+            )
+        return message
     if condition == NATIVE_WAIT_BROWSER_CONDITION:
         message = participant_message(trial, COORDINATED_BROWSER_CONDITION)
         if trial['arm'] == 'C':
