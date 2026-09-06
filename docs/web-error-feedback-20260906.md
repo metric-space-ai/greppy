@@ -90,3 +90,28 @@ worker's guarded native build was refused before spawn for insufficient temporar
 disk space. No guidance integration pass is claimed. Next empirical work must
 address modal scope and intermediate post-action state, documented separately in
 `web-modal-feedback-20260906.md`, then measure actual Luna input and output tokens.
+
+## Native guidance integration now verified
+
+The worker subsequently completed the guarded build and both actual native tests
+at 972ebdb7. Ref identity/no-toggle/current-guidance and strict Boolean wait each
+pass 1/1; raw logs confirm harness reaped=true. Runtime SHA256:
+`a7366cfe7d5f61f01e5c9605b6296361dc33a681f4e1447f2eb30940031c9441`.
+Acceptance and source-bound receipts are under
+`/Volumes/tmp/dev-artifacts/greppy/native-guidance-candidate.08TDRS/ACCEPTANCE.md`,
+with capture directories 4vxy5l8_, u_8wj29r, nvfsd8cs named there. GL texture diagnostics
+remain recorded; these are not screenshot/rendering acceptance tests.
+
+Root verified the create-only candidate copy and ran probe07 with c18870 CLI,
+this runtime and `--require-current-guidance`. Exit0, all feedback gates PASS,
+independent oracle 5/5, rejected actions unchanged, candidate/fixture integrity and
+runtime/HTTP cleanup PASS. Response 2527 bytes includes the new current-state
+recovery instruction; this is not a new Luna token measurement. Probe06 remains
+the prior compact-formatter-only checkpoint; no historical receipt is rewritten.
+
+Of 36 captured source files, 35 match Root byte-for-byte; the only difference is
+CLI common.rs. Captured native sources match, but this is still a worker-built
+debug runtime and selected-source comparison, not a clean Root full-suite build.
+Evidence: `/Users/michaelwelsch/.local/state/greppy-web-study/error-feedback-20260906-07`.
+The earlier native-guidance integration gate is now passed for this candidate;
+modal structure, action expectations, broader Luna trials and release gates remain.
