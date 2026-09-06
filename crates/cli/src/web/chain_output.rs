@@ -209,7 +209,7 @@ fn only_keys(value: &Value, keys: &[&str]) -> bool {
 fn automatic(verb: &str, payload: &Value) -> bool {
     if ![
         "open", "goto", "back", "forward", "reload", "click", "fill", "type", "clear", "select",
-        "check", "uncheck", "press", "hover", "scroll", "upload",
+        "check", "uncheck", "press", "hover", "scroll", "upload", "wait",
     ]
     .contains(&verb)
     {
@@ -244,21 +244,44 @@ fn automatic(verb: &str, payload: &Value) -> bool {
         return false;
     }
     let result = &payload["result"];
-    if result["ok"] != true
-        || !only_keys(
-            result,
-            &[
-                "ok",
-                "dispatch",
-                "session_id",
-                "tab_id",
-                "url",
-                "status",
-                "untrusted_content_boundary",
-                "page_state",
-            ],
-        )
-    {
+    let valid_result = if verb == "wait" {
+        result["held"] == true
+            && result["wait_backend"] == "native_v1"
+            && ["session_id", "tab_id", "document_id"]
+                .iter()
+                .all(|key| result[*key].as_str().is_some_and(|id| !id.is_empty()))
+            && result["waited_ms"].as_u64().is_some()
+            && only_keys(
+                result,
+                &[
+                    "session_id",
+                    "tab_id",
+                    "document_id",
+                    "held",
+                    "waited_ms",
+                    "detail",
+                    "wait_backend",
+                    "page_state",
+                    "untrusted_content_boundary",
+                ],
+            )
+    } else {
+        result["ok"] == true
+            && only_keys(
+                result,
+                &[
+                    "ok",
+                    "dispatch",
+                    "session_id",
+                    "tab_id",
+                    "url",
+                    "status",
+                    "untrusted_content_boundary",
+                    "page_state",
+                ],
+            )
+    };
+    if !valid_result {
         return false;
     }
     if !result["status"].is_null()
@@ -325,6 +348,7 @@ fn automatic(verb: &str, payload: &Value) -> bool {
                 "selected_options_truncated",
                 "value_redacted",
                 "value_truncated",
+                "select_choices",
             ],
         ) && [
             "invalid",
@@ -334,6 +358,17 @@ fn automatic(verb: &str, payload: &Value) -> bool {
         ]
         .iter()
         .all(|key| control[*key].is_null() || control[*key] == false)
+            && (control["select_choices"].is_null()
+                || (super::view::compact_select_choices(&control["select_choices"]).is_some()
+                    && control["select_choices"]["choices_truncated"] == false
+                    && control["select_choices"]["choices"]
+                        .as_array()
+                        .is_some_and(|choices| {
+                            choices.iter().all(|choice| {
+                                choice["value_truncated"] == false
+                                    && choice["label_truncated"] == false
+                            })
+                        })))
     })
 }
 
@@ -360,7 +395,11 @@ pub(super) fn capture(json_out: bool, payload: &Value, scope: &Scope) -> Result<
             let consistent = receipt_session
                 .is_none_or(|session| scope.session.as_deref() == Some(session))
                 && receipt_tab.is_none_or(|tab| scope.tab.as_deref() == Some(tab));
-            if consistent && scope.session.is_some() && bytes <= HISTORY_LIMIT {
+            if consistent
+                && scope.session.as_deref().is_some_and(|id| !id.is_empty())
+                && scope.tab.as_deref().is_some_and(|id| !id.is_empty())
+                && bytes <= HISTORY_LIMIT
+            {
                 if buffer.bytes + bytes > HISTORY_LIMIT
                     || buffer
                         .batch
@@ -377,17 +416,26 @@ pub(super) fn capture(json_out: bool, payload: &Value, scope: &Scope) -> Result<
                     payload: payload.clone(),
                 };
                 buffer.push(reply, bytes);
+                if buffer.verb == "wait" {
+                    // The native wait observed this exact session/tab after its
+                    // predicate held. Archive the preceding automatic states,
+                    // but emit the full wait receipt now: a later action must
+                    // never hide the explicit condition result in history.
+                    buffer.flush()?;
+                    buffer.deferred = false;
+                }
                 return Ok(true);
             }
         }
         buffer.deferred = false;
-        // Successful waits report their own condition. They do not replace the
-        // pending observation; its step label still states when it was taken.
+        // Legacy waits without a fresh native page-state receipt cannot replace
+        // an observation. Their condition result remains explicit.
         let held_wait = !json_out
             && buffer.verb == "wait"
             && payload["operation"] == "web.wait"
             && payload["status"] == "ok"
             && payload["result"]["held"] == true
+            && payload["result"]["page_state"].is_null()
             && payload["error"].is_null();
         if !held_wait {
             buffer.flush()?;
@@ -420,6 +468,138 @@ mod tests {
     fn take(mut guard: Guard) -> Buffer {
         guard.active = false;
         ACTIVE.with(|slot| slot.borrow_mut().take().unwrap())
+    }
+
+    fn native_wait() -> Value {
+        let mut payload = action(2);
+        payload["operation"] = json!("web.wait");
+        let state = payload["result"]["page_state"].clone();
+        payload["result"] = json!({"session_id":"session-a", "tab_id":"tab-a",
+            "document_id":"document-current", "held":true, "waited_ms":7,
+            "wait_backend":"native_v1", "detail":null, "page_state":state});
+        payload
+    }
+
+    #[test]
+    fn native_wait_emits_current_state_and_archives_only_earlier_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = start(true, dir.path().into()).unwrap();
+        guard.step(1, "click");
+        let earlier = action(1);
+        assert!(capture(false, &earlier, &scope()).unwrap());
+        guard.step(2, "wait");
+        let wait = native_wait();
+        assert!(automatic("wait", &wait));
+        assert!(capture(false, &wait, &scope()).unwrap());
+        assert!(!guard.deferred());
+        assert!(
+            take(guard).batch.last.is_none(),
+            "wait must not linger behind later actions"
+        );
+        let paths: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&paths[0]).unwrap()).unwrap();
+        let records: Vec<Value> = serde_json::from_str(saved["body"].as_str().unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["payload"], earlier);
+        let shown = super::super::view::render(&wait, scope(), dir.path()).unwrap();
+        assert!(shown.contains("state 2") && !shown.contains("state 1"));
+        assert!(shown.contains("\"held\":true") && shown.contains("\"waited_ms\":7"));
+    }
+
+    #[test]
+    fn native_wait_errors_unknown_data_and_scope_mismatch_do_not_replace_history() {
+        let base = native_wait();
+        for (path, replacement) in [
+            (vec!["status"], json!("error")),
+            (vec!["result", "held"], json!(false)),
+            (vec!["result", "wait_backend"], json!("future_v2")),
+            (vec!["result", "future_detail"], json!(false)),
+            (vec!["result", "page_state", "status"], json!("unavailable")),
+            (
+                vec!["result", "page_state", "snapshot", "refs_truncated"],
+                json!(true),
+            ),
+        ] {
+            let mut changed = base.clone();
+            let mut field = &mut changed;
+            for key in path {
+                field = &mut field[key];
+            }
+            *field = replacement;
+            assert!(!automatic("wait", &changed));
+        }
+        for key in ["session_id", "tab_id"] {
+            let dir = tempfile::tempdir().unwrap();
+            let guard = start(true, dir.path().into()).unwrap();
+            guard.step(1, "click");
+            assert!(capture(false, &action(1), &scope()).unwrap());
+            guard.step(2, "wait");
+            let mut changed = base.clone();
+            changed["result"][key] = json!("other");
+            assert!(!capture(false, &changed, &scope()).unwrap());
+            assert!(take(guard).batch.last.is_none());
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "scope mismatch must show, not archive, the previous state"
+            );
+        }
+        for key in ["session_id", "tab_id", "document_id"] {
+            let mut changed = base.clone();
+            changed["result"][key] = json!("");
+            assert!(
+                !automatic("wait", &changed),
+                "empty {key} is not an identity"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_action_tab_is_never_treated_as_a_shared_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = start(true, dir.path().into()).unwrap();
+        let unknown_tab = Scope {
+            session: scope().session,
+            tab: None,
+        };
+        for step in 1..=2 {
+            guard.step(step, "click");
+            assert!(!capture(false, &action(step), &unknown_tab).unwrap());
+            assert!(!guard.deferred());
+        }
+        assert!(take(guard).batch.last.is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn known_complete_select_choices_coalesce_but_truncated_or_unknown_do_not() {
+        let mut payload = action(1);
+        payload["result"]["page_state"]["snapshot"]["actionables"][0]["select_choices"] = json!({
+            "schema":"greppy.web.select-choices.v1", "choices_total":1, "choices_truncated":false,
+            "choices":[{"value":"", "label":"Empty", "disabled":true,
+                "value_truncated":false, "label_truncated":false}]});
+        assert!(automatic("click", &payload));
+        for (path, replacement) in [
+            (vec!["schema"], json!("greppy.web.select-choices.v99")),
+            (vec!["future_flag"], json!(false)),
+            (vec!["choices_truncated"], json!(true)),
+        ] {
+            let mut changed = payload.clone();
+            let mut value = &mut changed["result"]["page_state"]["snapshot"]["actionables"][0]
+                ["select_choices"];
+            for key in path {
+                value = &mut value[key];
+            }
+            *value = replacement;
+            assert!(!automatic("click", &changed));
+        }
+        payload["result"]["page_state"]["snapshot"]["actionables"][0]["select_choices"]
+            ["choices"][0]["label_truncated"] = json!(true);
+        assert!(!automatic("click", &payload));
     }
 
     #[test]

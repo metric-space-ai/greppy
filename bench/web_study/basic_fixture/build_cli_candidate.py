@@ -18,7 +18,7 @@ SOURCE_FILES = ['Cargo.toml', 'Cargo.lock', 'crates/cli/src/web/common.rs',
                 'crates/web-client/src/lib.rs', 'crates/web-client/src/describe-node.js']
 
 
-def build(root, artifacts, timeout):
+def build(root, artifacts, timeout, test_web=False):
     assert Path('/Volumes/tmp').is_mount() and artifacts.resolve().is_relative_to(Path('/Volumes/tmp'))
     assert timeout > 0
     evidence = Path(tempfile.mkdtemp(prefix='cli-guarded-', dir=artifacts))
@@ -30,7 +30,11 @@ def build(root, artifacts, timeout):
     env.update(CI='1', CARGO_BUILD_JOBS='1', CARGO_INCREMENTAL='0',
                CARGO_TARGET_DIR=str(artifacts / 'target'), TMPDIR=str(artifacts / 'tmp'))
     argv = ['cargo', 'build', '-p', 'greppy', '--features', 'ci-test-assets', '--bin', 'greppy', '-j', '1']
+    if test_web:
+        argv = ['cargo', 'test', '-p', 'greppy', '--features', 'ci-test-assets', '--lib',
+                '-j', '1', 'web::', '--', '--test-threads=1']
     receipt = dict(argv=argv, cwd=str(root), head=head, source_before=before,
+                   kind='web_unit_tests' if test_web else 'cli_build',
                    evidence=str(evidence), guard_seconds=timeout, guard_free_bytes=2 * 1024**3,
                    scope='debug CLI test-assets candidate; listed source hashes and HEAD; not all external assets/libraries or native runtime acceptance')
     assert shutil.disk_usage('/Volumes/tmp').free > receipt['guard_free_bytes']
@@ -61,7 +65,7 @@ def build(root, artifacts, timeout):
         code = process.wait()
     receipt.update(exit_code=code, stopped=stopped, wall_seconds=time.monotonic() - start,
                    source_unchanged=before == hashes())
-    if code == 0 and receipt['source_unchanged']:
+    if code == 0 and receipt['source_unchanged'] and not test_web:
         binary = artifacts / 'target/debug/greppy'
         frozen = evidence / 'greppy'
         shutil.copy2(binary, frozen)
@@ -79,5 +83,6 @@ if __name__ == '__main__':
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--artifacts', type=Path, required=True)
     p.add_argument('--timeout', type=int, default=240)
+    p.add_argument('--test-web', action='store_true', help='Run compiled CLI web unit tests; do not publish a CLI candidate')
     a = p.parse_args()
-    raise SystemExit(build(a.root.resolve(), a.artifacts.resolve(), a.timeout))
+    raise SystemExit(build(a.root.resolve(), a.artifacts.resolve(), a.timeout, a.test_web))

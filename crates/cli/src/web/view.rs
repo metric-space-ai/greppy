@@ -83,6 +83,71 @@ fn v2_presentation_default(key: &str, value: &Value) -> bool {
     }
 }
 
+/// Compact only the complete, known projection grammar. Unknown versions,
+/// fields or malformed records are rendered verbatim by the caller.
+pub(super) fn compact_select_choices(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if value["schema"] != "greppy.web.select-choices.v1"
+        || object.keys().any(|key| {
+            !["schema", "choices", "choices_total", "choices_truncated"].contains(&key.as_str())
+        })
+    {
+        return None;
+    }
+    let choices = value["choices"].as_array()?;
+    let total = value["choices_total"].as_u64()?;
+    let truncated = value["choices_truncated"].as_bool()?;
+    if choices.len() > 8
+        || total < choices.len() as u64
+        || truncated != (total > choices.len() as u64)
+    {
+        return None;
+    }
+    let mut rendered = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let fields = choice.as_object()?;
+        if fields.keys().any(|key| {
+            ![
+                "value",
+                "label",
+                "disabled",
+                "value_truncated",
+                "label_truncated",
+            ]
+            .contains(&key.as_str())
+        }) {
+            return None;
+        }
+        let value_truncated = choice["value_truncated"].as_bool()?;
+        let label_truncated = choice["label_truncated"].as_bool()?;
+        let disabled = choice["disabled"].as_bool()?;
+        if !(if value_truncated {
+            choice["value"].is_null()
+        } else {
+            choice["value"].is_string()
+        }) || !choice["label"].is_string()
+        {
+            return None;
+        }
+        let mut compact = json!({"value":choice["value"], "label":choice["label"]});
+        for (key, flag) in [
+            ("disabled", disabled),
+            ("value_truncated", value_truncated),
+            ("label_truncated", label_truncated),
+        ] {
+            if flag {
+                compact[key] = json!(true);
+            }
+        }
+        rendered.push(compact);
+    }
+    let mut compact = json!({"choices":rendered, "choices_total":total});
+    if truncated {
+        compact["choices_truncated"] = json!(true);
+    }
+    Some(compact)
+}
+
 fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
     let receipt = payload
         .get("result")
@@ -239,6 +304,12 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
             // Preserve newly introduced state fields without requiring a formatter release.
             if let Some(obj) = a.as_object() {
                 for (key, value) in obj {
+                    if actionable_v2 && key == "select_choices" {
+                        if let Some(compact) = compact_select_choices(value) {
+                            body.push_str(&format!(" {}={compact}", quote(key)));
+                            continue;
+                        }
+                    }
                     if ![
                         "ref", "role", "tag", "name", "text", "value", "type", "checked",
                         "selected", "disabled", "expanded", "invalid", "href",
@@ -654,6 +725,75 @@ mod tests {
     }
 
     #[test]
+    fn known_select_choices_compact_only_defaults_and_preserve_decision_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut payload = observed("Sort order");
+        payload["result"]["actionable_schema"] = json!("greppy.web.actionable.v2");
+        payload["result"]["actionables"][0]["select_choices"] = json!({
+        "schema":"greppy.web.select-choices.v1", "choices_total":4, "choices_truncated":true,
+        "choices":[
+            {"value":"", "label":"Default", "disabled":false, "value_truncated":false, "label_truncated":false},
+            {"value":"descending", "label":"High to low", "disabled":true, "value_truncated":false, "label_truncated":false},
+            {"value":null, "label":"Long…", "disabled":false, "value_truncated":true, "label_truncated":true}
+        ]});
+        let before = payload.clone();
+        let output = render(&payload, scope(), tmp.path()).unwrap();
+        for expected in [
+            "\"value\":\"\"",
+            "\"label\":\"Default\"",
+            "\"value\":\"descending\"",
+            "\"disabled\":true",
+            "\"value\":null",
+            "\"value_truncated\":true",
+            "\"label_truncated\":true",
+            "\"choices_total\":4",
+            "\"choices_truncated\":true",
+        ] {
+            assert!(output.contains(expected), "lost {expected}: {output}");
+        }
+        for omitted in [
+            "greppy.web.select-choices.v1",
+            "\"disabled\":false",
+            "\"value_truncated\":false",
+            "\"label_truncated\":false",
+        ] {
+            assert!(!output.contains(omitted), "redundant {omitted}: {output}");
+        }
+        assert_eq!(payload, before, "machine data must remain untouched");
+        assert!(output.contains(OPEN) && output.contains(CLOSE));
+    }
+
+    #[test]
+    fn unknown_select_choices_and_redaction_fields_are_preserved_verbatim() {
+        let mut choices = json!({"schema":"greppy.web.select-choices.v1",
+            "choices":[], "choices_total":0, "choices_truncated":false});
+        assert!(compact_select_choices(&choices).is_some());
+        for (key, value) in [
+            ("schema", json!("greppy.web.select-choices.v99")),
+            ("value_redacted", json!(true)),
+            ("future_flag", json!(false)),
+            ("choices_total", json!(1)),
+        ] {
+            let mut unknown = choices.clone();
+            unknown[key] = value;
+            assert!(compact_select_choices(&unknown).is_none());
+            let mut payload = observed("Unknown");
+            payload["result"]["actionable_schema"] = json!("greppy.web.actionable.v2");
+            payload["result"]["actionables"][0]["select_choices"] = unknown.clone();
+            assert!(describe(&payload, scope())
+                .body
+                .contains(&unknown.to_string()));
+        }
+        choices["choices"] = json!([{"value":null, "label":"Secret", "disabled":false,
+            "value_truncated":false, "label_truncated":false}]);
+        choices["choices_total"] = json!(1);
+        assert!(
+            compact_select_choices(&choices).is_none(),
+            "null cannot masquerade as an empty value"
+        );
+    }
+
+    #[test]
     fn states_are_evidence_not_inferred_from_on_or_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let output = render(&observed("Two products"), scope(), tmp.path()).unwrap();
@@ -710,8 +850,15 @@ mod tests {
         let output = render(&payload, scope(), tmp.path()).unwrap();
         assert!(!output.contains("\"serialized\""));
         assert_eq!(output.matches("ascending").count(), 1);
-        for expected in ["\"disabled\":false", "\"value\":null", "\"value_truncated\":true",
-            "greppy.web.select-choices.v99", "\"future\":false", "future_receipt", "\"pending\":true"] {
+        for expected in [
+            "\"disabled\":false",
+            "\"value\":null",
+            "\"value_truncated\":true",
+            "greppy.web.select-choices.v99",
+            "\"future\":false",
+            "future_receipt",
+            "\"pending\":true",
+        ] {
             assert!(output.contains(expected), "lost {expected}: {output}");
         }
         assert_eq!(payload, before);
@@ -730,7 +877,9 @@ mod tests {
         }
         let malformed = json!({"operation":"web.inspect","status":"ok",
             "result":{"serialized":{"diagnostic":"missing node"},"value":{"count":0}}});
-        assert!(render(&malformed, scope(), tmp.path()).unwrap().contains("missing node"));
+        assert!(render(&malformed, scope(), tmp.path())
+            .unwrap()
+            .contains("missing node"));
     }
 
     #[test]
