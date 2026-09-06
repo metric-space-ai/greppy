@@ -18,6 +18,16 @@ pub struct TargetOpts {
     pub last: bool,
     #[arg(long)]
     pub nth: Option<i64>,
+    /// Execute once and wait for QUERY to exist in the DOM (not visibility).
+    /// Example: --expect "css=dialog[open]". Requires a workflow-capable runtime.
+    #[arg(long, value_name = "QUERY")]
+    pub expect: Option<String>,
+    /// Require QUERY to be absent; stale refs remain errors.
+    #[arg(long, requires = "expect")]
+    pub expect_absent: bool,
+    /// Expectation deadline in milliseconds, within the total request budget.
+    #[arg(long, default_value_t = 10_000, requires = "expect")]
+    pub expect_timeout: u64,
     #[arg(long)]
     pub json: bool,
 }
@@ -107,6 +117,18 @@ pub enum ActCommand {
 }
 
 pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
+    let opts = match &command {
+        ActCommand::Click { opts, .. } | ActCommand::Fill { opts, .. }
+        | ActCommand::Type { opts, .. } | ActCommand::Clear { opts, .. }
+        | ActCommand::Select { opts, .. } | ActCommand::Check { opts, .. }
+        | ActCommand::Uncheck { opts, .. } | ActCommand::Press { opts, .. }
+        | ActCommand::Hover { opts, .. } | ActCommand::Scroll { opts, .. }
+        | ActCommand::Upload { opts, .. } => opts,
+    };
+    if opts.expect.is_some() {
+        let json = opts.json;
+        return super::workflow::run(vec![super::WebCommand::Act(command)], root, json);
+    }
     match command {
         ActCommand::Click { target, opts } => {
             locator_rpc(root, opts, "web.click", &target, json!({}))
@@ -240,7 +262,7 @@ fn locator_rpc(
     rpc(root, opts.json, operation, payload, Some(session))
 }
 
-fn fill_value(
+pub(super) fn fill_value(
     value: Option<String>,
     from_env: Option<String>,
     value_stdin: bool,
@@ -288,7 +310,7 @@ fn fill_value(
 ///
 /// Returns the staged paths. A file that is already inside the area is passed
 /// through untouched, so repeated uploads do not pile up copies.
-fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>, String> {
+pub(super) fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>, String> {
     /// Refuse anything unreasonably large before it is copied twice.
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
     let area = std::env::temp_dir()

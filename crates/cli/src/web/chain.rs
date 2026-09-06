@@ -31,6 +31,12 @@ pub enum ChainCommand {
     /// first failing step so a chain cannot walk on through an unknown page
     /// state.
     Do {
+        /// Experimental single-request native workflow. Supports navigation,
+        /// actions and wait; requires a matching runtime and stops on failure.
+        /// Wait queries test DOM presence, not visibility; use css=dialog[open]
+        /// for an open dialog. Earlier actions are retained when a later step fails.
+        #[arg(long, conflicts_with = "continue_on_error")]
+        native: bool,
         /// Steps, separated by a literal `::` argument.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         steps: Vec<String>,
@@ -98,7 +104,8 @@ pub(super) fn dispatch(command: ChainCommand, root: Option<&str>) -> Result<i32>
             continue_on_error,
             explain,
             json,
-        } => return run_chain(root, &steps, continue_on_error, explain, json),
+            native,
+        } => return if native { run_chain_mode(root, &steps, continue_on_error, explain, json, true) } else { run_chain(root, &steps, continue_on_error, explain, json) },
         ChainCommand::Script { command } => command,
     };
     match command {
@@ -414,6 +421,17 @@ fn run_chain(
     explain: bool,
     json_out: bool,
 ) -> Result<i32> {
+    run_chain_mode(root, steps, continue_on_error, explain, json_out, false)
+}
+
+fn run_chain_mode(
+    root: Option<&str>,
+    steps: &[String],
+    continue_on_error: bool,
+    explain: bool,
+    json_out: bool,
+    native: bool,
+) -> Result<i32> {
     use clap::Parser;
 
     let parsed = split_steps(steps);
@@ -468,6 +486,12 @@ fn run_chain(
     }
 
     let mut ran = 0usize;
+    if native {
+        if parsed.iter().flatten().any(|arg| arg == "--interval" || arg.starts_with("--interval=")) {
+            return emit_error(json_out, invalid("native workflow does not use a polling interval; remove --interval"));
+        }
+        return super::workflow::run(commands, root, json_out);
+    }
     let mut failed = 0usize;
     let mut last_code = 0i32;
     // Mixed machine output is deliberately left untouched, including when a

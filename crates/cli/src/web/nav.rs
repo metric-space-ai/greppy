@@ -153,7 +153,7 @@ fn history(
     rpc(root, json, operation, payload, Some(session))
 }
 
-fn resolve_or_create_session(
+pub(super) fn resolve_or_create_session(
     root: Option<&str>,
     session: Option<String>,
     json: bool,

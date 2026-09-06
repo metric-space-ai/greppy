@@ -151,6 +151,7 @@ impl Handshake {
                 "session".into(),
                 "web.run".into(),
                 "web.observe".into(),
+                "web.workflow.v1".into(),
                 "web.inspect".into(),
                 "web.screenshot".into(),
                 "web.read".into(),

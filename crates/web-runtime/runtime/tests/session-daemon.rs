@@ -15,6 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use web_runtime::worker::give_child_attach_token;
 
+#[path = "cases/workflow_cases.rs"]
+mod workflow_cases;
 const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const SOCKET_WAIT: Duration = Duration::from_secs(30);

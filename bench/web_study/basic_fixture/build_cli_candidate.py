@@ -12,13 +12,17 @@ import time
 
 SOURCE_FILES = ['Cargo.toml', 'Cargo.lock', 'crates/cli/src/web/common.rs',
                 'crates/cli/src/web/expect.rs', 'crates/cli/src/web/runtimes.rs',
-                'crates/cli/src/web/see.rs', 'crates/cli/src/web/view.rs',
+                'crates/cli/src/web/see.rs', 'crates/cli/src/web/view.rs', 'crates/cli/src/web/view_scope.rs',
                 'crates/cli/src/web/chain.rs', 'crates/cli/src/web/chain_output.rs',
                 'crates/cli/src/web/act.rs', 'crates/web-client/src/protocol.rs',
-                'crates/web-client/src/lib.rs', 'crates/web-client/src/describe-node.js']
+                'crates/web-client/src/lib.rs', 'crates/web-client/src/describe-node.js',
+                'crates/cli/src/web/mod.rs', 'crates/cli/src/web/nav.rs',
+                'crates/cli/src/web/workflow.rs', 'crates/web-client/src/workflow.rs',
+                'crates/web-client/src/workflow-condition.js', 'crates/web-client/src/workflow-preflight.js',
+                'bench/web_study/basic_fixture/build_cli_candidate.py']
 
 
-def build(root, artifacts, timeout, test_web=False):
+def build(root, artifacts, timeout, test_web=False, test_client=False):
     assert Path('/Volumes/tmp').is_mount() and artifacts.resolve().is_relative_to(Path('/Volumes/tmp'))
     assert timeout > 0
     evidence = Path(tempfile.mkdtemp(prefix='cli-guarded-', dir=artifacts))
@@ -33,11 +37,15 @@ def build(root, artifacts, timeout, test_web=False):
     if test_web:
         argv = ['cargo', 'test', '-p', 'greppy', '--features', 'ci-test-assets', '--lib',
                 '-j', '1', 'web::', '--', '--test-threads=1']
+    if test_client:
+        argv = ['cargo', 'test', '-p', 'greppy-web-client', '--lib', '-j', '1', 'workflow::', '--', '--test-threads=1']
     receipt = dict(argv=argv, cwd=str(root), head=head, source_before=before,
-                   kind='web_unit_tests' if test_web else 'cli_build',
+                   kind='client_unit_tests' if test_client else ('web_unit_tests' if test_web else 'cli_build'),
                    evidence=str(evidence), guard_seconds=timeout, guard_free_bytes=2 * 1024**3,
                    scope='debug CLI test-assets candidate; listed source hashes and HEAD; not all external assets/libraries or native runtime acceptance')
-    assert shutil.disk_usage('/Volumes/tmp').free > receipt['guard_free_bytes']
+    disk_paths = (artifacts, root, Path(env['TMPDIR']))
+    receipt['checked_disk_paths'] = [str(path) for path in disk_paths]
+    assert min(shutil.disk_usage(path).free for path in disk_paths) >= 3 * 1024**3, 'artifact, source and temporary volumes each require 3 GiB free'
     print('Build evidence: ' + str(evidence), flush=True)
     start = time.monotonic()
     stopped = None
@@ -46,7 +54,7 @@ def build(root, artifacts, timeout, test_web=False):
         receipt['pid'] = process.pid
         (evidence / 'started.json').write_text(json.dumps(receipt, indent=2) + '\n')
         while process.poll() is None:
-            if shutil.disk_usage('/Volumes/tmp').free < receipt['guard_free_bytes']:
+            if min(shutil.disk_usage(path).free for path in disk_paths) < receipt['guard_free_bytes']:
                 stopped = 'disk guard'
             elif time.monotonic() - start > timeout:
                 stopped = 'time guard'
@@ -65,7 +73,7 @@ def build(root, artifacts, timeout, test_web=False):
         code = process.wait()
     receipt.update(exit_code=code, stopped=stopped, wall_seconds=time.monotonic() - start,
                    source_unchanged=before == hashes())
-    if code == 0 and receipt['source_unchanged'] and not test_web:
+    if code == 0 and receipt['source_unchanged'] and not test_web and not test_client:
         binary = artifacts / 'target/debug/greppy'
         frozen = evidence / 'greppy'
         shutil.copy2(binary, frozen)
@@ -84,5 +92,6 @@ if __name__ == '__main__':
     p.add_argument('--artifacts', type=Path, required=True)
     p.add_argument('--timeout', type=int, default=240)
     p.add_argument('--test-web', action='store_true', help='Run compiled CLI web unit tests; do not publish a CLI candidate')
+    p.add_argument("--test-client", action="store_true", help="Run shared declarative workflow contract tests")
     a = p.parse_args()
-    raise SystemExit(build(a.root.resolve(), a.artifacts.resolve(), a.timeout, a.test_web))
+    raise SystemExit(build(a.root.resolve(), a.artifacts.resolve(), a.timeout, a.test_web, a.test_client))

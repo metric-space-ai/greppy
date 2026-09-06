@@ -16,6 +16,7 @@ mod runtimes;
 mod see;
 mod sessions;
 mod view;
+mod workflow;
 
 use clap::Subcommand;
 use greppy_core::error::Result;

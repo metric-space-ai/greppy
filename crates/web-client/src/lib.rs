@@ -4,6 +4,7 @@
 
 mod frame;
 mod protocol;
+pub mod workflow;
 
 /// Pure bounded select-choice projection shared by diagnostics and descriptions.
 pub const SELECT_CHOICES_JS: &str = include_str!("select-choices.js");

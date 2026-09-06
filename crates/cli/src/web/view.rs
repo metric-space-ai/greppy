@@ -1,6 +1,9 @@
 //! Opt-in human web view. No model inference, page execution, or graph store.
 //! Continuations read immutable local snapshots; they never repeat an action.
 
+#[path = "view_scope.rs"]
+mod scope_projection;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -520,7 +523,36 @@ fn shell_quote(value: &str) -> String {
 }
 
 pub(super) fn render(payload: &Value, scope: Scope, dir: &Path) -> Result<String, String> {
-    let snapshot = describe(payload, scope);
+    let original = describe(payload, scope.clone());
+    let snapshot = if let Some(projected) = scope_projection::project(payload) {
+        let archive = Snapshot {
+            version: 1,
+            created: now(),
+            scope: original.scope.clone(),
+            header: "Complete returned state — archived; references may now be stale\n".into(),
+            body: payload.to_string(),
+        };
+        match save(dir, &archive) {
+            Ok(id) => {
+                let mut snapshot = describe(&projected, scope);
+                let mut command = format!(
+                    "greppy web result next {}",
+                    shell_quote(&format!("{PREFIX}{id}:0"))
+                );
+                if let Some(session) = &snapshot.scope.session {
+                    command.push_str(&format!(" --session {}", shell_quote(session)));
+                }
+                snapshot.header.push_str(&format!(
+                    "Full returned state including background: {command}\n"
+                ));
+                snapshot
+            }
+            // Never hide background state when its archive could not be saved.
+            Err(_) => original,
+        }
+    } else {
+        original
+    };
     let full = format!("{}{OPEN}{}{CLOSE}", snapshot.header, snapshot.body);
     if full.len() <= BUDGET {
         return Ok(full);
@@ -594,6 +626,41 @@ pub(super) fn resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_projection_archives_background_and_falls_back_if_archive_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = json!({"operation":"web.observe","result":{
+            "session_id":"scope-test", "text":"Background table then dialog",
+            "actionables":[{"ref":"@1","name":"Background"},{"ref":"@2","name":"Confirm"}],
+            "working_scope":{"schema":"greppy.web.working-scope.v1","kind":"modal",
+                "scope_ref":"@3","provenance":"native_modal","text":"Dialog only",
+                "text_truncated":false,"ancestry":[],"actionable_refs":["@2"],
+                "background_count":1,"background_returned":1,"background_location":"snapshot.actionables"}
+        }});
+        let rendered = render(&payload, Scope::default(), tmp.path()).unwrap();
+        assert!(rendered.contains("Dialog only"));
+        assert!(!rendered.contains("Background table"));
+        assert!(rendered.contains("Full returned state including background:"));
+        let start = rendered.find("view1:").unwrap();
+        let end = rendered[start..].find(char::from(39)).unwrap() + start;
+        let archived =
+            resume(&rendered[start..end], Some("scope-test"), tmp.path(), false).unwrap();
+        assert!(archived.contains("Background table then dialog"));
+        assert!(archived.contains("Background"));
+        assert!(resume(
+            &rendered[start..end],
+            Some("other-session"),
+            tmp.path(),
+            false
+        )
+        .is_err());
+        let invalid_dir = tmp.path().join("file-not-directory");
+        fs::write(&invalid_dir, "occupied").unwrap();
+        let unfiltered = render(&payload, Scope::default(), &invalid_dir).unwrap();
+        assert!(unfiltered.contains("Background table then dialog"));
+        assert!(!unfiltered.contains("Full returned state including background:"));
+    }
 
     #[test]
     fn action_followup_exposes_refs_and_keeps_receipt_separate() {

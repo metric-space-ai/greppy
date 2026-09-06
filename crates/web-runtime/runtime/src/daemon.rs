@@ -20,6 +20,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "daemon_workflow.rs"]
+mod workflow;
 fn isolated_id(value: &str) -> Result<&str, String> {
     if value.is_empty()
         || value.len() > 80
@@ -660,6 +662,8 @@ struct Daemon {
     exiting: bool,
     attach_capability: String,
     run_control: Arc<RunControl>,
+    workflow_deadline: Option<Instant>,
+    workflow_defer_observation: bool,
 }
 
 impl Daemon {
@@ -729,10 +733,25 @@ impl Daemon {
             exiting: false,
             attach_capability,
             run_control,
+            workflow_deadline: None,
+            workflow_defer_observation: false,
         })
     }
 
     fn handle(&mut self, request: Request) -> Response {
+        if request.operation != "web.workflow" {
+            return self.handle_scoped(request);
+        }
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(request.deadline_ms)) else {
+            return protocol_error(&request, "workflow deadline exceeds monotonic clock range");
+        };
+        let previous = self.workflow_deadline.replace(deadline);
+        let response = self.handle_scoped(request);
+        self.workflow_deadline = previous;
+        response
+    }
+
+    fn handle_scoped(&mut self, request: Request) -> Response {
         self.last_request = Instant::now();
         if request.schema != SCHEMA {
             return Response::error(
@@ -767,6 +786,7 @@ impl Daemon {
             if request.operation != "web.session.close"
                 && request.operation != "web.doctor"
                 && request.operation != "handshake"
+                && request.operation != "web.workflow"
             {
                 self.ensure_workers();
             }
@@ -925,6 +945,7 @@ impl Daemon {
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
             "web.wait" => self.web_wait(&request),
+            "web.workflow" => self.web_workflow(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
             "web.tab.list" => self.web_tab(&request, "list"),
             "web.tab.switch" => self.web_tab(&request, "switch"),
@@ -1887,13 +1908,19 @@ impl Daemon {
     ) -> Response {
         // Observe exactly once, before the original operation becomes idle.
         // Observation failure cannot replay or erase a completed side effect.
-        let state = page_state_envelope(self.observe_page(session_id, page));
+        let state = if self.workflow_defer_observation {
+            None
+        } else {
+            Some(page_state_envelope(self.observe_page(session_id, page)))
+        };
         if let Some(object) = result.as_object_mut() {
             // Identity comes from the resolved native target, including an
             // implicit active tab, not from an optional CLI request field.
             object.insert("session_id".into(), json!(session_id));
             object.insert("tab_id".into(), json!(page));
-            object.insert("page_state".into(), state);
+            if let Some(state) = state {
+                object.insert("page_state".into(), state);
+            }
         }
         self.finish_session(session_id);
         Response::ok(request, result)
@@ -2820,9 +2847,13 @@ impl Daemon {
                 let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let observation_budget = wait_deadline.saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(2));
-                let state = page_state_envelope(self.observe_page_bounded(
-                    &session_id, &page, observation_budget, false,
-                ));
+                let state = if self.workflow_defer_observation {
+                    json!({"status":"deferred","reason":"intermediate workflow step"})
+                } else {
+                    page_state_envelope(self.observe_page_bounded(
+                        &session_id, &page, observation_budget, false,
+                    ))
+                };
                 let document = self.sessions.get(&session_id)
                     .and_then(|session| session.locator_snapshots.get(&page))
                     .map(|snapshot| snapshot.token.clone());
@@ -3351,6 +3382,10 @@ impl Daemon {
         operation: &str,
         deadline: Option<Instant>,
     ) -> Result<(String, String), Response> {
+        let deadline = match (deadline, self.workflow_deadline) {
+            (Some(first), Some(second)) => Some(first.min(second)),
+            (first, second) => first.or(second),
+        };
         let session_id = request
             .payload
             .get("session_id")
@@ -3703,6 +3738,22 @@ impl Daemon {
         recover_worker: bool,
     ) -> Result<serde_json::Value, String> {
         let started = Instant::now();
+        let timeout = self.workflow_deadline.map_or(timeout, |deadline| {
+            timeout.min(deadline.saturating_duration_since(started))
+        });
+        if self.workflow_deadline.is_some() && timeout.as_millis() == 0 {
+            return Err("timeout: workflow request budget exhausted before engine dispatch".into());
+        }
+        let recover_worker = recover_worker && self.workflow_deadline.is_none();
+        let mut params = params;
+        if self.workflow_deadline.is_some() {
+            if let Some(object) = params.as_object_mut() {
+                let budget_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+                let operation_ms = object.get("timeout").and_then(|value| value.as_u64())
+                    .unwrap_or(budget_ms);
+                object.insert("timeout".into(), json!(operation_ms.min(budget_ms)));
+            }
+        }
         if !self.content.is_running() {
             if !recover_worker {
                 return Err("content worker is unavailable; observation did not restart it".into());
