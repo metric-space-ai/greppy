@@ -357,11 +357,17 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         .count();
     let warning_count = blocks.len().saturating_sub(error_count);
     let annotation = termination_annotation(timed_out, forwarded_signal, &status);
+    let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
+    let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
+    // Unfolded short output already contains every diagnostic and -e match.
+    // Keep its stream and bytes intact instead of printing those lines twice.
+    // Interrupted output still uses the diagnostic prefix and recovery pack.
+    let verbatim_short = short && !interrupted;
     render_answer_prefix(
         &stdout_lines,
         &stderr_lines,
-        &blocks,
-        &matches,
+        if verbatim_short { &[] } else { &blocks },
+        if verbatim_short { &[] } else { &matches },
         &verdict_line(exit_code, error_count, warning_count, annotation.as_deref()),
     );
     // A line-count threshold alone does not bound a minified source or data
@@ -378,13 +384,10 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
 
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
-    let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
-    let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
-
     // Kills and timeouts always receive an id, even when the partial wall is
-    // short. Normal short output keeps its raw skeleton bytes after the answer
-    // prefix. Oversized individual lines are previews with raw-log recovery.
-    if short && !interrupted {
+    // short. Normal short output keeps its raw skeleton bytes after the verdict
+    // only. Oversized individual lines are previews with raw-log recovery.
+    if verbatim_short {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
             let _ = insert_pack(store, &project, &query, &raw, "stdout", &ranges);

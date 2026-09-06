@@ -126,6 +126,32 @@ fn short_output_follows_verdict_and_exit_code_passes_through() {
 }
 
 #[test]
+fn short_regex_matches_are_printed_once_with_original_stream_bytes() {
+    let workspace = fresh_workspace("short-regex-once");
+    for count in [1, 10] {
+        for redirect in ["", " >&2"] {
+            let script = format!(
+                "i=0; while [ \"$i\" -lt {count} ]; do printf '{{\"trial\":\"x\"}}\\r\\n'{redirect}; i=$((i+1)); done"
+            );
+            let output = run(
+                &workspace,
+                &["bash-smart", "-e", "\"trial\"", "--", "sh", "-c", &script],
+            );
+            assert_eq!(output.status.code(), Some(0));
+            let expected = "{\"trial\":\"x\"}\r\n".repeat(count);
+            let mut stdout = b"ok \xe2\x80\x94 exit 0\n".to_vec();
+            if redirect.is_empty() {
+                stdout.extend_from_slice(expected.as_bytes());
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(output.stderr, expected.as_bytes());
+            }
+            assert_eq!(output.stdout, stdout);
+        }
+    }
+}
+
+#[test]
 fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
     let workspace = fresh_workspace("heartbeat");
     let output = command(&workspace)
@@ -198,6 +224,12 @@ fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
             &output.stderr
         };
         assert!(raw_stream.ends_with(diagnostics.as_bytes()));
+        let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        assert_eq!(
+            combined.matches("#error \"incompatible headers\"").count(),
+            1
+        );
+        assert_eq!(combined.matches("warning: unused variable").count(), 1);
     }
 }
 

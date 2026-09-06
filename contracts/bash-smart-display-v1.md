@@ -3,9 +3,11 @@
 Command capture, command exit status and explicit raw expansion are distinct
 from the default display. Raw stdout/stderr remain byte-preserving.
 
-- The verdict and selected diagnostic/regex lines appear first. Short output
-  (at most 80 total lines) also retains its raw skeleton; a short diagnostic
-  may consequently occur again there. This is not an expansion-store failure.
+- Normal short output (at most 80 total lines) appears once after the verdict,
+  on its original stdout/stderr stream. Diagnostics and `-e` matches are not
+  repeated in a separate prefix; their counts still appear in the verdict.
+  Timeouts and interrupted output retain their diagnostic prefix and recovery
+  pack even when the captured output is short.
 - Longer output is folded. If an active index writer prevents opening the
   expansion store, folding still works and names the existing raw spool
   instead of inventing an expansion ID.
