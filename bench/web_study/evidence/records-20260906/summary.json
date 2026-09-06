@@ -1,0 +1,762 @@
+{
+  "schema": "greppy.web.records-summary.v1",
+  "rows": [
+    {
+      "trial": "r1-a",
+      "arm": "A",
+      "repeat": 1,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 543142,
+        "output_tokens": 1391,
+        "cached_input_tokens": 485632,
+        "uncached_input_tokens": 57510
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 11,
+      "host_tool_calls": 10,
+      "agent_turn_seconds": 111.61,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "5145da0519e3efebc5de0c2e624cbdf4e9fa4f94561f284598c728844cc81d4f"
+    },
+    {
+      "trial": "r1-c",
+      "arm": "C",
+      "repeat": 1,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 588409,
+        "output_tokens": 1919,
+        "cached_input_tokens": 547584,
+        "uncached_input_tokens": 40825
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 13,
+      "host_tool_calls": 12,
+      "agent_turn_seconds": 145.644,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "067e0acc9ca2f8a3f8941161c5ef2283433882a7cd8d97bd9e60602792c7a147"
+    },
+    {
+      "trial": "r1-e",
+      "arm": "E",
+      "repeat": 1,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 432355,
+        "output_tokens": 1166,
+        "cached_input_tokens": 401920,
+        "uncached_input_tokens": 30435
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 10,
+      "host_tool_calls": 9,
+      "agent_turn_seconds": 128.264,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "85fafb68e5a3e0117db46118323da0f9f6626f3057c232a80169caab0d154efe"
+    },
+    {
+      "trial": "r2-c",
+      "arm": "C",
+      "repeat": 2,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 298928,
+        "output_tokens": 907,
+        "cached_input_tokens": 273664,
+        "uncached_input_tokens": 25264
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 7,
+      "host_tool_calls": 6,
+      "agent_turn_seconds": 80.682,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "0afe626be0664583e4fe77610118177497396466e52e37b49a1b22d3f576abc9"
+    },
+    {
+      "trial": "r2-e",
+      "arm": "E",
+      "repeat": 2,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 388784,
+        "output_tokens": 1221,
+        "cached_input_tokens": 359168,
+        "uncached_input_tokens": 29616
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 9,
+      "host_tool_calls": 8,
+      "agent_turn_seconds": 131.916,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "e8a92b934bc79f8dd2658f6010a298bd200d9e509b85577cc87baaf2f5800283"
+    },
+    {
+      "trial": "r2-a",
+      "arm": "A",
+      "repeat": 2,
+      "correct": false,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": false,
+        "note": false,
+        "conditions": false,
+        "one_save": false,
+        "reloaded_after_save": false,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 232869,
+        "output_tokens": 1137,
+        "cached_input_tokens": 215552,
+        "uncached_input_tokens": 17317
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 6,
+      "host_tool_calls": 5,
+      "agent_turn_seconds": 116.251,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "9c52725b60ebdfa866a75ccb8e051aa31019b92003be805291eb521880234320"
+    },
+    {
+      "trial": "r3-e",
+      "arm": "E",
+      "repeat": 3,
+      "correct": false,
+      "operator_stop": true,
+      "oracle": {
+        "correct_offer": false,
+        "note": false,
+        "conditions": false,
+        "one_save": false,
+        "reloaded_after_save": false,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 2024317,
+        "output_tokens": 5146,
+        "cached_input_tokens": 1954048,
+        "uncached_input_tokens": 70269
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 35,
+      "host_tool_calls": 34,
+      "agent_turn_seconds": 807.616,
+      "record_command_requests": 1,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "c8183699969d2266981599f84674f2948aa5ec14dd28c48167bb339879b5c632"
+    },
+    {
+      "trial": "r3-a",
+      "arm": "A",
+      "repeat": 3,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 514496,
+        "output_tokens": 1425,
+        "cached_input_tokens": 489472,
+        "uncached_input_tokens": 25024
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 12,
+      "host_tool_calls": 11,
+      "agent_turn_seconds": 89.851,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "213f31415eadaa51ca6754da4622181b0252159b1c445f9fdece9d5e5c3ed7b9"
+    },
+    {
+      "trial": "r3-c",
+      "arm": "C",
+      "repeat": 3,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 300602,
+        "output_tokens": 1150,
+        "cached_input_tokens": 273664,
+        "uncached_input_tokens": 26938
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 7,
+      "host_tool_calls": 6,
+      "agent_turn_seconds": 100.906,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "50e402d0d2c0909f5c332294b4643961759a194a662fb246a0e9fd19a9ad74cc"
+    },
+    {
+      "trial": "r4-a",
+      "arm": "A",
+      "repeat": 4,
+      "correct": false,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": false,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 545983,
+        "output_tokens": 1611,
+        "cached_input_tokens": 518912,
+        "uncached_input_tokens": 27071
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 13,
+      "host_tool_calls": 12,
+      "agent_turn_seconds": 196.094,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "dfcc0647187f85365652cb872c9db7bbf2f41899edcd70ddfb4933b94d0254ed"
+    },
+    {
+      "trial": "r4-e",
+      "arm": "E",
+      "repeat": 4,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 1159110,
+        "output_tokens": 2367,
+        "cached_input_tokens": 1102848,
+        "uncached_input_tokens": 56262
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 24,
+      "host_tool_calls": 23,
+      "agent_turn_seconds": 472.95,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "499abb9d95e4ba4d608f0feb5f2e57e04380786b7e8bc1751caf8c5da85968cd"
+    },
+    {
+      "trial": "r4-c",
+      "arm": "C",
+      "repeat": 4,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 607833,
+        "output_tokens": 1712,
+        "cached_input_tokens": 570112,
+        "uncached_input_tokens": 37721
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 13,
+      "host_tool_calls": 12,
+      "agent_turn_seconds": 183.804,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "011705802702ebd4283ed37a43561a703d444554a0d58ac2a9720c38ba026b8d"
+    },
+    {
+      "trial": "r5-c",
+      "arm": "C",
+      "repeat": 5,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 1142629,
+        "output_tokens": 3336,
+        "cached_input_tokens": 1095168,
+        "uncached_input_tokens": 47461
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 22,
+      "host_tool_calls": 21,
+      "agent_turn_seconds": 272.334,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "72b8964ec9976bb8f7865367909d45137de010818259c7370a9ffa6c5a9c8352"
+    },
+    {
+      "trial": "r5-a",
+      "arm": "A",
+      "repeat": 5,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 463425,
+        "output_tokens": 1407,
+        "cached_input_tokens": 440576,
+        "uncached_input_tokens": 22849
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 11,
+      "host_tool_calls": 10,
+      "agent_turn_seconds": 100.801,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "ff6798cd2194c94a495390216e8f9c190eaa016b455796931e0608e5c4dcac92"
+    },
+    {
+      "trial": "r5-e",
+      "arm": "E",
+      "repeat": 5,
+      "correct": true,
+      "operator_stop": false,
+      "oracle": {
+        "correct_offer": true,
+        "note": true,
+        "conditions": true,
+        "one_save": true,
+        "reloaded_after_save": true,
+        "existing_preserved": true
+      },
+      "tokens": {
+        "input_tokens": 1622006,
+        "output_tokens": 5737,
+        "cached_input_tokens": 1540352,
+        "uncached_input_tokens": 81654
+      },
+      "telemetry_limits": [],
+      "context": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+        "source": "line 8: payload"
+      },
+      "responses": 31,
+      "host_tool_calls": 30,
+      "agent_turn_seconds": 419.512,
+      "record_command_requests": 0,
+      "unmatched_calls": [],
+      "completed": true,
+      "trace_sha256": "5fcd7063f355d8d6010d0c236b7c3830f95ac5af637a9b24497c296523e17253"
+    }
+  ],
+  "comparisons": {
+    "C_versus_A": {
+      "all_paired_tasks_correct": false,
+      "metrics": {
+        "input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 27.761286830165453,
+          "median_paired_change_percent": 11.32819153709914,
+          "paired_changes_percent": [
+            8.334284588560624,
+            28.36745122794362,
+            -41.57350105734544,
+            11.32819153709914,
+            146.56179532826238
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -22.20029820137058,
+            79.38971170212432
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "output_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 29.450580978338834,
+          "median_paired_change_percent": 6.26939788950962,
+          "paired_changes_percent": [
+            37.95830337886412,
+            -20.228671943711518,
+            -19.298245614035093,
+            6.26939788950962,
+            137.1002132196162
+          ],
+          "lower_cost_pairs": 2,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -15.126216350031129,
+            71.3252935677733
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "uncached_input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 18.987654485848402,
+          "median_paired_change_percent": 39.340992205681346,
+          "paired_changes_percent": [
+            -29.01234567901234,
+            45.89132066755213,
+            7.648657289002547,
+            39.340992205681346,
+            107.71587378003416
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -8.866447353404396,
+            68.15094613317056
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        }
+      },
+      "exploratory_turn_time": {
+        "available": true,
+        "pairs": 5,
+        "aggregate_change_percent": 27.45868498080888,
+        "median_paired_change_percent": 12.303702796852578,
+        "paired_changes_percent": [
+          30.493683361705948,
+          -30.596726049668387,
+          12.303702796852578,
+          -6.267402368251962,
+          170.1699387902898
+        ],
+        "lower_cost_pairs": 2,
+        "mean_log_ratio_bootstrap_95_percent": [
+          -15.863274652368684,
+          89.00715420484508
+        ],
+        "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+      }
+    },
+    "E_versus_C": {
+      "all_paired_tasks_correct": false,
+      "metrics": {
+        "input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 91.48414392725839,
+          "median_paired_change_percent": 41.953862539809506,
+          "paired_changes_percent": [
+            -26.521348245862995,
+            30.059412299951838,
+            573.4210018562751,
+            90.69547063091343,
+            41.953862539809506
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            1.4364929923095393,
+            261.26915190048965
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "output_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 73.28235815602837,
+          "median_paired_change_percent": 38.259345794392516,
+          "paired_changes_percent": [
+            -39.2391870766024,
+            34.61962513781698,
+            347.47826086956525,
+            38.259345794392516,
+            71.97242206235013
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -11.812951721338568,
+            178.24267491047308
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "uncached_input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 50.517650623705876,
+          "median_paired_change_percent": 49.152991702234836,
+          "paired_changes_percent": [
+            -25.450091855480707,
+            17.226092463584553,
+            160.85455490385328,
+            49.152991702234836,
+            72.04441541476159
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -1.6167748813941074,
+            103.20936454797484
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        }
+      },
+      "exploratory_turn_time": {
+        "available": true,
+        "pairs": 5,
+        "aggregate_change_percent": 150.23398904732122,
+        "median_paired_change_percent": 63.50115267345875,
+        "paired_changes_percent": [
+          -11.933206997885248,
+          63.50115267345875,
+          700.3646958555487,
+          157.312136841418,
+          54.04319695667819
+        ],
+        "lower_cost_pairs": 1,
+        "mean_log_ratio_bootstrap_95_percent": [
+          23.1715443042215,
+          324.0148644520509
+        ],
+        "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+      }
+    },
+    "E_versus_A": {
+      "all_paired_tasks_correct": false,
+      "metrics": {
+        "input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 144.64260635719145,
+          "median_paired_change_percent": 112.29781879655593,
+          "paired_changes_percent": [
+            -20.39742829683582,
+            66.95395265149075,
+            293.4563145291703,
+            112.29781879655593,
+            250.00399201596807
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            24.144894209112756,
+            231.87681488561273
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "output_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 124.31501936594462,
+          "median_paired_change_percent": 46.927374301675975,
+          "paired_changes_percent": [
+            -16.175413371675052,
+            7.387862796833766,
+            261.12280701754383,
+            46.927374301675975,
+            307.74697938877046
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            3.5502594503138973,
+            216.69325333621984
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        },
+        "uncached_input_tokens": {
+          "available": true,
+          "pairs": 5,
+          "aggregate_change_percent": 79.09742206435158,
+          "median_paired_change_percent": 107.83125854235158,
+          "paired_changes_percent": [
+            -47.07876890975482,
+            71.02269446208929,
+            180.80642583120206,
+            107.83125854235158,
+            257.3635607685238
+          ],
+          "lower_cost_pairs": 1,
+          "mean_log_ratio_bootstrap_95_percent": [
+            -2.8592292612284744,
+            193.87207353184738
+          ],
+          "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+        }
+      },
+      "exploratory_turn_time": {
+        "available": true,
+        "pairs": 5,
+        "aggregate_change_percent": 218.94495181473692,
+        "median_paired_change_percent": 141.18534988321926,
+        "paired_changes_percent": [
+          14.921602006988621,
+          13.475152901910503,
+          798.8391893245484,
+          141.18534988321926,
+          316.178410928463
+        ],
+        "lower_cost_pairs": 0,
+        "mean_log_ratio_bootstrap_95_percent": [
+          32.61454637567027,
+          410.67599462615465
+        ],
+        "interval_caveat": "exploratory paired percentile bootstrap, five seeds of one case, not population coverage or a general-superiority test"
+      }
+    }
+  },
+  "missing_trials": [],
+  "acceptance": "No every-run gate. Failed tasks stay present; their costs do not demonstrate successful efficiency. Optional E uptake must be reviewed before attributing differences to records. No p95 or full release acceptance."
+}

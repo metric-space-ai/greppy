@@ -1,0 +1,35 @@
+{
+  "schema": "greppy.web-study.context.v1",
+  "condition": "short_alias_isolated_cwd_trial_owner_v2",
+  "trial_id": "compose-44fd9342ef62",
+  "alias": "/Volumes/tmp/dev-artifacts/greppy/web-composition-study/run-01/aliases/gw-compose-44fd9342ef62",
+  "command": "gw-compose-44fd9342ef62",
+  "workspace": "/Volumes/tmp/dev-artifacts/greppy/web-composition-study/run-01/contexts/compose-44fd9342ef62/workspace",
+  "wrapper": "/Volumes/tmp/dev-artifacts/greppy/web-composition-study/run-01/contexts/compose-44fd9342ef62/gw",
+  "cli": "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+  "candidate": {
+    "schema": "greppy.web-study.candidate.v1",
+    "cli": {
+      "path": "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+      "sha256": "a3d6d1f5e77e44b8187ad7611735c06427d11701e5e263a270cf0865d4ffc31e",
+      "bytes": 207913352
+    },
+    "runtime": {
+      "path": "/private/tmp/greppy-scoped-observe-tests.wGSgCs/web-runtime-current",
+      "sha256": "6e925e498338e5e9d5237de62aef7d2c86e7b6407a8a7b9be63864602321a134",
+      "bytes": 425512560
+    },
+    "scope": "CLI and runtime executable bytes; not all libraries/assets or source provenance"
+  },
+  "rendering": {
+    "view": "default",
+    "chain_view": "default"
+  },
+  "wrapper_sha256": "24546a900be5b3b4e6a6e5bd545dbbeeefb9177d01ed0b8dc906103362545574",
+  "runtime_id": "study-b377aaebe877fce755ccce29dd9d27bd",
+  "requested_runtime_group": "compose-44fd9342ef62",
+  "runtime_isolation": "per_trial_owner_v1",
+  "browser_actions_during_setup": 0,
+  "session_setup": "participant invokes native web open or explicit session create",
+  "cost_attribution": "harness correction; no product efficiency claim"
+}
