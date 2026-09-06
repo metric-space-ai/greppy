@@ -1,0 +1,21 @@
+# Prospective record-tool experiment
+
+The root continues implementation after the composition audit. `record_tool.py` is an opt-in research command, not a deployed product fix. `web records QUERY --fields data-* --where PREDICATES` collects native observed references, inspects the same native refs, retains explicit visibility and requested attributes, and delegates predicates to Greppy's existing `web match`. Other commands pass through unchanged. Sequential internal calls, Python overhead and extra onboarding belong to the experimental system and are measured, not called a native one-RPC improvement.
+
+This intervention addresses actual integration work left to the LLM. It is initially limited to the current document. Missing facts stay null; stale references, changed sessions, truncated observations and upstream errors fail explicitly. It neither invents references nor silently joins nodes by text/href. It issues no instructions in its output. Full frame support remains a later gate.
+
+## Updated evaluation rule from the owner
+
+The owner clarified on 2026-09-06 that an occasional bug-free run using somewhat more tokens is acceptable statistical variation. Nine more-efficient runs and one mildly worse run are not an automatic failure. Individual regressions remain visible and are investigated when the public trace suggests a functional/usability defect, but excess tokens alone do not establish a bug.
+
+Primary interpretation uses paired distributions and effect sizes for actual total input and output tokens, with uncertainty reported. Report ratio of aggregate totals, median paired percentage change and a deterministic paired-bootstrap interval for mean log ratios. Five development pairs are exploratory and can have wide intervals. No significance, p95 or general-superiority claim follows from win counts alone. A large outlier still matters to aggregate cost. Correctness errors remain distinct from stochastic efficiency variation. The historical every-pair gate is not the prospective acceptance criterion.
+
+## Planned development comparison
+
+Five repeated seeds, balanced A/C/E order frozen before dispatch. A is a fresh Codex Luna/medium participant with the standard in-app Browser; C is a fresh Codex Luna/medium participant with the unchanged scope development pair; E uses the same pair plus the record-tool prototype. E is a C variant, not Greppy-agent arm B. B's workspace readiness and the broad original three-arm acceptance remain separate.
+
+One development case: choose the cheapest visible, available EU delivery arriving within three days; replace a note, accept conditions, save through a confirmation dialog exactly once, reload and preserve an existing booking. Hidden and disabled cheap lookalikes are present. All arms receive identical business wording and initial facts, distinct mutable state, their own context and normal documented capabilities. No fixture code, oracle, expected selected offer or solution script is supplied. Tool-specific onboarding and startup remain in measured token totals.
+
+The prototype is frozen only after its full-UI pilot passes. That prepared pilot is not a participant trial. Public requests/results and actual response-level usage are exported from host telemetry. An independent file-backed oracle checks selected offer, exact note, accepted conditions, one save, reload after save and the preserved booking. No private reasoning is reconstructed. The fixture's normal UI performs its own HTTP save; participants may not call application APIs or read host state directly.
+
+Every failure and retry stays in the dataset. No swapping binaries/prototype mid-series. No competing participant runs. Other machine load cannot presently be excluded, so latency is exploratory. A prototype which lowers model tokens but adds local latency must expose that tradeoff; it does not satisfy all original release goals by token savings alone.
