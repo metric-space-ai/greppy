@@ -63,6 +63,16 @@ pub(crate) fn closest_valid_invocation(
     }
     let unknown = unknown_flag_name(clap_message)?;
     let unknown = unknown.as_str();
+    // This is a symbol-read option, not a misspelling of the boolean --all.
+    // Replacing only its name would leave the line count as another filename.
+    if subcommand == "read-file" && unknown == "--tail" {
+        return Some(
+            "`read-file` accepts `--lines A:B` for an explicit line range or `--all` \
+             for the complete file; `--tail N` is supported by `greppy read SYMBOL`, \
+             not by `read-file`"
+                .into(),
+        );
+    }
     let candidates = subcommand_flag_candidates(argv, subcommand);
     let replacement = candidates
         .into_iter()
@@ -90,6 +100,36 @@ pub(crate) fn closest_valid_invocation(
 #[cfg(test)]
 mod suggestion_tests {
     use super::*;
+
+    #[test]
+    fn file_tail_guidance_never_turns_the_count_into_a_filename() {
+        for args in [
+            vec!["greppy", "read-file", "a file.rs", "--tail", "80"],
+            vec!["greppy", "read-file", "a file.rs", "--tail=80"],
+            vec![
+                "greppy",
+                "--root",
+                "/repo",
+                "read-file",
+                "a.rs",
+                "--tail",
+                "2",
+            ],
+        ] {
+            let argv: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            let suggestion = closest_valid_invocation(
+                &argv,
+                "read-file",
+                "error: unexpected argument '--tail' found",
+            )
+            .expect("actionable guidance");
+            assert!(suggestion.contains("--lines A:B"));
+            assert!(suggestion.contains("greppy read SYMBOL"));
+            assert!(!suggestion.contains("--all 80"));
+            assert!(!suggestion.contains("--all 2"));
+            assert!(!suggestion.contains("--tail=80"));
+        }
+    }
 
     #[test]
     fn browser_context_flag_is_not_repaired_into_graph_limit() {
