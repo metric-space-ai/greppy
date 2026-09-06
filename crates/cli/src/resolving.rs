@@ -733,6 +733,16 @@ pub(crate) fn argv_without_stray_positional(
     clap_message: &str,
     usage: Option<&str>,
 ) -> Option<(Vec<std::ffi::OsString>, String)> {
+    // A browser operand can select a narrower page region or target. Dropping
+    // it would execute a different request. Nested clap usage is not evidence
+    // that the user's extra argument is harmless (e.g. observe role=dialog).
+    if grep_passthrough_args(argv)
+        .first()
+        .and_then(|arg| arg.to_str())
+        == Some("web")
+    {
+        return None;
+    }
     let stray = clap_message
         .strip_prefix("error: unexpected argument '")?
         .split('\'')
@@ -779,4 +789,58 @@ pub(crate) fn argv_without_stray_positional(
         out.push(argument.clone());
     }
     dropped.then(|| (out, stray.to_string()))
+}
+
+#[cfg(test)]
+mod positional_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn browser_scope_operands_are_never_dropped_before_reparse() {
+        for arguments in [
+            vec!["greppy", "web", "observe", "role=dialog", "--help"],
+            vec![
+                "greppy",
+                "--root",
+                "/repo",
+                "web",
+                "observe",
+                "css=dialog[open]",
+                "--help",
+            ],
+            vec![
+                "greppy",
+                "web",
+                "session",
+                "list",
+                "unexpected-scope",
+                "--help",
+            ],
+        ] {
+            let argv: Vec<std::ffi::OsString> = arguments.into_iter().map(Into::into).collect();
+            let error = <Cli as clap::Parser>::try_parse_from(argv.iter()).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            let error = error.to_string();
+            let first = error.lines().next().unwrap();
+            let usage = error.lines().find(|line| line.starts_with("Usage:"));
+            assert!(usage.is_some());
+            assert!(argv_without_stray_positional(&argv, first, usage).is_none());
+        }
+    }
+
+    #[test]
+    fn existing_non_browser_no_argument_recovery_is_unchanged() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "doctor", "parse_path"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let (repaired, stray) = argv_without_stray_positional(
+            &argv,
+            "error: unexpected argument 'parse_path' found",
+            Some("Usage: greppy doctor [OPTIONS]"),
+        )
+        .unwrap();
+        assert_eq!(stray, "parse_path");
+        assert_eq!(repaired, &argv[..2]);
+    }
 }

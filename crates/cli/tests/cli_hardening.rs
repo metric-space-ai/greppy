@@ -106,6 +106,31 @@ fn run_with_env_and_inference(
 }
 
 #[test]
+fn browser_observe_query_is_refused_instead_of_widened() {
+    let (repo, store, _scratch) = make_repo("observe-query", "marker");
+    for query in ["role=dialog", "css=dialog[open]"] {
+        // --help keeps the pre-fix repro free of browser side effects: the old
+        // repair drops QUERY and exits successfully via unfiltered help.
+        let (code, out, err) = run(&["web", "observe", query, "--help"], &repo, &store);
+        assert_eq!(code, 64, "query must not be dropped: {out}\n{err}");
+        assert!(out.contains("no observation was run"), "{out}");
+        assert!(out.contains("greppy web find QUERY"), "{out}");
+        assert!(out.contains("unfiltered page"), "{out}");
+        assert!(!out.contains("ignoring"), "{out}");
+        assert!(err.is_empty(), "{err}");
+    }
+    let (code, out, err) = run(&["web", "observe", "--help"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "valid unfiltered grammar stays supported: {out}\n{err}"
+    );
+    assert!(
+        !store.exists(),
+        "help/refusal must not create an index store"
+    );
+}
+
+#[test]
 fn option_recovery_never_rewrites_arguments_after_double_dash() {
     let (repo, store, _scratch) = make_repo("double-dash-recovery", "marker");
     let (code, out, err) = run(

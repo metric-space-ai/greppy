@@ -954,7 +954,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                if sub == "path" && stray == "--code" {
+                if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("observe")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web observe` currently observes the whole page and does not accept a query; \
+                         no observation was run. Use `greppy web find QUERY` to resolve matching nodes, \
+                         or `greppy web observe` for the unfiltered page."
+                    );
+                } else if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
                          run it without `--code`, then use `greppy read SYMBOL` for a returned \
