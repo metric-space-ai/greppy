@@ -45,6 +45,56 @@ fn index(repo: &Path, store: &Path) {
 }
 
 #[test]
+fn symbol_reads_never_mix_stale_spans_with_shifted_source() {
+    let (repo, store) = fresh_workspace("shifted-source");
+    let original = "fn predecessor() {\n    let _ = 1;\n}\nfn target() {\n    let _ = 42;\n}\n";
+    std::fs::write(repo.join("lib.rs"), original).unwrap();
+    index(&repo, &store);
+    std::fs::write(
+        repo.join("lib.rs"),
+        format!("// newly inserted line\n// another inserted line\n{original}"),
+    )
+    .unwrap();
+    for args in [
+        vec!["read", "target"],
+        vec!["read", "target", "--json"],
+        vec!["read", "target", "--head", "1", "--handle"],
+        vec!["read", "predecessor", "target", "--json"],
+        vec!["read-smart", "target"],
+    ] {
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_AUTO_REINDEX", "0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(75),
+            "{args:?}: {stdout}\n{stderr}"
+        );
+        assert!(!stdout.contains("fn target()"), "{stdout}");
+        assert!(!stdout.contains("let _ ="), "{stdout}");
+        assert!(
+            stdout.contains("freshness") || stdout.contains("stale"),
+            "{stdout}"
+        );
+    }
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read", "target"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout,
+        "lib.rs:6-8  target\nfn target() {\n    let _ = 42;\n}\n"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn read_is_symbols_only_whole_and_doc_extended() {
     let (repo, store) = fresh_workspace("whole");
     std::fs::write(

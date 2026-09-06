@@ -86,6 +86,26 @@ fn assert_file(path: &Path, expected: &str) {
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
 }
 
+#[test]
+fn malformed_patch_reports_input_line_and_preserves_the_file() {
+    let fixture = Fixture::new("patch-prefix-diagnostic");
+    let original = "fn before() {}\n";
+    std::fs::write(fixture.repo.join("item.rs"), original).unwrap();
+    let output = fixture.run_with_stdin(
+        &["patch"],
+        b"--- a/item.rs\n+++ b/item.rs\n@@ -1 +1 @@\n-fn before() {}\nfn after() {}\n",
+    );
+    assert_eq!(output.status.code(), Some(20), "{}", combined(&output));
+    let diagnostic = combined(&output);
+    assert!(
+        diagnostic.contains("item.rs: patch input line 5"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("git diff --no-color"), "{diagnostic}");
+    assert!(diagnostic.contains("nothing written"), "{diagnostic}");
+    assert_file(&fixture.repo.join("item.rs"), original);
+}
+
 #[cfg(unix)]
 fn install_fake_tsc(fixture: &Fixture, script: &str) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -302,6 +322,164 @@ fn patch_refusal_leaves_every_file_untouched() {
     assert!(text.contains("nothing written"), "{text}");
     assert_file(&fixture.repo.join("one.txt"), "one\n");
     assert_file(&fixture.repo.join("two.txt"), "two\n");
+}
+
+#[test]
+fn patch_accepts_git_metadata_between_files_without_changing_payload_lines() {
+    let fixture = Fixture::new("patch-git-metadata");
+    let one = "diff --git is file content\nindex is file content\none\n";
+    std::fs::write(fixture.repo.join("one.txt"), one).unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let diff = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1,3 +1,3 @@\n diff --git is file content\n index is file content\n-one\n+ONE\ndiff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-two\n+TWO\n";
+
+    let dry_run = fixture.run_with_stdin(&["patch", "--dry-run"], diff.as_bytes());
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert_file(&fixture.repo.join("one.txt"), one);
+    assert_file(&fixture.repo.join("two.txt"), "two\n");
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(
+        &fixture.repo.join("one.txt"),
+        "diff --git is file content\nindex is file content\nONE\n",
+    );
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+}
+
+#[test]
+fn patch_git_metadata_keeps_late_context_refusal_atomic() {
+    let fixture = Fixture::new("patch-git-atomic");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let diff = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\ndiff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-missing\n+TWO\n";
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+    assert!(combined(&output).contains("nothing written"));
+    assert_file(&fixture.repo.join("one.txt"), "one\n");
+    assert_file(&fixture.repo.join("two.txt"), "two\n");
+}
+
+#[test]
+fn patch_git_unsupported_sections_are_not_silently_dropped() {
+    let fixture = Fixture::new("patch-git-unsupported");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    let edit = "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
+    for suffix in [
+        "diff --git a/two.txt b/two.txt\nold mode 100644\nnew mode 100755\n",
+        "diff --git a/two.bin b/two.bin\nindex 3333333..4444444 100644\nBinary files a/two.bin and b/two.bin differ\n",
+        "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+        "diff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\n",
+    ] {
+        let diff = format!("{edit}{suffix}");
+        let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(20), "{text}");
+        assert!(text.contains("Git patch section"), "{text}");
+        assert!(text.contains("nothing written"), "{text}");
+        assert_file(&fixture.repo.join("one.txt"), "one\n");
+    }
+}
+
+#[test]
+fn replace_text_accepts_raw_borrows_and_preserves_syntax_refusal_atomicity() {
+    let fixture = Fixture::new("replace-text-rust-raw");
+    let source = "fn before() {}\n";
+    let replacement = "fn inserted() { let raw = 1; let _ = &raw; }\nfn before()";
+    let expected = format!("{replacement} {{}}\n");
+    std::fs::write(fixture.repo.join("valid.rs"), source).unwrap();
+
+    let dry_run = fixture.run(&[
+        "replace-text",
+        "valid.rs",
+        "fn before()",
+        replacement,
+        "--dry-run",
+    ]);
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert_file(&fixture.repo.join("valid.rs"), source);
+
+    let written = fixture.run(&["replace-text", "valid.rs", "fn before()", replacement]);
+    assert!(written.status.success(), "{}", combined(&written));
+    assert_file(&fixture.repo.join("valid.rs"), &expected);
+
+    let refused = fixture.run(&["replace-text", "valid.rs", "let _ = &raw;", "let _ = ;"]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert!(combined(&refused).contains("nothing written"));
+    assert_file(&fixture.repo.join("valid.rs"), &expected);
+}
+
+#[test]
+fn write_accepts_borrow_of_raw_identifier_and_still_rejects_broken_rust() {
+    let fixture = Fixture::new("write-rust-raw");
+    let source = b"fn main() { let raw = 1; let _ = &raw; }\n";
+    let dry_run = fixture.run_with_stdin(&["write", "--dry-run", "valid.rs"], source);
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert!(!fixture.repo.join("valid.rs").exists());
+    let written = fixture.run_with_stdin(&["write", "valid.rs"], source);
+    assert!(written.status.success(), "{}", combined(&written));
+    assert_eq!(
+        std::fs::read(fixture.repo.join("valid.rs")).unwrap(),
+        source
+    );
+    let refused = fixture.run_with_stdin(&["write", "valid.rs"], b"fn main( {}\n");
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert_eq!(
+        std::fs::read(fixture.repo.join("valid.rs")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn patch_creation_refusal_explains_recovery_and_preserves_transaction() {
+    let fixture = Fixture::new("patch-create");
+    std::fs::write(fixture.repo.join("existing.txt"), "before\n").unwrap();
+    let creation = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+new\n";
+    let mixed = format!(
+        "--- a/existing.txt\n+++ b/existing.txt\n@@ -1,1 +1,1 @@\n-before\n+after\n{creation}"
+    );
+    for diff in [creation, mixed.as_str()] {
+        for args in [vec!["patch", "--dry-run"], vec!["patch"]] {
+            let output = fixture.run_with_stdin(&args, diff.as_bytes());
+            let text = combined(&output);
+            assert_eq!(output.status.code(), Some(20), "{text}");
+            assert!(text.contains("patch only edits existing files"), "{text}");
+            assert!(text.contains("greppy write"), "{text}");
+            assert!(text.contains("separate transaction"), "{text}");
+            assert!(text.contains("nothing written"), "{text}");
+            assert!(!fixture.repo.join("new.txt").exists());
+            assert_file(&fixture.repo.join("existing.txt"), "before\n");
+        }
+    }
+}
+
+#[test]
+fn patch_deletion_and_contextless_edit_remain_explicit_refusals() {
+    let fixture = Fixture::new("patch-delete");
+    std::fs::write(fixture.repo.join("existing.txt"), "before\n").unwrap();
+    let deletion = "--- a/existing.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-before\n";
+    let output = fixture.run_with_stdin(&["patch"], deletion.as_bytes());
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(20), "{text}");
+    assert!(text.contains("file deletion is not supported"), "{text}");
+    assert!(text.contains("nothing written"), "{text}");
+    assert_file(&fixture.repo.join("existing.txt"), "before\n");
+
+    let insertion = "--- a/existing.txt\n+++ b/existing.txt\n@@ -0,0 +1,1 @@\n+new\n";
+    let output = fixture.run_with_stdin(&["patch"], insertion.as_bytes());
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(20), "{text}");
+    assert!(text.contains("no context line to anchor on"), "{text}");
+    assert_file(&fixture.repo.join("existing.txt"), "before\n");
+}
+
+#[test]
+fn patch_help_discloses_existing_file_only_contract() {
+    let fixture = Fixture::new("patch-help");
+    let output = fixture.run(&["patch", "--help"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("existing files"), "{text}");
+    assert!(text.contains("greppy write"), "{text}");
+    assert!(text.contains("separate transaction"), "{text}");
 }
 
 #[test]

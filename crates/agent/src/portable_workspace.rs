@@ -184,7 +184,10 @@ impl AgentWorkspace {
         trace_workspace_phase(run_id, "provider-io-verified", started);
         #[cfg(target_os = "macos")]
         {
-            greppy_workspace_core::spawn_repository_tracker(data_root.clone())?;
+            greppy_workspace_core::spawn_repository_tracker_for(
+                data_root.clone(),
+                repo_root.to_path_buf(),
+            )?;
             trace_workspace_phase(run_id, "repository-tracker-started", started);
         }
         let provider_instance = provider.manifest().instance_id.clone();
@@ -757,16 +760,30 @@ fn repository_tracker_fence(
     core: &WorkspaceCore,
     epoch: u64,
 ) -> Result<u64, WorkspaceError> {
-    let git_dir = PathBuf::from(git_ok(
-        repository,
-        &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
-    )?);
+    let git_dir = PathBuf::from(
+        git_ok(
+            repository,
+            &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+        )
+        .map_err(|error| {
+            WorkspaceError::Io(io::Error::other(format!(
+                "cannot resolve repository Git directory before tracker fence: {error}"
+            )))
+        })?,
+    );
     let deadline = std::time::Instant::now() + REPOSITORY_TRACKER_TIMEOUT;
     let mut attempt = 0u32;
     loop {
-        let before = core.repository_tracker_status(repository)?.ok_or_else(|| {
-            WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
-        })?;
+        let before = core
+            .repository_tracker_status(repository)
+            .map_err(|error| {
+                WorkspaceError::Io(io::Error::other(format!(
+                    "cannot read repository tracker status before fence: {error}"
+                )))
+            })?
+            .ok_or_else(|| {
+                WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+            })?;
         if before.state != RepositoryTrackerState::Active || before.epoch != epoch {
             return Err(WorkspaceError::AdapterUnavailable(format!(
                 "repository tracker changed before fence: state={:?}, epoch={}, expected_epoch={}, generation={}, owner_pid={}, heartbeat_age_ms={}, detail={}",
@@ -786,20 +803,44 @@ fn repository_tracker_fence(
         );
         let path = git_dir.join(&name);
         let virtual_path = format!(".git/{name}");
-        fs::write(&path, b"greppy.repository-tracker-fence.v1\n")?;
+        fs::write(&path, b"greppy.repository-tracker-fence.v1\n").map_err(|error| {
+            WorkspaceError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot write repository tracker fence {}: {error}",
+                    path.display()
+                ),
+            ))
+        })?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait = remaining.min(REPOSITORY_TRACKER_FENCE_ATTEMPT);
         let observed = wait_for_tracker_path(repository, core, epoch, &virtual_path, wait);
         let remove = fs::remove_file(&path);
         match observed {
             Ok(Some(generation)) => {
-                remove?;
+                remove.map_err(|error| {
+                    WorkspaceError::Io(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot remove observed repository tracker fence {}: {error}",
+                            path.display()
+                        ),
+                    ))
+                })?;
                 // The observed create event is the ordering barrier: every
                 // repository event before this fence has reached the journal.
                 return Ok(generation);
             }
             Ok(None) if std::time::Instant::now() < deadline => {
-                remove?;
+                remove.map_err(|error| {
+                    WorkspaceError::Io(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot remove unobserved repository tracker fence {}: {error}",
+                            path.display()
+                        ),
+                    ))
+                })?;
                 attempt += 1;
             }
             Ok(None) => {
@@ -827,9 +868,16 @@ fn wait_for_tracker_path(
 ) -> Result<Option<u64>, WorkspaceError> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let status = core.repository_tracker_status(repository)?.ok_or_else(|| {
-            WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
-        })?;
+        let status = core
+            .repository_tracker_status(repository)
+            .map_err(|error| {
+                WorkspaceError::Io(io::Error::other(format!(
+                    "cannot read repository tracker status while waiting for fence: {error}"
+                )))
+            })?
+            .ok_or_else(|| {
+                WorkspaceError::AdapterUnavailable("repository tracker disappeared".into())
+            })?;
         if status.state != RepositoryTrackerState::Active || status.epoch != epoch {
             return Err(WorkspaceError::AdapterUnavailable(format!(
                 "repository tracker lost continuity during fence: {}",
@@ -838,7 +886,14 @@ fn wait_for_tracker_path(
                     .unwrap_or_else(|| "epoch/state changed".into())
             )));
         }
-        if let Some(generation) = core.consume_repository_fence(repository, epoch, expected_path)? {
+        if let Some(generation) = core
+            .consume_repository_fence(repository, epoch, expected_path)
+            .map_err(|error| {
+                WorkspaceError::Io(io::Error::other(format!(
+                    "cannot consume repository tracker fence event: {error}"
+                )))
+            })?
+        {
             return Ok(Some(generation));
         }
         if std::time::Instant::now() >= deadline {
@@ -2309,10 +2364,27 @@ fn initialize_private_git(
         });
     }
 
-    let baseline_view_commit =
-        fs::read_to_string(private_git_dir.join("refs/heads/greppy-baseline"))?;
+    let baseline_ref = private_git_dir.join("refs/heads/greppy-baseline");
+    let baseline_view_commit = fs::read_to_string(&baseline_ref).map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read private Git baseline ref {}: {error}",
+                baseline_ref.display()
+            ),
+        ))
+    })?;
     let baseline_view_commit = baseline_view_commit.trim();
-    let head = fs::read(private_git_dir.join("HEAD"))?;
+    let head_path = private_git_dir.join("HEAD");
+    let head = fs::read(&head_path).map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read private Git HEAD {}: {error}",
+                head_path.display()
+            ),
+        ))
+    })?;
     if baseline_view_commit != expected_baseline_view_commit
         || head != b"ref: refs/heads/greppy-baseline\n"
     {
@@ -2321,10 +2393,20 @@ fn initialize_private_git(
             detail: "private Git namespace does not match its immutable template".into(),
         });
     }
+    let worktree_git = worktree.join(".git");
     fs::write(
-        worktree.join(".git"),
+        &worktree_git,
         format!("gitdir: {}\n", private_git_dir.display()),
-    )?;
+    )
+    .map_err(|error| {
+        WorkspaceError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot write private Git link {}: {error}",
+                worktree_git.display()
+            ),
+        ))
+    })?;
     Ok((
         baseline_tree.into(),
         baseline_view_commit.into(),

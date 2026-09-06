@@ -29,7 +29,9 @@
 ///   v3 -> v4 (2026-07-12): resolve type-evident local receiver calls, use a
 ///   wider P-core work queue, and keep source bodies authoritative in the
 ///   worktree instead of duplicating them into SQLite by default.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v4";
+///   v4 -> v5 (2026-09-05): Rust grammar 0.24.2 correctly parses borrows of
+///   the contextual identifier `raw`; old extraction trees may be incomplete.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v5";
 
 pub mod cache;
 pub mod diag;

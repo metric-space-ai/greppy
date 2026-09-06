@@ -172,6 +172,21 @@ jq -e '
   (.result.executable | endswith("/web-runtime/bin/web-runtime")) and
   (.result.stamp | endswith("/web-runtime/.greppy-web-runtime-dist"))
 ' "$WORK/web-doctor.json" >/dev/null
+if [ "$(uname -s)" = Darwin ]; then
+  if ! "$BIN" web status --json >"$WORK/web-status.json"; then
+    fail "packaged macOS web runtime did not start"
+  fi
+  if ! jq -e '
+    .status == "ok" and
+    .result.process_health.healthy == true and
+    .result.controller_alive == true and
+    .result.content_alive == true
+  ' "$WORK/web-status.json" >/dev/null; then
+    "$BIN" web runtime stop --json >/dev/null 2>&1 || true
+    fail "packaged macOS web runtime did not become healthy"
+  fi
+  "$BIN" web runtime stop --json >/dev/null
+fi
 "$BIN" --device cpu --root "$WORK/repo" doctor --json >"$WORK/doctor.json" || test $? -eq 1
 jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$WORK/doctor.json" >/dev/null
 

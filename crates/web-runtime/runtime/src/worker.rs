@@ -697,7 +697,10 @@ pub fn require_inherited_capability() -> io::Result<String> {
             let inspected = unsafe { libc::ioctl(CAPABILITY_FD, libc::FIONREAD, &mut available) };
             eprintln!(
                 "web-runtime: capability-frame pid={} fd={} available_bytes={} inspected={}",
-                std::process::id(), CAPABILITY_FD, available, inspected == 0
+                std::process::id(),
+                CAPABILITY_FD,
+                available,
+                inspected == 0
             );
         }
         let file = File::from(unsafe { OwnedFd::from_raw_fd(CAPABILITY_FD) });

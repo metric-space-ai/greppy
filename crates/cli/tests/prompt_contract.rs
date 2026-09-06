@@ -407,8 +407,10 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // 03.09.2026: the owner approved the stabilized browser block for the
     // 0.4.0 public prompt. AGENTS.md now enables it for external agents while
     // the built-in agent includes the byte-identical canonical asset.
+    // 04.09.2026: owner-approved release plan corrects unsupported nested
+    // browser commands and action-result guidance to match the shipped CLI.
     const APPROVED_SHA256: &str =
-        "f9957e033efbd4ec40a038e150a52d2252ca1969648e97dc96d1e8ebd62ba0c1";
+        "4d28cb99e39d9895efe15f8a6d2fc7be5c47c1992b597ab1935ad2747087cde3";
 
     let text = prompt();
     let digest = {
@@ -598,6 +600,82 @@ fn browser_section_names_only_existing_web_subcommands() {
          --help`. Do not shorten the prompt to make it pass.",
         invented.len(),
         named.len()
+    );
+}
+
+/// Preserve every literal word of a documented command path, not just its
+/// top-level verb. Stop at placeholders/flags, and treat `do` as the chain
+/// parser rather than a namespace of subcommands.
+fn web_command_paths_named_in(text: &str) -> std::collections::BTreeSet<Vec<String>> {
+    text.lines()
+        .filter(|line| *line != line.trim_start())
+        .filter_map(|line| line.trim_start().strip_prefix("greppy web "))
+        .map(|line| {
+            let mut words = vec!["web".to_owned()];
+            for word in line.split("  ").next().unwrap_or(line).split_whitespace() {
+                if !word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    || word.starts_with('-')
+                {
+                    break;
+                }
+                words.push(word.to_owned());
+                if word == "do" {
+                    break;
+                }
+            }
+            words
+        })
+        .collect()
+}
+
+#[test]
+fn browser_documented_command_paths_parse_including_nested_verbs() {
+    let text = beta_web_prompt().expect("canonical browser prompt must ship");
+    let paths = web_command_paths_named_in(&text);
+    assert!(paths.contains(&vec!["web".into(), "session".into(), "create".into()]));
+    assert!(paths.contains(&vec!["web".into(), "dom".into(), "html".into()]));
+    for path in paths {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_greppy"))
+            .args(&path)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "documented `greppy {}` is not accepted:\n{}\n{}",
+            path.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn browser_command_path_guard_retains_invalid_nested_verb() {
+    let paths = web_command_paths_named_in("  greppy web session new   a context\n");
+    let path = vec!["web".to_owned(), "session".to_owned(), "new".to_owned()];
+    assert!(paths.contains(&path));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_greppy"))
+        .args(&path)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "fixture must catch the original prompt defect"
+    );
+}
+
+#[test]
+fn browser_dom_example_accepts_its_query_argument() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_greppy"))
+        .args(["web", "dom", "html", "tag=li", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

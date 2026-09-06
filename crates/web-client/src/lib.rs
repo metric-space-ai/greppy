@@ -5,10 +5,15 @@
 mod frame;
 mod protocol;
 pub mod workflow;
+mod observation_scope;
+
+pub use observation_scope::{guard_scoped_observation, observation_scope_roots};
 
 /// Pure bounded select-choice projection shared by diagnostics and descriptions.
 pub const SELECT_CHOICES_JS: &str = include_str!("select-choices.js");
 
+/// Shared DOM query grammar for reading verbs and bounded observations.
+pub const NODE_QUERY_RESOLVER_JS: &str = include_str!("node-query-resolver.js");
 /// Shared DOM description for native ref inspection and CLI query inspection.
 pub const DESCRIBE_NODE_JS: &str = concat!(
     "(function() {\n",

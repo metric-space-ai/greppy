@@ -301,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn syntax_counts_accept_valid_rust_macro_and_let_else_forms() {
+        for source in [
+            "fn f() { let raw = 1; let _ = &raw; }",
+            "fn f() { let raw = [1, 2]; let _ = &raw[..]; let _ = &raw[0]; }",
+            "fn f() { let mut raw = 1; let _ = &raw const raw; let _ = &raw mut raw; }",
+            "fn f() -> Result<(), ()> { let Ok(root) = std::env::var(\"ROOT\") else { return Ok(()); }; Ok(()) }",
+            "fn f() { let payload = serde_json::json!({\"id\": task.message_key, \"status\": \"running\"}).to_string(); }",
+            "fn f() -> Result<(), ()> { let (raw, revision): (String, String) = db.query_row(\"SELECT\", params![key], |row| Ok((row.get(0)?, row.get(1)?)),)?; Ok(()) }",
+        ] {
+            let counts = syntax_counts(Language::Rust, source.as_bytes()).unwrap();
+            assert_eq!(counts, SyntaxCounts { errors: 0, missing: 0 }, "{source}\n{}", greppy_parser::parse(Language::Rust, source.as_bytes()).unwrap().root_node().to_sexp());
+        }
+    }
+
+    #[test]
     fn property_random_mutation_never_corrupts() {
         // deterministic pseudo-random walk: any post-snapshot mutation must be
         // caught by the hash check before publish (verified here via sha

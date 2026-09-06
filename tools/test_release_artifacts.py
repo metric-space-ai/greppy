@@ -475,6 +475,22 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("crates/web-runtime/scripts/package-web-runtime.sh", workflow)
         self.assertIn("target/web-runtime-dist", workflow)
         self.assertIn("crates/web-runtime/target/release/web-runtime", workflow)
+        self.assertEqual(
+            workflow.count(
+                "--entitlements crates/web-runtime/scripts/entitlements.plist"
+            ),
+            2,
+        )
+        web_runtime_entitlements = (
+            REPOSITORY_ROOT / "crates/web-runtime/scripts/entitlements.plist"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "com.apple.security.cs.allow-jit", web_runtime_entitlements
+        )
+        self.assertIn(
+            "com.apple.security.cs.allow-unsigned-executable-memory",
+            web_runtime_entitlements,
+        )
         self.assertIn(
             "- name: Build the linked web runtime\n        if: runner.os != 'Windows'",
             workflow,
@@ -786,6 +802,9 @@ class ReleaseArtifactTests(unittest.TestCase):
             probe = (REPOSITORY_ROOT / probe_path).read_text(encoding="utf-8")
             self.assertNotRegex(probe, r'\$BIN[^\n]*\bsemantic-search\b')
             self.assertIn(" search --json ", probe)
+
+        self.assertIn('"$BIN" web status --json', unix_smoke)
+        self.assertIn(".result.process_health.healthy == true", unix_smoke)
 
 
 if __name__ == "__main__":

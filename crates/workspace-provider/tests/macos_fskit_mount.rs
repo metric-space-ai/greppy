@@ -9,6 +9,7 @@ use greppy_workspace_core::{
 use std::fs;
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -107,6 +108,16 @@ fn activated_fskit_provider_satisfies_shared_mounted_contract() {
         );
         thread::sleep(Duration::from_millis(25));
     }
+
+    let private_git_link = root.join(".git");
+    fs::write(&private_git_link, b"gitdir: /private/greppy/control\n")
+        .expect("FSKit must create the agent's private .git link");
+    assert_eq!(
+        fs::metadata(&private_git_link).unwrap().mode() & u32::from(libc::S_IFMT),
+        u32::from(libc::S_IFREG),
+        "FSKit must preserve the regular-file type bits returned after create"
+    );
+    fs::remove_file(private_git_link).unwrap();
 
     let immutable_inode = core
         .metadata(&workspace, "nested/deeper/base.txt")

@@ -899,6 +899,7 @@ struct TemporaryBaseWorktree {
     primary: PathBuf,
     path: PathBuf,
     _parent: tempfile::TempDir,
+    _lease: greppy_core::cache::FileLock,
 }
 
 impl TemporaryBaseWorktree {
@@ -915,6 +916,8 @@ impl TemporaryBaseWorktree {
             .prefix("greppy-linked-base-checkout-")
             .tempdir_in(shared_data_root)
             .map_err(|error| Error::io("create clean Base checkout parent", error))?;
+        let lease = greppy_core::cache::create_base_build_staging_lease(parent.path())
+            .map_err(|error| Error::io("lease clean Base checkout", error))?;
         let path = parent.path().join("worktree");
         let output = Command::new("git")
             .arg("-C")
@@ -934,6 +937,7 @@ impl TemporaryBaseWorktree {
             primary: primary.to_path_buf(),
             path,
             _parent: parent,
+            _lease: lease,
         })
     }
 
@@ -1175,6 +1179,36 @@ fn prepare_base_store_paths(
         .prefix("greppy-base-build-")
         .tempdir_in(shared_data_root)
         .map_err(|error| Error::io("create Base build staging directory", error))?;
+    let _staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
+        .map_err(|error| Error::io("lease Base build staging directory", error))?;
+    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
+        .map_err(|error| Error::io("resolve Base staging lease", error))?];
+    // Git may return the canonical /private/... spelling while the configured
+    // shared root uses /tmp/... (or another directory alias). Compare the same
+    // namespace so the child's checkout lease is not silently omitted.
+    let canonical_shared = std::fs::canonicalize(shared_data_root)
+        .map_err(|error| Error::io("resolve shared Base staging root", error))?;
+    let canonical_worktree = std::fs::canonicalize(worktree_path)
+        .map_err(|error| Error::io("resolve Base staging worktree", error))?;
+    if let Some(checkout) = canonical_worktree.ancestors().find(|ancestor| {
+        ancestor.parent() == Some(canonical_shared.as_path())
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("greppy-linked-base-checkout-"))
+    }) {
+        lease_roots.push(
+            std::fs::canonicalize(checkout)
+                .map_err(|error| Error::io("resolve Base checkout lease", error))?,
+        );
+    }
+    if let Some(inherited) = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES) {
+        lease_roots.extend(std::env::split_paths(&inherited));
+    }
+    lease_roots.sort();
+    lease_roots.dedup();
+    let child_leases = std::env::join_paths(&lease_roots)
+        .map_err(|error| Error::Invalid(format!("cannot pass Base staging leases: {error}")))?;
     let staging_data = staging.path().join("data");
     std::fs::create_dir_all(&staging_data)
         .map_err(|error| Error::io("create Base build data directory", error))?;
@@ -1195,6 +1229,10 @@ fn prepare_base_store_paths(
     command
         .current_dir(worktree_path)
         .env("GREPPY_STORE_DIR", &staging_data)
+        .env(
+            greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
+            child_leases,
+        )
         // The staging store isolates the graph, not the inference artifacts:
         // without this the child opened an empty content cache under the
         // staging root, re-embedded every span of the repository for each

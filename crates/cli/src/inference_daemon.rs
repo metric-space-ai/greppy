@@ -16,6 +16,7 @@ const CRASH_COOLDOWN: Duration = Duration::from_secs(2);
 const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
 const ENV_RUNTIME_DIR: &str = "GREPPY_RUNTIME_DIR";
+const ENV_WEB_RUNTIME_DIR: &str = "GREPPY_WEB_RUNTIME_DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOutcome<T> {
@@ -94,7 +95,29 @@ struct RuntimeScope {
 
 impl RuntimeScope {
     fn from_env() -> Self {
-        let explicit_runtime = env_absolute_path(ENV_RUNTIME_DIR);
+        Self::for_kind("embedding")
+    }
+
+    fn for_kind(kind: &str) -> Self {
+        Self::from_roots(
+            kind,
+            env_absolute_path(ENV_RUNTIME_DIR),
+            env_absolute_path(ENV_WEB_RUNTIME_DIR),
+        )
+    }
+
+    fn from_roots(
+        kind: &str,
+        shared: Option<std::path::PathBuf>,
+        browser: Option<std::path::PathBuf>,
+    ) -> Self {
+        // Browser isolation must never create another model owner. The legacy
+        // runtime override still isolates an entire explicit test harness.
+        let explicit_runtime = if kind == "web-runtime" {
+            browser.or(shared)
+        } else {
+            shared
+        };
         let identity = explicit_runtime
             .as_ref()
             .map(|path| runtime_identity(b"runtime-dir\0", path));
@@ -197,7 +220,7 @@ pub(super) struct Endpoint {
 
 impl Endpoint {
     pub(super) fn for_identity(kind: &'static str, identity: &str) -> Option<Self> {
-        let runtime = RuntimeScope::from_env();
+        let runtime = RuntimeScope::for_kind(kind);
         let digest = endpoint_digest(kind, identity, runtime.identity.as_deref());
         #[cfg(unix)]
         let address = {
@@ -347,7 +370,7 @@ pub(super) fn request(
                 RequestOutcome::Failed
             };
         }
-        match request_once(endpoint, &encoded, remaining, max_response_bytes) {
+        match request_once(endpoint, &encoded, deadline, max_response_bytes) {
             RequestAttempt::Response(response) => return RequestOutcome::Response(response),
             RequestAttempt::NoDaemon => return RequestOutcome::NoDaemon,
             RequestAttempt::Failed if capacity_seen => return RequestOutcome::DaemonBusy,
@@ -378,27 +401,61 @@ enum RequestAttempt<T> {
 fn request_once(
     endpoint: &Endpoint,
     encoded: &[u8],
-    timeout: Duration,
+    deadline: Instant,
     max_response_bytes: usize,
 ) -> RequestAttempt<serde_json::Value> {
-    let mut stream = match TransportStream::connect(endpoint, timeout) {
+    request_once_with_transport(
+        encoded,
+        deadline,
+        max_response_bytes,
+        |timeout| TransportStream::connect(endpoint, timeout),
+        Instant::now,
+    )
+}
+
+// Keep one absolute request deadline across connection, write, read and capacity
+// retries. Injectable connection and clock allow testing phase exhaustion with
+// real socket frames, without sleeps or a scheduler-sensitive timing assertion.
+fn request_once_with_transport(
+    encoded: &[u8],
+    deadline: Instant,
+    max_response_bytes: usize,
+    connect: impl FnOnce(Duration) -> std::io::Result<TransportStream>,
+    mut now: impl FnMut() -> Instant,
+) -> RequestAttempt<serde_json::Value> {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return RequestAttempt::Failed;
+    }
+    let mut stream = match connect(remaining) {
         Ok(stream) => stream,
         Err(error) if no_daemon_error(&error) => return RequestAttempt::NoDaemon,
         Err(_) => return RequestAttempt::Failed,
     };
-    if stream
-        .set_timeouts(CONNECTION_WRITE_TIMEOUT.min(timeout), timeout)
-        .is_err()
-    {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
         return RequestAttempt::Failed;
     }
-    if write_frame(&mut stream, encoded, CONNECTION_WRITE_TIMEOUT.min(timeout)).is_err() {
+    let write_timeout = CONNECTION_WRITE_TIMEOUT.min(remaining);
+    if stream.set_timeouts(write_timeout, remaining).is_err() {
         return RequestAttempt::Failed;
     }
-    let response = match read_frame(&mut stream, max_response_bytes, timeout) {
+    if write_frame(&mut stream, encoded, write_timeout).is_err() {
+        return RequestAttempt::Failed;
+    }
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return RequestAttempt::Failed;
+    }
+    let response = match read_frame(&mut stream, max_response_bytes, remaining) {
         Ok(response) => response,
         Err(_) => return RequestAttempt::Failed,
     };
+    // A readable response can race with expiry (or a descheduled caller).
+    // Do not accept it as an on-time result merely because the read succeeded.
+    if now() >= deadline {
+        return RequestAttempt::Failed;
+    }
     match serde_json::from_str(&response) {
         Ok(response) if retryable_capacity_response(&response) => RequestAttempt::RetryableCapacity,
         Ok(response) => RequestAttempt::Response(response),
@@ -1267,12 +1324,15 @@ fn write_frame(
     let deadline = Instant::now() + timeout;
     let mut written = 0usize;
     while written < bytes.len() {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "daemon frame write timed out",
             ));
         }
+        #[cfg(unix)]
+        stream.bound_write_timeout(remaining)?;
         match stream.write(&bytes[written..]) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -1297,12 +1357,15 @@ fn read_frame(
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
     let mut buffer = [0u8; 4096];
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "daemon frame read timed out",
             ));
         }
+        #[cfg(unix)]
+        stream.bound_read_timeout(remaining)?;
         match stream.read(&mut buffer) {
             #[cfg(windows)]
             Ok(0) => {
@@ -1451,7 +1514,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(unix)]
 fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    std::fs::create_dir_all(path)?;
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::new(
@@ -1459,7 +1524,11 @@ fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
             "daemon runtime directory is not an owned directory",
         ));
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    // Clients in a write-confined sandbox may connect to an existing shared
+    // daemon. Do not require a chmod merely to resolve its endpoint.
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
     let secured = std::fs::symlink_metadata(path)?;
     if secured.permissions().mode() & 0o077 != 0 {
         return Err(std::io::Error::new(
@@ -1544,6 +1613,25 @@ impl TransportStream {
     fn set_timeouts(&self, write: Duration, read: Duration) -> std::io::Result<()> {
         self.0.set_write_timeout(Some(write))?;
         self.0.set_read_timeout(Some(read))
+    }
+
+    // A deadline check outside a blocking syscall is insufficient: after a
+    // partial frame, the next syscall must use the remaining budget, not the
+    // original connection timeout. Preserve any stricter transport cap.
+    fn bound_read_timeout(&self, remaining: Duration) -> std::io::Result<()> {
+        let timeout = self
+            .0
+            .read_timeout()?
+            .map_or(remaining, |cap| cap.min(remaining));
+        self.0.set_read_timeout(Some(timeout))
+    }
+
+    fn bound_write_timeout(&self, remaining: Duration) -> std::io::Result<()> {
+        let timeout = self
+            .0
+            .write_timeout()?
+            .map_or(remaining, |cap| cap.min(remaining));
+        self.0.set_write_timeout(Some(timeout))
     }
 }
 
@@ -2008,6 +2096,107 @@ mod tests {
             legacy,
             endpoint_digest("summary", "model|prompt|cpu", None),
             "workspace/store selection must not split the machine daemon"
+        );
+    }
+
+    #[test]
+    fn private_browser_roots_do_not_split_inference_ownership() {
+        for kind in ["embedding", "summary"] {
+            for shared in [None, Some(std::path::PathBuf::from("/tmp/release-harness"))] {
+                let a = RuntimeScope::from_roots(
+                    kind,
+                    shared.clone(),
+                    Some("/tmp/greppy-agent-a".into()),
+                );
+                let b = RuntimeScope::from_roots(kind, shared, Some("/tmp/greppy-agent-b".into()));
+                assert_eq!(a.identity, b.identity);
+                assert_eq!(a.state_dir, b.state_dir, "model locks must be shared");
+                assert_eq!(
+                    endpoint_digest(kind, "same-model|cpu", a.identity.as_deref()),
+                    endpoint_digest(kind, "same-model|cpu", b.identity.as_deref()),
+                );
+            }
+        }
+        let a = RuntimeScope::from_roots("web-runtime", None, Some("/tmp/browser-a".into()));
+        let b = RuntimeScope::from_roots("web-runtime", None, Some("/tmp/browser-b".into()));
+        assert_ne!(a.identity, b.identity);
+        assert_ne!(a.state_dir, b.state_dir);
+    }
+
+    #[test]
+    fn separate_agent_processes_contend_for_the_same_model_owner() {
+        const CHILD: &str = "GREPPY_TEST_SHARED_OWNER_CHILD";
+        const TEST: &str =
+            "inference_daemon::tests::separate_agent_processes_contend_for_the_same_model_owner";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = RuntimeScope::from_env();
+            let lock = greppy_core::cache::acquire_named_lock_in(
+                &runtime.state_dir,
+                "inference-embedding-cpu.owner",
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            )
+            .unwrap();
+            assert!(
+                lock.is_none(),
+                "private browser root bypassed the shared owner"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("daemon-state");
+        let _owner = greppy_core::cache::acquire_named_lock_in(
+            &state,
+            "inference-embedding-cpu.owner",
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        for agent in ["first-agent", "second-agent"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ENV_RUNTIME_DIR, temp.path())
+                .env(ENV_WEB_RUNTIME_DIR, temp.path().join(agent))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{agent}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_client_can_resolve_an_existing_shared_endpoint_without_writes() {
+        const CHILD: &str = "GREPPY_TEST_READ_ONLY_ENDPOINT_CHILD";
+        const TEST: &str = "inference_daemon::tests::sandboxed_client_can_resolve_an_existing_shared_endpoint_without_writes";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(Endpoint::for_identity("embedding", "same-model|cpu").is_some());
+            return;
+        }
+        let temp = tempfile::Builder::new()
+            .prefix("g-endpoint-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        ensure_private_dir(temp.path()).unwrap();
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)(deny file-write*)"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ENV_RUNTIME_DIR, temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "read-only endpoint resolution failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -2967,6 +3156,138 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "daemon did not become reachable");
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_deadline_is_not_restarted_between_transport_phases() {
+        use std::os::unix::net::UnixStream;
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        // Each clock observation is a phase boundary: before connect, before
+        // write, before read, after read. The response is already available, so a
+        // success after either exhausted boundary cannot be blamed on timing.
+        for (elapsed, sent_request, succeeds) in [
+            ([0, 5, 5, 5], false, false),
+            ([0, 1, 5, 5], true, false),
+            ([0, 1, 2, 5], true, false),
+            ([0, 1, 2, 3], true, true),
+        ] {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            let probe = client.try_clone().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.write_all(b"{\"state\":\"ready\"}\n").unwrap();
+            let mut times = elapsed.into_iter();
+            let result = request_once_with_transport(
+                b"{\"op\":\"status\"}\n",
+                deadline,
+                4096,
+                |budget| {
+                    assert_eq!(budget, Duration::from_secs(5));
+                    Ok(TransportStream(client))
+                },
+                || start + Duration::from_secs(times.next().expect("unexpected phase")),
+            );
+            if succeeds {
+                assert_eq!(
+                    result,
+                    RequestAttempt::Response(serde_json::json!({"state": "ready"}))
+                );
+                assert!(probe.write_timeout().unwrap().unwrap() <= Duration::from_secs(4));
+                assert!(probe.read_timeout().unwrap().unwrap() <= Duration::from_secs(3));
+            } else {
+                assert_eq!(result, RequestAttempt::Failed);
+            }
+            drop(probe);
+            // The request stream has dropped; read only the expected request,
+            // avoiding platform-specific reset semantics for an unread reply.
+            if sent_request {
+                let mut request = [0; 16];
+                peer.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"{\"op\":\"status\"}\n");
+            } else {
+                match peer.read(&mut [0; 1]) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("expired connection must send no request: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expired_request_deadline_does_not_attempt_connection() {
+        let instant = Instant::now();
+        let result = request_once_with_transport(
+            b"{}\n",
+            instant,
+            4096,
+            |_| panic!("an expired request must not connect"),
+            || instant,
+        );
+        assert_eq!(result, RequestAttempt::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_io_binds_blocking_socket_timeout_to_its_own_budget() {
+        use std::os::unix::net::UnixStream;
+        let budget = Duration::from_secs(5);
+        // No wall-clock race: queued data makes both operations immediate.
+        // Inspect the kernel timeout instead of asserting scheduler latency.
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        writer.write_all(b"ready\n").unwrap();
+        let mut reader = TransportStream(reader);
+        assert_eq!(read_frame(&mut reader, 64, budget).unwrap(), "ready");
+        assert!(
+            reader.0.read_timeout().unwrap().unwrap() <= budget,
+            "a read syscall must not retain a timeout longer than the frame budget"
+        );
+
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut writer = TransportStream(writer);
+        write_frame(&mut writer, b"ready\n", budget).unwrap();
+        assert!(
+            writer.0.write_timeout().unwrap().unwrap() <= budget,
+            "a write syscall must not retain a timeout longer than the frame budget"
+        );
+        let mut value = [0; 6];
+        reader.read_exact(&mut value).unwrap();
+        assert_eq!(&value, b"ready\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_io_bounds_unlimited_sockets_and_preserves_stricter_caps() {
+        use std::os::unix::net::UnixStream;
+        let budget = Duration::from_secs(5);
+        for configured in [None, Some(Duration::from_secs(1))] {
+            let expected_cap = configured.unwrap_or(budget);
+            let (reader, mut peer) = UnixStream::pair().unwrap();
+            reader.set_read_timeout(configured).unwrap();
+            peer.write_all(b"ready\n").unwrap();
+            let mut reader = TransportStream(reader);
+            assert_eq!(read_frame(&mut reader, 64, budget).unwrap(), "ready");
+            assert!(reader.0.read_timeout().unwrap().unwrap() <= expected_cap);
+            assert_eq!(reader.0.write_timeout().unwrap(), None);
+
+            let (writer, mut peer) = UnixStream::pair().unwrap();
+            writer.set_write_timeout(configured).unwrap();
+            let mut writer = TransportStream(writer);
+            write_frame(&mut writer, b"ready\n", budget).unwrap();
+            assert!(writer.0.write_timeout().unwrap().unwrap() <= expected_cap);
+            assert_eq!(writer.0.read_timeout().unwrap(), None);
+            let mut value = [0; 6];
+            peer.read_exact(&mut value).unwrap();
+            assert_eq!(&value, b"ready\n");
         }
     }
 

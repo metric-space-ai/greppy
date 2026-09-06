@@ -238,22 +238,133 @@ pub fn models_root() -> PathBuf {
 }
 
 /// Staging directories the immutable Base build creates next to the managed
-/// stores. Both are `tempfile` directories that are removed when the build
-/// finishes normally; a build that dies (ENOSPC, OOM, SIGKILL) leaves them
-/// behind and nothing else ever looks at them again.
+/// stores. Both are `tempfile` directories normally removed after the build;
+/// abnormal termination may leave them for lease-checked reclamation.
 pub const BASE_BUILD_STAGING_PREFIXES: [&str; 2] =
     ["greppy-base-build-", "greppy-linked-base-checkout-"];
 
-/// Remove abandoned Base build staging directories under `shared_data_root`
-/// that were last modified more than `ttl` ago. Only the two well-known
-/// prefixes are touched; anything else under the root is left alone. Returns
-/// the number of directories removed.
+const BASE_BUILD_STAGING_LEASE: &str = "base-build-staging.lease";
+/// Internal handoff: an index child retains these leases independently of its
+/// parent, including if that parent exits before the child finishes.
+pub const ENV_BASE_BUILD_STAGING_LEASES: &str = "GREPPY_BASE_BUILD_STAGING_LEASES";
+
+fn checked_staging_root(path: &Path) -> io::Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)?;
+    let known_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            BASE_BUILD_STAGING_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        });
+    if !path.is_absolute() || metadata.file_type().is_symlink() || !metadata.is_dir() || !known_name
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Base build staging directory",
+        ));
+    }
+    fs::canonicalize(path)
+}
+
+/// Call immediately after creating the unique staging directory, before any
+/// work. Shared leases let an index child take ownership before its parent dies.
+pub fn create_base_build_staging_lease(path: &Path) -> io::Result<FileLock> {
+    let path = checked_staging_root(path)?;
+    acquire_named_lock_in(&path, BASE_BUILD_STAGING_LEASE, LockMode::Shared, false)?
+        .ok_or_else(|| io::Error::other("failed to acquire Base build staging lease"))
+}
+
+fn existing_staging_lease(path: &Path, mode: LockMode) -> io::Result<Option<FileLock>> {
+    let root = checked_staging_root(path)?;
+    let locks = root.join("locks");
+    let directory = fs::symlink_metadata(&locks)?;
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid staging lease directory",
+        ));
+    }
+    let path = locks.join(BASE_BUILD_STAGING_LEASE);
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid staging lease file",
+        ));
+    }
+    // Never create a missing lease: legacy/unidentified directories are not
+    // proven abandoned, and a child must not resurrect a reclaimed directory.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path)?;
+    if !lock_file(&file, mode, true)? {
+        return Ok(None);
+    }
+    let guard = FileLock { file, path };
+    let current = fs::symlink_metadata(&guard.path)?;
+    if !current.is_file() || current.file_type().is_symlink() || !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Base build staging was reclaimed",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = guard.file.metadata()?;
+        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+            return Err(io::Error::other("Base build staging lease was replaced"));
+        }
+    }
+    Ok(Some(guard))
+}
+
+pub fn retain_base_build_staging_leases_from_env() -> io::Result<Vec<FileLock>> {
+    let Some(value) = std::env::var_os(ENV_BASE_BUILD_STAGING_LEASES) else {
+        return Ok(Vec::new());
+    };
+    let mut guards = Vec::new();
+    for path in std::env::split_paths(&value) {
+        guards.push(
+            existing_staging_lease(&path, LockMode::Shared)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Base build staging is being reclaimed",
+                )
+            })?,
+        );
+    }
+    Ok(guards)
+}
+
+/// Reclaim only old staging with a known lease and no live holder. Directory
+/// mtime alone cannot prove abandonment: writes inside it do not refresh it.
 pub fn reap_stale_base_build_dirs(shared_data_root: &Path, ttl: Duration) -> io::Result<usize> {
+    Ok(reap_base_build_staging(shared_data_root, ttl, false)?
+        .removed
+        .len())
+}
+
+fn reap_base_build_staging(
+    shared_data_root: &Path,
+    ttl: Duration,
+    dry_run: bool,
+) -> io::Result<GcReport> {
+    let mut report = GcReport {
+        dry_run,
+        ..GcReport::default()
+    };
     let Ok(entries) = fs::read_dir(shared_data_root) else {
-        return Ok(0);
+        return Ok(report);
     };
     let now = SystemTime::now();
-    let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -279,11 +390,29 @@ pub fn reap_stale_base_build_dirs(shared_data_root: &Path, ttl: Duration) -> io:
         if !stale {
             continue;
         }
-        if fs::remove_dir_all(entry.path()).is_ok() {
-            removed += 1;
+        let path = entry.path();
+        let lease = match existing_staging_lease(&path, LockMode::Exclusive) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                let bytes = path_size_no_symlink(&path);
+                report.scanned_bytes = report.scanned_bytes.saturating_add(bytes);
+                report.locked_bytes = report.locked_bytes.saturating_add(bytes);
+                report.skipped_locked.push(path);
+                continue;
+            }
+            // Missing legacy ownership, permissions or malformed lease: fail
+            // closed. Leave it listed as unmanaged for an explicit audit.
+            Err(_) => continue,
+        };
+        let bytes = path_size_no_symlink(&path);
+        report.scanned_bytes = report.scanned_bytes.saturating_add(bytes);
+        if dry_run || fs::remove_dir_all(&path).is_ok() {
+            report.removed.push(path);
+            report.removed_bytes = report.removed_bytes.saturating_add(bytes);
         }
+        drop(lease);
     }
-    Ok(removed)
+    Ok(report)
 }
 
 pub fn agent_base_stores_root() -> PathBuf {
@@ -605,14 +734,18 @@ pub fn run_gc(
     let Some(_gc_lock) = acquire_named_lock("global.gc", LockMode::Exclusive, false)? else {
         unreachable!("blocking lock acquisition returned no guard")
     };
-    if !dry_run {
-        let _ = reap_stale_base_build_dirs(&data_root(), BASE_BUILD_STAGING_TTL);
-    }
-    gc_locked(policy, dry_run, current_workspace_root)
+    let staging = reap_base_build_staging(&data_root(), BASE_BUILD_STAGING_TTL, dry_run)?;
+    let mut report = gc_locked(policy, dry_run, current_workspace_root)?;
+    report.scanned_bytes = report.scanned_bytes.saturating_add(staging.scanned_bytes);
+    report.removed_bytes = report.removed_bytes.saturating_add(staging.removed_bytes);
+    report.locked_bytes = report.locked_bytes.saturating_add(staging.locked_bytes);
+    report.removed.extend(staging.removed);
+    report.skipped_locked.extend(staging.skipped_locked);
+    Ok(report)
 }
 
-/// A Base build that has not touched its staging directory for this long is
-/// abandoned: a live build rewrites graph and cache files continuously.
+/// Minimum age for reclaiming a staging directory whose lease is unheld.
+/// This age is not a substitute for the process-lifetime lease.
 pub const BASE_BUILD_STAGING_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Explicitly remove verified cache objects. `workspace_root = Some` clears
@@ -1767,6 +1900,8 @@ mod tests {
         }
         let old = SystemTime::now() - Duration::from_secs(7 * 60 * 60);
         for dir in [&stale_build, &stale_checkout] {
+            // Explicitly known, completed owners. Age alone is not ownership.
+            drop(create_base_build_staging_lease(dir).unwrap());
             set_directory_modified(dir, old);
         }
         let removed = reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap();
@@ -1775,6 +1910,230 @@ mod tests {
         assert!(!stale_checkout.exists());
         assert!(fresh_build.is_dir(), "a live build must survive");
         assert!(unrelated.is_dir(), "only the exact prefixes are reaped");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reaper_preserves_active_and_unidentified_old_staging() {
+        let base = tempdir("reaper-live");
+        let active = base.join("greppy-base-build-active");
+        let legacy = base.join("greppy-base-build-legacy");
+        for path in [&active, &legacy] {
+            fs::create_dir_all(path.join("data")).unwrap();
+        }
+        let lease = create_base_build_staging_lease(&active).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7 * 60 * 60);
+        for path in [&active, &legacy] {
+            set_directory_modified(path, old);
+            let before = fs::metadata(path).unwrap().modified().unwrap();
+            fs::write(path.join("data/graph.db"), b"live output").unwrap();
+            assert_eq!(
+                fs::metadata(path).unwrap().modified().unwrap(),
+                before,
+                "writing a descendant must not be mistaken for a root heartbeat"
+            );
+        }
+        let report = reap_base_build_staging(&base, BASE_BUILD_STAGING_TTL, false).unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(report.skipped_locked, vec![active.clone()]);
+        assert!(active.join("data/graph.db").is_file());
+        assert!(legacy.join("data/graph.db").is_file());
+        drop(lease);
+        let dry = reap_base_build_staging(&base, BASE_BUILD_STAGING_TTL, true).unwrap();
+        assert_eq!(dry.removed, vec![active.clone()]);
+        assert!(dry.removed_bytes >= b"live output".len() as u64);
+        assert!(active.is_dir(), "dry-run must retain the candidate");
+        let actual = reap_base_build_staging(&base, BASE_BUILD_STAGING_TTL, false).unwrap();
+        assert_eq!(actual.removed, dry.removed);
+        assert_eq!(actual.removed_bytes, dry.removed_bytes);
+        assert!(!active.exists());
+        assert!(
+            legacy.is_dir(),
+            "unknown legacy ownership remains fail-closed"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn staging_lease_requires_existing_regular_ownership() {
+        let base = tempdir("reaper-invalid-lease");
+        let staging = base.join("greppy-base-build-invalid");
+        fs::create_dir_all(&staging).unwrap();
+        assert!(existing_staging_lease(&staging, LockMode::Shared).is_err());
+        assert!(
+            !staging.join("locks").exists(),
+            "retaining must not create ownership"
+        );
+        let lease_path = staging.join("locks").join(BASE_BUILD_STAGING_LEASE);
+        fs::create_dir_all(&lease_path).unwrap();
+        set_directory_modified(
+            &staging,
+            SystemTime::now() - Duration::from_secs(7 * 60 * 60),
+        );
+        assert!(existing_staging_lease(&staging, LockMode::Shared).is_err());
+        assert_eq!(
+            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+            0
+        );
+        assert!(lease_path.is_dir());
+        fs::remove_dir_all(&staging).unwrap();
+        assert!(existing_staging_lease(&staging, LockMode::Shared).is_err());
+        assert!(!staging.exists(), "retaining must not resurrect staging");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_reaper_rejects_symlinked_ownership() {
+        use std::os::unix::fs::symlink;
+        let base = tempdir("reaper-symlink-lease");
+        let external = base.join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join(BASE_BUILD_STAGING_LEASE), b"keep").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7 * 60 * 60);
+        let file_link = base.join("greppy-base-build-file-link");
+        fs::create_dir_all(file_link.join("locks")).unwrap();
+        symlink(
+            external.join(BASE_BUILD_STAGING_LEASE),
+            file_link.join("locks").join(BASE_BUILD_STAGING_LEASE),
+        )
+        .unwrap();
+        let dir_link = base.join("greppy-base-build-dir-link");
+        fs::create_dir_all(&dir_link).unwrap();
+        symlink(&external, dir_link.join("locks")).unwrap();
+        let root_link = base.join("greppy-base-build-root-link");
+        symlink(&external, &root_link).unwrap();
+        for path in [&file_link, &dir_link] {
+            set_directory_modified(path, old);
+            assert!(existing_staging_lease(path, LockMode::Shared).is_err());
+        }
+        assert!(existing_staging_lease(&root_link, LockMode::Shared).is_err());
+        assert_eq!(
+            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+            0
+        );
+        assert!(file_link.is_dir() && dir_link.is_dir() && root_link.is_symlink());
+        assert_eq!(
+            fs::read(external.join(BASE_BUILD_STAGING_LEASE)).unwrap(),
+            b"keep"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_reports_staging_deletions_and_held_leases() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("gc-staging-report");
+        let staging = base.join("greppy-base-build-completed");
+        let active = base.join("greppy-linked-base-checkout-held");
+        for path in [&staging, &active] {
+            fs::create_dir_all(path.join("data")).unwrap();
+            fs::write(path.join("data/payload"), b"fixture").unwrap();
+        }
+        drop(create_base_build_staging_lease(&staging).unwrap());
+        let lease = create_base_build_staging_lease(&active).unwrap();
+        for path in [&staging, &active] {
+            set_directory_modified(path, SystemTime::now() - Duration::from_secs(7 * 60 * 60));
+        }
+        let bytes = path_size_no_symlink(&staging);
+        std::env::set_var("GREPPY_STORE_DIR", &base);
+        let policy = GcPolicy {
+            ttl: Duration::from_secs(1),
+            high_water_bytes: u64::MAX,
+            low_water_bytes: u64::MAX,
+            interval: Duration::ZERO,
+        };
+        let dry = run_gc(&policy, true, None).unwrap();
+        assert_eq!(dry.removed, vec![staging.clone()]);
+        assert_eq!(dry.removed_bytes, bytes);
+        assert_eq!(dry.skipped_locked, vec![active.clone()]);
+        assert!(staging.is_dir());
+        let actual = run_gc(&policy, false, None).unwrap();
+        assert_eq!(actual.removed, dry.removed);
+        assert_eq!(actual.removed_bytes, dry.removed_bytes);
+        assert_eq!(actual.skipped_locked, dry.skipped_locked);
+        assert!(!staging.exists() && active.is_dir());
+        std::env::remove_var("GREPPY_STORE_DIR");
+        drop(lease);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[ignore = "invoked only by the staging lease subprocess regression"]
+    fn staging_lease_subprocess_holder() {
+        let Some(ready) = std::env::var_os("GREPPY_TEST_STAGING_LEASE_READY") else {
+            return;
+        };
+        let _leases = retain_base_build_staging_leases_from_env().unwrap();
+        fs::write(ready, b"ready").unwrap();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+    }
+
+    #[test]
+    fn staging_child_retains_lease_after_parent_releases_it() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let base = tempdir("reaper-child");
+        let staging = base.join("greppy-base-build-child");
+        fs::create_dir_all(staging.join("data")).unwrap();
+        let parent = create_base_build_staging_lease(&staging).unwrap();
+        let ready = staging.join("data/ready");
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cache::tests::staging_lease_subprocess_holder",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(
+                    ENV_BASE_BUILD_STAGING_LEASES,
+                    std::env::join_paths([&staging]).unwrap(),
+                )
+                .env("GREPPY_TEST_STAGING_LEASE_READY", &ready)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "lease child exited before ready"
+            );
+            assert!(
+                std::time::Instant::now() < until,
+                "lease child readiness timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(parent);
+        set_directory_modified(
+            &staging,
+            SystemTime::now() - Duration::from_secs(7 * 60 * 60),
+        );
+        assert_eq!(
+            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+            0
+        );
+        assert!(
+            staging.is_dir(),
+            "child lifetime is independent of the parent lease"
+        );
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
+        assert_eq!(
+            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+            1
+        );
+        assert!(!staging.exists());
         let _ = fs::remove_dir_all(base);
     }
 

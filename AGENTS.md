@@ -201,7 +201,7 @@ A bare argument is a CSS selector:
   greppy web match QUERY                  filter JSONL records from stdin
   greppy web extract QUERY                values; named captures become fields
   greppy web inspect TARGET               one element: html, attrs, box, styles
-  greppy web dom QUERY                    raw DOM query, html, diff
+  greppy web dom html QUERY               raw HTML for matching elements
   greppy web screenshot                   the rendered page as an artifact
   greppy web screenshot --render-complete wait for complete rendering; use only
                                           when the final pixels are required
@@ -211,7 +211,7 @@ A bare argument is a CSS selector:
   greppy web trace start                  begin a Playwright trace
 
 ACT — TARGET is css=..., xpath=..., text=..., role=... name=...:
-  greppy web click TARGET                 click and return the updated page state
+  greppy web click TARGET                 click and report the action result
   greppy web fill TARGET VALUE            set a field; --from-env for secrets
   greppy web type TARGET TEXT             type character by character
   greppy web clear TARGET                 empty a field
@@ -227,7 +227,7 @@ ACT — TARGET is css=..., xpath=..., text=..., role=... name=...:
 
 SESSIONS AND TABS — several agents may drive greppy at once, so a context is
 never shared implicitly. Name a session to share one on purpose:
-  greppy web session new                  a browser context of your own
+  greppy web session create               a browser context of your own
   greppy web tab new                      a page in it
   greppy web runtime status               the long-lived owner
   greppy web status                       availability
@@ -239,7 +239,7 @@ SCRIPTS AND RESULTS:
   greppy web run --script-file F          a Playwright script; --mode active
                                           uses this browser, standalone its own
   greppy web endpoint start               a native Playwright connect endpoint
-  greppy web script alias NAME PATH       name a script from your files
+  greppy web script save NAME --file PATH store a script from your files
   greppy web artifact list                what a session produced
   greppy web artifacts                    artifacts of a session
   greppy web result next CURSOR           the rest of a truncated result
@@ -249,10 +249,11 @@ SCRIPTS AND RESULTS:
   greppy web search QUERY                 search the public web
   greppy web research QUERY               bounded multi-page research
 
-Every action returns the page state after it: url and title change, tree delta,
-new refs, console and network counts, and the ids you need next. Use that
-state. Observe again only when you need another view, a wider scope, or
-refreshed targets.
+Actions return results and session identifiers, but not always updated page
+contents. Use returned state when present; otherwise observe before deciding
+the next target. Successful dispatch alone does not prove the intended page
+change. Use dom html when you need attributes or relationships absent from
+observe.
 
 A target that matches more than one node FAILS. Pass --first, --last or
 --nth N when you mean it. Prefer a ref from observe over guessed CSS: refs are

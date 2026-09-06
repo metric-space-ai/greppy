@@ -210,6 +210,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_observe_retains_the_complete_query_operand() {
+        for query in ["role=dialog", "css=dialog button", "css=\"dialog button\"", "xpath=//dialog"] {
+            let cli = Cli::try_parse_from(["greppy", "web", "observe", query, "--json"]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Web {
+                command: WebCommand::Results(ResultsCommand::Observe { query: Some(value), json: true, .. })
+            }) if value == query));
+        }
+        assert!(Cli::try_parse_from(["greppy", "web", "observe", "css=dialog", "button"]).is_err());
+    }
+
+    #[test]
     fn parse_web_observe_search_read_research_flags() {
         let cli = Cli::try_parse_from(["greppy", "web", "observe", "--session", "wrs_1", "--json"])
             .unwrap();

@@ -339,6 +339,12 @@ fn install_platform_autostart(data_root: &Path, mount_root: &Path) -> Result<(),
 fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
+    let app = locate_macos_app(&current)?;
+    let cli = macos_autostart_cli(&app)?;
+    // Even the already-healthy setup path can be invoked by a development
+    // binary. Never persist that caller as the next login's provider launcher.
+    // Bind startup to the CLI sealed into the same validated FSKit application.
+    validate_macos_fskit_installation(&app)?;
     let home = PathBuf::from(
         std::env::var_os("HOME")
             .ok_or_else(|| "HOME is unavailable for LaunchAgent installation".to_string())?,
@@ -350,8 +356,47 @@ fn install_platform_autostart(data_root: &Path, _mount_root: &Path) -> Result<()
     fs::create_dir_all(&agents)
         .map_err(|error| format!("cannot create {}: {error}", agents.display()))?;
     let plist = agents.join("ai.metric-space.greppy.workspace.plist");
-    atomic_write_autostart(&plist, &render_macos_launch_agent(&current, data_root)?)?;
+    atomic_write_autostart(&plist, &render_macos_launch_agent(&cli, data_root)?)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autostart_cli(app: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app = fs::canonicalize(app).map_err(|error| {
+        format!(
+            "cannot resolve FSKit application {}: {error}",
+            app.display()
+        )
+    })?;
+    let cli = app.join("Contents/Resources/bin/greppy");
+    let recovery = "install the complete notarized Greppy application package before registering workspace autostart; no LaunchAgent was changed";
+    let metadata = fs::symlink_metadata(&cli).map_err(|error| {
+        format!(
+            "FSKit application has no bundled CLI at {}: {error}; {recovery}",
+            cli.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "bundled autostart CLI must be a regular executable, not a symlink or directory: {}; {recovery}",
+            cli.display()
+        ));
+    }
+    let resolved = fs::canonicalize(&cli).map_err(|error| {
+        format!(
+            "cannot resolve bundled CLI {}: {error}; {recovery}",
+            cli.display()
+        )
+    })?;
+    if !resolved.starts_with(&app) {
+        return Err(format!(
+            "bundled autostart CLI escapes the FSKit application: {}; {recovery}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 #[cfg(target_os = "windows")]
@@ -429,6 +474,13 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
     validate_macos_fskit_installation(&app)?;
     match macos_fskit_extension_status(&app) {
         Ok(MacosFsKitExtensionStatus::Enabled) => {}
+        Ok(MacosFsKitExtensionStatus::UnavailableToFsKit) => {
+            record_macos_fskit_activation_required(data_root)?;
+            return Err(format!(
+                "Greppy Workspace FS is registered in pluginkit, but FSKit does not enumerate this extension. A checked switch is not proof that macOS can mount it. No mount was attempted. Capture native status with `{}/Contents/MacOS/GreppyWorkspaceFS --fskit-status` and inspect the macOS fskitd logs; do not repeatedly reinstall the app or toggle the switch without resolving this registration mismatch",
+                app.display()
+            ));
+        }
         Ok(status) => {
             record_macos_fskit_activation_required(data_root)?;
             open_macos_fskit_settings(&app)?;
@@ -439,9 +491,8 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
         }
         Err(error) => {
             record_macos_fskit_activation_required(data_root)?;
-            open_macos_fskit_settings(&app)?;
             return Err(format!(
-                "cannot verify approval of Greppy Workspace FS for this exact application bundle: {error}; the File System Extensions dialog was opened. Enable `Greppy Workspace FS`, then rerun `greppy workspace setup`"
+                "cannot verify native FSKit availability for this exact application bundle: {error}; no mount was attempted. Use the matching notarized CLI and GreppyWorkspaceFS.app bundle, then rerun `greppy workspace setup`"
             ));
         }
     }
@@ -481,6 +532,7 @@ enum MacosFsKitExtensionStatus {
     Disabled,
     Missing,
     StaleRegistration,
+    UnavailableToFsKit,
 }
 
 #[cfg(target_os = "macos")]
@@ -491,6 +543,7 @@ impl MacosFsKitExtensionStatus {
             Self::Disabled => "disabled",
             Self::Missing => "not registered",
             Self::StaleRegistration => "registered without a valid version",
+            Self::UnavailableToFsKit => "not enumerated by FSKit",
         }
     }
 }
@@ -517,7 +570,8 @@ fn parse_macos_fskit_extension_status(
         ));
     }
     const BUNDLE_ID: &str = "ai.metricspace.greppy.workspacefs.extension";
-    let expected = expected_extension.to_string_lossy();
+    let expected =
+        fs::canonicalize(expected_extension).unwrap_or_else(|_| expected_extension.to_path_buf());
     let output = String::from_utf8_lossy(stdout);
     let mut saw_bundle = false;
     let mut matching_line = None;
@@ -526,11 +580,10 @@ fn parse_macos_fskit_extension_status(
             continue;
         }
         saw_bundle = true;
-        if line
-            .split('\t')
-            .next_back()
-            .is_some_and(|path| path.trim() == expected)
-        {
+        if line.split('\t').next_back().is_some_and(|path| {
+            let registered = Path::new(path.trim());
+            fs::canonicalize(registered).unwrap_or_else(|_| registered.to_path_buf()) == expected
+        }) {
             matching_line = Some(line.trim_start());
             break;
         }
@@ -567,12 +620,89 @@ fn macos_fskit_extension_status(app: &Path) -> Result<MacosFsKitExtensionStatus,
         ])
         .output()
         .map_err(|error| format!("cannot query FSKit registration with pluginkit: {error}"))?;
-    parse_macos_fskit_extension_status(
+    let registration = parse_macos_fskit_extension_status(
         output.status.code(),
         &output.stdout,
         &output.stderr,
         &expected_extension,
-    )
+    )?;
+    if registration != MacosFsKitExtensionStatus::Enabled {
+        return Ok(registration);
+    }
+    // pluginkit's election and FSKit's mount eligibility are different state.
+    // Ask the signed host through the public FSClient API before allocating a
+    // disk image or attempting a mount.
+    let protocol = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :GreppyFSKitStatusProtocolVersion"])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .map_err(|error| format!("cannot inspect FSKit status-helper contract: {error}"))?;
+    if !protocol.status.success() || protocol.stdout.trim_ascii() != b"1" {
+        return Err("installed app lacks the native FSKit status helper; install the matching notarized app bundle (the existing app was not modified)".into());
+    }
+    let helper = app.join("Contents/MacOS/GreppyWorkspaceFS");
+    require_bundled_file(&helper, "native FSKit status helper")?;
+    let output = Command::new(&helper)
+        .arg("--fskit-status")
+        .output()
+        .map_err(|error| format!("cannot invoke native FSKit status helper: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "native FSKit status helper exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_native_fskit_status(&output.stdout, &expected_extension)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_native_fskit_status(
+    bytes: &[u8],
+    expected_extension: &Path,
+) -> Result<MacosFsKitExtensionStatus, String> {
+    #[derive(serde::Deserialize)]
+    struct Module {
+        bundle_id: String,
+        path: PathBuf,
+        enabled: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct Status {
+        schema: String,
+        modules: Vec<Module>,
+    }
+    let status: Status = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid native FSKit status: {error}"))?;
+    if status.schema != "greppy.fskit-status.v1" {
+        return Err("unsupported native FSKit status schema".into());
+    }
+    let modules: Vec<_> = status
+        .modules
+        .iter()
+        .filter(|module| module.bundle_id == "ai.metricspace.greppy.workspacefs.extension")
+        .collect();
+    let [module] = modules.as_slice() else {
+        return if modules.is_empty() {
+            Ok(MacosFsKitExtensionStatus::UnavailableToFsKit)
+        } else {
+            Err(
+                "FSKit enumerated multiple Greppy extensions; exact registration is ambiguous"
+                    .into(),
+            )
+        };
+    };
+    let expected =
+        fs::canonicalize(expected_extension).unwrap_or_else(|_| expected_extension.to_path_buf());
+    let actual = fs::canonicalize(&module.path).unwrap_or_else(|_| module.path.clone());
+    if actual != expected {
+        return Ok(MacosFsKitExtensionStatus::StaleRegistration);
+    }
+    Ok(if module.enabled {
+        MacosFsKitExtensionStatus::Enabled
+    } else {
+        MacosFsKitExtensionStatus::Disabled
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -598,15 +728,60 @@ fn record_macos_fskit_activation_required(data_root: &Path) -> Result<(), String
         .map_err(|error| format!("cannot record FSKit activation state: {error}"))
 }
 
+/// Diagnostic guidance only: do not register, launch, mount or request approval.
+pub(crate) fn doctor_recovery_steps() -> Vec<String> {
+    let mut steps = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        match std::env::current_exe()
+            .map_err(|error| format!("cannot locate this CLI: {error}"))
+            .and_then(|exe| locate_macos_app(&exe))
+        {
+            Ok(app) => steps.push(format!(
+                "Run `greppy workspace setup` to validate registration and activation of {} before mounting. A stale heartbeat alone does not prove that the extension is disabled.",
+                app.display()
+            )),
+            Err(error) => steps.push(error),
+        }
+        steps.push("Extension approval and process liveness were not probed by this diagnostic; do not repeatedly toggle approval or replace the app based only on a heartbeat error.".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    steps.push("Run `greppy workspace setup` from the installed package to validate and start its portable workspace provider.".into());
+    steps.push("Then rerun `greppy workspace doctor --json`; do not start an agent until healthy=true. If it still fails, retain this diagnostic and the setup error; do not delete the workspace store.".into());
+    steps
+}
+
 #[cfg(target_os = "macos")]
 fn locate_macos_app(current_exe: &Path) -> Result<PathBuf, String> {
+    locate_macos_app_with_fallback(
+        current_exe,
+        Path::new("/Applications/GreppyWorkspaceFS.app"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn locate_macos_app_with_fallback(
+    current_exe: &Path,
+    installed_app: &Path,
+) -> Result<PathBuf, String> {
     if let Some(bundle) = current_exe.ancestors().find(|path| {
         path.file_name()
             .is_some_and(|name| name == "GreppyWorkspaceFS.app")
     }) {
         return Ok(bundle.to_path_buf());
     }
-    sibling(current_exe, "GreppyWorkspaceFS.app")
+    let bundled_app = sibling(current_exe, "GreppyWorkspaceFS.app")?;
+    if bundled_app.is_dir() {
+        return Ok(bundled_app);
+    }
+    if installed_app.is_dir() {
+        return Ok(installed_app.to_path_buf());
+    }
+    Err(format!(
+        "signed FSKit application is missing beside {} and at {}; install the notarized GreppyWorkspaceFS.app in /Applications or place it beside this development binary, then rerun `greppy workspace setup`",
+        current_exe.display(),
+        installed_app.display()
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -930,6 +1105,62 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_autostart_uses_the_packaged_cli_even_for_development_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let debug = root.path().join("target/debug/greppy");
+        let installed = root.path().join("Applications/GreppyWorkspaceFS.app");
+        let bundled = installed.join("Contents/Resources/bin/greppy");
+        fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        fs::write(&bundled, "fixture").unwrap();
+        fs::set_permissions(&bundled, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = locate_macos_app_with_fallback(&debug, &installed).unwrap();
+        let cli = macos_autostart_cli(&app).unwrap();
+        assert_eq!(cli, fs::canonicalize(&bundled).unwrap());
+        let plist = render_macos_launch_agent(&cli, root.path()).unwrap();
+        assert!(plist.contains(&xml_escape(cli.to_str().unwrap())));
+        assert!(!plist.contains("target/debug"));
+        assert!(!plist.contains(debug.to_str().unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_refuses_missing_nonexecutable_and_escaped_clis() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("GreppyWorkspaceFS.app");
+        let bin = app.join("Contents/Resources/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cli = bin.join("greppy");
+        let error = macos_autostart_cli(&app).unwrap_err();
+        assert!(error.contains("complete notarized"));
+        assert!(error.contains("no LaunchAgent was changed"));
+        fs::write(&cli, "fixture").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(macos_autostart_cli(&app)
+            .unwrap_err()
+            .contains("regular executable"));
+
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_cli = outside.join("greppy");
+        fs::write(&outside_cli, "outside fixture").unwrap();
+        fs::set_permissions(&outside_cli, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&cli).unwrap();
+        symlink(&outside_cli, &cli).unwrap();
+        assert!(macos_autostart_cli(&app).unwrap_err().contains("symlink"));
+        fs::remove_file(&cli).unwrap();
+        fs::remove_dir(&bin).unwrap();
+        symlink(&outside, &bin).unwrap();
+        assert!(macos_autostart_cli(&app).unwrap_err().contains("escapes"));
+        assert_eq!(fs::read_to_string(outside_cli).unwrap(), "outside fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn parses_hdiutil_anchor_device_without_localized_columns() {
         assert_eq!(
             parse_hdiutil_device("/dev/disk9\tApple_partition_scheme\n"),
@@ -942,16 +1173,36 @@ mod tests {
     #[test]
     fn locates_installed_or_sibling_fskit_application() {
         assert_eq!(
-            locate_macos_app(Path::new(
-                "/Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy"
-            ))
+            locate_macos_app_with_fallback(
+                Path::new("/Applications/GreppyWorkspaceFS.app/Contents/Resources/bin/greppy"),
+                Path::new("/unused/GreppyWorkspaceFS.app"),
+            )
             .unwrap(),
             Path::new("/Applications/GreppyWorkspaceFS.app")
         );
+
+        let root = tempfile::tempdir().unwrap();
+        let debug_dir = root.path().join("target/debug");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        let debug_binary = debug_dir.join("greppy");
+        let installed = root.path().join("Applications/GreppyWorkspaceFS.app");
+        std::fs::create_dir_all(&installed).unwrap();
         assert_eq!(
-            locate_macos_app(Path::new("/tmp/release/greppy")).unwrap(),
-            Path::new("/tmp/release/GreppyWorkspaceFS.app")
+            locate_macos_app_with_fallback(&debug_binary, &installed).unwrap(),
+            installed
         );
+
+        let sibling_app = debug_dir.join("GreppyWorkspaceFS.app");
+        std::fs::create_dir_all(&sibling_app).unwrap();
+        assert_eq!(
+            locate_macos_app_with_fallback(&debug_binary, &installed).unwrap(),
+            sibling_app
+        );
+
+        std::fs::remove_dir_all(&sibling_app).unwrap();
+        std::fs::remove_dir_all(&installed).unwrap();
+        let error = locate_macos_app_with_fallback(&debug_binary, &installed).unwrap_err();
+        assert!(error.contains("install the notarized GreppyWorkspaceFS.app"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1009,6 +1260,89 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("exited with 1"));
         assert!(error.contains("connection invalid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_fskit_status_requires_exact_available_enabled_module() {
+        let expected = Path::new(
+            "/Applications/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex",
+        );
+        let module = serde_json::json!({
+            "bundle_id": "ai.metricspace.greppy.workspacefs.extension",
+            "path": expected,
+            "enabled": true,
+        });
+        let evaluate = |modules| {
+            parse_native_fskit_status(
+                &serde_json::to_vec(
+                    &serde_json::json!({"schema": "greppy.fskit-status.v1", "modules": modules}),
+                )
+                .unwrap(),
+                expected,
+            )
+        };
+        assert_eq!(
+            evaluate(vec![module.clone()]).unwrap(),
+            MacosFsKitExtensionStatus::Enabled
+        );
+        assert_eq!(
+            evaluate(Vec::<serde_json::Value>::new()).unwrap(),
+            MacosFsKitExtensionStatus::UnavailableToFsKit
+        );
+        let mut disabled = module.clone();
+        disabled["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            evaluate(vec![disabled]).unwrap(),
+            MacosFsKitExtensionStatus::Disabled
+        );
+        let mut wrong_bundle = module.clone();
+        wrong_bundle["path"] = serde_json::json!("/Old/GreppyWorkspaceFS.appex");
+        assert_eq!(
+            evaluate(vec![wrong_bundle]).unwrap(),
+            MacosFsKitExtensionStatus::StaleRegistration
+        );
+        assert!(evaluate(vec![module.clone(), module]).is_err());
+        assert!(parse_native_fskit_status(b"{}", expected).is_err());
+        assert!(
+            parse_native_fskit_status(br#"{"schema":"unknown","modules":[]}"#, expected).is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_fskit_registration_through_sibling_app_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let installed_extension = root
+            .path()
+            .join("Applications/GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex");
+        fs::create_dir_all(&installed_extension).unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        symlink(
+            root.path().join("Applications/GreppyWorkspaceFS.app"),
+            bin.join("GreppyWorkspaceFS.app"),
+        )
+        .unwrap();
+        let sibling_extension =
+            bin.join("GreppyWorkspaceFS.app/Contents/Extensions/GreppyWorkspaceFS.appex");
+        let output = format!(
+            "+    ai.metricspace.greppy.workspacefs.extension(0.4.0)\tUUID\tDATE\t{}\n",
+            installed_extension.display()
+        );
+
+        assert_eq!(
+            parse_macos_fskit_extension_status(
+                Some(0),
+                output.as_bytes(),
+                b"",
+                &sibling_extension,
+            )
+            .unwrap(),
+            MacosFsKitExtensionStatus::Enabled
+        );
     }
 
     #[cfg(target_os = "macos")]

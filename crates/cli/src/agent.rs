@@ -1029,7 +1029,12 @@ fn run_agent(
         // Point parent and tool children at this run's own runtime directory --
         // the one the sandbox grants. Without it they fall back to the shared
         // /tmp/greppy-daemon-<uid>, which the child may not write.
-        std::env::set_var("GREPPY_RUNTIME_DIR", agent_runtime_dir(workspace.run_id()));
+        // Do not override GREPPY_RUNTIME_DIR: that would also split inference
+        // endpoints and model-owner locks for every agent on this machine.
+        std::env::set_var(
+            "GREPPY_WEB_RUNTIME_DIR",
+            agent_runtime_dir(workspace.run_id()),
+        );
         match crate::web_attach::claim_persistent_parent() {
             Ok(_) => {
                 let _ = greppy_agent::greppy_env::PREPARE_ATTACH_FD
@@ -2567,7 +2572,7 @@ fn resolve_sandbox_mode(
 /// one: the agent's browser can then never touch the sockets of the operator's
 /// other greppy daemons, and the grant dies with the run.
 ///
-/// Must stay short. `RuntimeScope::from_env` only honours `GREPPY_RUNTIME_DIR`
+/// Must stay short. Browser `RuntimeScope` only honours `GREPPY_WEB_RUNTIME_DIR`
 /// as a socket directory when it is <= 32 bytes, because a Unix socket path is
 /// capped near 104 bytes — which is exactly why the default is under `/tmp`
 /// and not the long macOS temp root.

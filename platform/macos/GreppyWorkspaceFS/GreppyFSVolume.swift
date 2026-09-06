@@ -196,12 +196,16 @@ extension GreppyFSVolume: FSVolume.Operations {
         let item = try workspace(rawItem)
         if case .doctorPath(let relative) = item.location {
             let url = doctorURL(relative)
+            var consumed: FSItem.Attribute = []
             if request.isValid(.mode), chmod(url.path, mode_t(request.mode & 0o7777)) != 0 {
                 throw posix(errno)
             }
+            if request.isValid(.mode) { consumed.insert(.mode) }
             if request.isValid(.size), truncate(url.path, off_t(request.size)) != 0 {
                 throw posix(errno)
             }
+            if request.isValid(.size) { consumed.insert(.size) }
+            request.consumedAttributes = consumed
             return try doctorAttributes(relative: relative, item: item)
         }
         guard let (workspaceID, relative) = item.workspaceAndPath, !relative.isEmpty else {
@@ -211,12 +215,26 @@ extension GreppyFSVolume: FSVolume.Operations {
         var mode: UInt32 = 0
         var atime: Int64 = 0
         var mtime: Int64 = 0
-        if request.isValid(.mode) { valid |= 1; mode = request.mode }
-        if request.isValid(.accessTime) { valid |= 2; atime = nanoseconds(request.accessTime) }
-        if request.isValid(.modifyTime) { valid |= 4; mtime = nanoseconds(request.modifyTime) }
+        var consumed: FSItem.Attribute = []
+        if request.isValid(.mode) {
+            valid |= 1
+            mode = request.mode & 0o7777
+            consumed.insert(.mode)
+        }
+        if request.isValid(.accessTime) {
+            valid |= 2
+            atime = nanoseconds(request.accessTime)
+            consumed.insert(.accessTime)
+        }
+        if request.isValid(.modifyTime) {
+            valid |= 4
+            mtime = nanoseconds(request.modifyTime)
+            consumed.insert(.modifyTime)
+        }
         if request.isValid(.size) {
             let (_, inode) = try privateInode(for: item)
             try core.truncate(workspace: workspaceID, inode: inode, size: request.size)
+            consumed.insert(.size)
         }
         if valid != 0 {
             let (_, inode) = try privateInode(for: item)
@@ -229,6 +247,7 @@ extension GreppyFSVolume: FSVolume.Operations {
                 modifiedNanoseconds: mtime
             )
         }
+        request.consumedAttributes = consumed
         return try await attributes(FSItem.GetAttributesRequest(), of: item)
     }
 
@@ -311,7 +330,9 @@ extension GreppyFSVolume: FSVolume.Operations {
         }
         guard let (workspaceID, _) = directory.workspaceAndPath else { throw posix(EPERM) }
         let relative = try relativePath(parent: directory, name: name)
-        let mode = request.isValid(.mode) ? request.mode : (type == .directory ? 0o755 : 0o644)
+        let mode = request.isValid(.mode)
+            ? request.mode & 0o7777
+            : (type == .directory ? 0o755 : 0o644)
         switch type {
         case .file:
             try core.createFile(workspace: workspaceID, path: relative, mode: mode)
@@ -320,6 +341,39 @@ extension GreppyFSVolume: FSVolume.Operations {
         default:
             throw posix(EINVAL)
         }
+        var consumed: FSItem.Attribute = []
+        var valid: UInt32 = 0
+        var accessedNanoseconds: Int64 = 0
+        var modifiedNanoseconds: Int64 = 0
+        if request.isValid(.mode) {
+            valid |= 1
+            consumed.insert(.mode)
+        }
+        if request.isValid(.accessTime) {
+            valid |= 2
+            accessedNanoseconds = nanoseconds(request.accessTime)
+            consumed.insert(.accessTime)
+        }
+        if request.isValid(.modifyTime) {
+            valid |= 4
+            modifiedNanoseconds = nanoseconds(request.modifyTime)
+            consumed.insert(.modifyTime)
+        }
+        if request.isValid(.size), type == .file {
+            try core.truncate(workspace: workspaceID, path: relative, size: request.size)
+            consumed.insert(.size)
+        }
+        if valid != 0 {
+            try core.setMetadata(
+                workspace: workspaceID,
+                path: relative,
+                valid: valid,
+                mode: mode,
+                accessedNanoseconds: accessedNanoseconds,
+                modifiedNanoseconds: modifiedNanoseconds
+            )
+        }
+        request.consumedAttributes = consumed
         return (item(location: .path(workspace: workspaceID, relative: relative), name: name), name)
     }
 

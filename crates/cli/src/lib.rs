@@ -843,25 +843,6 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
         };
     }
-    // Structured Greppy commands perform throttled cache maintenance. This
-    // intentionally runs after passthrough detection so an ordinary grep
-    // invocation cannot touch Greppy state.
-    // Skip under GREPPY_AGENT_RUN: agent tool children only have write access to
-    // their own store + lock namespace, not trash/other workspaces that GC needs.
-    // `web doctor` is facts-only: it must not spawn engines and must not scan
-    // the Greppy store. Other structured commands still run throttled GC.
-    let skip_gc = is_trial_invocation(&argv)
-        || is_web_doctor_invocation(&argv)
-        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
-    startup_trace(if skip_gc {
-        "run_os.gc_skipped"
-    } else {
-        "run_os.gc_begin"
-    });
-    if !skip_gc {
-        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
-        startup_trace("run_os.gc_end");
-    }
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
@@ -885,6 +866,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            if sub == "expand"
+                && unknown_flag_name(first)
+                    .as_deref()
+                    .is_some_and(|flag| matches!(flag, "--lines" | "--line"))
+            {
+                println!(
+                    "`expand` prints a prepared evidence page; it does not accept a line range. \
+                     Run `greppy expand ID --json` and follow `next.command` when another page exists. \
+                     To read a source-file range instead, use `greppy read-file PATH --lines A:B`."
+                );
+                println!("usage: greppy expand ID [--json] [--root DIR]");
+                return 64;
+            }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
                 first,
@@ -960,7 +954,25 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             {
                 // The usage line below already shows the shape that works;
                 // leading with `error:` only tells the agent it failed.
-                if sub == "path" && stray == "--code" {
+                if sub == "web" && stray == "::" {
+                    println!(
+                        "`::` chains browser steps only after `web do`. No browser action was run. \
+                         Use `greppy web do fill TARGET VALUE :: click TARGET`; do not repeat \
+                         the executable or `web` after `::`."
+                    );
+                } else if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("observe")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
+                         No observation was run. Use `greppy web observe QUERY` for matching visible \
+                         regions, or omit QUERY for the unfiltered page."
+                    );
+                } else if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
                          run it without `--code`, then use `greppy read SYMBOL` for a returned \
@@ -1021,6 +1033,34 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             return EXIT_USAGE;
         }
     };
+    // A delegated Base index must retain its staging independently of the
+    // parent before cache maintenance or any writes can begin. Missing/reaped
+    // staging is a refusal, never a request to recreate its ownership marker.
+    let _base_build_staging_leases =
+        match greppy_core::cache::retain_base_build_staging_leases_from_env() {
+            Ok(leases) => leases,
+            Err(error) => {
+                eprintln!("greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command");
+                return 73;
+            }
+        };
+    // Only a successfully parsed command may perform cache maintenance.
+    // Help, version and refused usage must not create gc.state/lock files or
+    // reclaim unrelated caches while the user is asking how to configure them.
+    // Passthrough already returned above. Agent children retain their scoped
+    // store permissions; trial and web doctor remain facts-only.
+    let skip_gc = is_trial_invocation(&argv)
+        || is_web_doctor_invocation(&argv)
+        || std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some();
+    startup_trace(if skip_gc {
+        "run_os.gc_skipped"
+    } else {
+        "run_os.gc_begin"
+    });
+    if !skip_gc {
+        maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
+        startup_trace("run_os.gc_end");
+    }
     dispatch_to_code(cli)
 }
 
@@ -1717,6 +1757,49 @@ fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32
     }
 }
 
+fn workspace_doctor_failure(
+    data_root: &std::path::Path,
+    error: &dyn std::fmt::Display,
+    smoke_status: &str,
+    json: bool,
+) -> Result<i32> {
+    let diagnostics = greppy_workspace_core::ProviderInstallation::diagnose(data_root);
+    let next_actions = workspace_setup::doctor_recovery_steps();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "healthy": false,
+                "error": error.to_string(),
+                "data_root": data_root,
+                "provider": diagnostics.provider,
+                "diagnostics": diagnostics,
+                "smoke_status": smoke_status,
+                "next_actions": next_actions
+            }))
+            .map_err(|error| Error::Invalid(error.to_string()))?
+        );
+    } else {
+        eprintln!("workspace provider unhealthy: {error}");
+        for (name, check) in &diagnostics.checks {
+            eprintln!(
+                "  {name}: {}{}",
+                check.status,
+                check
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" — {detail}"))
+                    .unwrap_or_default()
+            );
+        }
+        eprintln!("  I/O smoke: {smoke_status}");
+        for action in next_actions {
+            eprintln!("next: {action}");
+        }
+    }
+    Ok(EXIT_IO as i32)
+}
+
 fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
     let data_root = greppy_agent::workspace::workspace_data_root()
         .map_err(|error| Error::Invalid(error.to_string()))?;
@@ -1734,34 +1817,12 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             let provider =
                 match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
                     Ok(provider) => provider,
-                    Err(error) if json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "healthy": false,
-                                "error": error.to_string(),
-                                "data_root": data_root
-                            }))
-                            .map_err(|error| Error::Invalid(error.to_string()))?
-                        );
-                        return Ok(EXIT_IO as i32);
+                    Err(error) => {
+                        return workspace_doctor_failure(&data_root, &error, "not_run", json);
                     }
-                    Err(error) => return Err(Error::Invalid(error.to_string())),
                 };
             if let Err(error) = provider.doctor_io(&format!("doctor-{}", std::process::id())) {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "healthy": false,
-                            "provider": provider.manifest(),
-                            "error": error.to_string()
-                        }))
-                        .map_err(|error| Error::Invalid(error.to_string()))?
-                    );
-                    return Ok(EXIT_IO as i32);
-                }
-                return Err(Error::Invalid(error.to_string()));
+                return workspace_doctor_failure(&data_root, &error, "failed", json);
             }
             let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
                 .map_err(|error| Error::Invalid(error.to_string()))?;

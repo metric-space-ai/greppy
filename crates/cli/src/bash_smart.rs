@@ -12,6 +12,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
 
+#[path = "bash_smart_preview.rs"]
+mod preview;
+
 const SHORT_TOTAL_LINES: usize = 80;
 const STDERR_VERBATIM_LINES: usize = 40;
 const HEAD_LINES: usize = 20;
@@ -47,6 +50,24 @@ static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
+});
+// tsc/tsgo place the source location before the severity, unlike Rust's
+// leading `error:`. Require a numeric location and TS code, not arbitrary
+// prose containing the word "error". Match both plain compiler layouts.
+static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+error[\t ]+TS[0-9]+:",
+    )
+    .expect("bash-smart TypeScript error regex")
+});
+// GCC/Clang put a numeric file location before the severity. Keep the
+// classifier byte-oriented (paths need not be UTF-8) and require the complete
+// location/severity syntax rather than promoting arbitrary stderr prose.
+static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning):(?:[\t ]|$)",
+    )
+    .expect("bash-smart source diagnostic regex")
 });
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
@@ -210,7 +231,7 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         Ok(store) => Some(store),
         Err(Error::Lock(_)) => {
             eprintln!(
-                "bash-smart: index writer active; command execution continues without expansion storage"
+                "bash-smart: index writer active; command execution continues without expansion storage; long output stays compact with raw-log paths instead of expand IDs"
             );
             None
         }
@@ -336,23 +357,37 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
         .count();
     let warning_count = blocks.len().saturating_sub(error_count);
     let annotation = termination_annotation(timed_out, forwarded_signal, &status);
+    let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
+    let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
+    // Unfolded short output already contains every diagnostic and -e match.
+    // Keep its stream and bytes intact instead of printing those lines twice.
+    // Interrupted output still uses the diagnostic prefix and recovery pack.
+    let verbatim_short = short && !interrupted;
     render_answer_prefix(
         &stdout_lines,
         &stderr_lines,
-        &blocks,
-        &matches,
+        if verbatim_short { &[] } else { &blocks },
+        if verbatim_short { &[] } else { &matches },
         &verdict_line(exit_code, error_count, warning_count, annotation.as_deref()),
     );
+    // A line-count threshold alone does not bound a minified source or data
+    // URL stack. Preview such lines in every default display path, but retain
+    // the original spool and make recovery explicit, even without SQLite.
+    for (stream, lines) in [("stdout", &stdout_lines), ("stderr", &stderr_lines)] {
+        if lines.iter().any(|line| preview::oversized(line.raw)) {
+            if let Some(path) = raw.payload[stream]["path"].as_str() {
+                let _ = writeln!(std::io::stdout().lock(),
+                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file");
+            }
+        }
+    }
 
     let project = project_for(root).unwrap_or_else(|_| "bash-smart".into());
     let query = argv_for_metadata(argv);
-    let interrupted = timed_out || forwarded_signal.is_some() || status.code().is_none();
-    let short = stdout_lines.len() + stderr_lines.len() <= SHORT_TOTAL_LINES;
-
     // Kills and timeouts always receive an id, even when the partial wall is
-    // short. Normal short output keeps its raw skeleton bytes after the answer
-    // prefix.
-    if short && !interrupted {
+    // short. Normal short output keeps its raw skeleton bytes after the verdict
+    // only. Oversized individual lines are previews with raw-log recovery.
+    if verbatim_short {
         if let Some(store) = store.as_ref() {
             let ranges = full_line_range(&stdout_lines);
             let _ = insert_pack(store, &project, &query, &raw, "stdout", &ranges);
@@ -405,9 +440,23 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     if stdout_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stdout_id.as_deref()) {
             let gated = byte_gate(store, id, "stdout", &lifted_stdout);
-            render_folded(false, &stdout_lines, exit_code, id, &stdout_groups, &gated);
+            render_folded(
+                false,
+                &stdout_lines,
+                exit_code,
+                &format!("greppy expand {id}"),
+                &stdout_groups,
+                &gated,
+            );
         } else {
-            write_stream(false, &raw.stdout);
+            render_without_pack(
+                false,
+                &raw,
+                &stdout_lines,
+                exit_code,
+                &stdout_groups,
+                &lifted_stdout,
+            );
         }
     } else {
         write_stream(false, &raw.stdout);
@@ -416,9 +465,23 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     if stderr_folded {
         if let (Some(store), Some(id)) = (store.as_ref(), stderr_id.as_deref()) {
             let gated = byte_gate(store, id, "stderr", &lifted_stderr);
-            render_folded(true, &stderr_lines, exit_code, id, &stderr_groups, &gated);
+            render_folded(
+                true,
+                &stderr_lines,
+                exit_code,
+                &format!("greppy expand {id}"),
+                &stderr_groups,
+                &gated,
+            );
         } else {
-            write_stream(true, &raw.stderr);
+            render_without_pack(
+                true,
+                &raw,
+                &stderr_lines,
+                exit_code,
+                &stderr_groups,
+                &lifted_stderr,
+            );
         }
     } else {
         write_stream(true, &raw.stderr);
@@ -610,12 +673,22 @@ fn detect_blocks(
     ] {
         let mut index = 0usize;
         while index < lines.len() {
-            let kind = if ERROR_MARKER_RE.is_match(lines[index].content) {
+            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+                || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
+            {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
             } else {
-                None
+                SOURCE_DIAGNOSTIC_RE
+                    .captures(lines[index].content)
+                    .map(|captures| {
+                        if captures[1].eq_ignore_ascii_case(b"warning") {
+                            BlockKind::Warning
+                        } else {
+                            BlockKind::Error
+                        }
+                    })
             };
             let Some(kind) = kind else {
                 index += 1;
@@ -729,7 +802,7 @@ fn write_answer_line(
         return;
     }
     let _ = write!(writer, "{}  ", line.line);
-    let _ = writer.write_all(&line.bytes);
+    let _ = preview::write_line(writer, &line.bytes);
     let _ = writer.write_all(b"\n");
 }
 
@@ -755,7 +828,7 @@ fn write_answer_prefix(
             continue;
         }
         let _ = write!(writer, "{}  ", line.line);
-        let _ = writer.write_all(&line.bytes);
+        let _ = preview::write_line(writer, &line.bytes);
         if group.count > 1 {
             let _ = write!(writer, " ({} matches)", group.count);
         }
@@ -878,19 +951,14 @@ fn spool_dir() -> Result<PathBuf> {
     // below the graph store coupled command execution to that store's ACLs and
     // lifecycle: a concurrently published/replaced store could make the drain
     // threads fail with EPERM even though the child command itself was valid.
-    // Keep one hardened user-global namespace in the OS shared-temp root.
-    // Agent sandboxes commonly permit `/tmp` while intentionally denying
-    // metadata writes below the user's persistent Greppy data root. The files
-    // must outlive this process because an expansion command reads their paths
-    // from the durable expand pack until that pack's TTL expires.
+    // Keep one hardened namespace below the process' effective TMPDIR. Agent
+    // sandboxes grant their run-specific TMPDIR, not the whole OS temp root;
+    // using `/private/tmp` directly therefore fails closed on macOS. The run
+    // scratch directory outlives individual tool subprocesses, so a later
+    // expansion command can still consume the durable pack during the run.
     #[cfg(unix)]
-    let dir = {
-        #[cfg(target_os = "macos")]
-        let base = PathBuf::from("/private/tmp");
-        #[cfg(not(target_os = "macos"))]
-        let base = PathBuf::from("/tmp");
-        base.join(format!("greppy-bash-smart-{}", unsafe { libc::geteuid() }))
-    };
+    let dir =
+        std::env::temp_dir().join(format!("greppy-bash-smart-{}", unsafe { libc::geteuid() }));
     #[cfg(not(unix))]
     let dir = std::env::temp_dir().join("greppy-bash-smart");
     workspace_locator::ensure_store_dir(&dir)
@@ -1631,11 +1699,32 @@ fn display_line_ranges(ranges: &[(usize, usize)]) -> String {
     format!("lines {joined}")
 }
 
+fn render_without_pack(
+    stderr: bool,
+    raw: &StoredRaw,
+    lines: &[RawLine<'_>],
+    exit_code: i32,
+    groups: &[CollapseGroup],
+    lifted: &[LiftedLine],
+) {
+    let stream = if stderr { "stderr" } else { "stdout" };
+    if let Some(path) = raw.payload[stream]["path"].as_str() {
+        // The spool already exists independently of SQLite and remains available
+        // after this command exits. Never invent an expand ID or hide raw output
+        // without a recovery location. Debug formatting quotes the path as data,
+        // not as a shell command (TMPDIR may contain shell metacharacters).
+        let recovery = format!("raw log {path:?}; read with greppy read-file");
+        render_folded(stderr, lines, exit_code, &recovery, groups, lifted);
+    } else {
+        write_stream(stderr, if stderr { &raw.stderr } else { &raw.stdout });
+    }
+}
+
 fn render_folded(
     stderr: bool,
     lines: &[RawLine<'_>],
     exit_code: i32,
-    id: &str,
+    recovery: &str,
     groups: &[CollapseGroup],
     lifted: &[LiftedLine],
 ) {
@@ -1646,15 +1735,15 @@ fn render_folded(
     };
     let (head_end, tail_start) = folded_middle_bounds(lines, exit_code);
 
-    // Layer 1 is invariant: head and tail are literal raw bytes, even when a
-    // repeated middle block has the same shape.
+    // Head and tail are literal raw bytes unless an individual line exceeds
+    // the display bound; the raw spool and explicit expansion remain exact.
     for line in &lines[..head_end] {
-        let _ = writer.write_all(line.raw);
+        let _ = preview::write_line(&mut writer, line.raw);
     }
     ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
 
     for group in groups.iter().filter(|group| group.count() > 1) {
-        let _ = writer.write_all(&group.representative);
+        let _ = preview::write_stream(&mut writer, &group.representative);
         if !group.representative.ends_with(b"\n") {
             let _ = writer.write_all(b"\n");
         }
@@ -1664,7 +1753,7 @@ fn render_folded(
         .filter(|line| line.line > head_end && line.line <= tail_start)
     {
         let _ = write!(writer, "{}:", line.line);
-        let _ = writer.write_all(&line.bytes);
+        let _ = preview::write_line(&mut writer, &line.bytes);
         let _ = writer.write_all(b"\n");
     }
 
@@ -1676,7 +1765,10 @@ fn render_folded(
             .map(|(start, end)| end - start + 1)
             .sum::<usize>();
         let range_text = display_line_ranges(&hidden_ranges);
-        if groups.len() == 1 && groups[0].count() > 1 {
+        if groups.len() == 1
+            && groups[0].count() > 1
+            && !preview::oversized(groups[0].template.as_bytes())
+        {
             let noun = if hidden_count == 1 {
                 "repeat"
             } else {
@@ -1684,22 +1776,22 @@ fn render_folded(
             };
             let _ = writeln!(
                 writer,
-                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — greppy expand {id}",
+                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — {recovery}",
                 groups[0].template
             );
         } else {
             let noun = if hidden_count == 1 { "line" } else { "lines" };
             let _ = writeln!(
                 writer,
-                "… {range_text} ({hidden_count} collapsed {noun}) — greppy expand {id}"
+                "… {range_text} ({hidden_count} collapsed {noun}) — {recovery}"
             );
         }
     } else {
-        let _ = writeln!(writer, "… partial output — greppy expand {id}");
+        let _ = writeln!(writer, "… partial output — {recovery}");
     }
 
     for line in &lines[tail_start..] {
-        let _ = writer.write_all(line.raw);
+        let _ = preview::write_line(&mut writer, line.raw);
     }
 }
 
@@ -1964,9 +2056,9 @@ fn split_lines(bytes: &[u8]) -> Vec<RawLine<'_>> {
 
 fn write_stream(stderr: bool, bytes: &[u8]) {
     if stderr {
-        let _ = std::io::stderr().lock().write_all(bytes);
+        let _ = preview::write_stream(&mut std::io::stderr().lock(), bytes);
     } else {
-        let _ = std::io::stdout().lock().write_all(bytes);
+        let _ = preview::write_stream(&mut std::io::stdout().lock(), bytes);
     }
 }
 
@@ -2015,14 +2107,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn spool_directory_uses_sandbox_shared_private_temp_namespace() {
+    fn spool_directory_uses_effective_private_temp_namespace() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = spool_dir().expect("sandbox-shared spool");
-        #[cfg(target_os = "macos")]
-        assert!(dir.starts_with("/private/tmp"));
-        #[cfg(not(target_os = "macos"))]
-        assert!(dir.starts_with("/tmp"));
+        assert!(dir.starts_with(std::env::temp_dir()));
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2165,6 +2254,57 @@ mod tests {
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn typescript_file_prefixed_errors_count_in_either_stream() {
+        let diagnostics = b"apps/server/one.ts(12,3): error TS2375: incompatible value\n  property details\nC:\\project files\\two.ts(4,1): error TS377004: type failure\napps/web/three.ts:7:9 - error TS2322: bad assignment\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 3, "{blocks:?}");
+            assert!(blocks.iter().all(|block| block.kind == BlockKind::Error));
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(blocks[0].lines[1].bytes, b"  property details");
+        }
+    }
+
+    #[test]
+    fn typescript_words_without_a_compiler_location_are_not_errors() {
+        let text = split_lines(b"the docs mention error TS2322\nexample.ts(x,y): error TS2322: not a location\nexample.ts(1,1): error TSfoo: not a numeric code\nexample.ts(1,1): no error TS2322: all good\n");
+        assert!(detect_blocks(&text, &[]).is_empty());
+    }
+
+    #[test]
+    fn source_prefixed_compiler_diagnostics_count_in_either_stream() {
+        let diagnostics = b"/example/header.h:41:8: error: #error \"incompatible headers\"\n  41 | #error \"incompatible headers\"\n     |        ^~~~~\nC:\\project files\\source.cpp:9: fatal error: missing.h: No such file\nsrc/main.c:12:4: warning: unused variable\nsrc/\xff.c:13: error: invalid declaration\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 4, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Error);
+            assert_eq!(blocks[0].lines.len(), 3);
+            assert_eq!(blocks[1].kind, BlockKind::Error);
+            assert_eq!(blocks[2].kind, BlockKind::Warning);
+            assert_eq!(blocks[3].kind, BlockKind::Error);
+            let errors = blocks.iter().filter(|b| b.kind == BlockKind::Error).count();
+            assert_eq!(
+                verdict_line(1, errors, blocks.len() - errors, None),
+                "FAILED — exit 1: 3 errors, 1 warning"
+            );
+        }
+    }
+
+    #[test]
+    fn source_prefixed_compiler_diagnostics_require_location_and_severity() {
+        // Colons are valid path bytes, so `header.h:x:8:` could legitimately
+        // mean line 8 of a file named `header.h:x`; use no numeric suffix here.
+        let text = split_lines(b"header.h: error: no source line\nheader.h:x:y: error: not a numeric location\nheader.h:41:8: no error: successful\nheader.h:41:8: error_count: 0\nheader.h:41:8: note: informational\nheader.h:41:8: warning_count: 0\n");
+        assert!(detect_blocks(&text, &[]).is_empty());
     }
 
     #[test]

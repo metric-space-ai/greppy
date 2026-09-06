@@ -53,8 +53,26 @@ pub(crate) fn closest_valid_invocation(
                 .into(),
         );
     }
+    // Browser verbs have different nested grammars. The graph-flag candidate
+    // table below does not describe them: e.g. suggesting --max for an
+    // unsupported --tab turns a page id into an invalid integer (or silently
+    // changes meaning when the id happens to be numeric). Keep the real nested
+    // clap usage instead of inventing an executable repair from edit distance.
+    if subcommand == "web" {
+        return None;
+    }
     let unknown = unknown_flag_name(clap_message)?;
     let unknown = unknown.as_str();
+    // This is a symbol-read option, not a misspelling of the boolean --all.
+    // Replacing only its name would leave the line count as another filename.
+    if subcommand == "read-file" && unknown == "--tail" {
+        return Some(
+            "`read-file` accepts `--lines A:B` for an explicit line range or `--all` \
+             for the complete file; `--tail N` is supported by `greppy read SYMBOL`, \
+             not by `read-file`"
+                .into(),
+        );
+    }
     let candidates = subcommand_flag_candidates(argv, subcommand);
     let replacement = candidates
         .into_iter()
@@ -77,6 +95,89 @@ pub(crate) fn closest_valid_invocation(
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn file_tail_guidance_never_turns_the_count_into_a_filename() {
+        for args in [
+            vec!["greppy", "read-file", "a file.rs", "--tail", "80"],
+            vec!["greppy", "read-file", "a file.rs", "--tail=80"],
+            vec![
+                "greppy",
+                "--root",
+                "/repo",
+                "read-file",
+                "a.rs",
+                "--tail",
+                "2",
+            ],
+        ] {
+            let argv: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            let suggestion = closest_valid_invocation(
+                &argv,
+                "read-file",
+                "error: unexpected argument '--tail' found",
+            )
+            .expect("actionable guidance");
+            assert!(suggestion.contains("--lines A:B"));
+            assert!(suggestion.contains("greppy read SYMBOL"));
+            assert!(!suggestion.contains("--all 80"));
+            assert!(!suggestion.contains("--all 2"));
+            assert!(!suggestion.contains("--tail=80"));
+        }
+    }
+
+    #[test]
+    fn browser_context_flag_is_not_repaired_into_graph_limit() {
+        for page in ["page-7729-1", "1"] {
+            let argv: Vec<std::ffi::OsString> = [
+                "greppy",
+                "web",
+                "assert",
+                "css=#start",
+                "--tab",
+                page,
+                "--json",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+            assert_eq!(
+                closest_valid_invocation(&argv, "web", "error: unexpected argument '--tab' found"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn browser_session_creation_keeps_the_explicit_supported_repair() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "web", "session", "new"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let suggestion =
+            closest_valid_invocation(&argv, "web", "error: unrecognized subcommand 'new'").unwrap();
+        assert!(suggestion.contains("greppy web session create --profile project"));
+    }
+
+    #[test]
+    fn graph_json_typo_keeps_its_existing_repair() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "search-symbol", "marker", "--jsoon"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let suggestion = closest_valid_invocation(
+            &argv,
+            "search-symbol",
+            "error: unexpected argument '--jsoon' found",
+        )
+        .unwrap();
+        assert_eq!(suggestion, "greppy search-symbol marker --json");
+    }
 }
 
 /// The flags `subcommand` actually accepts, for near-miss comparison.
@@ -632,6 +733,16 @@ pub(crate) fn argv_without_stray_positional(
     clap_message: &str,
     usage: Option<&str>,
 ) -> Option<(Vec<std::ffi::OsString>, String)> {
+    // A browser operand can select a narrower page region or target. Dropping
+    // it would execute a different request. Nested clap usage is not evidence
+    // that the user's extra argument is harmless (e.g. observe role=dialog).
+    if grep_passthrough_args(argv)
+        .first()
+        .and_then(|arg| arg.to_str())
+        == Some("web")
+    {
+        return None;
+    }
     let stray = clap_message
         .strip_prefix("error: unexpected argument '")?
         .split('\'')
@@ -678,4 +789,60 @@ pub(crate) fn argv_without_stray_positional(
         out.push(argument.clone());
     }
     dropped.then(|| (out, stray.to_string()))
+}
+
+#[cfg(test)]
+mod positional_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn browser_scope_operands_are_never_dropped_before_reparse() {
+        for arguments in [
+            vec!["greppy", "web", "fill", "@invalid", "3", "::", "greppy", "web", "click", "@invalid"],
+            vec!["greppy", "web", "observe", "role=dialog", "extra", "--help"],
+            vec![
+                "greppy",
+                "--root",
+                "/repo",
+                "web",
+                "observe",
+                "css=dialog[open]",
+                "extra",
+                "--help",
+            ],
+            vec![
+                "greppy",
+                "web",
+                "session",
+                "list",
+                "unexpected-scope",
+                "--help",
+            ],
+        ] {
+            let argv: Vec<std::ffi::OsString> = arguments.into_iter().map(Into::into).collect();
+            let error = <Cli as clap::Parser>::try_parse_from(argv.iter()).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            let error = error.to_string();
+            let first = error.lines().next().unwrap();
+            let usage = error.lines().find(|line| line.starts_with("Usage:"));
+            assert!(usage.is_some());
+            assert!(argv_without_stray_positional(&argv, first, usage).is_none());
+        }
+    }
+
+    #[test]
+    fn existing_non_browser_no_argument_recovery_is_unchanged() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "doctor", "parse_path"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let (repaired, stray) = argv_without_stray_positional(
+            &argv,
+            "error: unexpected argument 'parse_path' found",
+            Some("Usage: greppy doctor [OPTIONS]"),
+        )
+        .unwrap();
+        assert_eq!(stray, "parse_path");
+        assert_eq!(repaired, &argv[..2]);
+    }
 }

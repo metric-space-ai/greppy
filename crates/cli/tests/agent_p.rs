@@ -528,15 +528,81 @@ fn nested_agent_run_is_refused() {
 #[test]
 fn workspace_doctor_json_is_machine_readable_when_provider_is_missing() {
     let dir = unique_temp("doctor-missing");
+    let missing = dir.join("not-created");
     let output = Command::new(binary_path())
         .args(["workspace", "doctor", "--json"])
-        .env("GREPPY_WORKSPACE_DIR", &dir)
+        .env("GREPPY_WORKSPACE_DIR", &missing)
         .output()
         .expect("spawn workspace doctor");
     assert_eq!(output.status.code(), Some(73));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["healthy"], false);
     assert!(value["error"].as_str().unwrap().contains("provider.json"));
+    assert_eq!(
+        value["diagnostics"]["checks"]["control_manifest"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        value["diagnostics"]["checks"]["heartbeat"]["status"],
+        "not_checked"
+    );
+    assert_eq!(value["smoke_status"], "not_run");
+    assert!(!value["next_actions"].as_array().unwrap().is_empty());
+    assert!(
+        !missing.exists(),
+        "diagnosis must not initialize a missing store"
+    );
+    let plain = Command::new(binary_path())
+        .args(["workspace", "doctor"])
+        .env("GREPPY_WORKSPACE_DIR", &missing)
+        .output()
+        .expect("spawn plain workspace doctor");
+    assert_eq!(plain.status.code(), Some(73));
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(stderr.contains("control_manifest: failed"), "{stderr}");
+    assert!(stderr.contains("heartbeat: not_checked"), "{stderr}");
+    assert!(stderr.contains("next:"), "{stderr}");
+    assert!(!missing.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn workspace_doctor_explains_stale_heartbeat_without_hiding_mount_identity() {
+    let dir = unique_temp("doctor-stale");
+    let data = dir.join("data");
+    let mount = dir.join("mount");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&mount).unwrap();
+    let manifest = serde_json::json!({
+        "protocol_version": 1, "adapter_version": "0.4.0", "adapter_kind": "fuse3",
+        "state": "ready", "instance_id": "doctor-stale", "data_root": data,
+        "mount_root": mount, "heartbeat_unix_ms": 1,
+        "capabilities": {"hard_links":true,"symbolic_links":true,"byte_range_locks":true,
+            "memory_maps":true,"atomic_rename":true,"case_preserving":true}
+    });
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(data.join("provider.json"), &bytes).unwrap();
+    std::fs::write(mount.join(".greppy-provider.json"), &bytes).unwrap();
+    let output = Command::new(binary_path())
+        .args(["workspace", "doctor", "--json"])
+        .env("GREPPY_WORKSPACE_DIR", &data)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(73));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["healthy"], false);
+    assert_eq!(
+        value["diagnostics"]["checks"]["heartbeat"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        value["diagnostics"]["checks"]["mounted_identity"]["status"],
+        "passed"
+    );
+    assert_eq!(value["smoke_status"], "not_run");
+    assert!(!data.join("core").exists());
+    assert!(!mount.join("doctor").exists());
+    assert_eq!(std::fs::read(data.join("provider.json")).unwrap(), bytes);
     let _ = std::fs::remove_dir_all(dir);
 }
 

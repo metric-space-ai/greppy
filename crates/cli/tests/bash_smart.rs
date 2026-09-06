@@ -1,10 +1,8 @@
 //! End-to-end coverage for the training-free bash-smart delivery contract.
 //!
-//! bash-smart is compiled out of the shipped 0.3.0 surface, so these tests only
-//! run when the feature that provides the verb is enabled. Without the gate
-//! they invoke a verb the binary does not have, the call falls through to real
-//! grep, and every assertion fails — which is what turned CI red on the release
-//! candidate rather than reporting an absent feature.
+//! These tests require the feature that provides the verb. They exercise the
+//! actual CLI, including subprocesses, signal forwarding and raw-log recovery;
+//! fixture inference is disabled because the delivery contract is mechanical.
 
 #![cfg(all(unix, feature = "bash-smart"))]
 
@@ -71,6 +69,41 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
+fn oversized_single_line_keeps_failure_and_exact_raw_log_recovery() {
+    for stream in ["stdout", "stderr"] {
+        let workspace = fresh_workspace(&format!("long-line-{stream}"));
+        let script = format!(
+            "{{ printf 'data:text/javascript;base64,'; head -c 160000 /dev/zero | tr '\\000' A; printf ':1:7\\nError: long-line-probe\\n'; }} {}; exit 1",
+            if stream == "stderr" { ">&2" } else { "" },
+        );
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            output.stdout.len() + output.stderr.len() < 12_000,
+            "one long line bypassed the preview bound: stdout={} stderr={}",
+            output.stdout.len(),
+            output.stderr.len()
+        );
+        let rendered = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        assert!(rendered.contains("Error: long-line-probe"));
+        assert!(rendered.contains("bytes omitted; full line in raw log"));
+        let path_json = rendered
+            .split("raw log ")
+            .nth(1)
+            .unwrap()
+            .split("; read with greppy read-file")
+            .next()
+            .unwrap();
+        let path: String = serde_json::from_str(path_json).unwrap();
+        let expected = format!(
+            "data:text/javascript;base64,{}:1:7\nError: long-line-probe\n",
+            "A".repeat(160_000)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+    }
+}
+
+#[test]
 fn short_output_follows_verdict_and_exit_code_passes_through() {
     let workspace = fresh_workspace("short");
     let output = run(
@@ -90,6 +123,32 @@ fn short_output_follows_verdict_and_exit_code_passes_through() {
         b"FAILED \xe2\x80\x94 exit 3: 0 errors, 0 warnings\nout\n"
     );
     assert_eq!(output.stderr, b"err\n");
+}
+
+#[test]
+fn short_regex_matches_are_printed_once_with_original_stream_bytes() {
+    let workspace = fresh_workspace("short-regex-once");
+    for count in [1, 10] {
+        for redirect in ["", " >&2"] {
+            let script = format!(
+                "i=0; while [ \"$i\" -lt {count} ]; do printf '{{\"trial\":\"x\"}}\\r\\n'{redirect}; i=$((i+1)); done"
+            );
+            let output = run(
+                &workspace,
+                &["bash-smart", "-e", "\"trial\"", "--", "sh", "-c", &script],
+            );
+            assert_eq!(output.status.code(), Some(0));
+            let expected = "{\"trial\":\"x\"}\r\n".repeat(count);
+            let mut stdout = b"ok \xe2\x80\x94 exit 0\n".to_vec();
+            if redirect.is_empty() {
+                stdout.extend_from_slice(expected.as_bytes());
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(output.stderr, expected.as_bytes());
+            }
+            assert_eq!(output.stdout, stdout);
+        }
+    }
 }
 
 #[test]
@@ -117,6 +176,61 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
                 .contains("latest child output: Blocking waiting for file lock on package cache"),
         "stderr={stderr:?}"
     );
+}
+
+#[test]
+fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
+    let workspace = fresh_workspace("typescript-diagnostic");
+    for redirect in ["", " >&2"] {
+        let script = format!(
+            "printf '%s\\n' 'example.ts(1,1): error TS2322: Type string is not assignable to type number.'{redirect}; exit 1"
+        );
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.starts_with("FAILED — exit 1: 1 error, 0 warnings\n"),
+            "stdout={stdout}; stderr={}",
+            text(&output.stderr)
+        );
+        let diagnostic =
+            "example.ts(1,1): error TS2322: Type string is not assignable to type number.";
+        let raw_stream = if redirect.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(text(raw_stream).lines().any(|line| line == diagnostic));
+    }
+}
+
+#[test]
+fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
+    let workspace = fresh_workspace("compiler-diagnostic");
+    let diagnostics = "/example/header.h:41:8: error: #error \"incompatible headers\"\n/example/main.c:9: warning: unused variable\n";
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 2");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.starts_with("FAILED — exit 2: 1 error, 1 warning\n"),
+            "stdout={stdout}; stderr={}",
+            text(&output.stderr)
+        );
+        let raw_stream = if redirect.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(raw_stream.ends_with(diagnostics.as_bytes()));
+        let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        assert_eq!(
+            combined.matches("#error \"incompatible headers\"").count(),
+            1
+        );
+        assert_eq!(combined.matches("warning: unused variable").count(), 1);
+    }
 }
 
 #[test]
@@ -281,13 +395,15 @@ fn signal_forwards_to_child_group_and_keeps_expandable_partial_output() {
         .expect("warmup bash-smart");
 
     let child_pid_path = workspace.base.join("child.pid");
-    let script = format!(
-        "echo $$ > {}; i=1; while [ $i -le 100000 ]; do echo line $i; i=$((i + 1)); sleep 0.01; done",
-        child_pid_path.display()
-    );
+    // Creation of a redirected file precedes its write. Publish the complete
+    // PID by same-directory rename so exists() cannot expose an empty receipt.
+    // Pass the path as argv, including when TMPDIR contains spaces.
+    let script = "set -eu; printf '%s\\n' \"$$\" > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+        i=1; while [ $i -le 100000 ]; do echo line $i; i=$((i + 1)); sleep 0.01; done";
     let started = Instant::now();
     let greppy = command(&workspace)
-        .args(["bash-smart", "--", "sh", "-c", &script])
+        .args(["bash-smart", "--", "sh", "-c", script, "greppy-signal-test"])
+        .arg(&child_pid_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -416,6 +532,13 @@ fn active_index_writer_never_blocks_command_execution() {
         &["bash-smart", "--", "sh", "-c", "printf ran > command-ran"],
     );
     let elapsed = started.elapsed();
+    let long_output = run(
+        &workspace,
+        &[
+            "bash-smart", "--", "sh", "-c",
+            "i=0; while [ $i -lt 500 ]; do printf 'test case_%s ... ok\\n' \"$i\"; printf 'detail case_%s\\n' \"$i\" >&2; i=$((i+1)); done",
+        ],
+    );
     let _ = index.kill();
     let _ = index.wait();
 
@@ -439,4 +562,36 @@ fn active_index_writer_never_blocks_command_execution() {
         "stderr={}",
         text(&output.stderr)
     );
+    assert_eq!(long_output.status.code(), Some(0), "{long_output:?}");
+    for (bytes, expected) in [
+        (
+            &long_output.stdout,
+            (0..500)
+                .map(|i| format!("test case_{i} ... ok\n"))
+                .collect::<String>(),
+        ),
+        (
+            &long_output.stderr,
+            (0..500)
+                .map(|i| format!("detail case_{i}\n"))
+                .collect::<String>(),
+        ),
+    ] {
+        let rendered = text(bytes);
+        assert!(
+            rendered.lines().count() < 100,
+            "uncompressed output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("greppy expand "),
+            "invented pack ID: {rendered}"
+        );
+        let path_json = rendered
+            .split("raw log ")
+            .nth(1)
+            .and_then(|s| s.split("; read with greppy read-file").next())
+            .unwrap_or_else(|| panic!("missing raw-log recovery: {rendered}"));
+        let path: String = serde_json::from_str(path_json).expect("quoted spool path");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
 }

@@ -24,6 +24,9 @@ pub enum ResultsCommand {
     },
     /// Return a compact observation of the current page.
     Observe {
+        /// Restrict observation to visible regions matched by this node query.
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
@@ -191,11 +194,21 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             json,
         } => run(root, session, script_file, script_stdin, timeout, json),
         ResultsCommand::Observe {
+            query,
             session,
             tab,
             format,
             json,
         } => {
+            let query = match query {
+                Some(query) => {
+                    if let Err(error) = super::see::validate_query(&query) {
+                        return emit_error(json, invalid(&error));
+                    }
+                    Some(super::see::normalize_node_query(&query))
+                }
+                None => None,
+            };
             let session = match resolve_session(root, session) {
                 Ok(session) => session,
                 Err(error) => return emit_error(json, error),
@@ -207,6 +220,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             });
             if let Some(tab) = tab {
                 payload["tab_id"] = json!(tab);
+            }
+            if let Some(query) = query {
+                payload["query"] = json!(query);
             }
             rpc(root, json, "web.observe", payload, Some(session))
         }

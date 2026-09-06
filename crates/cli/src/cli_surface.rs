@@ -75,6 +75,9 @@ pub enum Command {
     #[command(external_subcommand)]
     Passthrough(Vec<String>),
     /// Index a repository.
+    #[command(
+        after_help = "Storage location:\n  Set GREPPY_STORE_DIR to an absolute directory on the intended volume before\n  indexing; use the same value for status, queries and later edits. The store\n  lives under GREPPY_STORE_DIR/workspaces/. This selects a different store; it\n  does not move or delete an existing one.\n\n  TMPDIR controls temporary files, not the normal persistent index location.\n  XDG_CACHE_HOME does not select the Greppy index location.\n\n  Models and inference caches use GREPPY_SHARED_INFERENCE_ROOT when explicitly\n  set; otherwise they follow GREPPY_STORE_DIR. Use one shared inference root on\n  the intended volume to retain model/cache reuse across isolated stores.\n\n  Example (Unix):\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index .\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index status --json"
+    )]
     Index {
         /// Path to the repository root (default: cwd), or `status`/`recover`.
         path: Option<String>,
@@ -444,7 +447,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Apply a unified diff to every named file as one transaction.
+    /// Apply a unified diff to existing files as one transaction.
+    ///
+    /// File creation and deletion are not supported. To create a file, use
+    /// `greppy write PATH` with content on stdin; it is a separate transaction,
+    /// not atomic with edits in a patch.
     Patch {
         #[arg(value_name = "DIFF", allow_hyphen_values = true)]
         diff: Option<String>,

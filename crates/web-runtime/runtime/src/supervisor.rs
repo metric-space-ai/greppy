@@ -5,6 +5,9 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
+#[path = "shutdown_outcome.rs"]
+mod shutdown_outcome;
+
 fn emit_line(line: &str) {
     println!("{line}");
     let _ = io::stdout().flush();
@@ -1696,26 +1699,28 @@ impl WorkerProcess {
         if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof start pid={pid}",
             self.worker
         ); }
-        if self.send(&Message::shutdown()).is_ok() {
-            let deadline = Instant::now() + WORKER_EOF_WAIT;
-            while Instant::now() < deadline {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.reaped = true;
-                        self.input.take();
-                        self.join_reader_bounded(READER_JOIN_WAIT);
-                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof done pid={pid}",
-                            self.worker
-                        ); }
-                        return;
-                    }
-                    Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
-                    Err(_) => break,
-                }
+        let sent = self.send(&Message::shutdown());
+        let deadline = Instant::now() + WORKER_EOF_WAIT;
+        let outcome = shutdown_outcome::await_exit(
+            sent,
+            || Instant::now() < deadline,
+            || self.child.try_wait().map(|status| status.is_some()),
+            || thread::sleep(REAP_POLL_INTERVAL),
+        );
+        let failure = match outcome {
+            Ok(()) => {
+                self.reaped = true;
+                self.input.take();
+                self.join_reader_bounded(READER_JOIN_WAIT);
+                if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof done pid={pid}",
+                    self.worker
+                ); }
+                return;
             }
-        }
+            Err(failure) => failure,
+        };
         eprintln!(
-            "web-runtime: phase {:?}-eof timeout pid={pid}; escalating to reap",
+            "web-runtime: phase {:?}-{failure} pid={pid}; escalating to reap",
             self.worker
         );
         self.kill_tree();

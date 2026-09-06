@@ -235,6 +235,10 @@ embedded README snapshot, because command names and routing rules evolve with
 the binary. The prompt's compact rule is: choose one direct graph command for
 named symbols, one `search` for concept discovery, `search-pattern` for literal
 text, `read-file` for paths, and run builds/tests through `bash-smart`.
+`bash-smart` preserves the command's exit status and raw logs; its default
+display folds long output and previews oversized individual lines with an
+explicit raw-log recovery path. Short output may also appear after the verdict
+and diagnostics. See the [display contract](contracts/bash-smart-display-v1.md).
 
 The integrated agent allocates its portable Chunk-CoW workspace before the
 first model request. After installing the platform package, activate and verify
@@ -543,6 +547,11 @@ repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 - **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USAGE`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches.
 - **Native semantic navigation.** `search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
 - **Shared fair inference daemons.** Indexing, search, summaries, and `bash-smart` use user-scoped local daemons; client processes never load a heavyweight model as a fallback. Requests are micro-batched and scheduled round-robin by client without a queue-capacity rejection. A model is offloaded after its idle TTL and the daemon exits after extended inactivity. Failed inference never removes deterministic source or graph output.
+
+  Agent browser sockets use a separate `GREPPY_WEB_RUNTIME_DIR`; this does not
+  create another inference daemon or model-owner lock. `GREPPY_RUNTIME_DIR`
+  remains an explicit whole-runtime override for isolated test harnesses and
+  must not be set separately for each production agent.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
 
 ## What the graph cannot see

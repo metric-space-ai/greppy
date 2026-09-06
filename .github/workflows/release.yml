@@ -474,14 +474,18 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$APPLICATION_CERTIFICATE_PASSWORD" "$keychain"
           codesign --force --options runtime --timestamp --sign "$APPLICATION_SIGNING_IDENTITY" target/release/greppy
           codesign --verify --strict --verbose=2 target/release/greppy
-          codesign --force --options runtime --timestamp --sign "$APPLICATION_SIGNING_IDENTITY" crates/web-runtime/target/release/web-runtime
+          codesign --force --options runtime --timestamp \
+            --entitlements crates/web-runtime/scripts/entitlements.plist \
+            --sign "$APPLICATION_SIGNING_IDENTITY" \
+            crates/web-runtime/target/release/web-runtime
           codesign --verify --strict --verbose=2 crates/web-runtime/target/release/web-runtime
 
       - name: Ad-hoc sign the macOS web runtime for unsigned dry-runs
         if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/') && !inputs.sign_dry_run
         shell: bash
         run: |
-          codesign --force --timestamp=none --options runtime --sign - \
+          codesign --force --timestamp=none --options runtime \
+            --entitlements crates/web-runtime/scripts/entitlements.plist --sign - \
             crates/web-runtime/target/release/web-runtime
           codesign --verify --strict --verbose=2 \
             crates/web-runtime/target/release/web-runtime

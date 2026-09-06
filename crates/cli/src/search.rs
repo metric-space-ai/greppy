@@ -6,6 +6,9 @@
 
 use super::*;
 
+#[path = "source_preview.rs"]
+mod source_preview;
+
 pub(crate) fn dispatch_search_graph(
     q: greppy_search::GraphQuery,
     name_filter: Option<&str>,
@@ -219,6 +222,12 @@ fn search_sort_name_rows(query: &str, nodes: &mut [greppy_store::Node]) {
             .then_with(|| left.start_line.cmp(&right.start_line))
             .then_with(|| left.name.cmp(&right.name))
     });
+}
+
+fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
+    // Match the same qualified name printed in a successful navigation row,
+    // not only the bare method name stored in `name`.
+    node.name.contains(query) || (query.contains("::") && nav_short_name(node).contains(query))
 }
 
 fn search_symbol_no_match_status(
@@ -514,7 +523,7 @@ pub(crate) fn dispatch_search_symbols(
                 .ok()
                 .flatten()
                 .is_some_and(|node| {
-                    node.name.contains(q)
+                    search_symbol_name_contains(&node, q)
                         && path_filters.matches(&node.file_path)
                         && search_kind_matches(&root_path, &node, kind)
                 })
@@ -542,7 +551,9 @@ pub(crate) fn dispatch_search_symbols(
     all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
     let matches_outside_filter = all_nodes
         .iter()
-        .filter(|node| node.name.contains(q) && !path_filters.matches(&node.file_path))
+        .filter(|node| {
+            search_symbol_name_contains(node, q) && !path_filters.matches(&node.file_path)
+        })
         .count();
     let nodes = all_nodes
         .into_iter()
@@ -550,7 +561,7 @@ pub(crate) fn dispatch_search_symbols(
         .collect::<Vec<_>>();
     let mut contained = nodes
         .iter()
-        .filter(|node| node.name.contains(q))
+        .filter(|node| search_symbol_name_contains(node, q))
         .cloned()
         .collect::<Vec<_>>();
     search_sort_name_rows(q, &mut contained);
@@ -949,7 +960,14 @@ fn search_pattern_rows(
     Ok(rows)
 }
 
-fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
+fn print_search_pattern_rows(
+    rows: &[SearchPatternRow],
+    code: bool,
+    all: bool,
+    query: &str,
+    fixed: bool,
+    root_path: &std::path::Path,
+) {
     const FULL_LIMIT: usize = 25;
     const SUMMARY_ROWS: usize = 5;
     let mut per_file: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -973,6 +991,13 @@ fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
     }
     let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
     let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
+    // This regex only positions a display window. grep remains authoritative
+    // for ERE matching; unsupported regex dialects retain a head preview.
+    let display_regex = if code && !fixed {
+        regex::Regex::new(query).ok()
+    } else {
+        None
+    };
     for (index, row) in rows.iter().take(shown).enumerate() {
         if let Some(node) = &row.node {
             print_search_row(
@@ -986,7 +1011,32 @@ fn print_search_pattern_rows(rows: &[SearchPatternRow], code: bool, all: bool) {
             println!("{}:{}", row.hit.file, row.hit.line.max(1));
         }
         if code {
-            println!("{}", row.hit.text);
+            let anchor = if fixed {
+                row.hit.text.find(query)
+            } else {
+                display_regex
+                    .as_ref()
+                    .and_then(|pattern| pattern.find(&row.hit.text))
+                    .map(|hit| hit.start())
+            };
+            let preview = source_preview::line(&row.hit.text, anchor);
+            if preview.omitted_before == 0 && preview.omitted_after == 0 {
+                println!("{}", preview.text);
+            } else {
+                println!(
+                    "[source preview: {} bytes omitted before; {} after; {} total bytes]",
+                    preview.omitted_before,
+                    preview.omitted_after,
+                    row.hit.text.len()
+                );
+                println!("{}", preview.text);
+                let file = root_path.join(&row.hit.file);
+                let line = row.hit.line.max(1);
+                println!(
+                    "full source line (current file): greppy read-file {} --lines {line}:{line}",
+                    shell_quote_cli(&file.to_string_lossy())
+                );
+            }
             if index + 1 < shown {
                 println!();
             }
@@ -1089,7 +1139,7 @@ pub(crate) fn dispatch_search_code(
         // status block above carries the guidance.
         return Ok(if insensitive.is_empty() { 1 } else { 0 });
     }
-    print_search_pattern_rows(&rows, code, all);
+    print_search_pattern_rows(&rows, code, all, q, fixed, &root_path);
     Ok(0)
 }
 

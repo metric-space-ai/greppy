@@ -22,13 +22,14 @@ pub use namespace::{
     WorkspaceHandle, WorkspaceOperationLease, WorkspacePairLease, WorkspaceStatus,
 };
 pub use provider::{
-    AdapterKind, ProviderCapabilities, ProviderInstallation, ProviderManifest, ProviderState,
+    AdapterKind, ProviderCapabilities, ProviderDiagnosticCheck, ProviderDiagnostics,
+    ProviderInstallation, ProviderManifest, ProviderState,
     PROVIDER_PROTOCOL_VERSION,
 };
 pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
-pub use repository_tracker_service::spawn_repository_tracker;
+pub use repository_tracker_service::{spawn_repository_tracker, spawn_repository_tracker_for};
 pub use snapshot::{
     capture_overlay_directory, capture_repository, capture_repository_incremental,
     capture_repository_with_observer, BaselineDirectory, BaselineEntry, BaselineSnapshot,
