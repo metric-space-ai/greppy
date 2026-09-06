@@ -4020,6 +4020,20 @@ fn observed_refs_keep_node_identity_across_followup_snapshots() {
     assert_eq!(replaced.status, "ok", "{replaced:?}");
     let replacement = observe();
     assert_ne!(replacement, original, "new snapshot must not recycle the replaced node's ref");
+    let refused = call("web.click", json!({"session_id":session,
+        "selector":{"type":"ref","value":original}}));
+    assert_eq!(refused.status, "error", "{refused:?}");
+    let error = refused.error.as_ref().unwrap();
+    assert_eq!(error.code, "STALE_REF", "{refused:?}");
+    assert!(error.next_action.contains("supplied page_state"));
+    assert!(!error.next_action.contains("greppy web observe"));
+    let state = &refused.result.as_ref().unwrap()["page_state"];
+    assert_eq!(state["status"], "available", "{refused:?}");
+    assert_eq!(state["snapshot"]["actionables"][0]["ref"], format!("@{replacement}"));
+    let unchanged = call("web.evaluate", json!({"session_id":session,"source":
+        "document.getElementById('choice').checked"}));
+    assert_eq!(unchanged.result.as_ref().unwrap()["value"], true,
+        "a rejected old ref must not toggle the replacement");
     let stale = inspect(original);
     assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
     let fresh = inspect(replacement);
