@@ -61,7 +61,7 @@ Completed dependency artifacts are retained for the next bounded compile.
 Native integration cases cover malformed later-step preflight without earlier
 mutation, delayed effects, retained changes on timeout, stale references,
 stale-reference absence, explicit tab identity, navigation and the whole-request
-deadline. Their execution results will be recorded after the actual engine run.
+deadline. The completed engine run and retained failures are recorded below.
 
 The second native attempt (`native-capture-v3-run-gj_97cab`) compiled the runtime
 library and integration test source, but failed linking the test executable:
@@ -105,6 +105,44 @@ The first build invocation used the wrong Cargo package name
 `greppy-web-runtime`; Cargo rejected it before compilation. It is a harness
 invocation error, not a product failure. The corrected package is `web-runtime`.
 Its retained receipt is `native-capture-v3-run-xvqc8yqu`.
+
+The subsequent run `native-capture-v3-run-g8zgy_jk` passed the explicit-tab,
+navigation and overall-deadline scenario. The other scenario correctly stopped
+at the unmet `Saved 3` expectation: my inline test handler used `value.value`
+and wrote `Saved undefined`, while the input itself held `3`. The fixture and
+independent value assertion now use `document.getElementById('value').value`.
+An additional standard-browser probe using a data URL was blocked by browser
+URL security policy; no standard-browser confirmation is claimed.
+
+The final run `native-capture-v3-run-ckz2ukny` passed **2/2 native scenarios**
+in 2.59 seconds after a 2m05s incremental compile, exit 0. Captured sources and
+executables remained unchanged. It used the frozen internal runtime SHA256
+`caed05280ccc134f713d7db1df1fa08abdcd8073b52c3e3b708b9f5740391d0a`.
+This verifies the integration scenarios, not the complete native suite or
+agent efficiency. The previous failed runs remain part of the record.
+
+The actual CLI/runtime probe `native-workflow-cli-20260906-02` passed all
+14 checks. It independently records exactly one server-side save with value 3,
+confirms the delayed result in the returned workflow snapshot, verifies that a
+later timeout stops the following save, and checks modal foreground output plus
+full archived background recovery. Runtime stop returned `running=false` and
+the HTTP fixture thread stopped. CLI SHA256:
+`0a668f4cfad89b576a5875d6690929cd8061dc33022a5df04498465a24e9f1d9`;
+the runtime is the same frozen `caed0528...` image. Both hashes remained unchanged.
+The guarded CLI build `cli-guarded-fwwgbwtw` exited 0 with unchanged sources.
+
+Probe 01 is retained as a harness failure: its generic command wrapper appended
+`--json` after the last chain step. Greppy documents that chain flags precede
+the first step, so the human output was expected; my JSON parser was wrong.
+The corrected probe places `--json` immediately after `web do`.
+
+That human output exposed a separate efficiency defect: each workflow step
+repeats session/tab identity and protocol envelopes in the compact view. This
+was reported with the full command, executable identity and captured output to
+the existing fix worker. A compact workflow receipt is still required before
+measuring the combined candidate. The observed focused modal view was 1,013
+bytes, with a 2,816-byte full archive response; these are different views, not
+provider token counts or an A/C performance comparison.
 
 Acceptance remains open: new repeated Luna A/B/C comparisons, actual provider
 input/output token reductions, paired time/p95, prepared-script performance,

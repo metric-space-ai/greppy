@@ -25,7 +25,7 @@ fn workflow_supervisor(socket: &Path, run_id: &str, fixture: &str) -> Supervisor
 
 const PAGE: &str = r#"<!doctype html><html><body>
 <label>Value <input id="value" value="1"></label>
-<button id="save" onclick="window.saves++; const v=value.value; setTimeout(() => { document.getElementById('done').textContent='Saved '+v; }, 120)">Save</button>
+<button id="save" onclick="window.saves++; const v=document.getElementById('value').value; setTimeout(() => { document.getElementById('done').textContent='Saved '+v; }, 120)">Save</button>
 <button id="increment" onclick="window.count++; document.getElementById('count').textContent='Count '+window.count">Increment</button>
 <p id="done">Not saved</p><p id="count">Count 0</p>
 <script>window.count=0;window.saves=0;</script>
@@ -114,7 +114,7 @@ fn native_workflow_preflights_all_steps_and_preserves_partial_effects() {
         .is_none());
     assert_eq!(detail["page_state"]["status"], "available");
     assert_eq!(
-        evaluate("JSON.stringify({count:window.count,saves:window.saves,value:value.value})"),
+        evaluate("JSON.stringify({count:window.count,saves:window.saves,value:document.getElementById('value').value})"),
         r#"{"count":1,"saves":1,"value":"3"}"#
     );
 
@@ -206,7 +206,10 @@ fn native_workflow_keeps_explicit_tab_through_navigation_and_request_timeout() {
             json!({"session_id":session,"tab_id":tab,"source":"window.count"}),
         );
         assert_eq!(state.status, "ok", "{state:?}");
-        assert_eq!(state.result.unwrap()["value"].as_f64(), Some(f64::from(count)));
+        assert_eq!(
+            state.result.unwrap()["value"].as_f64(),
+            Some(f64::from(count))
+        );
     }
     let destination = format!("{fixture}?next=1");
     let navigation = call(
