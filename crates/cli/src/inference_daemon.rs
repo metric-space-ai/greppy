@@ -1290,12 +1290,15 @@ fn write_frame(
     let deadline = Instant::now() + timeout;
     let mut written = 0usize;
     while written < bytes.len() {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "daemon frame write timed out",
             ));
         }
+        #[cfg(unix)]
+        stream.bound_write_timeout(remaining)?;
         match stream.write(&bytes[written..]) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -1320,12 +1323,15 @@ fn read_frame(
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
     let mut buffer = [0u8; 4096];
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "daemon frame read timed out",
             ));
         }
+        #[cfg(unix)]
+        stream.bound_read_timeout(remaining)?;
         match stream.read(&mut buffer) {
             #[cfg(windows)]
             Ok(0) => {
@@ -1573,6 +1579,25 @@ impl TransportStream {
     fn set_timeouts(&self, write: Duration, read: Duration) -> std::io::Result<()> {
         self.0.set_write_timeout(Some(write))?;
         self.0.set_read_timeout(Some(read))
+    }
+
+    // A deadline check outside a blocking syscall is insufficient: after a
+    // partial frame, the next syscall must use the remaining budget, not the
+    // original connection timeout. Preserve any stricter transport cap.
+    fn bound_read_timeout(&self, remaining: Duration) -> std::io::Result<()> {
+        let timeout = self
+            .0
+            .read_timeout()?
+            .map_or(remaining, |cap| cap.min(remaining));
+        self.0.set_read_timeout(Some(timeout))
+    }
+
+    fn bound_write_timeout(&self, remaining: Duration) -> std::io::Result<()> {
+        let timeout = self
+            .0
+            .write_timeout()?
+            .map_or(remaining, |cap| cap.min(remaining));
+        self.0.set_write_timeout(Some(timeout))
     }
 }
 
@@ -3097,6 +3122,67 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "daemon did not become reachable");
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_io_binds_blocking_socket_timeout_to_its_own_budget() {
+        use std::os::unix::net::UnixStream;
+        let budget = Duration::from_secs(5);
+        // No wall-clock race: queued data makes both operations immediate.
+        // Inspect the kernel timeout instead of asserting scheduler latency.
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        writer.write_all(b"ready\n").unwrap();
+        let mut reader = TransportStream(reader);
+        assert_eq!(read_frame(&mut reader, 64, budget).unwrap(), "ready");
+        assert!(
+            reader.0.read_timeout().unwrap().unwrap() <= budget,
+            "a read syscall must not retain a timeout longer than the frame budget"
+        );
+
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut writer = TransportStream(writer);
+        write_frame(&mut writer, b"ready\n", budget).unwrap();
+        assert!(
+            writer.0.write_timeout().unwrap().unwrap() <= budget,
+            "a write syscall must not retain a timeout longer than the frame budget"
+        );
+        let mut value = [0; 6];
+        reader.read_exact(&mut value).unwrap();
+        assert_eq!(&value, b"ready\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_io_bounds_unlimited_sockets_and_preserves_stricter_caps() {
+        use std::os::unix::net::UnixStream;
+        let budget = Duration::from_secs(5);
+        for configured in [None, Some(Duration::from_secs(1))] {
+            let expected_cap = configured.unwrap_or(budget);
+            let (reader, mut peer) = UnixStream::pair().unwrap();
+            reader.set_read_timeout(configured).unwrap();
+            peer.write_all(b"ready\n").unwrap();
+            let mut reader = TransportStream(reader);
+            assert_eq!(read_frame(&mut reader, 64, budget).unwrap(), "ready");
+            assert!(reader.0.read_timeout().unwrap().unwrap() <= expected_cap);
+            assert_eq!(reader.0.write_timeout().unwrap(), None);
+
+            let (writer, mut peer) = UnixStream::pair().unwrap();
+            writer.set_write_timeout(configured).unwrap();
+            let mut writer = TransportStream(writer);
+            write_frame(&mut writer, b"ready\n", budget).unwrap();
+            assert!(writer.0.write_timeout().unwrap().unwrap() <= expected_cap);
+            assert_eq!(writer.0.read_timeout().unwrap(), None);
+            let mut value = [0; 6];
+            peer.read_exact(&mut value).unwrap();
+            assert_eq!(&value, b"ready\n");
         }
     }
 
