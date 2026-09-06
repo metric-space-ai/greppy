@@ -156,14 +156,28 @@ pub(super) struct DaemonCodeEmbeddingProvider<'a> {
     // own model weights. Sending one daemon round-trip for every candidate
     // span made first-use indexing issue tens of thousands of serialized
     // requests before the first embedding batch could run.
-    tokenizer: Option<greppy_embed_native::PromptTokenizer>,
+    tokenizer: Result<greppy_embed_native::PromptTokenizer, String>,
     content_cache_hits: usize,
     content_cache_misses: usize,
 }
 
 impl<'a> DaemonCodeEmbeddingProvider<'a> {
     pub(super) fn new(cfg: &'a super::EmbeddingModelConfig) -> Self {
-        let tokenizer = match &cfg.source {
+        let tokenizer = Self::load_tokenizer(cfg);
+        Self {
+            cfg,
+            model_key: super::embedding_query_cache_key(cfg),
+            cache: greppy_store::EmbeddingContentCache::open_global().ok(),
+            tokenizer,
+            content_cache_hits: 0,
+            content_cache_misses: 0,
+        }
+    }
+
+    fn load_tokenizer(
+        cfg: &super::EmbeddingModelConfig,
+    ) -> Result<greppy_embed_native::PromptTokenizer, String> {
+        match &cfg.source {
             super::EmbeddingModelSource::Gguf { tokenizer, .. } => {
                 greppy_embed_native::PromptTokenizer::from_file(
                     tokenizer,
@@ -174,16 +188,8 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
                         ..greppy_embed_native::TokenizerConfig::default()
                     },
                 )
-                .ok()
+                .map_err(|error| format!("{}: {error}", tokenizer.display()))
             }
-        };
-        Self {
-            cfg,
-            model_key: super::embedding_query_cache_key(cfg),
-            cache: greppy_store::EmbeddingContentCache::open_global().ok(),
-            tokenizer,
-            content_cache_hits: 0,
-            content_cache_misses: 0,
         }
     }
 
@@ -196,7 +202,7 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             cfg,
             model_key: super::embedding_query_cache_key(cfg),
             cache: Some(cache),
-            tokenizer: None,
+            tokenizer: Self::load_tokenizer(cfg),
             content_cache_hits: 0,
             content_cache_misses: 0,
         }
@@ -227,6 +233,18 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
         greppy_core::Error::Store(format!(
             "{detail}; no in-process model fallback was attempted"
         ))
+    }
+
+    fn token_count_error<T>(&self, outcome: RequestOutcome<T>) -> greppy_core::Error {
+        let daemon_error = self.daemon_error(outcome);
+        match &self.tokenizer {
+            Err(cause) => greppy_core::Error::Store(format!(
+                "local embedding tokenizer could not initialize ({cause}); \
+                 token counting via the shared daemon also failed: {daemon_error}; \
+                 check that the configured tokenizer file exists and is valid"
+            )),
+            Ok(_) => daemon_error,
+        }
     }
 }
 
@@ -264,7 +282,7 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
         }) {
             return Ok(hit.token_len);
         }
-        let token_len = if let Some(tokenizer) = &self.tokenizer {
+        let token_len = if let Ok(tokenizer) = &self.tokenizer {
             tokenizer
                 .token_len(&Self::prompt_input(title, content))
                 .map_err(|error| {
@@ -285,8 +303,8 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
                     .get("token_len")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?,
-                outcome => return Err(self.daemon_error(outcome)),
+                    .ok_or_else(|| self.token_count_error(RequestOutcome::Response(())))?,
+                outcome => return Err(self.token_count_error(outcome)),
             }
         };
         if let Some(cache) = &self.cache {
@@ -748,13 +766,54 @@ mod tests {
             max_length: Some(128),
             device: greppy_embed_native::DevicePreference::Cpu,
         };
-        let provider = DaemonCodeEmbeddingProvider::new(&cfg);
-        assert!(provider.tokenizer.is_some());
+        let cache = greppy_store::EmbeddingContentCache::open(temp.path().join("cache")).unwrap();
+        let provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
+        assert!(provider.tokenizer.is_ok());
         assert!(
             provider
                 .document_token_len(Some("src/lib.rs:1-1 f"), "fn f() {}")
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn token_count_failure_preserves_tokenizer_initialization_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        for kind in ["missing", "malformed"] {
+            let path = temp.path().join(format!("{kind}-tokenizer.json"));
+            if kind == "malformed" {
+                std::fs::write(&path, b"not valid tokenizer JSON").unwrap();
+            }
+            let cfg = super::super::EmbeddingModelConfig {
+                model_id: "test-model".into(),
+                source: super::super::EmbeddingModelSource::Gguf {
+                    gguf: temp.path().join("deliberately-missing.gguf"),
+                    tokenizer: path.clone(),
+                },
+                max_length: Some(128),
+                device: greppy_embed_native::DevicePreference::Cpu,
+            };
+            let cache = greppy_store::EmbeddingContentCache::open(temp.path().join(kind)).unwrap();
+            let provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
+            let cause = provider
+                .tokenizer
+                .as_ref()
+                .err()
+                .expect("invalid tokenizer");
+            assert!(cause.contains(path.to_str().unwrap()));
+            for (outcome, expected) in [
+                (RequestOutcome::<()>::Failed, "request failed"),
+                (RequestOutcome::NoDaemon, "is unavailable"),
+                (RequestOutcome::DaemonBusy, "is busy"),
+                (RequestOutcome::Response(()), "malformed data"),
+            ] {
+                let error = provider.token_count_error(outcome).to_string();
+                assert!(error.contains(cause), "{error}");
+                assert!(error.contains(expected), "{error}");
+                assert!(error.contains("configured tokenizer file"), "{error}");
+                assert!(error.contains("no in-process model fallback"), "{error}");
+            }
+        }
     }
 }
