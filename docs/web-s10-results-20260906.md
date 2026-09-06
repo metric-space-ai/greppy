@@ -30,6 +30,14 @@ The generic v6 onboarding is unchanged. CLI SHA `f3d06e96…` adds the independe
 
 No private reasoning, motive or internal trust state is inferred. These episodes are based on public request/result pairs and subsequent visible actions.
 
+## Why the remaining input regression survives compact output
+
+The provider timeline for pair 1 contains **12 model generations for C versus 9 for A**, including the final generation. C's mean input per generation is already smaller: **39508.50 versus 48002.56 tokens**. Nevertheless, the additional generations raise its total to 474102 versus 432023. This arithmetic identifies the immediate cost mechanism: smaller context per generation does not compensate for the extra interaction rounds.
+
+The recorded recovery sequence above explains which interactions to investigate: malformed chaining and misleading recovery, loss of pending execution handles, and repeated confirmation/observation after an old-dialog receipt. This does not establish how many entire generations a particular fix will remove. That requires a frozen candidate intervention and fresh Luna trials; the selected error-round costs below are not promised savings.
+
+`generation-cost-audit.json` retains all ten complete provider timelines as generation counts, first/last/mean inputs, outputs and public call IDs. The reproducible `feedback_round_costs.py` audit also emits first/last/mean generation costs; its S10 rerun, `error-round-costs-v3.json`, reconciles all ten timelines and preserves the manual error annotations and source hashes. It uses actual counters and includes cached input. Counts for A/C pairs are 9/12, 18/7, 13/8, 11/9 and 21/15. Tool response bytes are not mislabeled as model output tokens.
+
 ## Actual provider cost associated with selected error rounds
 
 The generalized `feedback_round_costs.py` verifies each manual call ID against its public argument text and response timeline. Selected generations remain whole; they can contain useful actions and cannot be treated as removable savings.

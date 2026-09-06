@@ -54,6 +54,7 @@ def audit(series, annotation_path=None):
         public_calls = {c['call_id']: c for c in metadata['tool_calls']
                         if c.get('kind') == 'request'}
         rounds = timeline['responses']
+        assert rounds, f'Missing provider generations: {path}'
         assert all(sum(r['tokens'][k] for r in rounds) == timeline['total'][k]
                    for k in KEYS), path
         annotations = annotations_by_trial.get(path.stem, [])
@@ -69,6 +70,11 @@ def audit(series, annotation_path=None):
         measured = {k: sum(r['tokens'][k] for r in selected) for k in KEYS}
         trials.append(dict(trial=path.stem, arm=path.stem[-1],
                            provider_total=timeline['total'], total_rounds=len(rounds),
+                           generation_profile=dict(
+                               first_input_tokens=rounds[0]['tokens']['input_tokens'],
+                               last_input_tokens=rounds[-1]['tokens']['input_tokens'],
+                               mean_input_tokens=timeline['total']['input_tokens'] / len(rounds),
+                               mean_output_tokens=timeline['total']['output_tokens'] / len(rounds)),
                            annotated_call_ids=sorted(ids), selected_rounds=selected,
                            measured_selected_generations=measured,
                            percent_of_trial={k: 100 * measured[k] / timeline['total'][k]
@@ -79,6 +85,7 @@ def audit(series, annotation_path=None):
                 limits=['Manual public-call annotation, not an exhaustive failure classifier.',
                         'Unannotated rounds remain in trial totals; an empty annotation is not proof of no retries.',
                         'Ordinary outcome observations and reloads are not classified as avoidable.',
+                        'Generation means describe observed cost; they do not partition causal savings.',
                         'Cached input remains input. No bytes-to-tokens conversion.',
                         'No model motive or private reasoning is inferred.'])
 
