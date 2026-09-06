@@ -10,7 +10,9 @@ from dispatch import freeze_dispatch, task_goal
 CONDITION = 'explicit_transport_v1'
 CURRENT_BROWSER_CONDITION = 'browser_plugin_transport_v2'
 SYNTHETIC_BROWSER_CONDITION = 'browser_plugin_synthetic_v3'
-CONDITIONS = (CONDITION, CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION)
+COORDINATED_BROWSER_CONDITION = 'browser_plugin_coordinated_v4'
+CONDITIONS = (CONDITION, CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION,
+              COORDINATED_BROWSER_CONDITION)
 COMMON = (
     'Work only through the visible browser UI and documented browser APIs. '
     'Do not read fixture source, host state files or application APIs. '
@@ -27,13 +29,19 @@ def participant_message(trial, condition=CONDITION):
     if trial.get('task_goal') != goal:
         raise ValueError('requires a prospectively recorded business goal')
     prefix = f"Complete this browser task on {trial['url']}\n\n{goal['text']}\n\n{COMMON}\n\n"
-    if condition == SYNTHETIC_BROWSER_CONDITION:
+    if condition in (SYNTHETIC_BROWSER_CONDITION, COORDINATED_BROWSER_CONDITION):
         prefix += (
             'This is a local synthetic test with disposable test data. '
             'The requested reservation creates only a test record; it does not place a real order, '
             'make a payment or enter a contract. Complete the specified test actions.\n\n'
         )
-    if trial['arm'] == 'A' and condition in (CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION):
+    if condition == COORDINATED_BROWSER_CONDITION:
+        prefix += (
+            'Do not message other tasks. Report any remaining failure in your final response; '
+            'the experiment coordinator records traces and forwards bug reports.\n\n'
+        )
+    if trial['arm'] == 'A' and condition in (
+            CURRENT_BROWSER_CONDITION, SYNTHETIC_BROWSER_CONDITION, COORDINATED_BROWSER_CONDITION):
         return prefix + (
             'Use only the standard Codex in-app Browser through mcp__node_repl__js. '
             'This study explicitly authorizes the standard browser despite repository defaults. '

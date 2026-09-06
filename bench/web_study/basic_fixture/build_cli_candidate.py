@@ -13,6 +13,8 @@ import time
 SOURCE_FILES = ['Cargo.toml', 'Cargo.lock', 'crates/cli/src/web/common.rs',
                 'crates/cli/src/web/expect.rs', 'crates/cli/src/web/runtimes.rs',
                 'crates/cli/src/web/see.rs', 'crates/cli/src/web/view.rs',
+                'crates/cli/src/web/chain.rs', 'crates/cli/src/web/chain_output.rs',
+                'crates/cli/src/web/act.rs', 'crates/web-client/src/protocol.rs',
                 'crates/web-client/src/lib.rs', 'crates/web-client/src/describe-node.js']
 
 
