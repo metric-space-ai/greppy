@@ -1,6 +1,6 @@
 # Office readiness: correct the window attribution before measuring
 
-This is a readiness and trace audit, not an agent benchmark or an Office acceptance result. No Word save/reopen success has been established.
+This is a historical readiness and trace audit, not an agent benchmark or an Office acceptance result. W1 and W2 below did not establish Word save/reopen success. A later root W3 attempt did verify one own document across save and fresh navigation; see [the W3 evidence](web-office-word-readiness-20260906.md).
 
 ## W1: the reported error belongs to the spreadsheet area
 
@@ -33,4 +33,4 @@ CTOX HEAD during the check was `ec3b378dd68951078ae863252025638f7fe913de`. The p
 
 ## Next readiness gate
 
-With the requested standard browser available, foreground and scope the Word app, identify a single newly created test document, and verify its unique content after save and reopen. Then perform the equivalent isolated spreadsheet check. Only after deployed readiness, explicit document identity and independent outcome checks exist can Office tasks enter the A/B/C efficiency study. Failed or inconclusive readiness attempts remain archived.
+The later W3 attempt passed the Word portion of this limited readiness gate. The later [X1 spreadsheet check](web-office-spreadsheet-readiness-20260906.md) retained a CSV-labelled table's visible values and formula after reload. Independent outcome oracles and actual XLSX coverage remain prerequisites for the Office A/B/C efficiency study. Failed or inconclusive readiness attempts remain archived.
