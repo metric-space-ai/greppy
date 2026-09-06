@@ -323,7 +323,7 @@ fn condition_ref_selector(
     };
     parse_target(query, false, false, None)
         .map(|target| Some(target.selector))
-        .map_err(|error| error.message)
+        .map_err(|error| error.message.to_string())
 }
 
 fn bind_condition_payload(
