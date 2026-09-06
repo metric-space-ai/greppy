@@ -6,7 +6,10 @@ observation pairs each returned 29,653 versus 1,322 UTF-8 stdout bytes, a 95.54%
 reduction. These are bytes, not provider tokens. No agent participated in this
 probe and it does not establish superiority over the standard browser.
 
-The fixture contains 60 unrelated application regions and one working form.
+The fixture contains 60 unrelated application regions and one working form,
+all within one HTML document. This does not establish observation or actions
+inside the nested srcdoc iframes used by real Office, nor frame-boundary safety.
+Those remain a separate required gate.
 The scoped view retains the current field value and save outcome, excludes the
 unrelated regions, and reports its explicit scope. The same elements retain their
 references across whole-page and scoped observations. A missing region returns
