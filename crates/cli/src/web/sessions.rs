@@ -37,6 +37,8 @@ pub enum SessionsCommand {
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     Create {
+        /// Network profile: research: public web; project: public web plus loopback
+        /// for explicitly requested local development. LAN and cloud metadata remain blocked.
         #[arg(long, default_value = "research")]
         profile: String,
         #[arg(long)]

@@ -32,6 +32,8 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
 const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
+const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
+const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -344,6 +346,9 @@ struct Delegate {
     last_responses: RefCell<Vec<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
+    /// Main-document lifecycle, owned by Servo rather than page script. A
+    /// navigation discards the old Window and all of its installed waiters.
+    document_generation: Cell<u64>,
     /// Receipts for synthetic input: Servo acknowledges every input event,
     /// and a painter-side drop (no display list yet -> empty hit test)
     /// arrives as InputEventResult::DispatchFailed. Confirmed delivery
@@ -384,6 +389,7 @@ impl Delegate {
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
+            document_generation: Cell::new(0),
             input_receipts: RefCell::new(HashMap::new()),
             wake,
             user_content,
@@ -423,6 +429,13 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::HeadParsed {
+            self.document_generation.set(self.document_generation.get().wrapping_add(1));
+        }
+        self.wake.wake();
+    }
+
     fn notify_input_event_handled(
         &self,
         _webview: WebView,
@@ -823,17 +836,19 @@ fn wait_for_function_waiter_script(
     token: &str,
     timeout_ms: u128,
     frame_index: Option<u64>,
+    strict_boolean: bool,
 ) -> io::Result<String> {
     let source_js = serde_json::to_string(source).map_err(io::Error::other)?;
     let token_js = serde_json::to_string(token).map_err(io::Error::other)?;
-    let mut waiter = String::from("(function(source, token, timeoutMs) { ");
+    let mut waiter = String::from("(function(source, token, timeoutMs, strictBoolean) { ");
     waiter.push_str(WAIT_FOR_FUNCTION_RUNTIME);
-    waiter.push_str("\nreturn greppyWaitForFunction(source, token, timeoutMs); })(");
+    waiter.push_str("\nreturn greppyWaitForFunction(source, token, timeoutMs, strictBoolean); })(");
     waiter.push_str(&source_js);
     waiter.push_str(", ");
     waiter.push_str(&token_js);
     waiter.push_str(", ");
     waiter.push_str(&timeout_ms.to_string());
+    waiter.push_str(if strict_boolean { ", true" } else { ", false" });
     waiter.push_str(")");
     if let Some(index) = frame_index {
         let waiter_js = serde_json::to_string(&waiter).map_err(io::Error::other)?;
@@ -870,6 +885,7 @@ struct ContentEngine {
 
 impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
+        trace_startup("renderer-create");
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
                 width: 1280,
@@ -877,11 +893,13 @@ impl ContentEngine {
             })
             .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
         );
+        trace_startup("renderer-make-current");
         rendering_context.make_current().map_err(|error| {
             io::Error::other(format!("renderer make_current failed: {error:?}"))
         })?;
 
         let profile = SharedProfile::new(NetworkProfile::Research);
+        trace_startup("policy-proxy-spawn");
         let proxy = PolicyProxy::spawn(profile.clone())?;
         let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
@@ -891,11 +909,13 @@ impl ContentEngine {
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
+        trace_startup("servo-build");
         let servo = ServoBuilder::default()
             .opts(opts)
             .preferences(preferences)
             .event_loop_waker(Box::new(wake.clone()))
             .build();
+        trace_startup("user-content-init");
         let user_content = Rc::new(UserContentManager::new(&servo));
         user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Self {
@@ -1371,7 +1391,17 @@ impl ContentEngine {
             ));
         }
         let result = saved.borrow_mut().take().expect("evaluation completed");
-        result.map_err(|error| io::Error::other(format!("page JavaScript failed: {error:?}")))
+        result.map_err(|error| {
+            let concise = match &error {
+                servo::JavaScriptEvaluationError::EvaluationFailure(Some(info)) => {
+                    crate::locator_diagnostics::concise_selection_failure(&info.message)
+                }
+                _ => None,
+            };
+            io::Error::other(concise.map(str::to_owned).unwrap_or_else(|| {
+                format!("page JavaScript failed: {error:?}")
+            }))
+        })
     }
 
     fn wait_for_recorded<T>(
@@ -1421,49 +1451,98 @@ impl ContentEngine {
         source: &str,
         timeout: Duration,
         frame_index: Option<u64>,
+        strict_boolean: bool,
     ) -> io::Result<serde_json::Value> {
-        let timeout = timeout.max(Duration::from_millis(20));
-        let deadline = Instant::now() + timeout;
-        let token = alloc_wait_nonce()?;
+        let timeout = if strict_boolean { timeout } else { timeout.max(Duration::from_millis(20)) };
+        if timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+        }
+        let deadline = Instant::now().checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
+        let io_deadline = strict_boolean.then_some(deadline);
+        let mut token = alloc_wait_nonce()?;
+        let mut document_generation = delegate.document_generation.get();
         delegate.clear_wait_notice(&token);
         let waiter =
-            wait_for_function_waiter_script(source, &token, timeout.as_millis(), frame_index)?;
-        let install_budget = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1));
+            wait_for_function_waiter_script(source, &token, timeout.as_millis(), frame_index, strict_boolean)?;
+        let install_budget = deadline.saturating_duration_since(Instant::now());
+        let install_budget = if strict_boolean { install_budget } else { install_budget.max(Duration::from_millis(1)) };
+        if install_budget.is_zero() || (strict_boolean && install_budget < Duration::from_millis(1)) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+        }
         let first = match self.evaluate_until(webview.clone(), &waiter, install_budget) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                self.drop_wait_slot(&webview, &token);
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timeout: waitForFunction",
                 ));
             }
             Err(error) => {
-                self.drop_wait_slot(&webview, &token);
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 return Err(error);
             }
         };
-        if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token)? {
-            return result;
-        }
-        if jsvalue_is_truthy(&first) {
-            self.drop_wait_slot(&webview, &token);
-            self.settle_pump_tokens(&webview);
-            return serialize_wait_value(first);
+        // Evaluation pumps Servo too: a navigation can commit while the
+        // installation reply is in flight. Only the installed document may
+        // certify its reply; otherwise the loop rebinds before inspecting it.
+        if delegate.document_generation.get() == document_generation {
+            if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
+                return result;
+            }
+            if jsvalue_is_truthy(&first) {
+                self.drop_wait_slot(&webview, &token, io_deadline);
+                if !strict_boolean {
+                    self.settle_pump_tokens(&webview);
+                }
+                return serialize_wait_value(first);
+            }
         }
         loop {
             if self.parent_dead() {
-                self.drop_wait_slot(&webview, &token);
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 return Err(Self::parent_gone());
             }
-            if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token)? {
+            if delegate.document_generation.get() != document_generation {
+                // Reinstall on the new Document with the ORIGINAL deadline.
+                // The old nonce must not certify this new document, even if
+                // an old console completion was already in the delegate.
+                delegate.clear_wait_notice(&token);
+                token = alloc_wait_nonce()?;
+                document_generation = delegate.document_generation.get();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining < Duration::from_millis(1) {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+                }
+                let waiter = wait_for_function_waiter_script(
+                    source, &token, remaining.as_millis(), frame_index, strict_boolean,
+                )?;
+                let first = match self.evaluate_until(webview.clone(), &waiter, remaining) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.drop_wait_slot(&webview, &token, io_deadline);
+                        return Err(error);
+                    }
+                };
+                if delegate.document_generation.get() == document_generation {
+                    if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
+                        return result;
+                    }
+                    if jsvalue_is_truthy(&first) {
+                        self.drop_wait_slot(&webview, &token, io_deadline);
+                        if !strict_boolean { self.settle_pump_tokens(&webview); }
+                        return serialize_wait_value(first);
+                    }
+                }
+                continue;
+            }
+            if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.drop_wait_slot(&webview, &token);
+                self.drop_wait_slot(&webview, &token, io_deadline);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timeout: waitForFunction",
@@ -1483,17 +1562,18 @@ impl ContentEngine {
             }
             match poll_wake_step(
                 &self.wake,
-                || delegate.wait_notice(&token).is_some(),
+                || delegate.wait_notice(&token).is_some()
+                    || delegate.document_generation.get() != document_generation,
                 remaining,
             ) {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
                     if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token)?
+                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
                     {
                         return result;
                     }
-                    self.drop_wait_slot(&webview, &token);
+                    self.drop_wait_slot(&webview, &token, io_deadline);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timeout: waitForFunction",
@@ -1511,27 +1591,38 @@ impl ContentEngine {
         format!("__greppyWait_{token}")
     }
 
-    fn drop_wait_slot(&self, webview: &WebView, token: &str) {
+    fn drop_wait_slot(&self, webview: &WebView, token: &str, deadline: Option<Instant>) {
+        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
+        if budget.is_zero() {
+            // The installed JS deadline still cancels observers/frames. Do not
+            // start another synchronous evaluation after the caller's budget.
+            return;
+        }
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
         let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return 0; })(");
         script.push_str(&key_js);
         script.push_str(")");
-        let _ = self.evaluate_until(webview.clone(), &script, Duration::from_millis(80));
+        let _ = self.evaluate_until(webview.clone(), &script, budget);
     }
 
     fn take_completed_wait_slot(
         &self,
         webview: &WebView,
         token: &str,
+        deadline: Option<Instant>,
     ) -> io::Result<Option<(String, JSValue)>> {
+        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
+        if budget.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+        }
         let key_js =
             serde_json::to_string(&Self::wait_slot_key(token)).map_err(io::Error::other)?;
         let mut script = String::from("(function(key) { var slot = window[key]; if (!slot || !slot.done) return [0, '', null]; var status = String(slot.status || ''); var value = slot.value; if (typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return [1, status, value]; })(");
         script.push_str(&key_js);
         script.push_str(")");
-        match self.evaluate_until(webview.clone(), &script, Duration::from_millis(80))? {
+        match self.evaluate_until(webview.clone(), &script, budget)? {
             JSValue::Array(mut items) if items.len() >= 3 => {
                 let value = items.remove(2);
                 let status_value = items.remove(1);
@@ -1559,15 +1650,17 @@ impl ContentEngine {
         webview: &WebView,
         delegate: &Delegate,
         token: &str,
+        deadline: Option<Instant>,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = self.take_completed_wait_slot(webview, token)? else {
+        let Some((status, value)) = self.take_completed_wait_slot(webview, token, deadline)? else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
         let status = if status.is_empty() { notice } else { status };
+        delegate.clear_wait_notice(token);
         Ok(Some(self.finish_wait_outcome(
             webview,
             match status.as_str() {
@@ -1579,6 +1672,7 @@ impl ContentEngine {
                 }),
                 other => WaitOutcome::Error(other.to_owned()),
             },
+            deadline.is_some(),
         )))
     }
 
@@ -1586,10 +1680,13 @@ impl ContentEngine {
         &self,
         webview: &WebView,
         outcome: WaitOutcome,
+        strict_budget: bool,
     ) -> io::Result<serde_json::Value> {
         match outcome {
             WaitOutcome::Ok(value) => {
-                self.settle_pump_tokens(webview);
+                if !strict_budget {
+                    self.settle_pump_tokens(webview);
+                }
                 serialize_wait_value(value)
             }
             WaitOutcome::Timeout => Err(io::Error::new(
@@ -1704,7 +1801,7 @@ impl ContentEngine {
             .unwrap_or(serde_json::Value::Null);
         let (webview, _) = self.page(&page_id)?.clone();
         let source = format!(
-            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
+            "(function(selector) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (!greppyObservedRefMatches(selector, nodes)) throw new Error('STALE_REF: observed node no longer belongs to the active document'); if (nodes.length !== 1) throw new Error('strict mode: expected 1 node, got ' + nodes.length); {expr} }})({selector})"
         );
         self.evaluate(webview, &source)
     }
@@ -2122,16 +2219,26 @@ impl ContentEngine {
                 let (webview, _) = self.page(&page_id)?.clone();
                 evaluate_serialized(self.evaluate(webview, &source)?)
             }
-            "page.waitForFunction" => {
+            "page.waitForFunction" | "page.waitForBoolean" => {
                 let page_id = required_str(&params, "page")?;
                 let source = required_str(&params, "source")?;
                 let (webview, delegate) = self.page(&page_id)?.clone();
+                let timeout = if method == "page.waitForBoolean" {
+                    let maximum = Duration::from_millis(params.get("timeout").and_then(|v| v.as_u64())
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Boolean wait timeout"))?);
+                    let deadline = params.get("deadline_monotonic_ns").and_then(|v| v.as_u64())
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing Boolean wait deadline"))?;
+                    crate::wait_contract::worker_remaining(crate::wait_contract::monotonic_ns()?, deadline, maximum)
+                } else {
+                    call_timeout(&params)
+                };
                 self.wait_for_function_truthy(
                     webview,
                     &delegate,
                     &source,
-                    call_timeout(&params),
+                    timeout,
                     None,
+                    method == "page.waitForBoolean",
                 )
             }
             "page.frameWaitForFunction" => {
@@ -2145,6 +2252,7 @@ impl ContentEngine {
                     &source,
                     call_timeout(&params),
                     Some(index),
+                    false,
                 )
             }
             "browser.close" => {
@@ -2213,8 +2321,10 @@ impl ContentEngine {
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
+                let first = params.get("ref_first").and_then(|value| value.as_u64()).unwrap_or(0);
+                let last = params.get("ref_last").and_then(|value| value.as_u64()).unwrap_or(0);
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(webview, &observe_script(snapshot))? {
+                match self.evaluate(webview, &observe_script(snapshot, first, last))? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -2264,6 +2374,15 @@ impl ContentEngine {
                     self.screenshot_png(&webview, clip)?
                 };
                 screenshot_engine_result(&png)
+            }
+            "locator.inspect" => {
+                let attrs = params.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false);
+                let html = params.get("html").and_then(|v| v.as_bool()).unwrap_or(false);
+                let describe = greppy_web_client::DESCRIBE_NODE_JS;
+                let source = format!(
+                    "var describe = {describe}; var out = {{ count: 1, node: describe(nodes[0], {attrs}) }}; if ({html}) out.html = nodes[0].outerHTML.slice(0, 20000); return out;"
+                );
+                Ok(json!({ "serialized": serialize_jsvalue(self.locator_eval(&params, &source)?)? }))
             }
             "locator.count" => {
                 let page_id = required_str(&params, "page")?;
@@ -2342,21 +2461,19 @@ impl ContentEngine {
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
-                let page_id = required_str(&params, "page")?;
                 let value = required_str(&params, "value")?;
-                let selector = params
-                    .get("selector")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let (webview, _) = self.page(&page_id)?.clone();
-                // Same rule as check: a selection the page never hears about
-                // is worse than a failure (finding 019).
-                let source = format!(
-                    "(function(selector, value) {{ {SELECTOR_RUNTIME} var nodes = greppyResolveNodes(selector); if (nodes.length !== 1) throw new Error('strict mode'); var el = nodes[0]; if (el.value !== value) {{ el.value = value; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }} return true; }})({selector}, {})",
-                    serde_json::to_string(&value).map_err(io::Error::other)?
-                );
-                self.evaluate(webview, &source)?;
-                Ok(json!({}))
+                let value = serde_json::to_string(&value).map_err(io::Error::other)?;
+                // Re-resolve through locator_eval so document-bound refs are
+                // checked again immediately before the selection is applied.
+                let result = self.locator_eval(&params, &format!(
+                    "{SELECT_CHOICES_RUNTIME}\n{SELECT_OPTION_RUNTIME}\nreturn greppySelectOption(nodes[0], {value});"
+                ))?;
+                match result {
+                    JSValue::Boolean(true) => Ok(json!({})),
+                    _ => Err(io::Error::other(
+                        "SELECTION_NOT_APPLIED: selection did not produce a verified result",
+                    )),
+                }
             }
             "locator.inputValue" => {
                 match self.locator_eval(&params, "return String(nodes[0].value || '')")? {
@@ -3701,13 +3818,21 @@ struct ResolvedNode {
     offset_top: f64,
 }
 
-const SELECTOR_RUNTIME: &str = r#"
+/// Use exactly the native locator's node-identity check for condition refs.
+/// The daemon supplies a selector bound to one session/page snapshot, never a
+/// page-provided CSS recipe. The closure runs again for each wait sample.
+pub(crate) fn observed_ref_condition_source(source: &str, selector: &serde_json::Value) -> String {
+    let guard = include_str!("observed-ref-condition.js");
+    format!("(function(){{ {SELECTOR_RUNTIME} return ({guard})({selector}, function(__greppyConditionNodes){{ return ({source}); }}); }})()")
+}
+
+const SELECTOR_RUNTIME: &str = concat!(include_str!("native-label-text.js"), r#"
 function greppyAccessibleName(el) {
   const labelled = el.getAttribute('aria-label');
   if (labelled) return labelled.trim();
-  if (el.id) {
-    const by = document.querySelector('label[for="' + el.id + '"]');
-    if (by) return (by.textContent || '').trim();
+  const labels = Array.from(el.labels || []);
+  if (labels.length) {
+    return labels.map((label) => greppyNativeLabelText(label, el)).join(' ').trim();
   }
   return ((el.innerText || el.textContent || el.value || '') + '').trim();
 }
@@ -3783,7 +3908,7 @@ function greppyResolveIn(root, selector) {
   }
   if (selector.type === 'label') {
     const labels = greppyQueryAll(root === document ? document : root, 'label');
-    const match = labels.find((label) => (label.textContent || '').trim() === selector.name);
+    const match = labels.find((label) => greppyNativeLabelText(label, greppyControlForLabel(label)).trim() === selector.name);
     if (!match) return [];
     if (match.control) return [match.control];
     if (match.htmlFor) {
@@ -3856,6 +3981,14 @@ function greppyResolveIn(root, selector) {
   }
   return [];
 }
+function greppyObservedRefMatches(selector, nodes) {
+  if (selector.snapshot == null) return true;
+  const registry = window.__greppyObservedRefs;
+  return !!(registry && registry.snapshot === selector.snapshot &&
+    document.documentElement && document.documentElement.getAttribute('data-greppy-ref-snapshot') === selector.snapshot &&
+    nodes.length === 1 && registry.matches(nodes[0], selector.observed_ref) &&
+    nodes[0].ownerDocument === document && nodes[0].isConnected);
+}
 function greppyResolveNodes(selector) {
   if (selector.type === 'filter') {
     let nodes = greppyResolveNodes(selector.scope);
@@ -3892,7 +4025,7 @@ function greppyResolveNodes(selector) {
   }
   return nodes;
 }
-"#;
+"#);
 
 fn resolve_script(selector: &serde_json::Value) -> String {
     format!(
@@ -3921,7 +4054,7 @@ fn resolve_script(selector: &serde_json::Value) -> String {
             return {{ staleRef: true, count: 0 }};
           }}
           const nodes = greppyResolveNodes(selector);
-          if (selector.snapshot != null && nodes.length !== 1) {{
+          if (!greppyObservedRefMatches(selector, nodes)) {{
             return {{ staleRef: true, count: nodes.length }};
           }}
           if (nodes.length !== 1) {{
@@ -4921,36 +5054,111 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last) {
+  __GREPPY_NATIVE_LABEL_TEXT__
+  __GREPPY_SELECT_CHOICES__
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
+  let registry = null;
   if (snapshot != null) {
-    Array.from(document.querySelectorAll('[' + refAttr + ']')).forEach(function(node) {
-      node.removeAttribute(refAttr);
-    });
+    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
+    window.__greppyObservedRefs = registry;
+    snapshot = registry.snapshot;
     if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
   }
   const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
-    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[contenteditable="true"]'
+    'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
   )).filter(function(node) {
     const style = getComputedStyle(node);
     const rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   });
-  const capped = candidates.slice(0, 200);
-  const actionables = capped.map(function(node, index) {
-    const ref = index + 1;
+  const capped = candidates.slice(0, __GREPPY_REF_LIMIT__);
+  const compact = function(value) { return String(value || '').replace(/\s+/g, ' ').trim(); };
+  const accessibleName = function(node, tag, type) {
+    const labelledBy = (node.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
+    const labels = labelledBy.map(function(id) { return document.getElementById(id); }).filter(Boolean);
+    if (labels.length) {
+      return { name: compact(labels.map(function(label) { return label.textContent || ''; }).join(' ')), source: 'aria-labelledby' };
+    }
+    const aria = compact(node.getAttribute('aria-label'));
+    if (aria) return { name: aria, source: 'aria-label' };
+    const nativeLabels = Array.from(node.labels || []);
+    if (nativeLabels.length) return { name: compact(nativeLabels.map(function(label) { return greppyNativeLabelText(label, node); }).join(' ')), source: 'label' };
+    if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
+      const text = compact(node.innerText || node.textContent);
+      if (text) return { name: text, source: 'contents' };
+    }
+    if (tag === 'input' && ['button', 'submit', 'reset'].includes(type)) {
+      return { name: compact(node.value || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '')), source: 'value' };
+    }
+    const title = compact(node.getAttribute('title'));
+    if (title) return { name: title, source: 'title' };
+    return { name: null, source: null };
+  };
+  const implicitRole = function(node, tag, type) {
+    if (tag === 'a' && node.hasAttribute('href')) return 'link';
+    if (tag === 'button' || tag === 'summary') return 'button';
+    if (tag === 'select') return node.multiple || node.size > 1 ? 'listbox' : 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'input') {
+      if (['checkbox', 'radio'].includes(type)) return type;
+      if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+      if (type === 'number') return 'spinbutton';
+      if (type === 'range') return 'slider';
+      if (type === 'search') return 'searchbox';
+      if (['text', 'email', 'tel', 'url'].includes(type)) return 'textbox';
+    }
+    return null;
+  };
+  const ariaBoolean = function(node, attribute) {
+    const value = node.getAttribute(attribute);
+    return value === 'true' ? true : value === 'false' ? false : null;
+  };
+  const actionables = capped.map(function(node) {
+    const ref = registry.refFor(node);
     node.setAttribute(refAttr, snapshot + ':' + ref);
-    const text = ((node.innerText || node.textContent || node.value || '') + '').trim().slice(0, 160);
-    return {
+    const tag = node.tagName.toLowerCase();
+    const type = tag === 'input' || tag === 'button' ? node.type : null;
+    const autocomplete = (node.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
+    // Credential and file values must never enter either the new value field or the legacy text fallback.
+    const sensitive = type === 'password' || type === 'file' || autocomplete.some(function(token) {
+      return ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc'].includes(token);
+    });
+    const text = sensitive ? '' : ((node.innerText || node.textContent || node.value || '') + '').trim().slice(0, 160);
+    const name = accessibleName(node, tag, type);
+    const hasValue = tag === 'input' || tag === 'select' || tag === 'textarea';
+    const rawValue = hasValue && !sensitive ? String(node.value || '') : null;
+    const checkable = tag === 'input' && (type === 'checkbox' || type === 'radio');
+    const ariaChecked = node.getAttribute('aria-checked');
+    const selectedOptions = tag === 'select' && !sensitive ? Array.from(node.options).filter(function(option) { return option.selected; }) : null;
+    const selectChoices = sensitive ? null : greppySelectChoicesSnapshot(node);
+    const ariaInvalid = node.getAttribute('aria-invalid');
+    const actionable = {
       ref: '@' + ref,
-      tag: node.tagName.toLowerCase(),
-      role: node.getAttribute('role') || null,
-      name: (node.getAttribute('aria-label') || '').trim() || null,
+      tag: tag,
+      role: node.getAttribute('role') || implicitRole(node, tag, type),
+      name: name.name === null ? null : name.name.slice(0, 160),
+      name_source: name.source,
+      name_truncated: name.name !== null && name.name.length > 160,
       text: text,
       href: node.href || null,
-      disabled: !!(node.disabled || node.getAttribute('aria-disabled') === 'true')
+      disabled: !!(node.disabled || node.matches(':disabled') || node.getAttribute('aria-disabled') === 'true'),
+      type: type,
+      value: rawValue === null ? null : rawValue.slice(0, 160),
+      value_redacted: sensitive,
+      value_truncated: rawValue !== null && rawValue.length > 160,
+      checked: checkable ? (node.indeterminate ? 'mixed' : !!node.checked) : (ariaChecked === 'mixed' ? 'mixed' : ariaBoolean(node, 'aria-checked')),
+      selected: ariaBoolean(node, 'aria-selected'),
+      selected_options: selectedOptions === null ? null : selectedOptions.slice(0, 20).map(function(option) {
+        return { value: String(option.value).slice(0, 160), label: compact(option.label).slice(0, 160) };
+      }),
+      selected_options_truncated: selectedOptions !== null && (selectedOptions.length > 20 || selectedOptions.some(function(option) { return String(option.value).length > 160 || String(option.label).length > 160; })),
+      expanded: ariaBoolean(node, 'aria-expanded'),
+      invalid: (ariaInvalid !== null && ariaInvalid !== 'false') || (node.validity && !node.validity.valid) ? true : (node.validity || ariaInvalid !== null ? false : null)
     };
+    if (selectChoices !== null) actionable.select_choices = selectChoices;
+    return actionable;
   });
   return JSON.stringify({
     url: location.href,
@@ -4962,15 +5170,24 @@ const OBSERVE_JS: &str = r#"(function(snapshot) {
     links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(function(a) {
       return { href: a.href, text: ((a.innerText || '').trim()).slice(0, 80) };
     }),
+    actionable_schema: 'greppy.web.actionable.v2',
+    ref_snapshot: snapshot,
     actionables: actionables,
     ref_count: actionables.length,
     refs_truncated: candidates.length > capped.length
   });
-})(__GREPPY_SNAPSHOT__)"#;
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__)"#;
 
-fn observe_script(snapshot: Option<&str>) -> String {
+fn observe_script(snapshot: Option<&str>, first: u64, last: u64) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
-    OBSERVE_JS.replace("__GREPPY_SNAPSHOT__", &encoded)
+    OBSERVE_JS
+        .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
+        .replace("__GREPPY_SELECT_CHOICES__", greppy_web_client::SELECT_CHOICES_JS)
+        .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
+        .replace("__GREPPY_REF_LIMIT__", &crate::observed_refs::OBSERVED_REF_LIMIT.to_string())
+        .replace("__GREPPY_REF_FIRST__", &first.to_string())
+        .replace("__GREPPY_REF_LAST__", &last.to_string())
+        .replace("__GREPPY_SNAPSHOT__", &encoded)
 }
 
 static CLICK_PROBE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -5101,15 +5318,30 @@ fn is_parent_eof(error: &io::Error) -> bool {
     )
 }
 
+// Startup-only diagnostics deliberately avoid the per-operation tracing path:
+// a failed handshake needs a last-known phase, not an unbounded event log.
+fn trace_startup(stage: &str) {
+    if std::env::var_os("GREPPY_WEB_TRACE_STARTUP").is_some() {
+        eprintln!(
+            "web-runtime: startup worker=content pid={} stage={stage}",
+            std::process::id()
+        );
+    }
+}
+
 pub fn run() -> io::Result<()> {
+    trace_startup("authenticate");
     let capability = require_worker_auth(std::env::args_os().skip(1))?;
+    trace_startup("sandbox");
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
     )?;
+    trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
     let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
+    trace_startup("read-hello");
     match read_message(&mut protocol_in)? {
         Message::Hello {
             worker: WorkerKind::Content,
@@ -5124,6 +5356,7 @@ pub fn run() -> io::Result<()> {
         }
     }
     write_message(&mut protocol_out, &Message::ready(WorkerKind::Content))?;
+    trace_startup("ready-sent");
 
     let (tx, rx) = mpsc::channel();
     let parent_for_reader = Arc::clone(&parent_alive);

@@ -3707,6 +3707,899 @@ fn observed_refs_drive_locators_and_expire_on_navigation() {
 }
 
 #[test]
+fn observed_form_state_tracks_properties_labels_and_redacts_credentials() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+<label for="choose">Choose Linen shirt</label><input id="choose" type="checkbox" value="on">
+<span id="qty">Quantity</span><span id="units">in units</span>
+<input id="quantity" type="number" aria-label="wrong precedence" aria-labelledby="qty units" value="2" disabled>
+<select id="size" aria-label="Size"><option value="s">Small</option><option value="m" selected>Medium</option></select>
+<button id="details" aria-expanded="false">Details</button>
+<input id="email" type="email" aria-label="Email" value="bad" required>
+<div role="option" aria-selected="true">Special shipping</div>
+<input type="password" aria-label="Password" value="PASSWORD-MUST-NOT-LEAK">
+<input autocomplete="one-time-code" aria-label="Verification code" value="OTP-MUST-NOT-LEAK">
+</body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-form-state-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_form_state", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, params| {
+        let response = unix_request(
+            &socket,
+            &Request::new("run_form_state", method, params),
+            Duration::from_secs(30),
+        )
+        .expect("form state request");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.expect("form state result")
+    };
+    let created = call("web.session.create", json!({"profile": "project"}));
+    let session = created["session_id"].as_str().unwrap();
+    call("web.goto", json!({"session_id": session, "url": fixture}));
+    let before = call("web.observe", json!({"session_id": session}));
+    let named = |view: &serde_json::Value, name: &str| {
+        view["actionables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {view}"))
+            .clone()
+    };
+    assert_eq!(before["actionable_schema"], "greppy.web.actionable.v2");
+    let checkbox = named(&before, "Choose Linen shirt");
+    assert_eq!(checkbox["role"], "checkbox");
+    assert_eq!(checkbox["type"], "checkbox");
+    assert_eq!(checkbox["checked"], false);
+    assert_eq!(checkbox["value"], "on", "value is not the checked state");
+    let quantity = named(&before, "Quantity in units");
+    assert_eq!(quantity["role"], "spinbutton");
+    assert_eq!(quantity["name_source"], "aria-labelledby");
+    assert_eq!(quantity["value"], "2");
+    assert_eq!(quantity["disabled"], true);
+    assert_eq!(
+        named(&before, "Size")["selected_options"],
+        json!([{"value":"m", "label":"Medium"}])
+    );
+    assert_eq!(named(&before, "Special shipping")["selected"], true);
+    assert_eq!(named(&before, "Details")["expanded"], false);
+    assert_eq!(named(&before, "Email")["invalid"], true);
+    for name in ["Password", "Verification code"] {
+        let item = named(&before, name);
+        assert!(item["value"].is_null());
+        assert_eq!(item["value_redacted"], true);
+    }
+    let serialized = before.to_string();
+    assert!(!serialized.contains("PASSWORD-MUST-NOT-LEAK"));
+    assert!(!serialized.contains("OTP-MUST-NOT-LEAK"));
+    let reference = checkbox["ref"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches('@')
+        .parse::<u64>()
+        .unwrap();
+    call(
+        "web.check",
+        json!({"session_id": session, "selector": {"type":"ref", "value":reference}}),
+    );
+    call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "document.getElementById('quantity').disabled = false; document.getElementById('quantity').value = '3'; document.getElementById('size').value = 's'; document.getElementById('details').setAttribute('aria-expanded', 'true'); document.getElementById('email').value = 'ada@example.com'; true"
+        }),
+    );
+    let after = call("web.observe", json!({"session_id":session}));
+    assert_eq!(named(&after, "Choose Linen shirt")["checked"], true);
+    assert_eq!(named(&after, "Quantity in units")["disabled"], false);
+    assert_eq!(named(&after, "Quantity in units")["value"], "3");
+    assert_eq!(
+        named(&after, "Size")["selected_options"],
+        json!([{"value":"s", "label":"Small"}])
+    );
+    assert_eq!(named(&after, "Details")["expanded"], true);
+    assert_eq!(named(&after, "Email")["invalid"], false);
+    call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "document.getElementById('choose').indeterminate = true; const size = document.getElementById('size'); size.multiple = true; for (let i = 0; i < 25; i++) { const option = document.createElement('option'); option.value = 'value-' + i; option.textContent = 'Option ' + i; size.appendChild(option); option.selected = true; } const email = document.getElementById('email'); email.type = 'text'; email.value = 'x'.repeat(200); document.getElementById('details').removeAttribute('aria-expanded'); true"
+        }),
+    );
+    let bounded = call("web.observe", json!({"session_id":session}));
+    assert_eq!(named(&bounded, "Choose Linen shirt")["checked"], "mixed");
+    let multiple = named(&bounded, "Size");
+    assert_eq!(multiple["role"], "listbox");
+    assert_eq!(multiple["selected_options"].as_array().unwrap().len(), 20);
+    assert_eq!(multiple["selected_options_truncated"], true);
+    let long_value = named(&bounded, "Email");
+    assert_eq!(long_value["value"].as_str().unwrap().len(), 160);
+    assert_eq!(long_value["value_truncated"], true);
+    assert!(named(&bounded, "Details")["expanded"].is_null());
+}
+
+#[test]
+fn inspect_refs_read_disabled_nodes_and_refuse_replacement_nodes() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+<label for="country">Country</label><select id="country" disabled data-proof="original"><option value="DE" selected>Germany</option></select>
+<script>window.inputEvents = 0; document.addEventListener('input', () => window.inputEvents++);</script>
+</body></html>"#,
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-inspect-ref-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_inspect_ref", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_inspect_ref", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("inspect request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session, "url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        "@1"
+    );
+    let inspect = |sid: &str| {
+        call(
+            "web.inspect",
+            json!({"session_id":sid, "selector":{"type":"ref", "value":1}, "attrs":true, "html":true}),
+        )
+    };
+    let inspected = inspect(session);
+    assert_eq!(inspected.status, "ok", "{inspected:?}");
+    let result = inspected.result.as_ref().unwrap();
+    assert_eq!(result["value"]["count"].as_f64(), Some(1.0));
+    assert_eq!(result["value"]["node"]["id"], "country");
+    assert_eq!(result["value"]["node"]["value"], "DE");
+    assert_eq!(result["value"]["node"]["disabled"], true);
+    assert_eq!(result["value"]["node"]["attrs"]["data-proof"], "original");
+    assert!(result["value"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("Germany"));
+    assert_eq!(
+        result["untrusted_content_boundary"],
+        "UNTRUSTED_PAGE_CONTENT"
+    );
+    let tabs = call("web.tab.list", json!({"session_id":session}));
+    let first_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"]
+        .as_str()
+        .unwrap();
+    let new_tab = call("web.tab.new", json!({"session_id":session}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let other_observation = call("web.observe", json!({"session_id":session}));
+    assert_eq!(other_observation.status, "ok", "{other_observation:?}");
+    let explicit_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":first_tab, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        explicit_tab.status, "ok",
+        "explicit old tab must not become the active new tab: {explicit_tab:?}"
+    );
+    assert_eq!(
+        explicit_tab.result.as_ref().unwrap()["value"]["node"]["value"],
+        "DE"
+    );
+    let wrong_tab = inspect(session);
+    assert_eq!(
+        wrong_tab.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_tab:?}"
+    );
+    let unknown_tab = call(
+        "web.inspect",
+        json!({"session_id":session, "tab_id":"not-this-session-tab", "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        unknown_tab.error.as_ref().unwrap().code,
+        "TAB_NOT_FOUND",
+        "{unknown_tab:?}"
+    );
+    let switched = call(
+        "web.tab.switch",
+        json!({"session_id":session, "tab":first_tab}),
+    );
+    assert_eq!(switched.status, "ok", "{switched:?}");
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other_session = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let wrong_session = inspect(other_session);
+    assert_eq!(
+        wrong_session.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{wrong_session:?}"
+    );
+    let evaluated = call(
+        "web.evaluate",
+        json!({"session_id":session, "source":
+            "const original = document.getElementById('country'); const clone = original.cloneNode(true); original.replaceWith(clone); window.inputEvents"
+        }),
+    );
+    assert_eq!(
+        evaluated.result.as_ref().unwrap()["value"].as_f64(),
+        Some(0.0)
+    );
+    let replaced = inspect(session);
+    assert_eq!(
+        replaced.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{replaced:?}"
+    );
+    let stale_click = call(
+        "web.click",
+        json!({"session_id":session, "selector":{"type":"ref", "value":1}}),
+    );
+    assert_eq!(
+        stale_click.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{stale_click:?}"
+    );
+    let refreshed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(refreshed.status, "ok", "{refreshed:?}");
+    let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+    assert_eq!(inspect(session).error.as_ref().unwrap().code, "STALE_REF");
+    assert_eq!(call("web.inspect", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref}})).status, "ok");
+    let reloaded = call("web.reload", json!({"session_id":session}));
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    let navigated = inspect(session);
+    assert_eq!(
+        navigated.error.as_ref().unwrap().code,
+        "STALE_REF",
+        "{navigated:?}"
+    );
+}
+
+#[test]
+fn observed_refs_keep_node_identity_across_followup_snapshots() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body><label for="choice">Choice</label><input id="choice" type="checkbox" value="before"></body></html>"#,
+    );
+    let socket = std::env::temp_dir()
+        .join(format!("greppy-ref-identity-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_ref_identity", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_ref_identity", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("identity request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let observe = || {
+        let response = call("web.observe", json!({"session_id":session}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["actionables"][0]["ref"]
+            .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap()
+    };
+    let inspect = |reference: u64| {
+        call("web.inspect", json!({"session_id":session,
+            "selector":{"type":"ref","value":reference}}))
+    };
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let original = observe();
+    let changed = call("web.evaluate", json!({"session_id":session,"source":
+        "(() => { const node = document.getElementById('choice'); node.value = 'after'; node.checked = true; node.focus(); return node.checked && node.value === 'after' && document.activeElement === node; })()"
+    }));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    assert_eq!(changed.result.as_ref().unwrap()["value"], true);
+    assert_eq!(observe(), original, "same node must keep its ref after property changes");
+    let same_node = inspect(original);
+    assert_eq!(same_node.status, "ok", "{same_node:?}");
+    assert_eq!(same_node.result.as_ref().unwrap()["value"]["node"]["value"], "after");
+
+    let replaced = call("web.evaluate", json!({"session_id":session,"source":
+        "(() => { const node = document.getElementById('choice'); node.replaceWith(node.cloneNode(true)); return true; })()"
+    }));
+    assert_eq!(replaced.status, "ok", "{replaced:?}");
+    let replacement = observe();
+    assert_ne!(replacement, original, "new snapshot must not recycle the replaced node's ref");
+    let stale = inspect(original);
+    assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
+    let fresh = inspect(replacement);
+    assert_eq!(fresh.status, "ok", "{fresh:?}");
+
+    let navigated = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(navigated.status, "ok", "{navigated:?}");
+    let new_document = observe();
+    assert_ne!(new_document, original);
+    assert_ne!(new_document, replacement, "navigation must not recycle refs after observation");
+    for old in [original, replacement] {
+        let stale = inspect(old);
+        assert_eq!(stale.error.as_ref().unwrap().code, "STALE_REF", "{stale:?}");
+    }
+    let fresh = inspect(new_document);
+    assert_eq!(fresh.status, "ok", "{fresh:?}");
+}
+
+#[test]
+fn keyboard_refs_bind_the_observed_node_before_focusing() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body><label for="postcode">Postcode</label><input id="postcode">
+<script>window.keyEvents = []; document.addEventListener('keydown', e => window.keyEvents.push(e.key));</script>
+</body></html>"#,
+    );
+    let socket = std::env::temp_dir().join(format!("greppy-key-ref-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_keyboard_ref", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_keyboard_ref", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("keyboard ref request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
+    let css_control = call(
+        "web.type",
+        json!({"session_id":session,"selector":{"type":"css","value":"#postcode"},"text":"10115"}),
+    );
+    assert_eq!(css_control.status, "ok", "{css_control:?}");
+    let css_value = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"document.getElementById('postcode').value"}),
+    );
+    assert_eq!(css_value.result.as_ref().unwrap()["value"], "10115");
+    let cleared = call(
+        "web.fill",
+        json!({"session_id":session,"selector":{"type":"css","value":"#postcode"},"value":""}),
+    );
+    assert_eq!(cleared.status, "ok", "{cleared:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed.result.as_ref().unwrap()["actionables"][0]["ref"],
+        "@1"
+    );
+    let type_ref = |sid: &str| {
+        call(
+            "web.type",
+            json!({"session_id":sid,"selector":{"type":"ref","value":1},"text":"10115"}),
+        )
+    };
+    let press_ref = |sid: &str| {
+        call(
+            "web.press",
+            json!({"session_id":sid,"selector":{"type":"ref","value":1},"key":"ArrowLeft"}),
+        )
+    };
+    let typed = type_ref(session);
+    assert_eq!(
+        typed.status, "ok",
+        "fresh observed ref must type: {typed:?}"
+    );
+    let pressed = press_ref(session);
+    assert_eq!(
+        pressed.status, "ok",
+        "fresh observed ref must focus for a key: {pressed:?}"
+    );
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"document.getElementById('postcode').value === '10115' && window.keyEvents.includes('ArrowLeft')"}),
+    );
+    assert_eq!(state.result.as_ref().unwrap()["value"], true);
+
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other_session = other.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    for response in [type_ref(other_session), press_ref(other_session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+    let replaced = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"const original = document.getElementById('postcode'); original.replaceWith(original.cloneNode(true)); true"}),
+    );
+    assert_eq!(replaced.status, "ok", "{replaced:?}");
+    for response in [type_ref(session), press_ref(session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+    let refreshed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(refreshed.status, "ok", "{refreshed:?}");
+    let fresh_ref = refreshed.result.as_ref().unwrap()["actionables"][0]["ref"]
+        .as_str().unwrap().strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    assert_ne!(fresh_ref, 1, "replacement must not inherit the original ref");
+    assert_eq!(press_ref(session).error.as_ref().unwrap().code, "STALE_REF");
+    assert_eq!(call("web.press", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_ref},"key":"ArrowLeft"})).status, "ok");
+    assert_eq!(
+        call("web.reload", json!({"session_id":session})).status,
+        "ok"
+    );
+    for response in [type_ref(session), press_ref(session)] {
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "STALE_REF",
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
+fn observed_native_labels_exclude_their_own_control_contents() {
+    let fixture = serve_fixture(r#"<!doctype html><html><body>
+<label>Region<select id="region"><option value="all">All regions</option><option value="eu">EU</option></select></label>
+<label>Unit <b>price</b> order<select id="price"><option value="none">Unsorted</option><option value="asc">Low to high</option></select></label>
+<label for="external">External region</label><select id="external"><option>Europe</option></select>
+<label>Ignored<select aria-label="Override"><option>Hidden option name</option></select></label>
+</body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-label-own-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_label_own", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_label_own", method, payload), Duration::from_secs(30))
+            .expect("native label request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let state = &went.result.as_ref().unwrap()["page_state"];
+    assert_eq!(state["status"], "available");
+    let selects: Vec<_> = state["snapshot"]["actionables"].as_array().unwrap()
+        .iter().filter(|node| node["tag"] == "select").collect();
+    assert_eq!(selects.len(), 4);
+    assert_eq!(selects[0]["name"], "Region", "a control's own options must not enter its label");
+    assert_eq!(selects[0]["name_source"], "label");
+    assert_eq!(selects[0]["selected_options"][0]["label"], "All regions");
+    assert_eq!(selects[1]["name"], "Unit price order");
+    assert_eq!(selects[1]["selected_options"][0]["label"], "Unsorted");
+    assert_eq!(selects[2]["name"], "External region");
+    assert_eq!(selects[3]["name"], "Override");
+    assert_eq!(selects[3]["name_source"], "aria-label");
+    let inspected = call("web.inspect", json!({
+        "session_id":session, "selector":{"type":"label","name":"Region"}
+    }));
+    assert_eq!(inspected.status, "ok", "the displayed label must also resolve: {inspected:?}");
+    let unchanged = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"(() => { const select = document.getElementById('region'); return { labelText: select.parentElement.textContent, value: select.value, options: Array.from(select.options, option => option.textContent) }; })()"
+    }));
+    assert_eq!(unchanged.status, "ok", "{unchanged:?}");
+    assert_eq!(unchanged.result.as_ref().unwrap()["value"], json!({
+        "labelText":"RegionAll regionsEU", "value":"all", "options":["All regions","EU"]
+    }), "label extraction must not rewrite the live DOM: {unchanged:?}");
+}
+
+#[test]
+fn native_actions_return_page_state_and_keep_receipts_when_observation_fails() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Ready</title></head><body>
+<button id="once" onclick="window.clicks++; document.title='Clicks '+window.clicks">Once</button>
+<button id="poison" onclick="window.clicks++; Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation fixture failure')}})">Poison observation</button>
+<input type="password" value="never-disclose-this">
+<script>window.clicks=0;</script></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-page-state-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_page_state", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| unix_request(
+        &socket, &Request::new("run_page_state", method, payload), Duration::from_secs(30),
+    ).expect("page state request");
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let state = &went.result.as_ref().unwrap()["page_state"];
+    assert_eq!(state["schema"], "greppy.web.page-state.v1");
+    assert_eq!(state["status"], "available");
+    assert_eq!(state["snapshot"]["title"], "Ready");
+    assert!(!state.to_string().contains("never-disclose-this"));
+    let reference = state["snapshot"]["actionables"][0]["ref"].as_str().unwrap()
+        .strip_prefix('@').unwrap().parse::<u64>().unwrap();
+    let tabs = call("web.tab.list", json!({"session_id":session}));
+    let target_tab = tabs.result.as_ref().unwrap()["tabs"][0]["tab"].as_str().unwrap();
+    assert_eq!(went.result.as_ref().unwrap()["tab_id"], target_tab,
+        "implicit navigation must identify its actual native target");
+    let new_tab = call("web.tab.new", json!({"session_id":session}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    // Use the navigation's ref on an explicitly targeted, now inactive tab,
+    // without a caller-initiated observe or an implicit active-tab switch.
+    let clicked = call("web.click", json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"ref","value":reference}}));
+    assert_eq!(clicked.status, "ok", "{clicked:?}");
+    let receipt = clicked.result.as_ref().unwrap();
+    assert_eq!(receipt["session_id"], session);
+    assert_eq!(receipt["tab_id"], target_tab, "inactive explicit target must not become active-tab metadata");
+    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(receipt["page_state"]["status"], "available");
+    assert_eq!(receipt["page_state"]["snapshot"]["title"], "Clicks 1");
+    assert_eq!(receipt["page_state"]["snapshot"]["actionables"][0]["ref"], format!("@{reference}"));
+    let poisoned = call("web.click", json!({"session_id":session,"tab_id":target_tab,
+        "selector":{"type":"css","value":"#poison"}}));
+    assert_eq!(poisoned.status, "ok", "successful click must not be recast as failure: {poisoned:?}");
+    let receipt = poisoned.result.as_ref().unwrap();
+    assert_eq!(receipt["tab_id"], target_tab, "observation failure must retain target identity");
+    assert!(receipt.get("dispatch").is_some(), "dispatch receipt must survive: {receipt}");
+    assert_eq!(receipt["ok"], true);
+    assert_eq!(receipt["page_state"]["status"], "unavailable");
+    assert_eq!(receipt["page_state"]["error"]["code"], "OBSERVATION_UNAVAILABLE");
+    let checked = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,"source":"window.clicks"}));
+    assert_eq!(checked.status, "ok", "{checked:?}");
+    assert_eq!(checked.result.as_ref().unwrap()["value"].as_f64(), Some(2.0), "no action replay");
+    assert!(checked.result.as_ref().unwrap().get("page_state").is_none(), "explicit evaluation keeps its contract");
+    let repaired = call("web.evaluate", json!({"session_id":session,"tab_id":target_tab,
+        "source":"delete document.title; document.title = 'Recovered'; true"}));
+    assert_eq!(repaired.status, "ok", "{repaired:?}");
+    let observed = call("web.observe", json!({"session_id":session,"tab_id":target_tab}));
+    assert_eq!(observed.status, "ok", "temporary observation failure must recover: {observed:?}");
+    assert_eq!(observed.result.as_ref().unwrap()["title"], "Recovered");
+    assert_eq!(observed.result.as_ref().unwrap()["actionables"][0]["ref"], format!("@{reference}"));
+    let active = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(active.status, "ok", "{active:?}");
+    let active_tab = active.result.as_ref().unwrap()["tab_id"].as_str()
+        .filter(|tab| !tab.is_empty()).expect("implicit action identifies current tab");
+    assert_ne!(active_tab, target_tab, "explicit inactive action must not silently switch active tab");
+}
+
+#[test]
+fn failed_native_actions_return_current_state_without_replay_or_false_success() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before</title></head><body>
+<button class="duplicate" onclick="window.clicks++">Save</button>
+<button class="duplicate" onclick="window.clicks++">Save elsewhere</button>
+<input id="quantity" aria-label="Quantity" disabled><input type="password" value="never-disclose-this">
+<script>window.clicks=0;</script></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-errstate-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_errstate", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_errstate", method, payload), Duration::from_secs(30))
+            .expect("failed-action request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let changed = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"document.title='Changed before error'; document.getElementById('quantity').disabled=false; true"
+    }));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    for (method, extra) in [
+        ("web.click", json!({})), ("web.type", json!({"text":"not typed"})),
+        ("web.press", json!({"key":"Enter"})),
+    ] {
+        let mut payload = json!({"session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100});
+        payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let missing = call(method, payload);
+        assert_eq!(missing.status, "error", "{missing:?}");
+        let error = missing.error.as_ref().unwrap();
+        assert_eq!(error.code, "NO_MATCH", "{missing:?}");
+        assert_eq!(error.exit_code, 34);
+        assert!(!error.next_action.contains("narrow"));
+        let state = &missing.result.as_ref().unwrap()["page_state"];
+        assert_eq!(missing.result.as_ref().unwrap()["tab_id"], went.result.as_ref().unwrap()["tab_id"],
+            "failed action diagnostic must identify its resolved target");
+        assert_eq!(state["status"], "available", "{missing:?}");
+        assert_eq!(state["snapshot"]["title"], "Changed before error", "must not reuse the old goto snapshot");
+        assert!(state["snapshot"]["actionables"].as_array().unwrap().iter()
+            .any(|node| node["name"] == "Quantity" && node["disabled"] == false));
+        assert!(!serde_json::to_string(&missing).unwrap().contains("never-disclose-this"));
+    }
+    let ambiguous = call("web.click", json!({
+        "session_id":session,"selector":{"type":"css","value":".duplicate"},"timeout":100
+    }));
+    assert_eq!(ambiguous.status, "error", "{ambiguous:?}");
+    assert_eq!(ambiguous.error.as_ref().unwrap().code, "AMBIGUOUS_TARGET");
+    assert_eq!(ambiguous.result.as_ref().unwrap()["page_state"]["status"], "available");
+    let poisoned = call("web.evaluate", json!({
+        "session_id":session,
+        "source":"Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"
+    }));
+    assert_eq!(poisoned.status, "ok");
+    let missing = call("web.click", json!({
+        "session_id":session,"selector":{"type":"css","value":"#absent"},"timeout":100
+    }));
+    assert_eq!(missing.status, "error");
+    assert_eq!(missing.error.as_ref().unwrap().code, "NO_MATCH");
+    assert_eq!(missing.error.as_ref().unwrap().exit_code, 34);
+    assert_eq!(missing.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
+    let clicks = call("web.evaluate", json!({"session_id":session,"source":"window.clicks"}));
+    assert_eq!(clicks.status, "ok", "{clicks:?}");
+    assert_eq!(clicks.result.as_ref().unwrap()["value"].as_f64(), Some(0.0), "no failed action may be replayed");
+}
+
+#[test]
+fn select_option_refuses_unknown_values_without_mutation_or_false_success() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-select-option-{}.sock",
+        std::process::id()
+    ));
+    let (path, source) = fixture_source("select-option-contract.mjs");
+    let _guard = Supervisor::spawn(&socket, "run_select_option", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_select_option",
+        &source,
+        Some(&path),
+        Duration::from_secs(60),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Before wait</title></head>
+<body><input id="ready" aria-label="Quantity" disabled><input type="password" value="wait-secret"></body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-wait-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_wait", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_wait", method, payload), Duration::from_secs(30))
+            .expect("Boolean wait request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    for (source, code) in [
+        ("({holds:false,detail:'not ready'})", "INVALID_WAIT_PREDICATE"),
+        ("new RegExp('[bad')", "INVALID_WAIT_SOURCE"),
+        ("(() => {throw new Error('STALE_REF: replaced node')})()", "STALE_REF"),
+        ("false", "TIMEOUT"),
+    ] {
+        let response = call("web.wait", json!({"session_id":session,"source":source,"timeout_ms":250}));
+        assert_eq!(response.status, "error", "{response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
+        assert!(!serde_json::to_string(&response).unwrap().contains("JavaScriptErrorInfo"));
+    }
+    // No DOM-mutation signal is required for the property-only disabled change.
+    let changed = call("web.evaluate", json!({"session_id":session,"source":
+        "setTimeout(() => { document.getElementById('ready').disabled=false; document.title='After wait'; },50); true"}));
+    assert_eq!(changed.status, "ok", "{changed:?}");
+    let held = call("web.wait", json!({"session_id":session,"source":
+        "!document.getElementById('ready').disabled && !document.querySelector('#absent')","timeout_ms":2000}));
+    assert_eq!(held.status, "ok", "{held:?}");
+    let result = held.result.as_ref().unwrap();
+    assert_eq!(result["held"], true);
+    assert_eq!(result["session_id"], session);
+    assert!(result["tab_id"].as_str().is_some());
+    assert!(result["document_id"].as_str().is_some());
+    assert_eq!(result["page_state"]["status"], "available", "{held:?}");
+    assert_eq!(result["page_state"]["snapshot"]["title"], "After wait");
+    assert!(!serde_json::to_string(&held).unwrap().contains("wait-secret"));
+    let poisoned = call("web.evaluate", json!({"session_id":session,"source":
+        "Object.defineProperty(document,'title',{configurable:true,get(){throw new Error('observation unavailable')}}); true"}));
+    assert_eq!(poisoned.status, "ok");
+    let held = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    assert_eq!(held.status, "ok", "{held:?}");
+    assert_eq!(held.result.as_ref().unwrap()["held"], true);
+    assert_eq!(held.result.as_ref().unwrap()["page_state"]["status"], "unavailable");
+    assert!(held.result.as_ref().unwrap()["document_id"].is_null());
+    let zero = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":0}));
+    assert_eq!(zero.status, "error");
+    assert_eq!(zero.error.as_ref().unwrap().code, "TIMEOUT");
+}
+
+#[test]
+fn native_boolean_wait_rebinds_after_navigation_and_same_url_reload() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head><title>Navigation wait</title>
+<script>
+const loads = Number(sessionStorage.getItem('wait-loads') || 0) + 1;
+sessionStorage.setItem('wait-loads', String(loads));
+window.waitDocumentLoad = loads;
+</script></head><body>Navigation witness</body></html>"#);
+    let socket = std::env::temp_dir().join(format!("greppy-wait-nav-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_wait_nav", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_wait_nav", method, payload), Duration::from_secs(30))
+            .expect("navigation wait request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let before = call("web.wait", json!({"session_id":session,"source":"true","timeout_ms":2000}));
+    assert_eq!(before.status, "ok", "{before:?}");
+    // Schedule from the first predicate sample: the navigation must occur
+    // while this very wait is pending, never between two test RPCs.
+    let navigated = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":
+        "(() => { if (location.search === '?wait-landed') return true; if (!window.waitNavScheduled) { window.waitNavScheduled = true; setTimeout(() => { location.search = '?wait-landed'; }, 50); } return false; })()"}));
+    assert_eq!(navigated.status, "ok", "{navigated:?}");
+    assert_eq!(navigated.result.as_ref().unwrap()["held"], true);
+    assert_ne!(before.result.as_ref().unwrap()["document_id"], navigated.result.as_ref().unwrap()["document_id"]);
+    let current = call("web.evaluate", json!({"session_id":session,"source":"window.waitDocumentLoad"}));
+    assert_eq!(current.status, "ok", "{current:?}");
+    // JavaScript Number is encoded as serde's f64, including integral values.
+    let loads = current.result.as_ref().unwrap()["value"].as_f64()
+        .unwrap_or_else(|| panic!("numeric document load counter: {current:?}"));
+    assert!(loads.is_finite() && loads.fract() == 0.0 && loads >= 2.0,
+        "both initial and navigated documents must have loaded: {current:?}");
+    let reloaded = call("web.wait", json!({"session_id":session,"timeout_ms":5000,"source":format!(
+        "(() => {{ if (window.waitDocumentLoad > {loads}) return true; if (!window.waitReloadScheduled) {{ window.waitReloadScheduled = true; setTimeout(() => location.reload(), 50); }} return false; }})()"
+    )}));
+    assert_eq!(reloaded.status, "ok", "{reloaded:?}");
+    assert_eq!(reloaded.result.as_ref().unwrap()["held"], true);
+    assert_ne!(navigated.result.as_ref().unwrap()["document_id"], reloaded.result.as_ref().unwrap()["document_id"]);
+}
+
+#[test]
+fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><p id='witness'>survived</p></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!("greppy-wait-limit-{}.sock", std::process::id()));
+    let supervisor = Supervisor::spawn(&socket, "run_wait_limit", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_wait_limit", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("bounded wait resource-limit request")
+    };
+    let healthy = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(healthy.status, "ok", "{healthy:?}");
+    let session = healthy.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let before = call("web.wait", json!({
+        "session_id":session,"source":"true","timeout_ms":2000,
+    }));
+    assert_eq!(before.status, "ok", "{before:?}");
+    let before = before.result.as_ref().unwrap();
+    let tab = before["tab_id"].as_str().unwrap();
+    let document = before["document_id"].as_str().unwrap();
+    let worker = content_worker_pid(supervisor.child.id()).expect("healthy content worker");
+
+    let expired = call("web.session.create", json!({
+        "profile":"project","limits":{"wall_ms":20},
+    }));
+    assert_eq!(expired.status, "ok", "{expired:?}");
+    let expired = expired.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    // Deliberately expire the fixture's quota, not a browser-readiness workaround.
+    thread::sleep(Duration::from_millis(80));
+    let rejected = call("web.wait", json!({
+        "session_id":expired,"source":"true","timeout_ms":2000,
+    }));
+    assert_eq!(rejected.status, "error", "{rejected:?}");
+    assert_eq!(rejected.error.as_ref().unwrap().code, "resource_limit");
+    assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
+    assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
+
+    let after = call("web.wait", json!({
+        "session_id":session,"tab_id":tab,"timeout_ms":2000,
+        "source":"document.querySelector('#witness')?.textContent === 'survived'",
+    }));
+    assert_eq!(after.status, "ok", "{after:?}");
+    let after = after.result.as_ref().unwrap();
+    assert_eq!(after["held"], true);
+    assert_eq!(after["tab_id"], tab);
+    assert_eq!(after["document_id"], document);
+}
+
+#[test]
+fn ref_conditions_preserve_identity_and_never_confirm_stale_absence() {
+    let fixture = serve_fixture("<!doctype html><html><body><input id='choice' aria-label='Choice'></body></html>");
+    let socket = std::env::temp_dir().join(format!("greppy-ref-condition-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_ref_condition", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_ref_condition", method, payload), Duration::from_secs(30)).unwrap()
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    let observe = || {
+        let response = call("web.observe", json!({"session_id":session}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["actionables"][0]["ref"].as_str().unwrap()
+            .strip_prefix('@').unwrap().parse::<u64>().unwrap()
+    };
+    let original = observe();
+    for operation in ["web.evaluate", "web.wait"] {
+        let source = if operation == "web.wait" { "__greppyConditionNodes.length === 1" }
+            else { "({holds: __greppyConditionNodes.length === 1})" };
+        let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":original},"source":source,"timeout_ms":2000}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        let result = response.result.unwrap();
+        let confirmed = if operation == "web.wait" { &result["held"] } else { &result["value"]["holds"] };
+        assert_eq!(confirmed.as_bool(), Some(true));
+    }
+    let assert_stale = |session: &str, reference: u64| {
+        for operation in ["web.evaluate", "web.wait"] {
+            // Exactly the inverse/presence expression used for --absent. A
+            // missing identity must throw before this can produce true.
+            let source = if operation == "web.wait" { "__greppyConditionNodes.length === 0" }
+                else { "({holds: __greppyConditionNodes.length === 0})" };
+            let response = call(operation, json!({"session_id":session,"condition_ref":{"type":"ref","value":reference},"source":source,"timeout_ms":1000}));
+            assert_eq!(response.status, "error", "{response:?}");
+            assert_eq!(response.error.as_ref().unwrap().code, "STALE_REF", "{response:?}");
+            assert!(!response.error.as_ref().unwrap().next_action.contains("doctor"));
+        }
+    };
+    // Trigger replacement from the first predicate sample, not before the
+    // wait starts: subsequent samples must revalidate identity, not cache it.
+    let replaced_during_wait = call("web.wait", json!({
+        "session_id":session,"condition_ref":{"type":"ref","value":original},
+        "source":"(function(){ if (!window.refReplacementScheduled) { window.refReplacementScheduled = true; setTimeout(() => { const old = document.getElementById('choice'); old.replaceWith(old.cloneNode(true)); }, 50); } return __greppyConditionNodes.length === 0; })()",
+        "timeout_ms":2000,
+    }));
+    assert_eq!(replaced_during_wait.error.as_ref().unwrap().code, "STALE_REF", "{replaced_during_wait:?}");
+    assert_stale(session, original);
+    let replacement = observe();
+    assert_ne!(replacement, original);
+    let other = call("web.session.create", json!({"profile":"project"}));
+    let other = other.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    assert_eq!(call("web.goto", json!({"session_id":other,"url":fixture})).status, "ok");
+    assert_eq!(call("web.observe", json!({"session_id":other})).status, "ok");
+    assert_stale(other, replacement);
+    assert_eq!(call("web.evaluate", json!({"session_id":session,"source":"document.getElementById('choice').remove(); true"})).status, "ok");
+    assert_stale(session, replacement);
+    assert_eq!(call("web.goto", json!({"session_id":session,"url":fixture})).status, "ok");
+    let after_navigation = observe();
+    assert_ne!(after_navigation, replacement);
+    assert_stale(session, replacement);
+    let still_usable = call("web.wait", json!({"session_id":session,"condition_ref":{"type":"ref","value":after_navigation},"source":"__greppyConditionNodes.length === 1","timeout_ms":2000}));
+    assert_eq!(still_usable.status, "ok", "{still_usable:?}");
+}
+
+#[test]
 fn project_profile_can_load_an_allowed_http_host() {
     let fixture_html: &'static str = Box::leak(
         format!(
