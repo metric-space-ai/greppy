@@ -32,6 +32,107 @@ const PAGE: &str = r#"<!doctype html><html><body>
 </body></html>"#;
 
 #[test]
+fn native_workflow_preflight_diagnoses_the_exact_field_before_any_mutation() {
+    let fixture = serve_fixture(
+        r#"<!doctype html><html><body>
+      <select id="region"><option>All</option><option>EU</option></select>
+      <input id="enabled" type="checkbox">
+      <select id="sort"><option>default</option><option>ascending</option></select>
+      <p>3 matching items</p>
+      <script>window.changes=0;document.addEventListener('change',()=>window.changes++);</script>
+    </body></html>"#,
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-workflow-diagnostic-{}.sock",
+        std::process::id()
+    ));
+    let _guard = workflow_supervisor(&socket, "run_workflow_diagnostic", &fixture);
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |operation: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_diagnostic", operation, payload),
+            Duration::from_secs(35),
+        )
+        .expect("workflow diagnostic request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let state = || {
+        let result = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":
+            "JSON.stringify({region:document.getElementById('region').value,enabled:document.getElementById('enabled').checked,sort:document.getElementById('sort').value,changes:window.changes})"}),
+        );
+        assert_eq!(result.status, "ok", "{result:?}");
+        serde_json::from_str::<serde_json::Value>(result.result.unwrap()["value"].as_str().unwrap())
+            .unwrap()
+    };
+    let initial = state();
+    let mut steps = json!([
+        {"action":{"operation":"select","selector":{"type":"css","value":"#region"},"value":"EU"}},
+        {"action":{"operation":"check","selector":{"type":"css","value":"#enabled"}}},
+        {"action":{"operation":"select","selector":{"type":"css","value":"#sort"},"value":"ascending"},
+         "expect":{"condition":{"query":"3 matching items"},"timeout_ms":3000}}
+    ]);
+    for _ in 0..2 {
+        let response = call(
+            "web.workflow",
+            json!({"version":1,"session_id":session,"steps":steps}),
+        );
+        assert_eq!(response.status, "error", "{response:?}");
+        let error = response.error.unwrap();
+        assert_eq!(error.exit_code, 30);
+        assert!(
+            error.message.contains("step 3 expectation query"),
+            "{error:?}"
+        );
+        assert!(error.message.contains("CSS"));
+        assert!(error.next_action.contains("--expect 'text=EXPECTED TEXT'"));
+        let detail = response.result.unwrap();
+        assert_eq!(detail["phase"], "preflight");
+        assert_eq!(detail["actions_attempted"], 0);
+        assert_eq!(detail["completed_steps"], 0);
+        assert_eq!(detail["preflight"]["field"], "expectation.query");
+        assert_eq!(detail["preflight"]["syntax"], "css");
+        assert_eq!(state(), initial, "failed preflight mutated a control");
+    }
+    steps[2]["expect"]["condition"]["query"] = json!("text=3 matching items");
+    steps[2]["action"]["selector"]["value"] = json!("[");
+    let response = call(
+        "web.workflow",
+        json!({"version":1,"session_id":session,"steps":steps}),
+    );
+    assert_eq!(response.status, "error", "{response:?}");
+    let error = response.error.unwrap();
+    assert!(
+        error.message.contains("step 3 action selector"),
+        "{error:?}"
+    );
+    assert!(!error.next_action.contains("--expect"));
+    assert_eq!(response.result.unwrap()["actions_attempted"], 0);
+    assert_eq!(state(), initial);
+    steps[2]["action"]["selector"]["value"] = json!("#sort");
+    let success = call(
+        "web.workflow",
+        json!({"version":1,"session_id":session,"steps":steps}),
+    );
+    assert_eq!(success.status, "ok", "{success:?}");
+    assert_eq!(success.result.unwrap()["completed_steps"], 3);
+    let changed = state();
+    assert_eq!(changed["region"], "EU");
+    assert_eq!(changed["enabled"], true);
+    assert_eq!(changed["sort"], "ascending");
+    assert!(changed["changes"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
 fn native_workflow_preflights_all_steps_and_preserves_partial_effects() {
     let fixture = serve_fixture(PAGE);
     let socket = std::env::temp_dir().join(format!(

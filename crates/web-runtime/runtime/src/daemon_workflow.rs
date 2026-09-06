@@ -81,9 +81,9 @@ impl Daemon {
             }
         };
         if preflight.get("valid").and_then(|value| value.as_bool()) != Some(true) {
-            let mut response = protocol_error(
+            let mut response = Response::error(
                 request,
-                "workflow syntax preflight did not pass; no actions executed",
+                workflow.preflight_error(&preflight, &request.request_id),
             );
             response.result = Some(
                 json!({"workflow_version":1,"phase":"preflight","completed_steps":0,"actions_attempted":0,"preflight":preflight,"session_id":session,"tab_id":page}),

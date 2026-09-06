@@ -20,6 +20,8 @@ pub struct TargetOpts {
     pub nth: Option<i64>,
     /// Execute once and wait for QUERY to exist in the DOM (not visibility).
     /// Example: --expect "css=dialog[open]". Requires a workflow-capable runtime.
+    /// Bare QUERY is CSS. For element text, use --expect 'text=Saved' (exact)
+    /// or --expect 'text~/Saved/i' (partial); quotes alone do not change query type.
     #[arg(long, value_name = "QUERY")]
     pub expect: Option<String>,
     /// Require QUERY to be absent; stale refs remain errors.
@@ -118,11 +120,16 @@ pub enum ActCommand {
 
 pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
     let opts = match &command {
-        ActCommand::Click { opts, .. } | ActCommand::Fill { opts, .. }
-        | ActCommand::Type { opts, .. } | ActCommand::Clear { opts, .. }
-        | ActCommand::Select { opts, .. } | ActCommand::Check { opts, .. }
-        | ActCommand::Uncheck { opts, .. } | ActCommand::Press { opts, .. }
-        | ActCommand::Hover { opts, .. } | ActCommand::Scroll { opts, .. }
+        ActCommand::Click { opts, .. }
+        | ActCommand::Fill { opts, .. }
+        | ActCommand::Type { opts, .. }
+        | ActCommand::Clear { opts, .. }
+        | ActCommand::Select { opts, .. }
+        | ActCommand::Check { opts, .. }
+        | ActCommand::Uncheck { opts, .. }
+        | ActCommand::Press { opts, .. }
+        | ActCommand::Hover { opts, .. }
+        | ActCommand::Scroll { opts, .. }
         | ActCommand::Upload { opts, .. } => opts,
     };
     if opts.expect.is_some() {

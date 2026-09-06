@@ -74,10 +74,29 @@
     var trimmed = pattern.trim();
     return trimmed[0] === '~' ? regexp(trimmed.slice(1).trim()) : null;
   }
-  var query = condition.query == null ? null : parse(condition.query);
-  if (validateOnly && query) validateQuery(query);
-  var urlRegex = condition.url == null ? null : matcher(condition.url);
-  var titleRegex = condition.title == null ? null : matcher(condition.title);
+  // Keep syntax context on the exception, without guessing a different query
+  // or serializing action values. Execution-time condition behavior is unchanged.
+  function checked(field, syntax, operation) {
+    try { return operation(); } catch (error) {
+      if (!validateOnly) throw error;
+      var diagnostic = new Error(String(error));
+      diagnostic.workflowField = field;
+      diagnostic.workflowSyntax = syntax;
+      throw diagnostic;
+    }
+  }
+  var query = condition.query == null ? null : checked('expectation.query', 'query', function() {
+    return parse(condition.query);
+  });
+  if (validateOnly && query) checked('expectation.query', query.kind === 'text' && query.op === '~' ? 'text-regex' : query.kind, function() {
+    validateQuery(query);
+  });
+  var urlRegex = condition.url == null ? null : checked('expectation.url', 'pattern', function() {
+    return matcher(condition.url);
+  });
+  var titleRegex = condition.title == null ? null : checked('expectation.title', 'pattern', function() {
+    return matcher(condition.title);
+  });
   if (validateOnly) return true;
   var held = true;
   if (query) held = nodesFor(query).length > 0;

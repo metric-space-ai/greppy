@@ -266,6 +266,98 @@ impl WorkflowCondition {
 }
 
 impl Workflow {
+    /// Turn engine syntax evidence into bounded, field-specific recovery.
+    /// Never echo action values or reinterpret a rejected condition as text.
+    pub fn preflight_error(&self, detail: &Value, request_id: &str) -> crate::ErrorObject {
+        let context = (|| {
+            if detail.get("valid")?.as_bool()? {
+                return None;
+            }
+            // JS numbers may arrive as 3.0, not a serde_json integer. Bound the
+            // index against this workflow before using it for attribution.
+            let number = detail.get("step")?.as_f64()?;
+            if !number.is_finite()
+                || number.fract() != 0.0
+                || number < 1.0
+                || number > self.steps.len() as f64
+            {
+                return None;
+            }
+            let step = number as usize;
+            let input = &self.steps[step - 1];
+            let field = detail.get("field")?.as_str()?;
+            let syntax = detail.get("syntax")?.as_str()?;
+            let label = match field {
+                "action.selector" => match (input.action.as_ref()?.selector()?, syntax) {
+                    (WorkflowSelector::Css { .. }, "css")
+                    | (WorkflowSelector::Xpath { .. }, "xpath") => "action selector",
+                    _ => return None,
+                },
+                "expectation.query"
+                    if input.expect.as_ref()?.condition.query.is_some()
+                        && matches!(
+                            syntax,
+                            "query"
+                                | "css"
+                                | "xpath"
+                                | "text"
+                                | "text-regex"
+                                | "role"
+                                | "id"
+                                | "tag"
+                                | "ref"
+                        ) =>
+                {
+                    "expectation query"
+                }
+                "expectation.url"
+                    if input.expect.as_ref()?.condition.url.is_some() && syntax == "pattern" =>
+                {
+                    "expectation URL"
+                }
+                "expectation.title"
+                    if input.expect.as_ref()?.condition.title.is_some() && syntax == "pattern" =>
+                {
+                    "expectation title"
+                }
+                _ => return None,
+            };
+            Some((step, field, syntax, label))
+        })();
+        let Some((step, field, syntax, label)) = context else {
+            return crate::ErrorObject::new("protocol_violation",
+                "workflow syntax preflight did not pass; no actions executed", request_id, 30,
+                "inspect preflight.step and preflight.error; correct the selector or expectation syntax before retrying");
+        };
+        let grammar = match syntax {
+            "css" => "CSS",
+            "xpath" => "XPath",
+            "text-regex" => "text regular expression",
+            "pattern" => "exact text or ~/REGEX/flags",
+            other => other,
+        };
+        let guidance = match (field, syntax) {
+            ("action.selector", "css") => "correct this action's CSS selector (css=SELECTOR); quote the complete target as one argument",
+            ("action.selector", "xpath") => "correct this action's XPath selector (xpath=EXPRESSION); quote the complete target as one argument",
+            ("expectation.query", "css") => "correct the CSS query; if you intended text, use --expect 'text=EXPECTED TEXT' for exact element text or --expect 'text~/REGEX/i' for partial text. Shell quoting alone does not change bare input from CSS to text",
+            ("expectation.query", "xpath") => "correct --expect 'xpath=EXPRESSION'; quote the complete query as one argument",
+            ("expectation.query", "text-regex") => "correct --expect 'text~/REGEX/i' (supported flags: i, m, s, u); use --expect 'text=EXPECTED TEXT' for literal exact text",
+            ("expectation.query", _) => "use --expect with css=, xpath=, text=, text~/REGEX/i, role=, id=, tag= or @N; quote the complete query as one argument. Bare queries are CSS",
+            ("expectation.url", _) => "correct the URL condition: an exact URL or ~/REGEX/flags (supported flags: i, m, s, u). In the CLI use a wait --url step and quote the complete pattern",
+            ("expectation.title", _) => "correct the title condition: exact title text or ~/REGEX/flags (supported flags: i, m, s, u). In the CLI use a wait --title step and quote the complete pattern",
+            _ => unreachable!("validated preflight context"),
+        };
+        // Standalone wait steps accept QUERY, not the action-only --expect flag.
+        let guidance = if field == "expectation.query" && self.steps[step - 1].action.is_none() {
+            guidance.replace("--expect", "wait")
+        } else {
+            guidance.to_owned()
+        };
+        crate::ErrorObject::new("protocol_violation",
+            format!("workflow step {step} {label} is invalid (interpreted as {grammar}); no actions executed"),
+            request_id, 30, guidance)
+    }
+
     /// Shape/size validation. Engine syntax preflight MUST also pass before mutation.
     pub fn validate(&self) -> Result<(), String> {
         if self.version != WORKFLOW_VERSION {
@@ -423,5 +515,107 @@ mod tests {
         assert_eq!(action.operation(), "web.fill");
         assert_eq!(action.payload()["value"], "secret-not-in-preflight");
         assert!(action.payload().get("operation").is_none());
+    }
+
+    #[test]
+    fn preflight_recovery_identifies_css_expectation_without_reinterpreting_or_echoing_data() {
+        let mut workflow = valid();
+        workflow.steps = vec![workflow.steps[0].clone(); 3];
+        workflow.steps[2].expect.as_mut().unwrap().condition.query =
+            Some("3 matching items".into());
+        let before = workflow.clone();
+        let error = workflow.preflight_error(
+            &json!({"valid":false,"step":3.0,
+            "field":"expectation.query","syntax":"css","error":"arbitrary engine text"}),
+            "request",
+        );
+        assert_eq!(error.code, "protocol_violation");
+        assert_eq!(error.exit_code, 30);
+        assert!(!error.retryable);
+        assert!(error.message.contains("step 3 expectation query"));
+        assert!(error.message.contains("CSS"));
+        assert!(error.message.contains("no actions executed"));
+        assert!(error.next_action.contains("--expect 'text=EXPECTED TEXT'"));
+        assert!(error.next_action.contains("Shell quoting alone"));
+        assert!(!error.message.contains("arbitrary engine text"));
+        assert_eq!(workflow, before);
+    }
+
+    #[test]
+    fn preflight_recovery_distinguishes_action_selector_from_expectation_fields() {
+        let mut workflow = valid();
+        workflow.steps[0].action = Some(WorkflowAction::Fill {
+            selector: WorkflowSelector::Css {
+                value: "[".into(),
+                nth: None,
+            },
+            value: "SECRET_ACTION_VALUE".into(),
+        });
+        for (field, syntax, label, hint) in [
+            ("action.selector", "css", "action selector", "css=SELECTOR"),
+            (
+                "expectation.query",
+                "text-regex",
+                "expectation query",
+                "supported flags",
+            ),
+        ] {
+            let error = workflow.preflight_error(
+                &json!({"valid":false,"step":1,"field":field,"syntax":syntax}),
+                "request",
+            );
+            assert!(error.message.contains(label));
+            assert!(error.next_action.contains(hint));
+            assert!(!error.message.contains("SECRET_ACTION_VALUE"));
+            assert!(!error.next_action.contains("SECRET_ACTION_VALUE"));
+        }
+        let condition = &mut workflow.steps[0].expect.as_mut().unwrap().condition;
+        condition.url = Some("~/[/i".into());
+        condition.title = Some("~/[/i".into());
+        for field in ["expectation.url", "expectation.title"] {
+            let error = workflow.preflight_error(
+                &json!({"valid":false,"step":1,"field":field,"syntax":"pattern"}),
+                "request",
+            );
+            assert!(error.next_action.contains("~/REGEX/flags"));
+            assert!(!error.next_action.contains("css="));
+            assert!(!error.next_action.contains("--expect-"));
+        }
+    }
+
+    #[test]
+    fn standalone_wait_recovery_uses_its_own_query_argument() {
+        let mut workflow = valid();
+        workflow.steps[0].action = None;
+        let error = workflow.preflight_error(
+            &json!({"valid":false,"step":1,
+            "field":"expectation.query","syntax":"css"}),
+            "request",
+        );
+        assert!(error.next_action.contains("wait 'text=EXPECTED TEXT'"));
+        assert!(!error.next_action.contains("--expect"));
+    }
+
+    #[test]
+    fn malformed_or_older_preflight_evidence_cannot_invent_a_field_or_step() {
+        let workflow = valid();
+        for detail in [
+            json!({"valid":false,"step":1,"error":"old runtime"}),
+            json!({"valid":false,"step":1.5,"field":"expectation.query","syntax":"css"}),
+            json!({"valid":false,"step":0,"field":"expectation.query","syntax":"css"}),
+            json!({"valid":false,"step":2,"field":"expectation.query","syntax":"css"}),
+            json!({"valid":false,"step":1,"field":"expectation.url","syntax":"pattern"}),
+            json!({"valid":false,"step":1,"field":"action.selector","syntax":"css"}),
+            json!({"valid":true,"step":1,"field":"expectation.query","syntax":"css"}),
+            json!({"valid":false,"step":1,"field":"expectation.query","syntax":"INVENTED"}),
+        ] {
+            let error = workflow.preflight_error(&detail, "request");
+            assert_eq!(
+                &*error.message, "workflow syntax preflight did not pass; no actions executed",
+                "{detail}"
+            );
+            assert_eq!(error.exit_code, 30);
+            assert!(!error.retryable);
+        }
     }
 }

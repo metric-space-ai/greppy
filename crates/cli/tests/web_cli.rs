@@ -66,6 +66,24 @@ fn session_create_help_explains_both_profiles_without_relaxing_policy() {
 }
 
 #[test]
+fn action_expect_help_distinguishes_query_type_from_shell_quoting() {
+    for action in ["select", "check", "click", "fill"] {
+        let (code, stdout, stderr) = run(&["web", action, "--help"]);
+        assert_eq!(code, 0, "{action}: {stdout}\n{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        let stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(stdout.contains("Bare QUERY is CSS"), "{stdout}");
+        assert!(stdout.contains("text=Saved"), "{stdout}");
+        assert!(stdout.contains("text~/Saved/i"), "{stdout}");
+        assert!(
+            stdout.contains("quotes alone do not change query type"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("not visibility"), "{stdout}");
+    }
+}
+
+#[test]
 fn session_new_refusal_names_create_and_nested_usage() {
     let (code, stdout, stderr) = run(&["web", "session", "new", "--profile", "project"]);
     assert_eq!(code, 64, "stdout={stdout} stderr={stderr}");
