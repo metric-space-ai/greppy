@@ -53,6 +53,14 @@ pub(crate) fn closest_valid_invocation(
                 .into(),
         );
     }
+    // Browser verbs have different nested grammars. The graph-flag candidate
+    // table below does not describe them: e.g. suggesting --max for an
+    // unsupported --tab turns a page id into an invalid integer (or silently
+    // changes meaning when the id happens to be numeric). Keep the real nested
+    // clap usage instead of inventing an executable repair from edit distance.
+    if subcommand == "web" {
+        return None;
+    }
     let unknown = unknown_flag_name(clap_message)?;
     let unknown = unknown.as_str();
     let candidates = subcommand_flag_candidates(argv, subcommand);
@@ -77,6 +85,59 @@ pub(crate) fn closest_valid_invocation(
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn browser_context_flag_is_not_repaired_into_graph_limit() {
+        for page in ["page-7729-1", "1"] {
+            let argv: Vec<std::ffi::OsString> = [
+                "greppy",
+                "web",
+                "assert",
+                "css=#start",
+                "--tab",
+                page,
+                "--json",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+            assert_eq!(
+                closest_valid_invocation(&argv, "web", "error: unexpected argument '--tab' found"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn browser_session_creation_keeps_the_explicit_supported_repair() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "web", "session", "new"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let suggestion =
+            closest_valid_invocation(&argv, "web", "error: unrecognized subcommand 'new'").unwrap();
+        assert!(suggestion.contains("greppy web session create --profile project"));
+    }
+
+    #[test]
+    fn graph_json_typo_keeps_its_existing_repair() {
+        let argv: Vec<std::ffi::OsString> = ["greppy", "search-symbol", "marker", "--jsoon"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let suggestion = closest_valid_invocation(
+            &argv,
+            "search-symbol",
+            "error: unexpected argument '--jsoon' found",
+        )
+        .unwrap();
+        assert_eq!(suggestion, "greppy search-symbol marker --json");
+    }
 }
 
 /// The flags `subcommand` actually accepts, for near-miss comparison.
