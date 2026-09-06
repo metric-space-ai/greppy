@@ -370,7 +370,7 @@ pub(super) fn request(
                 RequestOutcome::Failed
             };
         }
-        match request_once(endpoint, &encoded, remaining, max_response_bytes) {
+        match request_once(endpoint, &encoded, deadline, max_response_bytes) {
             RequestAttempt::Response(response) => return RequestOutcome::Response(response),
             RequestAttempt::NoDaemon => return RequestOutcome::NoDaemon,
             RequestAttempt::Failed if capacity_seen => return RequestOutcome::DaemonBusy,
@@ -401,27 +401,61 @@ enum RequestAttempt<T> {
 fn request_once(
     endpoint: &Endpoint,
     encoded: &[u8],
-    timeout: Duration,
+    deadline: Instant,
     max_response_bytes: usize,
 ) -> RequestAttempt<serde_json::Value> {
-    let mut stream = match TransportStream::connect(endpoint, timeout) {
+    request_once_with_transport(
+        encoded,
+        deadline,
+        max_response_bytes,
+        |timeout| TransportStream::connect(endpoint, timeout),
+        Instant::now,
+    )
+}
+
+// Keep one absolute request deadline across connection, write, read and capacity
+// retries. Injectable connection and clock allow testing phase exhaustion with
+// real socket frames, without sleeps or a scheduler-sensitive timing assertion.
+fn request_once_with_transport(
+    encoded: &[u8],
+    deadline: Instant,
+    max_response_bytes: usize,
+    connect: impl FnOnce(Duration) -> std::io::Result<TransportStream>,
+    mut now: impl FnMut() -> Instant,
+) -> RequestAttempt<serde_json::Value> {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return RequestAttempt::Failed;
+    }
+    let mut stream = match connect(remaining) {
         Ok(stream) => stream,
         Err(error) if no_daemon_error(&error) => return RequestAttempt::NoDaemon,
         Err(_) => return RequestAttempt::Failed,
     };
-    if stream
-        .set_timeouts(CONNECTION_WRITE_TIMEOUT.min(timeout), timeout)
-        .is_err()
-    {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
         return RequestAttempt::Failed;
     }
-    if write_frame(&mut stream, encoded, CONNECTION_WRITE_TIMEOUT.min(timeout)).is_err() {
+    let write_timeout = CONNECTION_WRITE_TIMEOUT.min(remaining);
+    if stream.set_timeouts(write_timeout, remaining).is_err() {
         return RequestAttempt::Failed;
     }
-    let response = match read_frame(&mut stream, max_response_bytes, timeout) {
+    if write_frame(&mut stream, encoded, write_timeout).is_err() {
+        return RequestAttempt::Failed;
+    }
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return RequestAttempt::Failed;
+    }
+    let response = match read_frame(&mut stream, max_response_bytes, remaining) {
         Ok(response) => response,
         Err(_) => return RequestAttempt::Failed,
     };
+    // A readable response can race with expiry (or a descheduled caller).
+    // Do not accept it as an on-time result merely because the read succeeded.
+    if now() >= deadline {
+        return RequestAttempt::Failed;
+    }
     match serde_json::from_str(&response) {
         Ok(response) if retryable_capacity_response(&response) => RequestAttempt::RetryableCapacity,
         Ok(response) => RequestAttempt::Response(response),
@@ -3123,6 +3157,77 @@ mod tests {
             assert!(Instant::now() < deadline, "daemon did not become reachable");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_deadline_is_not_restarted_between_transport_phases() {
+        use std::os::unix::net::UnixStream;
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        // Each clock observation is a phase boundary: before connect, before
+        // write, before read, after read. The response is already available, so a
+        // success after either exhausted boundary cannot be blamed on timing.
+        for (elapsed, sent_request, succeeds) in [
+            ([0, 5, 5, 5], false, false),
+            ([0, 1, 5, 5], true, false),
+            ([0, 1, 2, 5], true, false),
+            ([0, 1, 2, 3], true, true),
+        ] {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            let probe = client.try_clone().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.write_all(b"{\"state\":\"ready\"}\n").unwrap();
+            let mut times = elapsed.into_iter();
+            let result = request_once_with_transport(
+                b"{\"op\":\"status\"}\n",
+                deadline,
+                4096,
+                |budget| {
+                    assert_eq!(budget, Duration::from_secs(5));
+                    Ok(TransportStream(client))
+                },
+                || start + Duration::from_secs(times.next().expect("unexpected phase")),
+            );
+            if succeeds {
+                assert_eq!(
+                    result,
+                    RequestAttempt::Response(serde_json::json!({"state": "ready"}))
+                );
+                assert!(probe.write_timeout().unwrap().unwrap() <= Duration::from_secs(4));
+                assert!(probe.read_timeout().unwrap().unwrap() <= Duration::from_secs(3));
+            } else {
+                assert_eq!(result, RequestAttempt::Failed);
+            }
+            drop(probe);
+            // The request stream has dropped; read only the expected request,
+            // avoiding platform-specific reset semantics for an unread reply.
+            if sent_request {
+                let mut request = [0; 16];
+                peer.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"{\"op\":\"status\"}\n");
+            } else {
+                match peer.read(&mut [0; 1]) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("expired connection must send no request: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expired_request_deadline_does_not_attempt_connection() {
+        let instant = Instant::now();
+        let result = request_once_with_transport(
+            b"{}\n",
+            instant,
+            4096,
+            |_| panic!("an expired request must not connect"),
+            || instant,
+        );
+        assert_eq!(result, RequestAttempt::Failed);
     }
 
     #[cfg(unix)]
