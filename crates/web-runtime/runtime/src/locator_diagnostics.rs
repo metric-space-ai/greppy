@@ -27,6 +27,16 @@ pub(crate) fn failure_observation_budget(deadline_ms: u64, elapsed: Duration) ->
         .min(Duration::from_secs(2))
 }
 
+/// Only a successful, runtime-owned observation can replace stale-ref recovery.
+/// This changes guidance, never the refusal or the failed action's execution.
+pub(crate) fn recovery_with_observed_state(code: &str, available: bool) -> Option<&'static str> {
+    if code == "STALE_REF" && available {
+        Some("inspect the supplied page_state; if the intended target is present, use its current ref for your next action. The old ref was rejected; do not blindly repeat the action or assume its intended outcome occurred")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn recovery_for_locator_error(message: &str) -> (&'static str, &'static str) {
     // Choice labels/values are page data. They may contain words such as
     // STALE_REF or "timed out" and must not choose the recovery policy.
@@ -69,6 +79,28 @@ pub(crate) fn recovery_for_locator_error(message: &str) -> (&'static str, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_ref_uses_supplied_state_without_requesting_another_observation() {
+        let next = recovery_with_observed_state("STALE_REF", true).unwrap();
+        assert!(next.contains("supplied page_state"));
+        assert!(next.contains("if the intended target is present"));
+        assert!(next.contains("current ref"));
+        assert!(next.contains("do not blindly repeat"));
+        assert!(!next.contains("greppy web observe"));
+    }
+
+    #[test]
+    fn missing_state_and_other_failures_keep_the_original_recovery() {
+        assert_eq!(recovery_with_observed_state("STALE_REF", false), None);
+        assert!(recovery_for_locator_error("STALE_REF: old node")
+            .1
+            .contains("greppy web observe"));
+        for code in ["TIMEOUT", "NO_MATCH", "AMBIGUOUS_TARGET", "engine_error"] {
+            assert_eq!(recovery_with_observed_state(code, true), None);
+            assert_eq!(recovery_with_observed_state(code, false), None);
+        }
+    }
 
     #[test]
     fn concise_selection_diagnostics_preserve_page_fences_and_other_errors() {

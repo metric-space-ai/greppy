@@ -1,7 +1,7 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
 use crate::artifacts::ArtifactStore;
-use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error};
+use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error, recovery_with_observed_state};
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
 use crate::session::{LocatorSnapshot, Session, SessionState};
@@ -1918,6 +1918,13 @@ impl Daemon {
             let state = page_state_envelope(
                 self.observe_page_bounded(session_id, page, budget, false),
             );
+            if let Some(error) = response.error.as_mut() {
+                if let Some(next) = recovery_with_observed_state(
+                    &error.code, state["status"].as_str() == Some("available"),
+                ) {
+                    error.next_action = next.to_owned();
+                }
+            }
             response.result = Some(json!({
                 "session_id": session_id,
                 "tab_id": page,
