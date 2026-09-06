@@ -120,7 +120,29 @@ def run(cli, runtime, scratch, evidence):
               detail['completed_steps'] == 1 and detail['rolled_back'] is False)
         with lock:
             check('server saw no duplicate save after timeout', commits == ['3'])
+        formatted = call('do', '--native', 'fill', 'css=#quantity', '4', human=True)
+        check('human workflow summary and ordered step are present',
+              'workflow:' in formatted and 'step 1: action="web.fill" status="ok"' in formatted)
+        step_lines = [line for line in formatted.splitlines() if line.startswith('step ')]
+        check('human steps omit only redundant protocol identity', step_lines and
+              all(not any(key in line for key in ('session_id', 'tab_id', 'untrusted_content_boundary'))
+                  for line in step_lines))
+        command = next(line[line.index('greppy web result next '):]
+                       for line in formatted.splitlines() if 'greppy web result next ' in line)
+        archive = call(*shlex.split(command)[2:])
+        check('human workflow archive fits this probe page', archive['next_cursor'] is None)
+        original = json.loads(archive['content'])
+        restored = original['result']
+        check('human workflow archive preserves original receipt and current form state',
+              restored['steps'][0]['action']['receipt']['session_id'] == restored['session_id'] and
+              any(node.get('name') == 'Quantity' and node.get('value') == '4'
+                  for node in restored['page_state']['snapshot']['actionables']))
+        failed_human = call('do', '--native', 'wait', 'css=#never', '--timeout', '80', human=True, expected=34)
+        check('human failure preserves timeout and partial execution counts',
+              'FAILED' in failed_human and 'TIMEOUT' in failed_human and
+              '"completed_steps":0' in failed_human and '"rolled_back":false' in failed_human)
         check('candidate bytes unchanged', capture(cli, runtime) == context['candidate'])
+
         terminal['passed'] = True
     except BaseException as error:
         terminal['failure'] = repr(error)

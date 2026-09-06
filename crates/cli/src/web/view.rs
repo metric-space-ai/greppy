@@ -4,6 +4,9 @@
 #[path = "view_scope.rs"]
 mod scope_projection;
 
+#[path = "view_workflow.rs"]
+mod workflow_projection;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -151,7 +154,11 @@ pub(super) fn compact_select_choices(value: &Value) -> Option<Value> {
     Some(compact)
 }
 
-fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
+fn describe(payload: &Value, scope: Scope) -> Snapshot {
+    describe_with_workflow(payload, scope, None)
+}
+
+fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&str>) -> Snapshot {
     let receipt = payload
         .get("result")
         .filter(|v| !v.is_null())
@@ -214,7 +221,9 @@ fn describe(payload: &Value, mut scope: Scope) -> Snapshot {
     }
     let mut body = String::new();
     if observed.is_some() {
-        if let Some(obj) = receipt.as_object() {
+        if let Some(workflow) = workflow {
+            body.push_str(workflow);
+        } else if let Some(obj) = receipt.as_object() {
             let fields: serde_json::Map<String, Value> = obj
                 .iter()
                 .filter(|(key, _)| key.as_str() != "page_state")
@@ -524,7 +533,9 @@ fn shell_quote(value: &str) -> String {
 
 pub(super) fn render(payload: &Value, scope: Scope, dir: &Path) -> Result<String, String> {
     let original = describe(payload, scope.clone());
-    let snapshot = if let Some(projected) = scope_projection::project(payload) {
+    let projected = scope_projection::project(payload);
+    let workflow = workflow_projection::render(payload);
+    let snapshot = if projected.is_some() || workflow.is_some() {
         let archive = Snapshot {
             version: 1,
             created: now(),
@@ -534,7 +545,11 @@ pub(super) fn render(payload: &Value, scope: Scope, dir: &Path) -> Result<String
         };
         match save(dir, &archive) {
             Ok(id) => {
-                let mut snapshot = describe(&projected, scope);
+                let mut snapshot = describe_with_workflow(
+                    projected.as_ref().unwrap_or(payload),
+                    scope,
+                    workflow.as_deref(),
+                );
                 let mut command = format!(
                     "greppy web result next {}",
                     shell_quote(&format!("{PREFIX}{id}:0"))
@@ -626,6 +641,150 @@ pub(super) fn resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workflow_receipt() -> Value {
+        json!({"operation":"web.workflow", "status":"ok", "result":{
+            "workflow_version":1, "session_id":"workflow-s", "tab_id":"workflow-p",
+            "completed_steps":1, "total_steps":1, "actions_attempted":1, "rolled_back":false,
+            "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT",
+            "steps":[{"step":1,
+                "action":{"operation":"web.click", "status":"ok", "receipt":{
+                    "ok":true, "dispatch":"native", "session_id":"workflow-s", "tab_id":"workflow-p",
+                    "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT"}},
+                "expectation":{"status":"ok", "result":{"held":true,"waited_ms":158,
+                    "document_id":"document-a", "session_id":"workflow-s","tab_id":"workflow-p",
+                    "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT"}}}],
+            "page_state":{"schema":"greppy.web.page-state.v1","status":"available",
+                "snapshot":{"title":"Saved","actionables":[]}}
+        }})
+    }
+
+    #[test]
+    fn workflow_compaction_keeps_exact_archive_and_shared_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = workflow_receipt();
+        let before = payload.clone();
+        let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+        assert!(out.contains("workflow:"));
+        assert!(out.contains("step 1: action=\"web.click\" status=\"ok\""));
+        assert!(out.contains("\"held\":true"));
+        assert!(out.contains("\"waited_ms\":158"));
+        assert!(out.contains("\"rolled_back\":false"));
+        let step = out
+            .lines()
+            .find(|line| line.starts_with("step 1:"))
+            .unwrap();
+        for duplicate in [
+            "session_id",
+            "tab_id",
+            "untrusted_content_boundary",
+            "\"ok\":true",
+        ] {
+            assert!(!step.contains(duplicate), "{step}");
+        }
+        let start = out.find("view1:").unwrap();
+        let end = start + out[start..].find('\'').unwrap();
+        let restored = resume(&out[start..end], Some("workflow-s"), tmp.path(), true).unwrap();
+        let restored: Value = serde_json::from_str(&restored).unwrap();
+        assert!(restored["next_cursor"].is_null());
+        let archived: Value = serde_json::from_str(restored["content"].as_str().unwrap()).unwrap();
+        assert_eq!(archived, before);
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn workflow_failure_never_promotes_partial_action_or_missing_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        for held in [Some(json!(false)), None] {
+            let mut payload = workflow_receipt();
+            payload["status"] = json!("error");
+            payload["error"] = json!({"code":"TIMEOUT","exit_code":34,"message":"not confirmed",
+                "details":{"stopped_at":1},"next_action":"inspect; do not replay"});
+            payload["result"]["completed_steps"] = json!(0);
+            payload["result"]["total_steps"] = json!(3);
+            payload["result"]["failed_step"] = json!(1);
+            payload["result"]["phase"] = json!("expectation");
+            let stage = &mut payload["result"]["steps"][0]["expectation"];
+            stage["status"] = json!("error");
+            stage["result"].as_object_mut().unwrap().remove("held");
+            if let Some(held) = held {
+                stage["result"]["held"] = held;
+            }
+            let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+            for kept in [
+                "FAILED",
+                "TIMEOUT",
+                "not confirmed",
+                "do not replay",
+                "stopped_at",
+                "\"completed_steps\":0",
+                "\"actions_attempted\":1",
+                "\"total_steps\":3",
+                "\"failed_step\":1",
+                "\"rolled_back\":false",
+                "expectation status=\"error\"",
+            ] {
+                assert!(out.contains(kept), "missing {kept}: {out}");
+            }
+            assert!(!out.contains("\"held\":true"));
+        }
+    }
+
+    #[test]
+    fn workflow_unknowns_and_unavailable_state_use_lossless_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        for changed in [
+            "version",
+            "top-field",
+            "stage-field",
+            "malformed",
+            "unavailable",
+        ] {
+            let mut payload = workflow_receipt();
+            match changed {
+                "version" => payload["result"]["workflow_version"] = json!(2),
+                "top-field" => payload["result"]["future"] = json!({"keep":"future-top"}),
+                "stage-field" => {
+                    payload["result"]["steps"][0]["action"]["future"] = json!("future-stage")
+                }
+                "malformed" => {
+                    payload["result"]["steps"][0]["action"]["receipt"] = json!(["future-shape"])
+                }
+                _ => payload["result"]["page_state"]["status"] = json!("unavailable"),
+            }
+            assert!(workflow_projection::render(&payload).is_none());
+            let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+            assert!(out.contains("\"steps\""), "{changed}: {out}");
+        }
+        let mut payload = workflow_receipt();
+        payload["result"]["steps"][0]["action"]["receipt"]["future"] =
+            json!({"secret-shape":false});
+        payload["result"]["steps"][0]["action"]["receipt"]["session_id"] =
+            json!("different-session");
+        payload["result"]["steps"][0]["action"]["receipt"]["ok"] = json!(false);
+        let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+        for kept in ["secret-shape", "different-session", "\"ok\":false"] {
+            assert!(out.contains(kept));
+        }
+        let future = &payload["result"]["steps"][0]["action"]["receipt"];
+        assert!(
+            out.contains(&future.to_string()),
+            "unknown detail must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn workflow_archive_failure_keeps_original_receipts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unavailable = tmp.path().join("not-a-directory");
+        fs::write(&unavailable, "occupied").unwrap();
+        let payload = workflow_receipt();
+        let out = render(&payload, Scope::default(), &unavailable).unwrap();
+        assert!(!out.contains("workflow:"));
+        assert!(out.contains("\"steps\""));
+        assert!(out.contains("\"held\":true"));
+        assert!(!out.contains("Full returned state"));
+    }
 
     #[test]
     fn modal_projection_archives_background_and_falls_back_if_archive_fails() {
