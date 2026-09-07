@@ -126,10 +126,29 @@ impl ChunkStore {
             locations: RwLock::new(HashMap::new()),
             gc_guard: RwLock::new(()),
         };
-        store.recover_uncommitted_tails()?;
-        store.remove_orphan_segment_files()?;
+        store.reconcile_segments()?;
         store.refresh_read_cache()?;
         Ok(store)
+    }
+
+    /// Reconcile segment files with the committed metadata while holding the
+    /// same writer lock `put` holds. `put` extends a segment file and syncs it
+    /// before it commits the new `committed_len`, so a reader-only view of the
+    /// metadata cannot tell an in-flight record from the tail of a crashed
+    /// writer: it would truncate bytes another process is about to commit and
+    /// leave the store "truncated" for everyone. BEGIN IMMEDIATE serialises
+    /// this pass against every process's `put` and `gc`; `busy_timeout` bounds
+    /// the wait. Nothing here writes to SQLite, the commit only releases the lock.
+    fn reconcile_segments(&self) -> Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        recover_uncommitted_tails(&transaction, &self.root)?;
+        remove_orphan_segment_files(&transaction, &self.root)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn verify_integrity(&self) -> Result<()> {
@@ -614,82 +633,92 @@ impl ChunkStore {
         })
     }
 
-    fn recover_uncommitted_tails(&self) -> Result<()> {
-        let segments: Vec<(i64, u64)> = {
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
-            let mut statement =
-                connection.prepare("SELECT id, committed_len FROM cow_segments ORDER BY id")?;
-            let rows =
-                statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let registered = segments.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
-        let segments_root = self.root.join("segments");
-        let mut removed_orphan = false;
-        for entry in fs::read_dir(&segments_root)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| Error::Corrupt("segment filename is not UTF-8".into()))?;
-            let stem = name.strip_suffix(".gcws").ok_or_else(|| {
-                Error::Corrupt(format!("unexpected file in segment store: {name}"))
-            })?;
-            if stem.len() != 16 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(Error::Corrupt(format!(
-                    "non-canonical segment filename: {name}"
-                )));
-            }
-            let parsed = u64::from_str_radix(stem, 16)
-                .ok()
-                .and_then(|id| i64::try_from(id).ok())
-                .ok_or_else(|| Error::Corrupt(format!("invalid segment id: {name}")))?;
-            let metadata = fs::symlink_metadata(entry.path())?;
+    fn segment_path(&self, segment_id: i64) -> PathBuf {
+        segment_path_in(&self.root, segment_id)
+    }
+}
+
+fn segment_path_in(root: &Path, segment_id: i64) -> PathBuf {
+    root.join("segments")
+        .join(format!("{segment_id:016x}.gcws"))
+}
+
+/// Requires the caller to hold the SQLite writer lock (see
+/// `ChunkStore::reconcile_segments`): truncating past `committed_len` is only
+/// safe when no `put` can be between its segment write and its commit.
+fn recover_uncommitted_tails(connection: &Connection, root: &Path) -> Result<()> {
+    let segments: Vec<(i64, u64)> = {
+        let mut statement =
+            connection.prepare("SELECT id, committed_len FROM cow_segments ORDER BY id")?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let registered = segments.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+    let segments_root = root.join("segments");
+    let mut removed_orphan = false;
+    for entry in fs::read_dir(&segments_root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| Error::Corrupt("segment filename is not UTF-8".into()))?;
+        let stem = name
+            .strip_suffix(".gcws")
+            .ok_or_else(|| Error::Corrupt(format!("unexpected file in segment store: {name}")))?;
+        if stem.len() != 16 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Corrupt(format!(
+                "non-canonical segment filename: {name}"
+            )));
+        }
+        let parsed = u64::from_str_radix(stem, 16)
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+            .ok_or_else(|| Error::Corrupt(format!("invalid segment id: {name}")))?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::Corrupt(format!(
+                "segment path is not a regular file: {name}"
+            )));
+        }
+        if !registered.contains(&parsed) {
+            fs::remove_file(entry.path())?;
+            removed_orphan = true;
+        }
+    }
+    if removed_orphan {
+        sync_directory(&segments_root)?;
+    }
+    for (id, committed_len) in segments {
+        let path = segment_path_in(root, id);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
             if !metadata.file_type().is_file() {
                 return Err(Error::Corrupt(format!(
-                    "segment path is not a regular file: {name}"
+                    "segment {id} is not a regular file"
                 )));
             }
-            if !registered.contains(&parsed) {
-                fs::remove_file(entry.path())?;
-                removed_orphan = true;
-            }
         }
-        if removed_orphan {
-            sync_directory(&segments_root)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let actual = file.metadata()?.len();
+        if actual < committed_len {
+            return Err(Error::Corrupt(format!(
+                "segment {id} is truncated: {actual} bytes, metadata commits {committed_len}"
+            )));
         }
-        for (id, committed_len) in segments {
-            let path = self.segment_path(id);
-            if let Ok(metadata) = fs::symlink_metadata(&path) {
-                if !metadata.file_type().is_file() {
-                    return Err(Error::Corrupt(format!(
-                        "segment {id} is not a regular file"
-                    )));
-                }
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)?;
-            let actual = file.metadata()?.len();
-            if actual < committed_len {
-                return Err(Error::Corrupt(format!(
-                    "segment {id} is truncated: {actual} bytes, metadata commits {committed_len}"
-                )));
-            }
-            if actual > committed_len {
-                file.set_len(committed_len)?;
-                file.sync_data()?;
-            }
+        if actual > committed_len {
+            file.set_len(committed_len)?;
+            file.sync_data()?;
         }
-        Ok(())
     }
+    Ok(())
+}
 
+impl ChunkStore {
     fn refresh_read_cache(&self) -> Result<()> {
         let connection = self
             .connection
@@ -760,38 +789,32 @@ impl ChunkStore {
             .insert(id, location);
         Ok(location)
     }
+}
 
-    fn remove_orphan_segment_files(&self) -> Result<()> {
-        let known: std::collections::HashSet<PathBuf> = {
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| Error::Corrupt("chunk metadata mutex poisoned".into()))?;
-            let mut statement = connection.prepare("SELECT id FROM cow_segments")?;
-            let paths = statement
-                .query_map([], |row| row.get::<_, i64>(0))?
-                .map(|id| id.map(|id| self.segment_path(id)))
-                .collect::<std::result::Result<_, _>>()?;
-            paths
-        };
-        for entry in fs::read_dir(self.root.join("segments"))? {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "gcws")
-                && !known.contains(&path)
-            {
-                fs::remove_file(path)?;
-            }
+/// Same lock requirement as [`recover_uncommitted_tails`]: `put` registers a
+/// new segment inside its transaction before it creates the file, so without
+/// the writer lock a fresh segment looks like an orphan and would be unlinked
+/// under its writer.
+fn remove_orphan_segment_files(connection: &Connection, root: &Path) -> Result<()> {
+    let known: std::collections::HashSet<PathBuf> = {
+        let mut statement = connection.prepare("SELECT id FROM cow_segments")?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .map(|id| id.map(|id| segment_path_in(root, id)))
+            .collect::<std::result::Result<_, _>>()?;
+        paths
+    };
+    for entry in fs::read_dir(root.join("segments"))? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "gcws")
+            && !known.contains(&path)
+        {
+            fs::remove_file(path)?;
         }
-        Ok(())
     }
-
-    fn segment_path(&self, segment_id: i64) -> PathBuf {
-        self.root
-            .join("segments")
-            .join(format!("{segment_id:016x}.gcws"))
-    }
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -861,6 +884,81 @@ mod tests {
         connection.execute_batch("COMMIT").unwrap();
 
         opening.join().unwrap().unwrap();
+    }
+
+    /// The exact window behind "segment 1 is truncated" in the Linux
+    /// performance gate: a store that is already open reconciles its segments
+    /// while another process's `put` has extended the segment file but not yet
+    /// committed the new length. The reconciliation must wait for that writer
+    /// instead of truncating its record.
+    #[test]
+    fn reconciliation_waits_for_an_appending_writer_instead_of_truncating_it() {
+        let root = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ChunkStore::open(root.path()).unwrap());
+        store.put(b"first").unwrap();
+
+        let writer = Connection::open(root.path().join("chunks.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let committed: i64 = writer
+            .query_row(
+                "SELECT committed_len FROM cow_segments WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload = b"second";
+        let id = ChunkId(*blake3::hash(payload).as_bytes());
+        let segment = segment_path_in(root.path(), 1);
+        {
+            let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+            file.write_all(RECORD_MAGIC).unwrap();
+            file.write_all(&(payload.len() as u32).to_le_bytes())
+                .unwrap();
+            file.write_all(&id.0).unwrap();
+            file.write_all(payload).unwrap();
+            file.sync_data().unwrap();
+        }
+        let new_len = committed as u64 + RECORD_HEADER_LEN + payload.len() as u64;
+
+        let reconciling = {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || store.reconcile_segments())
+        };
+        // Isolated fault injection: keep the writer mid-flight long enough for
+        // the reconciliation to reach its lock; without the lock it truncates
+        // the record immediately, with it the join below proves it waited.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        writer
+            .execute(
+                "INSERT INTO cow_chunks(hash, segment_id, payload_offset, len, refs)
+                 VALUES(?1, 1, ?2, ?3, 0)",
+                params![
+                    &id.0[..],
+                    (committed as u64 + RECORD_HEADER_LEN) as i64,
+                    payload.len() as i64
+                ],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE cow_segments SET committed_len = ?1 WHERE id = 1",
+                params![new_len as i64],
+            )
+            .unwrap();
+        writer.execute_batch("COMMIT").unwrap();
+        reconciling.join().unwrap().unwrap();
+
+        assert_eq!(
+            fs::metadata(&segment).unwrap().len(),
+            new_len,
+            "an in-flight record must survive a concurrent reconciliation"
+        );
+        drop(store);
+        let reopened = ChunkStore::open(root.path()).unwrap();
+        assert_eq!(reopened.read(id).unwrap(), payload);
     }
 
     #[test]
