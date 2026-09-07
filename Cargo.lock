@@ -1226,6 +1226,7 @@ name = "greppy-workspace-ffi"
 version = "0.4.0"
 dependencies = [
  "greppy-workspace-core",
+ "libc",
  "serde_json",
  "tempfile",
 ]

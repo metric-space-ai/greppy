@@ -80,6 +80,8 @@ char *greppy_workspace_list_json(GreppyWorkspaceCore *core, const char *workspac
                                  const char *path);
 char *greppy_workspace_list_workspaces_json(GreppyWorkspaceCore *core);
 char *greppy_workspace_last_error(void);
+/// POSIX errno of the most recent failure on this thread, 0 when it has no POSIX shape.
+int32_t greppy_workspace_last_errno(void);
 void greppy_workspace_string_free(char *value);
 
 #ifdef __cplusplus

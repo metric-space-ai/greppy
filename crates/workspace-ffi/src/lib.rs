@@ -11,6 +11,11 @@ use std::sync::Mutex;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+    /// POSIX errno of the last failure, 0 when the failure has no POSIX shape.
+    /// The FSKit extension must answer the kernel with a POSIX code: a
+    /// not-found lookup reported as anything but ENOENT stops every file
+    /// creation inside a workspace (the kernel never reaches create).
+    static LAST_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 #[repr(C)]
@@ -34,9 +39,38 @@ pub struct GreppyWorkspaceMetadata {
 }
 
 fn remember(error: impl std::fmt::Display) -> i32 {
+    remember_with_errno(error, 0)
+}
+
+fn remember_with_errno(error: impl std::fmt::Display, errno: i32) -> i32 {
     let message = error.to_string().replace('\0', "\\0");
     LAST_ERROR.with(|slot| *slot.borrow_mut() = CString::new(message).unwrap());
+    LAST_ERRNO.with(|slot| slot.set(errno));
     -1
+}
+
+/// Remember a workspace-core failure together with the POSIX code the
+/// file-system layer must report for it.
+fn remember_core(error: greppy_workspace_core::Error) -> i32 {
+    let errno = match &error {
+        greppy_workspace_core::Error::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
+        other => errno_for_kind(other.kind()),
+    };
+    remember_with_errno(error, errno)
+}
+
+fn errno_for_kind(kind: greppy_workspace_core::ErrorKind) -> i32 {
+    use greppy_workspace_core::ErrorKind;
+    match kind {
+        ErrorKind::NotFound => libc::ENOENT,
+        ErrorKind::AlreadyExists => libc::EEXIST,
+        ErrorKind::NotDirectory => libc::ENOTDIR,
+        ErrorKind::IsDirectory => libc::EISDIR,
+        ErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
+        ErrorKind::InvalidInput => libc::EINVAL,
+        ErrorKind::Unavailable => libc::EAGAIN,
+        ErrorKind::Corrupt | ErrorKind::Io => libc::EIO,
+    }
 }
 
 unsafe fn required_str<'a>(value: *const c_char, name: &str) -> Result<&'a str, i32> {
@@ -59,7 +93,7 @@ unsafe fn ffi_core<'a>(value: *mut GreppyWorkspaceCore) -> Result<&'a GreppyWork
 }
 
 fn workspace(core: &WorkspaceCore, id: &str) -> Result<WorkspaceHandle, i32> {
-    core.open_workspace(id).map_err(remember)
+    core.open_workspace(id).map_err(remember_core)
 }
 
 fn open_inode_handle(
@@ -80,7 +114,7 @@ fn open_inode_handle(
     value
         .core
         .open_file_inode(&workspace, inode)
-        .map_err(remember)
+        .map_err(remember_core)
 }
 
 fn status(result: greppy_workspace_core::Result<()>) -> i32 {
@@ -238,8 +272,10 @@ pub unsafe extern "C" fn greppy_workspace_metadata(
     }
     let result = workspace(core, id).and_then(|workspace| {
         core.metadata(&workspace, path)
-            .map_err(remember)?
-            .ok_or_else(|| remember(format!("path does not exist: {path}")))
+            .map_err(remember_core)?
+            .ok_or_else(|| {
+                remember_with_errno(format!("path does not exist: {path}"), libc::ENOENT)
+            })
     });
     match result {
         Ok(value) => {
@@ -269,9 +305,9 @@ pub unsafe extern "C" fn greppy_workspace_open_file_inode(
         return -1;
     };
     workspace(core, id)
-        .and_then(|workspace| core.open_file(&workspace, path).map_err(remember))
+        .and_then(|workspace| core.open_file(&workspace, path).map_err(remember_core))
         .map(|handle| core.metadata_open_file(&handle).map(|value| value.inode))
-        .and_then(|result| result.map_err(remember))
+        .and_then(|result| result.map_err(remember_core))
         .and_then(|inode| i64::try_from(inode).map_err(|_| remember("inode exceeds i64")))
         .unwrap_or_else(i64::from)
 }
@@ -306,7 +342,7 @@ pub unsafe extern "C" fn greppy_workspace_open_file_read_only_inode(
             value
                 .core
                 .open_file_read_only(&workspace, path)
-                .map_err(remember)
+                .map_err(remember_core)
         })
         .and_then(|handle| {
             let token = value.next_open_file.fetch_add(1, Ordering::Relaxed);
@@ -368,8 +404,12 @@ pub unsafe extern "C" fn greppy_workspace_metadata_inode(
     if out.is_null() {
         return remember("metadata output is null");
     }
-    let result = open_inode_handle(value, id, inode)
-        .and_then(|handle| value.core.metadata_open_file(&handle).map_err(remember));
+    let result = open_inode_handle(value, id, inode).and_then(|handle| {
+        value
+            .core
+            .metadata_open_file(&handle)
+            .map_err(remember_core)
+    });
     match result {
         Ok(value) => {
             out.write(metadata(value));
@@ -405,7 +445,7 @@ pub unsafe extern "C" fn greppy_workspace_read_inode(
         value
             .core
             .read_open_file(&handle, offset, capacity)
-            .map_err(remember)
+            .map_err(remember_core)
     });
     match result {
         Ok(bytes) => {
@@ -450,7 +490,7 @@ pub unsafe extern "C" fn greppy_workspace_write_inode(
             value
                 .core
                 .write_open_file(&handle, offset, bytes)
-                .map_err(remember)
+                .map_err(remember_core)
         })
         .map(|written| written as i64)
         .unwrap_or_else(i64::from)
@@ -484,7 +524,7 @@ pub unsafe extern "C" fn greppy_workspace_read(
     }
     let result = workspace(core, id).and_then(|workspace| {
         core.read(&workspace, path, offset, capacity)
-            .map_err(remember)
+            .map_err(remember_core)
     });
     match result {
         Ok(bytes) => {
@@ -523,7 +563,7 @@ pub unsafe extern "C" fn greppy_workspace_read_symlink(
         return remember("readlink output is null") as i64;
     }
     let result = workspace(core, id)
-        .and_then(|workspace| core.read_symlink(&workspace, path).map_err(remember));
+        .and_then(|workspace| core.read_symlink(&workspace, path).map_err(remember_core));
     match result {
         Ok(bytes) if bytes.len() <= capacity => {
             if !bytes.is_empty() {
@@ -572,7 +612,7 @@ pub unsafe extern "C" fn greppy_workspace_write(
     };
     match workspace(core, id).and_then(|workspace| {
         core.write(&workspace, path, offset, bytes)
-            .map_err(remember)
+            .map_err(remember_core)
     }) {
         Ok(written) => written as i64,
         Err(code) => code as i64,
@@ -898,7 +938,7 @@ pub unsafe extern "C" fn greppy_workspace_list_json(
     };
     let result = workspace(core, id).and_then(|workspace| {
         core.read_dir(&workspace, path)
-            .map_err(remember)
+            .map_err(remember_core)
             .and_then(|entries| serde_json::to_string(&entries).map_err(remember))
     });
     match result.and_then(|json| CString::new(json).map_err(remember)) {
@@ -922,7 +962,7 @@ pub unsafe extern "C" fn greppy_workspace_list_workspaces_json(
     };
     let result = core
         .list_workspaces()
-        .map_err(remember)
+        .map_err(remember_core)
         .and_then(|workspaces| serde_json::to_string(&workspaces).map_err(remember));
     match result.and_then(|json| CString::new(json).map_err(remember)) {
         Ok(json) => json.into_raw(),
@@ -933,6 +973,13 @@ pub unsafe extern "C" fn greppy_workspace_list_workspaces_json(
 #[no_mangle]
 pub extern "C" fn greppy_workspace_last_error() -> *mut c_char {
     LAST_ERROR.with(|slot| slot.borrow().clone().into_raw())
+}
+
+#[no_mangle]
+/// POSIX errno for the most recent failure on this thread, or 0 when the
+/// failure carries no POSIX shape (the caller should then report EIO).
+pub extern "C" fn greppy_workspace_last_errno() -> i32 {
+    LAST_ERRNO.with(|slot| slot.get())
 }
 
 #[no_mangle]
@@ -955,6 +1002,76 @@ mod tests {
 
     fn c(value: &str) -> CString {
         CString::new(value).unwrap()
+    }
+
+    /// FSKit can only report POSIX codes. A missing path must reach the
+    /// kernel as ENOENT: reported as anything else, `open(O_CREAT)` never
+    /// proceeds to create and no new file can be written into a workspace
+    /// (the agent's private Git link failed with "Invalid argument").
+    #[test]
+    fn c_abi_reports_posix_errno_for_missing_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.test"][..],
+            &["config", "user.name", "Test"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.path().join("base.txt"), "base").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let workspace_id = c("ffi-errno");
+        unsafe {
+            let core = greppy_workspace_core_open(c(storage.path().to_str().unwrap()).as_ptr());
+            assert!(!core.is_null());
+            assert_eq!(
+                greppy_workspace_create(
+                    core,
+                    workspace_id.as_ptr(),
+                    c(repo.path().to_str().unwrap()).as_ptr(),
+                ),
+                0
+            );
+            let mut out = GreppyWorkspaceMetadata::default();
+            assert_eq!(
+                greppy_workspace_metadata(
+                    core,
+                    workspace_id.as_ptr(),
+                    c(".git").as_ptr(),
+                    &mut out
+                ),
+                -1
+            );
+            assert_eq!(greppy_workspace_last_errno(), libc::ENOENT);
+            assert_eq!(
+                greppy_workspace_metadata(
+                    core,
+                    workspace_id.as_ptr(),
+                    c("base.txt").as_ptr(),
+                    &mut out
+                ),
+                0
+            );
+            let unknown = c("no-such-workspace");
+            assert_eq!(
+                greppy_workspace_metadata(core, unknown.as_ptr(), c("base.txt").as_ptr(), &mut out),
+                -1
+            );
+            assert_eq!(greppy_workspace_last_errno(), libc::ENOENT);
+        }
     }
 
     #[test]

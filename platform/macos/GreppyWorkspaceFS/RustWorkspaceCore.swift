@@ -1,4 +1,6 @@
 import Foundation
+import FSKit
+import os
 import GreppyWorkspaceCore
 
 enum RustWorkspaceError: Error, CustomStringConvertible {
@@ -404,11 +406,24 @@ final class RustWorkspaceCore {
         guard result == 0 else { throw Self.lastError() }
     }
 
-    private static func lastError() -> RustWorkspaceError {
-        guard let value = greppy_workspace_last_error() else {
-            return .operation("portable workspace core failed without diagnostic")
+    /// FSKit answers the kernel only with POSIX codes. A core failure that
+    /// carries one (not found, exists, not a directory, ...) is returned as that
+    /// code; anything else is EIO with the diagnostic kept in the log. Before
+    /// this, a not-found lookup surfaced as EINVAL and the kernel never reached
+    /// create for any new file inside a workspace.
+    private static func lastError() -> Error {
+        let code = greppy_workspace_last_errno()
+        let message: String
+        if let value = greppy_workspace_last_error() {
+            defer { greppy_workspace_string_free(value) }
+            message = String(cString: value)
+        } else {
+            message = "portable workspace core failed without diagnostic"
         }
-        defer { greppy_workspace_string_free(value) }
-        return .operation(String(cString: value))
+        if code == ENOENT {
+            return fs_errorForPOSIXError(code)
+        }
+        os_log(.error, "workspace core: %{public}s", message)
+        return fs_errorForPOSIXError(code > 0 ? code : EIO)
     }
 }
