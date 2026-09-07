@@ -2996,7 +2996,7 @@ impl Daemon {
             return Err(protocol_error(request, "condition_ref requires an observed ref selector"));
         }
         let bound = self.bind_observed_selector(request, session_id, page, selector.clone())?;
-        Ok(crate::content_worker::observed_ref_condition_source(&source, &bound))
+        Ok(crate::selector_runtime::observed_ref_condition_source(&source, &bound))
     }
 
     fn web_history(&mut self, request: &Request, method: &str, operation: &str) -> Response {

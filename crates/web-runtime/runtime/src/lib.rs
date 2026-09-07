@@ -5,6 +5,7 @@ pub mod controller_worker;
 pub mod content_worker;
 #[cfg(unix)]
 pub mod daemon;
+pub(crate) mod selector_runtime;
 pub mod limits;
 pub mod linux_sandbox;
 mod observed_refs;
