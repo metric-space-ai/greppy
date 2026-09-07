@@ -19,6 +19,11 @@ final class GreppyFSVolume: FSVolume {
     }()
     private let cache = NSLock()
     private var items: [GreppyFSItem.Location: GreppyFSItem] = [:]
+    /// Extended attributes live only for the lifetime of the mount. Without
+    /// native support the kernel stores every xattr (macOS tags each file the
+    /// CLI creates with com.apple.provenance) in AppleDouble `._name` files
+    /// inside the workspace, which git then sees as untracked, transient paths.
+    private var extendedAttributes: [FSItem.Identifier: [String: Data]] = [:]
     private var nextIdentifier: UInt64 = FSItem.Identifier.rootDirectory.rawValue + 16
 
     private lazy var root = item(
@@ -122,7 +127,7 @@ extension GreppyFSVolume: FSVolume.PathConfOperations {
     var maximumNameLength: Int { 255 }
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
-    var maximumXattrSize: Int { 0 }
+    var maximumXattrSize: Int { 65_536 }
     var maximumFileSize: UInt64 { UInt64.max }
 }
 
@@ -444,6 +449,7 @@ extension GreppyFSVolume: FSVolume.Operations {
             _ = try privateInode(for: item)
         }
         try core.unlink(workspace: workspaceID, path: relative)
+        forgetExtendedAttributes(of: item)
         evict(item.location)
     }
 
@@ -746,7 +752,12 @@ extension GreppyFSVolume: FSVolume.Operations {
         value.fileID = item.identifier
         value.parentID = parent
         value.type = itemType(metadata.kind)
-        value.mode = metadata.mode
+        // The core keeps the type bits inside `mode` (symlinks are stored as
+        // 0o120000 without permission bits). FSKit carries the type separately,
+        // and macOS refuses readlink(2) on a symlink without read permission,
+        // so present symlinks with the conventional 0o777.
+        let permissions = metadata.mode & 0o7777
+        value.mode = metadata.kind == .symbolicLink && permissions == 0 ? 0o777 : permissions
         value.linkCount = metadata.linkCount
         value.size = metadata.size
         value.allocSize = metadata.size
@@ -872,5 +883,56 @@ extension GreppyFSVolume: FSVolume.ReadWriteOperations {
             offset: UInt64(offset),
             contents: contents
         )
+    }
+}
+
+extension GreppyFSVolume: FSVolume.XattrOperations {
+    func xattr(named name: FSFileName, of rawItem: FSItem) async throws -> Data {
+        let item = try workspace(rawItem)
+        guard let key = name.string else { throw posix(EINVAL) }
+        cache.lock()
+        defer { cache.unlock() }
+        guard let value = extendedAttributes[item.identifier]?[key] else { throw posix(ENOATTR) }
+        return value
+    }
+
+    func setXattr(
+        named name: FSFileName,
+        to value: Data?,
+        on rawItem: FSItem,
+        policy: FSVolume.SetXattrPolicy
+    ) async throws {
+        let item = try workspace(rawItem)
+        guard let key = name.string else { throw posix(EINVAL) }
+        cache.lock()
+        defer { cache.unlock() }
+        var attributes = extendedAttributes[item.identifier] ?? [:]
+        let exists = attributes[key] != nil
+        switch policy {
+        case .delete:
+            guard exists else { throw posix(ENOATTR) }
+            attributes[key] = nil
+        case .mustCreate where exists:
+            throw posix(EEXIST)
+        case .mustReplace where !exists:
+            throw posix(ENOATTR)
+        default:
+            guard let value, value.count <= maximumXattrSize else { throw posix(EINVAL) }
+            attributes[key] = value
+        }
+        extendedAttributes[item.identifier] = attributes.isEmpty ? nil : attributes
+    }
+
+    func xattrs(of rawItem: FSItem) async throws -> [FSFileName] {
+        let item = try workspace(rawItem)
+        cache.lock()
+        defer { cache.unlock() }
+        return (extendedAttributes[item.identifier] ?? [:]).keys.sorted().map { FSFileName(string: $0) }
+    }
+
+    private func forgetExtendedAttributes(of item: GreppyFSItem) {
+        cache.lock()
+        defer { cache.unlock() }
+        extendedAttributes[item.identifier] = nil
     }
 }
