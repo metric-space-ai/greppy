@@ -68,7 +68,7 @@ SCRIPTS AND RESULTS:
   greppy web pw CODE                      Playwright in the controller
   greppy web run --script-file F          a Playwright script; --mode active
                                           uses this browser, standalone its own
-  greppy web endpoint start               a native Playwright connect endpoint
+  greppy web endpoint                     a native Playwright connect endpoint
   greppy web script save NAME --file PATH store a script from your files
   greppy web artifact list                what a session produced
   greppy web artifacts                    artifacts of a session

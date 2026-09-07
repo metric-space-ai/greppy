@@ -410,7 +410,7 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // 04.09.2026: owner-approved release plan corrects unsupported nested
     // browser commands and action-result guidance to match the shipped CLI.
     const APPROVED_SHA256: &str =
-        "4d28cb99e39d9895efe15f8a6d2fc7be5c47c1992b597ab1935ad2747087cde3";
+        "bfa1d5486861c176b3f9da64ffa788b4721880d130f1c830808da3234e7e21a3";
 
     let text = prompt();
     let digest = {
