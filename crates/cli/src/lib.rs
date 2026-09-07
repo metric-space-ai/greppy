@@ -190,6 +190,11 @@ const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
+/// Test-only synchronisation point: while set, the held publication resumes
+/// as soon as this file exists instead of after a guessed duration. HOLD_MS
+/// then only bounds a test that never releases.
+#[cfg(debug_assertions)]
+const ENV_TEST_INDEX_FAILPOINT_RELEASE: &str = "GREPPY_TEST_INDEX_FAILPOINT_RELEASE";
 const ENV_DELEGATED_BACKGROUND_JOB: &str = "GREPPY_DELEGATED_BACKGROUND_JOB";
 #[cfg(all(
     not(feature = "ci-test-assets"),
@@ -9173,6 +9178,14 @@ fn maybe_index_test_failpoint(name: &str, temp_path: &std::path::Path) -> Result
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(300_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(hold_ms);
+    if let Ok(release_path) = std::env::var(ENV_TEST_INDEX_FAILPOINT_RELEASE) {
+        let release_path = std::path::PathBuf::from(release_path);
+        while !release_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return Ok(());
+    }
     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
     Ok(())
 }
