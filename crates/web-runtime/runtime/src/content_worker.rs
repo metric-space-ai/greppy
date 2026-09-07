@@ -5051,7 +5051,7 @@ pub fn run() -> io::Result<()> {
             Err(RecvTimeoutError::Timeout) => {
                 if engine.has_live_pages() {
                     let started = Instant::now();
-                    engine.servo.spin_event_loop();
+                    let more = engine.servo.spin_event_loop_idle();
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
                         if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-spin elapsed_ms={} pages={}",
@@ -5059,10 +5059,14 @@ pub fn run() -> io::Result<()> {
                             engine.pages.len()
                         ); }
                     }
-                    // Layout can run for seconds after web.run/goto returned.
-                    // page.close is queued on `rx` during that spin; skip the
-                    // next idle wait so the supervisor's 250ms close budget
-                    // sees it as soon as the event loop yields.
+                    // Yield to protocol between batches. Layout after goto
+                    // can drain thousands of paint messages inside one
+                    // unlimited spin; page.close / the next web.run sit on
+                    // `rx` until that drain finishes (Fund 026).
+                    if more {
+                        engine.wake.wake();
+                        continue;
+                    }
                     if elapsed >= Duration::from_millis(50) {
                         continue;
                     }
