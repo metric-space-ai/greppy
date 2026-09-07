@@ -41,9 +41,10 @@ private struct RustWorkspaceStatus: Decodable {
 
 struct RustWorkspaceDirectoryMetadata: Decodable {
     enum Kind: String, Decodable {
-        case file = "File"
-        case directory = "Directory"
-        case symbolicLink = "Symlink"
+        // The core serialises `NodeKind` in kebab-case (`greppy_workspace_list_json`).
+        case file = "file"
+        case directory = "directory"
+        case symbolicLink = "symlink"
     }
 
     let kind: Kind

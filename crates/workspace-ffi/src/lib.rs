@@ -1190,6 +1190,101 @@ mod tests {
         }
     }
 
+    /// The FSKit volume decodes `greppy_workspace_list_json` with a fixed
+    /// Swift `Decodable` (`RustWorkspaceDirectoryEntry` in
+    /// platform/macos/GreppyWorkspaceFS/RustWorkspaceCore.swift). Pin the wire
+    /// format it relies on: the entry keys, the metadata keys, and the
+    /// kebab-case `kind` values. A drift here is a decoding error inside the
+    /// extension, which FSKit reports to the kernel as EINVAL on every
+    /// `readdir` of a workspace directory.
+    #[test]
+    fn list_json_wire_format_matches_the_fskit_decoder() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.test"][..],
+            &["config", "user.name", "Test"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.path().join("base.txt"), "base").unwrap();
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("sub/inner.txt"), "inner").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("base.txt", repo.path().join("link")).unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let workspace_id = c("ffi-list-json");
+        let listing = unsafe {
+            let core = greppy_workspace_core_open(c(storage.path().to_str().unwrap()).as_ptr());
+            assert!(!core.is_null());
+            assert_eq!(
+                greppy_workspace_create(
+                    core,
+                    workspace_id.as_ptr(),
+                    c(repo.path().to_str().unwrap()).as_ptr(),
+                ),
+                0
+            );
+            let raw = greppy_workspace_list_json(core, workspace_id.as_ptr(), c("").as_ptr());
+            assert!(
+                !raw.is_null(),
+                "{:?}",
+                LAST_ERROR.with(|slot| slot.borrow().clone())
+            );
+            let json = CStr::from_ptr(raw).to_str().unwrap().to_owned();
+            greppy_workspace_string_free(raw);
+            assert_eq!(greppy_workspace_remove(core, workspace_id.as_ptr()), 0);
+            greppy_workspace_core_close(core);
+            json
+        };
+
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&listing).unwrap();
+        let mut kinds = std::collections::BTreeMap::new();
+        for entry in &entries {
+            let object = entry.as_object().unwrap();
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["metadata", "name"]);
+            let metadata = object["metadata"].as_object().unwrap();
+            let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "accessed_unix_ns",
+                    "changed_unix_ns",
+                    "inode",
+                    "kind",
+                    "mode",
+                    "modified_unix_ns",
+                    "nlink",
+                    "size",
+                ]
+            );
+            kinds.insert(
+                object["name"].as_str().unwrap().to_owned(),
+                metadata["kind"].as_str().unwrap().to_owned(),
+            );
+        }
+        assert_eq!(kinds["base.txt"], "file");
+        assert_eq!(kinds["sub"], "directory");
+        #[cfg(unix)]
+        assert_eq!(kinds["link"], "symlink");
+    }
+
     #[test]
     fn c_abi_exercises_workspace_lifecycle_and_io() {
         let repo = tempfile::tempdir().unwrap();
