@@ -3264,19 +3264,22 @@ impl ContentEngine {
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                    WheelDelta {
-                        x: delta_x,
-                        y: delta_y,
-                        z: 0.0,
-                        mode: WheelMode::DeltaPixel,
-                    },
-                    point,
-                )));
-                self.servo.spin_event_loop();
+                let delta = WheelDelta {
+                    x: delta_x,
+                    y: delta_y,
+                    z: 0.0,
+                    mode: WheelMode::DeltaPixel,
+                };
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::Wheel(WheelEvent::new(delta, point))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.wheel after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             "page.mouse.up" => {
