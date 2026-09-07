@@ -191,9 +191,29 @@ privilege boundary.
   16-26 % of embedding batches were dropped as transport failures, the
   index job ended failed, and the summary-quality release gate stayed
   unhealthy. A regression test covers the buffered multi-chunk frame.
+- The macOS FSKit adapter now reports the core's failures to the kernel as
+  POSIX codes. A lookup of a name that did not exist yet surfaced as EINVAL
+  instead of ENOENT, so `open(O_CREAT)` never reached create and no new file
+  could be written into a workspace; the agent failed at its private Git link.
+- The FSKit adapter decodes the core's kebab-case node kinds. Every listing of
+  a workspace directory had failed inside the extension (`ls`: "Invalid
+  argument"), and the agent aborted with an incomplete workspace inventory.
+  An FFI test pins the wire format the Swift decoder relies on.
+- The FSKit volume keeps extended attributes in memory for the lifetime of the
+  mount. Without that, macOS stored its provenance attribute as AppleDouble
+  `._name` files inside the workspace, which git saw as untracked and the
+  agent's finish could not stage. Symlinks are presented with read
+  permission; macOS refuses `readlink` on a mode-0 link.
+- A path created and removed again inside a workspace is no longer reported
+  as a change. The agent's self-check writes and removes `.greppy-selfcheck`,
+  and `finish` then ran `git add` on a pathspec that matched nothing, ending
+  every run with exit 3 after a correct answer. Removing a baseline file or
+  directory still counts as a change.
 
 These corrections do not replace the required real-device, parallel-agent or
-exact-SHA release gates.
+exact-SHA release gates. The macOS device acceptance (setup, doctor, kernel
+file operations inside a workspace, two agent runs and the bench) was run on
+the notarized build of every candidate above.
 
 ### Known limits
 
