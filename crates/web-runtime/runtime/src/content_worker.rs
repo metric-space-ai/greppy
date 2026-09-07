@@ -3248,14 +3248,20 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                    MouseButtonAction::Down,
-                    MouseButton::Left,
-                    point,
-                )));
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Down,
+                        MouseButton::Left,
+                        point,
+                    ))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.down after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             "page.mouse.wheel" => {
@@ -3286,14 +3292,20 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                    MouseButtonAction::Up,
-                    MouseButton::Left,
-                    point,
-                )));
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Up,
+                        MouseButton::Left,
+                        point,
+                    ))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.up after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             other => Err(io::Error::new(
