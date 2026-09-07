@@ -2141,73 +2141,6 @@ fn rollback_patch_file(
         .map_err(|error| error.to_string())
 }
 
-#[cfg(test)]
-mod patch_rollback_tests {
-    use super::*;
-
-    #[test]
-    fn failed_patch_never_rolls_back_the_unpublished_conflict_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first.txt");
-        let last = dir.path().join("last.txt");
-        std::fs::write(&first, b"before\n").unwrap();
-        std::fs::write(&last, b"original\n").unwrap();
-        let diff = b"--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-before\n+after\n--- a/last.txt\n+++ b/last.txt\n@@ -1 +1 @@\n-original\n+patched\n";
-        let result =
-            run_trained_patch_with_publish_hook(dir.path(), diff.to_vec(), false, false, |index| {
-                if index == 1 {
-                    std::fs::write(&last, b"concurrent-success\n").unwrap();
-                }
-            });
-        assert!(result.is_err());
-        assert_eq!(std::fs::read(&first).unwrap(), b"before\n");
-        assert_eq!(std::fs::read(&last).unwrap(), b"concurrent-success\n");
-        assert!(!edit_journal_dir(dir.path())
-            .join(EDIT_JOURNAL_PENDING)
-            .exists());
-        // This test alone created the journal under its unique temporary root hash.
-        std::fs::remove_dir_all(edit_journal_dir(dir.path())).unwrap();
-    }
-
-    #[test]
-    fn transaction_lock_excludes_another_writer_and_releases_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = acquire_edit_transaction_lock(dir.path()).unwrap();
-        assert!(matches!(
-            acquire_edit_transaction_lock(dir.path()),
-            Err(Error::Lock(_))
-        ));
-        drop(first);
-        assert!(acquire_edit_transaction_lock(dir.path()).is_ok());
-    }
-
-    #[test]
-    fn rollback_restores_our_published_image() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        std::fs::write(&path, b"our patch").unwrap();
-        rollback_patch_file(dir.path(), &path, b"before", b"our patch").unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), b"before");
-    }
-
-    #[test]
-    fn rollback_preserves_a_later_writers_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        std::fs::write(&path, b"someone else").unwrap();
-        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
-        assert_eq!(std::fs::read(path).unwrap(), b"someone else");
-    }
-
-    #[test]
-    fn rollback_does_not_recreate_a_concurrently_deleted_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
-        assert!(!path.exists());
-    }
-}
-
 pub(crate) fn run_trained_patch(
     root_path: &std::path::Path,
     diff: Vec<u8>,
@@ -2882,4 +2815,71 @@ pub(crate) fn edit_operation_line_span(
     let line_count = content.iter().filter(|byte| **byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
     (1, line_count.max(1))
+}
+
+#[cfg(test)]
+mod patch_rollback_tests {
+    use super::*;
+
+    #[test]
+    fn failed_patch_never_rolls_back_the_unpublished_conflict_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let last = dir.path().join("last.txt");
+        std::fs::write(&first, b"before\n").unwrap();
+        std::fs::write(&last, b"original\n").unwrap();
+        let diff = b"--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-before\n+after\n--- a/last.txt\n+++ b/last.txt\n@@ -1 +1 @@\n-original\n+patched\n";
+        let result =
+            run_trained_patch_with_publish_hook(dir.path(), diff.to_vec(), false, false, |index| {
+                if index == 1 {
+                    std::fs::write(&last, b"concurrent-success\n").unwrap();
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&first).unwrap(), b"before\n");
+        assert_eq!(std::fs::read(&last).unwrap(), b"concurrent-success\n");
+        assert!(!edit_journal_dir(dir.path())
+            .join(EDIT_JOURNAL_PENDING)
+            .exists());
+        // This test alone created the journal under its unique temporary root hash.
+        std::fs::remove_dir_all(edit_journal_dir(dir.path())).unwrap();
+    }
+
+    #[test]
+    fn transaction_lock_excludes_another_writer_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_edit_transaction_lock(dir.path()).unwrap();
+        assert!(matches!(
+            acquire_edit_transaction_lock(dir.path()),
+            Err(Error::Lock(_))
+        ));
+        drop(first);
+        assert!(acquire_edit_transaction_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn rollback_restores_our_published_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"our patch").unwrap();
+        rollback_patch_file(dir.path(), &path, b"before", b"our patch").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"before");
+    }
+
+    #[test]
+    fn rollback_preserves_a_later_writers_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"someone else").unwrap();
+        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"someone else");
+    }
+
+    #[test]
+    fn rollback_does_not_recreate_a_concurrently_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        assert!(rollback_patch_file(dir.path(), &path, b"before", b"our patch").is_err());
+        assert!(!path.exists());
+    }
 }

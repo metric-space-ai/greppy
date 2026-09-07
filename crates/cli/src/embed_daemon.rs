@@ -796,11 +796,9 @@ mod tests {
             };
             let cache = greppy_store::EmbeddingContentCache::open(temp.path().join(kind)).unwrap();
             let provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
-            let cause = provider
-                .tokenizer
-                .as_ref()
-                .err()
-                .expect("invalid tokenizer");
+            let Err(cause) = provider.tokenizer.as_ref() else {
+                panic!("invalid tokenizer");
+            };
             assert!(cause.contains(path.to_str().unwrap()));
             for (outcome, expected) in [
                 (RequestOutcome::<()>::Failed, "request failed"),

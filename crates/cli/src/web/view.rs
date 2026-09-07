@@ -338,13 +338,13 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
                                 continue;
                             }
                         }
-                        if ![
+                        let shown_elsewhere = [
                             "ref", "role", "tag", "name", "text", "value", "type", "checked",
                             "selected", "disabled", "expanded", "invalid", "href",
                         ]
-                        .contains(&key.as_str())
-                            && !(actionable_v2 && v2_presentation_default(key, value))
-                        {
+                        .contains(&key.as_str());
+                        let v2_default = actionable_v2 && v2_presentation_default(key, value);
+                        if !(shown_elsewhere || v2_default) {
                             body.push_str(&format!(" {}={value}", quote(key)));
                         }
                     }
