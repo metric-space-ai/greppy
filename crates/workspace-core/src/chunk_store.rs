@@ -961,6 +961,51 @@ mod tests {
         assert_eq!(reopened.read(id).unwrap(), payload);
     }
 
+    /// Many stores on one root, opening and appending at once, must never
+    /// lose a committed record. This is the performance gate's parallel
+    /// phase in miniature and fails within seconds without the writer lock
+    /// around segment reconciliation.
+    #[test]
+    fn concurrent_opens_and_puts_keep_every_committed_chunk() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ChunkStore::open(root.path()).unwrap());
+        let writers = (0..6u8)
+            .map(|lane| {
+                let root = root.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let store = ChunkStore::open(&root).unwrap();
+                    (0..120u32)
+                        .map(|index| {
+                            let payload = format!("lane {lane} chunk {index}").repeat(64);
+                            (store.put(payload.as_bytes()).unwrap(), payload)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let openers = (0..6u8)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for _ in 0..120 {
+                        drop(ChunkStore::open(&root).unwrap());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for opener in openers {
+            opener.join().unwrap();
+        }
+        let written = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        let store = ChunkStore::open(root.path()).unwrap();
+        for (id, payload) in written {
+            assert_eq!(store.read(id).unwrap(), payload.as_bytes());
+        }
+    }
+
     #[test]
     fn chunks_are_deduplicated_and_verified() {
         let temp = tempfile::tempdir().unwrap();
