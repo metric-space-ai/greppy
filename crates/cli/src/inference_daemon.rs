@@ -1619,20 +1619,39 @@ impl TransportStream {
     // partial frame, the next syscall must use the remaining budget, not the
     // original connection timeout. Preserve any stricter transport cap.
     fn bound_read_timeout(&self, remaining: Duration) -> std::io::Result<()> {
-        let timeout = self
-            .0
-            .read_timeout()?
-            .map_or(remaining, |cap| cap.min(remaining));
-        self.0.set_read_timeout(Some(timeout))
+        let cap = self.0.read_timeout()?;
+        let timeout = cap.map_or(remaining, |cap| cap.min(remaining));
+        match self.0.set_read_timeout(Some(timeout)) {
+            Ok(()) => Ok(()),
+            Err(error) if cap.is_some() && peer_closed_rearm_error(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn bound_write_timeout(&self, remaining: Duration) -> std::io::Result<()> {
-        let timeout = self
-            .0
-            .write_timeout()?
-            .map_or(remaining, |cap| cap.min(remaining));
-        self.0.set_write_timeout(Some(timeout))
+        let cap = self.0.write_timeout()?;
+        let timeout = cap.map_or(remaining, |cap| cap.min(remaining));
+        match self.0.set_write_timeout(Some(timeout)) {
+            Ok(()) => Ok(()),
+            Err(error) if cap.is_some() && peer_closed_rearm_error(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
+}
+
+/// macOS rejects `SO_RCVTIMEO`/`SO_SNDTIMEO` with `EINVAL` on an AF_UNIX
+/// stream once the peer has shut its side down, even while the peer's final
+/// bytes are still buffered. The frame reader re-arms the timeout before every
+/// chunk, so a daemon that writes its response and closes could turn a fully
+/// delivered multi-chunk frame into a transport failure. When a cap is already
+/// armed it stays in force, and the deadline check after the read still bounds
+/// the request; failing to tighten it is not a failure of the request.
+#[cfg(unix)]
+fn peer_closed_rearm_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOTCONN | libc::EPIPE)
+    )
 }
 
 #[cfg(unix)]
@@ -2066,6 +2085,40 @@ fn wide_string(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The embedding daemon writes its response and closes. On macOS the
+    /// reader could not re-arm SO_RCVTIMEO after that and dropped the
+    /// buffered remainder of any frame longer than one read; the summary
+    /// quality gate saw "N of M embedding documents failed inference".
+    #[cfg(unix)]
+    #[test]
+    fn read_frame_drains_a_multi_chunk_response_after_the_peer_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-closed.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Longer than one 4096-byte read, shorter than the socket buffer so
+        // the peer can write everything and close before the client reads.
+        let body = "x".repeat(6_000);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn({
+            let body = body.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                drop(stream);
+                closed_tx.send(()).unwrap();
+            }
+        });
+        let mut stream = TransportStream(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        stream
+            .set_timeouts(Duration::from_secs(5), Duration::from_secs(5))
+            .unwrap();
+        closed_rx.recv().unwrap();
+        let frame = read_frame(&mut stream, 1 << 20, Duration::from_secs(5)).unwrap();
+        assert_eq!(frame, body);
+        server.join().unwrap();
+    }
 
     #[test]
     fn endpoint_identity_is_stable_and_versioned() {
