@@ -961,6 +961,23 @@ mod tests {
         assert_eq!(reopened.read(id).unwrap(), payload);
     }
 
+    /// SQLite reports `database is locked` once the store's bounded busy
+    /// wait (5 s) expires under heavy contention. That is the documented
+    /// back-pressure of a shared store, not the integrity property this
+    /// test pins; a loaded CI runner hit it with twelve threads. Retry only
+    /// that classified condition and let every other error fail the test.
+    fn retry_when_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> T {
+        for _ in 0..50 {
+            match attempt() {
+                Ok(value) => return value,
+                Err(Error::Sql(rusqlite::Error::SqliteFailure(error, _)))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+        panic!("store stayed busy through 50 bounded waits");
+    }
+
     /// Many stores on one root, opening and appending at once, must never
     /// lose a committed record. This is the performance gate's parallel
     /// phase in miniature and fails within seconds without the writer lock
@@ -973,11 +990,11 @@ mod tests {
             .map(|lane| {
                 let root = root.path().to_path_buf();
                 std::thread::spawn(move || {
-                    let store = ChunkStore::open(&root).unwrap();
+                    let store = retry_when_busy(|| ChunkStore::open(&root));
                     (0..120u32)
                         .map(|index| {
                             let payload = format!("lane {lane} chunk {index}").repeat(64);
-                            (store.put(payload.as_bytes()).unwrap(), payload)
+                            (retry_when_busy(|| store.put(payload.as_bytes())), payload)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -988,7 +1005,7 @@ mod tests {
                 let root = root.path().to_path_buf();
                 std::thread::spawn(move || {
                     for _ in 0..120 {
-                        drop(ChunkStore::open(&root).unwrap());
+                        drop(retry_when_busy(|| ChunkStore::open(&root)));
                     }
                 })
             })
