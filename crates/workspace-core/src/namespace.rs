@@ -726,14 +726,27 @@ impl WorkspaceCore {
         let connection = self.lock_metadata()?;
         let mut paths = BTreeSet::new();
         {
-            let mut statement = connection
-                .prepare("SELECT path FROM cow_entries WHERE workspace_id = ?1 ORDER BY path")?;
-            let rows = statement.query_map(params![workspace.id], |row| row.get::<_, String>(0))?;
+            let mut statement = connection.prepare(
+                "SELECT path, tombstone FROM cow_entries WHERE workspace_id = ?1 ORDER BY path",
+            )?;
+            let rows = statement.query_map(params![workspace.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?;
             for row in rows {
-                let path = row?;
-                if path != ".git" && !path.starts_with(".git/") {
-                    paths.insert(path);
+                let (path, tombstone) = row?;
+                if path == ".git" || path.starts_with(".git/") {
+                    continue;
                 }
+                // A tombstone only changes the tree when it hides something the
+                // baseline provides; a scratch path created and removed inside
+                // the workspace leaves nothing to stage.
+                if tombstone
+                    && repository_layers::lookup(&connection, &workspace.id, &path)?.is_none()
+                    && !repository_layers::has_descendant(&connection, &workspace.id, &path)?
+                {
+                    continue;
+                }
+                paths.insert(path);
             }
         }
         {
@@ -3215,6 +3228,46 @@ mod tests {
         let baseline = crate::capture_repository(repo.path(), core.chunks()).unwrap();
         let workspace = core.create_workspace("test-workspace", baseline).unwrap();
         (repo, storage, core, workspace)
+    }
+
+    /// The agent's self-check writes and removes `.greppy-selfcheck` inside
+    /// the workspace before the first model call. A tombstone over a path the
+    /// baseline never had is not a change: reporting it made `finish` run
+    /// `git add -A -- .greppy-selfcheck`, which fails with "pathspec did not
+    /// match any files" because the path is neither in the worktree nor in the
+    /// index (RC5 device acceptance, 07.09.2026).
+    #[test]
+    fn scratch_paths_created_and_removed_again_are_not_changes() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.create_file(&workspace, ".greppy-selfcheck", 0o100644)
+            .unwrap();
+        core.write(&workspace, ".greppy-selfcheck", 0, b"ok")
+            .unwrap();
+        core.mkdir(&workspace, "scratch", 0o755).unwrap();
+        core.create_file(&workspace, "scratch/inner.txt", 0o100644)
+            .unwrap();
+        core.unlink(&workspace, "scratch/inner.txt").unwrap();
+        core.unlink(&workspace, "scratch").unwrap();
+        core.unlink(&workspace, ".greppy-selfcheck").unwrap();
+        assert_eq!(
+            core.changed_paths(&workspace).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            core.metadata(&workspace, ".greppy-selfcheck").unwrap(),
+            None
+        );
+
+        // Tombstones over baseline paths stay changes, including a removed
+        // baseline directory whose files git tracks.
+        core.unlink(&workspace, "README.md").unwrap();
+        assert_eq!(core.changed_paths(&workspace).unwrap(), ["README.md"]);
+        core.unlink(&workspace, "src/lib.rs").unwrap();
+        core.unlink(&workspace, "src").unwrap();
+        assert_eq!(
+            core.changed_paths(&workspace).unwrap(),
+            ["README.md", "src", "src/lib.rs"]
+        );
     }
 
     #[test]
