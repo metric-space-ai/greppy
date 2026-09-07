@@ -2745,6 +2745,31 @@ impl GraphIndex {
                 .and_then(|value| value.as_str())?;
             return self.resolve_receiver_method(&edge.file_path, owner, name);
         }
+        // A module-qualified call names its module explicitly (`store::f()`).
+        // Honour that before the same-file guess: a same-named function in the
+        // caller's own file is not the callee. Only a qualifier that maps onto
+        // a candidate's module file (`store.rs` / `store/mod.rs`) takes part;
+        // `Type::new`, `crate::f`, `self::f` keep the existing path. Several
+        // candidates in files of that module stay unresolved rather than
+        // guessed.
+        if let Some(module) = edge
+            .properties
+            .get("callee_path")
+            .and_then(|value| value.as_str())
+            .and_then(|path| greppy_resolver::path_module_segment(path, name))
+        {
+            let in_module: Vec<i64> = self
+                .defs_named(&CALLABLE_LABELS, name)
+                .into_iter()
+                .filter(|node| greppy_resolver::file_stem_matches(&node.file_path, module))
+                .map(|node| node.id)
+                .collect();
+            match in_module.as_slice() {
+                [id] => return Some(*id),
+                [] => {}
+                _ => return None,
+            }
+        }
         if let Some(tgt) = self.by_qname(&edge.target_qualified_name) {
             return Some(tgt.id);
         }
@@ -4121,6 +4146,65 @@ def Widget():
         assert_ne!(
             hop.file_path, caller.file_path,
             "trace must cross the file boundary"
+        );
+    }
+
+    #[test]
+    fn module_qualified_call_targets_the_named_module_not_the_same_file_twin() {
+        // `app.rs` defines its own `resolve_root` AND calls
+        // `store::resolve_root()`. The same-file preference used to attribute
+        // the qualified call to the local twin and leave the store function
+        // without callers (readiness ledger, item 5). The explicit module
+        // qualifier decides; the unqualified call still resolves same-file.
+        const LIB_RS: &str = r#"
+            pub mod store;
+            pub mod app;
+        "#;
+        const STORE_RS: &str = r#"
+            pub fn resolve_root() -> u32 { 1 }
+        "#;
+        const APP_RS: &str = r#"
+            use crate::store;
+            pub fn resolve_root() -> u32 { 2 }
+            pub fn use_store_root() -> u32 { store::resolve_root() }
+            pub fn use_local_root() -> u32 { resolve_root() }
+        "#;
+        let repo = setup_multifile_repo("qualified", LIB_RS, STORE_RS);
+        std::fs::write(repo.join("src/app.rs"), APP_RS).unwrap();
+        std::fs::rename(repo.join("src/helper.rs"), repo.join("src/store.rs")).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let _ = index(&mut store, &repo, "test").unwrap();
+
+        let store_fn = store
+            .get_node_by_qname("test", "src/store.rs::Function::resolve_root")
+            .unwrap()
+            .expect("store::resolve_root must exist");
+        let app_fn = store
+            .get_node_by_qname("test", "src/app.rs::Function::resolve_root")
+            .unwrap()
+            .expect("app::resolve_root must exist");
+        let calls_of = |caller: &str| -> Vec<i64> {
+            let node = store
+                .get_node_by_qname("test", caller)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{caller} must exist"));
+            store
+                .outgoing_edges(node.id, None, 256)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.edge_type == "CALLS")
+                .map(|e| e.target_id)
+                .collect()
+        };
+        assert_eq!(
+            calls_of("src/app.rs::Function::use_store_root"),
+            vec![store_fn.id],
+            "store::resolve_root() must target the store module, not the same-file twin"
+        );
+        assert_eq!(
+            calls_of("src/app.rs::Function::use_local_root"),
+            vec![app_fn.id],
+            "an unqualified call keeps the same-file resolution"
         );
     }
 

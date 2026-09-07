@@ -266,7 +266,7 @@ pub fn unique_def_named_with_path(
 /// `crate::b::dup` → `Some("b")`, `dup` → `None` (no module qualifier),
 /// `self::dup` / `crate::dup` → `None` (the qualifier is not a module
 /// file we can map). Whitespace around `::` is tolerated.
-fn path_module_segment<'a>(path: &'a str, name: &str) -> Option<&'a str> {
+pub fn path_module_segment<'a>(path: &'a str, name: &str) -> Option<&'a str> {
     let segs: Vec<&str> = path
         .split("::")
         .map(|s| s.trim())
@@ -288,7 +288,7 @@ fn path_module_segment<'a>(path: &'a str, name: &str) -> Option<&'a str> {
 
 /// Whether a node's `file_path` belongs to a module named `module`:
 /// `src/b.rs` or `src/b/mod.rs` both match module `b`.
-fn file_stem_matches(file_path: &str, module: &str) -> bool {
+pub fn file_stem_matches(file_path: &str, module: &str) -> bool {
     let p = std::path::Path::new(file_path);
     // `src/b/mod.rs` → parent dir name is the module.
     if p.file_name().and_then(|s| s.to_str()) == Some("mod.rs") {

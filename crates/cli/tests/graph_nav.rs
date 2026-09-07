@@ -253,6 +253,53 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
 // who-calls — incoming CALLS edges resolve to the cross-file caller.
 // ---------------------------------------------------------------------------
 
+/// A module-qualified call (`store::resolve_root()`) belongs to the named
+/// module even when the caller's own file defines a same-named function.
+/// Before the qualifier was honoured, the store function had no callers and
+/// the local twin collected both call sites (readiness ledger, item 5).
+#[test]
+fn who_calls_honours_the_module_qualifier_over_a_same_file_twin() {
+    let (repo, store) = make_graph_repo("qualified-caller");
+    let src = repo.join("src");
+    std::fs::write(
+        src.join("lib.rs"),
+        "mod helper;\nmod types;\nmod store;\nmod app;\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("store.rs"), "pub fn resolve_root() -> u32 { 1 }\n").unwrap();
+    std::fs::write(
+        src.join("app.rs"),
+        "use crate::store;\n\npub fn resolve_root() -> u32 { 2 }\n\npub fn use_store_root() -> u32 {\n    store::resolve_root()\n}\n\npub fn use_local_root() -> u32 {\n    resolve_root()\n}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let (code, out, _) = run(&["who-calls", "src/store.rs::resolve_root"], &repo, &store);
+    assert_eq!(code, 0, "who-calls store::resolve_root: {out}");
+    assert!(
+        out.contains("use_store_root") && !out.contains("use_local_root"),
+        "the qualified call must be the store function's only caller: {out}"
+    );
+
+    let (code, out, _) = run(&["who-calls", "src/app.rs::resolve_root"], &repo, &store);
+    assert_eq!(code, 0, "who-calls app::resolve_root: {out}");
+    assert!(
+        out.contains("use_local_root") && !out.contains("use_store_root"),
+        "the unqualified call must be the local twin's only caller: {out}"
+    );
+
+    let (code, out, _) = run(&["callees", "use_store_root"], &repo, &store);
+    assert_eq!(code, 0, "callees use_store_root: {out}");
+    assert!(
+        out.contains("src/store.rs"),
+        "callees must point at the store module: {out}"
+    );
+}
+
 #[test]
 fn who_calls_lists_cross_file_caller_with_file_line() {
     let (repo, store) = index_fixture("whocalls");

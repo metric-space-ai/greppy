@@ -728,6 +728,22 @@ fn rust_node_is_call_target(node: Node<'_>, call: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// The full scoped path a Rust call target sits in: `store::f` for the `f`
+/// leaf of `store::f()`, `None` for an unqualified callee. Walks up through
+/// nested `scoped_identifier` nodes so `crate::a::b::f` is returned whole.
+fn rust_scoped_call_path<'a>(source: &'a [u8], leaf: Node<'_>) -> Option<&'a str> {
+    let mut top = None;
+    let mut cur = leaf.parent();
+    while let Some(parent) = cur {
+        if parent.kind() != "scoped_identifier" {
+            break;
+        }
+        top = Some(parent);
+        cur = parent.parent();
+    }
+    top.map(|node| node_text(source, node))
+}
+
 fn rust_reference_leaf<'t>(node: Node<'t>) -> Node<'t> {
     if !matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
         return node;
@@ -2703,6 +2719,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     "direct"
                 };
                 let receiver_owner = rust_receiver_owner(source, node);
+                // The scoped path a direct call names (`store::f` for
+                // `store::f()`), so the indexer can honour an explicit module
+                // over a same-named function in the caller's own file.
+                let callee_path = (callee_form == "direct")
+                    .then(|| rust_scoped_call_path(source, node))
+                    .flatten();
                 // NOTE: no `Call` pseudo-node (forensics F2 + index perf). The
                 // CALLS edge below targets the real `file::Function::<text>`
                 // qname (resolved by name when cross-file); the Call node was
@@ -2738,6 +2760,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                                 object.insert(
                                     "receiver_owner".into(),
                                     serde_json::Value::String(owner.to_string()),
+                                );
+                            }
+                            if let (Some(path), Some(object)) =
+                                (callee_path, properties.as_object_mut())
+                            {
+                                object.insert(
+                                    "callee_path".into(),
+                                    serde_json::Value::String(path.to_string()),
                                 );
                             }
                             properties
