@@ -736,22 +736,24 @@ pub(super) fn rpc_on_response(
         } else {
             Duration::from_secs(120)
         };
-        greppy_web_client::unix_request(&ctx.socket, &request, wait).map(|response| {
-            if operation == "web.observe" {
-                if let Some(query) = payload.get("query").and_then(serde_json::Value::as_str) {
-                    return greppy_web_client::guard_scoped_observation(query, response);
+        greppy_web_client::unix_request(&ctx.socket, &request, wait)
+            .map(|response| {
+                if operation == "web.observe" {
+                    if let Some(query) = payload.get("query").and_then(serde_json::Value::as_str) {
+                        return greppy_web_client::guard_scoped_observation(query, response);
+                    }
                 }
-            }
-            response
-        }).map_err(|error| {
-            ErrorObject::new(
-                "runtime_unavailable",
-                error.to_string(),
-                request.request_id,
-                EXIT_WEB_UNAVAILABLE,
-                "retry greppy web doctor",
-            )
-        })
+                response
+            })
+            .map_err(|error| {
+                ErrorObject::new(
+                    "runtime_unavailable",
+                    error.to_string(),
+                    request.request_id,
+                    EXIT_WEB_UNAVAILABLE,
+                    "retry greppy web doctor",
+                )
+            })
     }
 }
 
@@ -1704,7 +1706,12 @@ mod scope_tests {
 
     #[test]
     fn page_error_text_cannot_become_a_missing_session_signal() {
-        for code in ["OPTION_NOT_FOUND", "engine_error", "TIMEOUT", "protocol_violation"] {
+        for code in [
+            "OPTION_NOT_FOUND",
+            "engine_error",
+            "TIMEOUT",
+            "protocol_violation",
+        ] {
             for message in [
                 "session was not found",
                 "illegal session transition Failed -> Busy",

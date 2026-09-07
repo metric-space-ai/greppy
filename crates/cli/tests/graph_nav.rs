@@ -1042,11 +1042,7 @@ fn search_symbol_heals_single_file_edits_in_band() {
 /// Start an indexer for a one-file edit that pauses at the publication
 /// failpoint, holding the writer lock. It publishes as soon as the returned
 /// release path exists; HOLD_MS only bounds a test that never releases.
-fn spawn_held_publication(
-    repo: &Path,
-    store: &Path,
-    tag: &str,
-) -> (std::process::Child, PathBuf) {
+fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process::Child, PathBuf) {
     let ready = repo.parent().unwrap().join(format!("{tag}-ready"));
     let release = repo.parent().unwrap().join(format!("{tag}-release"));
     let child = Command::new(bin())
@@ -1213,7 +1209,10 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
         String::from_utf8_lossy(&index_out.stderr)
     );
     let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
-    assert_eq!(code, 0, "published refresh must serve; stderr={err}\nstdout={out}");
+    assert_eq!(
+        code, 0,
+        "published refresh must serve; stderr={err}\nstdout={out}"
+    );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["status"], "ok");
     assert!(

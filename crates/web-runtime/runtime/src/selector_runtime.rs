@@ -11,7 +11,9 @@ pub(crate) fn observed_ref_condition_source(source: &str, selector: &serde_json:
     format!("(function(){{ {SELECTOR_RUNTIME} return ({guard})({selector}, function(__greppyConditionNodes){{ return ({source}); }}); }})()")
 }
 
-pub(crate) const SELECTOR_RUNTIME: &str = concat!(include_str!("native-label-text.js"), r#"
+pub(crate) const SELECTOR_RUNTIME: &str = concat!(
+    include_str!("native-label-text.js"),
+    r#"
 function greppyAccessibleName(el) {
   const labelled = el.getAttribute('aria-label');
   if (labelled) return labelled.trim();
@@ -210,4 +212,5 @@ function greppyResolveNodes(selector) {
   }
   return nodes;
 }
-"#);
+"#
+);

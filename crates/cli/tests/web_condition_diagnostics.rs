@@ -59,7 +59,10 @@ fn valid_css_and_javascript_regex_reach_session_resolution() {
     ] {
         let (code, output) = run("wait", query);
         assert_eq!(code, 30, "query={query}: {output}");
-        assert!(output.contains("no current web session"), "query={query}: {output}");
+        assert!(
+            output.contains("no current web session"),
+            "query={query}: {output}"
+        );
         assert!(!output.contains("unknown query kind"), "{output}");
     }
 }

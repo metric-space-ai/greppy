@@ -23,8 +23,7 @@ pub use namespace::{
 };
 pub use provider::{
     AdapterKind, ProviderCapabilities, ProviderDiagnosticCheck, ProviderDiagnostics,
-    ProviderInstallation, ProviderManifest, ProviderState,
-    PROVIDER_PROTOCOL_VERSION,
+    ProviderInstallation, ProviderManifest, ProviderState, PROVIDER_PROTOCOL_VERSION,
 };
 pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,

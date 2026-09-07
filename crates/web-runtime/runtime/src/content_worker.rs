@@ -3,6 +3,7 @@ use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
     read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
 };
+use crate::selector_runtime::SELECTOR_RUNTIME;
 use crate::web_api_shims::shim_source;
 use crate::worker::require_worker_auth;
 use dpi::PhysicalSize;
@@ -10,11 +11,11 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, RenderingContext, RgbaImage,
-    Opts, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent, TouchEventType,
-    TouchId, TouchPointerType,
-    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
+    RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
+    TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
+    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -27,7 +28,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
-use crate::selector_runtime::SELECTOR_RUNTIME;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
@@ -45,7 +45,11 @@ impl Drop for SlowOp<'_> {
     fn drop(&mut self) {
         let ms = self.started.elapsed().as_millis();
         if ms >= 200 {
-            if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: slow-op {} {ms}ms", self.method); } }
+            if crate::supervisor::phase_trace_enabled() {
+                if crate::supervisor::phase_trace_enabled() {
+                    eprintln!("web-runtime: slow-op {} {ms}ms", self.method);
+                }
+            }
         }
     }
 }
@@ -432,7 +436,8 @@ impl Delegate {
 impl WebViewDelegate for Delegate {
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
         if status == LoadStatus::HeadParsed {
-            self.document_generation.set(self.document_generation.get().wrapping_add(1));
+            self.document_generation
+                .set(self.document_generation.get().wrapping_add(1));
         }
         self.wake.wake();
     }
@@ -443,9 +448,7 @@ impl WebViewDelegate for Delegate {
         event_id: InputEventId,
         result: InputEventResult,
     ) {
-        self.input_receipts
-            .borrow_mut()
-            .insert(event_id, result);
+        self.input_receipts.borrow_mut().insert(event_id, result);
         self.wake.wake();
     }
 
@@ -1399,9 +1402,11 @@ impl ContentEngine {
                 }
                 _ => None,
             };
-            io::Error::other(concise.map(str::to_owned).unwrap_or_else(|| {
-                format!("page JavaScript failed: {error:?}")
-            }))
+            io::Error::other(
+                concise
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("page JavaScript failed: {error:?}")),
+            )
         })
     }
 
@@ -1454,22 +1459,43 @@ impl ContentEngine {
         frame_index: Option<u64>,
         strict_boolean: bool,
     ) -> io::Result<serde_json::Value> {
-        let timeout = if strict_boolean { timeout } else { timeout.max(Duration::from_millis(20)) };
+        let timeout = if strict_boolean {
+            timeout
+        } else {
+            timeout.max(Duration::from_millis(20))
+        };
         if timeout.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout: waitForFunction",
+            ));
         }
-        let deadline = Instant::now().checked_add(timeout)
+        let deadline = Instant::now()
+            .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
         let io_deadline = strict_boolean.then_some(deadline);
         let mut token = alloc_wait_nonce()?;
         let mut document_generation = delegate.document_generation.get();
         delegate.clear_wait_notice(&token);
-        let waiter =
-            wait_for_function_waiter_script(source, &token, timeout.as_millis(), frame_index, strict_boolean)?;
+        let waiter = wait_for_function_waiter_script(
+            source,
+            &token,
+            timeout.as_millis(),
+            frame_index,
+            strict_boolean,
+        )?;
         let install_budget = deadline.saturating_duration_since(Instant::now());
-        let install_budget = if strict_boolean { install_budget } else { install_budget.max(Duration::from_millis(1)) };
-        if install_budget.is_zero() || (strict_boolean && install_budget < Duration::from_millis(1)) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+        let install_budget = if strict_boolean {
+            install_budget
+        } else {
+            install_budget.max(Duration::from_millis(1))
+        };
+        if install_budget.is_zero() || (strict_boolean && install_budget < Duration::from_millis(1))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout: waitForFunction",
+            ));
         }
         let first = match self.evaluate_until(webview.clone(), &waiter, install_budget) {
             Ok(value) => value,
@@ -1489,7 +1515,9 @@ impl ContentEngine {
         // installation reply is in flight. Only the installed document may
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
-            if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
+            if let Some(result) =
+                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+            {
                 return result;
             }
             if jsvalue_is_truthy(&first) {
@@ -1514,10 +1542,17 @@ impl ContentEngine {
                 document_generation = delegate.document_generation.get();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timeout: waitForFunction",
+                    ));
                 }
                 let waiter = wait_for_function_waiter_script(
-                    source, &token, remaining.as_millis(), frame_index, strict_boolean,
+                    source,
+                    &token,
+                    remaining.as_millis(),
+                    frame_index,
+                    strict_boolean,
                 )?;
                 let first = match self.evaluate_until(webview.clone(), &waiter, remaining) {
                     Ok(value) => value,
@@ -1527,18 +1562,24 @@ impl ContentEngine {
                     }
                 };
                 if delegate.document_generation.get() == document_generation {
-                    if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
+                    if let Some(result) =
+                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+                    {
                         return result;
                     }
                     if jsvalue_is_truthy(&first) {
                         self.drop_wait_slot(&webview, &token, io_deadline);
-                        if !strict_boolean { self.settle_pump_tokens(&webview); }
+                        if !strict_boolean {
+                            self.settle_pump_tokens(&webview);
+                        }
                         return serialize_wait_value(first);
                     }
                 }
                 continue;
             }
-            if let Some(result) = self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)? {
+            if let Some(result) =
+                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+            {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1563,8 +1604,10 @@ impl ContentEngine {
             }
             match poll_wake_step(
                 &self.wake,
-                || delegate.wait_notice(&token).is_some()
-                    || delegate.document_generation.get() != document_generation,
+                || {
+                    delegate.wait_notice(&token).is_some()
+                        || delegate.document_generation.get() != document_generation
+                },
                 remaining,
             ) {
                 WakePoll::Ready => {}
@@ -1616,7 +1659,10 @@ impl ContentEngine {
     ) -> io::Result<Option<(String, JSValue)>> {
         let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
         if budget.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: waitForFunction"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout: waitForFunction",
+            ));
         }
         let key_js =
             serde_json::to_string(&Self::wait_slot_key(token)).map_err(io::Error::other)?;
@@ -1929,9 +1975,7 @@ impl ContentEngine {
                 // ran against a document being torn down. The same page then
                 // answered 2, then 0, then 2 (Fund 028). Stamp the outgoing
                 // document instead -- a fresh one never carries the stamp.
-                let same_url = previous
-                    .as_ref()
-                    .is_some_and(|old| urls_match(old, &url));
+                let same_url = previous.as_ref().is_some_and(|old| urls_match(old, &url));
                 let stamped = same_url
                     && self
                         .evaluate_until(
@@ -2025,9 +2069,11 @@ impl ContentEngine {
                 if let (Some(started), Some(loaded), Some(painted)) =
                     (goto_started, loaded_ms, painted_ms)
                 {
-                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: goto-trace loaded_ms={loaded} painted_ms={painted} init_ms={} url={url}",
+                    if crate::supervisor::phase_trace_enabled() {
+                        eprintln!("web-runtime: goto-trace loaded_ms={loaded} painted_ms={painted} init_ms={} url={url}",
                         started.elapsed().as_millis(),
-                    ); }
+                    );
+                    }
                 }
                 let final_url = webview
                     .url()
@@ -2225,11 +2271,31 @@ impl ContentEngine {
                 let source = required_str(&params, "source")?;
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 let timeout = if method == "page.waitForBoolean" {
-                    let maximum = Duration::from_millis(params.get("timeout").and_then(|v| v.as_u64())
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Boolean wait timeout"))?);
-                    let deadline = params.get("deadline_monotonic_ns").and_then(|v| v.as_u64())
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing Boolean wait deadline"))?;
-                    crate::wait_contract::worker_remaining(crate::wait_contract::monotonic_ns()?, deadline, maximum)
+                    let maximum = Duration::from_millis(
+                        params
+                            .get("timeout")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "invalid Boolean wait timeout",
+                                )
+                            })?,
+                    );
+                    let deadline = params
+                        .get("deadline_monotonic_ns")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing Boolean wait deadline",
+                            )
+                        })?;
+                    crate::wait_contract::worker_remaining(
+                        crate::wait_contract::monotonic_ns()?,
+                        deadline,
+                        maximum,
+                    )
                 } else {
                     call_timeout(&params)
                 };
@@ -2322,12 +2388,24 @@ impl ContentEngine {
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
-                let first = params.get("ref_first").and_then(|value| value.as_u64()).unwrap_or(0);
-                let last = params.get("ref_last").and_then(|value| value.as_u64()).unwrap_or(0);
+                let first = params
+                    .get("ref_first")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let last = params
+                    .get("ref_last")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
                 let (webview, _) = self.page(&page_id)?.clone();
                 let query = params.get("query").and_then(|value| value.as_str());
-                let include_html = params.get("include_html").and_then(|value| value.as_bool()).unwrap_or(false);
-                match self.evaluate(webview, &observe_script(snapshot, first, last, query, include_html))? {
+                let include_html = params
+                    .get("include_html")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                match self.evaluate(
+                    webview,
+                    &observe_script(snapshot, first, last, query, include_html),
+                )? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
                     JSValue::Object(values) => Ok(jsvalue_to_json(JSValue::Object(values))),
@@ -2379,13 +2457,21 @@ impl ContentEngine {
                 screenshot_engine_result(&png)
             }
             "locator.inspect" => {
-                let attrs = params.get("attrs").and_then(|v| v.as_bool()).unwrap_or(false);
-                let html = params.get("html").and_then(|v| v.as_bool()).unwrap_or(false);
+                let attrs = params
+                    .get("attrs")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let html = params
+                    .get("html")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let describe = greppy_web_client::DESCRIBE_NODE_JS;
                 let source = format!(
                     "var describe = {describe}; var out = {{ count: 1, node: describe(nodes[0], {attrs}) }}; if ({html}) out.html = nodes[0].outerHTML.slice(0, 20000); return out;"
                 );
-                Ok(json!({ "serialized": serialize_jsvalue(self.locator_eval(&params, &source)?)? }))
+                Ok(
+                    json!({ "serialized": serialize_jsvalue(self.locator_eval(&params, &source)?)? }),
+                )
             }
             "locator.count" => {
                 let page_id = required_str(&params, "page")?;
@@ -3383,11 +3469,13 @@ impl ContentEngine {
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    || InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Down,
-                        MouseButton::Left,
-                        point,
-                    )),
+                    || {
+                        InputEvent::MouseButton(MouseButtonEvent::new(
+                            MouseButtonAction::Down,
+                            MouseButton::Left,
+                            point,
+                        ))
+                    },
                     &mut || self.servo.spin_event_loop(),
                 )?;
                 Ok(json!({}))
@@ -3405,8 +3493,7 @@ impl ContentEngine {
                     std::process::id(),
                     WHEEL_PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
                 );
-                let encoded_probe =
-                    serde_json::to_string(&probe).expect("wheel probe serializes");
+                let encoded_probe = serde_json::to_string(&probe).expect("wheel probe serializes");
                 self.evaluate(
                     webview.clone(),
                     &format!(
@@ -3417,15 +3504,17 @@ impl ContentEngine {
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    || InputEvent::Wheel(WheelEvent::new(
-                        WheelDelta {
-                            x: delta_x,
-                            y: delta_y,
-                            z: 0.0,
-                            mode: WheelMode::DeltaPixel,
-                        },
-                        point,
-                    )),
+                    || {
+                        InputEvent::Wheel(WheelEvent::new(
+                            WheelDelta {
+                                x: delta_x,
+                                y: delta_y,
+                                z: 0.0,
+                                mode: WheelMode::DeltaPixel,
+                            },
+                            point,
+                        ))
+                    },
                     &mut || self.servo.spin_event_loop(),
                 )?;
                 let dispatch = match self.evaluate(
@@ -3450,11 +3539,13 @@ impl ContentEngine {
                 dispatch_input_and_wait(
                     &webview,
                     &delegate,
-                    || InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Up,
-                        MouseButton::Left,
-                        point,
-                    )),
+                    || {
+                        InputEvent::MouseButton(MouseButtonEvent::new(
+                            MouseButtonAction::Up,
+                            MouseButton::Left,
+                            point,
+                        ))
+                    },
                     &mut || self.servo.spin_event_loop(),
                 )?;
                 Ok(json!({}))
@@ -3821,7 +3912,6 @@ struct ResolvedNode {
     offset_top: f64,
 }
 
-
 fn resolve_script(selector: &serde_json::Value) -> String {
     format!(
         "(function(selector) {{ {SELECTOR_RUNTIME}
@@ -3956,13 +4046,15 @@ impl NavTrace {
 
     fn finish(&mut self, webview: &WebView) {
         let Some(started) = self.started else { return };
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
+        if crate::supervisor::phase_trace_enabled() {
+            eprintln!("web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
             self.settled_ms,
             self.head_parsed_ms,
             self.complete_ms,
             started.elapsed().as_millis(),
             webview.url().map(|u| u.to_string()),
-        ); }
+        );
+        }
     }
 }
 
@@ -4026,23 +4118,27 @@ fn tap_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        || InputEvent::Touch(TouchEvent::new(
-            TouchEventType::Down,
-            id,
-            point,
-            TouchPointerType::Touch,
-        )),
+        || {
+            InputEvent::Touch(TouchEvent::new(
+                TouchEventType::Down,
+                id,
+                point,
+                TouchPointerType::Touch,
+            ))
+        },
         &mut spin,
     )?;
     dispatch_input_and_wait(
         webview,
         delegate,
-        || InputEvent::Touch(TouchEvent::new(
-            TouchEventType::Up,
-            id,
-            point,
-            TouchPointerType::Touch,
-        )),
+        || {
+            InputEvent::Touch(TouchEvent::new(
+                TouchEventType::Up,
+                id,
+                point,
+                TouchPointerType::Touch,
+            ))
+        },
         &mut spin,
     )
 }
@@ -4101,21 +4197,25 @@ fn click_at(
     dispatch_input_and_wait(
         webview,
         delegate,
-        || InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Down,
-            MouseButton::Left,
-            point,
-        )),
+        || {
+            InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
+                MouseButton::Left,
+                point,
+            ))
+        },
         &mut spin,
     )?;
     dispatch_input_and_wait(
         webview,
         delegate,
-        || InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Up,
-            MouseButton::Left,
-            point,
-        )),
+        || {
+            InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Up,
+                MouseButton::Left,
+                point,
+            ))
+        },
         &mut spin,
     )
 }
@@ -4337,10 +4437,7 @@ mod serialize_tests {
 
     #[test]
     fn headparsed_with_interactive_ready_state_commits_navigation() {
-        assert!(load_status_allows_navigation(
-            LoadStatus::Complete,
-            None
-        ));
+        assert!(load_status_allows_navigation(LoadStatus::Complete, None));
         assert!(load_status_allows_navigation(
             LoadStatus::HeadParsed,
             Some("interactive")
@@ -4794,7 +4891,10 @@ mod serialize_tests {
         let small = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         let small_value = screenshot_engine_result(&small).expect("small screenshot");
         assert!(
-            small_value.get("png_base64").and_then(|v| v.as_str()).is_some(),
+            small_value
+                .get("png_base64")
+                .and_then(|v| v.as_str())
+                .is_some(),
             "small PNG must stay inline: {small_value:?}"
         );
         assert!(small_value.get("png_path").is_none());
@@ -4820,10 +4920,7 @@ mod serialize_tests {
             &Message::engine_result(1, true, large_inline, None),
         )
         .expect_err("inline oversized PNG must be refused");
-        assert!(
-            inline_err.to_string().contains("exceeds"),
-            "{inline_err}"
-        );
+        assert!(inline_err.to_string().contains("exceeds"), "{inline_err}");
 
         let large_value = screenshot_engine_result(&large).expect("large screenshot");
         let path = large_value
@@ -4835,10 +4932,7 @@ mod serialize_tests {
             large_value.get("png_base64").is_none(),
             "oversized PNG must not ride the frame as base64: {large_value:?}"
         );
-        assert_eq!(
-            std::fs::read(&path).expect("sidecar bytes"),
-            large
-        );
+        assert_eq!(std::fs::read(&path).expect("sidecar bytes"), large);
         let mut large_frame = Vec::new();
         write_message(
             &mut large_frame,
@@ -5008,21 +5102,54 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   return JSON.stringify(tree);
 })(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__)"#;
 
-fn observe_script(snapshot: Option<&str>, first: u64, last: u64, query: Option<&str>, include_html: bool) -> String {
+fn observe_script(
+    snapshot: Option<&str>,
+    first: u64,
+    last: u64,
+    query: Option<&str>,
+    include_html: bool,
+) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS
-        .replace("__GREPPY_NATIVE_LABEL_TEXT__", include_str!("native-label-text.js"))
-        .replace("__GREPPY_SELECT_CHOICES__", greppy_web_client::SELECT_CHOICES_JS)
-        .replace("__GREPPY_WORKING_SCOPE__", include_str!("observed-working-scope.js"))
-        .replace("__GREPPY_OBSERVATION_SCOPE__", include_str!("observation-scope.js"))
-        .replace("__GREPPY_QUERY_RESOLVER__", greppy_web_client::NODE_QUERY_RESOLVER_JS)
-        .replace("__GREPPY_REF_REGISTRY__", include_str!("observed-ref-registry.js"))
-        .replace("__GREPPY_REF_LIMIT__", &crate::observed_refs::OBSERVED_REF_LIMIT.to_string())
+        .replace(
+            "__GREPPY_NATIVE_LABEL_TEXT__",
+            include_str!("native-label-text.js"),
+        )
+        .replace(
+            "__GREPPY_SELECT_CHOICES__",
+            greppy_web_client::SELECT_CHOICES_JS,
+        )
+        .replace(
+            "__GREPPY_WORKING_SCOPE__",
+            include_str!("observed-working-scope.js"),
+        )
+        .replace(
+            "__GREPPY_OBSERVATION_SCOPE__",
+            include_str!("observation-scope.js"),
+        )
+        .replace(
+            "__GREPPY_QUERY_RESOLVER__",
+            greppy_web_client::NODE_QUERY_RESOLVER_JS,
+        )
+        .replace(
+            "__GREPPY_REF_REGISTRY__",
+            include_str!("observed-ref-registry.js"),
+        )
+        .replace(
+            "__GREPPY_REF_LIMIT__",
+            &crate::observed_refs::OBSERVED_REF_LIMIT.to_string(),
+        )
         .replace("__GREPPY_REF_FIRST__", &first.to_string())
         .replace("__GREPPY_REF_LAST__", &last.to_string())
         .replace("__GREPPY_SNAPSHOT__", &encoded)
-        .replace("__GREPPY_INCLUDE_HTML__", if include_html { "true" } else { "false" })
-        .replace("__GREPPY_QUERY__", &serde_json::to_string(&query).expect("query serializes"))
+        .replace(
+            "__GREPPY_INCLUDE_HTML__",
+            if include_html { "true" } else { "false" },
+        )
+        .replace(
+            "__GREPPY_QUERY__",
+            &serde_json::to_string(&query).expect("query serializes"),
+        )
 }
 
 static CLICK_PROBE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -5037,10 +5164,8 @@ fn engine_result_frame_len(result: &serde_json::Value) -> usize {
 
 fn write_screenshot_sidecar(png: &[u8]) -> io::Result<PathBuf> {
     let seq = SCREENSHOT_SIDECAR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "greppy-web-shot-{}-{seq}.png",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("greppy-web-shot-{}-{seq}.png", std::process::id()));
     let confined = confine_worker_path(&path)?;
     std::fs::write(&confined, png)?;
     Ok(confined)
@@ -5248,7 +5373,11 @@ pub fn run() -> io::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis();
-                    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace recv method={method} at_ms={now}"); } }
+                    if crate::supervisor::phase_trace_enabled() {
+                        if crate::supervisor::phase_trace_enabled() {
+                            eprintln!("web-runtime: call-trace recv method={method} at_ms={now}");
+                        }
+                    }
                     Instant::now()
                 });
                 let reply = match engine.handle(&method, params) {
@@ -5261,13 +5390,20 @@ pub fn run() -> io::Result<()> {
                     ),
                 };
                 if let Some(started) = call_started {
-                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: call-trace method={method} handle_ms={}",
-                        started.elapsed().as_millis()
-                    ); }
+                    if crate::supervisor::phase_trace_enabled() {
+                        eprintln!(
+                            "web-runtime: call-trace method={method} handle_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
                 }
                 engine.wake.wake();
                 if let Err(error) = write_message(&mut protocol_out, &reply) {
-                    if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: engine result write failed: {error}"); } }
+                    if crate::supervisor::phase_trace_enabled() {
+                        if crate::supervisor::phase_trace_enabled() {
+                            eprintln!("web-runtime: engine result write failed: {error}");
+                        }
+                    }
                     let fallback = Message::engine_result(
                         request_id,
                         false,
@@ -5299,10 +5435,13 @@ pub fn run() -> io::Result<()> {
                     engine.servo.spin_event_loop();
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
-                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-spin elapsed_ms={} pages={}",
-                            elapsed.as_millis(),
-                            engine.pages.len()
-                        ); }
+                        if crate::supervisor::phase_trace_enabled() {
+                            eprintln!(
+                                "web-runtime: phase content-spin elapsed_ms={} pages={}",
+                                elapsed.as_millis(),
+                                engine.pages.len()
+                            );
+                        }
                     }
                 }
             }

@@ -105,7 +105,13 @@ pub(super) fn dispatch(command: ChainCommand, root: Option<&str>) -> Result<i32>
             explain,
             json,
             native,
-        } => return if native { run_chain_mode(root, &steps, continue_on_error, explain, json, true) } else { run_chain(root, &steps, continue_on_error, explain, json) },
+        } => {
+            return if native {
+                run_chain_mode(root, &steps, continue_on_error, explain, json, true)
+            } else {
+                run_chain(root, &steps, continue_on_error, explain, json)
+            }
+        }
         ChainCommand::Script { command } => command,
     };
     match command {
@@ -487,8 +493,15 @@ fn run_chain_mode(
 
     let mut ran = 0usize;
     if native {
-        if parsed.iter().flatten().any(|arg| arg == "--interval" || arg.starts_with("--interval=")) {
-            return emit_error(json_out, invalid("native workflow does not use a polling interval; remove --interval"));
+        if parsed
+            .iter()
+            .flatten()
+            .any(|arg| arg == "--interval" || arg.starts_with("--interval="))
+        {
+            return emit_error(
+                json_out,
+                invalid("native workflow does not use a polling interval; remove --interval"),
+            );
         }
         return super::workflow::run(commands, root, json_out);
     }

@@ -3,9 +3,9 @@
 //! This crate must not depend on `deno_core` or `servo`.
 
 mod frame;
+mod observation_scope;
 mod protocol;
 pub mod workflow;
-mod observation_scope;
 
 pub use observation_scope::{guard_scoped_observation, observation_scope_roots};
 
