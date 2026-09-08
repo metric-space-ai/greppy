@@ -104,6 +104,36 @@ fn oversized_single_line_keeps_failure_and_exact_raw_log_recovery() {
 }
 
 #[test]
+fn output_over_head_cap_preserves_child_exit_and_raw_log() {
+    let workspace = fresh_workspace("over-head-cap");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "head -c 33554433 /dev/zero | tr '\\000' x; exit 7",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let stdout = text(&output.stdout);
+    assert!(stdout.starts_with("FAILED — exit 7: 0 errors, 0 warnings\n"));
+    assert!(output.stdout.len() < 12_000);
+    let path_json = stdout
+        .split("raw log ")
+        .nth(1)
+        .unwrap()
+        .split("; read with greppy read-file")
+        .next()
+        .unwrap();
+    let path: String = serde_json::from_str(path_json).unwrap();
+    let raw = std::fs::read(path).unwrap();
+    assert_eq!(raw.len(), 33_554_433);
+    assert!(raw.iter().all(|byte| *byte == b'x'));
+}
+
+#[test]
 fn short_output_follows_verdict_and_exit_code_passes_through() {
     let workspace = fresh_workspace("short");
     let output = run(
@@ -201,6 +231,36 @@ fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
             &output.stderr
         };
         assert!(text(raw_stream).lines().any(|line| line == diagnostic));
+    }
+}
+
+#[test]
+fn linter_rule_diagnostics_count_and_preserve_child_exit_and_stream_bytes() {
+    let workspace = fresh_workspace("linter-rule-diagnostics");
+    let diagnostics = concat!(
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:2:1: error t3code(namespace-node-imports): Import node:net as a namespace named NodeNet.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:3:1: error t3code(namespace-node-imports): Import node:fs as a namespace named NodeFs.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:4:1: error t3code(namespace-node-imports): Import node:path as a namespace named NodePath.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:5:1: error t3code(namespace-node-imports): Import node:os as a namespace named NodeOs.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:6:1: error t3code(namespace-node-imports): Import node:test as a namespace named NodeTest.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:9:3: error t3code(no-global-process-runtime): Use the node:process import.\n",
+        "C:\\project files\\source.ts:12:4: warning eslint(no-unused-vars): Unused variable.\n",
+        "example.ts:12:4: error_count: 7\n",
+        "example.ts:x:4: error t3code(rule): Invalid location is not a diagnostic.\n",
+        "example.ts:12:4: error mentioned in documentation: Not a rule identifier.\n",
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 6 errors, 1 warning\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostics}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostics.as_bytes());
+        }
     }
 }
 
