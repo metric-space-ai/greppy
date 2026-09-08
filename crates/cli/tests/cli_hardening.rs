@@ -2566,7 +2566,38 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 #[cfg(unix)]
 #[test]
 fn first_use_index_is_bounded_and_reports_retryable_progress() {
+    check_first_use_index_is_bounded(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn first_use_index_after_file_read_is_bounded_and_reports_retryable_progress() {
+    check_first_use_index_is_bounded(true);
+}
+
+#[cfg(unix)]
+fn check_first_use_index_is_bounded(seed_pack: bool) {
     let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
+    if seed_pack {
+        let (code, out, err) = run(&["read-file", "lib.rs"], &repo, &store);
+        assert_eq!(code, 0, "file reads must work before indexing: {out} {err}");
+        let db = find_graph_db(&store).expect("file read creates an evidence store");
+        let graph = greppy_store::Store::open(&db).unwrap();
+        assert!(graph
+            .get_workspace_state(repo.to_string_lossy().as_ref())
+            .unwrap()
+            .is_none());
+        // Explicit opt-out must preserve the cold state, without launching a job.
+        let (code, out, err) = run_with_env(
+            &["search-symbol", "first_use_marker"],
+            &repo,
+            &store,
+            &[("GREPPY_AUTO_REINDEX", "0")],
+        );
+        assert_ne!(code, 0, "no graph can be served yet: {out} {err}");
+        assert!(!err.contains("first-use index started"), "{err}");
+        assert!(!db.parent().unwrap().join("index.job").exists());
+    }
     let ready = scratch.0.join("first-use-writer-ready");
     let ready_string = ready.to_string_lossy().into_owned();
     let envs = [
