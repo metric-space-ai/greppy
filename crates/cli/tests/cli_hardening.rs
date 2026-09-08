@@ -2569,9 +2569,9 @@ fn first_use_index_is_bounded_and_reports_retryable_progress() {
     check_first_use_index_is_bounded(false);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "bash-smart"))]
 #[test]
-fn first_use_index_after_file_read_is_bounded_and_reports_retryable_progress() {
+fn first_use_index_after_output_capture_is_bounded_and_reports_retryable_progress() {
     check_first_use_index_is_bounded(true);
 }
 
@@ -2579,9 +2579,16 @@ fn first_use_index_after_file_read_is_bounded_and_reports_retryable_progress() {
 fn check_first_use_index_is_bounded(seed_pack: bool) {
     let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
     if seed_pack {
-        let (code, out, err) = run(&["read-file", "lib.rs"], &repo, &store);
-        assert_eq!(code, 0, "file reads must work before indexing: {out} {err}");
-        let db = find_graph_db(&store).expect("file read creates an evidence store");
+        let (code, out, err) = run(
+            &["bash-smart", "--", "sh", "-c", "printf evidence"],
+            &repo,
+            &store,
+        );
+        assert_eq!(
+            code, 0,
+            "output capture must work before indexing: {out} {err}"
+        );
+        let db = find_graph_db(&store).expect("output capture creates an evidence store");
         let graph = greppy_store::Store::open(&db).unwrap();
         assert!(graph
             .get_workspace_state(repo.to_string_lossy().as_ref())
