@@ -6,6 +6,10 @@ use crate::fts;
 use crate::store::Store;
 use crate::store_error::{Error, Result};
 
+const FILE_NODES_SQL: &str =
+    "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+     FROM nodes WHERE project = ?1 AND file_path = ?2";
+
 /// One row of the `nodes` table plus its parsed JSON properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -347,6 +351,25 @@ impl Store {
         Ok(out)
     }
 
+    /// All visible nodes in one exact file, in qualified-name/id order.
+    ///
+    /// Keep SQL limited to the indexed project/file lookup. An optional OR
+    /// filter plus SQL ORDER BY can make SQLite scan the project's qname
+    /// index for each file. Sorting only this file's rows preserves the old
+    /// order without repeating a project-wide scan during structural indexing.
+    pub fn list_nodes_for_file(&self, project: &str, file: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn().prepare_cached(FILE_NODES_SQL)?;
+        let mut rows = stmt
+            .query_map(params![project, file], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.sort_by(|a, b| {
+            a.qualified_name
+                .cmp(&b.qualified_name)
+                .then(a.id.cmp(&b.id))
+        });
+        Ok(rows)
+    }
+
     /// Paginated, filtered node listing for search / CLI surfaces.
     ///
     /// Lists nodes for `project`, optionally narrowed by `label` and/or
@@ -652,6 +675,49 @@ mod tests {
         let classes = s.list_nodes_by_label("p", "Class", 100).unwrap();
         assert_eq!(classes.len(), 1);
         assert_eq!(s.count_nodes_by_label("p", "Function").unwrap(), 2);
+    }
+
+    #[test]
+    fn file_node_lookup_is_bounded_and_preserves_exact_results() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let mut s = store_with_project("p");
+        for i in (0..2000).rev() {
+            let mut n = new_node("p", "Function", &format!("p.n{i:05}"));
+            if i >= 10 {
+                n.file_path = format!("src/other_{i}.rs");
+            }
+            s.insert_node(&n).unwrap();
+        }
+        let expected = s.list_nodes("p", "", "src/lib.rs", 0, usize::MAX).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        s.conn().progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let actual = s.list_nodes_for_file("p", "src/lib.rs").unwrap();
+        s.conn().progress_handler(0, None::<fn() -> bool>);
+        assert_eq!(actual.len(), 10);
+        assert_eq!(actual, expected);
+        assert!(
+            steps.load(Ordering::Relaxed) < 1500,
+            "one-file lookup scanned unrelated project nodes: {} SQLite steps",
+            steps.load(Ordering::Relaxed)
+        );
+        assert!(s
+            .list_nodes_for_file("other", "src/lib.rs")
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_nodes_for_file("p", "src/lib.rs.extra")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
