@@ -120,6 +120,19 @@ final class GreppyFSVolume: FSVolume {
         items[location] = nil
         cache.unlock()
     }
+
+    /// Drops the cached items for `path` and everything below it.
+    private func evictSubtree(workspace: String, path: String) {
+        let prefix = path + "/"
+        cache.lock()
+        defer { cache.unlock() }
+        for location in items.keys {
+            guard case .path(let itemWorkspace, let relative) = location,
+                  itemWorkspace == workspace,
+                  relative == path || relative.hasPrefix(prefix) else { continue }
+            items[location] = nil
+        }
+    }
 }
 
 extension GreppyFSVolume: FSVolume.PathConfOperations {
@@ -484,7 +497,15 @@ extension GreppyFSVolume: FSVolume.Operations {
             _ = try privateInode(for: source)
         }
         try core.rename(workspace: sourceWorkspace, source: sourcePath, destination: destination)
-        evict(source.location)
+        // Cached items are keyed by path and may hold a bound private inode.
+        // After a rename the source path names nothing, the destination path
+        // names the moved inode (an item replaced by an atomic-write rename
+        // still pointed at its old, now unlinked inode and answered getattr
+        // with ENOENT, which the kernel reports as ENODATA), and every
+        // descendant of a moved directory changed its path.
+        if let replaced = overItem as? GreppyFSItem { forgetExtendedAttributes(of: replaced) }
+        evictSubtree(workspace: sourceWorkspace, path: sourcePath)
+        evictSubtree(workspace: destinationWorkspace, path: destination)
         return destinationName
     }
 
