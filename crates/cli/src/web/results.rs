@@ -7,6 +7,26 @@ use greppy_web_client::ErrorObject;
 use serde_json::json;
 use std::path::Path;
 
+// Keep URL arguments in a separate derive so the large results parser does not
+// add every Read argument temporary to its debug-build stack frame.
+#[derive(Debug, clap::Args)]
+pub struct ReadArgs {
+    #[arg(value_name = "URL", conflicts_with = "url")]
+    pub(super) positional_url: Option<String>,
+    #[arg(long)]
+    pub(super) url: Option<String>,
+    #[arg(long)]
+    pub(super) query: Option<String>,
+    #[arg(long)]
+    pub(super) session: Option<String>,
+    #[arg(long = "fixture-url")]
+    pub(super) fixture_url: Option<String>,
+    #[arg(long = "search-endpoint")]
+    pub(super) search_endpoint: Option<String>,
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ResultsCommand {
     /// Run an unchanged Playwright script in a session.
@@ -67,22 +87,7 @@ pub enum ResultsCommand {
         json: bool,
     },
     /// Read one URL through the runtime.
-    Read {
-        #[arg(value_name = "URL", conflicts_with = "url")]
-        positional_url: Option<String>,
-        #[arg(long)]
-        url: Option<String>,
-        #[arg(long)]
-        query: Option<String>,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long = "fixture-url")]
-        fixture_url: Option<String>,
-        #[arg(long = "search-endpoint")]
-        search_endpoint: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Read(ReadArgs),
     /// Bounded research over the runtime.
     Research {
         #[arg(long)]
@@ -267,7 +272,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 },
             )
         }
-        ResultsCommand::Read {
+        ResultsCommand::Read(ReadArgs {
             positional_url,
             url,
             query,
@@ -275,7 +280,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             fixture_url,
             search_endpoint,
             json,
-        } => {
+        }) => {
             let Some(url) = url.or(positional_url).filter(|url| !url.is_empty()) else {
                 return emit_error(json, invalid("web read requires URL or --url URL"));
             };

@@ -131,11 +131,11 @@ mod tests {
             let cli = Cli::try_parse_from(argv).unwrap();
             let Some(Command::Web {
                 command:
-                    WebCommand::Results(ResultsCommand::Read {
+                    WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
                         url,
                         positional_url,
                         ..
-                    }),
+                    })),
             }) = cli.command
             else {
                 panic!("expected web read")
@@ -314,12 +314,12 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Read {
+                command: WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
                     url: Some(url),
                     session: Some(session),
                     json: true,
                     ..
-                })
+                }))
             }) if url == "https://example.com/article" && session == "wrs_1"
         ));
         let cli = Cli::try_parse_from([
@@ -450,12 +450,12 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Read {
+                command: WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
                     fixture_url: Some(fixture_url),
                     search_endpoint: Some(search_endpoint),
                     json: true,
                     ..
-                })
+                }))
             }) if fixture_url == "http://127.0.0.1:9/page.html"
                 && search_endpoint == "http://127.0.0.1:9/search"
         ));
