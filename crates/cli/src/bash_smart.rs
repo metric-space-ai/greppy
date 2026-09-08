@@ -66,9 +66,18 @@ static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 // Linters can add a rule identifier, e.g. `error t3code(namespace-node-imports):`.
 static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning)(?:[\t ]+[a-z0-9_@][a-z0-9_@./-]*(?:\([a-z0-9_@./-]+\))?)?:(?:[\t ]|$)",
+        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning):(?:[\t ]|$)",
     )
     .expect("bash-smart source diagnostic regex")
+});
+
+// Named-rule linters include both line and column. Keep that complete shape:
+// accepting only the final number would misread `file.ts:x:4:` as a location.
+static LINTER_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+:[0-9]+:[0-9]+:[\t ]+(error|warning)[\t ]+[a-z0-9_@][a-z0-9_@./-]*(?:\([a-z0-9_@./-]+\))?:(?:[\t ]|$)",
+    )
+    .expect("bash-smart linter diagnostic regex")
 });
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
@@ -683,6 +692,7 @@ fn detect_blocks(
             } else {
                 SOURCE_DIAGNOSTIC_RE
                     .captures(lines[index].content)
+                    .or_else(|| LINTER_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
