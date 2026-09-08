@@ -121,16 +121,40 @@ final class GreppyFSVolume: FSVolume {
         cache.unlock()
     }
 
-    /// Drops the cached items for `path` and everything below it.
-    private func evictSubtree(workspace: String, path: String) {
-        let prefix = path + "/"
+    /// Moves the cached item for `source` and every cached descendant to
+    /// their paths under `destination`, dropping whatever was cached under
+    /// the destination before (a replaced item). The kernel keeps addressing
+    /// the moved directory and its children through the item objects it
+    /// already holds, so those objects must answer for the new paths:
+    /// with a stale path, a lookup relative to a renamed directory, or its
+    /// removal, failed with ENOENT (`rm -r` after `mv d1 d2`).
+    private func relocate(workspace: String, from source: String, to destination: String, name: FSFileName) {
+        let sourcePrefix = source + "/"
+        let destinationPrefix = destination + "/"
         cache.lock()
         defer { cache.unlock() }
+        var moved: [(GreppyFSItem, GreppyFSItem.Location, FSFileName)] = []
+        for (location, item) in items {
+            guard case .path(let itemWorkspace, let relative) = location, itemWorkspace == workspace else {
+                continue
+            }
+            if relative == source {
+                moved.append((item, .path(workspace: workspace, relative: destination), name))
+            } else if relative.hasPrefix(sourcePrefix) {
+                let child = destinationPrefix + relative.dropFirst(sourcePrefix.count)
+                moved.append((item, .path(workspace: workspace, relative: child), item.name))
+            }
+        }
+        for (item, _, _) in moved { items[item.location] = nil }
         for location in items.keys {
             guard case .path(let itemWorkspace, let relative) = location,
                   itemWorkspace == workspace,
-                  relative == path || relative.hasPrefix(prefix) else { continue }
+                  relative == destination || relative.hasPrefix(destinationPrefix) else { continue }
             items[location] = nil
+        }
+        for (item, location, name) in moved {
+            item.relocate(to: location, name: name)
+            items[location] = item
         }
     }
 }
@@ -504,8 +528,12 @@ extension GreppyFSVolume: FSVolume.Operations {
         // with ENOENT, which the kernel reports as ENODATA), and every
         // descendant of a moved directory changed its path.
         if let replaced = overItem as? GreppyFSItem { forgetExtendedAttributes(of: replaced) }
-        evictSubtree(workspace: sourceWorkspace, path: sourcePath)
-        evictSubtree(workspace: destinationWorkspace, path: destination)
+        relocate(
+            workspace: sourceWorkspace,
+            from: sourcePath,
+            to: destination,
+            name: destinationName
+        )
         return destinationName
     }
 
