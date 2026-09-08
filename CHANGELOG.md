@@ -230,6 +230,9 @@ privilege boundary.
 - `greppy web read URL` accepts its documented positional URL alongside
   `--url URL`. Browser URLs and selectors are no longer rewritten into graph
   path filters, which could cause an endless argument-recovery loop.
+- Linux worker re-exec keeps its executable descriptor above reserved worker
+  channel descriptors. Installing a capability or protocol channel can no
+  longer overwrite the executable pin and make `execveat` fail with EACCES.
 - `search-pattern --path` restricts files before content scanning and reuses
   that scope for case-insensitive diagnostics. A one-file search no longer
   reads unrelated source files to count matches outside the requested path.
