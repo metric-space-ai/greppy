@@ -209,6 +209,26 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
 }
 
 #[test]
+fn node_assertion_error_counts_and_keeps_the_original_failure() {
+    let workspace = fresh_workspace("node-assertion-error");
+    let diagnostic =
+        "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n1 !== 2\n";
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostic}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 1 error, 0 warnings\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostic.as_bytes());
+        }
+    }
+}
+
+#[test]
 fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
     let workspace = fresh_workspace("typescript-diagnostic");
     for redirect in ["", " >&2"] {
