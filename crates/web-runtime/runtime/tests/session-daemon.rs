@@ -4342,6 +4342,8 @@ fn observed_native_labels_exclude_their_own_control_contents() {
 <label>Unit <b>price</b> order<select id="price"><option value="none">Unsorted</option><option value="asc">Low to high</option></select></label>
 <label for="external">External region</label><select id="external"><option>Europe</option></select>
 <label>Ignored<select aria-label="Override"><option>Hidden option name</option></select></label>
+<label for="empty-label"></label><input id="empty-label">
+<p>Unrelated text after an empty label must not enter its accessible name.</p>
 </body></html>"#);
     let socket = std::env::temp_dir().join(format!("greppy-label-own-{}.sock", std::process::id()));
     let _guard = Supervisor::spawn(&socket, "run_label_own", |command| {
@@ -4370,6 +4372,10 @@ fn observed_native_labels_exclude_their_own_control_contents() {
     assert_eq!(selects[2]["name"], "External region");
     assert_eq!(selects[3]["name"], "Override");
     assert_eq!(selects[3]["name_source"], "aria-label");
+    let empty_label = state["snapshot"]["actionables"].as_array().unwrap()
+        .iter().find(|node| node["tag"] == "input").unwrap();
+    assert_eq!(empty_label["name"], "", "empty label must terminate without reading outside its subtree");
+    assert_eq!(empty_label["name_source"], "label");
     let inspected = call("web.inspect", json!({
         "session_id":session, "selector":{"type":"label","name":"Region"}
     }));

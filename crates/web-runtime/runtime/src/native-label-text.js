@@ -3,11 +3,19 @@
 // values in the separate form-state fields, not in the control's name.
 function greppyNativeLabelText(label, control) {
   if (!control) return label.textContent || '';
-  const walker = label.ownerDocument.createTreeWalker(label, NodeFilter.SHOW_TEXT);
+  // Traverse only descendants of this label. Native TreeWalker can escape
+  // an empty root and keep visiting unrelated page text in the engine.
+  const pending = Array.from(label.childNodes).reverse();
   let text = '';
-  while (walker.nextNode()) {
-    if (!control.contains(walker.currentNode)) {
-      text += walker.currentNode.nodeValue || '';
+  while (pending.length) {
+    const node = pending.pop();
+    if (node === control) continue;
+    if (node.nodeType === 3) {
+      text += node.nodeValue || '';
+    } else {
+      for (let child = node.lastChild; child; child = child.previousSibling) {
+        pending.push(child);
+      }
     }
   }
   return text;

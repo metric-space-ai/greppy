@@ -39,7 +39,9 @@ one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
 - Wrapped inline links use a visible line box for click hit-testing, avoiding
   false overlay failures when the bounding-box centre falls between lines.
 - Observation batches reference attributes after layout reads, avoiding a
-  full layout for each actionable control on large pages.
+  full layout for each actionable control on large pages. Label extraction
+  stays inside the label subtree; an empty Magento label no longer sends the
+  native text walker through unrelated nodes until the observation times out.
 - An expired session wall quota rejects ordinary operations without replacing
   the shared content worker or destroying other sessions’ live tabs.
 - Action and read verbs accept the same selector forms: unquoted descendant
