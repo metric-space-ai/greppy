@@ -216,10 +216,27 @@ privilege boundary.
   not stat the file and the agent's finish failed. Descendants of a renamed
   directory were affected the same way.
 
+- `bash-smart` retains the child exit status and raw output when a stream
+  exceeds its 32 MiB head buffer; the tail spool is readable as well as
+  writable. Named linter rules and Node assertion headers count as errors,
+  while complete zero-failure counters such as `fail 0` do not.
+- First-use graph queries start the background indexer even when command
+  output storage has already created a database without workspace state.
+  Explicit automatic-indexing opt-out continues to be respected.
+- Structural indexing uses the existing project/file lookup for each file's
+  definitions, avoiding a scan of all project nodes for every source file.
+  Returned ordering and Base/Delta visibility are preserved; this correction
+  changes neither the store schema nor the indexer version.
+- `greppy web read URL` accepts its documented positional URL alongside
+  `--url URL`. Browser URLs and selectors are no longer rewritten into graph
+  path filters, which could cause an endless argument-recovery loop.
+- Refused edits outside the configured directory explain how an explicit
+  `--root` selects the intended edit root. The write boundary is unchanged.
+
 These corrections do not replace the required real-device, parallel-agent or
-exact-SHA release gates. The macOS device acceptance (setup, doctor, kernel
-file operations inside a workspace, two agent runs and the bench) was run on
-the notarized build of every candidate above.
+exact-SHA release gates. The final notarized macOS bundle must pass setup,
+doctor, kernel file operations inside a workspace and two successful agent
+runs; benchmark outcomes are recorded separately.
 
 ### Known limits
 
