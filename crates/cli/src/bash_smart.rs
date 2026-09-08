@@ -47,6 +47,14 @@ static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     )
     .expect("bash-smart error marker regex")
 });
+// Node's diagnostic reporter emits `fail 0` even for an entirely green run.
+// Only the complete zero counter is exempt; positive counts and failure
+// messages that merely start with zero remain diagnostic blocks.
+static ZERO_FAILURE_COUNT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*fail(?:ed)?[\t ]+0[\t ]*$")
+        .expect("bash-smart zero failure count regex")
+});
+
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
@@ -683,7 +691,8 @@ fn detect_blocks(
     ] {
         let mut index = 0usize;
         while index < lines.len() {
-            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+            let kind = if (ERROR_MARKER_RE.is_match(lines[index].content)
+                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content))
                 || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
@@ -2265,6 +2274,21 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Error);
         assert_eq!(blocks[0].lines.len(), 4);
         assert_eq!(blocks[0].lines[3].bytes, b"caused by missing fixture");
+    }
+
+    #[test]
+    fn zero_failure_counters_are_not_diagnostics_but_real_failures_remain() {
+        for text in ["fail 0\n", "failed 0\n", "  FAIL 0  \n"] {
+            let lines = split_lines(text.as_bytes());
+            assert!(detect_blocks(&lines, &[]).is_empty(), "{text}");
+            assert!(detect_blocks(&[], &lines).is_empty(), "{text}");
+        }
+        for text in ["fail 1\n", "FAIL zero-case: broken\n", "FAIL 0: broken\n"] {
+            let lines = split_lines(text.as_bytes());
+            let blocks = detect_blocks(&lines, &[]);
+            assert_eq!(blocks.len(), 1, "{text}");
+            assert_eq!(blocks[0].kind, BlockKind::Error, "{text}");
+        }
     }
 
     #[test]

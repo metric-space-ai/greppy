@@ -209,6 +209,42 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
 }
 
 #[test]
+fn node_zero_failure_summary_preserves_bytes_and_child_status() {
+    let workspace = fresh_workspace("node-zero-failures");
+    let summary = "SUMMARY {\"success\":true,\"failed\":0}\npass 60\nfail 0\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{summary}'{redirect}; exit {exit}");
+            let output = run(
+                &workspace,
+                &[
+                    "bash-smart",
+                    "-e",
+                    "^fail |SUMMARY",
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                ],
+            );
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{summary}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, summary.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn node_assertion_error_counts_and_keeps_the_original_failure() {
     let workspace = fresh_workspace("node-assertion-error");
     let diagnostic =
