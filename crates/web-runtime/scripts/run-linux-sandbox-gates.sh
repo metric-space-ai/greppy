@@ -24,6 +24,8 @@ echo "run-linux-sandbox-gates: linux_sandbox module"
 cargo $CARGO_ARGS linux_sandbox
 echo "run-linux-sandbox-gates: linux_spawn_uses_fd_backed_exec"
 cargo $CARGO_ARGS worker::tests::linux_spawn_uses_fd_backed_exec -- --exact
+echo "run-linux-sandbox-gates: linux_spawn_preserves_image_when_worker_fds_are_installed"
+cargo $CARGO_ARGS worker::tests::linux_spawn_preserves_image_when_worker_fds_are_installed -- --exact
 echo "run-linux-sandbox-gates: linux_identity_mismatch_kills_child"
 cargo $CARGO_ARGS worker::tests::linux_identity_mismatch_kills_child -- --exact
 echo "run-linux-sandbox-gates: linux_worker_sandbox_refuses_filesystem_root"
