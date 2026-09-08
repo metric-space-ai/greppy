@@ -68,6 +68,8 @@ pub enum ResultsCommand {
     },
     /// Read one URL through the runtime.
     Read {
+        #[arg(value_name = "URL", conflicts_with = "url")]
+        positional_url: Option<String>,
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
@@ -266,6 +268,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             )
         }
         ResultsCommand::Read {
+            positional_url,
             url,
             query,
             session,
@@ -273,8 +276,8 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             search_endpoint,
             json,
         } => {
-            let Some(url) = url.filter(|url| !url.is_empty()) else {
-                return emit_error(json, invalid("web read requires --url URL"));
+            let Some(url) = url.or(positional_url).filter(|url| !url.is_empty()) else {
+                return emit_error(json, invalid("web read requires URL or --url URL"));
             };
             let session = match resolve_session(root, session) {
                 Ok(session) => session,

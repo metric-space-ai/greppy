@@ -121,6 +121,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_read_accepts_positional_and_flagged_urls() {
+        for operand in [
+            vec!["https://example.com/article"],
+            vec!["--url", "https://example.com/article"],
+        ] {
+            let mut argv = vec!["greppy", "web", "read"];
+            argv.extend(operand);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Some(Command::Web {
+                command:
+                    WebCommand::Results(ResultsCommand::Read {
+                        url,
+                        positional_url,
+                        ..
+                    }),
+            }) = cli.command
+            else {
+                panic!("expected web read")
+            };
+            assert_eq!(
+                url.or(positional_url).as_deref(),
+                Some("https://example.com/article")
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "greppy",
+            "web",
+            "read",
+            "https://one.example/",
+            "--url",
+            "https://two.example/",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn parse_web_goto_is_flat_not_nested_under_nav() {
         let cli = Cli::try_parse_from([
             "greppy",
