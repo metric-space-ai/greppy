@@ -257,3 +257,77 @@ fn search_pattern_without_path_still_sees_both_trees() {
     assert!(out.contains("src/lib.rs"), "{out}");
     assert!(out.contains("tools/lib.rs"), "{out}");
 }
+
+#[cfg(unix)]
+#[test]
+fn search_pattern_limits_content_scans_to_the_path_filter() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (repo, store) = indexed_two_tree_repo("pattern-content-scope");
+    let base = repo.parent().unwrap();
+    let shim_dir = base.join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let trace = base.join("grep-args");
+    let shim = shim_dir.join("grep");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nprintf '<call>\\n' >> \"$GREPPY_TEST_GREP_TRACE\"\nprintf '%s\\n' \"$@\" >> \"$GREPPY_TEST_GREP_TRACE\"\nexec /usr/bin/grep \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut search_path = vec![shim_dir];
+    search_path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let search_path = std::env::join_paths(search_path).unwrap();
+
+    // Check both file and directory scopes, regex and literal searches, and
+    // the second content scan used to explain a case-sensitive miss.
+    for (query, scope, fixed, expected_scans) in [
+        ("parse_widget", "src/lib.rs", false, 1),
+        ("PARSE_WIDGET", "src", false, 2),
+        ("PARSE_WIDGET", "src/lib.rs", true, 2),
+    ] {
+        std::fs::write(&trace, "").unwrap();
+        let mut command = Command::new(bin());
+        command
+            .args(["search-pattern", query, "--path", scope])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_AUTO_REINDEX", "0")
+            .env("GREPPY_TEST_GREP_TRACE", &trace)
+            .env("PATH", &search_path);
+        if fixed {
+            command.arg("--fixed");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if expected_scans == 2 {
+            assert!(stdout.contains("case-insensitive: 1 matches"), "{stdout}");
+        } else {
+            assert!(stdout.contains("src/lib.rs"), "{stdout}");
+        }
+        let recorded = std::fs::read_to_string(&trace).unwrap();
+        let scans: Vec<_> = recorded
+            .split("<call>\n")
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(scans.len(), expected_scans, "{recorded}");
+        for scan in scans {
+            let args: Vec<_> = scan.lines().collect();
+            let separator = args.iter().position(|arg| *arg == "--").unwrap();
+            assert_eq!(
+                &args[separator + 2..],
+                &["src/lib.rs"],
+                "content scan escaped the requested scope: {recorded}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}

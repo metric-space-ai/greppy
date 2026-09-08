@@ -230,6 +230,9 @@ privilege boundary.
 - `greppy web read URL` accepts its documented positional URL alongside
   `--url URL`. Browser URLs and selectors are no longer rewritten into graph
   path filters, which could cause an endless argument-recovery loop.
+- `search-pattern --path` restricts files before content scanning and reuses
+  that scope for case-insensitive diagnostics. A one-file search no longer
+  reads unrelated source files to count matches outside the requested path.
 - Refused edits outside the configured directory explain how an explicit
   `--root` selects the intended edit root. The write boundary is unchanged.
 
