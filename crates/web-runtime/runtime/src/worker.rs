@@ -525,7 +525,11 @@ impl PinnedSupervisorImage {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
         let args = FexecveArgs::from_command(command)?;
-        let raw = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        // Earlier pre_exec hooks install the worker channels at fixed FDs.
+        // Keep the executable above them: dup2 would otherwise replace this
+        // pin with a pipe/socket before fexecve and fail with EACCES.
+        let minimum = CAPABILITY_FD.max(ATTACH_TOKEN_FD).max(PROTOCOL_FD) + 1;
+        let raw = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1075,6 +1079,75 @@ exit 0;
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_spawn_preserves_image_when_worker_fds_are_installed() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        const CHILD_ENV: &str = "GREPPY_TEST_FEXECVE_RESERVED_FDS";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Give the isolated test process a deterministic low-FD layout.
+            // Closing these in the shell cannot disturb this test runner.
+            let output = Command::new("/bin/sh")
+                .args(["-c", "exec 3<&- 4<&- 5<&-; exec \"$@\"", "greppy-fd-test"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::tests::linux_spawn_preserves_image_when_worker_fds_are_installed",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let true_bin = unix_bin("true");
+        let image = PinnedSupervisorImage::open_path(&true_bin).unwrap();
+        assert_eq!(image.as_raw_fd(), 3, "isolated image must occupy FD 3");
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(null.as_raw_fd(), 4, "FD 4 must be free for the exec pin");
+        let raw = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
+        assert!(raw >= 6);
+        let channel = unsafe { OwnedFd::from_raw_fd(raw) };
+        drop(null);
+
+        // Repeat the collision for sequential workers. With an unrestricted
+        // duplicate, bind_command chooses FD 4, overwritten by the first hook.
+        for _ in 0..2 {
+            let channel_fd = channel.as_raw_fd();
+            let mut command = Command::new(&true_bin);
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in [
+                        super::CAPABILITY_FD,
+                        super::ATTACH_TOKEN_FD,
+                        super::PROTOCOL_FD,
+                    ] {
+                        if libc::dup2(channel_fd, fd) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            image.bind_command(&mut command).unwrap();
+            assert!(command
+                .status()
+                .expect("exec pin must survive channel setup")
+                .success());
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
