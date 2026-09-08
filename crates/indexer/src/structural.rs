@@ -282,7 +282,7 @@ pub(crate) fn build_structural(
         // part of the structural spine or the synthetic Module node. We
         // list every label in this file (empty label filter) and skip the
         // structural/synthetic labels.
-        for def in store.list_nodes(project, "", &rel, 0, usize::MAX)? {
+        for def in store.list_nodes_for_file(project, &rel)? {
             if NON_DEF_LABELS.contains(&def.label.as_str()) {
                 continue;
             }
