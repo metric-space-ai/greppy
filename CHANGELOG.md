@@ -209,6 +209,14 @@ privilege boundary.
   and `finish` then ran `git add` on a pathspec that matched nothing, ending
   every run with exit 3 after a correct answer. Removing a baseline file or
   directory still counts as a change.
+- The FSKit adapter moves its cached items along with a rename. An item
+  replaced by an atomic write (temp file renamed over it) kept pointing at
+  its old, unlinked inode and answered `getattr` with ENOENT, which the
+  kernel reports as ENODATA ("No message available on STREAM"); git could
+  not stat the file and the agent's finish failed. A renamed directory kept
+  answering for its old path, so lookups relative to it and its removal
+  failed with ENOENT (`rm -r` after `mv`); the item and every cached
+  descendant now follow the rename.
 
 These corrections do not replace the required real-device, parallel-agent or
 exact-SHA release gates. The macOS device acceptance (setup, doctor, kernel
