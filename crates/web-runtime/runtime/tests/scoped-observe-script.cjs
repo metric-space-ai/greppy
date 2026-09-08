@@ -189,3 +189,30 @@ test('hidden descendants do not enter scoped heading/link projections', () => {
   assert.deepEqual(tree.links, []);
   assert.deepEqual(tree.actionables.map(n => n.name), ['Save']);
 });
+
+test('observation does not interleave reference writes with layout reads for every control', () => {
+  const f = fixture();
+  for (let i = 0; i < 200; i++) f.element('button', 'grid-' + i, 'Order ' + i, f.document.body);
+  let dirty = false;
+  let flushes = 0;
+  const readLayout = () => { if (dirty) { flushes++; dirty = false; } };
+  for (const node of f.document.querySelectorAll('*')) {
+    const text = node.innerText;
+    Object.defineProperty(node, 'innerText', { get() { readLayout(); return text; } });
+    const bounds = node.getBoundingClientRect;
+    node.getBoundingClientRect = () => { readLayout(); return bounds(); };
+    const set = node.setAttribute;
+    node.setAttribute = (name, value) => {
+      if (node.getAttribute(name) !== value) dirty = true;
+      set(name, value);
+    };
+  }
+  const tree = f.observe(null);
+  assert.equal(tree.actionables.length, 200);
+  assert.ok(flushes <= 2, 'reference tagging repeatedly invalidated layout: ' + flushes);
+  for (const item of tree.actionables) {
+    const reference = Number(item.ref.slice(1));
+    const node = f.document.querySelectorAll('*').find(n => f.window.__greppyObservedRefs.matches(n, reference));
+    assert.equal(node.getAttribute('data-greppy-ref'), tree.ref_snapshot + ':' + reference);
+  }
+});

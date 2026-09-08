@@ -4696,6 +4696,16 @@ fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
     assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
     assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
 
+    // Ordinary operations must enforce the same quota without resetting the
+    // shared engine. Previously only a bounded wait preserved other tabs.
+    for method in ["web.observe", "web.evaluate"] {
+        let rejected = call(method, json!({"session_id":expired,"source":"true"}));
+        assert_eq!(rejected.status, "error", "{rejected:?}");
+        assert_eq!(rejected.error.as_ref().unwrap().code, "resource_limit");
+        assert!(rejected.error.as_ref().unwrap().message.contains("wall time"));
+        assert_eq!(content_worker_pid(supervisor.child.id()), Some(worker));
+    }
+
     let after = call("web.wait", json!({
         "session_id":session,"tab_id":tab,"timeout_ms":2000,
         "source":"document.querySelector('#witness')?.textContent === 'survived'",
@@ -6406,6 +6416,11 @@ Object.defineProperty(document.documentElement, "outerHTML", {
 #[test]
 fn locator_click_waits_for_actionable_target() {
     run_named_fixture("actionability.mjs", "run_actab");
+}
+
+#[test]
+fn locator_click_uses_wrapped_inline_line_box() {
+    run_named_fixture("wrapped-inline-link.mjs", "run_wrapped_inline");
 }
 
 #[test]

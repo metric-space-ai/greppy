@@ -3933,6 +3933,22 @@ fn resolve_script(selector: &serde_json::Value) -> String {
             if (!top) return false;
             return el === top || el.contains(top);
           }}
+          function greppyActionRect(el) {{
+            var bounds = el.getBoundingClientRect();
+            var doc = el.ownerDocument || document;
+            var view = doc.defaultView || window;
+            var rects = el.getClientRects();
+            for (var i = 0; i < rects.length; i++) {{
+              var r = rects[i];
+              var left = Math.max(0, r.left);
+              var top = Math.max(0, r.top);
+              var right = Math.min(view.innerWidth, r.right);
+              var bottom = Math.min(view.innerHeight, r.bottom);
+              var candidate = {{ x: left, y: top, width: right - left, height: bottom - top }};
+              if (greppyHitTarget(el, candidate)) return candidate;
+            }}
+            return bounds;
+          }}
           if (selector.snapshot != null &&
               (!document.documentElement ||
                document.documentElement.getAttribute('data-greppy-ref-snapshot') !== selector.snapshot)) {{
@@ -3947,13 +3963,13 @@ fn resolve_script(selector: &serde_json::Value) -> String {
           }}
           const el = nodes[0];
           void document.body.offsetHeight;
-          var rect = el.getBoundingClientRect();
+          var rect = greppyActionRect(el);
           var hidden = greppyStyleHidden(el);
           var hit = greppyHitTarget(el, rect);
           if (!hidden && (!hit || rect.width <= 0 || rect.height <= 0) && el.scrollIntoView) {{
             el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
             void document.body.offsetHeight;
-            rect = el.getBoundingClientRect();
+            rect = greppyActionRect(el);
             hidden = greppyStyleHidden(el);
             hit = greppyHitTarget(el, rect);
           }}
@@ -4959,12 +4975,15 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   const inScope = function(node) { return !selectedScope || selectedScope.includes(node); };
   const refAttr = 'data-greppy-ref';
   const snapshotAttr = 'data-greppy-ref-snapshot';
+  const referenceAttributes = [];
   let registry = null;
   if (snapshot != null) {
     registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
     window.__greppyObservedRefs = registry;
     snapshot = registry.snapshot;
-    if (document.documentElement) document.documentElement.setAttribute(snapshotAttr, snapshot);
+    if (document.documentElement && document.documentElement.getAttribute(snapshotAttr) !== snapshot) {
+      document.documentElement.setAttribute(snapshotAttr, snapshot);
+    }
   }
   const candidates = snapshot == null ? [] : Array.from(document.querySelectorAll(
     'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="tab"],[role="combobox"],[role="textbox"],[contenteditable="true"]'
@@ -5016,7 +5035,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   };
   const actionables = capped.map(function(node) {
     const ref = registry.refFor(node);
-    node.setAttribute(refAttr, snapshot + ':' + ref);
+    referenceAttributes.push([node, snapshot + ':' + ref]);
     const tag = node.tagName.toLowerCase();
     const type = tag === 'input' || tag === 'button' ? node.type : null;
     const autocomplete = (node.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
@@ -5061,7 +5080,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   });
   const describe = function(node) {
     const ref = registry.refFor(node);
-    node.setAttribute(refAttr, snapshot + ':' + ref);
+    referenceAttributes.push([node, snapshot + ':' + ref]);
     const tag = node.tagName.toLowerCase();
     const type = tag === 'input' || tag === 'button' ? node.type : null;
     const name = accessibleName(node, tag, type);
@@ -5092,6 +5111,12 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
     ref_count: actionables.length,
     refs_truncated: candidates.length > capped.length
   };
+  // Tag references after every layout-dependent read. Mutating an attribute
+  // before each control's innerText otherwise forces a whole-page layout
+  // per control on large grids. The identity registry is already complete.
+  for (const [node, value] of referenceAttributes) {
+    if (node.getAttribute(refAttr) !== value) node.setAttribute(refAttr, value);
+  }
   if (selectedScope) {
     tree.observation_scope = selectedScope.metadata;
     tree.observation_scope.text_truncated = text.length > 8000;

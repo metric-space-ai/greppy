@@ -36,6 +36,12 @@ one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
   state, so framework apps that bind checkbox state to native clicks see the
   change; the property-and-events path stays as fallback (finding 033).
 - Enter in an eligible form field performs the HTML implicit submit (038).
+- Wrapped inline links use a visible line box for click hit-testing, avoiding
+  false overlay failures when the bounding-box centre falls between lines.
+- Observation batches reference attributes after layout reads, avoiding a
+  full layout for each actionable control on large pages.
+- An expired session wall quota rejects ordinary operations without replacing
+  the shared content worker or destroying other sessions’ live tabs.
 - Action and read verbs accept the same selector forms: unquoted descendant
   CSS (`css=body a`) and the quoted wrapper (`css="body a"`) both work in
   `click`, `hover`, `wait`, `extract` and `find` (032).

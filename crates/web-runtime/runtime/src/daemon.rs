@@ -3527,15 +3527,10 @@ impl Daemon {
         });
         match wall_time_error {
             Some(("engine", message)) => return Err(engine_error(request, message, 38)),
-            Some(("wall_limit", message)) if deadline.is_some() => {
-                // Expiring this session's elapsed-time quota says nothing
-                // about the health of the shared worker. A bounded wait must
-                // refuse without replacing other sessions' live documents.
-                // CPU and RSS violations still take the recovery path below.
-                return Err(limit_error(request, message));
-            }
             Some(("wall_limit", message)) => {
-                let _ = self.recover_content(&format!("wall time exceeded: {message}"));
+                // A session's elapsed-time quota says nothing about shared
+                // worker health, regardless of which operation discovers it.
+                // Refuse the expired session without destroying live tabs.
                 return Err(limit_error(request, message));
             }
             Some(("limit", message)) => {
