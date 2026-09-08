@@ -264,12 +264,7 @@ fn search_symbol_no_match_status(
     println!("next: refresh definitions after source changes: greppy index .");
 }
 
-fn search_pattern_no_match_status(
-    query: &str,
-    fixed: bool,
-    path_filters: &QueryPathFilters,
-    matches_outside_filter: usize,
-) {
+fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &QueryPathFilters) {
     println!("status: no_matches");
     if path_filters.is_empty() {
         println!("scope: live Greppy-discovered source files in the repository");
@@ -280,13 +275,9 @@ fn search_pattern_no_match_status(
             "message: no matches under path filter: {}",
             path_filters.shown()
         );
-        if matches_outside_filter > 0 {
-            println!(
-                "reason: {matches_outside_filter} source match(es) exist outside the path filter"
-            );
-        } else {
-            println!("reason: no source match exists inside this scope");
-        }
+        println!(
+            "reason: no source match exists inside this scope; files outside it were not searched"
+        );
         let mode = if fixed { " --fixed" } else { "" };
         println!(
             "next: retry without the path filter: greppy search-pattern {}{mode}",
@@ -864,18 +855,9 @@ struct SearchPatternRow {
 fn search_pattern_case_insensitive_hits(
     query: &str,
     root_path: &std::path::Path,
+    paths: &[String],
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
-    let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
-        root_path,
-        &greppy_discover::SkipPolicy::walk_default(),
-        &overrides,
-    )?;
-    let paths = entries
-        .into_iter()
-        .map(|entry| entry.rel_path)
-        .collect::<Vec<_>>();
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -1075,22 +1057,19 @@ pub(crate) fn dispatch_search_code(
     } else {
         "live-fallback"
     };
-    let mut all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
-    let matches_outside_filter = all_hits
-        .iter()
-        .filter(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| !path_filters.matches(file))
-        })
-        .count();
-    // The path filter shapes the hit set BEFORE any count is taken — a count
-    // from before the filter is a false number (the --kind discipline).
-    all_hits.retain(|hit| {
-        hit.location
-            .rsplit_once(':')
-            .is_some_and(|(file, _)| path_filters.matches(file))
-    });
+    // Restrict content I/O before grep, not just the displayed hits. Reuse the
+    // same discovery scope for the case-insensitive no-match diagnostic.
+    let overrides = discover_overrides_from_env()?;
+    let scoped_paths = greppy_discover::walk_with_policy_and_overrides(
+        &root_path,
+        &greppy_discover::SkipPolicy::walk_default(),
+        &overrides,
+    )?
+    .into_iter()
+    .map(|entry| entry.rel_path)
+    .filter(|file| path_filters.matches(file))
+    .collect::<Vec<_>>();
+    let all_hits = live_grep_search_code_paths_pattern(q, &root_path, &scoped_paths, fixed)?;
 
     if json {
         let shown_hits = all_hits
@@ -1125,13 +1104,9 @@ pub(crate) fn dispatch_search_code(
         kind,
     )?;
     if rows.is_empty() {
-        search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
-        let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
-        insensitive.retain(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| path_filters.matches(file))
-        });
+        search_pattern_no_match_status(q, fixed, &path_filters);
+        let insensitive =
+            search_pattern_case_insensitive_hits(q, &root_path, &scoped_paths, fixed)?;
         if !insensitive.is_empty() {
             println!("case-insensitive: {} matches", insensitive.len());
         }

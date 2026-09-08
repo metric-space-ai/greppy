@@ -690,6 +690,15 @@ pub(crate) fn argv_with_stray_path_as_filter(
     argv: &[std::ffi::OsString],
     clap_message: &str,
 ) -> Option<(Vec<std::ffi::OsString>, String)> {
+    // Browser operands are URLs/selectors, not graph path filters. Otherwise
+    // unknown-flag recovery removes the inserted --path and recreates argv.
+    if grep_passthrough_args(argv)
+        .first()
+        .and_then(|arg| arg.to_str())
+        == Some("web")
+    {
+        return None;
+    }
     let stray = clap_message
         .strip_prefix("error: unexpected argument '")?
         .split('\'')
