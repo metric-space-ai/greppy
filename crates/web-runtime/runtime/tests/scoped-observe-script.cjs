@@ -216,3 +216,16 @@ test('observation does not interleave reference writes with layout reads for eve
     assert.equal(node.getAttribute('data-greppy-ref'), tree.ref_snapshot + ':' + reference);
   }
 });
+
+
+test('observation resolves labels without native live label collections', () => {
+  const f = fixture();
+  const label = f.element('label', 'save-label', 'Save order', f.dialog, { for: 'save' });
+  label.childNodes = [{ nodeType: 3, nodeValue: 'Save order' }];
+  Object.defineProperty(f.button, 'labels', { get() { throw new Error('native labels collection stalled'); } });
+  Object.defineProperty(label, 'control', { get() { throw new Error('native label control getter used'); } });
+  const tree = f.observe(null);
+  const button = tree.actionables.find(node => node.name === 'Save order');
+  assert.ok(button, 'explicit label must be resolved from its for attribute');
+  assert.equal(button.name_source, 'label');
+});

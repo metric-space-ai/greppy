@@ -5001,7 +5001,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
     }
     const aria = compact(node.getAttribute('aria-label'));
     if (aria) return { name: aria, source: 'aria-label' };
-    const nativeLabels = Array.from(node.labels || []);
+    const nativeLabels = greppyNativeLabels(node);
     if (nativeLabels.length) return { name: compact(nativeLabels.map(function(label) { return greppyNativeLabelText(label, node); }).join(' ')), source: 'label' };
     if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
       const text = compact(node.innerText || node.textContent);

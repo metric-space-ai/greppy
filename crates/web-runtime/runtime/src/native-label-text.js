@@ -21,8 +21,24 @@ function greppyNativeLabelText(label, control) {
   return text;
 }
 
+function greppyIsLabelable(control) {
+  return !!control && (['BUTTON', 'METER', 'OUTPUT', 'PROGRESS', 'SELECT', 'TEXTAREA'].includes(control.tagName)
+    || (control.tagName === 'INPUT' && control.type !== 'hidden'));
+}
+
 function greppyControlForLabel(label) {
-  if (label.control) return label.control;
-  if (label.htmlFor) return label.ownerDocument.getElementById(label.htmlFor);
-  return label.querySelector('input, textarea, select, button');
+  if (label.hasAttribute('for')) {
+    const control = label.ownerDocument.getElementById(label.getAttribute('for'));
+    return greppyIsLabelable(control) ? control : null;
+  }
+  return Array.from(label.querySelectorAll('button,input,meter,output,progress,select,textarea'))
+    .find(greppyIsLabelable) || null;
+}
+
+function greppyNativeLabels(control) {
+  if (!greppyIsLabelable(control)) return [];
+  // The engine-backed control.labels collection can stall on Magento grid
+  // checkboxes. Resolve HTML label associations from the finite label list.
+  return Array.from(control.ownerDocument.querySelectorAll('label'))
+    .filter(label => greppyControlForLabel(label) === control);
 }

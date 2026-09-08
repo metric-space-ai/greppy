@@ -17,7 +17,7 @@ pub(crate) const SELECTOR_RUNTIME: &str = concat!(
 function greppyAccessibleName(el) {
   const labelled = el.getAttribute('aria-label');
   if (labelled) return labelled.trim();
-  const labels = Array.from(el.labels || []);
+  const labels = greppyNativeLabels(el);
   if (labels.length) {
     return labels.map((label) => greppyNativeLabelText(label, el)).join(' ').trim();
   }

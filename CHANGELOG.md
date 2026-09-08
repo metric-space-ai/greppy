@@ -42,6 +42,8 @@ one long-lived runtime): engine tier 70/70, CLI-chain tier 70/70, both up from
   full layout for each actionable control on large pages. Label extraction
   stays inside the label subtree; an empty Magento label no longer sends the
   native text walker through unrelated nodes until the observation times out.
+  Label associations are resolved without the native live labels collection,
+  which can stall on Magento order-grid checkboxes.
 - An expired session wall quota rejects ordinary operations without replacing
   the shared content worker or destroying other sessions’ live tabs.
 - Action and read verbs accept the same selector forms: unquoted descendant
