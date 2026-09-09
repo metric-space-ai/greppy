@@ -2158,9 +2158,27 @@ fn run_trained_patch_with_publish_hook(
     mut before_publish: impl FnMut(usize),
 ) -> EditResult<EditRecord> {
     let parsed = parse_trained_patch(&diff)?;
+    let mut targets = std::collections::HashSet::new();
     let mut planned = Vec::new();
     for file in parsed {
         let (rel, abs, content) = edit_read_file(root_path, &file.path)?;
+        let target = std::fs::canonicalize(&abs).map_err(|error| {
+            EditRefusal::new(
+                "file_unreadable",
+                format!("resolve {}: {error}", file.path),
+                10,
+            )
+        })?;
+        if !targets.insert(target) {
+            return Err(EditRefusal::new(
+                "invalid_patch",
+                format!(
+                    "{}: duplicate patch target; combine all hunks for this file under one ---/+++ header pair before retrying — nothing written",
+                    file.path
+                ),
+                20,
+            ));
+        }
         let (after, changed) = apply_trained_patch_file(&rel, &content, &file.hunks)?;
         let language = greppy_edit::language_for_path(std::path::Path::new(&rel));
         if language.is_supported() {
@@ -2820,6 +2838,45 @@ pub(crate) fn edit_operation_line_span(
 #[cfg(test)]
 mod patch_rollback_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_patch_targets_are_refused_before_any_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.txt");
+        std::fs::write(&path, b"one\nkeep\ntwo\n").unwrap();
+        for second in ["example.txt", "./example.txt"] {
+            for dry_run in [false, true] {
+                let diff = format!(
+                    "--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- a/{second}\n+++ b/{second}\n@@ -3 +3 @@\n-two\n+TWO\n"
+                );
+                let result = run_trained_patch_with_publish_hook(
+                    dir.path(),
+                    diff.into_bytes(),
+                    dry_run,
+                    false,
+                    |_| panic!("duplicate target must be rejected during planning"),
+                );
+                let refusal = match result {
+                    Err(refusal) => refusal,
+                    Ok(_) => panic!("duplicate target was accepted"),
+                };
+                assert_eq!(refusal.code, "invalid_patch");
+                assert_eq!(refusal.exit, 20);
+                assert!(refusal.message.contains("duplicate patch target"));
+                assert!(refusal.message.contains("one ---/+++ header pair"));
+                assert!(!refusal.message.contains("stale plan"));
+                assert_eq!(std::fs::read(&path).unwrap(), b"one\nkeep\ntwo\n");
+            }
+        }
+        let grouped = parse_trained_patch(
+            b"--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-one\n+ONE\n@@ -3 +3 @@\n-two\n+TWO\n",
+        ).unwrap();
+        assert_eq!(grouped.len(), 1);
+        let (after, _) =
+            apply_trained_patch_file("example.txt", b"one\nkeep\ntwo\n", &grouped[0].hunks)
+                .unwrap();
+        assert_eq!(after, b"ONE\nkeep\nTWO\n");
+    }
 
     #[test]
     fn failed_patch_never_rolls_back_the_unpublished_conflict_target() {
