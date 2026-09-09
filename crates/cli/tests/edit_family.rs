@@ -87,6 +87,43 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn edit_preview_reads_the_explicit_root_instead_of_cwd() {
+    let fixture = Fixture::new("preview-explicit-root");
+    let target = fixture.repo.join("target-repo");
+    std::fs::create_dir_all(target.join(".git")).unwrap();
+    std::fs::write(fixture.repo.join("same.txt"), "CWD_SENTINEL\n").unwrap();
+    for relative in [false, true] {
+        let root = if relative {
+            "target-repo"
+        } else {
+            target.to_str().unwrap()
+        };
+        let output = fixture.run(&["--root", root, "write", "same.txt", "TARGET_WRITE\n"]);
+        assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+        let text = combined(&output);
+        assert!(text.contains("TARGET_WRITE"), "{text}");
+        assert!(!text.contains("CWD_SENTINEL"), "{text}");
+        assert_file(&target.join("same.txt"), "TARGET_WRITE\n");
+        assert_file(&fixture.repo.join("same.txt"), "CWD_SENTINEL\n");
+
+        let output = fixture.run(&[
+            "--root",
+            root,
+            "replace-text",
+            "same.txt",
+            "TARGET_WRITE",
+            "TARGET_REPLACED",
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+        let text = combined(&output);
+        assert!(text.contains("TARGET_REPLACED"), "{text}");
+        assert!(!text.contains("CWD_SENTINEL"), "{text}");
+        assert_file(&target.join("same.txt"), "TARGET_REPLACED\n");
+        assert_file(&fixture.repo.join("same.txt"), "CWD_SENTINEL\n");
+    }
+}
+
+#[test]
 fn malformed_patch_reports_input_line_and_preserves_the_file() {
     let fixture = Fixture::new("patch-prefix-diagnostic");
     let original = "fn before() {}\n";
