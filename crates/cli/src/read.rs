@@ -597,11 +597,12 @@ pub(crate) fn dispatch_read(
     let canonical_root = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
+    let file_base = resolve_file_operand_base(root, &root_path);
     let file_intents = subjects
         .iter()
         .map(|subject| {
             looks_like_path(subject)
-                || read_open_file(&root_path, &canonical_root, subject).is_some()
+                || read_open_file(&file_base, &canonical_root, subject).is_some()
         })
         .collect::<Vec<_>>();
 
@@ -1221,12 +1222,7 @@ pub(crate) fn dispatch_read_smart(
 }
 
 fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
-    let supplied = std::path::Path::new(subject);
-    if supplied.is_absolute() {
-        supplied.to_path_buf()
-    } else {
-        root_path.join(supplied)
-    }
+    file_operand_path(root_path, subject)
 }
 
 fn read_open_file(
@@ -1364,6 +1360,7 @@ pub(crate) fn dispatch_read_files(
     // query-writer connection that can collide with the indexer's schema
     // publication. The store is needed only for continuation/handle records.
     let root_path = resolve_root(root)?;
+    let file_base = resolve_file_operand_base(root, &root_path);
     let path_filters = if path_filter_args.is_empty() {
         QueryPathFilters::default()
     } else {
@@ -1374,6 +1371,8 @@ pub(crate) fn dispatch_read_files(
     // only for continuation packs or explicit handles. Re-resolving a linked
     // worktree several times made a plain file read crawl under filesystem
     // pressure and could leave callers waiting with no output.
+    // File operands join against `file_base` (the explicit --root, if any);
+    // shown paths, handles and continuation packs stay workspace-relative.
     let canonical_root = root_path.clone();
     let mut project = None::<String>;
     let mut store = None;
@@ -1388,7 +1387,7 @@ pub(crate) fn dispatch_read_files(
             failed = true;
             continue;
         }
-        let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
+        let Some((shown, _, content)) = read_open_file(&file_base, &canonical_root, path) else {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");
             previous_ended_with_newline = true;

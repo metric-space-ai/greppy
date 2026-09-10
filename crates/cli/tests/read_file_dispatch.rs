@@ -391,3 +391,172 @@ fn compact_read_handle_still_drives_replace_span() {
         "dry-run must not publish the replacement"
     );
 }
+
+fn run_from(cwd: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .output()
+        .expect("run greppy");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn nested_read_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (repo, store) = fresh_workspace(tag);
+    let cwd = repo.parent().unwrap().to_path_buf();
+    std::fs::write(cwd.join("probe.conf"), "CWD_SENTINEL\n").unwrap();
+    std::fs::write(repo.join("probe.conf"), "REPO_SENTINEL\n").unwrap();
+    let nested = repo.join("etc");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("probe.conf"), "SUBDIR_SENTINEL\n").unwrap();
+    (cwd, repo, store, nested)
+}
+
+#[test]
+fn nested_root_reads_select_the_subdir_not_cwd_or_repo_sentinels() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-read");
+    let absolute = nested.to_str().unwrap();
+    let trailing = format!("{absolute}/");
+    let mut roots = vec![absolute.to_string(), "repo/etc".to_string(), trailing];
+    #[cfg(unix)]
+    {
+        let link = cwd.join("etc-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        roots.push("etc-link".to_string());
+    }
+    for root in &roots {
+        for args in [
+            vec!["--root", root.as_str(), "read-file", "probe.conf", "--all"],
+            vec!["--root", root.as_str(), "read", "probe.conf"],
+        ] {
+            let (code, stdout, stderr) = run_from(&cwd, &store, &args);
+            assert_eq!(code, 0, "{args:?}: {stdout}\n{stderr}");
+            assert!(stdout.contains("etc/probe.conf"), "{args:?}: {stdout}");
+            assert!(stdout.contains("SUBDIR_SENTINEL"), "{args:?}: {stdout}");
+            assert!(!stdout.contains("CWD_SENTINEL"), "{args:?}: {stdout}");
+            assert!(!stdout.contains("REPO_SENTINEL"), "{args:?}: {stdout}");
+        }
+    }
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "probe.conf", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("probe.conf"), "{stdout}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("etc/probe.conf"), "{stdout}");
+
+    let (code, stdout, stderr) = run_from(&repo, &store, &["read-file", "probe.conf", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("etc/probe.conf"), "{stdout}");
+
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_missing_file_does_not_select_the_ancestor_sentinel() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-missing");
+    std::fs::remove_file(nested.join("probe.conf")).unwrap();
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "probe.conf",
+            "--all",
+        ],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert_eq!(stdout, "no such file: probe.conf\n");
+    assert!(!stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("CWD_SENTINEL"), "{stdout}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-page");
+    let mut long = String::new();
+    for line in 1..=805 {
+        long.push_str(&format!("subdir line {line}\n"));
+    }
+    std::fs::write(nested.join("long.txt"), &long).unwrap();
+    let mut repo_long = String::new();
+    for line in 1..=805 {
+        repo_long.push_str(&format!("repo line {line}\n"));
+    }
+    std::fs::write(repo.join("long.txt"), &repo_long).unwrap();
+
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &["--root", nested.to_str().unwrap(), "read-file", "long.txt"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.starts_with("etc/long.txt:1-400\nsubdir line 1\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("subdir line 400\n"), "{stdout}");
+    assert!(!stdout.contains("repo line"), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("continuation id");
+
+    let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "{expanded}\n{expand_stderr}");
+    assert!(
+        expanded.starts_with("etc/long.txt:401-800\nsubdir line 401\n"),
+        "{expanded}"
+    );
+    assert!(!expanded.contains("repo line"), "{expanded}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_relative_escape_is_still_refused() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-escape");
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "../probe.conf",
+            "--all",
+        ],
+    );
+    // ../probe.conf from etc lands on the repo sentinel, which is still inside
+    // the workspace, so the relative operand is allowed and names the repo file.
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("probe.conf"), "{stdout}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+
+    let (escape_code, escape_out, escape_err) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "../../probe.conf",
+            "--all",
+        ],
+    );
+    assert_eq!(escape_code, 1, "{escape_out}\n{escape_err}");
+    assert_eq!(escape_out, "no such file: ../../probe.conf\n");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
