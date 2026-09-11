@@ -111,6 +111,16 @@ fn parse_svg_document_in_memory(
         .map_err(|_| "Not a valid SVG document")
 }
 
+fn is_svg_mime(content_type: Option<&Mime>) -> bool {
+    content_type.is_some_and(|content_type| {
+        (
+            content_type.type_(),
+            content_type.subtype(),
+            content_type.suffix(),
+        ) == (mime::IMAGE, mime::SVG, Some(mime::XML))
+    })
+}
+
 fn decode_bytes_sync(
     key: LoadKey,
     bytes: &[u8],
@@ -119,15 +129,7 @@ fn decode_bytes_sync(
     fontdb: Arc<fontdb::Database>,
     font_resolver: Arc<dyn FontResolver>,
 ) -> DecoderMsg {
-    let is_svg_document = content_type.is_some_and(|content_type| {
-        (
-            content_type.type_(),
-            content_type.subtype(),
-            content_type.suffix(),
-        ) == (mime::IMAGE, mime::SVG, Some(mime::XML))
-    });
-
-    let image = if is_svg_document {
+    let image = if is_svg_mime(content_type.as_ref()) {
         parse_svg_document_in_memory(bytes, fontdb, font_resolver.clone())
             .ok()
             .map(|svg_tree| {
@@ -141,6 +143,30 @@ fn decode_bytes_sync(
     };
 
     DecoderMsg { key, image }
+}
+
+/// Layout-sized stand-in: real header metrics, no RGBA, no WebRender key.
+///
+/// Agents need width/height for boxes and `img.complete` / `naturalWidth`.
+/// They do not need pixels until canvas or a visual screenshot asks. Paint
+/// skips fragments without an image key, so the replaced box stays empty
+/// until `get_image` decodes on demand.
+fn placeholder_raster(metadata: ImageMetadata, cors_status: CorsStatus) -> RasterImage {
+    RasterImage {
+        metadata,
+        format: PixelFormat::BGRA8,
+        id: None,
+        cors_status,
+        bytes: Arc::new(vec![0, 0, 0, 0]),
+        frames: vec![ImageFrame {
+            delay: None,
+            byte_range: 0..4,
+            width: 1,
+            height: 1,
+        }],
+        is_opaque: false,
+        loop_count: None,
+    }
 }
 
 fn set_webrender_image_key(
@@ -248,6 +274,15 @@ enum CacheResult<'a> {
     Miss(Option<(LoadKey, &'a mut PendingLoad)>),
 }
 
+/// Encoded raster bytes kept until something actually needs pixels.
+#[derive(MallocSizeOf)]
+struct EncodedRaster {
+    #[conditional_malloc_size_of]
+    bytes: Arc<Vec<u8>>,
+    cors_status: CorsStatus,
+    content_type: Option<Mime>,
+}
+
 /// Represents an image that has completed loading.
 /// Images that fail to load (due to network or decode
 /// failure) are still stored here, so that they aren't
@@ -256,11 +291,18 @@ enum CacheResult<'a> {
 struct CompletedLoad {
     image_response: ImageResponse,
     id: PendingImageId,
+    /// Raster bytes waiting for `get_image` / a visual paint. `None` once
+    /// decoded, for vectors, and for failures.
+    encoded: Option<EncodedRaster>,
 }
 
 impl CompletedLoad {
     fn new(image_response: ImageResponse, id: PendingImageId) -> CompletedLoad {
-        CompletedLoad { image_response, id }
+        CompletedLoad {
+            image_response,
+            id,
+            encoded: None,
+        }
     }
 }
 
@@ -722,6 +764,47 @@ impl ImageCacheStore {
         }
     }
 
+    /// Finish a raster fetch without decoding RGBA. Listeners see `Loaded`
+    /// (so `img.complete` and `load` fire) with header metrics only.
+    fn complete_deferred_raster(
+        &mut self,
+        key: LoadKey,
+        bytes: Arc<Vec<u8>>,
+        cors_status: CorsStatus,
+        content_type: Option<Mime>,
+        metadata: ImageMetadata,
+    ) {
+        let pending_load = match self.pending_loads.remove(&key) {
+            Some(load) => load,
+            None => return,
+        };
+        let url = pending_load
+            .final_url
+            .clone()
+            .unwrap_or_else(|| pending_load.url.clone());
+        let image_response = ImageResponse::Loaded(
+            Image::Raster(Arc::new(placeholder_raster(metadata, cors_status))),
+            url,
+        );
+        let mut completed_load = CompletedLoad::new(image_response.clone(), key);
+        completed_load.encoded = Some(EncodedRaster {
+            bytes,
+            cors_status,
+            content_type,
+        });
+        self.completed_loads.insert(
+            (
+                pending_load.url,
+                pending_load.load_origin,
+                pending_load.cors_setting,
+            ),
+            completed_load,
+        );
+        for listener in pending_load.listeners {
+            listener.respond(image_response.clone());
+        }
+    }
+
     fn remove_loaded_image(
         &mut self,
         url: &ServoUrl,
@@ -921,6 +1004,7 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Image> {
+        self.decode_deferred_raster(url.clone(), origin.clone(), cors_setting);
         let store = self.store.lock();
         let result = store.get_completed_image_if_available(url, origin, cors_setting);
         match result {
@@ -1271,20 +1355,49 @@ impl ImageCache for ImageCacheImpl {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {
-                        let (bytes, cors_status, content_type) = {
+                        let eager = {
                             let mut store = self.store.lock();
-                            if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
+                            let prepared = {
+                                let Some(pending_load) = store.pending_loads.get_by_key_mut(&id)
+                                else {
+                                    debug!(
+                                        "Pending load for id {:?} already evicted from cache",
+                                        id
+                                    );
+                                    return;
+                                };
                                 pending_load.result = Some(Ok(()));
-                                debug!("Async decoding {} ({:?})", pending_load.url, key);
                                 (
                                     pending_load.bytes.mark_complete(),
                                     pending_load.cors_status,
                                     pending_load.content_type.clone(),
+                                    pending_load.metadata,
+                                    pending_load.url.clone(),
                                 )
+                            };
+                            let (bytes, cors_status, content_type, metadata, url) = prepared;
+                            if !is_svg_mime(content_type.as_ref()) {
+                                if let Some(metadata) = metadata {
+                                    debug!("Deferring raster decode {url} ({key:?})");
+                                    store.complete_deferred_raster(
+                                        id,
+                                        bytes,
+                                        cors_status,
+                                        content_type,
+                                        metadata,
+                                    );
+                                    None
+                                } else {
+                                    debug!("Async decoding {url} ({key:?})");
+                                    Some((bytes, cors_status, content_type))
+                                }
                             } else {
-                                debug!("Pending load for id {:?} already evicted from cache", id);
-                                return;
+                                debug!("Async decoding {url} ({key:?})");
+                                Some((bytes, cors_status, content_type))
                             }
+                        };
+                        let Some((bytes, cors_status, content_type)) = eager else {
+                            return;
                         };
 
                         let local_store = self.store.clone();
@@ -1400,6 +1513,50 @@ impl Drop for ImageCacheStore {
 }
 
 impl ImageCacheImpl {
+    /// Decode a deferred raster so canvas.drawImage / visual screenshot see
+    /// real pixels. Layout and `img.complete` already ran on the placeholder.
+    fn decode_deferred_raster(
+        &self,
+        url: ServoUrl,
+        origin: ImmutableOrigin,
+        cors_setting: Option<CorsSettings>,
+    ) {
+        let encoded = {
+            let mut store = self.store.lock();
+            let Some(load) = store
+                .completed_loads
+                .get_mut(&(url.clone(), origin.clone(), cors_setting))
+            else {
+                return;
+            };
+            load.encoded.take()
+        };
+        let Some(encoded) = encoded else {
+            return;
+        };
+        let msg = decode_bytes_sync(
+            PendingImageId(0),
+            &encoded.bytes,
+            encoded.cors_status,
+            encoded.content_type,
+            self.fontdb.clone(),
+            self.font_resolver.clone(),
+        );
+        let Some(DecodedImage::Raster(raster)) = msg.image else {
+            return;
+        };
+        let mut store = self.store.lock();
+        let Some(load) = store.completed_loads.get_mut(&(url, origin, cors_setting)) else {
+            return;
+        };
+        let ImageResponse::Loaded(_, final_url) = &load.image_response else {
+            return;
+        };
+        let final_url = final_url.clone();
+        load.image_response = ImageResponse::Loaded(Image::Raster(Arc::new(raster)), final_url);
+        load.encoded = None;
+    }
+
     /// Require self.store.lock() before calling.
     fn add_listener_with_store(&self, store: &mut ImageCacheStore, listener: ImageLoadListener) {
         let id = listener.id;

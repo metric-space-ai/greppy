@@ -1,5 +1,5 @@
 [workspace]
-members = ["phase1-probe", "runtime"]
+members = ["phase1-probe", "runtime", "vendor/servo-net"]
 default-members = ["runtime"]
 resolver = "2"
 

@@ -104,6 +104,30 @@ fn create_timing() -> ResourceFetchTiming {
     ResourceFetchTiming::new(ResourceTimingType::Resource)
 }
 
+fn push_jpeg(
+    cache: &Arc<dyn ImageCache>,
+    url: ServoUrl,
+    origin: servo_url::ImmutableOrigin,
+) -> PendingImageId {
+    let id = match cache.get_cached_image_status(url, origin, None) {
+        ImageCacheResult::ReadyForRequest(id) => id,
+        _ => panic!("Expected ReadyForRequest"),
+    };
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponse(create_request_id(), Ok(create_test_metadata(None))),
+    );
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponseChunk(create_request_id(), DebugVec(jpeg_image_bytes())),
+    );
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
+    );
+    id
+}
+
 #[test]
 fn test_get_cached_image_status_before_request() {
     let (cache, _key_receiver) = create_test_image_cache();
@@ -774,4 +798,90 @@ fn test_svg_not_rasterize_zero_size() {
             .rasterize_vector_image(vec_img.id, size, None)
             .is_none()
     );
+}
+
+#[test]
+fn raster_eof_is_available_from_headers_without_rgba() {
+    let (cache, _key_receiver) = create_test_image_cache();
+    let url = ServoUrl::parse("http://example.com/test.jpeg").unwrap();
+    let origin = mock_origin();
+    push_jpeg(&cache, url.clone(), origin.clone());
+
+    let ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable { image, .. }) =
+        cache.get_cached_image_status(url, origin, None)
+    else {
+        panic!("EOF with a header must complete the load without waiting for RGBA");
+    };
+    let net_traits::image_cache::Image::Raster(raster) = image else {
+        panic!("expected raster");
+    };
+    assert!(raster.metadata.width > 1, "header width");
+    assert!(raster.metadata.height > 1, "header height");
+    assert_eq!(
+        raster.frames[0].width, 1,
+        "pixels stay deferred until get_image"
+    );
+    assert_eq!(raster.id, None, "no WebRender key until pixels are needed");
+}
+
+#[test]
+fn get_image_decodes_deferred_raster_pixels() {
+    let (cache, _key_receiver) = create_test_image_cache();
+    let url = ServoUrl::parse("http://example.com/test.jpeg").unwrap();
+    let origin = mock_origin();
+    push_jpeg(&cache, url.clone(), origin.clone());
+
+    let image = cache
+        .get_image(url, origin, None)
+        .expect("canvas.drawImage path must decode on demand");
+    let net_traits::image_cache::Image::Raster(raster) = image else {
+        panic!("expected raster");
+    };
+    assert_eq!(
+        raster.frames[0].width, raster.metadata.width,
+        "decoded frame uses the header size"
+    );
+    assert_eq!(raster.frames[0].height, raster.metadata.height);
+    assert!(
+        raster.bytes.len() > 4,
+        "RGBA buffer must outgrow the 1x1 placeholder"
+    );
+}
+
+#[test]
+fn raster_load_event_fires_at_eof_before_decode() {
+    let (cache, _key_receiver) = create_test_image_cache();
+    let url = ServoUrl::parse("http://example.com/test.jpeg").unwrap();
+    let origin = mock_origin();
+
+    let id = match cache.get_cached_image_status(url.clone(), origin.clone(), None) {
+        ImageCacheResult::ReadyForRequest(id) => id,
+        _ => panic!("Expected ReadyForRequest"),
+    };
+    let (sender, receiver) = unbounded();
+    cache.add_listener(create_test_listener(id, sender));
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponse(create_request_id(), Ok(create_test_metadata(None))),
+    );
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponseChunk(create_request_id(), DebugVec(jpeg_image_bytes())),
+    );
+    cache.notify_pending_response(
+        id,
+        FetchResponseMsg::ProcessResponseEOF(create_request_id(), Ok(()), create_timing()),
+    );
+
+    let mut saw_loaded = false;
+    let mut saw_metadata = false;
+    while let Ok(response) = receiver.try_recv() {
+        match response {
+            ImageResponse::Loaded(..) => saw_loaded = true,
+            ImageResponse::MetadataLoaded(_) => saw_metadata = true,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(saw_metadata, "header arrives during the body");
+    assert!(saw_loaded, "Loaded at EOF is what makes img.complete true");
 }
