@@ -10,7 +10,7 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
+    MouseMoveEvent, Preferences, PromoteDeferredImageDecode, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
@@ -3546,6 +3546,15 @@ impl ContentEngine {
         webview: &WebView,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        // Header-only rasters complete as Loaded with no WebRender key, so the
+        // HTML element keeps a placeholder Arc. Promote on the layout thread
+        // and dirty style so the next display list attaches real keys. The
+        // custom property is visual-path only; default screenshots never set it.
+        let _promote = PromoteDeferredImageDecode::enter();
+        let _ = self.evaluate(
+            webview.clone(),
+            r#"(function(){var i=document.querySelector("img");if(i){var w=i.width;i.width=w+1;void i.offsetWidth;i.width=w;}document.documentElement.style.setProperty("--greppy-visual","1");return document.documentElement.offsetHeight;})()"#,
+        );
         webview.paint();
         self.rendering_context.present();
         let saved = Rc::new(RefCell::new(None));

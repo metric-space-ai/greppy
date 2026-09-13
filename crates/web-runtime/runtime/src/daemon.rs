@@ -1840,7 +1840,16 @@ impl Daemon {
         match self.with_session_page(request, "web.screenshot") {
             Err(response) => response,
             Ok((session_id, page)) => {
-                match self.engine_call("page.screenshot", json!({ "page": page })) {
+                let mut params = json!({ "page": page });
+                if request
+                    .payload
+                    .get("renderComplete")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+                {
+                    params["renderComplete"] = json!(true);
+                }
+                match self.engine_call("page.screenshot", params) {
                     Ok(result) => {
                         let bytes = match screenshot_png_bytes(&result) {
                             Ok(bytes) => bytes,

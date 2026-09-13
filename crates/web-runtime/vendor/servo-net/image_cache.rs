@@ -1542,9 +1542,16 @@ impl ImageCacheImpl {
             self.fontdb.clone(),
             self.font_resolver.clone(),
         );
-        let Some(DecodedImage::Raster(raster)) = msg.image else {
+        let Some(DecodedImage::Raster(mut raster)) = msg.image else {
             return;
         };
+        // Visual paint and canvas.drawImage need a WebRender key. generate
+        // one now so layout can push the decoded pixels; if the paint API
+        // cannot mint a key we still keep the RGBA for get_image callers.
+        if let Some(image_key) = self.get_image_key() {
+            let store = self.store.lock();
+            set_webrender_image_key(&store.paint_api, &mut raster, image_key);
+        }
         let mut store = self.store.lock();
         let Some(load) = store.completed_loads.get_mut(&(url, origin, cors_setting)) else {
             return;

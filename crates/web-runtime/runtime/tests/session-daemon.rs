@@ -3211,6 +3211,195 @@ fn web_screenshot_returns_inline_png_bytes() {
     );
 }
 
+
+fn decode_png_base64(b64: &str) -> Vec<u8> {
+    fn val(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    }
+    let bytes: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 1);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let a = val(chunk[0]);
+        let b = val(chunk[1]);
+        out.push((a << 2) | (b >> 4));
+        if chunk.len() > 2 && chunk[2] != b'=' {
+            let c = val(chunk[2]);
+            out.push((b << 4) | (c >> 2));
+            if chunk.len() > 3 && chunk[3] != b'=' {
+                let d = val(chunk[3]);
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    out
+}
+
+fn count_red_png_pixels(png_bytes: &[u8]) -> usize {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    let samples = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Indexed => 1,
+    };
+    buf.chunks(samples)
+        .filter(|px| px[0] > 200 && (samples < 2 || px[1] < 40) && (samples < 3 || px[2] < 40))
+        .count()
+}
+
+fn solid_red_png(width: u32, height: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&[255, 0, 0]);
+        }
+        writer.write_image_data(&data).expect("png data");
+    }
+    buf
+}
+
+fn serve_red_image_page() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let png = solid_red_png(32, 32);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind red image");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buffer[..n]);
+            let (ctype, body): (&str, Vec<u8>) = if req.contains("GET /red.png") {
+                ("image/png", png.clone())
+            } else {
+                (
+                    "text/html; charset=utf-8",
+                    b"<!DOCTYPE html><html><body style=\"margin:0;background:#ffffff\"><img src=\"/red.png\" width=\"200\" height=\"200\" alt=\"red\"></body></html>".to_vec(),
+                )
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+    });
+    format!("http://{address}/")
+}
+
+#[test]
+fn screenshot_render_complete_replaces_placeholder_with_raster_pixels() {
+    // 1x1 red PNG stretched to 200x200. Default screenshot keeps the empty
+    // layout box (agent-lazy). renderComplete must decode and paint red.
+    let fixture = serve_red_image_page();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-visual-shot-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_visual_shot", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_visual_shot",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_visual_shot",
+            "web.read",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+
+    let instant = unix_request(
+        &socket,
+        &Request::new(
+            "run_visual_shot",
+            "web.screenshot",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("instant screenshot");
+    assert_eq!(instant.status, "ok", "{instant:?}");
+    let instant_b64 = instant.result.as_ref().unwrap()["png_base64"]
+        .as_str()
+        .expect("instant png_base64");
+    let instant_red = count_red_png_pixels(&decode_png_base64(instant_b64));
+
+    let visual = unix_request(
+        &socket,
+        &Request::new(
+            "run_visual_shot",
+            "web.screenshot",
+            json!({ "session_id": session_id, "renderComplete": true }),
+        ),
+        Duration::from_secs(45),
+    )
+    .expect("renderComplete screenshot");
+    assert_eq!(visual.status, "ok", "{visual:?}");
+    let visual_b64 = visual.result.as_ref().unwrap()["png_base64"]
+        .as_str()
+        .expect("visual png_base64");
+    let visual_red = count_red_png_pixels(&decode_png_base64(visual_b64));
+
+    assert!(
+        instant_red < 1000,
+        "default screenshot must stay a placeholder (empty layout box), red_pixels={instant_red}"
+    );
+    assert!(
+        visual_red >= 10_000,
+        "renderComplete must paint the decoded raster, red_pixels={visual_red}"
+    );
+
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_visual_shot",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
 #[test]
 fn web_goto_navigates_a_fixture() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body><p>nav-goto</p></body></html>");

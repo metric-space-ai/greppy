@@ -508,10 +508,8 @@ impl ReplacedContents {
 
         let base = BaseFragment::new(self.base_fragment_info, style.clone().into(), rect);
         match &self.kind {
-            ReplacedContentKind::Image(image_info) => image_info
-                .image
-                .as_ref()
-                .and_then(|image| match image {
+            ReplacedContentKind::Image(image_info) => {
+                let image_key = image_info.image.as_ref().and_then(|image| match image {
                     Image::Raster(raster_image) => raster_image.id,
                     Image::Vector(vector_image) => {
                         let scale = layout_context.style_context.device_pixel_ratio();
@@ -529,18 +527,23 @@ impl ReplacedContents {
                             )
                             .and_then(|i| i.id)
                     },
-                })
-                .map(|image_key| {
-                    Fragment::Image(Arc::new(ImageFragment {
+                });
+                // Header-only rasters have no WebRender key yet. Still emit a
+                // fragment with the URL so a visual screenshot can attach keys
+                // at display-list time without a second img.load event.
+                let emit_keyless_raster = matches!(image_info.image, Some(Image::Raster(_)));
+                if image_key.is_none() && !emit_keyless_raster {
+                    Vec::new()
+                } else {
+                    vec![Fragment::Image(Arc::new(ImageFragment {
                         base,
                         clip,
-                        image_key: Some(image_key),
+                        image_key,
                         showing_broken_image_icon: image_info.showing_broken_image_icon,
                         url: image_info.url.clone(),
-                    }))
-                })
-                .into_iter()
-                .collect(),
+                    }))]
+                }
+            },
             ReplacedContentKind::Video(video_info) => {
                 vec![Fragment::Image(Arc::new(ImageFragment {
                     base,

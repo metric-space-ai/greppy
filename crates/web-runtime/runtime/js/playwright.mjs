@@ -2305,19 +2305,27 @@ class Page {
 
   async screenshot(options) {
     let clip = null;
+    let renderComplete = false;
     if (options != null) {
       const keys = Object.keys(options).filter((key) => options[key] !== undefined);
-      if (keys.some((key) => key !== "clip") || !options.clip) {
+      if (keys.some((key) => key !== "clip" && key !== "renderComplete")) {
         return unsupported("Page.screenshot.options")();
       }
-      clip = {
-        x: Number(options.clip.x) || 0,
-        y: Number(options.clip.y) || 0,
-        width: Number(options.clip.width) || 1,
-        height: Number(options.clip.height) || 1,
-      };
+      if (options.clip) {
+        clip = {
+          x: Number(options.clip.x) || 0,
+          y: Number(options.clip.y) || 0,
+          width: Number(options.clip.width) || 1,
+          height: Number(options.clip.height) || 1,
+        };
+      }
+      renderComplete = options.renderComplete === true;
     }
-    const result = await engineCall("page.screenshot", { page: this._id, clip });
+    const result = await engineCall("page.screenshot", {
+      page: this._id,
+      clip,
+      renderComplete,
+    });
     return screenshotBuffer(result);
   }
 

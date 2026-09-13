@@ -8,6 +8,7 @@ use std::sync::Arc;
 use app_units::{AU_PER_PX, Au};
 use clip::Clip;
 pub(crate) use clip::ClipId;
+use embedder_traits::promote_deferred_image_decode;
 use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
@@ -818,7 +819,21 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             .to_webrender();
         let common = self.common_properties(state, clip, &style);
 
-        if let Some(image_key) = fragment.image_key {
+        let image_key = fragment.image_key.or_else(|| {
+            if !promote_deferred_image_decode() {
+                return None;
+            }
+            let url = fragment.url.as_ref()?;
+            match self.image_resolver.image_cache.get_image(
+                url.clone(),
+                self.image_resolver.origin.clone(),
+                None,
+            )? {
+                CachedImage::Raster(raster) => raster.id,
+                _ => None,
+            }
+        });
+        if let Some(image_key) = image_key {
             self.wr().push_image(
                 &common,
                 rect,

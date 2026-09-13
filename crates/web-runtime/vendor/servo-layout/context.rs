@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use embedder_traits::UntrustedNodeAddress;
+use embedder_traits::{promote_deferred_image_decode, UntrustedNodeAddress};
 use euclid::Size2D;
 use fonts::FontContext;
 use layout_api::{
@@ -218,6 +218,21 @@ impl ImageResolver {
         destination: LayoutImageDestination,
         is_internal_request: InternalRequest,
     ) -> Result<CachedImage, ResolveImageError> {
+        if promote_deferred_image_decode() {
+            if let Some(image) =
+                self.image_cache
+                    .get_image(url.clone(), self.origin.clone(), None)
+            {
+                if let CachedImage::Raster(raster) = &image {
+                    if raster.id.is_some() {
+                        self.resolved_images_cache
+                            .write()
+                            .insert(url.clone(), Ok(image.clone()));
+                        return Ok(image);
+                    }
+                }
+            }
+        }
         if let Some(cached_image) = self.resolved_images_cache.read().get(&url) {
             return cached_image.clone();
         }

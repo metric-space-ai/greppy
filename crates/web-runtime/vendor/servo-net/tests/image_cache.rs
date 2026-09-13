@@ -849,6 +849,28 @@ fn get_image_decodes_deferred_raster_pixels() {
 }
 
 #[test]
+fn get_image_assigns_webrender_key_for_visual_paint() {
+    let (cache, key_receiver) = create_test_image_cache();
+    let url = ServoUrl::parse("http://example.com/test.jpeg").unwrap();
+    let origin = mock_origin();
+    push_jpeg(&cache, url.clone(), origin.clone());
+    // Prime the key cache the way a live paint API would: request a key,
+    // deliver a batch, then decode. Visual paint uploads with that key.
+    let _ = cache.get_image_key();
+    handle_pending_key_requests(&cache, &key_receiver);
+    let image = cache
+        .get_image(url, origin, None)
+        .expect("visual path must decode on demand");
+    let net_traits::image_cache::Image::Raster(raster) = image else {
+        panic!("expected raster");
+    };
+    assert!(
+        raster.id.is_some(),
+        "visual paint needs a WebRender key on the decoded raster"
+    );
+}
+
+#[test]
 fn raster_load_event_fires_at_eof_before_decode() {
     let (cache, _key_receiver) = create_test_image_cache();
     let url = ServoUrl::parse("http://example.com/test.jpeg").unwrap();
