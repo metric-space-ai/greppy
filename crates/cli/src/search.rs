@@ -855,7 +855,9 @@ fn search_pattern_case_insensitive_hits(
     query: &str,
     root_path: &std::path::Path,
     fixed: bool,
-) -> Result<Vec<greppy_search::CodeHit>> {
+    path_filters: &QueryPathFilters,
+) -> Result<Option<Vec<greppy_search::CodeHit>>> {
+    const MAX_DIAGNOSTIC_FILES: usize = 1_024;
     let overrides = discover_overrides_from_env()?;
     let entries = greppy_discover::walk_with_policy_and_overrides(
         root_path,
@@ -865,9 +867,13 @@ fn search_pattern_case_insensitive_hits(
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
+        .filter(|path| path_filters.matches(&path.to_string_lossy()))
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
+    }
+    if paths.len() > MAX_DIAGNOSTIC_FILES {
+        return Ok(None);
     }
     let mut hits = Vec::new();
     for chunk in paths.chunks(128) {
@@ -894,7 +900,7 @@ fn search_pattern_case_insensitive_hits(
                 .filter_map(parse_grep_code_hit),
         );
     }
-    Ok(hits)
+    Ok(Some(hits))
 }
 
 fn search_pattern_rows(
@@ -1115,14 +1121,14 @@ pub(crate) fn dispatch_search_code(
     }
 
     if rows.is_empty() {
+        let insensitive =
+            search_pattern_case_insensitive_hits(q, &root_path, fixed, &path_filters)?;
+        // Finish every source scan before emitting the terminal answer.  A caller
+        // may treat `status: no_matches` as completion even though the optional
+        // case-insensitive diagnostic can still take substantial time on a large
+        // repository.
         search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
-        let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
-        insensitive.retain(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| path_filters.matches(file))
-        });
-        if !insensitive.is_empty() {
+        if let Some(insensitive) = insensitive.filter(|hits| !hits.is_empty()) {
             println!("case-insensitive: {} matches", insensitive.len());
         }
         // grep's code, as the prompt promises for the search commands. The
