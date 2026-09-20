@@ -510,43 +510,6 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    if json {
-        let fetch = if kind.is_some() {
-            10_000
-        } else {
-            cli_result_limit(20)
-        };
-        let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
-        hits.retain(|hit| {
-            store
-                .get_node(hit.node_id)
-                .ok()
-                .flatten()
-                .is_some_and(|node| {
-                    search_symbol_name_contains(&node, q)
-                        && path_filters.matches(&node.file_path)
-                        && search_kind_matches(&root_path, &node, kind)
-                })
-        });
-        let total_filtered = hits.len() as i64;
-        hits.truncate(cli_result_limit_unless_all(20, all));
-        let status = if hits.is_empty() { "no_matches" } else { "ok" };
-        search_symbols_json(
-            &store,
-            q,
-            &project,
-            status,
-            Some(&freshness),
-            &hits,
-            &path_filters,
-            // The containment filter shapes `hits` on every run, so the total
-            // must count the same set on every run — a count from before the
-            // filter is a false number (measured: total_exact 2 beside 1 hit).
-            Some(total_filtered),
-        )?;
-        return Ok(0);
-    }
-
     let mut all_nodes = search_all_nodes(&store, &project)?;
     all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
     let matches_outside_filter = all_nodes
@@ -565,6 +528,36 @@ pub(crate) fn dispatch_search_symbols(
         .cloned()
         .collect::<Vec<_>>();
     search_sort_name_rows(q, &mut contained);
+    if json {
+        // JSON changes presentation, not retrieval, ordering or cardinality.
+        // Count the complete filtered name match set before applying the limit.
+        let total_filtered = contained.len() as i64;
+        let hits = contained
+            .iter()
+            .take(cli_result_limit_unless_all(20, all))
+            .enumerate()
+            .map(|(rank, node)| greppy_search::SymbolHit {
+                node_id: node.id,
+                rank: rank as f64,
+            })
+            .collect::<Vec<_>>();
+        let status = if total_filtered == 0 {
+            "no_matches"
+        } else {
+            "ok"
+        };
+        search_symbols_json(
+            &store,
+            q,
+            &project,
+            status,
+            Some(&freshness),
+            &hits,
+            &path_filters,
+            Some(total_filtered),
+        )?;
+        return Ok(if total_filtered == 0 { 1 } else { 0 });
+    }
     if !contained.is_empty() {
         contained.truncate(cli_result_limit_unless_all(20, all));
         search_print_symbol_rows(&root_path, &contained, code);
@@ -618,7 +611,7 @@ pub(crate) fn dispatch_search_symbols(
         println!();
         println!("similar names:");
         search_print_symbol_rows(&root_path, &similar, code);
-        return Ok(0);
+        return Ok(1);
     }
 
     let meaning = search_symbol_meaning_hits(
@@ -637,12 +630,9 @@ pub(crate) fn dispatch_search_symbols(
         let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
         print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
     }
-    // Nothing at all was produced: keep grep's "no lines selected". The system
-    // prompt states this exactly -- "the search commands use grep's codes, 0
-    // for a hit and 1 for none" -- and it is the contract the agent reads, so
-    // the code follows it. The guidance the caller needs is in the status block
-    // above; it does not need the exit code to carry it as well.
-    Ok(if meaning.is_empty() { 1 } else { 0 })
+    // Suggestions help recover from a miss; they are not matches for the
+    // requested name and must not turn an empty primary result into success.
+    Ok(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -975,22 +965,18 @@ fn print_search_pattern_rows(
         *per_file.entry(&row.hit.file).or_insert(0) += 1;
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
-    if summarize {
-        let mut spread = per_file.into_iter().collect::<Vec<_>>();
-        spread.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
+    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
+    if shown < rows.len() {
+        // A limited query must not list every omitted file in its preamble.
         println!(
-            "{} matches: {}",
+            "— {} matches in {} files; showing {}",
             rows.len(),
-            spread
-                .into_iter()
-                .map(|(file, count)| format!("{file} {count}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            per_file.len(),
+            shown
         );
         println!();
     }
-    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
-    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
     // This regex only positions a display window. grep remains authoritative
     // for ERE matching; unsupported regex dialects retain a head preview.
     let display_regex = if code && !fixed {
@@ -1092,30 +1078,6 @@ pub(crate) fn dispatch_search_code(
             .is_some_and(|(file, _)| path_filters.matches(file))
     });
 
-    if json {
-        let shown_hits = all_hits
-            .iter()
-            .take(cli_result_limit(SEARCH_CODE_LIMIT))
-            .cloned()
-            .collect::<Vec<_>>();
-        emit_search_code_results_with_format(
-            &store,
-            q,
-            &project,
-            status,
-            Some(decision.freshness()),
-            all_hits.len(),
-            &shown_hits,
-            &path_filters,
-            &root_path,
-            true,
-            false,
-            fixed,
-            resolve_definitions,
-        )?;
-        return Ok(0);
-    }
-
     let rows = search_pattern_rows(
         &store,
         &project,
@@ -1124,6 +1086,34 @@ pub(crate) fn dispatch_search_code(
         resolve_definitions,
         kind,
     )?;
+    if json {
+        let shown_hits = rows
+            .iter()
+            .take(cli_result_limit_unless_all(SEARCH_CODE_LIMIT, all))
+            .map(|row| greppy_search::CodeHit {
+                location: format!("{}:{}", row.hit.file, row.hit.line),
+                snippet: row.hit.text.clone(),
+                rank: 0.0,
+            })
+            .collect::<Vec<_>>();
+        emit_search_code_results_with_format(
+            &store,
+            q,
+            &project,
+            status,
+            Some(decision.freshness()),
+            rows.len(),
+            &shown_hits,
+            &path_filters,
+            &root_path,
+            true,
+            false,
+            fixed,
+            resolve_definitions,
+        )?;
+        return Ok(if rows.is_empty() { 1 } else { 0 });
+    }
+
     if rows.is_empty() {
         search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
         let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
@@ -1137,7 +1127,7 @@ pub(crate) fn dispatch_search_code(
         }
         // grep's code, as the prompt promises for the search commands. The
         // status block above carries the guidance.
-        return Ok(if insensitive.is_empty() { 1 } else { 0 });
+        return Ok(1);
     }
     print_search_pattern_rows(&rows, code, all, q, fixed, &root_path);
     Ok(0)

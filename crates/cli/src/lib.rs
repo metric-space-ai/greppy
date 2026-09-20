@@ -978,6 +978,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                          No observation was run. Use `greppy web observe QUERY` for matching visible \
                          regions, or omit QUERY for the unfiltered page."
                     );
+                } else if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("wait")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                         `greppy web wait 'text~/WORD/i'` for partial text, or \
+                         `greppy web wait --url '~/PATTERN/'` for a URL."
+                    );
                 } else if sub == "path" && stray == "--code" {
                     println!(
                         "`path` prints the bounded call-site chain and does not accept `--code`; \
@@ -1649,7 +1662,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
 pub fn dispatch(cli: Cli) -> Result<i32> {
-    let _query_progress = query_progress::for_command(cli.command.as_ref());
+    let _query_progress = query_progress::for_command(cli.command.as_ref(), cli.root.as_deref());
     // If a recognised subcommand matched, dispatch it. Otherwise treat
     // the trailing args as a `grep` passthrough. This makes both
     //   greppy grep -R foo .
@@ -3863,7 +3876,7 @@ fn nav_freshness_json(
                     (false, "unknown", reasons)
                 }
             };
-            serde_json::json!({
+            let mut freshness = serde_json::json!({
                 "fresh": fresh,
                 "state": state_name,
                 "reasons": reasons,
@@ -3880,7 +3893,21 @@ fn nav_freshness_json(
                     "include": ENV_DISCOVER_INCLUDE,
                     "exclude": ENV_DISCOVER_EXCLUDE,
                 },
-            })
+            });
+            // An active writer prevents persisting a metadata-only fingerprint
+            // update, not reading content-equivalent graph rows. The completed
+            // inventory proof above must establish zero changed files and no
+            // root, scope, indexer-version or unknown-state drift. Keep the
+            // pending metadata visible rather than pretending it was persisted.
+            if metadata_only_fingerprint_drift(&freshness) && workspace_writer_active(root) {
+                freshness["metadata_drift_reasons"] = freshness["reasons"].clone();
+                freshness["metadata_refresh_pending"] = serde_json::json!(true);
+                freshness["source"] = serde_json::json!("verified_published_snapshot");
+                freshness["fresh"] = serde_json::json!(true);
+                freshness["state"] = serde_json::json!("fresh");
+                freshness["reasons"] = serde_json::json!([]);
+            }
+            freshness
         }
         Err(e) => serde_json::json!({
             "fresh": false,
@@ -9305,6 +9332,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9366,6 +9394,7 @@ const BUDGET_ARRAY_FIELDS: &[&str] = &[
     "callers",
     "references",
     "callees",
+    "candidates",
 ];
 
 fn result_item_count(value: &serde_json::Value) -> usize {
@@ -9853,11 +9882,8 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("unresolved textual candidates:")
 }
 
-fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
-    if exit_code != 0 {
-        return bytes.to_vec();
-    }
     let mut priority = Vec::new();
     let mut content = Vec::new();
     for line in text.lines() {
@@ -9887,11 +9913,25 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || selected.pop().is_none()
         {
             return rendered;
         }
+        if selected.pop().is_none() {
+            return hard_cap_text_output(rendered, spec.max_bytes.unwrap_or(usize::MAX));
+        }
     }
+}
+
+fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&rendered[..end]).is_err() {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered
 }
 
 /// Translate a `Result<i32>` into the actual exit code we should return.

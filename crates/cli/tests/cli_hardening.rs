@@ -152,6 +152,15 @@ fn browser_observe_accepts_one_query_but_never_discards_extra_scope() {
         assert!(out.contains("quote a selector containing spaces"), "{out}");
         assert!(!out.contains("ignoring"), "{out}");
     }
+    let (code, out, err) = run(&["web", "wait", "text", "Koushik", "--help"], &repo, &store);
+    assert_eq!(
+        code, 64,
+        "bare wait text WORD must not be discarded: {out}\n{err}"
+    );
+    assert!(out.contains("No wait was run"), "{out}");
+    assert!(out.contains("text=WORD"), "{out}");
+    assert!(out.contains("--url"), "{out}");
+    assert!(!out.contains("does not fit `web`"), "{out}");
     let (code, out, err) = run(&["web", "observe", "--help"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -616,7 +625,7 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "healed index returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -679,7 +688,7 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "old marker returns a bounded no-match status from live fallback; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -1891,7 +1900,7 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "retired symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -1967,7 +1976,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "replaced symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2238,7 +2247,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "pre-crash symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2764,6 +2773,133 @@ fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
     assert_eq!(
         code, 0,
         "query must recover after lease release: {out}\n{err}"
+    );
+}
+
+#[test]
+fn impact_and_path_accept_the_same_file_selector_as_read() {
+    let (repo, store, _scratch) = make_repo("qualified-navigation", "qualified_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let selector = "lib.rs::qualified_marker";
+    for args in [
+        vec!["read", selector],
+        vec!["impact", selector, "--json", "--diagnostics"],
+        vec![
+            "impact",
+            selector,
+            "--direction",
+            "outgoing",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "path",
+            "--from",
+            selector,
+            "--to",
+            selector,
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{args:?}: {out}\n{err}");
+        if args[0] == "impact" {
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(value["symbol_found"], true, "{value}");
+        }
+    }
+}
+
+#[test]
+fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
+    let (repo, store, _scratch) = make_real_git_repo("query-during-metadata-refresh");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed: {out}\n{err}");
+    // A commit changes the fingerprint without changing any indexed source.
+    git(&repo, &["commit", "--allow-empty", "-m", "metadata only"]);
+    let mut writer = hold_index_before_publish(&repo, &store, "metadata-refresh");
+    for args in [
+        vec![
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "who-calls",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(
+            code, 0,
+            "{args:?} must use the verified active graph: {out}\n{err}"
+        );
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_ne!(result["status"], "skipped_stale_index", "{result}");
+        assert_eq!(
+            result["freshness"]["metadata_refresh_pending"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["freshness"]["source"], "verified_published_snapshot",
+            "{result}"
+        );
+        assert!(
+            result["freshness"]["metadata_drift_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str().unwrap().starts_with("head_oid changed")),
+            "{result}"
+        );
+        if args[0] == "search-symbol" {
+            assert!(
+                result["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit["name"] == "clean_committed_marker"),
+                "{result}"
+            );
+        }
+        assert!(
+            writer.child.try_wait().unwrap().is_none(),
+            "query must finish while the real indexer remains active"
+        );
+    }
+    // Actual source changes still must not be represented as fresh graph data.
+    std::fs::write(repo.join("src/lib.rs"), "pub fn changed_marker() {}\n").unwrap();
+    let (code, out, err) = run(
+        &["search-symbol", "clean_committed_marker", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 75,
+        "changed source must not silently reuse old rows: {out}\n{err}"
+    );
+    drop(writer);
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "refresh must recover after prior writer stops: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["search-symbol", "changed_marker", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "new graph must be queryable: {out}\n{err}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["freshness"]["fresh"], true, "{result}");
+    assert!(
+        result["freshness"]["metadata_refresh_pending"].is_null(),
+        "{result}"
     );
 }
 

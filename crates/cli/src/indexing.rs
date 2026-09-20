@@ -663,6 +663,10 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         && diag.integrity_ok
         && project_present
         && fresh
+        && freshness
+            .get("metadata_refresh_pending")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
         && embedding_healthy
         && provider_failure_count == 0
         && coverage_warning.is_none()

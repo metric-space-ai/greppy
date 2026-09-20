@@ -322,6 +322,20 @@ pub(crate) fn resolve_symbol_id(
     store: &greppy_store::Store,
     symbol: Option<&str>,
 ) -> Result<Option<i64>> {
+    if symbol.is_some_and(|query| split_path_qualified(query).is_some()) {
+        // Reuse the same file-qualified selector contract as read/callees.
+        // Treating the file as an owner made impact/path reject valid targets.
+        let mut candidates = Vec::new();
+        for id in resolve_symbol_nodes(store, symbol)? {
+            if let Some(node) = store.get_node(id)? {
+                candidates.push(node);
+            }
+        }
+        return Ok(candidates
+            .into_iter()
+            .min_by_key(|node| (label_rank(&node.label), node.id))
+            .map(|node| node.id));
+    }
     // Push the name filter into SQL. The old form loaded the first 10k
     // nodes of the project (ordered by qualified_name) and filtered in
     // memory — on a repo bigger than the cap (django: 56k nodes) every
@@ -472,9 +486,9 @@ pub(crate) fn resolve_symbol_nodes(
         };
         ids.sort_unstable();
         ids.dedup();
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
+        // A file selector is authoritative, including when it has no match.
+        // Do not recurse into the single-node resolver or guess another file.
+        return Ok(ids);
     }
     // Name filter pushed into SQL — see resolve_symbol_id for why the old
     // capped whole-project scan was wrong on large repos.

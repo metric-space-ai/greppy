@@ -164,6 +164,10 @@ impl ChunkStore {
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<ChunkId> {
+        self.put_with_miss_hook(bytes, || {})
+    }
+
+    fn put_with_miss_hook(&self, bytes: &[u8], on_miss: impl FnOnce()) -> Result<ChunkId> {
         if bytes.len() > CHUNK_SIZE {
             return Err(Error::Corrupt(format!(
                 "chunk has {} bytes, maximum is {CHUNK_SIZE}",
@@ -191,7 +195,29 @@ impl ChunkStore {
             return Ok(id);
         }
 
+        // Test callers use this seam to hold two optimistic misses at the
+        // same point. Production puts take the normal no-op path.
+        on_miss();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The SELECT above is outside the writer lock. Parallel processes that
+        // share chunks.sqlite3 can both observe a miss, then the second INSERT
+        // hits UNIQUE cow_chunks.hash. Re-check after BEGIN IMMEDIATE.
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT len FROM cow_chunks WHERE hash = ?1",
+                params![&id.0[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(len) = existing {
+            if len != bytes.len() as i64 {
+                return Err(Error::Corrupt(format!(
+                    "chunk hash {id} is registered with conflicting length {len}"
+                )));
+            }
+            transaction.commit()?;
+            return Ok(id);
+        }
         let (mut segment_id, mut committed_len): (i64, u64) = transaction.query_row(
             "SELECT id, committed_len FROM cow_segments ORDER BY id DESC LIMIT 1",
             [],
@@ -1021,6 +1047,35 @@ mod tests {
         for (id, payload) in written {
             assert_eq!(store.read(id).unwrap(), payload.as_bytes());
         }
+    }
+
+    #[test]
+    fn concurrent_identical_puts_reuse_the_hash() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ChunkStore::open(root.path()).unwrap());
+        let payload = b"shared payload for cas race";
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let store = retry_when_busy(|| ChunkStore::open(&root));
+                    store.put_with_miss_hook(payload, || {
+                        start.wait();
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let store = ChunkStore::open(root.path()).unwrap();
+        assert_eq!(store.read(ids[0]).unwrap(), payload);
+        assert_eq!(store.stats().unwrap().chunk_count, 1);
     }
 
     #[test]

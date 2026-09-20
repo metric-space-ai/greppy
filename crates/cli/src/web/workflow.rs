@@ -148,6 +148,14 @@ fn compile_action(command: ActCommand, json_out: bool) -> std::result::Result<Co
             )
         }
     };
+    if let Some(query) = opts.expect.as_deref() {
+        if let Err(error) = super::see::validate_condition_query(query) {
+            return Err(rejected(
+                json_out,
+                &format!("web workflow expectation: {error}"),
+            ));
+        }
+    }
     let expect = opts.expect.map(|query| Expectation {
         condition: Condition {
             query: Some(query),
@@ -180,12 +188,19 @@ fn compile(command: WebCommand, json_out: bool) -> std::result::Result<Compiled,
             };
             Ok(Compiled { step: Step { action: Some(action), expect: None }, session, tab, open })
         }
-        WebCommand::Expect(ExpectCommand::Wait { condition, timeout, .. }) => Ok(Compiled {
-            step: Step { action: None, expect: Some(Expectation {
-                condition: Condition { query: condition.query, url: condition.url, title: condition.title, absent: condition.absent },
-                timeout_ms: timeout,
-            }) }, session: condition.session, tab: condition.tab, open: false,
-        }),
+        WebCommand::Expect(ExpectCommand::Wait { condition, timeout, .. }) => {
+            if let Some(query) = condition.query.as_deref() {
+                if let Err(error) = super::see::validate_condition_query(query) {
+                    return Err(rejected(json_out, &format!("web workflow wait: {error}")));
+                }
+            }
+            Ok(Compiled {
+                step: Step { action: None, expect: Some(Expectation {
+                    condition: Condition { query: condition.query, url: condition.url, title: condition.title, absent: condition.absent },
+                    timeout_ms: timeout,
+                }) }, session: condition.session, tab: condition.tab, open: false,
+            })
+        }
         _ => Err(rejected(json_out, "native workflow supports navigation, actions and wait; no steps executed. Use ordinary web do for other commands.")),
     }
 }
@@ -316,5 +331,18 @@ mod tests {
             assert!(Cli::try_parse_from(args).is_err());
         }
         assert!(Cli::try_parse_from(["test", "click", "@1"]).is_ok());
+    }
+
+    #[test]
+    fn workflow_validates_wait_dialects_before_runtime_dispatch() {
+        for arguments in [
+            vec!["test", "wait", "title=Ready"],
+            vec!["test", "click", "@1", "--expect", "url=~/done/"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert_eq!(compile(cli.command, true).err(), Some(EXIT_WEB_INVALID));
+        }
+        let cli = Cli::try_parse_from(["test", "wait", "title~meta"]).unwrap();
+        assert!(compile(cli.command, true).is_ok());
     }
 }

@@ -301,6 +301,71 @@ fn who_calls_honours_the_module_qualifier_over_a_same_file_twin() {
 }
 
 #[test]
+fn index_upgrade_repairs_old_call_edges_without_source_edits() {
+    let (repo, store_dir) = make_graph_repo("old-call-edges");
+    let src = repo.join("src");
+    std::fs::write(src.join("lib.rs"), "mod store;\nmod app;\n").unwrap();
+    std::fs::write(src.join("store.rs"), "pub fn resolve_root() -> u32 { 1 }\n").unwrap();
+    std::fs::write(src.join("app.rs"), "use crate::store;\npub fn resolve_root() -> u32 { 2 }\npub fn use_store_root() -> u32 { store::resolve_root() }\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let db = find_graph_db(&store_dir).unwrap();
+    {
+        let store = greppy_store::Store::open(&db).unwrap();
+        // Simulate the persisted v5 defect, keeping raw callee_path metadata
+        // and unchanged file hashes so a no-op incremental run cannot repair it.
+        store
+            .conn()
+            .execute(
+                "UPDATE workspace_state SET indexer_version = 'greppy-indexer-v5'",
+                [],
+            )
+            .unwrap();
+        let changed = store.conn().execute(
+            "UPDATE edges SET target_id = (SELECT id FROM nodes WHERE name = 'resolve_root' AND file_path = 'src/app.rs')
+             WHERE edge_type = 'CALLS' AND source_id = (SELECT id FROM nodes WHERE name = 'use_store_root' AND file_path = 'src/app.rs')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            changed, 1,
+            "seed the wrong same-file twin as the persisted target"
+        );
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "upgrade must rebuild persisted edges: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/store.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("use_store_root"),
+        "missing real caller after upgrade: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/app.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !out.contains("use_store_root"),
+        "stale wrong edge survived migration: {out}\n{err}"
+    );
+    let store =
+        greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only()).unwrap();
+    assert!(store
+        .list_workspace_states()
+        .unwrap()
+        .iter()
+        .all(|state| state.indexer_version == greppy_core::INDEXER_VERSION_BASE));
+}
+
+#[test]
 fn who_calls_lists_cross_file_caller_with_file_line() {
     let (repo, store) = index_fixture("whocalls");
 
@@ -978,6 +1043,216 @@ fn trace_depth_zero_returns_only_start() {
 // ---------------------------------------------------------------------------
 // search-symbols — improved output carries label + qualified_name + file:line.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
+    let (repo, store) = make_graph_repo("search-format-contract");
+    for index in 0..8 {
+        std::fs::write(
+            repo.join(format!("src/symbol_{index}.rs")),
+            "pub fn contract_main() {}\n",
+        )
+        .unwrap();
+    }
+    for scope in ["a", "b"] {
+        std::fs::create_dir_all(repo.join("src").join(scope)).unwrap();
+        for index in 0..2 {
+            std::fs::write(
+                repo.join(format!("src/{scope}/path_{index}.rs")),
+                "pub fn path_match() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(
+        repo.join("src/kinds.rs"),
+        "pub struct ContractKind;\npub fn makeContractKind() {}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, text, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{text}\n{err}");
+    let (code, out, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["total_exact"], 8, "{out}");
+    assert_eq!(value["shown"], 3, "{out}");
+    assert_eq!(value["omitted"], 5, "{out}");
+    let locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            format!(
+                "{}:{}",
+                hit["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                hit["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        })
+        .collect::<Vec<_>>();
+    let text_locations = text
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.starts_with("src/symbol_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, locations,
+        "JSON must only change presentation"
+    );
+
+    for command in ["search-symbol", "search-pattern"] {
+        let args = [command, "path_match", "--path", "src/b", "--limit", "1"];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        assert!(text.contains("src/b/path_0.rs:1"), "{text}");
+        assert!(!text.contains("src/a/"), "{text}");
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, out, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 2,
+            "count must exclude other directory: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        assert_eq!(value["omitted"], 1, "{out}");
+        let location = if command == "search-symbol" {
+            format!(
+                "{}:{}",
+                value["hits"][0]["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                value["hits"][0]["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        } else {
+            value["hits"][0]["matches"][0]["location"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(location, "src/b/path_0.rs:1");
+        let (code, out, err) = run(
+            &[command, "ContractKind", "--kind", "struct", "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{command}: {out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 1,
+            "kind filter must precede counting: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        for query in ["QQZZABSENT987654321", "CONTRACT_MAIN"] {
+            for json in [false, true] {
+                let mut args = vec![command, query];
+                if json {
+                    args.push("--json");
+                }
+                let (code, out, err) = run(&args, &repo, &store);
+                assert_eq!(
+                    code, 1,
+                    "primary no-match must remain a miss, {args:?}: {out}\n{err}"
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(value["total_exact"], 0, "{out}");
+                    let status_key = if command == "search-symbol" {
+                        "status"
+                    } else {
+                        "result_status"
+                    };
+                    assert_eq!(value[status_key], "no_matches", "{out}");
+                    assert_eq!(value["hits"].as_array().unwrap().len(), 0, "{out}");
+                } else {
+                    assert!(out.contains("no_matches"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn search_pattern_limited_summary_does_not_expand_omitted_files() {
+    let (repo, store) = make_graph_repo("pattern-limited-summary");
+    for index in 0..30 {
+        std::fs::write(
+            repo.join(format!("src/summary_{index:02}.rs")),
+            "pub fn limited_summary_marker() {}\n",
+        )
+        .unwrap();
+    }
+    // Name-order scanning would put this file first, but the shared result
+    // order prefers files with fewer matches. Exercise a real ranking split.
+    std::fs::write(repo.join("src/summary_00.rs"),
+        "pub fn limited_summary_marker() {}\n// limited_summary_marker\n// limited_summary_marker\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &["search-pattern", "limited_summary_marker", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("32 matches in 30 files; showing 3"), "{out}");
+    let text_locations = out
+        .lines()
+        .filter(|line| line.starts_with("src/summary_"))
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "limited_summary_marker",
+            "--limit",
+            "3",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["total_exact"], 32, "{json}");
+    let json_locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, json_locations,
+        "both formats must rank the same rows"
+    );
+    assert_eq!(text_locations[0], "src/summary_01.rs:1");
+    assert!(
+        !out.contains("src/summary_29.rs"),
+        "omitted paths must not leak through the summary: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("src/summary_"))
+            .count(),
+        3,
+        "{out}"
+    );
+}
 
 #[test]
 fn search_symbols_prints_label_and_file_line() {

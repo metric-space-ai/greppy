@@ -31,7 +31,9 @@
 ///   worktree instead of duplicating them into SQLite by default.
 ///   v4 -> v5 (2026-09-05): Rust grammar 0.24.2 correctly parses borrows of
 ///   the contextual identifier `raw`; old extraction trees may be incomplete.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v5";
+///   v5 -> v6: resolve module-qualified Rust calls before same-file twins;
+///   existing resolved CALLS edges must not survive as a no-op incremental run.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v6";
 
 pub mod cache;
 pub mod diag;

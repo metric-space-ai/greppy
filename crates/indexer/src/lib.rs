@@ -266,32 +266,49 @@ pub fn index_with_options_and_progress(
 ) -> Result<IndexReport> {
     progress(IndexBuildProgress::new("discovering_files", 0, 0));
     let abs_root = greppy_discover::detect_repo_root(root)?;
+    let indexer_version = indexer_version_for_options(options);
+    let prior_state = store.list_private_file_states(project_name)?;
+    // Compatibility must be read before publishing the new version or filtering
+    // the inventory. Migrate every retained file in this store layer, even when
+    // this invocation would ordinarily refresh only a few Delta paths.
+    let incompatible_index = store
+        .list_private_workspace_states()?
+        .iter()
+        .find(|state| state.root_path == abs_root.to_string_lossy())
+        .map_or(!prior_state.is_empty(), |state| {
+            state.indexer_version != indexer_version
+        });
+    let mut only_paths = options.only_paths.clone();
+    if incompatible_index {
+        if let Some(paths) = only_paths.as_mut() {
+            paths.extend(prior_state.iter().map(|state| state.rel_path.clone()));
+        }
+    }
     let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
         &abs_root,
         &greppy_discover::SkipPolicy::walk_default(),
         &options.discover_overrides,
     )?;
-    let (all_entries, discovery_filtered_entries) =
-        if let Some(only_paths) = options.only_paths.as_ref() {
-            let discovered_paths = discovered_entries
-                .iter()
-                .map(|entry| entry.rel_path.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let filtered = only_paths
-                .iter()
-                .filter(|rel_path| !discovered_paths.contains(rel_path.as_str()))
-                .filter_map(|rel_path| explicit_filtered_inventory_entry(&abs_root, rel_path))
-                .collect::<Vec<_>>();
-            (
-                discovered_entries
-                    .into_iter()
-                    .filter(|entry| only_paths.contains(&entry.rel_path))
-                    .collect::<Vec<_>>(),
-                filtered,
-            )
-        } else {
-            (discovered_entries, Vec::new())
-        };
+    let (all_entries, discovery_filtered_entries) = if let Some(only_paths) = only_paths.as_ref() {
+        let discovered_paths = discovered_entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let filtered = only_paths
+            .iter()
+            .filter(|rel_path| !discovered_paths.contains(rel_path.as_str()))
+            .filter_map(|rel_path| explicit_filtered_inventory_entry(&abs_root, rel_path))
+            .collect::<Vec<_>>();
+        (
+            discovered_entries
+                .into_iter()
+                .filter(|entry| only_paths.contains(&entry.rel_path))
+                .collect::<Vec<_>>(),
+            filtered,
+        )
+    } else {
+        (discovered_entries, Vec::new())
+    };
     progress(IndexBuildProgress::new(
         "classifying_files",
         0,
@@ -335,7 +352,7 @@ pub fn index_with_options_and_progress(
         head_oid: fp.head_oid.clone(),
         index_signature: fp.index_signature.clone(),
         schema_version: store.schema_version()?,
-        indexer_version: indexer_version_for_options(options),
+        indexer_version,
         graph_generation: 0,
         updated_at: ws::now_iso8601(),
     })?;
@@ -396,8 +413,16 @@ pub fn index_with_options_and_progress(
     // paths then re-resolve over the *whole* project's raw edges, so the
     // resulting graph is byte-for-byte identical to a full reindex (the
     // `incremental_matches_full_reindex` test enforces this).
-    let prior_state = store.list_file_states(project_name)?;
-    let incremental = !prior_state.is_empty() && raw_edges_present;
+    if incompatible_index {
+        // Reuse the ordinary per-file cleanup, including files removed or
+        // excluded since the old snapshot, before full extraction. This stays
+        // inside the unpublished snapshot used by CLI indexing.
+        for state in &prior_state {
+            drop_indexed_rows_for_skip(store, project_name, &state.rel_path)?;
+            store.delete_index_skip(project_name, &state.rel_path)?;
+        }
+    }
+    let incremental = !incompatible_index && !prior_state.is_empty() && raw_edges_present;
 
     if incremental {
         // Capture the project's **definition fingerprint** before we touch
@@ -3695,6 +3720,124 @@ mod tests {
             }
         }
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn index_version_upgrade_does_not_copy_base_into_delta() {
+        let repo = setup_repo("version-upgrade-overlay", "pub fn dirty_file() {}\n");
+        fs::write(repo.join("src/clean.rs"), "pub fn clean_base_file() {}\n").unwrap();
+        let stores = repo.with_extension("stores");
+        fs::create_dir_all(&stores).unwrap();
+        let base_path = stores.join("base.db");
+        let delta_path = stores.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+        }
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["src/lib.rs".to_string()])),
+            ..IndexOptions::default()
+        };
+        {
+            let mut delta = Store::open(&delta_path).unwrap();
+            index_with_options(&mut delta, &repo, "test", &options).unwrap();
+            for mut state in delta.list_workspace_states().unwrap() {
+                state.indexer_version = "greppy-indexer-v5".into();
+                delta.upsert_workspace_state(&state).unwrap();
+            }
+        }
+        let visibility =
+            greppy_store::VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new())
+                .unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(overlay
+            .list_file_states("test")
+            .unwrap()
+            .iter()
+            .any(|state| state.rel_path == "src/clean.rs"));
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        let report = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
+        assert_eq!(
+            report.files_indexed, 1,
+            "only the old Delta may be migrated"
+        );
+        let private = overlay.list_private_file_states("test").unwrap();
+        assert_eq!(private.len(), 1);
+        assert_eq!(private[0].rel_path, "src/lib.rs");
+        let nodes = overlay
+            .list_nodes_by_label("test", "Function", 100)
+            .unwrap();
+        assert!(nodes.iter().any(|node| node.name == "dirty_file"));
+        assert!(nodes.iter().any(|node| node.name == "clean_base_file"));
+        // A current Base row must not hide lost compatibility metadata in an
+        // existing private layer and wrongly permit incremental reuse.
+        overlay
+            .conn()
+            .execute("DELETE FROM main.workspace_state", [])
+            .unwrap();
+        assert!(!overlay.list_workspace_states().unwrap().is_empty());
+        assert!(overlay.list_private_workspace_states().unwrap().is_empty());
+        let repaired = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
+        assert_eq!(
+            repaired.files_indexed, 1,
+            "missing Delta metadata requires migration"
+        );
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        drop(overlay);
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(stores);
+    }
+
+    #[test]
+    fn index_version_upgrade_preserves_sparse_layer_and_then_reuses_it() {
+        let repo = setup_repo("version-upgrade-sparse", "pub fn changed_path() {}\n");
+        fs::write(repo.join("src/retained.rs"), "pub fn retained_path() {}\n").unwrap();
+        fs::write(repo.join("src/outside.rs"), "pub fn outside_layer() {}\n").unwrap();
+        fs::write(repo.join(".gitattributes"), "*.bin binary\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let initial = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "src/lib.rs".to_string(),
+                "src/retained.rs".to_string(),
+                ".gitattributes".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        assert!(store
+            .get_index_skip("test", ".gitattributes")
+            .unwrap()
+            .is_some());
+        fs::remove_file(repo.join(".gitattributes")).unwrap();
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version = "greppy-indexer-v5".into();
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let narrow = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["src/lib.rs".to_string()])),
+            ..IndexOptions::default()
+        };
+        let upgraded = index_with_options(&mut store, &repo, "test", &narrow).unwrap();
+        assert_eq!(
+            upgraded.files_indexed, 2,
+            "all retained layer files need migration"
+        );
+        assert_eq!(upgraded.files_skipped, 0);
+        assert!(store
+            .get_index_skip("test", ".gitattributes")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_file_state("test", ".gitattributes")
+            .unwrap()
+            .is_none());
+        let nodes = store.list_nodes_by_label("test", "Function", 100).unwrap();
+        assert!(nodes.iter().any(|node| node.name == "retained_path"));
+        assert!(!nodes.iter().any(|node| node.name == "outside_layer"));
+        let unchanged = index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        assert_eq!(unchanged.files_indexed, 0, "migration must run only once");
+        assert_eq!(unchanged.files_skipped, 2);
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]

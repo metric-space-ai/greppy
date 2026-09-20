@@ -191,8 +191,8 @@ fn empty_search_pattern_reports_the_case_insensitive_fact() {
     );
 
     assert_eq!(
-        code, 0,
-        "a case-insensitive hit IS a hit, so this case keeps grep's 0; stdout={stdout}"
+        code, 1,
+        "case-insensitive suggestions are not primary case-sensitive hits; stdout={stdout}"
     );
     assert!(stdout.contains("status: no_matches"), "{stdout}");
     assert!(

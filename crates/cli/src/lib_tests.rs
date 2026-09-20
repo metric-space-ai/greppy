@@ -667,6 +667,32 @@ fn parse_path_disambiguation_and_hyphen_values() {
 }
 
 #[test]
+fn ambiguous_read_failure_respects_explicit_stdout_budget() {
+    let cli = Cli::try_parse_from(["greppy", "read", "main", "--max-bytes", "3000"])
+        .expect("read accepts a global byte budget");
+    let spec = output_budget_spec(&cli).expect("read must enable shared output capture");
+    assert_eq!(spec.command, "read");
+    assert_eq!(spec.max_bytes, Some(3000));
+
+    let mut output = String::from("`main` is 83 definitions\n");
+    for index in 0..83 {
+        output.push_str(&format!(
+            "crates/example/src/long_module_name_{index}/implementation.rs:{}\n",
+            index + 1
+        ));
+    }
+    let rendered = budget_text_output(output.as_bytes(), &spec, 1);
+    assert!(rendered.len() <= 3000, "{} bytes", rendered.len());
+    let rendered = String::from_utf8(rendered).unwrap();
+    assert!(rendered.contains("truncated: true"), "{rendered}");
+    assert!(
+        rendered.contains("try: greppy read --offset "),
+        "{rendered}"
+    );
+    assert!(rendered.contains("`main` is 83 definitions"), "{rendered}");
+}
+
+#[test]
 fn parse_plus_uses_vectors_without_a_public_flag() {
     let cli =
         Cli::try_parse_from(["greppy", "plus", "--json", "--k", "5", "refund workflow"]).unwrap();
@@ -1992,6 +2018,31 @@ fn qualified_query_resolves_to_owner_node() {
         resolve_symbol_nodes(&store, Some("com.google.gson.JsonArray.get")).unwrap(),
         vec![arr]
     );
+}
+
+#[test]
+fn file_qualified_single_and_multi_resolvers_agree() {
+    let store = store_with_defs(&[
+        ("Function", "src/first.rs", "Function", "run"),
+        ("Function", "src/second.rs", "Function", "run"),
+    ]);
+    let first = id_of(&store, "src/first.rs", "Function", "run");
+    for selector in ["src/first.rs::run", "src/first.rs::Function::run"] {
+        assert_eq!(
+            resolve_symbol_nodes(&store, Some(selector)).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            resolve_symbol_id(&store, Some(selector)).unwrap(),
+            Some(first)
+        );
+    }
+    for selector in ["missing.rs::run", "src/first.rs::missing"] {
+        assert!(resolve_symbol_nodes(&store, Some(selector))
+            .unwrap()
+            .is_empty());
+        assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
+    }
 }
 
 /// REGRESSION 2: never-guess. A qualified query whose `Owner.member`
