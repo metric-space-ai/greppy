@@ -8036,36 +8036,28 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
-    let created = unix_request(
+    let source = r#"
+let total = 0;
+const until = Date.now() + 100;
+while (Date.now() < until) {
+  for (let i = 0; i < 10_000; i++) total += Math.sqrt(i);
+}
+console.log(total);
+    "#;
+    let ran = run_playwright_source_with_limits(
         &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.session.create",
-            json!({ "profile": "project", "limits": { "controller_cpu_ms": 1 } }),
-        ),
-        Duration::from_secs(10),
-    )
-    .expect("create");
-    let session_id = created.result.as_ref().unwrap()["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let origin = serve_fixture("<p>ctlcpu</p>");
-    let read = unix_request(
-        &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.read",
-            json!({ "session_id": session_id, "url": origin }),
-        ),
+        "run_ctlcpu",
+        source,
+        None,
         Duration::from_secs(15),
-    )
-    .expect("read");
-    assert_eq!(read.status, "error", "{read:?}");
-    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+        json!({ "controller_cpu_ms": 1 }),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit", "{ran:?}");
+    assert!(ran.metrics.controller_cpu_ms > 0, "{ran:?}");
     assert!(
-        read.error.as_ref().unwrap().message.contains("cpu time"),
-        "{read:?}"
+        ran.error.as_ref().unwrap().message.contains("cpu time"),
+        "{ran:?}"
     );
 }
 

@@ -809,30 +809,16 @@ impl Daemon {
         // click, observe -- reported nothing about what they cost. Time the
         // dispatch here and fill in whatever the handler left empty.
         let dispatch_started = Instant::now();
-        let content_before = sample_cpu_ms(self.content.pid());
-        let controller_before = sample_cpu_ms(self.controller.pid());
+        let content_pid_before = self.content.pid();
+        let controller_pid_before = self.controller.pid();
+        let content_cpu_before_ns = sample_cpu_ns(content_pid_before);
+        let controller_cpu_before_ns = sample_cpu_ns(controller_pid_before);
         let session_id = request
             .payload
             .get("session_id")
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .or_else(|| request.session_id.clone());
-        if let Some(session) = session_id
-            .as_ref()
-            .and_then(|session_id| self.sessions.get_mut(session_id))
-        {
-            // Start a new session's CPU accounting before any supervisor
-            // preflight. `session.networkBytes` below is real controller work
-            // performed for this request and must not sit outside the budget.
-            let _ = session_cpu_delta_ms(
-                &mut session.content_cpu_baseline,
-                self.content.pid(),
-            );
-            let _ = session_cpu_delta_ms(
-                &mut session.controller_cpu_baseline,
-                self.controller.pid(),
-            );
-        }
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
@@ -852,14 +838,6 @@ impl Daemon {
         if response.metrics.peak_rss_bytes == 0 {
             response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
         }
-        if response.metrics.content_cpu_ms == 0 {
-            response.metrics.content_cpu_ms =
-                sample_cpu_ms(self.content.pid()).saturating_sub(content_before);
-        }
-        if response.metrics.controller_cpu_ms == 0 {
-            response.metrics.controller_cpu_ms =
-                sample_cpu_ms(self.controller.pid()).saturating_sub(controller_before);
-        }
         if response.metrics.network_bytes == 0 {
             if let Some(before) = bytes_before {
                 if self.content.is_running() {
@@ -873,47 +851,71 @@ impl Daemon {
                 }
             }
         }
-        // The pre-dispatch check in `with_session_page` protects every later
-        // operation from CPU already consumed by this session. The first
-        // operation starts the per-worker baseline, though, so its actual CPU
-        // can only be judged here. Enforce the same cumulative session budget
-        // before returning success; otherwise a one-shot request can exceed a
-        // 1 ms limit while reporting the overage only in metrics.
-        if response.status == "ok" {
-            if let Some(session_id) = session_id {
-                let content_pid = self.content.pid();
-                let controller_pid = self.controller.pid();
-                let measured_content_cpu_ms = response.metrics.content_cpu_ms;
-                let measured_controller_cpu_ms = response.metrics.controller_cpu_ms;
-                let cpu_limit_error = self.sessions.get_mut(&session_id).and_then(|session| {
-                    let content_cpu = Duration::from_millis(
-                        session_cpu_delta_ms(&mut session.content_cpu_baseline, content_pid)
-                            .max(measured_content_cpu_ms),
-                    );
-                    let controller_cpu = Duration::from_millis(
-                        session_cpu_delta_ms(&mut session.controller_cpu_baseline, controller_pid)
-                            .max(measured_controller_cpu_ms),
-                    );
-                    let error = session
-                        .limits
-                        .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
-                        .and_then(|_| {
-                            session.limits.check_cpu_time(
-                                controller_cpu,
-                                session.limits.controller_cpu_time,
-                                "controller",
-                            )
-                        })
-                        .err();
-                    if error.is_some() {
-                        let _ = session.transition(SessionState::Failed);
-                    }
-                    error
-                });
-                if let Some(message) = cpu_limit_error {
-                    let metrics = response.metrics.clone();
-                    response = limit_error(&limit_request, message);
-                    response.metrics = metrics;
+        let content_pid_after = self.content.pid();
+        let controller_pid_after = self.controller.pid();
+        let content_cpu_after_ns = sample_cpu_ns(content_pid_after);
+        let controller_cpu_after_ns = sample_cpu_ns(controller_pid_after);
+        let mut observed_content_cpu_ns = process_cpu_delta_ns(
+            content_pid_before,
+            content_cpu_before_ns,
+            content_pid_after,
+            content_cpu_after_ns,
+        );
+        let mut observed_controller_cpu_ns = process_cpu_delta_ns(
+            controller_pid_before,
+            controller_cpu_before_ns,
+            controller_pid_after,
+            controller_cpu_after_ns,
+        );
+        if let Some(session_id) = session_id.as_deref() {
+            if let Some(session) = self.sessions.get_mut(session_id) {
+                (observed_content_cpu_ns, observed_controller_cpu_ns) = account_operation_cpu(
+                    session,
+                    &mut response,
+                    (content_pid_before, content_cpu_before_ns),
+                    (content_pid_after, content_cpu_after_ns),
+                    (controller_pid_before, controller_cpu_before_ns),
+                    (controller_pid_after, controller_cpu_after_ns),
+                );
+            }
+        }
+        if response.metrics.content_cpu_ms == 0 {
+            response.metrics.content_cpu_ms = observed_content_cpu_ns / 1_000_000;
+        }
+        if response.metrics.controller_cpu_ms == 0 {
+            response.metrics.controller_cpu_ms = observed_controller_cpu_ns / 1_000_000;
+        }
+        // Charge this serialized operation even when it failed. The counters
+        // are independent of worker PIDs, so a respawn cannot reset or
+        // underflow a session's cumulative quota.
+        let cpu_limit_error = session_id.as_deref().and_then(|session_id| {
+            self.sessions.get_mut(session_id).and_then(|session| {
+                session
+                    .limits
+                    .check_cpu_time(
+                        Duration::from_nanos(session.content_cpu_used_ns),
+                        session.limits.content_cpu_time,
+                        "content",
+                    )
+                    .and_then(|_| {
+                        session.limits.check_cpu_time(
+                            Duration::from_nanos(session.controller_cpu_used_ns),
+                            session.limits.controller_cpu_time,
+                            "controller",
+                        )
+                    })
+                    .err()
+            })
+        });
+        if let Some(message) = cpu_limit_error {
+            if response.status == "ok" {
+                let metrics = response.metrics.clone();
+                response = limit_error(&limit_request, message);
+                response.metrics = metrics;
+            }
+            if let Some(session_id) = session_id.as_deref() {
+                if let Some(session) = self.sessions.get_mut(session_id) {
+                    let _ = session.transition(SessionState::Failed);
                 }
             }
         }
@@ -1382,6 +1384,24 @@ impl Daemon {
             }
         }
         if let Some(session) = self.sessions.get_mut(&session_id) {
+            if let Err(message) = session
+                .limits
+                .check_cpu_time(
+                    Duration::from_nanos(session.content_cpu_used_ns),
+                    session.limits.content_cpu_time,
+                    "content",
+                )
+                .and_then(|_| {
+                    session.limits.check_cpu_time(
+                        Duration::from_nanos(session.controller_cpu_used_ns),
+                        session.limits.controller_cpu_time,
+                        "controller",
+                    )
+                })
+            {
+                let _ = session.transition(SessionState::Failed);
+                return limit_error(request, message);
+            }
             if let Err(message) = session.begin_operation(&request.request_id) {
                 return Response::error(
                     request,
@@ -1844,9 +1864,7 @@ impl Daemon {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
-        let content_cpu = Duration::from_millis(session_cpu_delta_ms(
-            &mut session.content_cpu_baseline, self.content.pid(),
-        ));
+        let content_cpu = Duration::from_nanos(session.content_cpu_used_ns);
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
         let timeout = session.limits.wall_time.saturating_sub(elapsed).min(budget);
         if timeout.is_zero() {
@@ -3482,20 +3500,8 @@ impl Daemon {
         };
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
-        let content_pid = self.content.pid();
-        let controller_pid = self.controller.pid();
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
-            // Budget the CPU this SESSION used, not the worker lifetime
-            // (finding 039); a respawned worker resets the baseline.
-            let content_cpu = Duration::from_millis(session_cpu_delta_ms(
-                &mut session.content_cpu_baseline,
-                content_pid,
-            ));
-            let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
-                &mut session.controller_cpu_baseline,
-                controller_pid,
-            ));
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
@@ -3508,14 +3514,14 @@ impl Daemon {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                content_cpu,
+                Duration::from_nanos(session.content_cpu_used_ns),
                 session.limits.content_cpu_time,
                 "content",
             ) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                controller_cpu,
+                Duration::from_nanos(session.controller_cpu_used_ns),
                 session.limits.controller_cpu_time,
                 "controller",
             ) {
@@ -4714,28 +4720,49 @@ fn sample_rss_bytes(pid: u32) -> u64 {
     kb.saturating_mul(1024)
 }
 
-/// CPU spent since this session's baseline for the given worker, resetting
-/// the baseline when the worker was respawned (pid changed) so a fresh
-/// process never inherits or wrongly credits another lifetime (finding 039).
-fn session_cpu_delta_ms(baseline: &mut Option<(u32, u64)>, pid: u32) -> u64 {
-    let now_ns = sample_cpu_ns(pid);
-    match baseline {
-        Some((base_pid, base_ns)) if *base_pid == pid => {
-            now_ns.saturating_sub(*base_ns) / 1_000_000
-        }
-        _ => {
-            *baseline = Some((pid, now_ns));
-            0
-        }
-    }
-}
-
 fn sample_cpu_ms(pid: u32) -> u64 {
     sample_cpu_ns(pid) / 1_000_000
 }
 
+/// Return CPU from one serialized operation interval. A worker replacement
+/// ends the interval; its new lifetime is measured from its own next sample.
+fn process_cpu_delta_ns(before_pid: u32, before_ns: u64, after_pid: u32, after_ns: u64) -> u64 {
+    (before_pid == after_pid).then_some(after_ns.saturating_sub(before_ns)).unwrap_or(0)
+}
+
+fn account_operation_cpu(
+    session: &mut Session,
+    response: &mut Response,
+    content_before: (u32, u64),
+    content_after: (u32, u64),
+    controller_before: (u32, u64),
+    controller_after: (u32, u64),
+) -> (u64, u64) {
+    let content_ns = process_cpu_delta_ns(
+        content_before.0,
+        content_before.1,
+        content_after.0,
+        content_after.1,
+    );
+    let controller_ns = process_cpu_delta_ns(
+        controller_before.0,
+        controller_before.1,
+        controller_after.0,
+        controller_after.1,
+    );
+    session.content_cpu_used_ns = session.content_cpu_used_ns.saturating_add(content_ns);
+    session.controller_cpu_used_ns = session.controller_cpu_used_ns.saturating_add(controller_ns);
+    if response.metrics.content_cpu_ms == 0 {
+        response.metrics.content_cpu_ms = content_ns / 1_000_000;
+    }
+    if response.metrics.controller_cpu_ms == 0 {
+        response.metrics.controller_cpu_ms = controller_ns / 1_000_000;
+    }
+    (content_ns, controller_ns)
+}
+
 fn cpu_ms_since(pid: u32, baseline_ns: u64) -> u64 {
-    sample_cpu_ns(pid).saturating_sub(baseline_ns) / 1_000_000
+    process_cpu_delta_ns(pid, baseline_ns, pid, sample_cpu_ns(pid)) / 1_000_000
 }
 
 fn sample_cpu_ns(pid: u32) -> u64 {
@@ -4858,13 +4885,27 @@ fn gate_session_engine(
     session
         .limits
         .check_controller_memory(sample_rss_bytes(controller_pid))?;
+    let content_cpu_ns = session.content_cpu_used_ns.saturating_add(process_cpu_delta_ns(
+        content_pid,
+        content_cpu_baseline_ns,
+        content_pid,
+        sample_cpu_ns(content_pid),
+    ));
+    let controller_cpu_ns = session
+        .controller_cpu_used_ns
+        .saturating_add(process_cpu_delta_ns(
+            controller_pid,
+            controller_cpu_baseline_ns,
+            controller_pid,
+            sample_cpu_ns(controller_pid),
+        ));
     session.limits.check_cpu_time(
-        Duration::from_millis(cpu_ms_since(content_pid, content_cpu_baseline_ns)),
+        Duration::from_nanos(content_cpu_ns),
         session.limits.content_cpu_time,
         "content",
     )?;
     session.limits.check_cpu_time(
-        Duration::from_millis(cpu_ms_since(controller_pid, controller_cpu_baseline_ns)),
+        Duration::from_nanos(controller_cpu_ns),
         session.limits.controller_cpu_time,
         "controller",
     )?;
@@ -5064,8 +5105,6 @@ impl Daemon {
             response.metrics.network_bytes = session.network_bytes;
             response.metrics.peak_rss_bytes = session.peak_rss_bytes;
         }
-        response.metrics.content_cpu_ms = sample_cpu_ms(self.content.pid());
-        response.metrics.controller_cpu_ms = sample_cpu_ms(self.controller.pid());
         if response.metrics.peak_rss_bytes == 0 {
             response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
         }
@@ -5332,22 +5371,104 @@ mod redirect_chain_tests {
     }
 
     #[test]
-    fn session_cpu_delta_starts_at_zero_and_resets_for_a_new_worker() {
-        let pid = std::process::id();
-        let mut baseline = None;
-        assert_eq!(super::session_cpu_delta_ms(&mut baseline, pid), 0);
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_millis(20) {
-            std::hint::black_box((0..10_000_u64).sum::<u64>());
-        }
-        assert!(super::session_cpu_delta_ms(&mut baseline, pid) > 0);
-        let replacement_pid = pid.saturating_add(1);
-        assert_eq!(
-            super::session_cpu_delta_ms(&mut baseline, replacement_pid),
-            0,
-            "a replacement worker must not inherit its predecessor's CPU"
+    fn serialized_operation_cpu_deltas_stay_with_their_session() {
+        let mut session_a = super::Session::new("a", "run", super::NetworkProfile::Research);
+        let mut session_b = super::Session::new("b", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("cpu", "web.read", json!({}));
+        let mut failed = super::Response::error(
+            &request,
+            super::ErrorObject::new("failed", "failed", "cpu", 1, "retry"),
         );
-        assert_eq!(baseline.map(|entry| entry.0), Some(replacement_pid));
+        failed.metrics.content_cpu_ms = 999_999;
+        failed.metrics.controller_cpu_ms = 999_999;
+
+        super::account_operation_cpu(
+            &mut session_a,
+            &mut failed,
+            (7, 100),
+            (7, 110),
+            (9, 200),
+            (9, 203),
+        );
+        super::account_operation_cpu(
+            &mut session_b,
+            &mut failed,
+            (7, 110),
+            (7, 150),
+            (9, 203),
+            (9, 210),
+        );
+        super::account_operation_cpu(
+            &mut session_a,
+            &mut failed,
+            (7, 150),
+            (7, 151),
+            (9, 210),
+            (9, 211),
+        );
+
+        assert_eq!(session_a.content_cpu_used_ns, 11);
+        assert_eq!(session_b.content_cpu_used_ns, 40);
+        assert_eq!(session_a.controller_cpu_used_ns, 4);
+        assert_eq!(session_b.controller_cpu_used_ns, 7);
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.metrics.content_cpu_ms, 999_999);
+    }
+
+    #[test]
+    fn repeated_session_operations_exhaust_the_cumulative_cpu_limit() {
+        let mut session = super::Session::new("cpu", "run", super::NetworkProfile::Research);
+        session.limits.content_cpu_time = std::time::Duration::from_nanos(10);
+
+        session.content_cpu_used_ns += 6;
+        assert!(session.limits.check_cpu_time(
+            std::time::Duration::from_nanos(session.content_cpu_used_ns),
+            session.limits.content_cpu_time,
+            "content",
+        ).is_ok());
+
+        session.content_cpu_used_ns += 5;
+        assert!(session.limits.check_cpu_time(
+            std::time::Duration::from_nanos(session.content_cpu_used_ns),
+            session.limits.content_cpu_time,
+            "content",
+        ).is_err());
+    }
+
+    #[test]
+    fn worker_restart_does_not_reset_or_underflow_session_cpu() {
+        let mut session = super::Session::new("restart", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("restart", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (11, 100),
+            (11, 107),
+            (12, 5),
+            (12, 8),
+        );
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (11, 107),
+            (12, 1),
+            (12, 8),
+            (13, 1),
+        );
+        assert_eq!(session.content_cpu_used_ns, 7);
+        assert_eq!(session.controller_cpu_used_ns, 3);
+
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (12, 1),
+            (12, 4),
+            (13, 1),
+            (13, 4),
+        );
+        assert_eq!(session.content_cpu_used_ns, 10);
+        assert_eq!(session.controller_cpu_used_ns, 6);
     }
 
     #[test]
