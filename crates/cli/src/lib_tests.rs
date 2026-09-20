@@ -1,6 +1,45 @@
 use super::*;
 use clap::Parser;
 
+#[cfg(unix)]
+#[test]
+fn query_path_filters_normalize_alias_roots_for_existing_and_missing_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_root = temp.path().join("real-root");
+    std::fs::create_dir_all(real_root.join("src")).unwrap();
+    std::fs::write(real_root.join("src/existing.rs"), "fn existing() {}\n").unwrap();
+    let alias_root = temp.path().join("alias-root");
+    symlink(&real_root, &alias_root).unwrap();
+
+    for (raw, expected) in [
+        ("src/existing.rs".to_owned(), "src/existing.rs"),
+        ("src/deleted.rs".to_owned(), "src/deleted.rs"),
+        (
+            alias_root
+                .join("src/existing.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/existing.rs",
+        ),
+        (
+            alias_root
+                .join("src/deleted.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/deleted.rs",
+        ),
+    ] {
+        assert_eq!(
+            normalize_query_filter_path(&alias_root, &raw).as_deref(),
+            Some(expected),
+            "failed to normalize {raw} through alias root {}",
+            alias_root.display()
+        );
+    }
+}
+
 fn drift_json(reason: &str) -> serde_json::Value {
     serde_json::json!({ "reasons": [reason] })
 }
@@ -725,7 +764,7 @@ fn embedding_config_defaults_to_bundled_embeddinggemma_when_no_flags() {
     // ran on the lexical/algorithmic path with no vectors at all.
     let cfg = embedding_config_required(EmbeddingCliArgs {
         device: None,
-        no_gpu: true,
+        no_gpu: false,
     })
     .expect("no-flags embedding config must resolve to the embedded model, not error");
     assert!(

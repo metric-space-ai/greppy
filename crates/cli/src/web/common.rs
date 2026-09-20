@@ -1733,7 +1733,10 @@ mod scope_tests {
         let run_id = artifacts.path().file_name().unwrap().to_str().unwrap();
         let image = vec![42u8; 32_768];
         std::fs::write(artifacts.path().join("image.png"), &image).unwrap();
-        let output = tempfile::tempdir().unwrap();
+        let output = tempfile::Builder::new()
+            .prefix("screenshot-output-test-")
+            .tempdir_in(&parent)
+            .unwrap();
         let dest = output.path().join("saved.png");
         let request = Request::new(run_id, "web.screenshot", json!({}));
         let mut response = Response::ok(

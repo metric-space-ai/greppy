@@ -7299,6 +7299,31 @@ fn absolutize_path(p: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Canonicalize the deepest existing ancestor while retaining a missing
+/// lexical suffix. This keeps deleted-file filters comparable with a
+/// canonical repository root without requiring the filtered path to exist.
+fn canonicalize_with_missing_suffix(p: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
+}
+
 /// Walk up from `start` looking for a repository marker. Returns the
 /// first ancestor (including `start`) that contains a marker, or `start`
 /// itself when none is found. Pure path logic so it is unit-testable
@@ -7376,23 +7401,30 @@ impl QueryPathFilters {
 }
 
 fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    // Normalize both sides through their deepest existing ancestor so platform
+    // aliases (for example macOS /var -> /private/var), Windows path
+    // normalization, and deleted-file suffixes remain comparable.
+    let normalized_root = canonicalize_with_missing_suffix(root_path);
     let supplied = std::path::Path::new(raw);
     let candidate = if supplied.is_absolute() {
-        absolutize_path(supplied)
+        supplied.to_path_buf()
     } else {
         let cwd = std::env::current_dir().ok();
         let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
         if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
-            absolutize_path(path)
+            path.to_path_buf()
         } else if root_path.join(supplied).exists() {
-            absolutize_path(&root_path.join(supplied))
-        } else if let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(root_path)) {
+            root_path.join(supplied)
+        } else if let Some(cwd) =
+            cwd.filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root))
+        {
             cwd.join(supplied)
         } else {
             root_path.join(supplied)
         }
     };
-    let relative = candidate.strip_prefix(root_path).ok()?;
+    let candidate = canonicalize_with_missing_suffix(&candidate);
+    let relative = candidate.strip_prefix(&normalized_root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {

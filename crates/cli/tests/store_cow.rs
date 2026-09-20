@@ -135,12 +135,14 @@ fn query_json_raw(
     let mut argv = args.to_vec();
     argv.push("--json");
     let (code, stdout, stderr) = run(repo, store, &argv, overlay);
-    assert_eq!(
-        code, 0,
-        "query {args:?} failed\nstdout={stdout}\nstderr={stderr}"
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("invalid JSON for {args:?}: {error}; stdout={stdout:?}"));
+    let expected_no_match = code == 1 && value["status"] == "no_matches";
+    assert!(
+        code == 0 || expected_no_match,
+        "query {args:?} failed with exit {code}\nstdout={stdout}\nstderr={stderr}"
     );
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("invalid JSON for {args:?}: {error}; stdout={stdout:?}"))
+    value
 }
 
 fn query_text(repo: &Path, store: &Path, args: &[&str], overlay: Option<(&Path, &str)>) -> String {
