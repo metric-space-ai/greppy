@@ -179,7 +179,7 @@ fn recover_completed_index_snapshot(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    let Some((_, candidate)) = candidates.into_iter().next() else {
+    if candidates.is_empty() {
         return Ok(IndexRecoveryReport {
             command: "index-recover",
             status: "no-candidate",
@@ -189,110 +189,138 @@ fn recover_completed_index_snapshot(
             owner_pid: None,
             reason: None,
         });
-    };
-    let candidate_name = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let owner_pid = candidate_name
-        .strip_prefix(&prefix)
-        .and_then(|suffix| suffix.split('.').next())
-        .and_then(|pid| pid.parse::<u32>().ok());
-    if owner_pid.is_some_and(process_is_alive) {
+    }
+
+    let candidates = candidates
+        .into_iter()
+        .map(|(_, candidate)| {
+            let owner_pid = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|suffix| suffix.split('.').next())
+                .and_then(|pid| pid.parse::<u32>().ok());
+            (candidate, owner_pid)
+        })
+        .collect::<Vec<_>>();
+
+    // A live owner means indexing may still be preparing a publication even
+    // if its writer lock is momentarily unavailable or the PID was observed
+    // through a surviving candidate. Never publish another snapshot around it.
+    if let Some((candidate, owner_pid)) = candidates
+        .iter()
+        .find(|(_, owner_pid)| owner_pid.as_ref().is_some_and(|pid| process_is_alive(*pid)))
+    {
         return Ok(IndexRecoveryReport {
             command: "index-recover",
             status: "rejected",
             root_path,
             active_store,
             candidate: Some(candidate.to_string_lossy().into_owned()),
-            owner_pid,
+            owner_pid: *owner_pid,
             reason: Some("candidate owner process is still alive".into()),
         });
     }
 
-    let validation = (|| -> Result<()> {
-        checkpoint_store_path(&candidate)?;
-        let store =
-            greppy_store::Store::open_with(&candidate, greppy_store::OpenOptions::read_only())?;
-        store.integrity_check().map_err(|error| {
-            Error::Store(format!(
-                "recovery candidate {} failed integrity_check: {error}",
-                candidate.display()
-            ))
-        })?;
-        let schema = store.schema_version()?;
-        if schema != greppy_store::migrate::CURRENT_VERSION {
-            return Err(Error::Store(format!(
-                "recovery candidate schema {schema} does not match expected {}",
-                greppy_store::migrate::CURRENT_VERSION
-            )));
+    let mut rejected = Vec::new();
+    for (candidate, owner_pid) in candidates {
+        match validate_index_recovery_candidate(&candidate, target, project, options) {
+            Ok(()) => {
+                cleanup_sqlite_sidecars(&candidate)?;
+                sync_file(&candidate)?;
+                sync_parent_dir(&candidate)?;
+                publish_store_snapshot(&candidate, active_path)?;
+                cleanup_stale_snapshot_artifacts(active_path, true)?;
+                return Ok(IndexRecoveryReport {
+                    command: "index-recover",
+                    status: "published",
+                    root_path,
+                    active_store,
+                    candidate: Some(candidate.to_string_lossy().into_owned()),
+                    owner_pid,
+                    reason: None,
+                });
+            }
+            Err(error) => rejected.push((candidate, owner_pid, error.to_string())),
         }
-        let project_row = store
-            .get_project(project)?
-            .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
-        let expected_target = absolutize_path(target);
-        if absolutize_path(std::path::Path::new(&project_row.root_path)) != expected_target {
-            return Err(Error::Store(format!(
-                "recovery candidate project root {} does not match {}",
-                project_row.root_path,
-                expected_target.display()
-            )));
-        }
-        let state = store
-            .get_workspace_state(expected_target.to_string_lossy().as_ref())?
-            .ok_or_else(|| Error::Store("recovery candidate lacks workspace fingerprint".into()))?;
-        if state.schema_version != greppy_store::migrate::CURRENT_VERSION
-            || state.indexer_version != greppy_core::INDEXER_VERSION_BASE
-        {
-            return Err(Error::Store(format!(
-                "recovery candidate fingerprint version mismatch (schema={}, indexer={})",
-                state.schema_version, state.indexer_version
-            )));
-        }
-        let freshness = greppy_freshness::check_files_report_with_ttl(
-            &store,
-            target,
-            project,
-            std::time::Duration::from_secs(300),
-            &options.discover_overrides,
-            std::time::Duration::ZERO,
-        )?;
-        if !matches!(
-            freshness.state.outcome,
-            greppy_freshness::FreshnessOutcome::Fresh
-        ) {
-            return Err(Error::Store(
-                "repository HEAD, index signature or discovered files changed after snapshot creation"
-                    .into(),
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(error) = validation {
-        return Ok(IndexRecoveryReport {
-            command: "index-recover",
-            status: "rejected",
-            root_path,
-            active_store,
-            candidate: Some(candidate.to_string_lossy().into_owned()),
-            owner_pid,
-            reason: Some(error.to_string()),
-        });
     }
-    cleanup_sqlite_sidecars(&candidate)?;
-    sync_file(&candidate)?;
-    sync_parent_dir(&candidate)?;
-    publish_store_snapshot(&candidate, active_path)?;
-    cleanup_stale_snapshot_artifacts(active_path, true)?;
+
+    let (candidate, owner_pid, reason) = rejected
+        .into_iter()
+        .next()
+        .expect("non-empty candidate list must produce a rejection");
     Ok(IndexRecoveryReport {
         command: "index-recover",
-        status: "published",
+        status: "rejected",
         root_path,
         active_store,
         candidate: Some(candidate.to_string_lossy().into_owned()),
         owner_pid,
-        reason: None,
+        reason: Some(format!("no safe completed snapshot: {reason}")),
     })
+}
+
+fn validate_index_recovery_candidate(
+    candidate: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    options: &greppy_indexer::IndexOptions,
+) -> Result<()> {
+    checkpoint_store_path(candidate)?;
+    let store = greppy_store::Store::open_with(candidate, greppy_store::OpenOptions::read_only())?;
+    store.integrity_check().map_err(|error| {
+        Error::Store(format!(
+            "recovery candidate {} failed integrity_check: {error}",
+            candidate.display()
+        ))
+    })?;
+    let schema = store.schema_version()?;
+    if schema != greppy_store::migrate::CURRENT_VERSION {
+        return Err(Error::Store(format!(
+            "recovery candidate schema {schema} does not match expected {}",
+            greppy_store::migrate::CURRENT_VERSION
+        )));
+    }
+    let project_row = store
+        .get_project(project)?
+        .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
+    let expected_target = absolutize_path(target);
+    if absolutize_path(std::path::Path::new(&project_row.root_path)) != expected_target {
+        return Err(Error::Store(format!(
+            "recovery candidate project root {} does not match {}",
+            project_row.root_path,
+            expected_target.display()
+        )));
+    }
+    let state = store
+        .get_workspace_state(expected_target.to_string_lossy().as_ref())?
+        .ok_or_else(|| Error::Store("recovery candidate lacks workspace fingerprint".into()))?;
+    if state.schema_version != greppy_store::migrate::CURRENT_VERSION
+        || state.indexer_version != greppy_core::INDEXER_VERSION_BASE
+    {
+        return Err(Error::Store(format!(
+            "recovery candidate fingerprint version mismatch (schema={}, indexer={})",
+            state.schema_version, state.indexer_version
+        )));
+    }
+    let freshness = greppy_freshness::check_files_report_with_ttl(
+        &store,
+        target,
+        project,
+        std::time::Duration::from_secs(300),
+        &options.discover_overrides,
+        std::time::Duration::ZERO,
+    )?;
+    if !matches!(
+        freshness.state.outcome,
+        greppy_freshness::FreshnessOutcome::Fresh
+    ) {
+        return Err(Error::Store(
+            "repository HEAD, index signature or discovered files changed after snapshot creation"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Result<i32> {

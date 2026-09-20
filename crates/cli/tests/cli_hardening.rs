@@ -383,6 +383,56 @@ fn next_snapshot_paths_for_db(db: &Path) -> Vec<PathBuf> {
     paths
 }
 
+#[cfg(unix)]
+fn leave_completed_index_snapshot(repo: &Path, store: &Path, db: &Path) -> PathBuf {
+    let ready = store.join("recovery-candidate-ready");
+    let mut child = Command::new(bin())
+        .args(["index", "."])
+        .current_dir(repo)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_DISCOVER_INCLUDE")
+        .env_remove("GREPPY_DISCOVER_EXCLUDE")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn failpoint greppy index");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().expect("poll failpoint child") {
+            panic!("failpoint child exited before ready marker: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timeout waiting for failpoint ready marker");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    child.kill().expect("kill failpoint child");
+    let killed = child.wait().expect("wait for killed failpoint child");
+    assert!(!killed.success(), "failpoint child must be killed");
+    let candidates = next_snapshot_paths_for_db(db)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.ends_with("-wal") && !name.ends_with("-shm"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "one killed indexer should leave one completed candidate: {candidates:?}"
+    );
+    candidates.into_iter().next().unwrap()
+}
+
 fn corrupt_snapshot_for_db(db: &Path) -> Option<PathBuf> {
     let parent = db.parent()?;
     std::fs::read_dir(parent)
@@ -2255,6 +2305,158 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     assert!(
         v["hits"].as_array().unwrap().is_empty(),
         "old symbol must not leak after recovery publish; got {v:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_skips_newest_invalid_completed_candidate() {
+    let (repo, store, _scratch) = make_repo("recover-newest-invalid", "old_recovery_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn recovered_from_older_valid_candidate() -> i32 { 17 }\n",
+    )
+    .unwrap();
+    let valid = leave_completed_index_snapshot(&repo, &store, &db);
+    let invalid = valid.with_file_name(format!(
+        "{}.invalid",
+        valid.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&invalid, b"not a sqlite database").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&valid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&invalid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "newest invalid completed artifact must not block the older valid snapshot: {out}\n{err}"
+    );
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "published", "{out}");
+    assert_eq!(
+        recovery["candidate"].as_str(),
+        Some(valid.to_string_lossy().as_ref()),
+        "recovery must publish the newest valid eligible candidate: {out}"
+    );
+    assert!(
+        next_snapshot_paths_for_db(&db).is_empty(),
+        "successful publication cleans all remaining candidate artifacts"
+    );
+    let (code, out, err) = run(
+        &["search-symbol", "recovered_from_older_valid_candidate"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "recovered graph must be queryable: {out}\n{err}");
+    assert!(
+        out.contains("recovered_from_older_valid_candidate"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_rejects_when_no_completed_candidate_is_valid() {
+    let (repo, store, _scratch) = make_repo("recover-no-valid", "preserved_active_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+    let active_before = std::fs::read(&db).unwrap();
+    let mut dead_owner = Command::new("true")
+        .spawn()
+        .expect("spawn short-lived owner");
+    let dead_pid = dead_owner.id();
+    assert!(dead_owner.wait().unwrap().success());
+    let invalid = db.with_file_name(format!("graph.db.next.{dead_pid}.invalid"));
+    std::fs::write(&invalid, b"not a sqlite database").unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(code, 73, "invalid-only recovery must fail: {out}\n{err}");
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "rejected", "{out}");
+    assert!(
+        recovery["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no safe completed snapshot")),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        active_before,
+        "a rejected recovery must preserve the active store byte-for-byte"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_never_publishes_around_a_live_candidate_owner() {
+    let (repo, store, _scratch) = make_repo("recover-live-owner", "old_live_owner_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+    let active_before = std::fs::read(&db).unwrap();
+
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn candidate_blocked_by_live_owner() -> i32 { 19 }\n",
+    )
+    .unwrap();
+    let completed = leave_completed_index_snapshot(&repo, &store, &db);
+    let live = db.with_file_name(format!("graph.db.next.{}.live", std::process::id()));
+    std::fs::copy(&completed, &live).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&live)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&completed)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(
+        code, 73,
+        "live owner must block all publication: {out}\n{err}"
+    );
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "rejected", "{out}");
+    assert_eq!(recovery["owner_pid"], std::process::id(), "{out}");
+    assert!(
+        recovery["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("owner process is still alive")),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        active_before,
+        "live-owner refusal must preserve the active store byte-for-byte"
+    );
+    assert!(
+        completed.exists() && live.exists(),
+        "refusal must leave candidates untouched for the active owner"
     );
 }
 
