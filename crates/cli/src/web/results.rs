@@ -31,6 +31,9 @@ pub struct ReadArgs {
 pub enum ResultsCommand {
     /// Run an unchanged Playwright script in a session.
     Run {
+        /// Choose whether the script owns a new browser or uses the active session page.
+        #[arg(long, value_enum, default_value_t = RunMode::Standalone)]
+        mode: RunMode,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
@@ -194,12 +197,13 @@ pub enum ResultCommand {
 pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i32> {
     match command {
         ResultsCommand::Run {
+            mode,
             session,
             script_file,
             script_stdin,
             timeout,
             json,
-        } => run(root, session, script_file, script_stdin, timeout, json),
+        } => run(root, session, script_file, script_stdin, timeout, mode, json),
         ResultsCommand::Observe {
             query,
             session,

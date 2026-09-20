@@ -13,6 +13,20 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub(super) enum RunMode {
+    /// Start the script with its own browser, context, and page.
+    Standalone,
+    /// Bind the script to the selected session's current browser, context, and page.
+    Active,
+}
+
+impl Default for RunMode {
+    fn default() -> Self {
+        Self::Standalone
+    }
+}
+
 pub const EXIT_WEB_INVALID: i32 = 30;
 pub const EXIT_WEB_UNAVAILABLE: i32 = 31;
 #[allow(dead_code)]
@@ -340,6 +354,7 @@ pub(super) fn run(
     script_file: Option<String>,
     script_stdin: bool,
     timeout: Option<u64>,
+    mode: RunMode,
     json: bool,
 ) -> Result<i32> {
     let session = match resolve_session(root, session) {
@@ -376,11 +391,30 @@ pub(super) fn run(
             invalid("web run requires --script-file FILE or --script-stdin"),
         );
     };
+    let payload = build_run_payload(
+        &session,
+        script_source,
+        script_file_field.as_deref(),
+        script_text.as_deref(),
+        timeout,
+        mode,
+    );
+    rpc(root, json, "web.run", payload, Some(session))
+}
+
+fn build_run_payload(
+    session: &str,
+    script_source: &str,
+    script_file: Option<&str>,
+    script_text: Option<&str>,
+    timeout: Option<u64>,
+    mode: RunMode,
+) -> serde_json::Value {
     let mut payload = json!({
         "session_id": session,
         "script_source": script_source,
     });
-    if let Some(path) = script_file_field {
+    if let Some(path) = script_file {
         payload["script_file"] = json!(path);
     }
     if let Some(text) = script_text {
@@ -389,7 +423,10 @@ pub(super) fn run(
     if let Some(timeout) = timeout {
         payload["timeout_seconds"] = json!(timeout);
     }
-    rpc(root, json, "web.run", payload, Some(session))
+    if mode == RunMode::Active {
+        payload["bind_session_page"] = json!(true);
+    }
+    payload
 }
 
 pub(super) fn screenshot(
@@ -1661,6 +1698,35 @@ fn parse_complete_selector_value(input: &str) -> std::result::Result<String, Err
 #[cfg(test)]
 mod target_tests {
     use super::*;
+
+    #[test]
+    fn run_payload_binds_only_active_mode() {
+        let standalone = build_run_payload(
+            "wrs_1",
+            "file",
+            Some("spec.mjs"),
+            Some("await page.title()"),
+            Some(12),
+            RunMode::Standalone,
+        );
+        assert_eq!(standalone["session_id"], "wrs_1");
+        assert_eq!(standalone["script_source"], "file");
+        assert_eq!(standalone["script_file"], "spec.mjs");
+        assert_eq!(standalone["script_text"], "await page.title()");
+        assert_eq!(standalone["timeout_seconds"], 12);
+        assert!(standalone.get("bind_session_page").is_none());
+
+        let active = build_run_payload(
+            "wrs_1",
+            "stdin",
+            None,
+            Some("return await page.title()"),
+            None,
+            RunMode::Active,
+        );
+        assert_eq!(active["bind_session_page"], true);
+        assert!(active.get("script_file").is_none());
+    }
 
     #[test]
     fn parse_css_quoted_and_nth() {

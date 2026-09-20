@@ -89,7 +89,7 @@ pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::common::{
-        export_regular_file, find_binary, images_from_dist, runtime_executable_name,
+        export_regular_file, find_binary, images_from_dist, runtime_executable_name, RunMode,
     };
     use super::sessions::SessionCommand;
     use super::*;
@@ -638,6 +638,8 @@ mod tests {
             "greppy",
             "web",
             "run",
+            "--mode",
+            "active",
             "--session",
             "wrs_1",
             "--script-file",
@@ -648,9 +650,42 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Run { json: true, .. })
+                command: WebCommand::Results(ResultsCommand::Run {
+                    mode: RunMode::Active,
+                    json: true,
+                    ..
+                })
             })
         ));
+
+        let cli = Cli::try_parse_from(["greppy", "web", "run", "--script-file", "spec.mjs"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Results(ResultsCommand::Run {
+                    mode: RunMode::Standalone,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_unknown_web_run_mode_with_choices() {
+        let error = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "run",
+            "--mode",
+            "attached",
+            "--script-file",
+            "spec.mjs",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("active"), "{error}");
+        assert!(error.contains("standalone"), "{error}");
     }
 
     #[test]
