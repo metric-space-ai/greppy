@@ -1934,6 +1934,80 @@ impl ContentEngine {
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
+            "session.attachPage" => {
+                let page = required_str(&params, "page")?;
+                let (page_generation, context_id, browser_id, url) =
+                    match self.pages.get(&page) {
+                        Some(PageSlot::Live {
+                            pair,
+                            generation,
+                            context_id,
+                            browser_id,
+                        }) => (
+                            *generation,
+                            context_id.clone(),
+                            browser_id.clone(),
+                            pair.0
+                                .url()
+                                .map(|url| url.to_string())
+                                .unwrap_or_else(|| "about:blank".to_owned()),
+                        ),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "session active page is unavailable",
+                            ))
+                        }
+                    };
+                let browser = browser_id
+                    .unwrap_or_else(|| self.alloc_id("browser"));
+                if !self.browsers.contains_key(&browser) {
+                    self.browsers.insert(
+                        browser.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: None,
+                        },
+                    );
+                }
+                let context = context_id
+                    .unwrap_or_else(|| self.alloc_id("context"));
+                if !self.contexts.contains_key(&context) {
+                    self.contexts.insert(
+                        context.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: Some(browser.clone()),
+                        },
+                    );
+                }
+                if let Some(PageSlot::Live {
+                    context_id,
+                    browser_id,
+                    ..
+                }) = self.pages.get_mut(&page)
+                {
+                    *context_id = Some(context.clone());
+                    *browser_id = Some(browser.clone());
+                }
+                let context_generation = match self.contexts.get(&context) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("BrowserContext")),
+                };
+                let browser_generation = match self.browsers.get(&browser) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("Browser")),
+                };
+                Ok(json!({
+                    "browser": browser,
+                    "browserGeneration": browser_generation,
+                    "context": context,
+                    "contextGeneration": context_generation,
+                    "page": page,
+                    "pageGeneration": page_generation,
+                    "url": url,
+                }))
+            }
             "session.networkBytes" => {
                 // Real bytes relayed through the policy proxy, both
                 // directions — the metric behind web.run's network_bytes,
@@ -2354,6 +2428,65 @@ impl ContentEngine {
             "page.close" => {
                 let page_id = required_str(&params, "page")?;
                 self.dispose_page(&page_id);
+                Ok(json!({}))
+            }
+            "session.closePage" => {
+                let page_id = required_str(&params, "page")?;
+                let (context_id, browser_id) = match self.pages.get(&page_id) {
+                    Some(PageSlot::Live {
+                        context_id,
+                        browser_id,
+                        ..
+                    }) => (context_id.clone(), browser_id.clone()),
+                    _ => (None, None),
+                };
+                self.dispose_page(&page_id);
+                if let Some(context_id) = context_id {
+                    let still_used = self.pages.values().any(|slot| {
+                        matches!(
+                            slot,
+                            PageSlot::Live {
+                                context_id: Some(owner),
+                                ..
+                            } if owner == &context_id
+                        )
+                    });
+                    if !still_used {
+                        let generation = match self.contexts.get(&context_id) {
+                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
+                            _ => None,
+                        };
+                        if let Some(generation) = generation {
+                            self.contexts.insert(
+                                context_id,
+                                ObjectLife::Disposed { generation },
+                            );
+                        }
+                    }
+                }
+                if let Some(browser_id) = browser_id {
+                    let still_used = self.pages.values().any(|slot| {
+                        matches!(
+                            slot,
+                            PageSlot::Live {
+                                browser_id: Some(owner),
+                                ..
+                            } if owner == &browser_id
+                        )
+                    });
+                    if !still_used {
+                        let generation = match self.browsers.get(&browser_id) {
+                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
+                            _ => None,
+                        };
+                        if let Some(generation) = generation {
+                            self.browsers.insert(
+                                browser_id,
+                                ObjectLife::Disposed { generation },
+                            );
+                        }
+                    }
+                }
                 Ok(json!({}))
             }
             "page.isClosed" => {

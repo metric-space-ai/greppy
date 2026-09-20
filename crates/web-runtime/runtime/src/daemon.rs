@@ -1309,7 +1309,7 @@ impl Daemon {
                 let _ = session.transition(SessionState::Closing);
                 if let Some(page) = session.page_id.take() {
                     if self.content.is_running() {
-                        let _ = self.engine_call("page.close", json!({ "page": page }));
+                        let _ = self.engine_call("session.closePage", json!({ "page": page }));
                     }
                 }
                 let _ = session.transition(SessionState::Closed);
@@ -1383,6 +1383,48 @@ impl Daemon {
                 return engine_error(request, error, 33);
             }
         }
+        let bind_session_page = request
+            .payload
+            .get("bind_session_page")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let bound_page = if bind_session_page {
+            match self
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.page_id.clone())
+            {
+                Some(page) => Some(page),
+                None => {
+                    if let Some(session) = self.sessions.get(&session_id) {
+                        if let Err(message) =
+                            session.limits.check_pages(session.pages.saturating_add(1))
+                        {
+                            return limit_error(request, message);
+                        }
+                    }
+                    match self.engine_call("session.ensurePage", json!({})) {
+                        Ok(result) => {
+                            let Some(page) = result
+                                .get("page")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                            else {
+                                return engine_error(request, "session has no page", 34);
+                            };
+                            if let Some(session) = self.sessions.get_mut(&session_id) {
+                                session.page_id = Some(page.clone());
+                                session.pages = 1;
+                            }
+                            Some(page)
+                        }
+                        Err(error) => return engine_error(request, error, 34),
+                    }
+                }
+            }
+        } else {
+            None
+        };
         if let Some(session) = self.sessions.get_mut(&session_id) {
             if let Err(message) = session
                 .limits
@@ -1445,7 +1487,7 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let (specifier, source) = match (file, source) {
+        let (specifier, mut source) = match (file, source) {
             (Some(path), maybe_text) => {
                 let text = match maybe_text {
                     Some(text) => text,
@@ -1503,6 +1545,15 @@ impl Daemon {
                 );
             }
         };
+        if let Some(page) = bound_page {
+            let page = serde_json::to_string(&page)
+                .expect("a runtime page id is always JSON serializable");
+            source = format!(
+                "import {{ greppyAttachPage }} from \"playwright\";\n\
+                 const {{ browser, context, page }} = await greppyAttachPage({page});\n\
+                 {source}"
+            );
+        }
         let _stage_guard = if specifier != "greppy:stdin" {
             Some(ScriptStageGuard {
                 run_id: self.run_id.clone(),
@@ -4912,6 +4963,12 @@ fn gate_session_engine(
         "controller",
     )?;
     match method {
+        "session.attachPage" => {
+            let requested = _params.get("page").and_then(|value| value.as_str());
+            if requested != session.page_id.as_deref() {
+                return Err("session active page does not match requested page".to_owned());
+            }
+        }
         "browser.newContext" => {
             session
                 .limits

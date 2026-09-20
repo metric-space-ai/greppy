@@ -3337,6 +3337,20 @@ const chromium = withUnsupported(
   "BrowserType",
 );
 
+async function greppyAttachPage(pageId) {
+  const result = await engineCall("session.attachPage", { page: pageId });
+  const browser = new Browser(result.browser, result.browserGeneration);
+  const context = new BrowserContext(result.context, result.contextGeneration);
+  const page = new Page(result.page, result.pageGeneration);
+  page._url = result.url || "about:blank";
+  context._browser = browser;
+  context._pages = [page];
+  context._lastPage = result.page;
+  browser._contexts = [context];
+  page._context = context;
+  return { browser, context, page };
+}
+
 const firefox = withUnsupported(
   {
     async launch() {
@@ -3380,7 +3394,7 @@ const Credentials = withUnsupported({}, "Credentials");
 const Logger = withUnsupported({}, "Logger");
 const WebError = withUnsupported({}, "WebError");
 
-export { chromium, firefox, webkit, selectors, errors, TimeoutError, Debugger, Credentials, Logger, WebError };
+export { chromium, firefox, webkit, selectors, errors, TimeoutError, Debugger, Credentials, Logger, WebError, greppyAttachPage };
 export const request = withUnsupported({}, "APIRequest");
 export const devices = withUnsupported({}, "devices");
 export default { chromium, firefox, webkit, request, selectors, devices, errors, Debugger, Credentials, Logger, WebError };

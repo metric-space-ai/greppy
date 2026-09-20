@@ -3419,6 +3419,195 @@ fn web_goto_navigates_a_fixture() {
 }
 
 #[test]
+fn bound_web_run_uses_only_the_named_sessions_active_page() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><head><title>Bound Session Page</title></head><body><input id=\"marker\" value=\"initial\"></body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-bound-page-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_bound_page", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let create = |label: &str| {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("create {label}: {error}"));
+        assert_eq!(created.status, "ok", "{label}: {created:?}");
+        created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let session_a = create("a");
+    let session_b = create("b");
+    for (session, marker) in [(&session_a, "session-a"), (&session_b, "session-b")] {
+        let went = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.goto",
+                json!({ "session_id": session, "url": fixture }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("goto");
+        assert_eq!(went.status, "ok", "{went:?}");
+        let seeded = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": format!(
+                        "document.getElementById('marker').value = {marker:?}"
+                    )
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("seed marker");
+        assert_eq!(seeded.status, "ok", "{seeded:?}");
+    }
+
+    let run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": r#"
+const input = page.locator("#marker");
+const before = await input.inputValue();
+await input.fill("mutated-a");
+console.log(JSON.stringify({
+  before,
+  after: await input.inputValue(),
+  url: page.url(),
+  title: await page.title(),
+  pages: context.pages().length,
+  contexts: browser.contexts().length,
+}));
+"#,
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("bound web.run");
+    assert_eq!(run.status, "ok", "{run:?}");
+    let stdout = run.result.as_ref().unwrap()["stdout"].as_str().unwrap_or("");
+    assert!(stdout.contains("session-a"), "{run:?}");
+    assert!(stdout.contains("mutated-a"), "{run:?}");
+    assert!(stdout.contains(&fixture), "{run:?}");
+    assert!(stdout.contains("Bound Session Page"), "{run:?}");
+    assert!(stdout.contains("\"pages\":1"), "{run:?}");
+    assert!(stdout.contains("\"contexts\":1"), "{run:?}");
+
+    for (session, expected) in [(&session_a, "mutated-a"), (&session_b, "session-b")] {
+        let value = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": "document.getElementById('marker').value"
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("read marker");
+        assert_eq!(value.status, "ok", "{value:?}");
+        assert_eq!(value.result.as_ref().unwrap()["value"], expected, "{value:?}");
+    }
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "throw new Error('intentional-bound-failure');",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("failing bound web.run");
+    assert_eq!(failed.status, "error", "{failed:?}");
+    let after_failure = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.evaluate",
+            json!({
+                "session_id": session_a,
+                "source": "document.getElementById('marker').value"
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("read marker after failure");
+    assert_eq!(
+        after_failure.result.as_ref().unwrap()["value"],
+        "mutated-a",
+        "{after_failure:?}"
+    );
+
+    let fresh = create("fresh");
+    let fresh_run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": fresh,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "console.log(page.url());",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("fresh bound web.run");
+    assert_eq!(fresh_run.status, "ok", "{fresh_run:?}");
+    assert!(
+        fresh_run.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("about:blank"),
+        "{fresh_run:?}"
+    );
+
+    for session in [session_a, session_b, fresh] {
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.close",
+                json!({ "session_id": session }),
+            ),
+            Duration::from_secs(5),
+        );
+    }
+}
+
+#[test]
 fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
     let fixture = serve_navigation_lifecycle_fixture();
     let url = format!("{}/phrase", fixture.origin);
