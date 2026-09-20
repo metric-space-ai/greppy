@@ -26,8 +26,11 @@ pub enum DiagnoseCommand {
     /// Network requests the page issued.
     ///
     ///   greppy web network
+    ///   greppy web network 'status>=400'
     ///   greppy web network --failed
     Network {
+        /// Record query, using the same predicate grammar as `web match`.
+        query: Option<String>,
         /// Only requests that did not complete successfully.
         #[arg(long)]
         failed: bool,
@@ -139,20 +142,39 @@ pub(super) fn dispatch(command: DiagnoseCommand, root: Option<&str>) -> Result<i
             errors.then_some("error"),
         ),
         DiagnoseCommand::Network {
+            query,
             failed,
             session,
             json,
-        } => records(
-            root,
-            json,
-            session,
-            "web.network",
-            failed.then_some("failed"),
-        ),
+        } => network_records(root, json, session, query, failed),
         DiagnoseCommand::Events { session, json } => {
             records(root, json, session, "web.events", None)
         }
     }
+}
+
+fn network_records(
+    root: Option<&str>,
+    json_out: bool,
+    session: Option<String>,
+    query: Option<String>,
+    failed: bool,
+) -> Result<i32> {
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(json_out, error),
+    };
+    let mut payload = json!({ "session_id": session });
+    let object = payload
+        .as_object_mut()
+        .expect("network payload is an object");
+    if let Some(query) = query {
+        object.insert("query".into(), json!(query));
+    }
+    if failed {
+        object.insert("filter".into(), json!("failed"));
+    }
+    rpc(root, json_out, "web.network", payload, Some(session))
 }
 
 /// One call for all three verbs. `filter` is passed through so the runtime

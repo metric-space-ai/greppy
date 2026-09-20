@@ -12,7 +12,7 @@ use embedder_traits::{
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PermissionFeature, PromptResponse, RgbColor, ScreenGeometry,
     SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
-    WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
+    WebResourceRequest, WebResourceResponse, WebResourceResponseCompleted, WebResourceResponseMsg,
 };
 use paint_api::rendering_context::RenderingContext;
 use servo_base::generic_channel::{GenericCallback, GenericSender, SendError};
@@ -1082,6 +1082,14 @@ pub trait WebViewDelegate {
     /// will call [`crate::ServoDelegate::load_web_resource`].
     fn load_web_resource(&self, _webview: WebView, _load: WebResourceLoad) {}
 
+    /// Called after a real network response reaches a terminal state.
+    fn web_resource_response_completed(
+        &self,
+        _webview: WebView,
+        _response: WebResourceResponseCompleted,
+    ) {
+    }
+
     /// Request to display a notification.
     fn show_notification(&self, _webview: WebView, _notification: Notification) {}
 
@@ -1226,10 +1234,15 @@ mod test {
     #[test]
     fn test_web_resource_load() {
         use http::{HeaderMap, Method, StatusCode};
+        use embedder_traits::WebResourceLoadId;
 
         use crate::responders::ServoErrorChannel;
 
         let web_resource_request = || WebResourceRequest {
+            id: WebResourceLoadId {
+                fetch_id: "test-fetch".to_owned(),
+                redirect_count: 0,
+            },
             method: Method::GET,
             headers: HeaderMap::default(),
             url: Url::parse("https://example.com").expect("Guaranteed by argument"),

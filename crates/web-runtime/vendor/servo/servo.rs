@@ -414,6 +414,15 @@ impl ServoInner {
                     self.delegate.borrow().load_web_resource(web_resource_load);
                 }
             },
+            NetToEmbedderMsg::WebResourceResponseCompleted(webview_id, response) => {
+                if let Some(webview) =
+                    webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
+                {
+                    webview
+                        .delegate()
+                        .web_resource_response_completed(webview, response);
+                }
+            },
             NetToEmbedderMsg::RequestAuthentication(
                 webview_id,
                 url,

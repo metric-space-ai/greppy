@@ -121,6 +121,7 @@ pub use crate::webview_delegate::{
     InputMethodControl, NavigationRequest, PermissionRequest, PromptDialog, SelectElement,
     SimpleDialog, WebResourceLoad, WebViewDelegate,
 };
+pub use embedder_traits::WebResourceResponseCompleted;
 
 #[cfg(feature = "webxr")]
 pub mod webxr {

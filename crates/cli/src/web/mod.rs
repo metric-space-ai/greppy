@@ -121,6 +121,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_network_accepts_record_query() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "network",
+            "status>=400 url~/missing/",
+            "--session",
+            "wrs_1",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Diagnose(DiagnoseCommand::Network {
+                    query: Some(query),
+                    failed: false,
+                    session: Some(session),
+                    json: true,
+                })
+            }) if query == "status>=400 url~/missing/" && session == "wrs_1"
+        ));
+    }
+
+    #[test]
     fn parse_web_read_accepts_positional_and_flagged_urls() {
         for operand in [
             vec!["https://example.com/article"],

@@ -715,6 +715,46 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn serve_status_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status fixture");
+    let address = listener.local_addr().expect("status fixture addr");
+    thread::spawn(move || {
+        let repeated = std::sync::atomic::AtomicUsize::new(0);
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..count]);
+            let path = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("/");
+            if path == "/jump" {
+                let location = format!("http://{address}/landed");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
+            if path == "/chunked" {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+                continue;
+            }
+            let (status, body) = match path {
+                "/missing" => ("404 Not Found", b"missing".as_slice()),
+                "/repeat" if repeated.fetch_add(1, Ordering::SeqCst) > 0 => ("404 Not Found", b"repeated missing".as_slice()),
+                "/empty" => ("204 No Content", b"".as_slice()),
+                "/landed" => ("200 OK", b"landed".as_slice()),
+                _ => ("200 OK", b"ok".as_slice()),
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}/")
+}
+
 struct NavigationLifecycleFixture {
     origin: String,
     events: std::sync::mpsc::Receiver<String>,
@@ -2897,6 +2937,177 @@ fn route_fulfill_overrides_http_body() {
     run.deadline_ms = 60_000;
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "{ran:?}");
+}
+
+#[test]
+fn network_query_filters_enriched_response_records() {
+    let origin = serve_fixture("unused");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-query.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_network_query", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_query",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network");
+    assert_eq!(filtered.status, "ok", "{filtered:?}");
+    let requests = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("network requests");
+    assert_eq!(requests.len(), 1, "{filtered:?}");
+    assert!(
+        requests[0]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/same")),
+        "{filtered:?}"
+    );
+    assert_eq!(requests[0]["status"], 404);
+    assert_eq!(requests[0]["ok"], false);
+    assert_eq!(requests[0]["byteLength"], 7);
+
+    let successful = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status=200 url~/same$/" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network successful occurrence");
+    let successes = successful.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("successful network requests");
+    assert_eq!(successes.len(), 1, "{successful:?}");
+    assert_ne!(
+        successes[0]["requestId"], requests[0]["requestId"],
+        "repeated URL occurrences must retain distinct response identities"
+    );
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network failed records");
+    let failures = failed.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("failed network requests");
+    assert_eq!(failures.len(), 2, "{failed:?}");
+    let transport = failures
+        .iter()
+        .find(|record| {
+            record["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/failed"))
+        })
+        .expect("failed transport record");
+    assert!(transport.get("status").is_none(), "{transport:?}");
+    assert!(transport["failure"]["errorText"].is_string(), "{transport:?}");
+}
+
+#[test]
+fn network_query_filters_real_http_and_https_responses() {
+    let origin = serve_status_fixture();
+    let https = spawn_tls_origin("network-status-origin.py");
+    let https_origin = format!("https://{}/", https.addr);
+    let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    let failed_origin = format!("http://{}/transport-failure", failed_listener.local_addr().unwrap());
+    thread::spawn(move || { if let Ok((stream, _)) = failed_listener.accept() { drop(stream); } });
+    let socket = std::env::temp_dir().join(format!("greppy-web-network-http-query-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-http-status.mjs");
+    let source = format!(
+        "globalThis.httpsFixtureUrl = {};\nglobalThis.failedFixtureUrl = {};\n{}",
+        serde_json::to_string(&https_origin).unwrap(),
+        serde_json::to_string(&failed_origin).unwrap(),
+        std::fs::read_to_string(&script).unwrap(),
+    );
+    let _guard = Supervisor::spawn(&socket, "run_network_http_query", |command| {
+        command.arg("--fixture-url").arg(&origin).env("GREPPY_WEB_TEST_IGNORE_CERTS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new("run_network_http_query", "web.session.create", json!({ "profile": "project" })), Duration::from_secs(10)).expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"].as_str().unwrap().to_owned();
+    let mut run = Request::new("run_network_http_query", "web.run", json!({
+        "session_id": session_id, "script_source": "file",
+        "script_file": script.display().to_string(), "script_text": source,
+    }));
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(&socket, &Request::new("run_network_http_query", "web.network", json!({ "session_id": session_id, "query": "status>=400" })), Duration::from_secs(10)).expect("filtered network");
+    let failures = filtered.result.as_ref().unwrap()["requests"].as_array().unwrap();
+    assert_eq!(failures.len(), 4, "{filtered:?}");
+    for scheme in ["http://", "https://"] {
+        assert!(failures.iter().any(|row| row["url"].as_str().is_some_and(|url| url.starts_with(scheme) && url.ends_with("/missing")) && row["status"] == 404 && row["byteLength"] == 7), "{scheme}: {filtered:?}");
+        assert!(failures.iter().any(|row| row["url"].as_str().is_some_and(|url| url.starts_with(scheme) && url.ends_with("/repeat")) && row["status"] == 404 && row["byteLength"] == 16), "{scheme}: {filtered:?}");
+    }
+
+    let all = unix_request(&socket, &Request::new("run_network_http_query", "web.network", json!({ "session_id": session_id })), Duration::from_secs(10)).expect("all network");
+    let records = all.result.as_ref().unwrap()["requests"].as_array().unwrap();
+    for base in [&origin, &https_origin] {
+        let repeated = records.iter().filter(|row| row["url"].as_str().is_some_and(|url| url == format!("{base}repeat"))).collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 2, "{base}: {all:?}");
+        assert_ne!(repeated[0]["requestId"], repeated[1]["requestId"]);
+        assert_eq!((repeated[0]["status"].as_u64(), repeated[0]["byteLength"].as_u64()), (Some(200), Some(11)));
+        assert_eq!((repeated[1]["status"].as_u64(), repeated[1]["byteLength"].as_u64()), (Some(404), Some(16)));
+        for (path, status, bytes) in [("jump", 302, 0), ("landed", 200, 6), ("chunked", 200, 11), ("empty", 204, 0)] {
+            let row = records.iter().find(|row| row["url"].as_str().is_some_and(|url| url == format!("{base}{path}"))).unwrap_or_else(|| panic!("missing {base}{path}: {all:?}"));
+            assert_eq!((row["status"].as_u64(), row["byteLength"].as_u64()), (Some(status), Some(bytes)), "{base}{path}: {all:?}");
+        }
+    }
+    let failed = records.iter().find(|row| row["url"] == failed_origin).unwrap_or_else(|| panic!("missing transport failure: {all:?}"));
+    assert!(failed.get("status").is_none(), "{failed:?}");
+    assert!(failed["failure"]["errorText"].is_string(), "{failed:?}");
+    let failed_only = unix_request(&socket, &Request::new("run_network_http_query", "web.network", json!({ "session_id": session_id, "filter": "failed" })), Duration::from_secs(10)).expect("failed network filter");
+    assert!(failed_only.result.as_ref().unwrap()["requests"].as_array().unwrap().iter().any(|row| row["url"] == failed_origin && row["failure"]["errorText"].is_string()), "{failed_only:?}");
 }
 
 #[test]
@@ -7915,7 +8126,7 @@ impl Drop for TlsHeaderOrigin {
     }
 }
 
-fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+fn spawn_tls_origin(script_name: &str) -> TlsHeaderOrigin {
     let dir = tempfile_tls_dir::TempDir::new();
     let cert = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
@@ -7947,7 +8158,7 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
         String::from_utf8_lossy(&generated.stderr)
     );
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extra-headers-origin.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(script_name);
     assert!(
         script.is_file(),
         "missing TLS origin fixture {}",
@@ -7994,6 +8205,10 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
         child: Some(child),
         _dir: dir,
     }
+}
+
+fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+    spawn_tls_origin("extra-headers-origin.py")
 }
 
 

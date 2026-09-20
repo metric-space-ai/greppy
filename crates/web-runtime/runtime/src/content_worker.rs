@@ -14,8 +14,8 @@ use servo::{
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
     RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
     TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder, WebViewDelegate,
+    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,6 +35,7 @@ const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
+const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -335,6 +336,7 @@ struct Delegate {
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
+    dropped_requests: Cell<u64>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
@@ -349,6 +351,7 @@ struct Delegate {
     denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
+    dropped_responses: Cell<u64>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     /// Main-document lifecycle, owned by Servo rather than page script. A
@@ -378,6 +381,7 @@ impl Delegate {
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
+            dropped_requests: Cell::new(0),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
@@ -391,6 +395,7 @@ impl Delegate {
             denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
+            dropped_responses: Cell::new(0),
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
@@ -401,13 +406,13 @@ impl Delegate {
         }
     }
 
-    fn mark_request_failure(&self, url: &str, error_text: &str) {
+    fn mark_request_failure(&self, request_id: &str, error_text: &str) {
         if let Some(row) = self
             .requests
             .borrow_mut()
             .iter_mut()
             .rev()
-            .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url))
+            .find(|row| row.get("requestId").and_then(|value| value.as_str()) == Some(request_id))
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
@@ -554,6 +559,7 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
+        let request_id = format!("{}:{}", load.request.id.fetch_id, load.request.id.redirect_count);
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -591,7 +597,9 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow if abort_match => Some("net::ERR_FAILED".to_owned()),
             UrlDecision::Allow => None,
         };
-        self.requests.borrow_mut().push(json!({
+        let mut requests = self.requests.borrow_mut();
+        requests.push(json!({
+            "requestId": request_id,
             "url": url,
             "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
@@ -599,6 +607,8 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
+        retain_bounded(&mut requests, &self.dropped_requests, MAX_NETWORK_RECORDS_PER_PAGE);
+        drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
@@ -633,7 +643,7 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
-                self.mark_request_failure(&url, "net::ERR_FAILED");
+                self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
                 }
@@ -658,7 +668,9 @@ impl WebViewDelegate for Delegate {
                 intercepted.finish();
                 let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
                 let body_b64 = base64_encode(&body);
-                self.last_responses.borrow_mut().push(json!({
+                let mut responses = self.last_responses.borrow_mut();
+                responses.push(json!({
+                    "requestId": request_id,
                     "url": request_url.to_string(),
                     "status": status,
                     "statusText": status_text,
@@ -669,6 +681,8 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
+                retain_bounded(&mut responses, &self.dropped_responses, MAX_NETWORK_RECORDS_PER_PAGE);
+                drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
                 let is_download = lower.contains("octet-stream") || lower.contains("attachment");
@@ -701,6 +715,97 @@ impl WebViewDelegate for Delegate {
             _ => {}
         }
     }
+    fn web_resource_response_completed(
+        &self,
+        _webview: WebView,
+        response: WebResourceResponseCompleted,
+    ) {
+        let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        let headers: serde_json::Map<String, serde_json::Value> = response.headers.iter().filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| (name.as_str().to_owned(), json!(value)))
+        }).collect();
+        let mut row = json!({
+            "requestId": request_id,
+            "url": response.url.to_string(),
+            "statusText": String::from_utf8_lossy(&response.status_message),
+            "bodyBytes": response.body_bytes,
+            "byteLength": response.body_bytes,
+            "fromCache": response.from_cache,
+            "headers": headers,
+        });
+        if let Some(status) = response.status_code {
+            row["status"] = json!(status);
+            row["ok"] = json!((200..400).contains(&status));
+        }
+        if let Some(failure) = response.failure {
+            row["failure"] = json!({ "errorText": failure });
+        }
+        let mut responses = self.last_responses.borrow_mut();
+        if let Some(existing) = responses.iter_mut().find(|existing| {
+            existing.get("requestId").and_then(|id| id.as_str()) == Some(request_id.as_str())
+        }) {
+            merge_terminal_response(existing, row);
+        } else {
+            responses.push(row);
+            retain_bounded(&mut responses, &self.dropped_responses, MAX_NETWORK_RECORDS_PER_PAGE);
+        }
+        self.wake.wake();
+    }
+}
+
+fn retain_bounded(records: &mut Vec<serde_json::Value>, dropped: &Cell<u64>, limit: usize) {
+    let excess = records.len().saturating_sub(limit);
+    if excess != 0 {
+        records.drain(..excess);
+        dropped.set(dropped.get().saturating_add(excess as u64));
+    }
+}
+
+fn network_retention_metadata(retained: usize, dropped: u64) -> serde_json::Value {
+    json!({
+        "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+        "retained": retained,
+        "dropped": dropped,
+        "complete": dropped == 0,
+    })
+}
+
+fn response_information_score(response: &serde_json::Value) -> usize {
+    let failure = response.get("failure").is_some_and(|value| !value.is_null()) as usize * 1_000;
+    let status = response.get("status").and_then(|value| value.as_u64()).is_some() as usize * 100;
+    let headers = response.get("headers").and_then(|value| value.as_object()).map_or(0, |value| value.len() * 10);
+    let body = response.get("bodyBytes").and_then(|value| value.as_u64()).is_some() as usize * 10;
+    failure + status + headers + body
+}
+
+fn merge_terminal_response(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    let existing_key = (response_information_score(existing), existing.to_string());
+    let incoming_key = (response_information_score(&incoming), incoming.to_string());
+    let (mut richer, other) = if incoming_key > existing_key {
+        (incoming, existing.clone())
+    } else {
+        (existing.clone(), incoming)
+    };
+    let Some(richer_object) = richer.as_object_mut() else { return };
+    let Some(other_object) = other.as_object() else { return };
+    for (key, value) in other_object {
+        let missing = richer_object.get(key).is_none_or(|current| {
+            current.is_null()
+                || current.as_str().is_some_and(str::is_empty)
+                || current.as_object().is_some_and(serde_json::Map::is_empty)
+        });
+        if missing {
+            richer_object.insert(key.clone(), value.clone());
+        }
+    }
+    for key in ["bodyBytes", "byteLength"] {
+        if let Some(maximum) = [richer_object.get(key), other_object.get(key)]
+            .into_iter().flatten().filter_map(serde_json::Value::as_u64).max()
+        {
+            richer_object.insert(key.to_owned(), json!(maximum));
+        }
+    }
+    *existing = richer;
 }
 
 fn extra_request_headers(extras: &[(String, String)]) -> http::HeaderMap {
@@ -3269,13 +3374,24 @@ impl ContentEngine {
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                let retained = delegate.requests.borrow().len();
+                let dropped = delegate.dropped_requests.get();
                 Ok(json!({
-                    "requests": crate::daemon::redact_json(json!(self.page(&page_id)?.1.requests.borrow().clone()))
+                    "requests": crate::daemon::redact_json(json!(delegate.requests.borrow().clone())),
+                    "retention": network_retention_metadata(retained, dropped)
                 }))
             }
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
-                Ok(json!({ "responses": self.page(&page_id)?.1.last_responses.borrow().clone() }))
+                let delegate = &self.page(&page_id)?.1;
+                let responses = delegate.last_responses.borrow().clone();
+                let retained = responses.len();
+                let dropped = delegate.dropped_responses.get();
+                Ok(json!({
+                    "responses": responses,
+                    "retention": network_retention_metadata(retained, dropped)
+                }))
             }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
@@ -4513,6 +4629,49 @@ fn serialize_jsvalue(value: JSValue) -> io::Result<serde_json::Value> {
 mod serialize_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn terminal_response_merge_is_order_independent_and_keeps_failure_details() {
+        let streamed = json!({
+            "requestId": "fetch:0", "status": 200, "statusText": "OK",
+            "headers": { "content-type": "text/plain" },
+            "bodyBytes": 7, "byteLength": 7,
+            "failure": { "errorText": "body reset" }
+        });
+        let generic = json!({
+            "requestId": "fetch:0", "statusText": "", "headers": {},
+            "bodyBytes": 0, "byteLength": 0,
+            "failure": { "errorText": "network error" }
+        });
+        let mut first = streamed.clone();
+        merge_terminal_response(&mut first, generic.clone());
+        let mut second = generic;
+        merge_terminal_response(&mut second, streamed);
+        assert_eq!(first, second);
+        assert_eq!(first["status"], 200);
+        assert_eq!(first["byteLength"], 7);
+        assert_eq!(first["headers"]["content-type"], "text/plain");
+        assert!(first["failure"]["errorText"].is_string());
+    }
+
+    #[test]
+    fn bounded_network_retention_reports_dropped_and_retained_counts() {
+        let dropped = Cell::new(0);
+        let mut records = vec![json!(1), json!(2), json!(3)];
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(2), json!(3)]);
+        assert_eq!(dropped.get(), 1);
+        records.push(json!(4));
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(3), json!(4)]);
+        assert_eq!(dropped.get(), 2);
+        assert_eq!(network_retention_metadata(records.len(), dropped.get()), json!({
+            "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+            "retained": 2,
+            "dropped": 2,
+            "complete": false,
+        }));
+    }
 
     #[test]
     fn serialize_jsvalue_keeps_undefined_and_non_finite_distinct() {
