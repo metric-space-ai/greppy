@@ -1,7 +1,7 @@
 name: release
 
-# Build ready-to-run binaries for macOS Apple Silicon, Linux x86_64, and
-# Windows x86_64, sign them, and attach them to a GitHub Release.
+# Build ready-to-run binaries for macOS Apple Silicon and Linux x86_64, sign
+# them, and attach them to a GitHub Release. Windows remains debug-only.
 #
 # Triggers:
 #   * push a tag `v*`   -> builds and publishes a Release with the assets
@@ -20,7 +20,7 @@ on:
     inputs:
       sign_dry_run:
         description: >-
-          RC signing dry-run: run the Apple/Windows signing, notarization and
+          RC signing dry-run: run the Apple signing, notarization and
           verification steps on the built artifacts WITHOUT a tag and WITHOUT
           publishing. Lets the first real signing test happen before the
           immutable release tag exists. Requires the signing secrets.
@@ -28,8 +28,9 @@ on:
         default: false
       measure_runtime_footprint:
         description: >-
-          Include the hours-long diagnostic CPU/Metal runtime-footprint
-          evidence in a manual dry-run. Release tags always include it.
+          Include macOS Metal runtime-footprint evidence in a manual dry-run.
+          Linux CUDA acceptance is run separately on provisioned ts-gpu3;
+          release tags always include the macOS evidence.
         type: boolean
         default: false
 
@@ -226,9 +227,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS release inference requires Metal. Linux keeps its CPU
-          # footprint evidence because CUDA is dynamically loaded there (no
-          # hard cudart link, so the binary still starts without CUDA).
+          # Every release artifact contains both embedding and summary GPU
+          # backends. Compilation needs nvcc but no GPU; real Linux CUDA
+          # acceptance runs separately on the provisioned ts-gpu3 host
+          # (100.71.114.101, metricspace) until that host is registered as a
+          # GitHub Actions runner.
           - name: macos-arm64
             os: macos-latest
             asset: greppy-macos-arm64.pkg
@@ -246,22 +249,16 @@ jobs:
             asset: greppy-linux-x86_64.deb
             secondary_asset: greppy-linux-x86_64.rpm
             features: cuda
-            footprint_devices: 'cpu'
+            footprint_devices: 'cuda'
             runner_os: Linux
             runner_arch: X64
             rust_host: x86_64-unknown-linux-gnu
             cuda_sub_packages: '["nvcc", "cudart"]'
             cuda_non_cuda_sub_packages: '["libcublas", "libcublas-dev"]'
-          # v0.2.0 certifies Windows CPU inference and named-pipe daemons.
-          # Windows CUDA and macOS Intel remain outside this release gate.
-          - name: windows-x86_64
-            os: windows-2022
-            asset: greppy-windows-x86_64.msi
-            features: cpu-only
-            footprint_devices: 'cpu'
-            runner_os: Windows
-            runner_arch: X64
-            rust_host: x86_64-pc-windows-msvc
+          # Windows keeps debug portability coverage in ci.yml and
+          # filesystem-cow.yml, but is not a supported product target. Do not
+          # add a Windows release artifact until both embedded models have a
+          # verified native GPU backend there.
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Restore model assets
@@ -558,7 +555,7 @@ jobs:
           "WINDOWS_SIGNING_PFX_PATH=$cert" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify CUDA backend runtime dependencies
-        if: matrix.features == 'cuda'
+        if: matrix.features == 'cuda' && runner.os == 'Linux'
         shell: bash
         run: |
           backend="$(find target/release/build -path '*/out/greppy_embed_native_cuda.so' -print -quit)"
@@ -636,38 +633,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Measure runtime footprint (Unix)
-        if: runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
+      - name: Measure runtime footprint (macOS Metal)
+        if: runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
         shell: bash
         run: |
           repo="$RUNNER_TEMP/greppy-footprint-serde"
           git clone --quiet --filter=blob:none https://github.com/serde-rs/serde.git "$repo"
           git -C "$repo" checkout --quiet --detach 1023d077510b4aef36a41ef56fdb7798568a2654
           for device in ${{ matrix.footprint_devices }}; do
-            timeout_args=()
-            if [ "$device" = cpu ]; then
-              # 3600 was too tight: the serde embedding build on the 4-core
-              # hosted runner needs >1h on the pure-CPU path (dry-run #4 hit
-              # the cap). This is a measurement, not a quality gate - the
-              # numbers land in the release evidence either way.
-              timeout_args=(--timeout-seconds 7200)
-            fi
             python3 bench/runtime_footprint.py \
               --greppy "$PWD/target/release/greppy" \
               --repo "$repo" \
               --semantic-query 'apply a rename case rule to a struct field' \
               --brief-symbol apply_to_field \
               --device "$device" \
-              "${timeout_args[@]}" \
               --warm-repeats 3 \
               --output "runtime-footprint-${{ matrix.name }}-$device.json"
           done
 
-      # Windows runtime-footprint measurement removed: greppy's CPU semantic
-      # index of the pinned repo takes multiple hours on the hosted Windows
-      # runner and cannot reliably complete inside the job. macOS and Linux
-      # runtime evidence still ships; the Windows footprint is measured out of
-      # band. (Its asset-contract entry is removed to match.)
+      # Linux CUDA acceptance is deliberately out of band until the known
+      # ts-gpu3 host (100.71.114.101, metricspace; 3x RTX A4500, nvcc) is
+      # registered as a GitHub Actions runner. Hosted Linux still compiles the
+      # CUDA artifact with nvcc; it must not pretend to execute a GPU gate.
 
       - name: Package (Unix)
         if: runner.os == 'Linux'
@@ -960,7 +947,7 @@ jobs:
           subject-path: ${{ matrix.secondary_asset }}.spdx.json
 
       - name: Attest runtime footprint evidence
-        if: runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
+        if: runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: runtime-footprint-*.json
@@ -1028,10 +1015,6 @@ jobs:
             asset: greppy-linux-x86_64.deb
             secondary_asset: greppy-linux-x86_64.rpm
             rust_host: x86_64-unknown-linux-gnu
-          - name: windows-x86_64
-            os: windows-2022
-            asset: greppy-windows-x86_64.msi
-            rust_host: x86_64-pc-windows-msvc
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -1097,9 +1080,6 @@ jobs:
           ' "$RUNNER_TEMP/workspace-doctor.json" >/dev/null
           cleanup_provider
           trap - EXIT
-          if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
-            test -s package/runtime-footprint-linux-x86_64-cpu.json
-          fi
           python3 "$deb_root/usr/lib/greppy/release-tests/release_artifacts.py" verify-spdx \
             --sbom "package/${{ matrix.asset }}.spdx.json" \
             --dist "$deb_root" \

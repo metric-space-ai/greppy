@@ -264,10 +264,6 @@ jobs:
           sub-packages: '["nvcc", "cudart"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
-      # Windows CUDA is deliberately outside the release gate (release.yml ships
-      # a CPU Windows binary), so this is the one target that builds without a
-      # GPU backend — and it must say so out loud rather than drift into a
-      # silent CPU build.
       - name: Build default product binary with real assets
         run: cargo build -p greppy --bin greppy ${{ runner.os == 'Windows' && '--features cpu-only' || '' }}
 
@@ -318,9 +314,7 @@ jobs:
           tools/build_winfsp_fork.ps1 -Destination $fork
           "GREPPY_WINFSP_FORK_ROOT=$fork" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # This job's name is its contract: Windows ships a CPU binary, so the
-      # backend assertion is waived explicitly here and nowhere else.
-      - name: Build Windows CPU test binary
+      - name: Build Windows CPU debug test binary
         run: cargo build --workspace --features greppy/ci-test-assets,greppy/cpu-only
 
       - name: Test Windows locks, portable agent fail-closed, and daemon transport
@@ -415,6 +409,7 @@ jobs:
       - name: battle suite + soak
         env:
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
+          GREPPY_DEVICE: ${{ runner.os == 'Linux' && 'cpu' || 'auto' }}
           BATTLE_SOAK: "1"
           BATTLE_SOAK_ITERS: "100"
           BATTLE_SOAK_FILES: "40"

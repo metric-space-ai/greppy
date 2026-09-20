@@ -354,19 +354,15 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 29)
+        self.assertEqual(len(names), 19)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
-        self.assertIn("build-environment-windows-x86_64.json", names)
-        self.assertIn("greppy-windows-x86_64.msi", names)
-        self.assertIn("greppy-windows-driver-contract.json", names)
-        self.assertIn("greppy-windows-driver-signature-evidence.json", names)
-        self.assertIn("greppyworkspacefsp-x64.cat", names)
+        self.assertNotIn("build-environment-windows-x86_64.json", names)
+        self.assertNotIn("greppy-windows-x86_64.msi", names)
         self.assertIn("runtime-footprint-macos-arm64-metal.json", names)
         self.assertNotIn("runtime-footprint-macos-arm64-cpu.json", names)
         self.assertNotIn("greppy-windows-x86_64.zip", names)
-        # Release scope (SECURITY.md): the Windows runtime footprint is measured
-        # out of band (hours-long CPU index on the hosted runner), and the
+        # Windows is debug-only and has no release runtime-footprint asset. The
         # edit-regime coding benchmark publishes per commit but does not gate.
         self.assertNotIn("runtime-footprint-windows-x86_64-cpu.json", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz", names)
@@ -385,23 +381,16 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("native agent fallback", ci_workflow)
         self.assertIn("portable agent fail-closed", ci_workflow)
         self.assertIn("tools.test_portable_cow_performance", workflow)
-        windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
-            "steps:", 1
-        )[0]
         macos_matrix = workflow.split("- name: macos-arm64", 1)[1].split(
             "- name: linux-x86_64", 1
         )[0]
         self.assertIn("footprint_devices: 'metal'", macos_matrix)
         self.assertNotIn("footprint_devices: 'cpu metal'", macos_matrix)
-        self.assertIn("features: cpu-only", windows_matrix)
-        self.assertNotIn("features: cpu\n", windows_matrix)
+        self.assertNotIn("features: cpu-only", workflow)
         self.assertIn("--features ${{ matrix.features }}", workflow)
         self.assertIn("record-build-environment", workflow)
-        self.assertEqual(
-            release.BUILD_ENVIRONMENTS[
-                "build-environment-windows-x86_64.json"
-            ]["build_features"],
-            "cpu-only",
+        self.assertNotIn(
+            "build-environment-windows-x86_64.json", release.BUILD_ENVIRONMENTS
         )
         self.assertIn("create-training-archive", workflow)
         self.assertIn("augment-spdx", workflow)
@@ -673,22 +662,19 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn(
             "Notarization without these profiles is insufficient", portable_docs
         )
-        # One Unix footprint invocation remains; the Windows measurement is out
-        # of band (see the release-scope comment in release.yml). Manual
-        # packaging dry-runs may skip the hours-long diagnostic, but immutable
-        # release tags must always execute and verify it.
-        self.assertGreaterEqual(workflow.count("--timeout-seconds 7200"), 1)
-        self.assertIn('if [ "$device" = cpu ]', workflow)
+        # Hosted CI measures Metal. Linux CUDA acceptance stays explicit and
+        # out of band until the known GPU host is registered as a runner.
         self.assertIn("measure_runtime_footprint:", workflow)
         self.assertIn(
-            "runner.os != 'Windows' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)",
+            "runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || inputs.measure_runtime_footprint)",
             workflow,
         )
+        self.assertIn("ts-gpu3 host (100.71.114.101, metricspace", workflow)
         self.assertEqual(
             workflow.count(
                 'if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]'
             ),
-            2,
+            1,
         )
 
         windows_smoke = (

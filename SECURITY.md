@@ -72,28 +72,9 @@ ticket, so `xcrun stapler validate` and `spctl --assess --type execute` report
 errors on it by construction — that is not a defect. Gatekeeper fetches the
 notarization ticket online when the binary first runs.
 
-For Windows, verify both the aggregate checksum and the Authenticode chain and
-timestamp before running the binary:
-
-```powershell
-$version = 'v0.3.3'
-gh release download $version --repo metric-space-ai/greppy
-$line = (Select-String 'greppy-windows-x86_64.zip$' SHA256SUMS).Line
-$want = ($line -split '\s+')[0]
-$got = (Get-FileHash greppy-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($got -ne $want) { throw 'release checksum mismatch' }
-Expand-Archive greppy-windows-x86_64.zip -DestinationPath unpack
-$signature = Get-AuthenticodeSignature unpack/greppy.exe
-if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
-    throw "invalid or untimestamped Authenticode signature: $($signature.Status)"
-}
-$signature.SignerCertificate | Format-List Subject,Thumbprint,NotAfter
-gh attestation verify greppy-windows-x86_64.zip `
-  --repo metric-space-ai/greppy `
-  --signer-workflow metric-space-ai/greppy/.github/workflows/release.yml `
-  --source-ref "refs/tags/$version" `
-  --deny-self-hosted-runners
-```
+Windows is covered by CPU debug portability tests but is not a supported
+product/release target. Releases contain macOS Metal and Linux x86_64 CUDA
+packages only.
 
 The GitHub attestation establishes the expected repository and workflow
 identity. The Apple and Microsoft checks independently establish platform

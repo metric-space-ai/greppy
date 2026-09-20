@@ -43,13 +43,6 @@ BUILD_ENVIRONMENTS = {
         "runner_arch": "X64",
         "rust_host": "x86_64-unknown-linux-gnu",
     },
-    "build-environment-windows-x86_64.json": {
-        "matrix_name": "windows-x86_64",
-        "build_features": "cpu-only",
-        "runner_os": "Windows",
-        "runner_arch": "X64",
-        "rust_host": "x86_64-pc-windows-msvc",
-    },
 }
 SHA256_LINE = re.compile(r"^([0-9a-f]{64})  ([^/\\]+)$")
 MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})  ([^\\]+)$")
