@@ -399,9 +399,21 @@ pub(crate) fn freshness_serve_decision_with_policy(
     allow_auto_reindex: bool,
     _warn_on_stale: bool,
 ) -> FreshnessServe {
-    let freshness = nav_freshness_json(store, root, project);
+    let writer_active = workspace_writer_active(root);
+    // A writer may be publishing metadata-only drift while the indexed file
+    // contents remain exactly valid. Bypass the freshness stamp so serving
+    // under contention requires a current inventory proof; changed or
+    // unverifiable contents remain fail-closed below.
+    let freshness = if writer_active {
+        nav_freshness_json_uncached(store, root, project)
+    } else {
+        nav_freshness_json(store, root, project)
+    };
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
+    }
+    if writer_active {
+        return FreshnessServe::Refuse(refresh_state(freshness, true));
     }
     let state = freshness
         .get("state")

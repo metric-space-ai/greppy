@@ -3771,6 +3771,23 @@ fn nav_freshness_json(
     root: Option<&str>,
     project: &str,
 ) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, false)
+}
+
+fn nav_freshness_json_uncached(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, true)
+}
+
+fn nav_freshness_json_with_policy(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    force_uncached: bool,
+) -> serde_json::Value {
     let overrides = match discover_overrides_from_env() {
         Ok(overrides) => overrides,
         Err(e) => {
@@ -3866,13 +3883,25 @@ fn nav_freshness_json(
             }
         }
     }
-    match greppy_freshness::check_files_report_with_overrides(
-        store,
-        &root_path,
-        project,
-        NAV_FRESHNESS_BUDGET,
-        &overrides,
-    ) {
+    let report = if force_uncached {
+        greppy_freshness::check_files_report_with_ttl(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+            std::time::Duration::ZERO,
+        )
+    } else {
+        greppy_freshness::check_files_report_with_overrides(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+        )
+    };
+    match report {
         Ok(report) => {
             let (fresh, state_name, reasons) = match report.state.outcome {
                 greppy_freshness::FreshnessOutcome::Fresh => (true, "fresh", Vec::<String>::new()),

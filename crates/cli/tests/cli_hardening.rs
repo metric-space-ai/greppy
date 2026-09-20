@@ -3131,6 +3131,10 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
         "refresh contention is temporary; stdout={out}\nstderr={err}"
     );
     assert!(
+        !out.contains("old_refresh_marker"),
+        "an unpublished refresh must never serve the deleted definition: {out}\n{err}"
+    );
+    assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "query must not wait for the held writer indefinitely"
     );
