@@ -264,12 +264,7 @@ fn search_symbol_no_match_status(
     println!("next: refresh definitions after source changes: greppy index .");
 }
 
-fn search_pattern_no_match_status(
-    query: &str,
-    fixed: bool,
-    path_filters: &QueryPathFilters,
-    matches_outside_filter: usize,
-) {
+fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &QueryPathFilters) {
     println!("status: no_matches");
     if path_filters.is_empty() {
         println!("scope: live Greppy-discovered source files in the repository");
@@ -280,13 +275,9 @@ fn search_pattern_no_match_status(
             "message: no matches under path filter: {}",
             path_filters.shown()
         );
-        if matches_outside_filter > 0 {
-            println!(
-                "reason: {matches_outside_filter} source match(es) exist outside the path filter"
-            );
-        } else {
-            println!("reason: no source match exists inside this scope");
-        }
+        println!(
+            "reason: no source match exists inside this scope; paths outside it were not scanned"
+        );
         let mode = if fixed { " --fixed" } else { "" };
         println!(
             "next: retry without the path filter: greppy search-pattern {}{mode}",
@@ -862,10 +853,12 @@ fn search_pattern_case_insensitive_hits(
 ) -> Result<Option<Vec<greppy_search::CodeHit>>> {
     const MAX_DIAGNOSTIC_FILES: usize = 1_024;
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
@@ -940,26 +933,36 @@ mod case_insensitive_diagnostic_tests {
 }
 
 fn search_pattern_rows(
-    store: &greppy_store::Store,
     project: &str,
     root_path: &std::path::Path,
     hits: &[greppy_search::CodeHit],
-    resolve_definitions: bool,
     kind: Option<&str>,
 ) -> Result<Vec<SearchPatternRow>> {
     let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
+        Default::default();
+    let mut live_nodes: std::collections::HashMap<String, Vec<greppy_store::Node>> =
         Default::default();
     let mut rows = Vec::new();
     for hit in hits {
         let Some(match_line) = parse_search_code_match(hit) else {
             continue;
         };
-        let node = if resolve_definitions {
-            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
-                .and_then(|row| store.get_node(row.id).ok().flatten())
-        } else {
-            None
-        };
+        if !live_nodes.contains_key(&match_line.file) {
+            let nodes = live_search_pattern_nodes(root_path, project, &match_line.file)?;
+            live_nodes.insert(match_line.file.clone(), nodes);
+        }
+        let nodes = &live_nodes[&match_line.file];
+        let node = nodes
+            .iter()
+            .filter(|node| node.start_line <= match_line.line && match_line.line <= node.end_line)
+            .min_by(|left, right| {
+                right
+                    .start_line
+                    .cmp(&left.start_line)
+                    .then_with(|| left.end_line.cmp(&right.end_line))
+                    .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            })
+            .cloned();
         if kind.is_some()
             && node
                 .as_ref()
@@ -990,6 +993,83 @@ fn search_pattern_rows(
             .then_with(|| left.hit.line.cmp(&right.hit.line))
     });
     Ok(rows)
+}
+
+fn live_search_pattern_nodes(
+    root_path: &std::path::Path,
+    project: &str,
+    file: &str,
+) -> Result<Vec<greppy_store::Node>> {
+    let path = root_path.join(file);
+    let language = greppy_parser::language_for_path(&path);
+    if !language.is_supported() {
+        return Ok(Vec::new());
+    }
+    let source = std::fs::read(&path)
+        .map_err(|error| Error::io(format!("read scoped match {}", path.display()), error))?;
+    let extracted = greppy_parser::extract(language, &source, file)?;
+    Ok(extracted
+        .nodes
+        .into_iter()
+        .map(|node| greppy_store::Node {
+            id: 0,
+            project: project.to_owned(),
+            label: node.label,
+            name: node.name,
+            qualified_name: node.qualified_name,
+            file_path: file.to_owned(),
+            start_line: i64::from(node.start_line),
+            end_line: i64::from(node.end_line),
+            properties: node.properties,
+        })
+        .collect())
+}
+
+fn search_pattern_row_json(
+    row: &SearchPatternRow,
+    root_path: &std::path::Path,
+    _code: bool,
+) -> Result<serde_json::Value> {
+    if let Some(node) = row.node.as_ref() {
+        let graph_row = greppy_search::graph::SearchGraphRow {
+            id: node.id,
+            project: node.project.clone(),
+            label: node.label.clone(),
+            name: node.name.clone(),
+            qualified_name: node.qualified_name.clone(),
+            file_path: node.file_path.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+        };
+        if let Some(mut entry) = search_code_definition_entry(root_path, &graph_row)? {
+            entry.matches.push(row.hit.clone());
+            let mut value = search_code_entry_json(&SearchCodeEntry::Definition(entry));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("name".into(), serde_json::json!(&node.name));
+                object.insert(
+                    "kind".into(),
+                    serde_json::json!(nav_kind_word(
+                        nav_file_lines(root_path, &node.file_path).as_ref(),
+                        node
+                    )),
+                );
+                object.insert("test".into(), serde_json::json!(row.test));
+            }
+            return Ok(value);
+        }
+    }
+    Ok(serde_json::json!({
+        "qualified_name": serde_json::Value::Null,
+        "file": &row.hit.file,
+        "span": { "start_line": row.hit.line, "end_line": row.hit.line },
+        "source": serde_json::Value::Null,
+        "handle": serde_json::Value::Null,
+        "matches": [{
+            "location": format!("{}:{}", row.hit.file, row.hit.line),
+            "line": row.hit.line,
+            "text": &row.hit.text,
+        }],
+    }))
 }
 
 fn print_search_pattern_rows(
@@ -1092,26 +1172,16 @@ pub(crate) fn dispatch_search_code(
             "search-pattern requires a regular expression".into(),
         ));
     }
-    let path_filters = prepare_query_path_filters(root, "search-pattern", q, paths)?;
-    let store = open_default_store(root)?;
-    let project = project_for(root)?;
     let root_path = resolve_root(root)?;
-    let decision = freshness_serve_decision(&store, root, &project);
-    let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
-    let status = if resolve_definitions {
-        "ok"
-    } else {
-        "live-fallback"
-    };
-    let mut all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
-    let matches_outside_filter = all_hits
-        .iter()
-        .filter(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| !path_filters.matches(file))
-        })
-        .count();
+    let path_filters = prepare_query_path_filters(root, "search-pattern", q, paths)?;
+    let project = project_for(root)?;
+    let decision = serde_json::json!({
+        "state": "not_consulted",
+        "fresh": false,
+        "reasons": ["literal search resolved against selected live source files"],
+    });
+    let status = "live-fallback";
+    let mut all_hits = live_grep_code_hits_pattern_scoped(q, &root_path, fixed, &path_filters)?;
     // The path filter shapes the hit set BEFORE any count is taken — a count
     // from before the filter is a false number (the --kind discipline).
     all_hits.retain(|hit| {
@@ -1120,39 +1190,80 @@ pub(crate) fn dispatch_search_code(
             .is_some_and(|(file, _)| path_filters.matches(file))
     });
 
-    let rows = search_pattern_rows(
-        &store,
-        &project,
-        &root_path,
-        &all_hits,
-        resolve_definitions,
-        kind,
-    )?;
+    let rows = search_pattern_rows(&project, &root_path, &all_hits, kind)?;
     if json {
-        let shown_hits = rows
-            .iter()
-            .take(cli_result_limit_unless_all(SEARCH_CODE_LIMIT, all))
-            .map(|row| greppy_search::CodeHit {
-                location: format!("{}:{}", row.hit.file, row.hit.line),
-                snippet: row.hit.text.clone(),
-                rank: 0.0,
-            })
-            .collect::<Vec<_>>();
-        emit_search_code_results_with_format(
-            &store,
-            q,
-            &project,
-            status,
-            Some(decision.freshness()),
-            rows.len(),
-            &shown_hits,
-            &path_filters,
-            &root_path,
-            true,
-            false,
-            fixed,
-            resolve_definitions,
-        )?;
+        let mut shown: Vec<serde_json::Value> = Vec::new();
+        let mut definitions = std::collections::HashMap::<String, usize>::new();
+        let shown_matches = cli_result_limit_unless_all(SEARCH_CODE_LIMIT, all).min(rows.len());
+        for row in rows.iter().take(shown_matches) {
+            let value = search_pattern_row_json(row, &root_path, code)?;
+            let key = value
+                .get("qualified_name")
+                .and_then(serde_json::Value::as_str)
+                .map(|qualified_name| {
+                    format!(
+                        "{}\0{}\0{}\0{}",
+                        value["file"],
+                        value["span"]["start_line"],
+                        value["span"]["end_line"],
+                        qualified_name
+                    )
+                });
+            if let Some(index) = key.as_ref().and_then(|key| definitions.get(key)).copied() {
+                if let (Some(matches), Some(next)) = (
+                    shown[index]
+                        .get_mut("matches")
+                        .and_then(serde_json::Value::as_array_mut),
+                    value
+                        .get("matches")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|matches| matches.first()),
+                ) {
+                    matches.push(next.clone());
+                }
+            } else {
+                let index = shown.len();
+                if let Some(key) = key {
+                    definitions.insert(key, index);
+                }
+                shown.push(value);
+            }
+        }
+        let omitted = rows.len().saturating_sub(shown_matches);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": "search-pattern",
+                "status": status,
+                "result_status": if rows.is_empty() { "no_matches" } else { "ok" },
+                "query": q,
+                "pattern_mode": if fixed { "fixed" } else { "regex" },
+                "project": project,
+                "path_filters": path_filters.json_value(),
+                "backend": "live-filesystem",
+                "fresh": true,
+                "freshness": serde_json::Value::Null,
+                "index_freshness": decision,
+                "provider_complete": serde_json::Value::Null,
+                "incomplete_provider_count": serde_json::Value::Null,
+                "incomplete_providers": serde_json::Value::Null,
+                "provider_metadata_status": "not_consulted_for_live_literal_search",
+                "total_exact": rows.len(),
+                "shown": shown_matches,
+                "omitted": omitted,
+                "truncated": omitted > 0,
+                "next": if rows.is_empty() {
+                    vec![
+                        format!("greppy search-symbol {}", shell_example_arg(q)),
+                        "retry without --path/--kind".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                "hits": shown,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize search-pattern JSON: {error}")))?
+        );
         return Ok(if rows.is_empty() { 1 } else { 0 });
     }
 
@@ -1163,7 +1274,7 @@ pub(crate) fn dispatch_search_code(
         // may treat `status: no_matches` as completion even though the optional
         // case-insensitive diagnostic can still take substantial time on a large
         // repository.
-        search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
+        search_pattern_no_match_status(q, fixed, &path_filters);
         if let Some(insensitive) = insensitive.filter(|hits| !hits.is_empty()) {
             println!("case-insensitive: {} matches", insensitive.len());
         }
