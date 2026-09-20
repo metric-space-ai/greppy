@@ -226,14 +226,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GPU-accelerated where the platform supports it; the binary always
-          # runs on CPU when no GPU is present (Metal detected at runtime, CUDA
-          # dynamically loaded — no hard cudart link, so it starts without CUDA).
+          # macOS release inference requires Metal. Linux keeps its CPU
+          # footprint evidence because CUDA is dynamically loaded there (no
+          # hard cudart link, so the binary still starts without CUDA).
           - name: macos-arm64
             os: macos-latest
             asset: greppy-macos-arm64.pkg
             features: metal
-            footprint_devices: 'cpu metal'
+            footprint_devices: 'metal'
             runner_os: macOS
             runner_arch: ARM64
             rust_host: aarch64-apple-darwin
@@ -1178,7 +1178,6 @@ jobs:
           bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
           bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
           if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
-            test -s package/runtime-footprint-macos-arm64-cpu.json
             test -s package/runtime-footprint-macos-arm64-metal.json
           fi
           python3 "$docs/release_artifacts.py" verify-spdx \

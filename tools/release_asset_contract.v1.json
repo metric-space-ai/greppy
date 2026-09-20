@@ -5,7 +5,6 @@
     {"name": "greppy-macos-arm64.pkg", "role": "package"},
     {"name": "greppy-macos-arm64.pkg.sha256", "role": "checksum-sidecar"},
     {"name": "greppy-macos-arm64.pkg.spdx.json", "role": "sbom"},
-    {"name": "runtime-footprint-macos-arm64-cpu.json", "role": "runtime-evidence"},
     {"name": "runtime-footprint-macos-arm64-metal.json", "role": "runtime-evidence"},
     {"name": "build-environment-macos-arm64.json", "role": "build-environment"},
     {"name": "greppy-linux-x86_64.deb", "role": "package"},
