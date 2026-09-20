@@ -340,6 +340,17 @@ pub fn walk_with_policy_and_overrides(
     policy: &skip::SkipPolicy,
     overrides: &WalkOverrides,
 ) -> Result<Vec<InventoryEntry>> {
+    walk_scoped_with_policy_and_overrides(root, policy, overrides, None)
+}
+
+/// Walk only the supplied root-relative files or subtrees while retaining the
+/// root's ignore files, skip policy, and symlink boundary.
+pub fn walk_scoped_with_policy_and_overrides(
+    root: &Path,
+    policy: &skip::SkipPolicy,
+    overrides: &WalkOverrides,
+    scopes: Option<&[String]>,
+) -> Result<Vec<InventoryEntry>> {
     use ignore::WalkBuilder;
 
     let mut entries = Vec::new();
@@ -364,6 +375,27 @@ pub fn walk_with_policy_and_overrides(
     builder.parents(!root.join(".git").exists());
     if !overrides.is_empty() {
         builder.overrides(build_ignore_overrides(root, overrides)?);
+    }
+    if let Some(scopes) = scopes {
+        let root = root.to_path_buf();
+        let scopes = scopes.to_vec();
+        builder.filter_entry(move |entry| {
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            relative.is_empty()
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || relative == *scope
+                        || relative
+                            .strip_prefix(scope)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || scope
+                            .strip_prefix(&relative)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+        });
     }
     let walker = builder.build();
     for dent in walker {

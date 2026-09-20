@@ -591,22 +591,16 @@ fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["query"], "json_unique_marker");
     assert_eq!(v["project"], "repo");
-    assert_eq!(v["provider_complete"], false);
-    assert!(
-        v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1,
-        "search-pattern JSON must expose provider incompleteness: {v:?}"
-    );
-    assert!(
-        v["incomplete_providers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["language"] == "rust"),
-        "rust provider incompleteness must be visible: {v:?}"
+    assert!(v["provider_complete"].is_null());
+    assert!(v["incomplete_provider_count"].is_null());
+    assert!(v["incomplete_providers"].is_null());
+    assert_eq!(
+        v["provider_metadata_status"],
+        "not_consulted_for_live_literal_search"
     );
     assert_eq!(v["total_exact"], 25);
     assert_eq!(v["shown"], 20);
@@ -673,10 +667,10 @@ function pickFolder(options: { title: string }) {
     );
 }
 
-/// Small drift is atomically reindexed, while the current search-pattern request
-/// uses the live filesystem rather than the already-open old snapshot.
+/// Search-pattern is a live lexical query: drift does not trigger graph work,
+/// and both old and new text are answered from current source.
 #[test]
-fn search_pattern_json_auto_reindexes_and_reports_current_state() {
+fn search_pattern_json_reports_current_state_without_reindexing() {
     let (repo, store, _scratch) = make_repo("search-json-stale", "old_json_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -701,7 +695,7 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     );
     assert_eq!(
         code, 1,
-        "healed index returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
+        "live search returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -724,14 +718,15 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     );
     assert_eq!(
         code, 0,
-        "healed index must find the NEW marker; stderr={err}\nstdout={out}"
+        "live search must find the NEW marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["index_freshness"]["state"], "not_consulted");
     assert!(
         !v["hits"].as_array().unwrap().is_empty(),
-        "healed index must serve the current content: {v:?}"
+        "live search must serve the current content: {v:?}"
     );
 }
 
@@ -772,8 +767,7 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["result_status"], "no_matches");
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["index_freshness"]["state"], "drift");
-    assert_eq!(v["index_freshness"]["stale_file_count"], 1);
+    assert_eq!(v["index_freshness"]["state"], "not_consulted");
     assert!(v["hits"].as_array().unwrap().is_empty());
 }
 
@@ -811,8 +805,12 @@ fn provider_policy_require_complete_does_not_block_search_pattern_json() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["status"], "live-fallback");
+    assert!(v["provider_complete"].is_null());
+    assert_eq!(
+        v["provider_metadata_status"],
+        "not_consulted_for_live_literal_search"
+    );
     assert_eq!(v["shown"], 1);
     assert_eq!(v["hits"].as_array().unwrap().len(), 1);
 }
@@ -2806,6 +2804,94 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 #[test]
 fn first_use_query_waits_for_healthy_slow_index() {
     check_first_use_query_waits_for_healthy_slow_index(false);
+}
+
+#[test]
+fn cold_scoped_search_pattern_parses_matches_without_starting_an_index() {
+    let (repo, store, _scratch) = make_repo("cold-scoped-pattern", "unrelated_root_marker");
+    std::fs::create_dir(repo.join("selected")).unwrap();
+    std::fs::write(
+        repo.join("selected/target.rs"),
+        "pub fn selected_hit() {\n    let scoped_literal_marker = 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("selected/ignored.rs"),
+        "pub fn ignored_hit() { let scoped_literal_marker = 2; }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("selected/.gitignore"), "ignored.rs\n").unwrap();
+    std::fs::write(
+        repo.join("unrelated.rs"),
+        "pub fn unrelated_hit() { let scoped_literal_marker = 3; }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "scoped_literal_marker",
+            "--path",
+            "selected",
+            "--kind",
+            "function",
+            "--code",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("selected/target.rs:2"), "{out}");
+    assert!(out.contains("selected_hit"), "{out}");
+    assert!(out.contains("let scoped_literal_marker = 1;"), "{out}");
+    assert!(!out.contains("ignored_hit"), "{out}");
+    assert!(!out.contains("unrelated_hit"), "{out}");
+
+    let missing_base = repo.join("missing-base.db");
+    let missing_base_string = missing_base.to_string_lossy().into_owned();
+    let (code, out, err) = run_with_env(
+        &[
+            "search-pattern",
+            "scoped_literal_marker",
+            "--path",
+            "selected",
+            "--kind",
+            "function",
+            "--code",
+            "--json",
+        ],
+        &repo,
+        &store,
+        &[
+            ("GREPPY_AGENT_BASE_STORE", missing_base_string.as_str()),
+            (
+                "GREPPY_AGENT_BASE_COMMIT",
+                "1111111111111111111111111111111111111111",
+            ),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        json["hits"][0]["matches"][0]["location"],
+        "selected/target.rs:2"
+    );
+    assert_eq!(json["hits"][0]["name"], "selected_hit");
+    assert_eq!(json["hits"][0]["kind"], "function");
+    assert!(json["hits"][0]["handle"]
+        .as_str()
+        .is_some_and(|handle| !handle.is_empty()));
+    assert!(json["hits"][0]["source"]
+        .as_str()
+        .is_some_and(|source| source.contains("scoped_literal_marker")));
+
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    assert!(!workspace.join("index.job").exists());
+    assert!(!workspace.join("graph.db").exists());
 }
 
 #[cfg(all(unix, feature = "bash-smart"))]
