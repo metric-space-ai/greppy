@@ -170,4 +170,20 @@ mod tests {
         session.transition(SessionState::Ready).unwrap();
         assert_eq!(session.state, SessionState::Ready);
     }
+
+    #[test]
+    fn default_session_accepts_multiple_operations_after_two_minutes() {
+        let mut session = Session::new("wrs_old", "run", crate::policy::NetworkProfile::Project);
+        session.started = Instant::now() - std::time::Duration::from_secs(121);
+        session.transition(SessionState::Ready).unwrap();
+
+        for operation in ["wrq_late_1", "wrq_late_2"] {
+            session
+                .limits
+                .check_wall_time(session.started.elapsed())
+                .unwrap();
+            session.begin_operation(operation).unwrap();
+            session.transition(SessionState::Ready).unwrap();
+        }
+    }
 }

@@ -1989,7 +1989,7 @@ impl Daemon {
         session.limits.check_wall_time(elapsed)?;
         let content_cpu = Duration::from_nanos(session.content_cpu_used_ns);
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
-        let timeout = session.limits.wall_time.saturating_sub(elapsed).min(budget);
+        let timeout = session.limits.operation_budget(elapsed, budget);
         if timeout.is_zero() {
             return Err("observation has no remaining request/session budget".into());
         }
@@ -3086,8 +3086,7 @@ impl Daemon {
             }
         };
         let session_remaining = self.sessions.get(&session_id)
-            .map(|session| session.limits.wall_time.saturating_sub(session.started.elapsed()))
-            .unwrap_or(Duration::ZERO);
+            .and_then(|session| session.limits.remaining_wall_time(session.started.elapsed()));
         let budget = crate::wait_contract::remaining_wait_budget(
             request.deadline_ms, timeout_ms, started.elapsed(), session_remaining,
         );
@@ -3794,7 +3793,7 @@ impl Daemon {
         let profile_result = if let Some(end) = deadline {
             let remaining = end.saturating_duration_since(Instant::now());
             let remaining = self.sessions.get(&session_id)
-                .map(|session| remaining.min(session.limits.wall_time.saturating_sub(session.started.elapsed())))
+                .map(|session| session.limits.operation_budget(session.started.elapsed(), remaining))
                 .unwrap_or(Duration::ZERO);
             if remaining < Duration::from_millis(1) {
                 Err("timeout: no remaining wait setup budget".into())

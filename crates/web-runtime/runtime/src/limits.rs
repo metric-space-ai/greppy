@@ -4,7 +4,10 @@ use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLimits {
-    pub wall_time: Duration,
+    /// Optional cumulative session-age budget. Ordinary sessions rely on
+    /// per-operation deadlines and idle cleanup instead of expiring merely
+    /// because an agent spent time reasoning between operations.
+    pub wall_time: Option<Duration>,
     pub controller_cpu_time: Duration,
     pub content_cpu_time: Duration,
     pub controller_heap_bytes: u64,
@@ -66,7 +69,7 @@ impl SessionLimits {
             self.idle_ttl = Duration::from_millis(value.clamp(20, 3_600_000));
         }
         if let Some(value) = object.get("wall_ms").and_then(|v| v.as_u64()) {
-            self.wall_time = Duration::from_millis(value.clamp(20, 3_600_000));
+            self.wall_time = Some(Duration::from_millis(value.clamp(20, 3_600_000)));
         }
         if let Some(value) = object.get("content_cpu_ms").and_then(|v| v.as_u64()) {
             self.content_cpu_time = Duration::from_millis(value);
@@ -112,14 +115,29 @@ impl SessionLimits {
     }
 
     pub fn check_wall_time(&self, elapsed: Duration) -> Result<(), String> {
-        if elapsed > self.wall_time {
+        let Some(limit) = self.wall_time else {
+            return Ok(());
+        };
+        if elapsed > limit {
             Err(format!(
                 "session wall time exceeded (session age {elapsed:?} > {:?}; this is not the duration of the last action)",
-                self.wall_time
+                limit
             ))
         } else {
             Ok(())
         }
+    }
+
+    /// Restrict an operation's own finite budget by an explicitly configured
+    /// cumulative session budget, when one exists.
+    pub(crate) fn operation_budget(&self, elapsed: Duration, budget: Duration) -> Duration {
+        self.wall_time
+            .map(|limit| limit.saturating_sub(elapsed).min(budget))
+            .unwrap_or(budget)
+    }
+
+    pub(crate) fn remaining_wall_time(&self, elapsed: Duration) -> Option<Duration> {
+        self.wall_time.map(|limit| limit.saturating_sub(elapsed))
     }
 
     pub fn check_contexts(&self, contexts: u32) -> Result<(), String> {
@@ -207,7 +225,7 @@ impl SessionLimits {
 impl Default for SessionLimits {
     fn default() -> Self {
         Self {
-            wall_time: Duration::from_secs(120),
+            wall_time: None,
             controller_cpu_time: Duration::from_secs(30),
             content_cpu_time: Duration::from_secs(30),
             controller_heap_bytes: 256 * 1024 * 1024,
@@ -250,7 +268,7 @@ mod tests {
     #[test]
     fn wall_time_error_names_session_age_not_last_action() {
         let limits = SessionLimits {
-            wall_time: Duration::from_secs(120),
+            wall_time: Some(Duration::from_secs(120)),
             ..SessionLimits::default()
         };
         let error = limits
@@ -263,6 +281,31 @@ mod tests {
         );
         assert!(error.contains("123s"), "{error}");
         assert!(limits.check_wall_time(Duration::from_secs(120)).is_ok());
+    }
+
+    #[test]
+    fn default_session_age_does_not_replace_operation_deadlines() {
+        let limits = SessionLimits::default();
+        let old_session = Duration::from_secs(10 * 60);
+        assert!(limits.check_wall_time(old_session).is_ok());
+        assert_eq!(
+            limits.operation_budget(old_session, Duration::from_secs(45)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(limits.remaining_wall_time(old_session), None);
+    }
+
+    #[test]
+    fn explicit_wall_budget_still_bounds_each_operation() {
+        let limits = SessionLimits {
+            wall_time: Some(Duration::from_secs(120)),
+            ..SessionLimits::default()
+        };
+        assert_eq!(
+            limits.operation_budget(Duration::from_secs(110), Duration::from_secs(45)),
+            Duration::from_secs(10)
+        );
+        assert!(limits.check_wall_time(Duration::from_secs(121)).is_err());
     }
 
     #[test]
@@ -321,10 +364,12 @@ mod tests {
         let mut limits = SessionLimits::for_profile("project");
         limits.apply_payload(&serde_json::json!({
             "max_pages": 0,
-            "idle_ttl_ms": 50
+            "idle_ttl_ms": 50,
+            "wall_ms": 75
         }));
         assert_eq!(limits.max_pages, 0);
         assert_eq!(limits.idle_ttl, Duration::from_millis(50));
+        assert_eq!(limits.wall_time, Some(Duration::from_millis(75)));
         assert!(limits.check_pages(1).is_err());
     }
 }

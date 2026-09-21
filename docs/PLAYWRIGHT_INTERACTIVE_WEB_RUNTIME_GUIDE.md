@@ -886,7 +886,7 @@ Every session MUST have typed limits:
 
 ```rust
 pub struct SessionLimits {
-    pub wall_time: Duration,
+    pub wall_time: Option<Duration>,
     pub controller_cpu_time: Duration,
     pub content_cpu_time: Duration,
     pub controller_heap_bytes: u64,
@@ -900,6 +900,10 @@ pub struct SessionLimits {
     pub max_console_bytes: u64,
 }
 ```
+
+`wall_time` is an explicit cumulative session-age budget. Normal sessions leave
+it unset: finite per-operation deadlines bound active work, while `idle_ttl`
+cleans up abandoned sessions without expiring a healthy agent between actions.
 
 Limit enforcement MUST be outside the limited worker. A worker cannot be the
 authority for its own memory or deadline. Timeout termination MUST kill the
