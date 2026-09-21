@@ -630,7 +630,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             false,
             None,
         )
-        .map(|code| code == 0)
+        .map(|_| true)
         .unwrap_or(false)
     } else {
         index_atomic_snapshot(

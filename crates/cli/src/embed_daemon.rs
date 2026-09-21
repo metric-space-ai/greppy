@@ -160,6 +160,7 @@ pub(super) struct DaemonCodeEmbeddingProvider<'a> {
     tokenizer: Result<greppy_embed_native::PromptTokenizer, String>,
     content_cache_hits: usize,
     content_cache_misses: usize,
+    last_error: Option<String>,
 }
 
 impl<'a> DaemonCodeEmbeddingProvider<'a> {
@@ -172,6 +173,7 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             tokenizer,
             content_cache_hits: 0,
             content_cache_misses: 0,
+            last_error: None,
         }
     }
 
@@ -206,6 +208,7 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             tokenizer: Self::load_tokenizer(cfg),
             content_cache_hits: 0,
             content_cache_misses: 0,
+            last_error: None,
         }
     }
 
@@ -214,6 +217,16 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
             "shared-daemon:{}",
             super::inference_device_identity(&self.cfg.device)
         )
+    }
+
+    pub(super) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    fn recorded_daemon_error<T>(&mut self, outcome: RequestOutcome<T>) -> greppy_core::Error {
+        let error = self.daemon_error(outcome);
+        self.last_error = Some(error.to_string());
+        error
     }
 
     fn prompt_input(title: Option<&str>, content: &str) -> String {
@@ -377,29 +390,36 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
             });
             let response = match request_via_daemon(self.cfg, &self.model_key, request) {
                 RequestOutcome::Response(response) => response,
-                outcome => return Err(self.daemon_error(outcome)),
+                outcome => return Err(self.recorded_daemon_error(outcome)),
             };
-            let vectors = response
+            let Some(vectors) = response
                 .get("vectors_bits")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
-            let token_lens = response
+            else {
+                return Err(self.recorded_daemon_error(RequestOutcome::<()>::Failed));
+            };
+            let Some(token_lens) = response
                 .get("token_lens")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+            else {
+                return Err(self.recorded_daemon_error(RequestOutcome::<()>::Failed));
+            };
             if vectors.len() != missing.len() || token_lens.len() != missing.len() {
-                return Err(self.daemon_error(RequestOutcome::<()>::Failed));
+                return Err(self.recorded_daemon_error(RequestOutcome::<()>::Failed));
             }
             let mut cache_entries = Vec::with_capacity(missing.len());
             for (((index, key, _, _), vector), token_len) in
                 missing.into_iter().zip(vectors).zip(token_lens)
             {
-                let vector = decode_vector(Some(vector))
-                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
-                let token_len = token_len
+                let Some(vector) = decode_vector(Some(vector)) else {
+                    return Err(self.recorded_daemon_error(RequestOutcome::<()>::Failed));
+                };
+                let Some(token_len) = token_len
                     .as_u64()
                     .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| self.daemon_error(RequestOutcome::<()>::Failed))?;
+                else {
+                    return Err(self.recorded_daemon_error(RequestOutcome::<()>::Failed));
+                };
                 cache_entries.push((key, token_len, vector.clone()));
                 output[index] = Some(vector);
             }
@@ -797,7 +817,7 @@ mod tests {
                 device: greppy_embed_native::DevicePreference::Cpu,
             };
             let cache = greppy_store::EmbeddingContentCache::open(temp.path().join(kind)).unwrap();
-            let provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
+            let mut provider = DaemonCodeEmbeddingProvider::with_cache(&cfg, cache);
             let Err(cause) = provider.tokenizer.as_ref() else {
                 panic!("invalid tokenizer");
             };
@@ -814,6 +834,10 @@ mod tests {
                 assert!(error.contains("configured tokenizer file"), "{error}");
                 assert!(error.contains("no in-process model fallback"), "{error}");
             }
+            let error = provider
+                .recorded_daemon_error(RequestOutcome::<()>::NoDaemon)
+                .to_string();
+            assert_eq!(provider.last_error(), Some(error.as_str()));
         }
     }
 }

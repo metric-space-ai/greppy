@@ -1663,6 +1663,36 @@ fn graph_index_progress_publishes_real_phase_and_file_counts() {
 }
 
 #[test]
+fn degraded_overlay_retains_exact_background_failure() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("overlay-embedding-degraded");
+    let job_path = root.join("index.job");
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
+    unsafe {
+        std::env::set_var("GREPPY_BACKGROUND_JOB", &job_path);
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+
+    let mut guard = BackgroundJobGuard::from_env();
+    record_overlay_job_outcome(
+        &mut guard,
+        &Ok(OverlayIndexOutcome::Degraded(
+            "2 of 2 embedding documents failed inference".into(),
+        )),
+    );
+    drop(guard);
+
+    let job = read_background_job(&job_path).expect("degraded overlay keeps failure record");
+    assert_eq!(job["state"], "failed");
+    assert_eq!(
+        job["last_error"],
+        "2 of 2 embedding documents failed inference"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn global_root_parses_before_and_after_subcommand() {
     // RV-006: `--root` is a global flag, accepted on either side of
     // the subcommand. Both spellings must land in `cli.root`.
