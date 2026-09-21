@@ -3051,6 +3051,66 @@ fn check_first_use_query_waits_for_healthy_slow_index(seed_pack: bool) {
     assert!(!err.contains("retry after"), "stderr={err:?}");
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
+#[test]
+fn cold_structural_query_publishes_graph_without_resolving_embedding_assets() {
+    let (repo, store, _scratch) = make_repo("structural-first-use", "structural_cold_marker");
+    let (index_code, index_out, index_err) = run_with_env_and_inference(
+        &["index", "."],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_EMBED_ASSET_MISSING", "1")],
+        true,
+    );
+    assert_ne!(
+        index_code, 0,
+        "ordinary index must retain required embedding policy: {index_out} {index_err}"
+    );
+
+    let (code, out, err) = run_with_env_and_inference(
+        &["search-symbol", "structural_cold_marker"],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_EMBED_ASSET_MISSING", "1")],
+        true,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("structural_cold_marker"), "stdout={out}");
+    assert!(!err.contains("EmbeddingGemma"), "stderr={err}");
+
+    let db = find_graph_db(&store).expect("structural first use publishes graph.db");
+    let graph = greppy_store::Store::open(&db).unwrap();
+    let state = graph
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("structural workspace state");
+    assert!(state.graph_generation > 0);
+    assert!(graph.vector_model_ids("repo").unwrap().is_empty());
+    let structural_generation = state.graph_generation;
+    drop(graph);
+
+    let (embed_code, embed_out, embed_err) = run_with_env(
+        &["index", "."],
+        &repo,
+        &store,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+        ],
+    );
+    assert_eq!(embed_code, 0, "stdout={embed_out}\nstderr={embed_err}");
+    let embedded = greppy_store::Store::open(&db).unwrap();
+    let embedded_state = embedded
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("embedded workspace state");
+    assert_eq!(
+        embedded_state.graph_generation, structural_generation,
+        "embedding completion must reuse the published graph generation"
+    );
+    assert!(!db.parent().unwrap().join("index.job").exists());
+}
+
 #[test]
 fn first_use_replaces_stale_job_whose_pid_was_reused() {
     let (repo, store, _scratch) = make_repo("first-use-stale-pid", "stale_pid_marker");

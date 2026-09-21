@@ -1065,7 +1065,70 @@ pub(crate) fn dispatch_index(
     // materializing inference assets. Background launchers use this lock for
     // their startup handshake and attached-query liveness; doing slow model
     // setup first leaves a PID-only ownership gap.
-    let embedding_config = embedding_config_for_index(embedding_args)?;
+    // A graph-only command must not wait for model resolution or inference on
+    // a cold workspace. Publish the complete structural snapshot first; a
+    // later semantic command uses the normal background embedding path for
+    // this generation. Explicit `greppy index` keeps its existing policy.
+    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
+    let embedding_config = if structural_first_use {
+        None
+    } else {
+        embedding_config_for_index(embedding_args)?
+    };
+    let embedding_job = std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref()
+        == Some("embedding");
+    let had_overlay_binding = embedding_job
+        && crate::store_cow::overlay_environment_for_recovery(&effective_root)?.is_some();
+    let _embedding_overlay = if embedding_job {
+        crate::store_cow::prepare_auto_linked_worktree_overlay(
+            &effective_root,
+            &greppy_core::cache::data_root(),
+            embedding_args,
+            background_job.progress_path(),
+        )?
+    } else {
+        None
+    };
+    let embedding_overlay = if had_overlay_binding {
+        crate::store_cow::overlay_spec_live(&effective_root)?
+    } else {
+        None
+    };
+    let embedding_only = embedding_job
+        && store_path.is_file()
+        && (!effective_root.join(".git").is_file() || embedding_overlay.is_some());
+    if embedding_only {
+        let cfg = embedding_config.as_ref().ok_or_else(|| {
+            Error::Invalid("background embedding job has no embedding configuration".into())
+        })?;
+        background_job.attach_foreground(background_job_path(&effective_root));
+        match complete_embeddings_from_published_graph(
+            &store_path,
+            &target,
+            &effective_root,
+            &project,
+            cfg,
+            embedding_overlay.as_ref(),
+            if background_job.has_progress_sink() {
+                Some(&mut background_job)
+            } else {
+                None
+            },
+        ) {
+            Ok(EmbeddingBuildOutcome::Complete(_)) => {
+                background_job.complete();
+                return Ok(0);
+            }
+            Ok(EmbeddingBuildOutcome::Degraded { reason, .. }) => {
+                background_job.degraded(&reason);
+                return Ok(0);
+            }
+            Err(error) => {
+                background_job.fail(&error);
+                return Err(error);
+            }
+        }
+    }
     let recovery = recover_completed_index_snapshot(
         &store_path,
         &target,
@@ -1312,7 +1375,7 @@ pub(crate) fn index_overlay_snapshot(
             target,
             project,
             config,
-            &report,
+            report.graph_generation,
             active_path.parent().map(std::path::Path::to_path_buf),
             progress,
         )?)
@@ -1440,7 +1503,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
                 target,
                 project,
                 cfg,
-                &report,
+                report.graph_generation,
                 active_path.parent().map(std::path::Path::to_path_buf),
                 background_job.as_deref_mut(),
             ) {
@@ -1518,12 +1581,68 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }))
 }
 
+fn complete_embeddings_from_published_graph(
+    active_path: &std::path::Path,
+    target: &std::path::Path,
+    effective_root: &std::path::Path,
+    project: &str,
+    cfg: &EmbeddingModelConfig,
+    overlay: Option<&crate::store_cow::OverlaySpec>,
+    mut background_job: Option<&mut BackgroundJobGuard>,
+) -> Result<EmbeddingBuildOutcome> {
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
+    let temp_path = unique_store_sibling(active_path, "embedding-next");
+    cleanup_sqlite_family(&temp_path)?;
+    seed_temp_store_from_active_if_usable(active_path, &temp_path)?;
+    let mut store = if let Some(overlay) = overlay {
+        greppy_store::Store::open_overlay(&overlay.base_path, &temp_path, &overlay.visibility)?
+    } else {
+        greppy_store::Store::open(&temp_path)?
+    };
+    let generation = store
+        .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+        .ok_or_else(|| Error::Invalid("published graph has no workspace state".into()))?
+        .graph_generation;
+    let outcome = index_embeddings_into_temp_store(
+        &mut store,
+        target,
+        project,
+        cfg,
+        generation,
+        active_path.parent().map(std::path::Path::to_path_buf),
+        background_job.as_deref_mut(),
+    )?;
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checkpointing_wal");
+    }
+    checkpoint_store(&store, &temp_path)?;
+    drop(store);
+    let integrity =
+        greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
+    integrity.integrity_check().map_err(|error| {
+        Error::Store(format!(
+            "embedding snapshot integrity_check failed for {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    drop(integrity);
+    cleanup_sqlite_sidecars(&temp_path)?;
+    sync_file(&temp_path)?;
+    sync_parent_dir(&temp_path)?;
+    if let Some(job) = background_job {
+        job.finalization_phase("publishing_snapshot");
+    }
+    publish_store_snapshot(&temp_path, active_path)?;
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
+    Ok(outcome)
+}
+
 pub(crate) fn index_embeddings_into_temp_store(
     store: &mut greppy_store::Store,
     target: &std::path::Path,
     project: &str,
     cfg: &EmbeddingModelConfig,
-    report: &greppy_indexer::IndexReport,
+    graph_generation: u64,
     _tokenizer_cache_dir: Option<std::path::PathBuf>,
     background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<EmbeddingBuildOutcome> {
@@ -1541,7 +1660,7 @@ pub(crate) fn index_embeddings_into_temp_store(
             .execute(
                 "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+                rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
             )
             .map_err(|error| {
                 Error::Store(format!("record test embedding completeness: {error}"))
@@ -1563,7 +1682,7 @@ pub(crate) fn index_embeddings_into_temp_store(
         ));
     }
     let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
-    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation);
+    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
     let embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
         // model weights and must remain observable instead of leaving status
@@ -1615,7 +1734,7 @@ pub(crate) fn index_embeddings_into_temp_store(
         .execute(
             "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+            rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
     Ok(EmbeddingBuildOutcome::Complete(embedding_report))

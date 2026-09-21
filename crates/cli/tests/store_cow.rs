@@ -390,6 +390,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     let primary = scratch.path().join("primary");
     let first = scratch.path().join("feature-one");
     let second = scratch.path().join("feature-two");
+    let third = scratch.path().join("feature-three");
     let store = scratch.path().join("store");
     std::fs::create_dir_all(primary.join("src")).unwrap();
     std::fs::write(
@@ -518,6 +519,99 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     )
     .contains("feature_two_symbol"));
 
+    // A cold structural query in a later linked worktree must reuse the
+    // already verified immutable Base and publish only its branch/dirty Delta.
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-three",
+            third.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        third.join("src/change.rs"),
+        "pub fn feature_three_symbol() -> i32 { 33 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        third.join("src/dirty.rs"),
+        "pub fn dirty_three_symbol() -> i32 { 34 }\n",
+    )
+    .unwrap();
+    let (third_code, third_out, third_err) = run_with_env(
+        &third,
+        &store,
+        &["search-symbol", "feature_three_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(third_code, 0, "stdout={third_out}\nstderr={third_err}");
+    assert!(third_out.contains("feature_three_symbol"), "{third_out}");
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "dirty_three_symbol"],
+        None,
+    )
+    .contains("dirty_three_symbol"));
+    let third_status = query_json_raw(&third, &store, &["index", "status"], None);
+    assert_eq!(third_status["store_cow"]["mode"], "overlay");
+    assert_eq!(third_status["store_cow"]["base_identity"], shared_identity);
+    let third_delta = PathBuf::from(
+        third_status["store_path"]
+            .as_str()
+            .expect("third Delta path"),
+    );
+    let third_graph = greppy_store::Store::open(&third_delta).unwrap();
+    let third_generation = third_graph
+        .get_workspace_state(third.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("third workspace state")
+        .graph_generation;
+    drop(third_graph);
+    // This fixture verifies Base lifecycle, composite visibility, and graph
+    // generation preservation. Real vector creation is covered by the native
+    // inference acceptance suite; test assets intentionally skip inference.
+    let (embed_code, embed_out, embed_err) = run_with_env(
+        &third,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(embed_code, 0, "stdout={embed_out}\nstderr={embed_err}");
+    let embedded_delta = greppy_store::Store::open(&third_delta).unwrap();
+    assert_eq!(
+        embedded_delta
+            .get_workspace_state(third.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("embedded third workspace state")
+            .graph_generation,
+        third_generation,
+        "embedding an existing Base+Delta must not rebuild its graph"
+    );
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "shared_base_symbol"],
+        None,
+    )
+    .contains("shared_base_symbol"));
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "dirty_three_symbol"],
+        None,
+    )
+    .contains("dirty_three_symbol"));
     // The first process's environment is gone. A fresh query still composes
     // its Base+Delta from the binding persisted in its private graph.
     assert!(query_text(
@@ -623,6 +717,85 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("first_untracked_symbol"));
+}
+
+#[test]
+fn cold_linked_structural_query_uses_complete_private_graph_without_building_a_base() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let linked = scratch.path().join("linked");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn cold_base_symbol() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(&primary, &["config", "user.email", "cold-cow@test.invalid"]);
+    git(&primary, &["config", "user.name", "Cold Store CoW"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cold-linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        linked.join("src/base.rs"),
+        "pub fn cold_branch_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        linked.join("src/dirty.rs"),
+        "pub fn cold_dirty_symbol() -> i32 { 3 }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run_with_env(
+        &linked,
+        &store,
+        &["search-symbol", "cold_branch_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("cold_branch_symbol"), "{out}");
+    assert!(query_text(
+        &linked,
+        &store,
+        &["search-symbol", "cold_dirty_symbol"],
+        None,
+    )
+    .contains("cold_dirty_symbol"));
+
+    std::fs::write(
+        linked.join("src/base.rs"),
+        "pub fn cold_after_edit_symbol() -> i32 { 4 }\n",
+    )
+    .unwrap();
+    let (refresh_code, refresh_out, refresh_err) = run_with_env(
+        &linked,
+        &store,
+        &["search-symbol", "cold_after_edit_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        refresh_code, 0,
+        "stale structural refresh must publish without a Base/model build: {refresh_out} {refresh_err}"
+    );
+    assert!(refresh_out.contains("cold_after_edit_symbol"), "{refresh_out}");
+
+    let status = query_json_raw(&linked, &store, &["index", "status"], None);
+    assert_eq!(status["store_cow"]["mode"], "single", "{status:#}");
+    assert_eq!(status["fresh"], true, "{status:#}");
 }
 
 #[test]

@@ -1332,14 +1332,20 @@ pub(crate) fn dispatch_semantic(
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
 
     let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
+    maybe_reindex_stale_semantic(&mut store, root)?;
     let project = project_for(root)?;
     // Stale/unknown snapshots are never served. Semantic search is always
     // vector-backed on current main, so auto-refresh is allowed only when the
     // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
-    let decision =
-        freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false);
+    let decision = freshness_serve_decision_with_policy(
+        &store,
+        root,
+        &project,
+        allow_reindex,
+        false,
+        false,
+    );
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
     let freshness = decision.freshness().clone();
 

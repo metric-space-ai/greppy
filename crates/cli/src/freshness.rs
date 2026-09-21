@@ -159,7 +159,7 @@ pub(crate) fn freshness_serve_decision(
     root: Option<&str>,
     project: &str,
 ) -> FreshnessServe {
-    freshness_serve_decision_with_policy(store, root, project, true, true)
+    freshness_serve_decision_with_policy(store, root, project, true, true, true)
 }
 
 /// Heal a reindexable-stale store in-band: rebuild the graph AND (when the
@@ -175,6 +175,21 @@ pub(crate) fn maybe_reindex_stale(
     store: &mut greppy_store::Store,
     root: Option<&str>,
 ) -> Result<()> {
+    maybe_reindex_stale_with_capability(store, root, true)
+}
+
+pub(crate) fn maybe_reindex_stale_semantic(
+    store: &mut greppy_store::Store,
+    root: Option<&str>,
+) -> Result<()> {
+    maybe_reindex_stale_with_capability(store, root, false)
+}
+
+fn maybe_reindex_stale_with_capability(
+    store: &mut greppy_store::Store,
+    root: Option<&str>,
+    structural_only: bool,
+) -> Result<()> {
     // An explicit auto-reindex opt-out must fall through to the fail-closed
     // stale gate. In particular, do not wait on an active writer that the
     // caller has said must not be joined for automatic healing.
@@ -183,6 +198,14 @@ pub(crate) fn maybe_reindex_stale(
     }
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
+        if structural_only {
+            let effective_root = resolve_root(root)?;
+            wait_for_index_publication(root, &effective_root, "structural-workspace-drift")?;
+            if let Ok(fresh) = open_default_store_query_writer(root) {
+                *store = fresh;
+            }
+            return Ok(());
+        }
         let rebuilt = try_auto_reindex_inline(root);
         if !rebuilt {
             let writer_active = workspace_writer_active(root);
@@ -398,7 +421,13 @@ pub(crate) fn freshness_serve_decision_with_policy(
     project: &str,
     allow_auto_reindex: bool,
     _warn_on_stale: bool,
+    structural_only: bool,
 ) -> FreshnessServe {
+    let refresh_cause = if structural_only {
+        "structural-workspace-drift"
+    } else {
+        "workspace-drift"
+    };
     let writer_active = workspace_writer_active(root);
     // A writer may be publishing metadata-only drift while the indexed file
     // contents remain exactly valid. Bypass the freshness stamp so serving
@@ -436,7 +465,7 @@ pub(crate) fn freshness_serve_decision_with_policy(
     if scope_or_version_drift {
         if allow_auto_reindex && auto_reindex_enabled() && version_drift_is_scope_stable(&freshness)
         {
-            let started = spawn_background_index(root, "indexer-version-drift");
+            let started = spawn_background_index(root, refresh_cause);
             return FreshnessServe::Refuse(refresh_state(
                 freshness,
                 started || workspace_writer_active(root),
@@ -465,12 +494,12 @@ pub(crate) fn freshness_serve_decision_with_policy(
                 .is_some_and(|bytes| bytes <= 8 * 1024 * 1024)
     });
     if allow_auto_reindex && auto_reindex_enabled() && small_enough {
-        let rebuilt = try_auto_reindex_inline(root);
+        let rebuilt = !structural_only && try_auto_reindex_inline(root);
         let writer_active = workspace_writer_active(root);
         let started = if rebuilt || writer_active {
             false
         } else {
-            spawn_background_index(root, "workspace-drift")
+            spawn_background_index(root, refresh_cause)
         };
         return FreshnessServe::Refuse(refresh_state(
             freshness,
@@ -478,7 +507,7 @@ pub(crate) fn freshness_serve_decision_with_policy(
         ));
     }
     if allow_auto_reindex && auto_reindex_enabled() {
-        let started = spawn_background_index(root, "workspace-drift");
+        let started = spawn_background_index(root, refresh_cause);
         return FreshnessServe::Refuse(refresh_state(
             freshness,
             started || workspace_writer_active(root),
@@ -733,16 +762,16 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // nobody will query would hold GPU memory for a TTL for nothing.
     #[cfg(any(unix, windows))]
     {
-        let no_args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        if let Ok(Some(cfg)) = embedding_config_optional(no_args) {
-            let has_vectors = project_for(root)
-                .ok()
-                .and_then(|p| store.vector_model_ids(&p).ok())
-                .is_some_and(|m| !m.is_empty());
-            if has_vectors {
+        let has_vectors = project_for(root)
+            .ok()
+            .and_then(|p| store.vector_model_ids(&p).ok())
+            .is_some_and(|models| !models.is_empty());
+        if has_vectors {
+            let no_args = EmbeddingCliArgs {
+                device: None,
+                no_gpu: false,
+            };
+            if let Ok(Some(cfg)) = embedding_config_optional(no_args) {
                 let key = embedding_query_cache_key(&cfg);
                 embed_daemon::prewarm_from_env(&cfg, &key);
             }
@@ -798,7 +827,7 @@ fn observe_first_use_index(
     )
 }
 
-fn first_use_snapshot_ready(effective_root: &std::path::Path) -> bool {
+fn published_graph_generation(effective_root: &std::path::Path) -> Option<u64> {
     greppy_store::Store::open_with(
         &workspace_locator::store_path(effective_root),
         greppy_store::OpenOptions::read_only(),
@@ -810,17 +839,30 @@ fn first_use_snapshot_ready(effective_root: &std::path::Path) -> bool {
             .ok()
             .flatten()
     })
-    .is_some()
+    .map(|state| state.graph_generation)
 }
 
-/// A normal first query owns completion of the index it starts. There is no
-/// elapsed-time cutoff: a slow but live cold start (including model asset
-/// materialization) remains attached, while a failed or dead owner terminates
-/// immediately with the recorded cause. Process interruption still cancels
-/// the waiting query; the detached indexer keeps its existing durable contract.
+fn publication_advanced(baseline: Option<u64>, published: Option<u64>) -> bool {
+    published.is_some() && published != baseline
+}
+
+/// A structural query owns completion of the graph publication it starts. There
+/// is no elapsed-time cutoff: a slow but live extraction remains attached, while
+/// a failed or dead owner terminates immediately with the recorded cause. Process
+/// interruption still cancels the waiting query; the detached indexer keeps its
+/// existing durable contract.
 fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path) -> Result<()> {
+    wait_for_index_publication(root, effective_root, "first-use")
+}
+
+fn wait_for_index_publication(
+    root: Option<&str>,
+    effective_root: &std::path::Path,
+    cause: &str,
+) -> Result<()> {
+    let baseline_generation = published_graph_generation(effective_root);
     let mut launch =
-        spawn_background_job_handle(root, "first-use", "index", None).ok_or_else(|| {
+        spawn_background_job_handle(root, cause, "index", None).ok_or_else(|| {
             let detail = read_background_job(&background_job_path(effective_root))
                 .and_then(|job| {
                     job.get("last_error")
@@ -829,7 +871,7 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
                 })
                 .unwrap_or_else(|| "the index process could not be started".into());
             Error::Index(format!(
-                "first-use index failed for {}: {detail}",
+                "structural index failed for {}: {detail}",
                 effective_root.display()
             ))
         })?;
@@ -837,7 +879,7 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
                 format!(
-                    "observe first-use index owner for {}",
+                    "observe structural index owner for {}",
                     effective_root.display()
                 ),
                 error,
@@ -847,7 +889,11 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
         // Never reopen SQLite while its verified writer is active. Once the
         // lock is released, publication outranks a historical job record,
         // including a stale failed/nonterminal record left by another owner.
-        let snapshot_ready = !owner_active && first_use_snapshot_ready(effective_root);
+        let snapshot_ready = !owner_active
+            && publication_advanced(
+                baseline_generation,
+                published_graph_generation(effective_root),
+            );
         match observe_first_use_index(job.as_ref(), snapshot_ready, owner_active) {
             FirstUseIndexObservation::Pending => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -860,7 +906,7 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
             }
             FirstUseIndexObservation::Failed(detail) => {
                 return Err(Error::Index(format!(
-                    "first-use index failed for {}: {detail}",
+                    "structural index failed for {}: {detail}",
                     effective_root.display()
                 )));
             }
@@ -1075,7 +1121,43 @@ pub(crate) fn cleanup_sqlite_sidecars(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod refresh_wait_tests {
-    use super::{background_refresh_is_pending, observe_first_use_index, FirstUseIndexObservation};
+    use super::{
+        background_refresh_is_pending, observe_first_use_index, publication_advanced,
+        FirstUseIndexObservation,
+    };
+
+    #[test]
+    fn stale_snapshot_is_not_a_new_structural_publication() {
+        assert!(publication_advanced(None, Some(1)));
+        assert!(publication_advanced(Some(7), Some(8)));
+        assert!(!publication_advanced(Some(7), Some(7)));
+        assert!(!publication_advanced(Some(7), None));
+    }
+
+    #[test]
+    fn failed_refresh_does_not_hide_behind_the_old_snapshot() {
+        let failed = serde_json::json!({
+            "state": "failed",
+            "last_error": "fixture structural extraction failed",
+        });
+        assert_eq!(
+            observe_first_use_index(
+                Some(&failed),
+                publication_advanced(Some(7), Some(7)),
+                false,
+            ),
+            FirstUseIndexObservation::Failed("fixture structural extraction failed".into())
+        );
+        assert_eq!(
+            observe_first_use_index(
+                Some(&failed),
+                publication_advanced(Some(7), Some(8)),
+                false,
+            ),
+            FirstUseIndexObservation::Published,
+            "a newer atomic publication remains authoritative over a stale job record"
+        );
+    }
 
     #[test]
     fn launch_record_without_writer_lock_is_still_pending() {

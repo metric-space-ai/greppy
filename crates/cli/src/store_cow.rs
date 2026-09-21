@@ -108,7 +108,7 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
 /// absent. This is only for the explicit index recovery path: steady-state
 /// readers must continue to fail closed instead of opening an incomplete
 /// overlay.
-fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
+pub(crate) fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
     overlay_environment_inner(root, true)
 }
 
@@ -837,6 +837,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
     std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, &project);
     std::env::set_var(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1");
 
+    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
     let outcome = (|| {
         // Keep an existing worktree pinned to its verified Base. Advancing the
         // primary checkout must not force every already-indexed worktree to
@@ -847,7 +848,8 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         };
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
-                Some(prepared) => prepared,
+                Some(prepared) => Some(prepared),
+                None if structural_first_use => None,
                 None => {
                     // Only the first worktree for this immutable Git tree needs a
                     // clean materialization. Every later worktree opens the
@@ -857,7 +859,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                     report_base_phase(progress_path, "preparing_base_checkout");
                     let clean =
                         TemporaryBaseWorktree::create(&primary, shared_data_root, &base_commit)?;
-                    prepare_base_store_paths(
+                    Some(prepare_base_store_paths(
                         &primary,
                         clean.path(),
                         clean.path(),
@@ -865,24 +867,35 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         shared_data_root,
                         embedding_args,
                         progress_path,
-                    )?
+                    )?)
                 }
             };
-        configure_overlay_environment(&prepared, &base_commit);
-        eprintln!(
-            "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",
-            &prepared.identity_hash[..12],
-            base_commit,
-            if prepared.reused { "reused" } else { "created" },
-        );
+        if let Some(prepared) = prepared.as_ref() {
+            configure_overlay_environment(prepared, &base_commit);
+            eprintln!(
+                "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",
+                &prepared.identity_hash[..12],
+                base_commit,
+                if prepared.reused { "reused" } else { "created" },
+            );
+        }
         Ok::<_, Error>(prepared)
     })();
 
     match outcome {
-        Ok(prepared) => Ok(Some(AutoLinkedWorktreeOverlay {
+        Ok(Some(prepared)) => Ok(Some(AutoLinkedWorktreeOverlay {
             _prepared: prepared,
             restore,
         })),
+        Ok(None) => {
+            for (name, value) in restore.into_iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Ok(None)
+        }
         Err(error) => {
             for (name, value) in restore.into_iter().rev() {
                 match value {

@@ -184,6 +184,7 @@ const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
+const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
@@ -4784,6 +4785,9 @@ fn spawn_background_job_handle(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
+        command.env(ENV_STRUCTURAL_FIRST_USE, "1");
+    }
     #[cfg(debug_assertions)]
     if std::env::var_os("GREPPY_TEST_BACKGROUND_SPAWN_FAIL").is_some() {
         command = std::process::Command::new(
