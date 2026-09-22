@@ -147,7 +147,7 @@ fn empty_searches_return_bounded_statuses_and_next_actions() {
         "{path_out}"
     );
     assert!(
-        path_out.contains("source match(es) exist outside the path filter"),
+        path_out.contains("files outside it were not searched"),
         "{path_out}"
     );
     assert!(

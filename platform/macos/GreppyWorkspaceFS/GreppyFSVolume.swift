@@ -120,6 +120,43 @@ final class GreppyFSVolume: FSVolume {
         items[location] = nil
         cache.unlock()
     }
+
+    /// Moves the cached item for `source` and every cached descendant to
+    /// their paths under `destination`, dropping whatever was cached under
+    /// the destination before (a replaced item). The kernel keeps addressing
+    /// the moved directory and its children through the item objects it
+    /// already holds, so those objects must answer for the new paths:
+    /// with a stale path, a lookup relative to a renamed directory, or its
+    /// removal, failed with ENOENT (`rm -r` after `mv d1 d2`).
+    private func relocate(workspace: String, from source: String, to destination: String, name: FSFileName) {
+        let sourcePrefix = source + "/"
+        let destinationPrefix = destination + "/"
+        cache.lock()
+        defer { cache.unlock() }
+        var moved: [(GreppyFSItem, GreppyFSItem.Location, FSFileName)] = []
+        for (location, item) in items {
+            guard case .path(let itemWorkspace, let relative) = location, itemWorkspace == workspace else {
+                continue
+            }
+            if relative == source {
+                moved.append((item, .path(workspace: workspace, relative: destination), name))
+            } else if relative.hasPrefix(sourcePrefix) {
+                let child = destinationPrefix + relative.dropFirst(sourcePrefix.count)
+                moved.append((item, .path(workspace: workspace, relative: child), item.name))
+            }
+        }
+        for (item, _, _) in moved { items[item.location] = nil }
+        for location in items.keys {
+            guard case .path(let itemWorkspace, let relative) = location,
+                  itemWorkspace == workspace,
+                  relative == destination || relative.hasPrefix(destinationPrefix) else { continue }
+            items[location] = nil
+        }
+        for (item, location, name) in moved {
+            item.relocate(to: location, name: name)
+            items[location] = item
+        }
+    }
 }
 
 extension GreppyFSVolume: FSVolume.PathConfOperations {
@@ -484,7 +521,19 @@ extension GreppyFSVolume: FSVolume.Operations {
             _ = try privateInode(for: source)
         }
         try core.rename(workspace: sourceWorkspace, source: sourcePath, destination: destination)
-        evict(source.location)
+        // Cached items are keyed by path and may hold a bound private inode.
+        // After a rename the source path names nothing, the destination path
+        // names the moved inode (an item replaced by an atomic-write rename
+        // still pointed at its old, now unlinked inode and answered getattr
+        // with ENOENT, which the kernel reports as ENODATA), and every
+        // descendant of a moved directory changed its path.
+        if let replaced = overItem as? GreppyFSItem { forgetExtendedAttributes(of: replaced) }
+        relocate(
+            workspace: sourceWorkspace,
+            from: sourcePath,
+            to: destination,
+            name: destinationName
+        )
         return destinationName
     }
 

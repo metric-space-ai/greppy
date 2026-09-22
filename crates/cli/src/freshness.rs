@@ -715,6 +715,24 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // (the token-efficiency benchmark's latency culprit). Readers tolerate
     // whatever schema the DB has.
     let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
+    // File reads and command-output packs can create a database before any
+    // graph is published. Its existence alone is not a completed first index.
+    // Start the same detached bootstrap as a missing database; never serve a
+    // pack-only store as an empty graph or block on building it in this query.
+    if auto_reindex_enabled()
+        && store
+            .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+            .is_none()
+    {
+        drop(store);
+        let started = spawn_background_index(root, "first-use");
+        return Err(Error::Lock(format!(
+            "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
+            if started { "started" } else { "is already running" },
+            effective_root.display(),
+            root.unwrap_or(".")
+        )));
+    }
     let _ = workspace_locator::ensure_db_mode(&path);
     // Feature B: record that this store was just used to serve a query.
     // A read-only open never bumps graph.db's mtime, so a dedicated

@@ -1579,7 +1579,7 @@ pub(crate) fn edit_resolve_new_path(
                 if !normalized.pop() {
                     return Err(EditRefusal::new(
                         "path_outside_repo",
-                        format!("{file} is outside {}", base.display()),
+                        format!("{file} is outside {}. An intended edit in another directory needs an explicit root: `greppy --root <target-directory> <edit-command> ...`; the target must remain inside that root", base.display()),
                         17,
                     ));
                 }
@@ -1590,7 +1590,7 @@ pub(crate) fn edit_resolve_new_path(
     let Ok(relative) = normalized.strip_prefix(&base) else {
         return Err(EditRefusal::new(
             "path_outside_repo",
-            format!("{file} is outside {}", base.display()),
+            format!("{file} is outside {}. An intended edit in another directory needs an explicit root: `greppy --root <target-directory> <edit-command> ...`; the target must remain inside that root", base.display()),
             17,
         ));
     };
@@ -1801,7 +1801,7 @@ pub(crate) fn run_trained_write(
         if !canonical.starts_with(&root) {
             return Err(EditRefusal::new(
                 "path_outside_repo",
-                format!("{path} is outside {}", root.display()),
+                format!("{path} is outside {}. An intended edit in another directory needs an explicit root: `greppy --root <target-directory> <edit-command> ...`; the target must remain inside that root", root.display()),
                 17,
             ));
         }

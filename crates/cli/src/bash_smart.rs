@@ -43,10 +43,18 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
+// Node's diagnostic reporter emits `fail 0` even for an entirely green run.
+// Only the complete zero counter is exempt; positive counts and failure
+// messages that merely start with zero remain diagnostic blocks.
+static ZERO_FAILURE_COUNT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*fail(?:ed)?[\t ]+0[\t ]*$")
+        .expect("bash-smart zero failure count regex")
+});
+
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
@@ -63,11 +71,21 @@ static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 // GCC/Clang put a numeric file location before the severity. Keep the
 // classifier byte-oriented (paths need not be UTF-8) and require the complete
 // location/severity syntax rather than promoting arbitrary stderr prose.
+// Linters can add a rule identifier, e.g. `error t3code(namespace-node-imports):`.
 static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
         r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning):(?:[\t ]|$)",
     )
     .expect("bash-smart source diagnostic regex")
+});
+
+// Named-rule linters include both line and column. Keep that complete shape:
+// accepting only the final number would misread `file.ts:x:4:` as a location.
+static LINTER_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?i-u)^[^\r\n]+:[0-9]+:[0-9]+:[\t ]+(error|warning)[\t ]+[a-z0-9_@][a-z0-9_@./-]*(?:\([a-z0-9_@./-]+\))?:(?:[\t ]|$)",
+    )
+    .expect("bash-smart linter diagnostic regex")
 });
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
@@ -673,7 +691,8 @@ fn detect_blocks(
     ] {
         let mut index = 0usize;
         while index < lines.len() {
-            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+            let kind = if (ERROR_MARKER_RE.is_match(lines[index].content)
+                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content))
                 || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
@@ -682,6 +701,7 @@ fn detect_blocks(
             } else {
                 SOURCE_DIAGNOSTIC_RE
                     .captures(lines[index].content)
+                    .or_else(|| LINTER_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
@@ -990,7 +1010,13 @@ where
         // `<token>.tail-ring`, so the two writers could truncate one another.
         let tail_path = tail_ring_path(&path);
         let mut output = std::fs::File::create(&path)?;
-        let mut tail = std::fs::File::create(&tail_path)?;
+        // The ring is read back after the head limit; File::create is write-only.
+        let mut tail = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tail_path)?;
         let mut timestamps = std::fs::File::create(&timestamps_path)?;
         let started = std::time::Instant::now();
         let mut byte_len = 0u64;
@@ -2251,6 +2277,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_failure_counters_are_not_diagnostics_but_real_failures_remain() {
+        for text in ["fail 0\n", "failed 0\n", "  FAIL 0  \n"] {
+            let lines = split_lines(text.as_bytes());
+            assert!(detect_blocks(&lines, &[]).is_empty(), "{text}");
+            assert!(detect_blocks(&[], &lines).is_empty(), "{text}");
+        }
+        for text in ["fail 1\n", "FAIL zero-case: broken\n", "FAIL 0: broken\n"] {
+            let lines = split_lines(text.as_bytes());
+            let blocks = detect_blocks(&lines, &[]);
+            assert_eq!(blocks.len(), 1, "{text}");
+            assert_eq!(blocks[0].kind, BlockKind::Error, "{text}");
+        }
+    }
+
+    #[test]
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
@@ -2400,6 +2441,47 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"one\ntwo\nlast");
         assert_eq!(std::fs::read_to_string(times).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_ring_capture_preserves_overflow_and_wrap_order() {
+        for (overflow, suffix) in [
+            (1, b"!".as_slice()),
+            (PACK_TAIL_BYTES + 19, b"last nineteen bytes".as_slice()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("capture.stdout");
+            let input = std::io::repeat(b'h')
+                .take(PACK_HEAD_BYTES)
+                .chain(std::io::repeat(b't').take(overflow - suffix.len() as u64))
+                .chain(std::io::Cursor::new(suffix));
+            let captured = spawn_drain(input, path.clone(), dir.path().join("times"))
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(captured.byte_len, PACK_HEAD_BYTES + overflow);
+            assert_eq!(captured.line_count, 1);
+            let raw = std::fs::read(&path).unwrap();
+            let head = PACK_HEAD_BYTES as usize;
+            assert!(raw[..head].iter().all(|byte| *byte == b'h'));
+            let tail_start = if overflow > PACK_TAIL_BYTES {
+                let gap = format!(
+                    "\n… bash-smart store gap: {} bytes omitted by pack cap …\n",
+                    overflow - PACK_TAIL_BYTES
+                );
+                assert!(raw[head..].starts_with(gap.as_bytes()));
+                head + gap.len()
+            } else {
+                head
+            };
+            let retained = overflow.min(PACK_TAIL_BYTES) as usize;
+            assert_eq!(raw.len(), tail_start + retained);
+            assert!(raw[tail_start..raw.len() - suffix.len()]
+                .iter()
+                .all(|byte| *byte == b't'));
+            assert!(raw.ends_with(suffix));
+            assert!(!tail_ring_path(&path).exists());
+        }
     }
 
     #[test]
