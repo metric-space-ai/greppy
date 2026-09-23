@@ -3244,6 +3244,21 @@ fn decode_png_base64(b64: &str) -> Vec<u8> {
     out
 }
 
+fn png_rgba_frame(png_bytes: &[u8]) -> (u32, u32, Vec<u8>, usize) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    let samples = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Indexed => 1,
+    };
+    (info.width, info.height, buf, samples)
+}
+
 fn count_red_png_pixels(png_bytes: &[u8]) -> usize {
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let mut reader = decoder.read_info().expect("png header");
@@ -3382,7 +3397,7 @@ fn screenshot_render_complete_replaces_placeholder_with_raster_pixels() {
 
     assert!(
         instant_red < 1000,
-        "default screenshot must stay a placeholder (empty layout box), red_pixels={instant_red}"
+        "default screenshot must stay a placeholder (frame, not decoded raster), red_pixels={instant_red}"
     );
     assert!(
         visual_red >= 10_000,
@@ -3393,6 +3408,206 @@ fn screenshot_render_complete_replaces_placeholder_with_raster_pixels() {
         &socket,
         &Request::new(
             "run_visual_shot",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn screenshot_default_draws_placeholder_frame_for_deferred_raster() {
+    // 32x32 red PNG laid out at 200x200. Default paint must show the
+    // agent-lazy frame (gray fill + dark caption), not the red raster.
+    let fixture = serve_red_image_page();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-placeholder-shot-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_placeholder_shot", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_shot",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_shot",
+            "web.read",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+
+    let instant = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_shot",
+            "web.screenshot",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("instant screenshot");
+    assert_eq!(instant.status, "ok", "{instant:?}");
+    let png = decode_png_base64(
+        instant.result.as_ref().unwrap()["png_base64"]
+            .as_str()
+            .expect("png_base64"),
+    );
+    let (width, height, rgba, samples) = png_rgba_frame(&png);
+    assert!(width >= 200 && height >= 200, "viewport {width}x{height}");
+
+    let mut gray = 0usize;
+    let mut caption = 0usize;
+    let mut border = 0usize;
+    let mut red = 0usize;
+    for y in 0..200u32 {
+        for x in 0..200u32 {
+            if x >= width || y >= height {
+                continue;
+            }
+            let i = ((y * width + x) as usize) * samples;
+            let r = rgba[i];
+            let g = if samples > 1 { rgba[i + 1] } else { r };
+            let b = if samples > 2 { rgba[i + 2] } else { r };
+            if r > 200 && g < 40 && b < 40 {
+                red += 1;
+            }
+            if (x == 0 || y == 0 || x == 199 || y == 199) && r < 40 && g < 40 && b < 40 {
+                border += 1;
+            }
+            if y > 0 && y < 14 && x > 2 && x < 198 && r < 120 && g < 120 && b < 140 && r > 50 {
+                caption += 1;
+            }
+            if y > 16 && y < 198 && x > 2 && x < 198 && (190..=230).contains(&r) && (190..=230).contains(&g) && (190..=240).contains(&b) {
+                gray += 1;
+            }
+        }
+    }
+    assert!(red < 1000, "placeholder must not paint the red raster, red={red}");
+    assert!(border >= 100, "placeholder must draw a dark frame, border={border}");
+    assert!(gray >= 10_000, "placeholder interior must be the stand-in fill, gray={gray}");
+    assert!(caption >= 200, "placeholder must reserve a caption strip for the filename, caption={caption}");
+
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_shot",
+            "web.session.close",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn deferred_image_placeholder_preserves_img_bounding_box() {
+    let fixture = serve_red_image_page();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-placeholder-box-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_placeholder_box", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
+            "web.read",
+            json!({ "session_id": session_id, "url": fixture }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("read");
+    assert_eq!(read.status, "ok", "{read:?}");
+
+    let before = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
+            "web.evaluate",
+            json!({
+                "session_id": session_id,
+                "source": "(function(){var r=document.querySelector('img').getBoundingClientRect();return {w:r.width,h:r.height,tag:document.elementFromPoint(100,100)&&document.elementFromPoint(100,100).tagName};})()"
+            }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("evaluate before");
+    assert_eq!(before.status, "ok", "{before:?}");
+
+    let visual = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
+            "web.screenshot",
+            json!({ "session_id": session_id, "renderComplete": true }),
+        ),
+        Duration::from_secs(45),
+    )
+    .expect("renderComplete");
+    assert_eq!(visual.status, "ok", "{visual:?}");
+
+    let after = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
+            "web.evaluate",
+            json!({
+                "session_id": session_id,
+                "source": "(function(){var r=document.querySelector('img').getBoundingClientRect();return {w:r.width,h:r.height,tag:document.elementFromPoint(100,100)&&document.elementFromPoint(100,100).tagName};})()"
+            }),
+        ),
+        Duration::from_secs(15),
+    )
+    .expect("evaluate after");
+    assert_eq!(after.status, "ok", "{after:?}");
+
+    let before_v = before.result.as_ref().unwrap().get("value").cloned().unwrap_or(json!(null));
+    let after_v = after.result.as_ref().unwrap().get("value").cloned().unwrap_or(json!(null));
+    assert_eq!(before_v, after_v, "agent-lazy placeholder must not change bounding box or hit-test, before={before_v:?} after={after_v:?}");
+    assert_eq!(before_v["w"], 200.0, "layout width comes from the header/attributes: {before_v:?}");
+    assert_eq!(before_v["h"], 200.0, "layout height comes from the header/attributes: {before_v:?}");
+    assert_eq!(before_v["tag"], "IMG", "hit-test at the image center: {before_v:?}");
+
+    let _ = unix_request(
+        &socket,
+        &Request::new(
+            "run_placeholder_box",
             "web.session.close",
             json!({ "session_id": session_id }),
         ),
