@@ -3519,6 +3519,8 @@ fn screenshot_default_draws_placeholder_frame_for_deferred_raster() {
 
 #[test]
 fn deferred_image_placeholder_preserves_img_bounding_box() {
+    // Fund 026 layout-identity edge: agent-lazy placeholder paint must not
+    // change boundingBox, visibility, or hit-test versus renderComplete.
     let fixture = serve_red_image_page();
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-placeholder-box-{}.sock",
@@ -3555,6 +3557,7 @@ fn deferred_image_placeholder_preserves_img_bounding_box() {
     .expect("read");
     assert_eq!(read.status, "ok", "{read:?}");
 
+    let probe = "(function(){var el=document.querySelector('img');var r=el.getBoundingClientRect();var cs=getComputedStyle(el);return {w:r.width,h:r.height,ow:el.offsetWidth,oh:el.offsetHeight,vis:cs.visibility,disp:cs.display,complete:el.complete,nw:el.naturalWidth,nh:el.naturalHeight,tag:document.elementFromPoint(100,100)&&document.elementFromPoint(100,100).tagName};})()";
     let before = unix_request(
         &socket,
         &Request::new(
@@ -3562,7 +3565,7 @@ fn deferred_image_placeholder_preserves_img_bounding_box() {
             "web.evaluate",
             json!({
                 "session_id": session_id,
-                "source": "(function(){var r=document.querySelector('img').getBoundingClientRect();return {w:r.width,h:r.height,tag:document.elementFromPoint(100,100)&&document.elementFromPoint(100,100).tagName};})()"
+                "source": probe
             }),
         ),
         Duration::from_secs(15),
@@ -3589,7 +3592,7 @@ fn deferred_image_placeholder_preserves_img_bounding_box() {
             "web.evaluate",
             json!({
                 "session_id": session_id,
-                "source": "(function(){var r=document.querySelector('img').getBoundingClientRect();return {w:r.width,h:r.height,tag:document.elementFromPoint(100,100)&&document.elementFromPoint(100,100).tagName};})()"
+                "source": probe
             }),
         ),
         Duration::from_secs(15),
@@ -3599,10 +3602,48 @@ fn deferred_image_placeholder_preserves_img_bounding_box() {
 
     let before_v = before.result.as_ref().unwrap().get("value").cloned().unwrap_or(json!(null));
     let after_v = after.result.as_ref().unwrap().get("value").cloned().unwrap_or(json!(null));
-    assert_eq!(before_v, after_v, "agent-lazy placeholder must not change bounding box or hit-test, before={before_v:?} after={after_v:?}");
-    assert_eq!(before_v["w"], 200.0, "layout width comes from the header/attributes: {before_v:?}");
-    assert_eq!(before_v["h"], 200.0, "layout height comes from the header/attributes: {before_v:?}");
+    assert_eq!(before_v, after_v, "agent-lazy placeholder must not change bounding box, visibility, or hit-test, before={before_v:?} after={after_v:?}");
+    let num = |v: &serde_json::Value, key: &str| v.get(key).and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+    assert_eq!(num(&before_v, "w"), 200.0, "layout width comes from the header/attributes: {before_v:?}");
+    assert_eq!(num(&before_v, "h"), 200.0, "layout height comes from the header/attributes: {before_v:?}");
+    assert_eq!(num(&before_v, "ow"), 200.0, "offsetWidth is the visible layout box: {before_v:?}");
+    assert_eq!(num(&before_v, "oh"), 200.0, "offsetHeight is the visible layout box: {before_v:?}");
+    assert_eq!(before_v["vis"], "visible", "computed visibility stays visible: {before_v:?}");
+    assert_ne!(before_v["disp"], "none", "computed display must not collapse the box: {before_v:?}");
+    assert_eq!(before_v["complete"], true, "img.complete stays true without RGBA: {before_v:?}");
+    assert_eq!(num(&before_v, "nw"), 32.0, "naturalWidth is the PNG header, not the 1x1 placeholder frame: {before_v:?}");
+    assert_eq!(num(&before_v, "nh"), 32.0, "naturalHeight is the PNG header, not the 1x1 placeholder frame: {before_v:?}");
     assert_eq!(before_v["tag"], "IMG", "hit-test at the image center: {before_v:?}");
+
+    let receipts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("contracts/web-runtime/receipts");
+    std::fs::create_dir_all(&receipts_dir).unwrap();
+    let receipt = json!({
+        "reference": {
+            "engine": "HTML width/height attributes plus header metrics on the pinned red.png fixture",
+            "value": {
+                "w": 200.0,
+                "h": 200.0,
+                "ow": 200.0,
+                "oh": 200.0,
+                "vis": "visible",
+                "tag": "IMG",
+                "complete": true,
+                "nw": 32.0,
+                "nh": 32.0
+            }
+        },
+        "candidate": {
+            "engine": "greppy-web-runtime+servo-0.5.0",
+            "status": "ok",
+            "placeholder": before_v,
+            "renderComplete": after_v
+        },
+        "match": true,
+        "scope": "Agent-lazy default vs renderComplete on the same document: boundingBox, offset box, computed visibility/display, img.complete, naturalWidth/Height, and elementFromPoint stay identical. Not a Chromium pixel comparison.",
+    });
+    write_receipt_preserving_provenance(receipts_dir.join("oracle-layout-identity.json"), &receipt);
 
     let _ = unix_request(
         &socket,

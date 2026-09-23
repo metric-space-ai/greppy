@@ -6552,10 +6552,12 @@
       "source": "passing",
       "behavior": "unverified",
       "tests": [
-        "network-and-box"
+        "network-and-box",
+        "deferred_image_placeholder_preserves_img_bounding_box"
       ],
       "known_differences": [
-        "getBoundingClientRect after actionability wait; not Chromium layout"
+        "getBoundingClientRect after actionability wait; not Chromium layout",
+        "oracle-layout-identity.json: agent-lazy placeholder vs renderComplete keeps the 200x200 header box, offset box, visibility, and IMG hit-test; not a Chromium comparison"
       ]
     },
     {
@@ -7165,12 +7167,14 @@
       "tests": [
         "compat-core",
         "oracle-content",
-        "actionability"
+        "actionability",
+        "deferred_image_placeholder_preserves_img_bounding_box"
       ],
       "known_differences": [
         "no wait; visible iff exactly one node with non-zero box",
         "oracle compares isVisible of #x after setContent equals true; hidden/offscreen not compared",
-        "false for display:none and visibility:hidden via getComputedStyle walk; not Chromium visibility including opacity/aria-hidden"
+        "false for display:none and visibility:hidden via getComputedStyle walk; not Chromium visibility including opacity/aria-hidden",
+        "oracle-layout-identity.json: agent-lazy placeholder keeps computed visibility visible and a 200x200 offset box, same as renderComplete"
       ]
     },
     {

@@ -20,6 +20,10 @@ an external reference.
 - `oracle-content.json` — Page.content markers + Locator.count/innerHTML/textContent.
 - `oracle-skip.json` — recorded skip used when the reference stack is absent.
   Never treat skip as `behavior:passing`.
+- `oracle-layout-identity.json` — agent-lazy default screenshot vs
+  `renderComplete` on the pinned red.png fixture: `boundingBox`, offset
+  box, computed visibility, `img.complete`, and hit-test stay identical.
+  Intra-engine identity (Fund 026), not a Chromium pixel comparison.
 
 Inventory `behavior` stays `unverified` except for the exact symbols covered
 by a named **oracle** receipt.
