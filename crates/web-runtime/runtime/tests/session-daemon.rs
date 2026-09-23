@@ -1961,7 +1961,10 @@ fn one_thousand_session_create_run_close_cycles() {
                 "script_text": source,
             }),
         );
-        run.deadline_ms = 10_000;
+        // Daemon budget 8s, Unix read 10s: a wedged web.run must return the
+        // engine wait_point (content:chromium.launch / controller:script-complete)
+        // instead of a client EAGAIN. Product deadline is not raised.
+        run.deadline_ms = 8_000;
         let ran = unix_request(&socket, &run, Duration::from_secs(10))
             .unwrap_or_else(|error| panic!("run {i}: {error}"));
         assert_eq!(ran.status, "ok", "run {i}: {ran:?}");
