@@ -2855,6 +2855,281 @@ fn first_use_query_waits_for_healthy_slow_index() {
     check_first_use_query_waits_for_healthy_slow_index(false);
 }
 
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process_is_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} remained alive after query demand ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_sole_first_use_query_stops_its_automatic_index() {
+    let (repo, store, scratch) = make_repo("first-use-cancel-sole", "cancel_sole_marker");
+    let ready = scratch.0.join("cancel-sole-writer-ready");
+    let demand_ready = scratch.0.join("cancel-sole-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search-symbol", "cancel_sole_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first-use query");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() || !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    let job_path = workspace.join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(query.id(), libc::SIGINT);
+    let status = query.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGINT)
+    );
+    wait_for_process_exit(index_pid);
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
+    let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
+    let linked = scratch.0.join("linked");
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-cancel",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let (code, out, err) = run(
+        &["search-symbol", "clean_committed_marker"],
+        &linked,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "structural first use must publish before semantic refresh: {out}\n{err}"
+    );
+    let delegated_ready = scratch.0.join("delegated-base-ready");
+    let demand_ready = scratch.0.join("linked-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search", "find clean committed marker"])
+        .current_dir(&linked)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_BASE_OWNER_HOLD_MS", "120000")
+        .env("GREPPY_TEST_BASE_OWNER_READY", &delegated_ready)
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn linked first-use query");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !delegated_ready.exists() || !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegated Base index or demand monitor did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let delegated_pid: u32 = std::fs::read_to_string(&delegated_ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let job_path = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&linked))
+        .join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(query.id(), libc::SIGKILL);
+    let status = query.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    wait_for_process_exit(index_pid);
+    wait_for_process_exit(delegated_pid);
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_index_stops_only_after_last_shared_query_exits() {
+    let (repo, store, scratch) = make_repo("first-use-cancel-shared", "cancel_shared_marker");
+    let ready = scratch.0.join("cancel-shared-writer-ready");
+    let spawn = |demand_ready: &Path| {
+        Command::new(bin())
+            .args(["search-symbol", "cancel_shared_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn shared first-use query")
+    };
+    let first_demand = scratch.0.join("first-demand-ready");
+    let second_demand = scratch.0.join("second-demand-ready");
+    let mut first = spawn(&first_demand);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() || !first_demand.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let mut second = spawn(&second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let job_path = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo))
+        .join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(first.id(), libc::SIGINT);
+    let _ = first.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        process_is_running(index_pid),
+        "shared waiter must keep index alive"
+    );
+
+    signal_process(second.id(), libc::SIGTERM);
+    let _ = second.wait().unwrap();
+    wait_for_process_exit(index_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
+    let (repo, store, scratch) = make_repo("first-use-explicit-writer", "explicit_writer_marker");
+    let ready = scratch.0.join("explicit-writer-ready");
+    let release = scratch.0.join("explicit-writer-release");
+    let mut writer = Command::new(bin())
+        .args(["index", "."])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn explicit foreground index");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let demand_ready = scratch.0.join("explicit-attached-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search-symbol", "explicit_writer_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn attached query");
+    while !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(std::time::Instant::now() < deadline, "query did not attach");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    signal_process(query.id(), libc::SIGINT);
+    let _ = query.wait().unwrap();
+    assert!(
+        writer.try_wait().unwrap().is_none(),
+        "query cancellation must not stop explicit writer"
+    );
+
+    std::fs::write(&release, b"release\n").unwrap();
+    let status = writer.wait().unwrap();
+    assert!(status.success(), "explicit writer failed: {status}");
+    let (code, out, err) = run(&["search-symbol", "explicit_writer_marker"], &repo, &store);
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("explicit_writer_marker"), "{out}\n{err}");
+}
+
 #[test]
 fn cold_scoped_search_pattern_parses_matches_without_starting_an_index() {
     let (repo, store, _scratch) = make_repo("cold-scoped-pattern", "unrelated_root_marker");
@@ -3206,10 +3481,10 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
 
 #[cfg(unix)]
 #[test]
-fn second_first_use_caller_waits_for_the_real_writer_and_completes() {
+fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
     let (repo, store, scratch) = make_repo("first-use-two-callers", "two_caller_marker");
     let ready = scratch.0.join("first-use-two-callers-ready");
-    let spawn = || {
+    let spawn = |demand_ready: &Path| {
         let mut command = Command::new(bin());
         command
             .args(["search-symbol", "two_caller_marker"])
@@ -3218,16 +3493,19 @@ fn second_first_use_caller_waits_for_the_real_writer_and_completes() {
             .env("GREPPY_TEST_SKIP_INFERENCE", "1")
             .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
             .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
-            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "750")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.spawn().expect("spawn first-use query")
     };
-    let mut first = spawn();
+    let first_demand = scratch.0.join("two-callers-first-demand");
+    let second_demand = scratch.0.join("two-callers-second-demand");
+    let mut first = spawn(&first_demand);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() {
+    while !ready.exists() || !first_demand.exists() {
         assert!(
             first.try_wait().unwrap().is_none(),
             "first query exited early"
@@ -3238,16 +3516,30 @@ fn second_first_use_caller_waits_for_the_real_writer_and_completes() {
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let second = spawn();
+    let mut second = spawn(&second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    signal_process(first.id(), libc::SIGINT);
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
-    for output in [first, second] {
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("two_caller_marker"),
-            "{output:?}"
-        );
-    }
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&first.status),
+        Some(libc::SIGINT)
+    );
+    assert_eq!(second.status.code(), Some(0), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("two_caller_marker"),
+        "{second:?}"
+    );
 }
 
 #[cfg(unix)]

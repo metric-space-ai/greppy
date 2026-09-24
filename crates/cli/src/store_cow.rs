@@ -1586,19 +1586,31 @@ fn prepare_base_store_paths(
     if let Some(path) = progress_path {
         command.env(crate::ENV_DELEGATED_BACKGROUND_JOB, path);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| Error::io("start immutable Base index build", error))?;
+    crate::begin_delegated_base_owner();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            crate::clear_delegated_base_owner();
+            return Err(Error::io("start immutable Base index build", error));
+        }
+    };
     // Child::wait closes a still-attached stdin. Take the pipe and retain its
     // writer explicitly so EOF means that this owner died, not that it waited.
-    let owner_writer = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::Invalid("immutable Base index build has no owner pipe".into()))?;
-    let status = child
-        .wait()
-        .map_err(|error| Error::io("wait for immutable Base index build", error))?;
-    drop(owner_writer);
+    let owner_writer = match child.stdin.take() {
+        Some(owner) => owner,
+        None => {
+            crate::clear_delegated_base_owner();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Invalid(
+                "immutable Base index build has no owner pipe".into(),
+            ));
+        }
+    };
+    crate::register_delegated_base_owner(owner_writer);
+    let status = child.wait();
+    crate::clear_delegated_base_owner();
+    let status = status.map_err(|error| Error::io("wait for immutable Base index build", error))?;
     if !status.success() {
         return Err(Error::Invalid(format!(
             "immutable Base index build exited {status}"

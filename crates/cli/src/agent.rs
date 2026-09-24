@@ -2154,9 +2154,9 @@ fn run_interactive_session(
         thread::Builder::new()
             .name("greppy-agent-index-monitor".to_string())
             .spawn(move || {
-                let ready = if let Some(mut job) = start_semantic_index(&startup_worktree) {
+                let ready = if let Some(job) = start_semantic_index(&startup_worktree) {
                     match monitor_index_startup(
-                        &mut job,
+                        job,
                         &startup_worktree,
                         &monitor_bridge,
                         &monitor_cancel,
@@ -2818,7 +2818,7 @@ fn client_for_endpoint(endpoint: &str, model: &str, api_key: Option<&str>) -> Cl
 }
 
 fn monitor_index_startup(
-    launch: &mut crate::BackgroundJobLaunch,
+    mut launch: crate::BackgroundJobLaunch,
     worktree_path: &Path,
     bridge: &crate::agent_tui::EventBridge,
     cancel: &AtomicBool,
@@ -2826,11 +2826,11 @@ fn monitor_index_startup(
     let mut missing_ticks = 0usize;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let owned = matches!(launch, crate::BackgroundJobLaunch::Owned { .. });
+            let owned = matches!(&launch, crate::BackgroundJobLaunch::Owned { .. });
             cancel_background_job(launch);
             bridge.send_discrete(SessionEvent::Warning(
                 if owned {
-                    "Indexing cancelled."
+                    "Index monitoring cancelled; automatic indexing stops when no other waiter remains."
                 } else {
                     "Startup monitoring stopped; the shared index job continues."
                 }
@@ -2851,7 +2851,7 @@ fn monitor_index_startup(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown error");
                 bridge.send_discrete(SessionEvent::Warning(format!("Indexing failed: {detail}")));
-                reap_owned_background_job(launch);
+                reap_owned_background_job(&mut launch);
                 return Ok(false);
             }
             let completed = job
@@ -2912,10 +2912,10 @@ fn monitor_index_startup(
                 eta_seconds,
             });
         } else if doctor_reports_embedding_complete(worktree_path) {
-            reap_owned_background_job(launch);
+            reap_owned_background_job(&mut launch);
             return Ok(true);
         } else {
-            if !owned_background_job_is_running(launch) {
+            if !owned_background_job_is_running(&mut launch) {
                 missing_ticks = missing_ticks.saturating_add(1);
             }
             if missing_ticks >= 20 {
@@ -2924,7 +2924,7 @@ fn monitor_index_startup(
                         "The index job ended before embeddings were complete.".into(),
                     ));
                 }
-                reap_owned_background_job(launch);
+                reap_owned_background_job(&mut launch);
                 return Ok(false);
             }
         }
@@ -2932,11 +2932,25 @@ fn monitor_index_startup(
     }
 }
 
-fn cancel_background_job(launch: &mut crate::BackgroundJobLaunch) {
-    if let crate::BackgroundJobLaunch::Owned { child, path } = launch {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(path);
+fn cancel_background_job(launch: crate::BackgroundJobLaunch) {
+    if let crate::BackgroundJobLaunch::Owned {
+        mut child,
+        path,
+        demand,
+    } = launch
+    {
+        if demand.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        drop(demand);
+        let _ = std::thread::Builder::new()
+            .name("greppy-agent-index-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
 }
 
@@ -3861,12 +3875,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("foreign-index-job.json");
         fs::write(&path, "{}\n").expect("write job marker");
-        let mut launch = crate::BackgroundJobLaunch::Attached {
+        let launch = crate::BackgroundJobLaunch::Attached {
             path: path.clone(),
             root: dir.path().to_path_buf(),
+            demand: None,
         };
 
-        cancel_background_job(&mut launch);
+        cancel_background_job(launch);
 
         assert!(path.exists(), "attached job belongs to another process");
     }
@@ -3880,18 +3895,15 @@ mod tests {
             .args(["-c", "sleep 30"])
             .spawn()
             .expect("spawn child");
-        let mut launch = crate::BackgroundJobLaunch::Owned {
+        let launch = crate::BackgroundJobLaunch::Owned {
             child,
             path: path.clone(),
+            demand: None,
         };
 
-        cancel_background_job(&mut launch);
+        cancel_background_job(launch);
 
         assert!(!path.exists());
-        let crate::BackgroundJobLaunch::Owned { child, .. } = &mut launch else {
-            panic!("expected owned launch");
-        };
-        assert!(child.try_wait().expect("query child").is_some());
     }
 
     #[test]

@@ -2520,3 +2520,84 @@ fn cache_commands_parse_with_stable_public_flags() {
         })
     ));
 }
+
+#[test]
+fn workspace_query_demand_is_shared_across_structural_and_embedding_waiters() {
+    let root = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let name = background_job_demand_name(root.path());
+    let structural = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let embedding = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the automatic writer must see demand from both job kinds"
+    );
+    drop(structural);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the remaining cross-kind waiter must preserve the writer"
+    );
+    drop(embedding);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_some(),
+        "the writer may stop only after the final workspace waiter exits"
+    );
+}
+
+#[test]
+fn completed_publication_and_successor_identity_block_demand_cancellation() {
+    let job = serde_json::json!({
+        "pid": 41,
+        "target_generation": 9,
+        "state": "syncing_snapshot"
+    });
+    assert!(background_demand_may_cancel(Some(&job), false, 41, 9));
+    assert!(
+        !background_demand_may_cancel(Some(&job), true, 41, 9),
+        "the in-process publication latch wins before terminal record cleanup"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 42, 9),
+        "a reused PID cannot authorize cancellation"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 41, 10),
+        "a successor generation cannot be overwritten"
+    );
+    assert!(!background_demand_may_cancel(None, false, 41, 9));
+}

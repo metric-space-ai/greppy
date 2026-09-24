@@ -1129,15 +1129,22 @@ pub(crate) fn dispatch_index(
             }
         }
     }
-    let recovery = recover_completed_index_snapshot(
-        &store_path,
-        &target,
-        &effective_root,
-        &project,
-        &index_options,
+    let recovery = background_job.publication_boundary(
+        || {
+            recover_completed_index_snapshot(
+                &store_path,
+                &target,
+                &effective_root,
+                &project,
+                &index_options,
+            )
+        },
+        |recovery| recovery.published(),
     )?;
     if recovery.published() {
+        background_job.publication_finished();
         let _ = remove_file_if_exists(&background_job_path(&effective_root));
+        background_job.complete();
         println!(
             "recovered and published completed index snapshot {}",
             recovery.candidate.as_deref().unwrap_or("unknown")
@@ -1215,6 +1222,7 @@ pub(crate) fn dispatch_index(
             return Err(error);
         }
     };
+    background_job.publication_finished();
     let report = &snapshot.index;
 
     println!(
@@ -1303,6 +1311,9 @@ pub(crate) fn record_overlay_job_outcome(
     background_job: &mut BackgroundJobGuard,
     result: &Result<OverlayIndexOutcome>,
 ) {
+    if result.is_ok() {
+        background_job.publication_finished();
+    }
     match result {
         Ok(OverlayIndexOutcome::Complete) => background_job.complete(),
         Ok(OverlayIndexOutcome::Degraded(reason)) => background_job.degraded(reason),
@@ -1390,7 +1401,7 @@ pub(crate) fn index_overlay_snapshot(
             config,
             report.graph_generation,
             active_path.parent().map(std::path::Path::to_path_buf),
-            progress,
+            progress.as_deref_mut(),
         )?)
     } else {
         None
@@ -1398,7 +1409,11 @@ pub(crate) fn index_overlay_snapshot(
     checkpoint_store(&store, &temp_path)?;
     drop(store);
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
-    publish_store_snapshot(&temp_path, active_path)?;
+    if let Some(job) = progress {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
     cleanup_stale_snapshot_artifacts(active_path, false)?;
 
     if announce {
@@ -1582,10 +1597,14 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
-    if let Some(job) = background_job {
+    if let Some(job) = background_job.as_deref_mut() {
         job.finalization_phase("publishing_snapshot");
     }
-    publish_store_snapshot(&temp_path, active_path)?;
+    if let Some(job) = background_job {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     Ok(Some(IndexSnapshotReport {
         index: report,
@@ -1643,10 +1662,14 @@ fn complete_embeddings_from_published_graph(
     cleanup_sqlite_sidecars(&temp_path)?;
     sync_file(&temp_path)?;
     sync_parent_dir(&temp_path)?;
-    if let Some(job) = background_job {
+    if let Some(job) = background_job.as_deref_mut() {
         job.finalization_phase("publishing_snapshot");
     }
-    publish_store_snapshot(&temp_path, active_path)?;
+    if let Some(job) = background_job {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     Ok(outcome)
 }
