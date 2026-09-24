@@ -62,11 +62,11 @@ static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 // tsc/tsgo place the source location before the severity, unlike Rust's
 // leading `error:`. Require a numeric location and TS code, not arbitrary
 // prose containing the word "error". Match both plain compiler layouts.
-static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+error[\t ]+TS[0-9]+:",
+        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+(error|warning)[\t ]+TS[0-9]+:",
     )
-    .expect("bash-smart TypeScript error regex")
+    .expect("bash-smart TypeScript diagnostic regex")
 });
 // GCC/Clang put a numeric file location before the severity. Keep the
 // classifier byte-oriented (paths need not be UTF-8) and require the complete
@@ -385,8 +385,10 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     for (stream, lines) in [("stdout", &stdout_lines), ("stderr", &stderr_lines)] {
         if lines.iter().any(|line| preview::oversized(line.raw)) {
             if let Some(path) = raw.payload[stream]["path"].as_str() {
-                let _ = writeln!(std::io::stdout().lock(),
-                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file");
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file"
+                );
             }
         }
     }
@@ -682,16 +684,16 @@ fn detect_blocks(
     ] {
         let mut index = 0usize;
         while index < lines.len() {
-            let kind = if (ERROR_MARKER_RE.is_match(lines[index].content)
-                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content))
-                || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
+            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
             } else {
-                SOURCE_DIAGNOSTIC_RE
+                TYPESCRIPT_DIAGNOSTIC_RE
                     .captures(lines[index].content)
+                    .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
@@ -2300,6 +2302,32 @@ mod tests {
             assert_eq!(blocks[0].lines.len(), 2);
             assert_eq!(blocks[0].lines[1].bytes, b"  property details");
         }
+    }
+
+    #[test]
+    fn typescript_file_prefixed_warnings_keep_severity_and_details() {
+        let diagnostics = b"src/example.test.ts(113,7): warning TS377033: This expression chains multiple Effect.provide calls. effect(multipleEffectProvide)\n  suggestion details\nC:\\project files\\two.ts:4:1 - warning TS377004: review this expression\napp.ts(8,2): error TS2322: incompatible value\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 3, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(blocks[1].kind, BlockKind::Warning);
+            assert_eq!(blocks[2].kind, BlockKind::Error);
+            let errors = blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Error)
+                .count();
+            assert_eq!(
+                verdict_line(1, errors, blocks.len() - errors, None),
+                "FAILED — exit 1: 1 error, 2 warnings"
+            );
+        }
+        let prose = split_lines(b"docs mention warning TS377033\nexample.ts(x,y): warning TS377033: no numeric location\nexample.ts(1,1): warning TSfoo: no numeric code\nexample.ts(1,1): no warning TS377033: all good\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
     }
 
     #[test]
