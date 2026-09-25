@@ -114,7 +114,7 @@ impl SessionLimits {
     pub fn check_wall_time(&self, elapsed: Duration) -> Result<(), String> {
         if elapsed > self.wall_time {
             Err(format!(
-                "wall time exceeded ({elapsed:?} > {:?})",
+                "session wall time exceeded (session age {elapsed:?} > {:?}; this is not the duration of the last action)",
                 self.wall_time
             ))
         } else {
@@ -245,6 +245,24 @@ mod tests {
         assert!(research.max_pages < project.max_pages);
         assert!(research.check_pages(9).is_err());
         assert!(project.check_pages(9).is_ok());
+    }
+
+    #[test]
+    fn wall_time_error_names_session_age_not_last_action() {
+        let limits = SessionLimits {
+            wall_time: Duration::from_secs(120),
+            ..SessionLimits::default()
+        };
+        let error = limits
+            .check_wall_time(Duration::from_secs(123))
+            .expect_err("over budget");
+        assert!(error.contains("session age"), "{error}");
+        assert!(
+            error.contains("not the duration of the last action"),
+            "{error}"
+        );
+        assert!(error.contains("123s"), "{error}");
+        assert!(limits.check_wall_time(Duration::from_secs(120)).is_ok());
     }
 
     #[test]

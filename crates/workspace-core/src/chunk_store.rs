@@ -192,6 +192,25 @@ impl ChunkStore {
         }
 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The SELECT above is outside the writer lock. Parallel processes that
+        // share chunks.sqlite3 can both observe a miss, then the second INSERT
+        // hits UNIQUE cow_chunks.hash. Re-check after BEGIN IMMEDIATE.
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT len FROM cow_chunks WHERE hash = ?1",
+                params![&id.0[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(len) = existing {
+            if len != bytes.len() as i64 {
+                return Err(Error::Corrupt(format!(
+                    "chunk hash {id} is registered with conflicting length {len}"
+                )));
+            }
+            transaction.commit()?;
+            return Ok(id);
+        }
         let (mut segment_id, mut committed_len): (i64, u64) = transaction.query_row(
             "SELECT id, committed_len FROM cow_segments ORDER BY id DESC LIMIT 1",
             [],
@@ -1021,6 +1040,31 @@ mod tests {
         for (id, payload) in written {
             assert_eq!(store.read(id).unwrap(), payload.as_bytes());
         }
+    }
+
+    #[test]
+    fn concurrent_identical_puts_reuse_the_hash() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ChunkStore::open(root.path()).unwrap());
+        let payload = b"shared payload for cas race";
+        let workers = (0..8).map(|_| {
+            let root = root.path().to_path_buf();
+            std::thread::spawn(move || {
+                let store = retry_when_busy(|| ChunkStore::open(&root));
+                (0..40)
+                    .map(|_| retry_when_busy(|| store.put(payload)))
+                    .collect::<Vec<_>>()
+            })
+        });
+        let ids = workers
+            .map(|worker| worker.join().unwrap())
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let store = ChunkStore::open(root.path()).unwrap();
+        assert_eq!(store.read(ids[0]).unwrap(), payload);
+        assert_eq!(store.stats().unwrap().chunk_count, 1);
     }
 
     #[test]

@@ -621,6 +621,42 @@ mod tests {
     }
 
     #[test]
+    fn wait_url_dialects_are_usage_errors_not_page_javascript() {
+        for query in [
+            "url_not=http://localhost:8023/users/sign_in",
+            "url!~sign_in",
+            "url~catalogsearch",
+            "url=http://localhost:7770/catalogsearch/",
+            "URL_NOT=http://example.test/",
+        ] {
+            let error = validate_query(query).expect_err(query);
+            assert!(error.contains("--url"), "{query}: {error}");
+            assert!(
+                error.contains("must not be sent to the page"),
+                "{query}: {error}"
+            );
+            assert!(!error.contains("unknown query kind"), "{query}: {error}");
+        }
+        let title = validate_query("title=One Stop Market").expect_err("title");
+        assert!(title.contains("--title"), "{title}");
+        for css_sibling in [
+            "div~span",
+            "div ~ span",
+            "input[class~=quantity]",
+            "css=div~span",
+        ] {
+            assert!(validate_query(css_sibling).is_ok(), "{css_sibling}");
+            assert!(
+                validate_condition_query(css_sibling).is_ok(),
+                "{css_sibling}"
+            );
+        }
+        assert!(validate_condition_query("url~catalogsearch")
+            .expect_err("condition")
+            .contains("--url"));
+    }
+
+    #[test]
     fn node_queries_reject_unknown_conditions_and_malformed_regexes() {
         for query in [
             "time=500ms",
@@ -680,10 +716,38 @@ pub(super) fn validate_condition_query(query: &str) -> std::result::Result<(), S
     validate_query_impl(query, false)
 }
 
+fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
+    let lower = query.trim().to_ascii_lowercase();
+    let url_like = lower.starts_with("url=")
+        || lower.starts_with("url~")
+        || lower.starts_with("url!~")
+        || lower.starts_with("url!=")
+        || lower.starts_with("url_not=")
+        || lower.starts_with("url_not~");
+    let title_like =
+        lower.starts_with("title=") || lower.starts_with("title~") || lower.starts_with("title!~");
+    if url_like {
+        Some(
+            "URL conditions use --url EXACT or --url '~/REGEX/flags', optionally with --absent; they are not node queries and must not be sent to the page"
+                .into(),
+        )
+    } else if title_like {
+        Some(
+            "title conditions use --title EXACT or --title '~/REGEX/flags', optionally with --absent; they are not node queries and must not be sent to the page"
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
 fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result<(), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("empty query; expected css=, xpath=, text=, role=, id= or tag=".into());
+    }
+    if let Some(message) = wait_condition_used_as_node_query(trimmed) {
+        return Err(message);
     }
     const KINDS: [&str; 6] = ["css", "xpath", "text", "role", "id", "tag"];
     let Some(split) = trimmed.find(['=', '~']) else {

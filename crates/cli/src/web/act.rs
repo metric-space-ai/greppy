@@ -22,6 +22,7 @@ pub struct TargetOpts {
     /// Example: --expect "css=dialog[open]". Requires a workflow-capable runtime.
     /// Bare QUERY is CSS. For element text, use --expect 'text=Saved' (exact)
     /// or --expect 'text~/Saved/i' (partial); quotes alone do not change query type.
+    /// Without --expect, a returned action is dispatch only, not a verified page change.
     #[arg(long, value_name = "QUERY")]
     pub expect: Option<String>,
     /// Require QUERY to be absent; stale refs remain errors.

@@ -152,6 +152,15 @@ fn browser_observe_accepts_one_query_but_never_discards_extra_scope() {
         assert!(out.contains("quote a selector containing spaces"), "{out}");
         assert!(!out.contains("ignoring"), "{out}");
     }
+    let (code, out, err) = run(&["web", "wait", "text", "Koushik", "--help"], &repo, &store);
+    assert_eq!(
+        code, 64,
+        "bare wait text WORD must not be discarded: {out}\n{err}"
+    );
+    assert!(out.contains("No wait was run"), "{out}");
+    assert!(out.contains("text=Koushik"), "{out}");
+    assert!(out.contains("--url"), "{out}");
+    assert!(!out.contains("does not fit `web`"), "{out}");
     let (code, out, err) = run(&["web", "observe", "--help"], &repo, &store);
     assert_eq!(
         code, 0,
