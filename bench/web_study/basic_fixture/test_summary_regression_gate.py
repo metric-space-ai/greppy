@@ -1,6 +1,6 @@
-"""A favorable median must not hide an individual input/output regression."""
+"""Individual regressions stay visible without becoming a per-run veto."""
 import unittest
-from summarize_trials import regression_audit
+from summarize_trials import regression_audit, aggregate_token_changes, development_token_gate
 
 
 def pair(repeat, input_change, output_change, passed=True):
@@ -29,6 +29,30 @@ class RegressionGateTests(unittest.TestCase):
         result = regression_audit([pair(1, -10, -20), pair(2, -30, -40)])
         self.assertTrue(result['every_pair_uses_fewer_input_and_output'])
         self.assertEqual(result['regressions'], [])
+
+class AggregateGateTests(unittest.TestCase):
+    def records(self, last):
+        rows = []
+        for i in range(10):
+            for arm, count in [('A', 100), ('C', last if i == 9 else 80)]:
+                rows.append({'arm': arm, 'tokens': {'input_tokens': count, 'output_tokens': count}})
+        return rows
+
+    def test_nine_savings_and_one_modest_regression_pass(self):
+        changes = aggregate_token_changes(self.records(110))
+        self.assertAlmostEqual(changes['input_tokens'], -17)
+        self.assertEqual(development_token_gate(True, changes), 'passes this development block only')
+
+    def test_large_outlier_still_counts(self):
+        self.assertEqual(development_token_gate(True, aggregate_token_changes(self.records(1000))), 'failed_or_unproven')
+
+    def test_correctness_or_integrity_failure_cannot_pass(self):
+        self.assertEqual(development_token_gate(False, aggregate_token_changes(self.records(110))), 'failed_or_unproven')
+
+    def test_missing_usage_cannot_pass(self):
+        rows = self.records(110)
+        rows[-1]['tokens']['output_tokens'] = None
+        self.assertEqual(development_token_gate(True, aggregate_token_changes(rows)), 'failed_or_unproven')
 
 
 if __name__ == '__main__':

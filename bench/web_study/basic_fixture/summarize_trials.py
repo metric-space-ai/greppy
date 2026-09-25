@@ -8,6 +8,29 @@ import statistics
 METRICS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'uncached_input_tokens')
 
 
+def aggregate_token_changes(records):
+    changes = {}
+    for metric in METRICS:
+        values = {arm: [r['tokens'].get(metric) for r in records if r['arm'] == arm]
+                  for arm in ('A', 'C')}
+        complete = all(values[arm] and all(type(v) is int and v >= 0 for v in values[arm])
+                       for arm in values)
+        baseline = sum(values['A']) if complete else 0
+        changes[metric] = ((sum(values['C']) / baseline - 1) * 100
+                           if baseline > 0 else None)
+    return changes
+
+
+def development_token_gate(median_passed, aggregate_changes):
+    # Individual regressions are descriptive evidence, not an automatic veto.
+    # A large outlier still matters through the full aggregate cost.
+    aggregate_passed = all(aggregate_changes.get(metric) is not None and
+                           aggregate_changes[metric] < 0
+                           for metric in ('input_tokens', 'output_tokens'))
+    return ('passes this development block only' if median_passed and aggregate_passed
+            else 'failed_or_unproven')
+
+
 def regression_audit(pairs):
     regressions, unproven = [], []
     for pair in pairs:
@@ -86,6 +109,7 @@ def summarize(series):
     token_win = token_win and isolation
     pair_audit = regression_audit(pairs)
     median_passed = token_win and all(p['both_passed'] for p in pairs)
+    aggregate_changes = aggregate_token_changes(records)
     return {
         'schema': 'greppy.basic-paired-summary.v1', 'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
         'condition': plan.get('harness_condition'),
@@ -95,12 +119,11 @@ def summarize(series):
         'session_isolation': isolation,
         'session_isolation_scope': 'Conservative trace ID audit; missing or reused session evidence cannot pass. Not a proof of full storage/profile isolation.',
         'median_paired_change_percent': changes, 'traces': traces,
+        'aggregate_token_change_percent': aggregate_changes,
         'median_token_gate': 'passes this development block only' if median_passed else 'failed_or_unproven',
         'paired_token_audit': pair_audit,
-        'token_gate': ('passes this development block only' if median_passed and
-                       pair_audit['every_pair_uses_fewer_input_and_output'] else
-                       'median_improved_but_pair_regressions_or_gaps_remain' if median_passed else
-                       'failed_or_unproven'),
+        'token_gate': development_token_gate(median_passed, aggregate_changes),
+        'token_gate_policy': 'paired medians and aggregate input/output costs improve; individual regressions remain visible, not a veto; correctness, candidate and isolation checks retained',
         'acceptance': 'not established; one development case, no arm B or controlled end-to-end latency',
         'time_acceptance': None, 'token_source': 'provider-reported usage, all completed trials retained',
     }

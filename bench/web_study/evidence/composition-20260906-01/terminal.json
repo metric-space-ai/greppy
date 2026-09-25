@@ -1,0 +1,27 @@
+{
+  "schema": "greppy.web-composition-probe.v1",
+  "completed": true,
+  "agent_token_acceptance": false,
+  "provider_tokens": null,
+  "fixture_sha256": "d1c774b63daae32e6b8d497cb7f55d8fafa9dc21c4dd5f6c8246fbc6be066bbb",
+  "candidate_is_main_union": false,
+  "candidate_scope": "historically tested scope pair; composition development only",
+  "candidate_unchanged": true,
+  "http_thread_stopped": true,
+  "runtime_stop": {
+    "label": "stop-owned-runtime",
+    "argv": [
+      "/Volumes/tmp/dev-artifacts/greppy/web-composition-study/run-01/aliases/gw-compose-44fd9342ef62",
+      "web",
+      "runtime",
+      "stop",
+      "--json"
+    ],
+    "stdin": null,
+    "exit_code": 0,
+    "stdout": "{\"result\":{\"owned\":false,\"run_id\":\"study-b377aaebe877fce755ccce29dd9d27bd\",\"running\":false,\"socket\":\"/tmp/greppy-daemon-501/web-runtime-7362f0c35ea76f91871f6061aeedb0a8.sock\"},\"schema\":\"greppy.web-runtime.v1\",\"status\":\"ok\"}\n",
+    "stderr": "",
+    "stdout_bytes": 224,
+    "seconds": 0.4837001669948222
+  }
+}

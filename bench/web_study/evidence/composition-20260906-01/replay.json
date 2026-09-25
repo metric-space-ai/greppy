@@ -1,0 +1,192 @@
+{
+  "schema": "greppy.composition-replay.v1",
+  "source": "recorded real browser envelopes plus explicit offline row recovery",
+  "agent_token_acceptance": false,
+  "provider_tokens": null,
+  "producers": {
+    "observe": {
+      "path": "result.actionables",
+      "row_count": 5,
+      "fields_common_to_all_rows": [
+        "checked",
+        "disabled",
+        "expanded",
+        "href",
+        "invalid",
+        "name",
+        "name_source",
+        "name_truncated",
+        "ref",
+        "role",
+        "selected",
+        "selected_options",
+        "selected_options_truncated",
+        "tag",
+        "text",
+        "type",
+        "value",
+        "value_redacted",
+        "value_truncated"
+      ],
+      "direct_match_exit": 0,
+      "direct_match_bytes": 0,
+      "recovered_match_count": 1,
+      "fixture_economy_row": {
+        "checked": null,
+        "disabled": false,
+        "expanded": null,
+        "href": "http://127.0.0.1:60299/#economy",
+        "invalid": null,
+        "name": "Economy delivery",
+        "name_source": "contents",
+        "name_truncated": false,
+        "ref": "@1",
+        "role": "link",
+        "selected": null,
+        "selected_options": null,
+        "selected_options_truncated": false,
+        "tag": "a",
+        "text": "Economy delivery",
+        "type": null,
+        "value": null,
+        "value_redacted": false,
+        "value_truncated": false
+      },
+      "has_ref_on_every_row": true,
+      "has_visibility_on_every_row": false,
+      "has_price_on_every_row": false
+    },
+    "find": {
+      "path": "result.value.nodes",
+      "row_count": 4,
+      "fields_common_to_all_rows": [
+        "box",
+        "href",
+        "id",
+        "tag",
+        "text",
+        "visible"
+      ],
+      "direct_match_exit": 0,
+      "direct_match_bytes": 0,
+      "recovered_match_count": 1,
+      "fixture_economy_row": {
+        "box": {
+          "h": 19.0,
+          "w": 135.0,
+          "x": 8.0,
+          "y": 82.0
+        },
+        "href": "http://127.0.0.1:60299/#economy",
+        "id": null,
+        "tag": "a",
+        "text": "Economy delivery",
+        "visible": true
+      },
+      "has_ref_on_every_row": false,
+      "has_visibility_on_every_row": true,
+      "has_price_on_every_row": false
+    },
+    "extract": {
+      "path": "result.value.rows",
+      "row_count": 4,
+      "fields_common_to_all_rows": [
+        "attr:data-price",
+        "href",
+        "text"
+      ],
+      "direct_match_exit": 0,
+      "direct_match_bytes": 0,
+      "recovered_match_count": 1,
+      "fixture_economy_row": {
+        "attr:data-price": "7",
+        "href": "http://127.0.0.1:60299/#economy",
+        "text": "Economy delivery"
+      },
+      "has_ref_on_every_row": false,
+      "has_visibility_on_every_row": false,
+      "has_price_on_every_row": true
+    }
+  },
+  "controls": [
+    {
+      "label": "observe-recovered-text",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "text~/Economy/"
+      ],
+      "stdin": "{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":\"http://127.0.0.1:60299/#economy\",\"invalid\":null,\"name\":\"Economy delivery\",\"name_source\":\"contents\",\"name_truncated\":false,\"ref\":\"@1\",\"role\":\"link\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"a\",\"text\":\"Economy delivery\",\"type\":null,\"value\":null,\"value_redacted\":false,\"value_truncated\":false}\n{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":\"http://127.0.0.1:60299/#express\",\"invalid\":null,\"name\":\"Express delivery\",\"name_source\":\"contents\",\"name_truncated\":false,\"ref\":\"@2\",\"role\":\"link\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"a\",\"text\":\"Express delivery\",\"type\":null,\"value\":null,\"value_redacted\":false,\"value_truncated\":false}\n{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":\"http://127.0.0.1:60299/#premium\",\"invalid\":null,\"name\":\"Premium delivery\",\"name_source\":\"contents\",\"name_truncated\":false,\"ref\":\"@3\",\"role\":\"link\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"a\",\"text\":\"Premium delivery\",\"type\":null,\"value\":null,\"value_redacted\":false,\"value_truncated\":false}\n{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":null,\"invalid\":false,\"name\":\"Delivery note\",\"name_source\":\"label\",\"name_truncated\":false,\"ref\":\"@4\",\"role\":\"textbox\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"input\",\"text\":\"ORIGINAL\",\"type\":\"text\",\"value\":\"ORIGINAL\",\"value_redacted\":false,\"value_truncated\":false}\n{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":null,\"invalid\":false,\"name\":\"Save delivery\",\"name_source\":\"contents\",\"name_truncated\":false,\"ref\":\"@5\",\"role\":\"button\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"button\",\"text\":\"Save delivery\",\"type\":\"submit\",\"value\":null,\"value_redacted\":false,\"value_truncated\":false}\n",
+      "exit_code": 0,
+      "stdout": "{\"checked\":null,\"disabled\":false,\"expanded\":null,\"href\":\"http://127.0.0.1:60299/#economy\",\"invalid\":null,\"name\":\"Economy delivery\",\"name_source\":\"contents\",\"name_truncated\":false,\"ref\":\"@1\",\"role\":\"link\",\"selected\":null,\"selected_options\":null,\"selected_options_truncated\":false,\"tag\":\"a\",\"text\":\"Economy delivery\",\"type\":null,\"value\":null,\"value_redacted\":false,\"value_truncated\":false}\n",
+      "stderr": ""
+    },
+    {
+      "label": "find-recovered-text",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "text~/Economy/"
+      ],
+      "stdin": "{\"box\":{\"h\":19.0,\"w\":135.0,\"x\":8.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#economy\",\"id\":null,\"tag\":\"a\",\"text\":\"Economy delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":126.0,\"x\":148.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#express\",\"id\":null,\"tag\":\"a\",\"text\":\"Express delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":134.0,\"x\":279.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#premium\",\"id\":null,\"tag\":\"a\",\"text\":\"Premium delivery\",\"visible\":true}\n{\"box\":{\"h\":0.0,\"w\":0.0,\"x\":0.0,\"y\":0.0},\"href\":\"http://127.0.0.1:60299/#hidden\",\"id\":null,\"tag\":\"a\",\"text\":\"Hidden delivery\",\"visible\":false}\n",
+      "exit_code": 0,
+      "stdout": "{\"box\":{\"h\":19.0,\"w\":135.0,\"x\":8.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#economy\",\"id\":null,\"tag\":\"a\",\"text\":\"Economy delivery\",\"visible\":true}\n",
+      "stderr": ""
+    },
+    {
+      "label": "find-visible-deliveries",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "text~/delivery/ visible=true"
+      ],
+      "stdin": "{\"box\":{\"h\":19.0,\"w\":135.0,\"x\":8.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#economy\",\"id\":null,\"tag\":\"a\",\"text\":\"Economy delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":126.0,\"x\":148.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#express\",\"id\":null,\"tag\":\"a\",\"text\":\"Express delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":134.0,\"x\":279.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#premium\",\"id\":null,\"tag\":\"a\",\"text\":\"Premium delivery\",\"visible\":true}\n{\"box\":{\"h\":0.0,\"w\":0.0,\"x\":0.0,\"y\":0.0},\"href\":\"http://127.0.0.1:60299/#hidden\",\"id\":null,\"tag\":\"a\",\"text\":\"Hidden delivery\",\"visible\":false}\n",
+      "exit_code": 0,
+      "stdout": "{\"box\":{\"h\":19.0,\"w\":135.0,\"x\":8.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#economy\",\"id\":null,\"tag\":\"a\",\"text\":\"Economy delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":126.0,\"x\":148.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#express\",\"id\":null,\"tag\":\"a\",\"text\":\"Express delivery\",\"visible\":true}\n{\"box\":{\"h\":19.0,\"w\":134.0,\"x\":279.0,\"y\":82.0},\"href\":\"http://127.0.0.1:60299/#premium\",\"id\":null,\"tag\":\"a\",\"text\":\"Premium delivery\",\"visible\":true}\n",
+      "stderr": ""
+    },
+    {
+      "label": "extract-recovered-text",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "text~/Economy/"
+      ],
+      "stdin": "{\"attr:data-price\":\"7\",\"href\":\"http://127.0.0.1:60299/#economy\",\"text\":\"Economy delivery\"}\n{\"attr:data-price\":\"19\",\"href\":\"http://127.0.0.1:60299/#express\",\"text\":\"Express delivery\"}\n{\"attr:data-price\":\"29\",\"href\":\"http://127.0.0.1:60299/#premium\",\"text\":\"Premium delivery\"}\n{\"attr:data-price\":\"1\",\"href\":\"http://127.0.0.1:60299/#hidden\",\"text\":\"Hidden delivery\"}\n",
+      "exit_code": 0,
+      "stdout": "{\"attr:data-price\":\"7\",\"href\":\"http://127.0.0.1:60299/#economy\",\"text\":\"Economy delivery\"}\n",
+      "stderr": ""
+    },
+    {
+      "label": "extract-price-only",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "attr:data-price<10"
+      ],
+      "stdin": "{\"attr:data-price\":\"7\",\"href\":\"http://127.0.0.1:60299/#economy\",\"text\":\"Economy delivery\"}\n{\"attr:data-price\":\"19\",\"href\":\"http://127.0.0.1:60299/#express\",\"text\":\"Express delivery\"}\n{\"attr:data-price\":\"29\",\"href\":\"http://127.0.0.1:60299/#premium\",\"text\":\"Premium delivery\"}\n{\"attr:data-price\":\"1\",\"href\":\"http://127.0.0.1:60299/#hidden\",\"text\":\"Hidden delivery\"}\n",
+      "exit_code": 0,
+      "stdout": "{\"attr:data-price\":\"7\",\"href\":\"http://127.0.0.1:60299/#economy\",\"text\":\"Economy delivery\"}\n{\"attr:data-price\":\"1\",\"href\":\"http://127.0.0.1:60299/#hidden\",\"text\":\"Hidden delivery\"}\n",
+      "stderr": ""
+    },
+    {
+      "label": "extract-visible-price",
+      "argv": [
+        "/private/tmp/greppy-scoped-observe-tests.wGSgCs/greppy-a3d6d1f",
+        "web",
+        "match",
+        "attr:data-price<10 visible=true"
+      ],
+      "stdin": "{\"attr:data-price\":\"7\",\"href\":\"http://127.0.0.1:60299/#economy\",\"text\":\"Economy delivery\"}\n{\"attr:data-price\":\"19\",\"href\":\"http://127.0.0.1:60299/#express\",\"text\":\"Express delivery\"}\n{\"attr:data-price\":\"29\",\"href\":\"http://127.0.0.1:60299/#premium\",\"text\":\"Premium delivery\"}\n{\"attr:data-price\":\"1\",\"href\":\"http://127.0.0.1:60299/#hidden\",\"text\":\"Hidden delivery\"}\n",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "conclusion": "row recovery repairs regex composition; price/visibility/ref facts remain split"
+}

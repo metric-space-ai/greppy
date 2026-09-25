@@ -1,0 +1,171 @@
+{
+  "schema": "greppy.web.records-dispatch-audit.v1",
+  "plan_sha256": "0a905839a94a2456a1f8f2bbef1eef909a09119118bad23392e276118f0963a2",
+  "observed_dispatches": [
+    {
+      "trial": "r1-a",
+      "timestamp": "2026-09-06T16:50:42.479Z",
+      "stored_message_sha256": "08487b6ff08fd46a758bf7e7abd2881a1f8e75022417acf369361185cc235c02",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r1-c",
+      "timestamp": "2026-09-06T16:53:24.304Z",
+      "stored_message_sha256": "49c192843cac4dd2574bac67bf202ab4204ccb397851aa59fc19f32929706ac2",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r1-e",
+      "timestamp": "2026-09-06T16:56:14.854Z",
+      "stored_message_sha256": "dcb6bbd5783e6c95cfd6492528121dd2fd8b4e003725765908a13d05adf05609",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r2-c",
+      "timestamp": "2026-09-06T16:59:01.103Z",
+      "stored_message_sha256": "bfd790f1f65210ec43a051b05182609730cc8c5d57a6539b2fcfd8501fa279ed",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r2-e",
+      "timestamp": "2026-09-06T17:00:56.913Z",
+      "stored_message_sha256": "7b770506a84601e9032059051569221b1b99eb598d3141df9422c3511bc97624",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r2-a",
+      "timestamp": "2026-09-06T17:03:36.778Z",
+      "stored_message_sha256": "c2e699ebf0c1485f462aa784b4b0887116602180a63fc374e8c1e5351fa50019",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r3-e",
+      "timestamp": "2026-09-06T17:06:09.411Z",
+      "stored_message_sha256": "5582c8cad3132eb3a160a89eff67c597f1b8ec6d9cc7227979b827a558957105",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r3-a",
+      "timestamp": "2026-09-06T17:20:21.972Z",
+      "stored_message_sha256": "a790447ad823ea7faf4652a73384c5c628b104694648639c648b0b29753df33a",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r3-c",
+      "timestamp": "2026-09-06T17:22:18.824Z",
+      "stored_message_sha256": "b698f5cc8bf204069248fae3608133e9bcaf8c4771a39a309b6bb98fed2e0e7e",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r4-a",
+      "timestamp": "2026-09-06T17:24:27.380Z",
+      "stored_message_sha256": "503448387040eba8889285c923c3bfe7458425a7d17e6ab12876af7fa5ddbbc6",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r4-e",
+      "timestamp": "2026-09-06T17:28:51.092Z",
+      "stored_message_sha256": "ea4e6886bc95c1627b804d0e35d62668f3ff7a92665bf2b16752e0bf20170730",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r4-c",
+      "timestamp": "2026-09-06T17:37:41.493Z",
+      "stored_message_sha256": "68c33562fb271f5a89ffd5afba95068dfe56ab70870ed661ea0de2d656801100",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r5-c",
+      "timestamp": "2026-09-06T17:41:53.726Z",
+      "stored_message_sha256": "7b6887d28a2d17831c7d4914f4bf036278625acc4d4680c1f358434f317120de",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r5-a",
+      "timestamp": "2026-09-06T17:47:15.260Z",
+      "stored_message_sha256": "2718fe2f00818c87efad9f3de0eb8414e1c457d0f74e70d9a27d20ef0f6f513d",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    },
+    {
+      "trial": "r5-e",
+      "timestamp": "2026-09-06T17:49:41.283Z",
+      "stored_message_sha256": "9a5804a0afed76a500f4cfb91b95b907596cb497062b86a7816bc24ba32c85ab",
+      "message_matches": null,
+      "message_check": "opaque_host_value",
+      "model_matches": true,
+      "effort_matches": true,
+      "fresh_context": true
+    }
+  ],
+  "frozen_order_matches": true,
+  "message_checks_unavailable": 15,
+  "non_message_checks_ok": true,
+  "sources_unchanged": {
+    "record_tool.py": true,
+    "records_fixture.py": true,
+    "records_series.py": true
+  },
+  "binaries_unchanged": {
+    "cli": true,
+    "runtime": true
+  },
+  "all_candidates_same": true,
+  "ok": false,
+  "scope": "Public coordinator spawn requests and executable/source bytes; not dynamic libraries, platform scheduling or proof of complete browser storage isolation. Operator stop and cleanup interventions are reported separately."
+}

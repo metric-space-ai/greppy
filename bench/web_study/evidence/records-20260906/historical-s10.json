@@ -1,0 +1,103 @@
+{
+  "schema": "greppy.basic-paired-summary.v1",
+  "plan_sha256": "10fc003d5940acf5584617d0f8e0acdcbf0958a92728e4881a1983f24a26ecfb",
+  "condition": "short_alias_isolated_cwd_trial_owner_v2",
+  "onboarding_condition": "browser_plugin_workflow_v6",
+  "medians": {
+    "A": {
+      "runs": 5,
+      "passed": 5,
+      "input_tokens": 648642,
+      "output_tokens": 1409,
+      "cached_input_tokens": 620288,
+      "uncached_input_tokens": 44494,
+      "tool_calls": 12
+    },
+    "C": {
+      "runs": 5,
+      "passed": 5,
+      "input_tokens": 361225,
+      "output_tokens": 820,
+      "cached_input_tokens": 347904,
+      "uncached_input_tokens": 13321,
+      "tool_calls": 8
+    }
+  },
+  "pairs": [
+    {
+      "case": "table",
+      "repeat": 1,
+      "both_passed": true,
+      "input_tokens_change_percent": 9.739990694939848,
+      "output_tokens_change_percent": -12.240515390121686,
+      "cached_input_tokens_change_percent": 26.925795053003544,
+      "uncached_input_tokens_change_percent": -79.47064471289569
+    },
+    {
+      "case": "table",
+      "repeat": 2,
+      "both_passed": true,
+      "input_tokens_change_percent": -73.79024260318144,
+      "output_tokens_change_percent": -75.97510373443983,
+      "cached_input_tokens_change_percent": -73.8263503281171,
+      "uncached_input_tokens_change_percent": -72.96714163707466
+    },
+    {
+      "case": "table",
+      "repeat": 3,
+      "both_passed": true,
+      "input_tokens_change_percent": -51.52164059681612,
+      "output_tokens_change_percent": -46.983676366217175,
+      "cached_input_tokens_change_percent": -50.969872059430465,
+      "uncached_input_tokens_change_percent": -63.592438456655145
+    },
+    {
+      "case": "table",
+      "repeat": 4,
+      "both_passed": true,
+      "input_tokens_change_percent": -32.862673523666494,
+      "output_tokens_change_percent": -31.034482758620683,
+      "cached_input_tokens_change_percent": -31.81133968891119,
+      "uncached_input_tokens_change_percent": -52.13610721856923
+    },
+    {
+      "case": "table",
+      "repeat": 5,
+      "both_passed": true,
+      "input_tokens_change_percent": -47.370992024756575,
+      "output_tokens_change_percent": -39.02205177372963,
+      "cached_input_tokens_change_percent": -47.65294771968854,
+      "uncached_input_tokens_change_percent": -40.4472802543693
+    }
+  ],
+  "aggregate_token_change_percent": {
+    "input_tokens": -46.90255689538022,
+    "output_tokens": -44.619257394587784,
+    "cached_input_tokens": -45.87765957446809,
+    "uncached_input_tokens": -64.15243669560977
+  },
+  "median_paired_change_percent": {
+    "input_tokens": -47.370992024756575,
+    "output_tokens": -39.02205177372963,
+    "cached_input_tokens": -47.65294771968854,
+    "uncached_input_tokens": -63.592438456655145
+  },
+  "candidate_integrity": true,
+  "session_isolation": true,
+  "paired_token_audit": {
+    "regressions": [
+      {
+        "case": "table",
+        "repeat": 1,
+        "metric": "input_tokens",
+        "change_percent": 9.739990694939848
+      }
+    ],
+    "not_strictly_improved": [],
+    "every_pair_uses_fewer_input_and_output": false
+  },
+  "token_gate": "passes this development block only",
+  "token_gate_policy": "paired medians and aggregate input/output costs improve; individual regressions remain visible, not a veto; correctness, candidate and isolation checks retained",
+  "acceptance": "not established; one development case, no arm B or controlled end-to-end latency",
+  "scope": "Re-evaluation of recorded historical S10 trials under clarified aggregate criterion; no new browser runs"
+}
