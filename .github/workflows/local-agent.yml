@@ -1,0 +1,41 @@
+name: Optional local agent provisioning
+
+on:
+  push:
+    paths: ['crates/agent/**', 'Cargo.lock', '.github/workflows/local-agent.yml']
+  pull_request:
+    paths: ['crates/agent/**', 'Cargo.lock', '.github/workflows/local-agent.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provisioning:
+    name: Local agent provisioning (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-2022]
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
+          components: clippy, rustfmt
+      - name: First-use cache and cancellation contracts
+        run: cargo test -p greppy-agent --test local_model --locked
+      - name: HTTPS fixture contracts (no model weights)
+        run: cargo test -p greppy-agent --features local-model-download --lib model_download::tests --locked
+      - name: Lint local provisioning (including TLS)
+        run: cargo clippy -p greppy-agent --all-targets --features local-model-download --locked -- -D warnings
+      - name: Formatting
+        run: cargo fmt --all --check

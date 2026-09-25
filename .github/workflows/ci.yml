@@ -215,7 +215,8 @@ jobs:
   # never use sentinels, and a real link catches missing LFS assets plus
   # PE/COFF, Mach-O, or ELF size/link regressions.
   real-assets-link:
-    name: real embedded assets (${{ matrix.os }})
+    # Keep the required-check name stable while pinning the Windows runner.
+    name: real embedded assets (${{ matrix.os == 'windows-2022' && 'windows-latest' || matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
       EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf

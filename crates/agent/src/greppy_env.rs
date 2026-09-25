@@ -325,7 +325,7 @@ struct Captured {
 /// On Unix the child is placed in its own process group so a timeout kill
 /// reaps grandchildren too (e.g. `sh` + `sleep`); otherwise grandchildren keep
 /// the pipes open and the drain threads block until they exit naturally.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_capture(cmd: &mut Command, timeout: Option<Duration>) -> Result<Captured, String> {
     run_capture_held(cmd, timeout, None)
 }

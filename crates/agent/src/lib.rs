@@ -28,7 +28,10 @@ pub mod agent_loop;
 pub mod client;
 pub mod env;
 pub mod greppy_env;
+pub mod local_model;
 pub mod model;
+#[cfg(feature = "local-model-download")]
+pub mod model_download;
 pub mod prompt;
 pub mod protocol;
 pub mod sandbox;
