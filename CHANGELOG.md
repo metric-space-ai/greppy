@@ -4,7 +4,66 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
-Nothing yet.
+### CLI
+
+- Builds with a CUDA backend now default to `--device cuda` instead of
+  `auto`, for every command, so a CUDA load failure is reported rather than
+  silently falling back to CPU. `--device`, `--no-gpu`, `GREPPY_DEVICE` and
+  `GREPPY_NO_GPU` still choose otherwise. The default is exported to child
+  processes, so background index jobs and queries share one daemon.
+- `greppy index rebuild [PATH]` removes the workspace's index and builds it
+  from scratch. A plain `greppy index` only re-extracts changed files, so
+  extractor fixes never reached unchanged ones. The command refuses, with
+  exit 75, while another greppy process holds the index.
+
+### Kotlin call graph
+
+- Member calls (`gate.awaitReady()`, `this.gate.x()`, `Registry.lookup()`,
+  `Maker().make()`) now produce CALLS edges. The CALLS query only matched bare
+  calls, so `who-calls`, `impact`, `path` and `callees` missed every dotted
+  call. An edge resolves only when the syntax states the receiver's type (a
+  typed parameter, `catch` or loop variable, constructor property, class or
+  file property, a typed or constructor-initialised local, `this`, a
+  capitalised object name, or `getInstance(Foo::class.java)`). When the type
+  has no such member, a unique top-level extension `fun Foo.name()` is the
+  target. Other call results, inferred locals and lambda `it` stay unresolved.
+- Overloads with the same owner no longer collapse into one node. Later
+  declarations get `…::f#2`, `…::f#3`, and each keeps its own edges and line
+  span. Name resolution still treats an overload set as one symbol, except
+  that a call in the same file goes to the one overload whose parameter
+  range fits its argument count.
+- Classes whose primary constructor has an annotation on its own line
+  followed by a visibility modifier (`@Inject` then `private constructor(`)
+  are extracted. tree-sitter-kotlin-ng 1.1.0 cannot parse that header, and
+  its error recovery dropped every member of the class. The modifier keyword
+  is blanked before parsing, so offsets and line numbers are unchanged.
+- An explicit import from another package (`import kotlinx.coroutines.delay`)
+  stops a bare call from resolving to a same-named project function in a
+  different package. Top-level Kotlin definitions record their `package`.
+- Receiver-method resolution looks up the method by name instead of scanning
+  every node for each call.
+
+### Windows source builds
+
+- Background index jobs, the inference daemon and the WinFsp provider no
+  longer flash console windows. They were started with `DETACHED_PROCESS`,
+  which makes Windows ignore `CREATE_NO_WINDOW`, so each `git` or other
+  console child they ran opened a visible window. They now start with
+  `CREATE_NO_WINDOW` alone: a hidden console their children share.
+- Freshness no longer re-hashes every indexed file on each query on Windows.
+  The stat tier requires `ctime`/file-identity, which were `None` off unix, so
+  every navigation command read the whole repository and large trees failed
+  closed with `graph freshness is unknown: budget exceeded`. Discovery now
+  records the NTFS ChangeTime and file index through an attribute-only handle;
+  `greppy_discover::stable_metadata` takes the file path.
+- A git submodule checkout (whose `.git` is a file) is no longer mistaken for a
+  linked worktree; `greppy index` there failed with "has no available primary
+  checkout".
+- The CUDA build finds `nvcc.exe` on `PATH` and passes it a plain drive-letter
+  path; previously every Windows build silently lost its GPU backend, or nvcc
+  failed to open `crt\link.stub` through a `\\?\` path.
+- `tools/fetch_model_assets.ps1` (no `jq`/`bash`) and `tools/build_windows.ps1`
+  (MSVC environment, CUDA toolkit, local GPU arch, release build).
 
 ## [0.4.0] — 2026-09-22
 

@@ -378,6 +378,12 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
                 RequestOutcome::Response(response) => response,
                 outcome => return Err(self.daemon_error(outcome)),
             };
+            if let Some(reason) = response
+                .get("gpu_fallback")
+                .and_then(serde_json::Value::as_str)
+            {
+                warn_gpu_fallback_once(reason);
+            }
             let vectors = response
                 .get("vectors_bits")
                 .and_then(serde_json::Value::as_array)
@@ -427,6 +433,13 @@ impl greppy_indexer::CodeEmbeddingProvider for DaemonCodeEmbeddingProvider<'_> {
             misses: self.content_cache_misses,
         }
     }
+}
+
+/// A daemon that could not load its GPU backend embeds on CPU, many times
+/// slower; say why once per process instead of hiding it in the daemon.
+fn warn_gpu_fallback_once(reason: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| eprintln!("greppy: embedding daemon is running on CPU: {reason}"));
 }
 
 fn spawn_daemon(
@@ -494,11 +507,43 @@ pub(super) fn daemon_main(socket: String, cfg: super::EmbeddingModelConfig, prew
         &socket,
         policy,
         prewarm,
-        || super::load_embedding_model(&cfg, None).map_err(|error| error.to_string()),
+        || load_daemon_model(&cfg),
         |raw| validate(raw, &model_key),
         |raw, model| respond(raw, &model_key, model),
         "embed-daemon",
     )
+}
+
+/// First GPU inference failure seen by this daemon. A failed request drops
+/// the model; reloading the same GPU backend would hit the same fault on the
+/// next request (on Windows, each one can reset the display driver).
+static GPU_FAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn load_daemon_model(
+    cfg: &super::EmbeddingModelConfig,
+) -> Result<super::LoadedEmbeddingModel, String> {
+    let Some(fault) = GPU_FAULT.get() else {
+        return super::load_embedding_model(cfg, None).map_err(|error| error.to_string());
+    };
+    if cfg.device != greppy_embed_native::DevicePreference::Auto {
+        return Err(format!(
+            "{} backend faulted earlier in this daemon ({fault}); not reloading it",
+            cfg.device.as_str()
+        ));
+    }
+    let cpu = super::EmbeddingModelConfig {
+        device: greppy_embed_native::DevicePreference::Cpu,
+        ..cfg.clone()
+    };
+    super::load_embedding_model(&cpu, None).map_err(|error| error.to_string())
+}
+
+fn gpu_fallback(loaded: &super::LoadedEmbeddingModel) -> Option<String> {
+    loaded.gpu_fallback().map(ToOwned::to_owned).or_else(|| {
+        GPU_FAULT
+            .get()
+            .map(|fault| format!("GPU inference faulted: {fault}"))
+    })
 }
 
 fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
@@ -618,6 +663,7 @@ fn respond(
                         vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
                     }).collect::<Vec<_>>(),
                     "token_lens": token_lens,
+                    "gpu_fallback": gpu_fallback(loaded),
                 }))
             })
         }
@@ -626,6 +672,9 @@ fn respond(
     match result {
         Ok(response) => response,
         Err(error) => {
+            if loaded.backend_name() != "cpu" {
+                let _ = GPU_FAULT.set(error.clone());
+            }
             *model = None;
             serde_json::json!({"error": format!("embed: {error}")})
         }

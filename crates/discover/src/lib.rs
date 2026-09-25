@@ -169,16 +169,22 @@ pub struct StableFileMetadata {
     pub file_id: Option<u64>,
 }
 
-/// Read `(size, mtime_ns, ctime_ns, file_id)` for a file.
-/// error. `mtime_ns` is nanoseconds since the Unix epoch; times before
-/// the epoch are encoded as negative values. This is the single place
-/// the walker turns a `std::fs::Metadata` into the additive
-/// `InventoryEntry` fields, so the conversion (and its saturation
+/// Read `(size, mtime_ns, ctime_ns, file_id)` for the file at `path`, whose
+/// non-following `meta` the caller already holds. `mtime_ns` is nanoseconds
+/// since the Unix epoch; times before the epoch are encoded as negative values.
+/// This is the single place the walker turns a `std::fs::Metadata` into the
+/// additive `InventoryEntry` fields, so the conversion (and its saturation
 /// behaviour for out-of-range durations) lives in one tested spot.
 fn metadata_fields(
+    path: &Path,
     meta: &std::fs::Metadata,
 ) -> (Option<u64>, Option<i64>, Option<i64>, Option<u64>) {
-    let size = Some(meta.len());
+    let (size, mtime_ns) = size_and_mtime(meta);
+    let (ctime_ns, file_id) = path_identity_fields(path, meta);
+    (size, mtime_ns, ctime_ns, file_id)
+}
+
+fn size_and_mtime(meta: &std::fs::Metadata) -> (Option<u64>, Option<i64>) {
     let mtime_ns = meta.modified().ok().map(|mt| {
         match mt.duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
@@ -189,8 +195,7 @@ fn metadata_fields(
             }
         }
     });
-    let (ctime_ns, file_id) = unix_identity_fields(meta);
-    (size, mtime_ns, ctime_ns, file_id)
+    (Some(meta.len()), mtime_ns)
 }
 
 #[cfg(unix)]
@@ -205,21 +210,127 @@ fn unix_identity_fields(meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) 
     (ctime_ns, Some(meta.ino()))
 }
 
-#[cfg(not(unix))]
-fn unix_identity_fields(_meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
+#[cfg(unix)]
+fn path_identity_fields(_path: &Path, meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
+    unix_identity_fields(meta)
+}
+
+#[cfg(unix)]
+fn handle_identity_fields(
+    _file: &std::fs::File,
+    meta: &std::fs::Metadata,
+) -> (Option<i64>, Option<u64>) {
+    unix_identity_fields(meta)
+}
+
+/// Windows keeps the unix `ctime`/inode pair as the NTFS ChangeTime (bumped by
+/// every content or metadata write and not settable through `SetFileTime`) and
+/// the per-volume file index. Stable `std` exposes neither from `Metadata`, so
+/// read them through an attribute-only handle that never follows a reparse
+/// point and shares every access mode, leaving editors undisturbed.
+#[cfg(windows)]
+fn path_identity_fields(path: &Path, _meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    match std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => windows_handle_identity(&file),
+        Err(_) => (None, None),
+    }
+}
+
+#[cfg(windows)]
+fn handle_identity_fields(
+    file: &std::fs::File,
+    _meta: &std::fs::Metadata,
+) -> (Option<i64>, Option<u64>) {
+    windows_handle_identity(file)
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &std::fs::File) -> (Option<i64>, Option<u64>) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
+    };
+    // FILETIME ticks (100 ns) between 1601-01-01 and the Unix epoch.
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+    let handle = file.as_raw_handle();
+    // SAFETY: `handle` is a live handle owned by `file`; both out-parameters
+    // are plain-old-data structs sized exactly as passed.
+    let (basic_ok, basic, info_ok, info) = unsafe {
+        let mut basic: FILE_BASIC_INFO = std::mem::zeroed();
+        let basic_ok = GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        );
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let info_ok = GetFileInformationByHandle(handle, &mut info);
+        (basic_ok, basic, info_ok, info)
+    };
+    // File systems without a change time (FAT) report 0; leave it unknown so
+    // the freshness check falls back to hashing instead of trusting it.
+    let ctime_ns = (basic_ok != 0 && basic.ChangeTime != 0)
+        .then(|| {
+            basic
+                .ChangeTime
+                .checked_sub(UNIX_EPOCH_TICKS)?
+                .checked_mul(100)
+        })
+        .flatten();
+    let file_id = (info_ok != 0)
+        .then(|| (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow));
+    (ctime_ns, file_id)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_identity_fields(_path: &Path, _meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
     (None, None)
 }
 
-/// Convert metadata obtained through an open handle into a comparable
-/// snapshot signature.
-pub fn stable_metadata(meta: &std::fs::Metadata) -> StableFileMetadata {
-    let (_, mtime_ns, ctime_ns, file_id) = metadata_fields(meta);
+#[cfg(not(any(unix, windows)))]
+fn handle_identity_fields(
+    _file: &std::fs::File,
+    _meta: &std::fs::Metadata,
+) -> (Option<i64>, Option<u64>) {
+    (None, None)
+}
+
+/// Comparable snapshot signature for the file at `path`, whose metadata the
+/// caller already read.
+pub fn stable_metadata(path: &Path, meta: &std::fs::Metadata) -> StableFileMetadata {
+    let (_, mtime_ns, ctime_ns, file_id) = metadata_fields(path, meta);
     StableFileMetadata {
         size: meta.len(),
         mtime_ns,
         ctime_ns,
         file_id,
     }
+}
+
+/// Snapshot signature read through an already open handle.
+fn stable_metadata_of_open(file: &std::fs::File) -> io::Result<StableFileMetadata> {
+    let meta = file.metadata()?;
+    let (_, mtime_ns) = size_and_mtime(&meta);
+    let (ctime_ns, file_id) = handle_identity_fields(file, &meta);
+    Ok(StableFileMetadata {
+        size: meta.len(),
+        mtime_ns,
+        ctime_ns,
+        file_id,
+    })
 }
 
 /// Read a regular file through one handle and verify with `fstat` before and
@@ -243,7 +354,7 @@ pub fn read_stable_file(path: &Path) -> io::Result<(Vec<u8>, StableFileMetadata)
             options.custom_flags(O_NOFOLLOW);
         }
         let mut file = options.open(path)?;
-        let before = stable_metadata(&file.metadata()?);
+        let before = stable_metadata_of_open(&file)?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -252,7 +363,7 @@ pub fn read_stable_file(path: &Path) -> io::Result<(Vec<u8>, StableFileMetadata)
         }
         let mut bytes = Vec::with_capacity(before.size.min(16 * 1024 * 1024) as usize);
         file.read_to_end(&mut bytes)?;
-        let after = stable_metadata(&file.metadata()?);
+        let after = stable_metadata_of_open(&file)?;
         if before == after && after.size == bytes.len() as u64 {
             return Ok((bytes, after));
         }
@@ -431,7 +542,7 @@ pub fn walk_with_policy_and_overrides(
                 if meta.file_type().is_symlink() {
                     continue;
                 }
-                metadata_fields(&meta)
+                metadata_fields(&abs, &meta)
             }
             // Could not stat: keep the entry (it was a regular file at
             // walk time) but with unknown metadata, mirroring the
@@ -1186,13 +1297,44 @@ mod tests {
         let p = dir.join("f.txt");
         fs::write(&p, "abcdef").unwrap();
         let meta = fs::metadata(&p).unwrap();
-        let (size, mtime, ctime, file_id) = metadata_fields(&meta);
+        let (size, mtime, ctime, file_id) = metadata_fields(&p, &meta);
         assert_eq!(size, Some(6));
         assert!(mtime.is_some());
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             assert!(ctime.is_some());
             assert!(file_id.is_some());
         }
+    }
+
+    /// The freshness stat tier trusts `(size, mtime, ctime, file_id)`: the
+    /// walker's path-based identity must equal the one a handle read records,
+    /// and a same-size rewrite with a restored mtime must still differ.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn identity_is_consistent_across_capture_paths_and_sees_restored_mtime() {
+        let dir = tests_support::unique_tmp();
+        let p = dir.join("f.txt");
+        fs::write(&p, "abcdef").unwrap();
+        let walked = stable_metadata(&p, &fs::symlink_metadata(&p).unwrap());
+        let (_, read) = read_stable_file(&p).unwrap();
+        assert_eq!(walked, read);
+        assert_eq!(walked, stable_metadata(&p, &fs::metadata(&p).unwrap()));
+
+        let original_mtime = fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&p, "ghijkl").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let rewritten = stable_metadata(&p, &fs::metadata(&p).unwrap());
+        assert_eq!(
+            (rewritten.size, rewritten.mtime_ns),
+            (walked.size, walked.mtime_ns)
+        );
+        assert_ne!(rewritten.ctime_ns, walked.ctime_ns);
     }
 }

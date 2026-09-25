@@ -132,7 +132,7 @@ pub fn compute_file_diff(
             },
             _ => match std::fs::metadata(&entry.abs_path) {
                 Ok(md) => {
-                    let metadata = stable_metadata(&md);
+                    let metadata = stable_metadata(&entry.abs_path, &md);
                     CurrentStat {
                         size: metadata.size,
                         mtime_ns: metadata.mtime_ns,
@@ -579,7 +579,8 @@ mod tests {
         let gone = make_entry(&dir, "src/gone.ts", "gone invalid syntax");
 
         for entry in [&keep, &changed, &gone] {
-            let metadata = stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+            let metadata =
+                stable_metadata(&entry.abs_path, &fs::metadata(&entry.abs_path).unwrap());
             store
                 .upsert_index_skip(&IndexSkip {
                     project: "p".into(),
@@ -632,7 +633,7 @@ mod tests {
         let entry = make_entry(&dir, "src/swap.ts", "old-body");
         let original = fs::metadata(&entry.abs_path).unwrap();
         let original_modified = original.modified().unwrap();
-        let identity = stable_metadata(&original);
+        let identity = stable_metadata(&entry.abs_path, &original);
         store
             .upsert_index_skip(&IndexSkip {
                 project: "p".into(),
@@ -736,7 +737,7 @@ mod tests {
             .unwrap();
         let dir = tempdir_via_env();
         let entry = make_entry(&dir, "src/keep.rs", "pub fn keep() {}\n");
-        let metadata = stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+        let metadata = stable_metadata(&entry.abs_path, &fs::metadata(&entry.abs_path).unwrap());
         store
             .upsert_file_state(&FileState {
                 project: "p".into(),
@@ -870,7 +871,10 @@ mod tests {
             })
             .unwrap();
 
-        let metadata = greppy_discover::stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+        let metadata = greppy_discover::stable_metadata(
+            &entry.abs_path,
+            &fs::metadata(&entry.abs_path).unwrap(),
+        );
         store
             .upsert_file_identity(
                 "p",
@@ -1043,7 +1047,7 @@ mod tests {
             })
             .unwrap();
 
-        let metadata = greppy_discover::stable_metadata(&md);
+        let metadata = greppy_discover::stable_metadata(&entry.abs_path, &md);
         store
             .upsert_file_identity(
                 "p",
@@ -1078,7 +1082,7 @@ mod tests {
         let entry = make_entry(&dir, "src/swap.rs", "old-body");
         let original = fs::metadata(&entry.abs_path).unwrap();
         let original_modified = original.modified().unwrap();
-        let original_identity = greppy_discover::stable_metadata(&original);
+        let original_identity = greppy_discover::stable_metadata(&entry.abs_path, &original);
         store
             .upsert_file_state(&FileState {
                 project: "p".into(),

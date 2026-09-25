@@ -153,6 +153,19 @@ Add `--features metal`
 CPU inference always works, and the device is selected automatically (override
 with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`).
 
+*Windows x64* has no `jq`/`bash` dependency: `tools\fetch_model_assets.ps1`
+fetches and verifies the same assets, and `tools\build_windows.ps1` imports
+the MSVC (`vcvars64`) environment, puts the CUDA Toolkit's `nvcc` on `PATH`,
+targets the local GPU's compute capability (override with `CUDA_ARCH_LIST`),
+and runs the release build. It needs Visual Studio 2022 Build Tools with the
+C++ workload and the CUDA Toolkit (12.8+ for RTX 50-series); `-CpuOnly`
+builds without a GPU backend.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1
+copy target\release\greppy.exe $HOME\.local\bin\greppy.exe   # any dir on PATH
+```
+
 The binary embeds EmbeddingGemma (300M) and an in-house Qwen3.5 (0.8B)
 fine-tune that writes the navigation hints. The weights live on Hugging Face
 ([EmbeddingGemma](https://huggingface.co/metricspace/embeddinggemma-300m-q4k),

@@ -6523,7 +6523,60 @@ fn is_lua_usage_keyword(name: &str) -> bool {
     is_ruby_usage_keyword(name)
 }
 
+/// tree-sitter-kotlin-ng 1.1.0 cannot parse a primary constructor whose
+/// annotation sits on its own line before a visibility modifier:
+///
+/// ```text
+/// class Handler
+/// @Inject
+/// private constructor(...)
+/// ```
+///
+/// Error recovery then discards the whole class, so none of its members or
+/// calls reach the graph. The same header without the modifier parses, so the
+/// modifier keyword is overwritten with spaces. Byte offsets and line numbers
+/// are unchanged, and no pass reads constructor visibility.
+fn kotlin_parseable_source(source: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const MODIFIERS: [&[u8]; 4] = [b"private", b"internal", b"protected", b"public"];
+    let mut patched: Option<Vec<u8>> = None;
+    let mut previous_is_annotation = false;
+    let mut start = 0;
+    while start < source.len() {
+        let end = source[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(source.len(), |i| start + i);
+        let line = &source[start..end];
+        let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let trimmed = &line[indent..];
+        if previous_is_annotation {
+            for modifier in MODIFIERS {
+                let Some(rest) = trimmed.strip_prefix(modifier) else {
+                    continue;
+                };
+                let gap = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+                if gap > 0 && rest[gap..].starts_with(b"constructor") {
+                    let at = start + indent;
+                    let buf = patched.get_or_insert_with(|| source.to_vec());
+                    buf[at..at + modifier.len()].fill(b' ');
+                }
+                break;
+            }
+        }
+        if !trimmed.is_empty() {
+            previous_is_annotation = trimmed.first() == Some(&b'@');
+        }
+        start = end + 1;
+    }
+    match patched {
+        Some(buf) => std::borrow::Cow::Owned(buf),
+        None => std::borrow::Cow::Borrowed(source),
+    }
+}
+
 fn extract_kotlin(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
+    let parseable = kotlin_parseable_source(source);
+    let source: &[u8] = &parseable;
     let queries = crate::query::cached_query_set(&Language::Kotlin)
         .map_err(|e| greppy_core::Error::Parse(format!("compile kotlin queries: {e}")))?;
     // Base pass (definitions for `class_declaration` / `object_declaration` +
@@ -6566,9 +6619,15 @@ fn extract_kotlin(source: &[u8], file_path: &str) -> greppy_core::Result<Extract
     let root = tree.root_node();
 
     kotlin_defs_pass(source, root, file_path, &mut result);
+    kotlin_member_calls(source, root, file_path, &mut result);
+    kotlin_tag_package(source, root, &mut result);
+    kotlin_tag_extension_receivers(source, root, &mut result);
 
     let file_module_qname = format!("{file_path}::__file__");
     kotlin_emit_usages(source, root, file_path, &file_module_qname, &mut result);
+
+    // Last: every pass above names callables by their shared overload qname.
+    kotlin_disambiguate_overloads(source, root, &mut result);
 
     Ok(result)
 }
@@ -6867,6 +6926,622 @@ fn kotlin_func_owner_name<'a>(source: &'a [u8], func: Node<'_>) -> Option<&'a st
         p = cur.parent();
     }
     None
+}
+
+/// CALLS for Kotlin member calls (`receiver.method()`, `a?.b()`,
+/// `obj.run { }`). The spec CALLS query captures only bare callees, so without
+/// this pass every dotted call was absent from the graph. The usage walk
+/// already treats the member name as a call endpoint
+/// (`kotlin_is_usage_reference`), so the two passes never both claim it.
+/// Edges are `callee_form = receiver`: the resolver links them only through
+/// a `receiver_owner` the syntax states, never by bare name.
+fn kotlin_member_calls(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+        if node.kind() != "call_expression" {
+            continue;
+        }
+        let Some(nav) = node
+            .named_child(0)
+            .filter(|callee| callee.kind() == "navigation_expression")
+        else {
+            continue;
+        };
+        let count = nav.named_child_count();
+        let Some(member) = count
+            .checked_sub(1)
+            .filter(|last| *last > 0)
+            .and_then(|last| nav.named_child(last))
+            .filter(|member| member.kind() == "identifier")
+        else {
+            continue;
+        };
+        let name = node_text(source, member);
+        if name.is_empty() {
+            continue;
+        }
+        let Some(caller) = kotlin_enclosing_qname(source, node, file_path) else {
+            continue;
+        };
+        let owner = kotlin_receiver_owner(source, nav);
+        let mut properties = serde_json::json!({
+            "callee_text": name,
+            "callee_name": name,
+            "callee_form": "receiver",
+        });
+        if let (Some(owner), Some(object)) = (owner, properties.as_object_mut()) {
+            object.insert(
+                "receiver_owner".into(),
+                serde_json::Value::String(owner.to_string()),
+            );
+        }
+        result.edges.push(ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: caller,
+            target_qualified_name: match owner {
+                Some(owner) => format!("{file_path}::{owner}::{name}"),
+                None => format!("{file_path}::Function::{name}"),
+            },
+            file_path: file_path.to_string(),
+            line: member.start_position().row as u32 + 1,
+            properties,
+        });
+    }
+}
+
+/// The receiver's type when the syntax states it: `this`, `this.field`, a
+/// constructor call `Foo()`, a capitalised object/class name, or a name bound
+/// with an explicit type (or a constructor initialiser) as a local, parameter,
+/// constructor property, class property or file property. Lambda parameters,
+/// call results and inferred locals return `None`: naming a type there would
+/// need inference, and a wrong owner is worse than an unresolved edge.
+fn kotlin_receiver_owner<'a>(source: &'a [u8], nav: Node<'_>) -> Option<&'a str> {
+    let mut receiver = nav.named_child(0)?;
+    // kotlin-ng parses `!gate.isReady()` as `(!gate).isReady()`, and `a!!.b()`
+    // wraps the receiver in the same node; the operand is the receiver.
+    while receiver.kind() == "unary_expression" {
+        receiver = receiver.child_by_field_name("argument")?;
+    }
+    match receiver.kind() {
+        "this_expression" => kotlin_type_name(source, kotlin_enclosing_type(nav)?),
+        "identifier" => kotlin_name_owner(source, nav, node_text(source, receiver)),
+        "navigation_expression" => {
+            let this = receiver.named_child(0)?;
+            if this.kind() != "this_expression" || receiver.named_child_count() != 2 {
+                return None;
+            }
+            let field = node_text(source, receiver.named_child(1)?);
+            kotlin_class_binding(source, kotlin_enclosing_type(nav)?, field)?
+        }
+        "call_expression" => kotlin_constructor_type(source, receiver)
+            .or_else(|| kotlin_class_literal_lookup_type(source, receiver)),
+        _ => None,
+    }
+}
+
+/// `injector.getInstance(Foo::class.java)` returns a `Foo`: Guice's typed
+/// lookup names its result type in the class literal it receives.
+fn kotlin_class_literal_lookup_type<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> {
+    let callee = call.named_child(0)?;
+    let method = match callee.kind() {
+        "navigation_expression" => {
+            callee.named_child(callee.named_child_count().checked_sub(1)?)?
+        }
+        _ => callee,
+    };
+    if node_text(source, method) != "getInstance" {
+        return None;
+    }
+    let mut cursor = call.walk();
+    let args = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "value_arguments")?;
+    if args.named_child_count() != 1 {
+        return None;
+    }
+    let literal = node_text(source, args.named_child(0)?).trim();
+    let class = literal
+        .strip_suffix("::class.java")
+        .or_else(|| literal.strip_suffix("::class"))?;
+    let name = class.rsplit('.').next()?.trim();
+    kotlin_is_type_like(name).then_some(name)
+}
+
+/// The nearest named class/object around `node`. A companion object stops the
+/// walk: `this` there is the companion, whose members are not graph nodes.
+fn kotlin_enclosing_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut p = node.parent();
+    while let Some(cur) = p {
+        match cur.kind() {
+            "class_declaration" | "object_declaration" => return Some(cur),
+            "companion_object" => return None,
+            _ => p = cur.parent(),
+        }
+    }
+    None
+}
+
+fn kotlin_is_type_like(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// `Foo(...)` names the type it constructs; any other call's type is unknown.
+fn kotlin_constructor_type<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> {
+    let callee = call.named_child(0)?;
+    let name = node_text(source, callee);
+    (callee.kind() == "identifier" && kotlin_is_type_like(name)).then_some(name)
+}
+
+/// Simple name of a declared type: `a.b.Foo<T>?` → `Foo`. Function and other
+/// structural types have no owner.
+fn kotlin_type_simple_name<'a>(source: &'a [u8], ty: Node<'_>) -> Option<&'a str> {
+    match ty.kind() {
+        "user_type" => {
+            let mut cursor = ty.walk();
+            let last = ty
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "identifier")
+                .last()?;
+            Some(node_text(source, last))
+        }
+        "nullable_type" => kotlin_type_simple_name(source, ty.named_child(0)?),
+        _ => None,
+    }
+}
+
+/// The type child of a declaration node (`variable_declaration`, `parameter`,
+/// `class_parameter`), if one is written.
+fn kotlin_declared_type<'a>(source: &'a [u8], decl: Node<'_>) -> Option<&'a str> {
+    let mut cursor = decl.walk();
+    let ty = decl
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "user_type" | "nullable_type"))?;
+    kotlin_type_simple_name(source, ty)
+}
+
+/// The identifier a declaration binds (its first `identifier` child).
+fn kotlin_binds(source: &[u8], decl: Node<'_>, name: &str) -> bool {
+    let mut cursor = decl.walk();
+    let bound = decl
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "identifier");
+    bound.is_some_and(|id| node_text(source, id) == name)
+}
+
+/// `Some(owner)` when `prop` is a `property_declaration` binding `name`: the
+/// declared type, else a constructor initialiser, else `None` (bound but
+/// untyped). `None` from the outer option means `prop` does not bind `name`.
+fn kotlin_property_binding<'a>(
+    source: &'a [u8],
+    prop: Node<'_>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    if prop.kind() != "property_declaration" {
+        return None;
+    }
+    let mut cursor = prop.walk();
+    let decl = prop
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "variable_declaration")?;
+    if !kotlin_binds(source, decl, name) {
+        return None;
+    }
+    if let Some(owner) = kotlin_declared_type(source, decl) {
+        return Some(Some(owner));
+    }
+    let mut cursor = prop.walk();
+    let init = prop
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "call_expression");
+    Some(init.and_then(|call| kotlin_constructor_type(source, call)))
+}
+
+/// Look `name` up among a class's constructor parameters and body
+/// properties. The outer option is "bound here"; the inner is its owner.
+fn kotlin_class_binding<'a>(
+    source: &'a [u8],
+    class: Node<'_>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        match child.kind() {
+            "primary_constructor" => {
+                let mut pc = child.walk();
+                let params = child
+                    .named_children(&mut pc)
+                    .find(|c| c.kind() == "class_parameters");
+                if let Some(params) = params {
+                    let mut ppc = params.walk();
+                    for param in params.named_children(&mut ppc) {
+                        if param.kind() == "class_parameter" && kotlin_binds(source, param, name) {
+                            return Some(kotlin_declared_type(source, param));
+                        }
+                    }
+                }
+            }
+            "class_body" => {
+                let mut bc = child.walk();
+                for member in child.named_children(&mut bc) {
+                    if let Some(binding) = kotlin_property_binding(source, member, name) {
+                        return Some(binding);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve a receiver name through the lexical scopes around `from`: earlier
+/// locals of each enclosing block, lambda parameters, function parameters,
+/// the enclosing classes, then file properties. The innermost binding wins
+/// even when it carries no type. An unbound capitalised name is an object or
+/// class reference.
+fn kotlin_name_owner<'a>(source: &'a [u8], from: Node<'_>, name: &'a str) -> Option<&'a str> {
+    let mut ancestor = from.parent();
+    while let Some(scope) = ancestor {
+        match scope.kind() {
+            "block" | "lambda_literal" | "source_file" => {
+                if scope.kind() == "lambda_literal" && name == "it" {
+                    return None;
+                }
+                for index in (0..scope.named_child_count()).rev() {
+                    let Some(child) = scope.named_child(index) else {
+                        continue;
+                    };
+                    if child.kind() == "lambda_parameters" {
+                        let mut lc = child.walk();
+                        let bound = child.named_children(&mut lc).any(|param| {
+                            param.kind() == "variable_declaration"
+                                && kotlin_binds(source, param, name)
+                        });
+                        if bound {
+                            return None;
+                        }
+                        continue;
+                    }
+                    // File properties are visible everywhere; block locals only
+                    // after their declaration.
+                    if scope.kind() != "source_file" && child.start_byte() >= from.start_byte() {
+                        continue;
+                    }
+                    if let Some(binding) = kotlin_property_binding(source, child, name) {
+                        return binding;
+                    }
+                }
+            }
+            "for_statement" => {
+                let mut fc = scope.walk();
+                let bound = scope.named_children(&mut fc).find(|child| {
+                    child.kind() == "variable_declaration" && kotlin_binds(source, *child, name)
+                });
+                if let Some(decl) = bound {
+                    return kotlin_declared_type(source, decl);
+                }
+            }
+            // `catch (e: Boom)` is `catch_block > identifier user_type block`.
+            "catch_block" if kotlin_binds(source, scope, name) => {
+                return kotlin_declared_type(source, scope);
+            }
+            "function_declaration" => {
+                let mut fc = scope.walk();
+                let params = scope
+                    .named_children(&mut fc)
+                    .find(|child| child.kind() == "function_value_parameters");
+                if let Some(params) = params {
+                    let mut pc = params.walk();
+                    for param in params.named_children(&mut pc) {
+                        if param.kind() == "parameter" && kotlin_binds(source, param, name) {
+                            return kotlin_declared_type(source, param);
+                        }
+                    }
+                }
+            }
+            "class_declaration" | "object_declaration" => {
+                if let Some(binding) = kotlin_class_binding(source, scope, name) {
+                    return binding;
+                }
+            }
+            _ => {}
+        }
+        ancestor = scope.parent();
+    }
+    kotlin_is_type_like(name).then_some(name)
+}
+
+/// Record the receiver type of a top-level extension function
+/// (`fun Foo.bar()` → `extension_receiver = "Foo"`), so a receiver call
+/// `foo.bar()` whose owner has no `Foo::bar` method can still resolve to it.
+fn kotlin_tag_extension_receivers(source: &[u8], root: Node<'_>, result: &mut ExtractionResult) {
+    let mut receivers = std::collections::HashMap::new();
+    let mut cursor = root.walk();
+    for func in root.named_children(&mut cursor) {
+        if func.kind() != "function_declaration" {
+            continue;
+        }
+        let Some(name) = func.child_by_field_name("name") else {
+            continue;
+        };
+        let mut fc = func.walk();
+        let receiver = func
+            .named_children(&mut fc)
+            .take_while(|child| child.start_byte() < name.start_byte())
+            .find(|child| matches!(child.kind(), "user_type" | "nullable_type"))
+            .and_then(|ty| kotlin_type_simple_name(source, ty));
+        if let Some(receiver) = receiver {
+            receivers.insert(
+                (
+                    func.start_position().row as u32 + 1,
+                    node_text(source, name),
+                ),
+                receiver,
+            );
+        }
+    }
+    for node in &mut result.nodes {
+        if node.label != "Function" {
+            continue;
+        }
+        let Some(receiver) = receivers.get(&(node.start_line, node.name.as_str())) else {
+            continue;
+        };
+        if let Some(object) = node.properties.as_object_mut() {
+            object.insert(
+                "extension_receiver".into(),
+                serde_json::Value::String((*receiver).to_string()),
+            );
+        }
+    }
+}
+
+/// Stamp the file's `package` on its top-level definitions so the indexer can
+/// tell `import kotlinx.coroutines.delay` from a project `delay` declared in
+/// another package. Nested declarations are left untagged: their import path
+/// runs through the enclosing type, not straight from the package.
+fn kotlin_tag_package(source: &[u8], root: Node<'_>, result: &mut ExtractionResult) {
+    let mut cursor = root.walk();
+    let mut package = None;
+    let mut top_level_lines = std::collections::HashSet::new();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "package_header" => {
+                let mut pc = child.walk();
+                package = child
+                    .named_children(&mut pc)
+                    .find(|c| c.kind() == "qualified_identifier" || c.kind() == "identifier")
+                    .map(|c| node_text(source, c).to_string());
+            }
+            "class_declaration"
+            | "object_declaration"
+            | "function_declaration"
+            | "property_declaration"
+            | "type_alias" => {
+                top_level_lines.insert(child.start_position().row as u32 + 1);
+            }
+            _ => {}
+        }
+    }
+    let Some(package) = package.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    for node in &mut result.nodes {
+        if !matches!(
+            node.label.as_str(),
+            "Class" | "Interface" | "Function" | "Type" | "Variable"
+        ) || !top_level_lines.contains(&node.start_line)
+        {
+            continue;
+        }
+        if let Some(object) = node.properties.as_object_mut() {
+            object.insert("package".into(), serde_json::Value::String(package.clone()));
+        }
+    }
+}
+
+/// Give same-owner overloads distinct qnames. Kotlin allows several `fun f`
+/// on one owner; they all named `file::Owner::f`, and the store upserts on
+/// qname, so the later declaration absorbed the earlier one's edges and took
+/// over its line span. The first declaration keeps the plain qname; later
+/// ones become `…::f#2`, `…::f#3` in source order. Edges sourced from (or
+/// `DEFINES_METHOD` edges targeting) an overloaded qname move to the
+/// declaration whose span encloses the edge's line, innermost first. A
+/// same-file call into the set targets the one overload whose parameter
+/// range admits the call's argument count; otherwise the set's first.
+fn kotlin_disambiguate_overloads(source: &[u8], root: Node<'_>, result: &mut ExtractionResult) {
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, node) in result.nodes.iter().enumerate() {
+        if matches!(node.label.as_str(), "Function" | "Method") {
+            groups
+                .entry(node.qualified_name.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut spans: std::collections::HashMap<String, Vec<(u32, u32, String)>> =
+        std::collections::HashMap::new();
+    for (qname, mut indices) in groups {
+        if indices.len() < 2 {
+            continue;
+        }
+        indices.sort_by_key(|&index| result.nodes[index].start_line);
+        let mut group = Vec::with_capacity(indices.len());
+        for (ordinal, &index) in indices.iter().enumerate() {
+            let node = &mut result.nodes[index];
+            if ordinal > 0 {
+                node.qualified_name = format!("{qname}#{}", ordinal + 1);
+            }
+            group.push((node.start_line, node.end_line, node.qualified_name.clone()));
+        }
+        spans.insert(qname, group);
+    }
+    if spans.is_empty() {
+        return;
+    }
+    let (arities, arg_counts) = kotlin_call_shapes(source, root);
+    let pick_by_arity = |base: &str, line: u32, name: &str| -> Option<String> {
+        let args = arg_counts
+            .get(&(line, name.to_string()))
+            .copied()
+            .flatten()?;
+        let group = spans.get(base)?;
+        let mut fitting = group.iter().filter(|(start, _, _)| {
+            arities
+                .get(start)
+                .is_some_and(|(min, max)| *min <= args && max.is_none_or(|max| args <= max))
+        });
+        let (_, _, qname) = fitting.next()?;
+        fitting.next().is_none().then(|| qname.clone())
+    };
+    let rehome = |qname: &mut String, line: u32| {
+        let Some(group) = spans.get(qname.as_str()) else {
+            return;
+        };
+        if let Some((_, _, target)) = group
+            .iter()
+            .filter(|(start, end, _)| (*start..=*end).contains(&line))
+            .min_by_key(|(start, end, _)| end - start)
+        {
+            *qname = target.clone();
+        }
+    };
+    for edge in &mut result.edges {
+        rehome(&mut edge.source_qualified_name, edge.line);
+        if edge.edge_type == "DEFINES_METHOD" {
+            rehome(&mut edge.target_qualified_name, edge.line);
+        }
+        if edge.edge_type != "CALLS" {
+            continue;
+        }
+        let Some(name) = edge
+            .properties
+            .get("callee_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        // A bare call names the caller's own owner first, then a free function.
+        let caller_owner = edge
+            .source_qualified_name
+            .rsplit_once("::")
+            .map(|(owner, _)| owner.to_string());
+        let mut bases = vec![edge.target_qualified_name.clone()];
+        if let Some(owner) = caller_owner.filter(|owner| !owner.ends_with("::Function")) {
+            bases.insert(0, format!("{owner}::{name}"));
+        }
+        if let Some(target) = bases
+            .iter()
+            .find(|base| spans.contains_key(base.as_str()))
+            .and_then(|base| pick_by_arity(base, edge.line, &name))
+        {
+            edge.target_qualified_name = target;
+        }
+    }
+}
+
+/// Parameter ranges of every `fun` keyed by its start line (`max` is `None`
+/// for a `vararg`), and argument counts of every call keyed by the callee
+/// identifier's `(line, name)`. A trailing lambda counts as an argument. Two
+/// calls to one name on one line with different counts record `None`.
+#[allow(clippy::type_complexity)]
+fn kotlin_call_shapes(
+    source: &[u8],
+    root: Node<'_>,
+) -> (
+    std::collections::HashMap<u32, (usize, Option<usize>)>,
+    std::collections::HashMap<(u32, String), Option<usize>>,
+) {
+    let mut arities = std::collections::HashMap::new();
+    let mut arg_counts: std::collections::HashMap<(u32, String), Option<usize>> =
+        std::collections::HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+        match node.kind() {
+            "function_declaration" => {
+                let mut fc = node.walk();
+                let Some(params) = node
+                    .named_children(&mut fc)
+                    .find(|child| child.kind() == "function_value_parameters")
+                else {
+                    continue;
+                };
+                let (mut total, mut required, mut vararg) = (0, 0, false);
+                let mut pc = params.walk();
+                let children: Vec<Node<'_>> = params.named_children(&mut pc).collect();
+                for (i, child) in children.iter().enumerate() {
+                    match child.kind() {
+                        "parameter" => {
+                            total += 1;
+                            let defaulted = children.get(i + 1).is_some_and(|next| {
+                                !matches!(next.kind(), "parameter" | "parameter_modifiers")
+                            });
+                            if !defaulted {
+                                required += 1;
+                            }
+                        }
+                        "parameter_modifiers" => {
+                            vararg |= node_text(source, *child).contains("vararg");
+                        }
+                        _ => {}
+                    }
+                }
+                arities.insert(
+                    node.start_position().row as u32 + 1,
+                    (required, (!vararg).then_some(total)),
+                );
+            }
+            "call_expression" => {
+                let Some(callee) = node.named_child(0) else {
+                    continue;
+                };
+                let name_node = match callee.kind() {
+                    "identifier" => Some(callee),
+                    "navigation_expression" => callee
+                        .named_child(callee.named_child_count().saturating_sub(1))
+                        .filter(|member| member.kind() == "identifier" && member != &callee),
+                    _ => None,
+                };
+                let Some(name_node) = name_node else {
+                    continue;
+                };
+                let mut count = 0;
+                let mut cc = node.walk();
+                for child in node.named_children(&mut cc) {
+                    match child.kind() {
+                        "value_arguments" => count += child.named_child_count(),
+                        "annotated_lambda" => count += 1,
+                        _ => {}
+                    }
+                }
+                let key = (
+                    name_node.start_position().row as u32 + 1,
+                    node_text(source, name_node).to_string(),
+                );
+                arg_counts
+                    .entry(key)
+                    .and_modify(|seen| {
+                        if *seen != Some(count) {
+                            *seen = None;
+                        }
+                    })
+                    .or_insert(Some(count));
+            }
+            _ => {}
+        }
+    }
+    (arities, arg_counts)
 }
 
 /// Reference pass for Kotlin. Identifiers under a `user_type` are emitted as
@@ -20318,6 +20993,213 @@ fun freeFn() { freeOther() }
         let b = kotlin("fun shared() {}", "b.kt");
         assert_eq!(first_callee(&a).as_deref(), Some("shared"));
         assert!(b.nodes.iter().any(|n| n.name == "shared"));
+    }
+
+    #[test]
+    fn kotlin_member_calls_record_owner_only_from_syntax() {
+        const SRC: &str = r#"
+package app
+class GameService(private val gate: BootGate, private val maybe: a.b.Probe?) {
+    private val made = Maker()
+    fun setup(p: Param) {
+        gate.awaitReady()
+        this.gate.markReady()
+        if (!gate.isOpen()) return
+        try { } catch (gate: Boom) { gate.fire() }
+        maybe?.probe()
+        made.build()
+        p.go()
+        val local: Local = fetch()
+        local.run()
+        val inferred = fetch()
+        inferred.guess()
+        Registry.lookup(1)
+        Maker().make()
+        injector.getInstance(BootGate::class.java).isReady()
+        items.forEach { it.visit() }
+    }
+}
+"#;
+        let r = kotlin(SRC, "app/GameService.kt");
+        let owner_of = |callee: &str| {
+            let edge = r
+                .edges
+                .iter()
+                .find(|e| {
+                    e.edge_type == "CALLS"
+                        && e.properties.get("callee_name").and_then(|v| v.as_str()) == Some(callee)
+                })
+                .unwrap_or_else(|| panic!("no CALLS edge for {callee}: {:?}", r.edges));
+            assert_eq!(
+                edge.properties.get("callee_form").and_then(|v| v.as_str()),
+                Some("receiver"),
+                "{callee}"
+            );
+            assert_eq!(
+                edge.source_qualified_name,
+                "app/GameService.kt::GameService::setup"
+            );
+            edge.properties
+                .get("receiver_owner")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(owner_of("awaitReady").as_deref(), Some("BootGate"));
+        assert_eq!(owner_of("markReady").as_deref(), Some("BootGate"));
+        assert_eq!(owner_of("isOpen").as_deref(), Some("BootGate"));
+        assert_eq!(
+            owner_of("fire").as_deref(),
+            Some("Boom"),
+            "a catch parameter shadows the same-named constructor property"
+        );
+        assert_eq!(owner_of("probe").as_deref(), Some("Probe"));
+        assert_eq!(owner_of("build").as_deref(), Some("Maker"));
+        assert_eq!(owner_of("go").as_deref(), Some("Param"));
+        assert_eq!(owner_of("run").as_deref(), Some("Local"));
+        assert_eq!(owner_of("guess"), None, "inferred local must not guess");
+        assert_eq!(owner_of("lookup").as_deref(), Some("Registry"));
+        assert_eq!(owner_of("make").as_deref(), Some("Maker"));
+        assert_eq!(
+            owner_of("isReady").as_deref(),
+            Some("BootGate"),
+            "getInstance(T::class.java) states its result type"
+        );
+        assert_eq!(owner_of("visit"), None, "lambda `it` has no stated type");
+        // The member name is a call endpoint, never also a value reference.
+        assert!(
+            !r.edges.iter().any(|e| e.edge_type != "CALLS"
+                && e.properties.get("ref_name").and_then(|v| v.as_str()) == Some("awaitReady")),
+            "{:?}",
+            r.edges
+        );
+    }
+
+    #[test]
+    fn kotlin_overloads_get_distinct_qnames_and_keep_their_own_edges() {
+        const SRC: &str = r#"
+object Decoder {
+    fun decodeAll(cache: Cache) {
+        collide()
+    }
+
+    private fun decodeAll(buffers: List<Int>): Int {
+        return count()
+    }
+}
+"#;
+        let r = kotlin(SRC, "Decoder.kt");
+        let mut overloads: Vec<_> = r
+            .nodes
+            .iter()
+            .filter(|n| n.name == "decodeAll")
+            .map(|n| (n.start_line, n.qualified_name.as_str()))
+            .collect();
+        overloads.sort();
+        assert_eq!(
+            overloads,
+            vec![
+                (3, "Decoder.kt::Decoder::decodeAll"),
+                (7, "Decoder.kt::Decoder::decodeAll#2"),
+            ]
+        );
+        let caller_of = |callee: &str| {
+            r.edges
+                .iter()
+                .find(|e| {
+                    e.edge_type == "CALLS"
+                        && e.properties.get("callee_name").and_then(|v| v.as_str()) == Some(callee)
+                })
+                .map(|e| e.source_qualified_name.as_str())
+        };
+        assert_eq!(caller_of("collide"), Some("Decoder.kt::Decoder::decodeAll"));
+        assert_eq!(caller_of("count"), Some("Decoder.kt::Decoder::decodeAll#2"));
+        let defines: Vec<&str> = r
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "DEFINES_METHOD")
+            .map(|e| e.target_qualified_name.as_str())
+            .collect();
+        assert!(
+            defines.contains(&"Decoder.kt::Decoder::decodeAll#2"),
+            "{defines:?}"
+        );
+    }
+
+    #[test]
+    fn kotlin_same_file_overload_call_targets_matching_arity() {
+        const SRC: &str = "object Decoder {\n    fun decodeAll(sink: Sink, cache: Cache) {\n        decodeAll(buffers)\n    }\n\n    private fun decodeAll(buffers: List<Int>) {}\n\n    fun log(msg: String, level: Int = 0) {}\n    fun log(vararg parts: String) {}\n\n    fun caller() {\n        log(\"a\", 1)\n    }\n}\n";
+        let r = kotlin(SRC, "Decoder.kt");
+        let target_of = |caller: &str, callee: &str| {
+            r.edges
+                .iter()
+                .find(|e| {
+                    e.edge_type == "CALLS"
+                        && e.source_qualified_name == caller
+                        && e.properties.get("callee_name").and_then(|v| v.as_str()) == Some(callee)
+                })
+                .map(|e| e.target_qualified_name.as_str())
+        };
+        assert_eq!(
+            target_of("Decoder.kt::Decoder::decodeAll", "decodeAll"),
+            Some("Decoder.kt::Decoder::decodeAll#2"),
+            "one argument fits only the private overload"
+        );
+        assert_ne!(
+            target_of("Decoder.kt::Decoder::caller", "log"),
+            Some("Decoder.kt::Decoder::log#2"),
+            "two arguments fit both overloads, so none is chosen"
+        );
+    }
+
+    #[test]
+    fn kotlin_annotated_private_constructor_keeps_class_members() {
+        const SRC: &str = "class Handler\n@Inject\nprivate constructor(\n    private val gate: BootGate,\n) {\n    fun onLogin() {\n        gate.isReady()\n    }\n}\n";
+        let r = kotlin(SRC, "Handler.kt");
+        let method = r
+            .nodes
+            .iter()
+            .find(|n| n.label == "Method" && n.name == "onLogin")
+            .expect("class body must survive the constructor header");
+        assert_eq!((method.start_line, method.end_line), (6, 8));
+        let call = r
+            .edges
+            .iter()
+            .find(|e| e.properties.get("callee_name").and_then(|v| v.as_str()) == Some("isReady"))
+            .expect("member call inside the class");
+        assert_eq!(
+            call.properties
+                .get("receiver_owner")
+                .and_then(|v| v.as_str()),
+            Some("BootGate")
+        );
+    }
+
+    #[test]
+    fn kotlin_top_level_declarations_record_their_package() {
+        const SRC: &str = r#"
+package org.rsmod.dsl
+fun delay(ticks: Int) {}
+class Outer {
+    class Inner
+    fun member() {}
+}
+"#;
+        let r = kotlin(SRC, "dsl/Effects.kt");
+        let package_of = |name: &str| {
+            r.nodes
+                .iter()
+                .find(|n| n.name == name)
+                .and_then(|n| n.properties.get("package"))
+                .and_then(|v| v.as_str())
+        };
+        assert_eq!(package_of("delay"), Some("org.rsmod.dsl"));
+        assert_eq!(package_of("Outer"), Some("org.rsmod.dsl"));
+        assert_eq!(
+            package_of("Inner"),
+            None,
+            "nested types import through Outer"
+        );
+        assert_eq!(package_of("member"), None);
     }
 
     #[test]

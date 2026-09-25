@@ -413,7 +413,7 @@ fn persisted_delta_path_matches(
     if !metadata.is_file() {
         return Ok(false);
     }
-    let current = greppy_discover::stable_metadata(&metadata);
+    let current = greppy_discover::stable_metadata(&path, &metadata);
     if let Some(state) = store
         .get_file_state(project, rel_path)
         .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
@@ -816,6 +816,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         == Some("1")
         || std::env::var_os(ENV_MODE).is_some()
         || !root.join(".git").is_file()
+        || !is_linked_worktree(root)?
     {
         return Ok(None);
     }
@@ -1061,6 +1062,19 @@ impl Drop for TemporaryBaseWorktree {
             .arg(&self.path)
             .status();
     }
+}
+
+/// A `.git` file also marks a submodule, whose git dir lives under the
+/// superproject's `.git/modules/` and is its own common dir. Only a linked
+/// worktree has a private git dir distinct from the shared common dir.
+fn is_linked_worktree(root: &Path) -> Result<bool> {
+    let resolve = |args: &[&str]| -> Result<PathBuf> {
+        let path = PathBuf::from(git_output(root, args)?);
+        Ok(path.canonicalize().unwrap_or(path))
+    };
+    let git_dir = resolve(&["rev-parse", "--absolute-git-dir"])?;
+    let common_dir = resolve(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(git_dir != common_dir)
 }
 
 fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
@@ -1861,6 +1875,38 @@ mod tests {
         let paths = private_delta_paths(&store).unwrap();
         assert!(!paths.contains("src"));
         assert!(paths.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn submodule_checkout_is_not_a_linked_worktree() {
+        let sub_origin = fixture();
+        let superproject = fixture();
+        let origin = sub_origin.path().to_string_lossy().into_owned();
+        git(
+            superproject.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                origin.as_str(),
+                "sub",
+            ],
+        );
+        let submodule = superproject.path().join("sub");
+        assert!(submodule.join(".git").is_file());
+        assert!(!is_linked_worktree(&submodule).unwrap());
+        assert!(!is_linked_worktree(superproject.path()).unwrap());
+
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        let linked_arg = linked.to_string_lossy().into_owned();
+        git(
+            superproject.path(),
+            &["worktree", "add", "-q", "--detach", linked_arg.as_str()],
+        );
+        assert!(is_linked_worktree(&linked).unwrap());
     }
 
     #[test]

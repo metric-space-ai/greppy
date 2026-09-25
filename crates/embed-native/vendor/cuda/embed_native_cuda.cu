@@ -2576,7 +2576,11 @@ static cudaError_t gp_launch_mmq_typed(
         int64_t ncols_dst,
         int nsm,
         cudaStream_t stream) {
-    constexpr int cc = 860;
+    // Host tile sizing must match the device code that was compiled. A
+    // hardcoded Ampere cc resolves to "no compiled arch" on an sm_120-only
+    // build, sizing shared memory for the DP4A layout while the kernel uses
+    // the MMA layout and overruns it.
+    const int cc = gp_cuda_info_state.devices[gp_cuda_current_device].cc;
     constexpr int warp_size = 32;
     constexpr int nwarps = 8;
     constexpr int mmq_y = 128;
@@ -2676,7 +2680,7 @@ static cudaError_t gp_launch_mmq_type(
         cudaStream_t stream) {
     int mmq_x_best = 8;
     int ntiles_x_best = INT_MAX;
-    constexpr int cc = 860;
+    const int cc = gp_cuda_info_state.devices[gp_cuda_current_device].cc;
     constexpr int warp_size = 32;
     constexpr int nwarps = 8;
     constexpr int mmq_y = 128;

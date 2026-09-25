@@ -352,7 +352,7 @@ pub fn manifest_for_language(language: Language) -> ProviderManifest {
         review_artifact: None,
         notes: match language {
             Language::Kotlin => vec![
-                "Kotlin classifies type/value references, but remains partial: member-call coverage, type assignments, and implements edges are not complete"
+                "Kotlin classifies type/value references, but remains partial: member-call coverage resolves only receivers whose type the syntax states, and type assignments and implements edges are not complete"
                     .into(),
             ],
             Language::Ruby => vec![

@@ -547,7 +547,7 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return None;
     }
-    let stable = stable_metadata(&metadata);
+    let stable = stable_metadata(&abs_path, &metadata);
     Some(InventoryEntry {
         rel_path: rel_path.replace('\\', "/"),
         abs_path,
@@ -1510,23 +1510,9 @@ fn resolve_and_persist_edges_with_progress(
         };
         let src_id = src.id;
         let src_file = src.file_path.clone();
-        let target_id = match edge
-            .properties
-            .get("imported_name")
-            .and_then(|v| v.as_str())
-        {
-            Some(name) if !name.is_empty() => {
-                let path = edge
-                    .properties
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                index.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
-            }
-            // Brace groups / globs / renames leave imported_name empty —
-            // a future expansion pass owns those.
-            _ => None,
-        };
+        // Brace groups / globs / renames leave imported_name empty — a
+        // future expansion pass owns those.
+        let target_id = index.resolve_import_edge(&src_file, edge);
         let Some(target_id) = target_id else { continue };
         // IMPORTS drops self-loops (only CALLS keeps them).
         if target_id == src_id {
@@ -2039,21 +2025,7 @@ fn resolve_edges_incremental(
         if !is_cand_import && !candidate_owner_files.contains(src_file.as_str()) {
             continue;
         }
-        let target_id = match edge
-            .properties
-            .get("imported_name")
-            .and_then(|v| v.as_str())
-        {
-            Some(name) if !name.is_empty() => {
-                let path = edge
-                    .properties
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                index.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
-            }
-            _ => None,
-        };
+        let target_id = index.resolve_import_edge(&src_file, edge);
         let Some(target_id) = target_id else { continue };
         if target_id == src_id {
             continue;
@@ -2468,6 +2440,17 @@ struct GraphIndex {
     /// Erlang/Zig/Dart module imports). Populated at load; only usable AFTER
     /// the structural pass has created the File nodes.
     files_by_stem: std::collections::HashMap<String, Vec<i64>>,
+    /// `node id → declaring package` for definitions whose extractor records
+    /// one (Kotlin top-level declarations). Lets a dotted import path be
+    /// checked against the candidate's real package.
+    package_by_id: std::collections::HashMap<i64, String>,
+    /// `node id → receiver type` of a Kotlin extension function
+    /// (`fun Foo.bar()` → `Foo`), the fallback target of `foo.bar()`.
+    extension_receiver_by_id: std::collections::HashMap<i64, String>,
+    /// `file_path → imported names` whose import path provably names a
+    /// declaration outside the project (every same-named candidate lives in
+    /// another package). Such a name never falls back to a project-wide match.
+    external_imports_by_file: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2501,11 +2484,17 @@ impl GraphIndex {
             std::collections::HashMap::new();
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
+        let mut package_by_id: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        let mut extension_receiver_by_id: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
         {
             let conn = store.conn();
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, name, qualified_name, label, file_path
+                    "SELECT id, name, qualified_name, label, file_path,
+                            json_extract(properties, '$.package'),
+                            json_extract(properties, '$.extension_receiver')
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -2517,11 +2506,20 @@ impl GraphIndex {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
             for row in rows {
-                let (id, name, qname, label, file_path) = row.map_err(sqlite_err)?;
+                let (id, name, qname, label, file_path, package, receiver) =
+                    row.map_err(sqlite_err)?;
+                if let Some(package) = package.filter(|p| !p.is_empty()) {
+                    package_by_id.insert(id, package);
+                }
+                if let Some(receiver) = receiver.filter(|r| !r.is_empty()) {
+                    extension_receiver_by_id.insert(id, receiver);
+                }
                 note_edge_resolution_work(1);
                 if label == "File" {
                     let base = file_path.rsplit('/').next().unwrap_or(&file_path);
@@ -2546,6 +2544,9 @@ impl GraphIndex {
             id_to_file,
             id_to_qname,
             files_by_stem,
+            package_by_id,
+            extension_receiver_by_id,
+            external_imports_by_file: std::collections::HashMap::new(),
         })
     }
 
@@ -2568,6 +2569,62 @@ impl GraphIndex {
             .insert(target_id);
     }
 
+    /// Resolve one IMPORTS edge's named symbol and remember, for the importing
+    /// file, a name whose import path provably points outside the project.
+    fn resolve_import_edge(&mut self, file: &str, edge: &ExtractedEdge) -> Option<i64> {
+        let name = edge
+            .properties
+            .get("imported_name")
+            .and_then(|v| v.as_str())
+            .filter(|name| !name.is_empty())?;
+        let path = edge
+            .properties
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let glob = edge
+            .properties
+            .get("glob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !glob
+            && self.import_names_foreign_package(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+        {
+            self.external_imports_by_file
+                .entry(file.to_string())
+                .or_default()
+                .insert(name.to_string());
+            return None;
+        }
+        self.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+    }
+
+    /// A dotted import path (`kotlinx.coroutines.delay`) names its package.
+    /// When every same-named candidate records a package and none equals the
+    /// path's, the import targets a declaration outside the project.
+    fn import_names_foreign_package(&self, labels: &[&str], name: &str, path: &str) -> bool {
+        let Some(package) = path
+            .strip_suffix(name)
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .filter(|package| !package.is_empty() && !path.contains("::"))
+        else {
+            return false;
+        };
+        let candidates = self.defs_named(labels, name);
+        !candidates.is_empty()
+            && candidates.iter().all(|candidate| {
+                self.package_by_id
+                    .get(&candidate.id)
+                    .is_some_and(|declared| declared != package)
+            })
+    }
+
+    fn imports_externally(&self, file: &str, name: &str) -> bool {
+        self.external_imports_by_file
+            .get(file)
+            .is_some_and(|names| names.contains(name))
+    }
+
     /// The set of node `name`s defined in any of `files`. Used by the
     /// incremental edge re-resolution to find which raw edges could have
     /// resolved into a changed file (and were therefore FK-cascaded). A name
@@ -2588,7 +2645,10 @@ impl GraphIndex {
     /// Every node whose `name` equals `name` and whose `label` is in
     /// `labels`. Mirrors `greppy_resolver::defs_named`: the by-name
     /// multimap is the in-memory equivalent of the `idx_nodes_name`
-    /// lookup, and the label filter is applied after.
+    /// lookup, and the label filter is applied after. An overload set
+    /// (`…::f`, `…::f#2`, …) counts once, as its plain-qname declaration:
+    /// name resolution cannot pick an overload, and splitting the set would
+    /// make every call to an overloaded function ambiguous.
     fn defs_named(&self, labels: &[&str], name: &str) -> Vec<&NodeLite> {
         match self.by_name.get(name) {
             Some(nodes) => {
@@ -2596,6 +2656,7 @@ impl GraphIndex {
                 nodes
                     .iter()
                     .filter(|n| labels.contains(&n.label.as_str()))
+                    .filter(|n| !self.is_later_overload(n.id))
                     .collect()
             }
             None => {
@@ -2603,6 +2664,13 @@ impl GraphIndex {
                 Vec::new()
             }
         }
+    }
+
+    /// Whether `id` is a `…#N` overload whose plain-qname sibling exists.
+    fn is_later_overload(&self, id: i64) -> bool {
+        self.qname_for_id(id)
+            .and_then(overload_base)
+            .is_some_and(|base| self.by_qname.contains_key(base))
     }
 
     /// Same-file preference, then project-wide uniqueness. Byte-for-byte
@@ -2654,6 +2722,11 @@ impl GraphIndex {
         let Some(referrer_file) = self.file_of(referrer_id) else {
             return UniqueResolution::Unresolved;
         };
+        // `import kotlinx.coroutines.delay` binds `delay` to a library
+        // declaration; a project `delay` in another package is not it.
+        if self.imports_externally(referrer_file, name) {
+            return UniqueResolution::Unresolved;
+        }
         let candidates = self.defs_named(labels, name);
         if let Some(id) = Self::resolve_unique(&candidates, referrer_file) {
             return UniqueResolution::Unique(id);
@@ -2784,7 +2857,8 @@ impl GraphIndex {
 
     /// Resolve a receiver call only when its statically observed owner and
     /// method name identify one Method node. Prefer the exact same-file qname;
-    /// cross-file resolution requires a globally unique owner/name suffix.
+    /// cross-file resolution requires a globally unique owner/name suffix
+    /// (an overload set counts once, via `defs_named`).
     fn resolve_receiver_method(&self, file_path: &str, owner: &str, name: &str) -> Option<i64> {
         if owner.is_empty() || name.is_empty() {
             return None;
@@ -2795,14 +2869,32 @@ impl GraphIndex {
         }
 
         let suffix = format!("::{owner}::{name}");
-        note_edge_resolution_work(self.by_qname.len());
-        let mut matches = self
-            .by_qname
-            .iter()
-            .filter(|(qname, node)| node.label == "Method" && qname.ends_with(&suffix))
-            .map(|(_, node)| node.id);
-        let target = matches.next()?;
-        matches.next().is_none().then_some(target)
+        let methods: Vec<i64> = self
+            .defs_named(&["Method"], name)
+            .into_iter()
+            .filter(|node| {
+                self.qname_for_id(node.id)
+                    .is_some_and(|qname| qname.ends_with(&suffix))
+            })
+            .map(|node| node.id)
+            .collect();
+        match methods.as_slice() {
+            [id] => return Some(*id),
+            [] => {}
+            _ => return None,
+        }
+        // No member: a unique extension function declared on the same type.
+        let mut extensions = self
+            .defs_named(&["Function"], name)
+            .into_iter()
+            .filter(|node| {
+                self.extension_receiver_by_id
+                    .get(&node.id)
+                    .is_some_and(|receiver| receiver == owner)
+            })
+            .map(|node| node.id);
+        let target = extensions.next()?;
+        extensions.next().is_none().then_some(target)
     }
 
     /// Resolve a reference edge: try the parser's direct same-file guess
@@ -2886,6 +2978,21 @@ impl GraphIndex {
             1 => return Some(candidates[0].id),
             _ => {}
         }
+        // A dotted path names the package; a candidate recording that exact
+        // package is the import's target.
+        if let Some(package) = path
+            .strip_suffix(name)
+            .and_then(|prefix| prefix.strip_suffix('.'))
+        {
+            let in_package: Vec<i64> = candidates
+                .iter()
+                .filter(|n| self.package_by_id.get(&n.id).is_some_and(|p| p == package))
+                .map(|n| n.id)
+                .collect();
+            if let [id] = in_package.as_slice() {
+                return Some(*id);
+            }
+        }
         let module_seg = path_module_segment(path, name)?;
         let matched: Vec<&&NodeLite> = candidates
             .iter()
@@ -2950,6 +3057,13 @@ fn module_name_for(rel_path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(rel_path)
         .to_string()
+}
+
+/// The plain qname of a later overload (`a.kt::Owner::f#2` → `a.kt::Owner::f`),
+/// or `None` for a qname without a numeric `#N` suffix.
+fn overload_base(qname: &str) -> Option<&str> {
+    let (base, ordinal) = qname.rsplit_once('#')?;
+    (!ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())).then_some(base)
 }
 
 /// The module segment of a Rust use-`path` for a given final `name`: the
@@ -3194,7 +3308,7 @@ fn record_index_skip(
     generation: u64,
 ) -> Result<()> {
     let metadata = std::fs::metadata(&entry.abs_path)
-        .map(|md| stable_metadata(&md))
+        .map(|md| stable_metadata(&entry.abs_path, &md))
         .unwrap_or(StableFileMetadata {
             size: 0,
             mtime_ns: None,
@@ -3364,7 +3478,7 @@ fn record_unsupported_file_state(
         return;
     };
     if md.len() > max_file_size_bytes() {
-        let metadata = stable_metadata(&md);
+        let metadata = stable_metadata(&entry.abs_path, &md);
         // Oversized: record stat only, never read the body.
         let fs = FileState {
             project: project.to_string(),
@@ -3976,6 +4090,176 @@ fn caller(value: Buffer) -> &'static [u8] {
             calls.iter().any(|edge| edge.target_id == method.id),
             "receiver call must resolve to the unique Method node: {calls:?}"
         );
+    }
+
+    fn kotlin_repo(label: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-kotlin-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (path, source) in files {
+            let path = repo.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        repo
+    }
+
+    fn calls_from(store: &Store, qname: &str) -> Vec<i64> {
+        let caller = store
+            .get_node_by_qname("test", qname)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{qname} must exist"));
+        store
+            .outgoing_edges(caller.id, Some("CALLS"), 256)
+            .unwrap()
+            .into_iter()
+            .map(|edge| edge.target_id)
+            .collect()
+    }
+
+    fn node_id(store: &Store, qname: &str) -> i64 {
+        store
+            .get_node_by_qname("test", qname)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{qname} must exist"))
+            .id
+    }
+
+    #[test]
+    fn kotlin_member_call_resolves_cross_module_through_declared_owner() {
+        let repo = kotlin_repo(
+            "member-call",
+            &[
+                (
+                    "api/gate/BootGate.kt",
+                    "package api.gate\nclass BootGate {\n    fun awaitReady() {}\n}\n",
+                ),
+                (
+                    "api/other/Other.kt",
+                    "package api.other\nclass Other {\n    fun awaitReady() {}\n}\n",
+                ),
+                (
+                    "server/GameService.kt",
+                    "package server\nimport api.gate.BootGate\nclass GameService(private val gate: BootGate) {\n    fun setup() {\n        gate.awaitReady()\n    }\n}\n",
+                ),
+            ],
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let calls = calls_from(&store, "server/GameService.kt::GameService::setup");
+        assert_eq!(
+            calls,
+            vec![node_id(
+                &store,
+                "api/gate/BootGate.kt::BootGate::awaitReady"
+            )],
+            "the declared owner picks BootGate over the same-named Other method"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn kotlin_explicit_library_import_blocks_project_name_fallback() {
+        let repo = kotlin_repo(
+            "external-import",
+            &[
+                (
+                    "dsl/Effects.kt",
+                    "package game.dsl\nfun delay(ticks: Int) {}\n",
+                ),
+                (
+                    "server/Service.kt",
+                    "package server\nimport kotlinx.coroutines.delay\nfun tick() {\n    delay(600)\n}\n",
+                ),
+                (
+                    "content/Script.kt",
+                    "package content\nimport game.dsl.delay\nfun pause() {\n    delay(1)\n}\n",
+                ),
+            ],
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let project_delay = node_id(&store, "dsl/Effects.kt::Function::delay");
+        assert!(
+            calls_from(&store, "server/Service.kt::Function::tick").is_empty(),
+            "kotlinx.coroutines.delay is not the project's game.dsl.delay"
+        );
+        assert_eq!(
+            calls_from(&store, "content/Script.kt::Function::pause"),
+            vec![project_delay],
+            "an import of the project's own package still resolves"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn kotlin_receiver_call_falls_back_to_extension_on_the_same_type() {
+        let repo = kotlin_repo(
+            "extension",
+            &[
+                (
+                    "ext/Ext.kt",
+                    "package ext\nfun Foo.bar(): Int = 1\nfun Other.baz(): Int = 2\n",
+                ),
+                (
+                    "use/Use.kt",
+                    "package use\nfun use(foo: Foo, other: Foo) {\n    foo.bar()\n    other.baz()\n}\n",
+                ),
+            ],
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        assert_eq!(
+            calls_from(&store, "use/Use.kt::Function::use"),
+            vec![node_id(&store, "ext/Ext.kt::Function::bar")],
+            "foo.bar() reaches the Foo extension; baz extends Other, not Foo"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn kotlin_overloads_persist_as_separate_nodes() {
+        let repo = kotlin_repo(
+            "overloads",
+            &[(
+                "map/Decoder.kt",
+                "object Decoder {\n    fun decodeAll(cache: Int) {\n        putCollision()\n    }\n\n    private fun decodeAll(buffers: List<Int>) {}\n\n    fun putCollision() {}\n}\n",
+            ), (
+                "boot/Boot.kt",
+                "fun boot() {\n    Decoder.decodeAll(1)\n}\n",
+            )],
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let public = store
+            .get_node_by_qname("test", "map/Decoder.kt::Decoder::decodeAll")
+            .unwrap()
+            .expect("first overload keeps the plain qname");
+        let private = store
+            .get_node_by_qname("test", "map/Decoder.kt::Decoder::decodeAll#2")
+            .unwrap()
+            .expect("second overload is its own node");
+        assert_eq!((public.start_line, private.start_line), (2, 6));
+        assert_eq!(
+            calls_from(&store, "map/Decoder.kt::Decoder::decodeAll"),
+            vec![node_id(&store, "map/Decoder.kt::Decoder::putCollision")]
+        );
+        assert!(calls_from(&store, "map/Decoder.kt::Decoder::decodeAll#2").is_empty());
+        assert_eq!(
+            calls_from(&store, "boot/Boot.kt::Function::boot"),
+            vec![public.id],
+            "a call into an overload set resolves once, to its first declaration"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

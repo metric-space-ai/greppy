@@ -1270,6 +1270,66 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
     );
 }
 
+/// A workspace edited throughout the build still gets a published snapshot:
+/// the indexer succeeds and names the drift, and the next query heals the
+/// changed file instead of the index failing until edits stop.
+#[test]
+fn index_publishes_while_the_workspace_keeps_changing() {
+    let (repo, store) = index_fixture("index-publishes-under-edits");
+    edit_helper_to_84(&repo);
+    let (child, release) = spawn_held_publication(&repo, &store, "editing");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let editor = {
+        let (repo, stop) = (repo.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                std::fs::write(
+                    repo.join("src/helper.rs"),
+                    format!("pub fn do_it() -> u32 {{\n    let answer = {n};\n    answer\n}}\n"),
+                )
+                .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::fs::write(&release, b"").unwrap();
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    editor.join().unwrap();
+    let stderr = String::from_utf8_lossy(&index_out.stderr);
+    assert!(
+        index_out.status.success(),
+        "an actively edited workspace must still publish\nstdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&index_out.stdout),
+    );
+    assert!(
+        stderr.contains("workspace changed during indexing"),
+        "the published drift must be reported; stderr={stderr:?}"
+    );
+
+    std::fs::write(
+        repo.join("src/helper.rs"),
+        "pub fn do_it() -> u32 {\n    let answer = 126;\n    answer\n}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["read", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "the next query must heal the drift; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("answer = 126")),
+        "read must serve the latest edit: {v:?}"
+    );
+}
+
 #[test]
 fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inline() {
     let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");

@@ -927,6 +927,40 @@ pub(crate) fn dispatch_index_agent_worktree(
     }
 }
 
+/// `greppy index rebuild [PATH]`: remove the workspace's index and build it
+/// from scratch. A plain `index` re-extracts only changed files, so a parser
+/// fix never reaches files that did not change.
+pub(crate) fn dispatch_index_rebuild(
+    path: Option<&str>,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    let target = match path {
+        Some(path) => absolutize_path(std::path::Path::new(path)),
+        None => std::env::current_dir()
+            .map_err(|error| Error::io("read current_dir for `greppy index rebuild`", error))?,
+    };
+    let effective_root = match root {
+        Some(root) => {
+            workspace_locator::resolve_workspace_root(&absolutize_path(std::path::Path::new(root)))
+        }
+        None => find_repo_root(&target),
+    };
+    let report = greppy_core::cache::clear_cache(Some(&effective_root))
+        .map_err(|error| Error::io("remove the index before rebuilding", error))?;
+    if report.locked_bytes > 0 {
+        eprintln!(
+            "greppy: the index for {} is in use by another greppy process; nothing was \
+             rebuilt. Stop it (or wait for it), then retry",
+            effective_root.display()
+        );
+        return Ok(EXIT_TEMPFAIL as i32);
+    }
+    let _ = remove_file_if_exists(&background_job_path(&effective_root));
+    let target = target.to_string_lossy().into_owned();
+    dispatch_index(Some(&target), root, embedding_args)
+}
+
 pub(crate) fn dispatch_index(
     path: Option<&str>,
     root: Option<&str>,
@@ -1137,6 +1171,11 @@ pub(crate) fn dispatch_index(
     {
         return Ok(EXIT_IO as i32);
     }
+    if let Some(changed) = &snapshot.changed_during_index {
+        eprintln!(
+            "greppy index: workspace changed during indexing ({changed}); published the snapshot anyway, the next query refreshes the changed files"
+        );
+    }
     if let Some(embedding_report) = &snapshot.embeddings {
         println!(
             "embedded {} code spans ({} local-store reused, {} global-cache hits, {} inference misses, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} failed, {} stale pruned)",
@@ -1310,36 +1349,6 @@ pub(crate) fn index_atomic_snapshot(
     allow_deferred_embeddings: bool,
     mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<IndexSnapshotReport> {
-    for attempt in 0..2 {
-        if let Some(report) = index_atomic_snapshot_attempt(
-            active_path,
-            target,
-            project,
-            embedding_config,
-            index_options,
-            allow_deferred_embeddings,
-            background_job.as_deref_mut(),
-        )? {
-            return Ok(report);
-        }
-        if attempt == 0 {
-            eprintln!("greppy: workspace changed during indexing; rebuilding snapshot once");
-        }
-    }
-    Err(Error::Store(
-        "workspace kept changing during indexing; snapshot was not published".into(),
-    ))
-}
-
-pub(crate) fn index_atomic_snapshot_attempt(
-    active_path: &std::path::Path,
-    target: &std::path::Path,
-    project: &str,
-    embedding_config: Option<&EmbeddingModelConfig>,
-    index_options: &greppy_indexer::IndexOptions,
-    allow_deferred_embeddings: bool,
-    mut background_job: Option<&mut BackgroundJobGuard>,
-) -> Result<Option<IndexSnapshotReport>> {
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
     cleanup_sqlite_family(&temp_path)?;
@@ -1379,12 +1388,13 @@ pub(crate) fn index_atomic_snapshot_attempt(
     {
         drop(temp_store);
         cleanup_sqlite_family(&temp_path)?;
-        return Ok(Some(IndexSnapshotReport {
+        return Ok(IndexSnapshotReport {
             index: report,
             embeddings: None,
             embedding_deferred: false,
             embedding_degraded: None,
-        }));
+            changed_during_index: None,
+        });
     }
 
     let embedding_deferred = embedding_config.is_some_and(|cfg| {
@@ -1459,25 +1469,41 @@ pub(crate) fn index_atomic_snapshot_attempt(
         std::time::Duration::ZERO,
     )?;
     drop(verify_store);
-    if !matches!(
-        verification.state.outcome,
-        greppy_freshness::FreshnessOutcome::Fresh
-    ) {
-        cleanup_sqlite_family(&temp_path)?;
-        return Ok(None);
-    }
+    // Edits made while the snapshot was built leave it consistent but
+    // behind the workspace. Publish it anyway: query-time freshness sees the
+    // same drift and refreshes just those paths, whereas rebuilding would
+    // never finish on a workspace that is being actively edited.
+    let changed_during_index = match verification.state.outcome {
+        greppy_freshness::FreshnessOutcome::Fresh => None,
+        greppy_freshness::FreshnessOutcome::Stale { reasons } => {
+            let reasons = reasons.join("; ");
+            Some(
+                match verification.changed_paths.as_ref().map_or(0, Vec::len) {
+                    0 => reasons,
+                    paths => format!("{paths} path(s): {reasons}"),
+                },
+            )
+        }
+        outcome => {
+            cleanup_sqlite_family(&temp_path)?;
+            return Err(Error::Store(format!(
+                "snapshot freshness could not be verified ({outcome:?}); snapshot was not published"
+            )));
+        }
+    };
 
     if let Some(job) = background_job {
         job.finalization_phase("publishing_snapshot");
     }
     publish_store_snapshot(&temp_path, active_path)?;
     cleanup_stale_snapshot_artifacts(active_path, true)?;
-    Ok(Some(IndexSnapshotReport {
+    Ok(IndexSnapshotReport {
         index: report,
         embeddings: embedding_report,
         embedding_deferred,
         embedding_degraded,
-    }))
+        changed_during_index,
+    })
 }
 
 pub(crate) fn index_embeddings_into_temp_store(
