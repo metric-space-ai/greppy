@@ -320,6 +320,7 @@ pub(crate) fn emit_edit_outcome(
     outcome: EditResult<EditRecord>,
     json: bool,
     report: Option<String>,
+    root_path: &std::path::Path,
 ) -> Result<i32> {
     let report_path = report.as_deref();
     match outcome {
@@ -383,7 +384,7 @@ pub(crate) fn emit_edit_outcome(
                 // address lines: a min-max span would mark untouched lines
                 // between the sites as changed, which is worse than no echo.
                 if record.published && !record.already_as_sent && record.headline.is_none() {
-                    print_landed_span(&record);
+                    print_landed_span(&record, root_path);
                 }
                 for note in &record.notes {
                     println!("{note}");
@@ -421,13 +422,13 @@ pub(crate) fn emit_edit_outcome(
 /// numbered read-file style. Only the single-file, known-span case — multi-site
 /// edits keep their per-site address lines. Long spans are elided in the
 /// middle: the evidence a verifier needs is the seams, not the body it wrote.
-fn print_landed_span(record: &super::EditRecord) {
+fn print_landed_span(record: &super::EditRecord, root_path: &std::path::Path) {
     const CONTEXT: usize = 3;
     const HEAD_TAIL: usize = 6;
     let (Some((first, last)), [file]) = (record.span, record.files.as_slice()) else {
         return;
     };
-    let Ok(content) = std::fs::read_to_string(file) else {
+    let Ok(content) = std::fs::read_to_string(root_path.join(file)) else {
         return;
     };
     let lines: Vec<&str> = content.lines().collect();
