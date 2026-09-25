@@ -106,6 +106,31 @@ fn run_with_env_and_inference(
 }
 
 #[test]
+fn browser_extra_url_is_refused_without_path_recovery_recursion() {
+    let (repo, store, _scratch) = make_repo("web-extra-url", "marker");
+    for args in [
+        vec![
+            "web",
+            "read",
+            "--url",
+            "https://one.example/",
+            "https://two.example/",
+        ],
+        vec!["web", "observe", "css=body", "https://extra.example/"],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 64, "invalid operands must not crash: {out} {err}");
+        assert!(out.len() + err.len() < 2000, "recovery must stay bounded");
+        assert!(!out.contains("using it as `--path"), "{out}");
+        assert!(!out.contains("ignoring unknown option"), "{out}");
+        assert!(
+            !store.exists(),
+            "syntax refusal must not start a graph index"
+        );
+    }
+}
+
+#[test]
 fn malformed_browser_chain_is_not_recovered_as_system_grep() {
     let (repo, store, _scratch) = make_repo("web-malformed-chain", "marker");
     let (code, out, err) = run(
