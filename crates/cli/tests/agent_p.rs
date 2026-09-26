@@ -330,72 +330,70 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
 }
 
 #[test]
-fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
-    // --deadline-secs 0 expires at loop start (Instant computed after self-check).
-    // The loop must stop with LoopStop::Deadline, print the stopped: line, and
-    // still produce the normal clean outcome (exit 0) — never discard work.
-    let repo = unique_temp("deadline-repo");
-    init_repo(&repo);
-    let store = unique_temp("deadline-store");
-    let provider_root = unique_temp("deadline-provider");
-    let provider = spawn_fake_provider(&provider_root, &repo);
-
-    let (endpoint, stop, handle) = spawn_stub_gateway();
-
-    let output = Command::new(binary_path())
-        .current_dir(&repo)
-        .env("GREPPY_STORE_DIR", &store)
-        .env("GREPPY_WORKSPACE_DIR", &provider.data)
-        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
-        .env_remove("GREPPY_MODEL")
-        .env_remove("GREPPY_ENDPOINT")
-        .env_remove("GREPPY_DEADLINE_SECS")
-        .args([
-            "-p",
-            "say hi",
-            "--model",
-            "test",
-            "--endpoint",
-            &endpoint,
-            "--max-turns",
-            "4",
-            "--deadline-secs",
-            "0",
-            // This test isolates loop deadline delivery. Base publication has
-            // its own fail-closed tests and CI fixture assets intentionally do
-            // not contain a complete embedding model.
-            "--private-store",
-            "--skip-selfcheck",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn greppy -p");
-
-    stop.store(true, Ordering::SeqCst);
-    let _ = handle.join();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stdout={stdout}\nstderr={stderr}"
-    );
-    assert!(
-        stderr.contains("stopped: wall-clock deadline reached (0s) — the result may be incomplete"),
-        "expected deadline stop line; stderr={stderr}"
-    );
-    assert!(
-        stdout.contains("no changes proposed."),
-        "deadline stop must still deliver the clean/proposal outcome: stdout={stdout}\nstderr={stderr}"
-    );
-    let _ = session_id_from_stderr(&stderr);
-
-    let _ = std::fs::remove_dir_all(&repo);
-    let _ = std::fs::remove_dir_all(&store);
-    drop(provider);
-    let _ = std::fs::remove_dir_all(&provider_root);
+fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
+    // Neither run reaches a model turn; both must retain a usable result.
+    for (limit_args, expected_stop) in [
+        (
+            vec!["--max-turns", "4", "--deadline-secs", "0"],
+            "deadline reached",
+        ),
+        (vec!["--max-turns", "0"], "turn limit reached"),
+    ] {
+        let repo = unique_temp("limited-repo");
+        init_repo(&repo);
+        let store = unique_temp("limited-store");
+        let provider_root = unique_temp("limited-provider");
+        let provider = spawn_fake_provider(&provider_root, &repo);
+        let (endpoint, stop, handle) = spawn_stub_gateway();
+        let output = Command::new(binary_path())
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_WORKSPACE_DIR", &provider.data)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_MODEL")
+            .env_remove("GREPPY_ENDPOINT")
+            .env_remove("GREPPY_DEADLINE_SECS")
+            .args([
+                "-p",
+                "say hi",
+                "--model",
+                "test",
+                "--endpoint",
+                &endpoint,
+                "--private-store",
+                "--skip-selfcheck",
+                "--json",
+            ])
+            .args(limit_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn greppy -p");
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+        let result = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "result")
+            .expect("final result must be delivered when a limit is reached");
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["exit_code"], 5);
+        assert_eq!(result["stop"], expected_stop);
+        assert_eq!(result["turns"], 0);
+        assert!(!result["session_id"].as_str().unwrap().is_empty());
+        assert_eq!(result["applied"], false);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&store);
+        drop(provider);
+        let _ = std::fs::remove_dir_all(&provider_root);
+    }
 }
 
 #[test]

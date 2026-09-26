@@ -36,6 +36,8 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_AGENT: u8 = 3;
 /// Exit: `--apply` cherry-pick conflict.
 pub const EXIT_CONFLICT: u8 = 4;
+/// Exit: the agent stopped before completing its response; proposals remain available.
+pub const EXIT_INCOMPLETE: u8 = 5;
 /// Exit: user cancelled interactive startup.
 pub const EXIT_CANCELLED: u8 = 130;
 
@@ -121,6 +123,7 @@ Exit codes:
   2  no gateway / bad usage / missing model / unsupported repository
   3  agent or loop error (worktree kept for debugging)
   4  --apply refused (dirty target) or cherry-pick conflict (ref still available)
+  5  incomplete (turn/token/deadline limit or repeated tool failures; proposal saved)
 ";
 
 /// Parsed `greppy -p` arguments (everything after the leading `-p` token).
@@ -1366,7 +1369,8 @@ fn run_agent(
     drop(stdout);
     drop(stderr);
     let cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
-    let (exit, status) = result_exit_and_status(cancelled, exit, result_status);
+    let (exit, status) =
+        result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
     if let Some(emitter) = json.as_mut() {
         emitter.session(&json_session);
         emitter.result(&crate::agent_json::JsonResult {
@@ -1489,13 +1493,21 @@ fn run_was_cancelled(stop: Option<&LoopStop>, cancel: Option<&Arc<AtomicBool>>) 
 
 fn result_exit_and_status(
     cancelled: bool,
+    stop: Option<&LoopStop>,
     exit: u8,
     ok_status: &'static str,
 ) -> (u8, &'static str) {
     if cancelled || exit == EXIT_CANCELLED {
         (EXIT_CANCELLED, "cancelled")
     } else if exit == EXIT_OK {
-        (exit, ok_status)
+        if matches!(
+            stop,
+            Some(LoopStop::MaxTurns | LoopStop::MaxTokens | LoopStop::Deadline | LoopStop::Stuck)
+        ) {
+            (EXIT_INCOMPLETE, "incomplete")
+        } else {
+            (exit, ok_status)
+        }
     } else {
         (exit, "error")
     }
@@ -3279,15 +3291,15 @@ mod tests {
     #[test]
     fn cancelled_loop_maps_to_exit_130() {
         assert_eq!(
-            result_exit_and_status(true, EXIT_OK, "clean"),
+            result_exit_and_status(true, None, EXIT_OK, "clean"),
             (EXIT_CANCELLED, "cancelled")
         );
         assert_eq!(
-            result_exit_and_status(false, EXIT_CANCELLED, "clean"),
+            result_exit_and_status(false, None, EXIT_CANCELLED, "clean"),
             (EXIT_CANCELLED, "cancelled")
         );
         assert_eq!(
-            result_exit_and_status(false, EXIT_OK, "proposal"),
+            result_exit_and_status(false, Some(&LoopStop::EndTurn), EXIT_OK, "proposal"),
             (EXIT_OK, "proposal")
         );
         let flag = Arc::new(AtomicBool::new(true));
