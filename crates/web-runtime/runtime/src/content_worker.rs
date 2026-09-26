@@ -1686,14 +1686,18 @@ impl ContentEngine {
         let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| {
             let concise = match &error {
+                servo::JavaScriptEvaluationError::CompilationFailure => Some(
+                    "page JavaScript could not be compiled; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression"
+                        .to_owned(),
+                ),
                 servo::JavaScriptEvaluationError::EvaluationFailure(Some(info)) => {
                     crate::locator_diagnostics::concise_selection_failure(&info.message)
+                        .map(str::to_owned)
                 }
                 _ => None,
             };
             io::Error::other(
                 concise
-                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("page JavaScript failed: {error:?}")),
             )
         })
