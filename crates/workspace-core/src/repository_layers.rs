@@ -1191,7 +1191,7 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(bases, vec![(ids[0].clone(), "ready".into())]);
+        assert_eq!(bases, vec![(ids[0].clone(), String::from("ready"))]);
         let entry_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM cow_repository_base_entries WHERE base_id = ?1",
