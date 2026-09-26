@@ -1983,6 +1983,7 @@ fn internal_source_search_is_literal_line_numbered_and_binary_safe() {
         "needle.*literal",
         &root,
         &["source.rs".into(), "binary.bin".into()],
+        None,
     )
     .unwrap();
     assert_eq!(hits.len(), 1);
