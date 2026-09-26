@@ -267,6 +267,15 @@ fn ensure_repository_base(
     store: &ChunkStore,
     baseline: &BaselineSnapshot,
 ) -> Result<String> {
+    ensure_repository_base_with_miss_hook(connection, store, baseline, || {})
+}
+
+fn ensure_repository_base_with_miss_hook(
+    connection: &mut Connection,
+    store: &ChunkStore,
+    baseline: &BaselineSnapshot,
+    on_miss: impl FnOnce(),
+) -> Result<String> {
     let repository = baseline
         .repository
         .to_str()
@@ -282,6 +291,7 @@ fn ensure_repository_base(
     {
         return Ok(id);
     }
+    on_miss();
 
     let base_id = format!(
         "base:{}",
@@ -298,8 +308,25 @@ fn ensure_repository_base(
     let retained = retained.into_iter().collect::<Vec<_>>();
     store.pin_many(&retained)?;
 
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let inserted = (|| -> Result<()> {
+    let installed = (|| -> Result<bool> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(id) = transaction
+            .query_row(
+                "SELECT id FROM cow_repository_bases
+                 WHERE repository = ?1 AND base_commit = ?2 AND state = 'ready'",
+                params![repository, baseline.base_commit],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if id != base_id {
+                return Err(Error::Corrupt(format!(
+                    "repository base identity mismatch: expected {base_id}, found {id}"
+                )));
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
         transaction.execute(
             "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
              VALUES(?1, ?2, ?3, 'ready')",
@@ -325,13 +352,21 @@ fn ensure_repository_base(
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     })();
-    if let Err(error) = inserted {
-        let _ = store.unpin_many(&retained);
-        return Err(error);
+    match installed {
+        Ok(true) => Ok(base_id),
+        Ok(false) => {
+            store.unpin_many(&retained)?;
+            Ok(base_id)
+        }
+        Err(error) => match store.unpin_many(&retained) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(Error::Corrupt(format!(
+                "repository base creation failed ({error}); temporary chunk-pin cleanup also failed ({cleanup})"
+            ))),
+        },
     }
-    Ok(base_id)
 }
 
 pub(crate) fn link_workspace(
@@ -954,6 +989,114 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].chunks, files[1].chunks);
         assert_eq!(store.stats().unwrap().chunk_count, 1);
+    }
+
+    #[test]
+    fn concurrent_repository_base_creation_reuses_canonical_base() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "test@example.test"],
+        );
+        git(repository.path(), &["config", "user.name", "Test"]);
+        fs::write(
+            repository.path().join("shared.txt"),
+            b"same committed content for concurrent repository bases\n",
+        )
+        .unwrap();
+        git(repository.path(), &["add", "."]);
+        git(repository.path(), &["commit", "-qm", "base"]);
+        let commit = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        let baseline = BaselineSnapshot {
+            repository: repository.path().to_path_buf(),
+            base_commit: String::from_utf8(commit.stdout).unwrap().trim().into(),
+            baseline_hash: "race-baseline".into(),
+            index_hash: "race-index".into(),
+            index_chunks: Vec::new(),
+            directories: Vec::new(),
+            entries: Vec::new(),
+            hardlink_groups: Vec::new(),
+            tracker_epoch: None,
+            tracker_generation: None,
+        };
+
+        let storage = tempfile::tempdir().unwrap();
+        let metadata_path = storage.path().join("metadata.sqlite3");
+        let connection = Connection::open(&metadata_path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        install_schema(&connection).unwrap();
+        drop(connection);
+        let chunk_root = storage.path().join("chunks");
+        drop(ChunkStore::open(&chunk_root).unwrap());
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let metadata_path = metadata_path.clone();
+                let chunk_root = chunk_root.clone();
+                let baseline = baseline.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut connection = Connection::open(metadata_path).unwrap();
+                    connection
+                        .busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    let store = ChunkStore::open(chunk_root).unwrap();
+                    ensure_repository_base_with_miss_hook(
+                        &mut connection,
+                        &store,
+                        &baseline,
+                        || {
+                            start.wait();
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+
+        let connection = Connection::open(metadata_path).unwrap();
+        let base_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cow_repository_bases",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(base_count, 1);
+        let mut statement = connection
+            .prepare("SELECT chunks_json FROM cow_repository_base_entries WHERE base_id = ?1")
+            .unwrap();
+        let entry_chunks = statement
+            .query_map(params![&ids[0]], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .map(|value| serde_json::from_slice::<Vec<ChunkId>>(&value).unwrap().len() as i64)
+            .sum::<i64>();
+        assert!(entry_chunks > 0);
+        let chunk_connection = Connection::open(chunk_root.join("chunks.sqlite3")).unwrap();
+        let retained_refs: i64 = chunk_connection
+            .query_row(
+                "SELECT COALESCE(SUM(refs), 0) FROM cow_chunks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_refs, entry_chunks);
     }
 
     #[test]
