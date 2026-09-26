@@ -572,6 +572,15 @@ fn run_agent(
         }
     };
     let shared_data_root = greppy_core::cache::data_root();
+    let deadline_total = args.deadline_secs.map(Duration::from_secs);
+    let deadline = deadline_total.map(|total| Instant::now() + total);
+    let startup_cancel = (!interactive && !serve).then(|| Arc::new(AtomicBool::new(false)));
+    #[cfg(unix)]
+    let _headless_signals = startup_cancel
+        .as_ref()
+        .map(|cancel| headless_signals::Guard::install(Arc::clone(cancel)));
+    #[cfg(not(unix))]
+    let _headless_signals = startup_cancel.as_ref().map(|_| ());
 
     // Stable and disposable agent worktrees have cache/run-id basenames that
     // are unrelated to the source repository. Pin one logical project name so
@@ -790,6 +799,8 @@ fn run_agent(
                 device: None,
                 no_gpu: false,
             },
+            deadline,
+            startup_cancel.as_deref(),
         ) {
             Ok(prepared) => {
                 if !interactive {
@@ -806,9 +817,27 @@ fn run_agent(
                 Some(prepared)
             }
             Err(error) => {
-                let message = format!(
-                    "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
-                );
+                let cancelled = startup_cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire));
+                let deadline_reached = deadline.is_some_and(|limit| Instant::now() >= limit);
+                let (exit, message) = if cancelled {
+                    (EXIT_CANCELLED, "stopped: cancelled by user".to_string())
+                } else if deadline_reached {
+                    (
+                        EXIT_INCOMPLETE,
+                        format!(
+                            "greppy -p: deadline reached while waiting for shared Base ({error})"
+                        ),
+                    )
+                } else {
+                    (
+                        EXIT_AGENT,
+                        format!(
+                            "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
+                        ),
+                    )
+                };
                 eprintln!("{message}");
                 if args.keep_worktree {
                     keep_worktree_on_error(&workspace);
@@ -820,7 +849,7 @@ fn run_agent(
                 return crate::agent_json::emit_error_result_opt(
                     json.as_mut(),
                     &json_session,
-                    EXIT_AGENT,
+                    exit,
                     &message,
                 );
             }
@@ -950,18 +979,6 @@ fn run_agent(
         }
     }
 
-    // Wall-clock Instant is computed AFTER the self-check (and after
-    // prewarm/index) so setup does not eat the budget — only the model loop
-    // does. `deadline_total` mirrors the original N so the low-time advisory
-    // can fire at 20% remaining.
-    let (deadline, deadline_total) = match args.deadline_secs {
-        Some(secs) => {
-            let total = Duration::from_secs(secs);
-            (Some(Instant::now() + total), Some(total))
-        }
-        None => (None, None),
-    };
-
     let mut config = AgentConfig {
         max_turns: args.max_turns,
         system: Some(system_prompt()),
@@ -970,21 +987,7 @@ fn run_agent(
         deadline_total,
         ..AgentConfig::default()
     };
-    #[cfg(unix)]
-    let _headless_signals = if !interactive && !serve {
-        let cancel = Arc::new(AtomicBool::new(false));
-        config.cancel = Some(Arc::clone(&cancel));
-        Some(headless_signals::Guard::install(cancel))
-    } else {
-        None
-    };
-    #[cfg(not(unix))]
-    let _headless_signals = if !interactive && !serve {
-        config.cancel = Some(Arc::new(AtomicBool::new(false)));
-        Some(())
-    } else {
-        None
-    };
+    config.cancel = startup_cancel;
 
     let repository = cwd
         .file_name()

@@ -883,7 +883,13 @@ pub(crate) fn dispatch_index_agent_worktree(
     ]
     .map(|name| (name, std::env::var_os(name)));
     let prepared_base =
-        match crate::store_cow::prepare_base_store(&workspace, &shared_data_root, embedding_args) {
+        match crate::store_cow::prepare_base_store(
+            &workspace,
+            &shared_data_root,
+            embedding_args,
+            None,
+            None,
+        ) {
             Ok(prepared) => {
                 if !cli_json_output() {
                     println!(
