@@ -264,6 +264,26 @@ pub(crate) fn embedding_config_optional(
     embedding_config_required(args).map(Some)
 }
 
+/// Resolve the daemon identity without materializing embedded assets.
+pub(crate) fn embedding_config_for_daemon_probe(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<Option<EmbeddingModelConfig>> {
+    if test_inference_skipped() {
+        return Ok(None);
+    }
+    let device = embedding_device_preference(args.device, args.no_gpu)?;
+    let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
+    Ok(Some(EmbeddingModelConfig {
+        model_id: embedded_embedding_model_id(),
+        source: EmbeddingModelSource::Gguf {
+            gguf: gguf.into(),
+            tokenizer: tokenizer.into(),
+        },
+        max_length: None,
+        device,
+    }))
+}
+
 pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>> {
     if test_inference_skipped() {
         return Ok(None);
@@ -335,7 +355,7 @@ pub(crate) fn embedding_config_required(
         None => {
             return Err(Error::Config(
                 "embedded EmbeddingGemma assets are unavailable".into(),
-            ))
+            ));
         }
     };
     let source_digest = embedding_source_content_digest(&source)?;

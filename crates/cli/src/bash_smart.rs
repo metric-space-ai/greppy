@@ -1901,14 +1901,13 @@ fn novelty_lifts(
             device: None,
             no_gpu: false,
         };
-        let Ok(Some(cfg)) = embedding_config_optional(args) else {
+        let Some(cfg) = embedding_config_if_daemon_ready_with(
+            args,
+            |probe_cfg, key| embed_daemon::status(probe_cfg, key),
+            || embedding_config_optional(args),
+        ) else {
             return Vec::new();
         };
-        let key = embedding_query_cache_key(&cfg);
-        let status = embed_daemon::status(&cfg, &key);
-        if status.get("state").and_then(serde_json::Value::as_str) != Some("ready") {
-            return Vec::new();
-        }
         let _ = root;
         let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(&cfg);
         let mut embedded = Vec::<(usize, Vec<f32>)>::new();
@@ -1938,6 +1937,34 @@ fn novelty_lifts(
         }
         rank_novelty(lines, groups, &embedded)
     }
+}
+
+#[cfg(any(unix, windows))]
+fn embedding_config_if_daemon_ready_with<S, M>(
+    args: EmbeddingCliArgs<'_>,
+    status: S,
+    materialize: M,
+) -> Option<EmbeddingModelConfig>
+where
+    S: FnOnce(&EmbeddingModelConfig, &str) -> serde_json::Value,
+    M: FnOnce() -> Result<Option<EmbeddingModelConfig>>,
+{
+    let Ok(Some(probe_cfg)) = embedding_config_for_daemon_probe(args) else {
+        return None;
+    };
+    let key = embedding_query_cache_key(&probe_cfg);
+    if status(&probe_cfg, &key)
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        != Some("ready")
+    {
+        return None;
+    }
+    let Ok(Some(cfg)) = materialize() else {
+        return None;
+    };
+    debug_assert_eq!(key, embedding_query_cache_key(&cfg));
+    Some(cfg)
 }
 
 fn rank_novelty(
@@ -2250,6 +2277,77 @@ mod tests {
                 "sampling must cover the whole log, including late anomalies"
             );
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unavailable_daemon_does_not_enter_materializing_path() {
+        let args = EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        };
+        let materialized = std::cell::Cell::new(false);
+        let cfg = embedding_config_if_daemon_ready_with(
+            args,
+            |_, _| serde_json::json!({"state": "unavailable"}),
+            || {
+                materialized.set(true);
+                embedding_config_optional(args)
+            },
+        );
+        assert!(cfg.is_none());
+        assert!(!materialized.get());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ready_daemon_preserves_materializing_novelty_path() {
+        let args = EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        };
+        let materialized = std::cell::Cell::new(false);
+        let probe = embedding_config_for_daemon_probe(args)
+            .unwrap()
+            .expect("probe config");
+        let source_digest = embedding_source_content_digest(&probe.source).unwrap();
+        let materialized_identity = EmbeddingModelConfig {
+            model_id: format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{source_digest}"),
+            source: probe.source,
+            max_length: probe.max_length,
+            device: probe.device,
+        };
+        let cfg = embedding_config_if_daemon_ready_with(
+            args,
+            |_, _| serde_json::json!({"state": "ready"}),
+            || {
+                materialized.set(true);
+                Ok(Some(materialized_identity))
+            },
+        );
+        assert!(cfg.is_some());
+        assert!(materialized.get());
+    }
+
+    #[test]
+    fn alphabetic_failed_log_fixture_reaches_novelty_candidates() {
+        let output = (0..128)
+            .map(|i| {
+                let name = (0..4)
+                    .map(|place| char::from(b'a' + ((i / 26usize.pow(place)) % 26) as u8))
+                    .collect::<String>();
+                format!("fn source_{name}() {{ error.next_action(); }}\n")
+            })
+            .collect::<String>();
+        let lines = split_lines(output.as_bytes());
+        assert!(lines.len() > SHORT_TOTAL_LINES);
+        let groups = collapse_groups(&lines);
+        assert_eq!(
+            groups.len(),
+            lines.len(),
+            "alphabetic identifiers stay distinct"
+        );
+        assert!(!novelty_candidate_indices(&groups, lines.len()).is_empty());
     }
 
     #[test]
