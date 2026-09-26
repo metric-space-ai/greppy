@@ -17,7 +17,6 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const BASE_BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -980,7 +979,7 @@ fn acquire_base_builder(
     layout: &BaseStoreLayout,
     identity_hash: &str,
     progress_path: Option<&Path>,
-    max_wait: std::time::Duration,
+    max_wait: Option<std::time::Duration>,
 ) -> Result<BaseBuilderLease> {
     let started = std::time::Instant::now();
     loop {
@@ -991,7 +990,7 @@ fn acquire_base_builder(
             return Ok(lease);
         }
         report_base_phase(progress_path, "waiting_for_base_builder");
-        if started.elapsed() >= max_wait {
+        if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
             let lock_path = layout
                 .builder_lock_path()
                 .map_err(|error| Error::io("resolve Base builder lock", error))?;
@@ -1000,7 +999,11 @@ fn acquire_base_builder(
                 lock_path.display()
             )));
         }
-        std::thread::sleep(std::time::Duration::from_millis(250).min(max_wait));
+        std::thread::sleep(
+            max_wait
+                .map(|limit| std::time::Duration::from_millis(250).min(limit))
+                .unwrap_or(std::time::Duration::from_millis(250)),
+        );
     }
 }
 
@@ -1465,12 +1468,11 @@ fn prepare_base_store_paths(
         }
     }
 
-    // Never disappear into a blocking flock behind another worktree's Base
-    // build. That build can legitimately take minutes, but this caller must
-    // remain observable and bounded so agents can retry the completed Base
-    // instead of abandoning Greppy as hung.
-    let builder_lease =
-        acquire_base_builder(&layout, &identity_hash, progress_path, BASE_BUILDER_WAIT)?;
+    // Poll rather than blocking in flock so progress remains observable. A
+    // matching live builder owns publication; wait for its OS lock to release,
+    // then validate and reuse its completed Base below. If it dies or fails,
+    // the same lock release elects this caller as the replacement builder.
+    let builder_lease = acquire_base_builder(&layout, &identity_hash, progress_path, None)?;
     if let Ok(manifest) = layout.read_verified_manifest() {
         if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
@@ -2405,7 +2407,7 @@ mod tests {
             &layout,
             &identity_hash,
             Some(&progress_path),
-            std::time::Duration::from_millis(20),
+            Some(std::time::Duration::from_millis(20)),
         ) {
             Ok(_) => panic!("second Base builder unexpectedly acquired the held lease"),
             Err(error) => error,
@@ -2428,6 +2430,40 @@ mod tests {
         assert_eq!(progress["progress_unit"], "steps");
         assert_eq!(progress["completed_spans"], 0);
         assert_eq!(progress["total_spans"], 0);
+    }
+
+    #[test]
+    fn concurrent_base_consumer_waits_for_owner_publication_lock() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let owner = layout.acquire_builder(true).unwrap().unwrap();
+        let publication = layout.directory.join("test-publication-complete");
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiting_layout = layout.clone();
+        let waiting_identity = identity_hash.clone();
+        let waiting_publication = publication.clone();
+        let waiter = std::thread::spawn(move || {
+            let lease = acquire_base_builder(&waiting_layout, &waiting_identity, None, None)
+                .expect("consumer must acquire the lifecycle lease after its owner publishes");
+            sent.send((lease, waiting_publication.is_file())).unwrap();
+        });
+
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        std::fs::create_dir_all(&layout.directory).unwrap();
+        std::fs::write(&publication, b"published").unwrap();
+        drop(owner);
+        let (consumer, observed_publication) = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("consumer did not resume after Base owner released publication lock");
+        assert!(observed_publication);
+        drop(consumer);
+        waiter.join().unwrap();
     }
 
     #[test]
