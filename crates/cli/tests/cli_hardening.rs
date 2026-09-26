@@ -3082,19 +3082,14 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
             linked.to_str().unwrap(),
         ],
     );
-    let (code, out, err) = run(
-        &["search-symbol", "clean_committed_marker"],
-        &linked,
-        &store,
-    );
-    assert_eq!(
-        code, 0,
-        "structural first use must publish before semantic refresh: {out}\n{err}"
-    );
     let delegated_ready = scratch.0.join("delegated-base-ready");
     let demand_ready = scratch.0.join("linked-demand-ready");
     let log_path = scratch.0.join("linked-query.log");
     let log = std::fs::File::create(&log_path).unwrap();
+    // Keep this as the linked worktree's cold first query. Warming the
+    // structural graph first also prepares the immutable Base; with healthy
+    // real inference assets the semantic query then correctly reuses that Base
+    // and never launches the delegated child this cancellation test exercises.
     let query = Command::new(bin())
         .args(["search", "find clean committed marker"])
         .current_dir(&linked)
