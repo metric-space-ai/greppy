@@ -74,14 +74,14 @@ fn agent_run_allows_help_without_agent_lifecycle_side_effects() {
         .stdout;
 
     for (args, expected_code, expected) in [
-        ((&["agent", "--help"])[..], 0, "Usage: greppy agent"),
-        ((&["agent", "sessions", "--help"])[..], 0, "list"),
+        (&["agent", "--help"][..], 0, "Usage: greppy agent"),
+        (&["agent", "sessions", "--help"][..], 0, "list"),
         (
-            (&["agent", "sessions", "list", "--help"])[..],
+            &["agent", "sessions", "list", "--help"][..],
             0,
             "Usage: greppy agent sessions list",
         ),
-        ((&["agent", "list", "--help"])[..], 64, "unrecognized subcommand"),
+        (&["agent", "list", "--help"][..], 64, "unrecognized subcommand"),
     ] {
         let output = Command::new(binary_path())
             .args(args)
