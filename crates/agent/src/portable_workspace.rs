@@ -3593,20 +3593,27 @@ fn filter_ignored_paths(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    {
-        let mut input = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("git check-ignore stdin unavailable"))?;
-        for path in &paths {
-            input.write_all(path.as_bytes())?;
-            input.write_all(&[0])?;
-        }
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("git check-ignore stdin unavailable"))?;
+    let mut request = Vec::new();
+    for path in &paths {
+        request.extend_from_slice(path.as_bytes());
+        request.push(0);
     }
+    // Feed stdin from its own thread: git answers while it reads, and once its
+    // answer outgrows the pipe buffer (a fresh .venv or node_modules is enough)
+    // a writer that only reads afterwards deadlocks against it.
+    let writer = std::thread::spawn(move || input.write_all(&request));
     let output = child.wait_with_output()?;
+    let written = writer
+        .join()
+        .map_err(|_| io::Error::other("git check-ignore stdin writer panicked"))?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(git_failed("git check-ignore -z --stdin", &output));
     }
+    written?;
     let ignored = output
         .stdout
         .split(|byte| *byte == 0)
@@ -3766,6 +3773,44 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
     const PROPOSAL_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_publishes_proposal";
+
+    #[test]
+    fn filtering_many_ignored_paths_does_not_deadlock_on_git_output() {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-check-ignore-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let venv = root.join(".venv");
+        fs::create_dir_all(&venv).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(venv.join(".gitignore"), "*\n").unwrap();
+        let mut paths = vec!["kept.txt".to_string()];
+        paths.extend((0..5000).map(|i| {
+            format!(".venv/lib/python3.13/site-packages/package_{i:05}/module_with_a_long_name.py")
+        }));
+        let index = root.join(".git/index");
+        let (tx, rx) = mpsc::channel();
+        let worker_root = root.clone();
+        std::thread::spawn(move || {
+            tx.send(filter_ignored_paths(&worker_root, &index, paths).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        let kept = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("filter_ignored_paths deadlocked on git check-ignore output")
+            .unwrap();
+        assert_eq!(kept, ["kept.txt"]);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn crash_child_applies_proposal() {
