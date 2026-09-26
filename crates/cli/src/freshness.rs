@@ -175,29 +175,32 @@ pub(crate) fn maybe_reindex_stale(
     store: &mut greppy_store::Store,
     root: Option<&str>,
 ) -> Result<()> {
-    maybe_reindex_stale_with_capability(store, root, true)
+    maybe_reindex_stale_with_capability(store, root, true, true)
 }
 
 pub(crate) fn maybe_reindex_stale_semantic(
     store: &mut greppy_store::Store,
     root: Option<&str>,
+    can_rebuild_vectors: bool,
 ) -> Result<()> {
-    maybe_reindex_stale_with_capability(store, root, false)
+    maybe_reindex_stale_with_capability(store, root, false, can_rebuild_vectors)
 }
 
 fn maybe_reindex_stale_with_capability(
     store: &mut greppy_store::Store,
     root: Option<&str>,
     structural_only: bool,
+    allow_auto_reindex: bool,
 ) -> Result<()> {
     // An explicit auto-reindex opt-out must fall through to the fail-closed
     // stale gate. In particular, do not wait on an active writer that the
     // caller has said must not be joined for automatic healing.
-    if !auto_reindex_enabled() {
+    if !auto_reindex_enabled() || !allow_auto_reindex {
         return Ok(());
     }
     let project = project_for(root)?;
-    if freshness_is_reindexable_stale(store, root, &project) {
+    let freshness = nav_freshness_json(store, root, &project);
+    if freshness_is_reindexable_stale(&freshness) {
         if structural_only {
             let effective_root = resolve_root(root)?;
             wait_for_index_publication(root, &effective_root, "structural-workspace-drift")?;
@@ -206,17 +209,11 @@ fn maybe_reindex_stale_with_capability(
             }
             return Ok(());
         }
-        let rebuilt = try_auto_reindex_inline(root);
+        let rebuilt =
+            freshness_within_inline_drift_cap(root, &freshness) && try_auto_reindex_inline(root);
         if !rebuilt {
-            let writer_active = workspace_writer_active(root);
-            let started = if writer_active {
-                false
-            } else {
-                spawn_background_index(root, "workspace-drift")
-            };
-            if started || writer_active || workspace_writer_active(root) {
-                wait_for_active_index_refresh(root);
-            }
+            let effective_root = resolve_root(root)?;
+            wait_for_index_publication(root, &effective_root, "workspace-drift")?;
         }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
@@ -225,128 +222,12 @@ fn maybe_reindex_stale_with_capability(
     Ok(())
 }
 
-/// An edit-owned or background indexer may already be building the exact fresh
-/// snapshot this query needs. Give a short refresh a chance to publish, but
-/// never strand a noninteractive caller behind a large repository build.
-pub(crate) fn wait_for_active_index_refresh(root: Option<&str>) {
-    let Ok(effective_root) = resolve_root(root) else {
-        return;
-    };
-    let store_path = workspace_locator::store_path(&effective_root);
-    let wait = std::time::Duration::from_secs(2);
-    eprintln!("greppy: graph refresh already running; waiting up to 2s for a fresh snapshot");
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        match greppy_freshness::try_acquire(&store_path) {
-            Ok(lock) => {
-                drop(lock);
-                // The launcher publishes its job record before the child can
-                // acquire the writer lock. During that short window the old
-                // graph still exists and the lock is momentarily free. Treating
-                // `path.exists()` as proof of publication made a stale query
-                // announce "refresh published", reopen the old generation,
-                // and fail stale again. A refresh is complete only after its
-                // owned record disappears; `BackgroundJobGuard::complete`
-                // removes it after snapshot publication.
-                if let Some(job) = read_background_job(&background_job_path(&effective_root)) {
-                    if background_refresh_is_pending(&job) && std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                    let state = job
-                        .get("state")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
-                    let error = job
-                        .get("last_error")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no error was recorded");
-                    eprintln!(
-                        "greppy: graph refresh did not publish a new snapshot — state={state}, error={error}; inspect `greppy index status --json`"
-                    );
-                    return;
-                }
-                if store_path.exists() {
-                    eprintln!("greppy: graph refresh published; resuming query");
-                    return;
-                }
-                eprintln!(
-                    "greppy: graph refresh has not published a snapshot yet; inspect `greppy index status --json`"
-                );
-                return;
-            }
-            Err(greppy_freshness::LockError::Held { .. })
-                if std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(greppy_freshness::LockError::Held { .. }) => {
-                let job = read_background_job(&background_job_path(&effective_root));
-                let phase = job
-                    .as_ref()
-                    .and_then(|value| value.get("state"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                let completed = job
-                    .as_ref()
-                    .and_then(|value| value.get("completed_spans"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                let total = job
-                    .as_ref()
-                    .and_then(|value| value.get("total_spans"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                let eta = job
-                    .as_ref()
-                    .and_then(|value| value.get("eta_seconds"))
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                eprintln!(
-                    "greppy: graph refresh still active — phase={phase}, completed={completed}/{total}, eta_seconds={eta}; returning temporary failure instead of waiting indefinitely; retry after `greppy index status --json` reports healthy=true"
-                );
-                return;
-            }
-            Err(greppy_freshness::LockError::Io { context, source }) => {
-                eprintln!(
-                    "greppy: cannot observe graph refresh ({context}: {source}); returning temporary failure; inspect `greppy index status --json`"
-                );
-                return;
-            }
-        }
-    }
-}
-
-fn background_refresh_is_pending(job: &serde_json::Value) -> bool {
-    let state = job
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    if matches!(state, "failed" | "complete") {
-        return false;
-    }
-    match job
-        .get("pid")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|pid| u32::try_from(pid).ok())
-    {
-        Some(pid) => process_is_alive(pid),
-        None => state == "launching",
-    }
-}
-
-/// The index is stale AND the drift is one an inline reindex can heal
+/// The index is stale AND the drift is one an automatic reindex can heal
 /// (workspace/content drift or a scope-stable version bump), not a cold or
-/// broken store. Used by `read` to reindex in-band before serving rather than
-/// refuse and leave the edit-loop agent empty-handed.
-pub(crate) fn freshness_is_reindexable_stale(
-    store: &greppy_store::Store,
-    root: Option<&str>,
-    project: &str,
-) -> bool {
-    let freshness = nav_freshness_json(store, root, project);
-    if freshness_json_is_fresh(&freshness) {
+/// broken store. Structural queries own publication even for large drift;
+/// semantic callers retain the bounded inline/background refresh policy.
+pub(crate) fn freshness_is_reindexable_stale(freshness: &serde_json::Value) -> bool {
+    if freshness_json_is_fresh(freshness) {
         return false;
     }
     let state = freshness
@@ -366,17 +247,24 @@ pub(crate) fn freshness_is_reindexable_stale(
                 .any(|reason| reason.contains("indexer version/scope"))
         });
     if scope_or_version_drift {
-        return version_drift_is_scope_stable(&freshness);
+        return version_drift_is_scope_stable(freshness);
     }
-    if metadata_only_fingerprint_drift(&freshness) {
+    if metadata_only_fingerprint_drift(freshness) {
         return false;
     }
     freshness
         .get("stale_file_count")
         .and_then(serde_json::Value::as_u64)
+        .is_some()
+}
+
+fn freshness_within_inline_drift_cap(root: Option<&str>, freshness: &serde_json::Value) -> bool {
+    freshness
+        .get("stale_file_count")
+        .and_then(serde_json::Value::as_u64)
         .is_some_and(|count| {
             count as usize <= AUTO_REINDEX_MAX_FILES
-                && freshness_changed_bytes(root, &freshness)
+                && freshness_changed_bytes(root, freshness)
                     .is_some_and(|bytes| bytes <= 8 * 1024 * 1024)
         })
 }
