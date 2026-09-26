@@ -23,6 +23,27 @@ pub(crate) fn dispatch_edit_inner(
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let file_base = resolve_file_operand_base(root, &root_path);
+    // Symbol selectors depend on the structural graph. Heal workspace drift
+    // before taking the edit transaction lock: structural publication owns its
+    // own workspace-store writer locks, and waiting for it while holding the
+    // edit journal lock would invert the transaction order. The resolver still
+    // re-reads the selected file and publishes with its existing CAS checks.
+    if matches!(
+        &command,
+        EditCommand::Replace { .. } | EditCommand::Delete { .. } | EditCommand::Rename { .. }
+    ) {
+        let mut store = open_default_store_query_writer(root)?;
+        maybe_reindex_stale(&mut store, root)?;
+        let project = project_for(root)?;
+        if let FreshnessServe::Refuse(freshness) =
+            freshness_serve_decision_with_policy(&store, root, &project, false, false, true)
+        {
+            return Err(Error::Index(indexed_stale_skip_message(
+                "symbol edit",
+                &freshness,
+            )));
+        }
+    }
     // All grammar verbs share pending.json and the undo stack. Hold one
     // workspace-store lock across planning, publication, rollback and close;
     // file-level CAS alone cannot protect those shared transaction records.
