@@ -2753,7 +2753,7 @@ fn large_drift_semantic_query_waits_for_vector_complete_publication() {
         result["hits"]
             .as_array()
             .is_some_and(|hits| hits.iter().any(|hit| {
-                hit["name"]
+                hit["qualified_name"]
                     .as_str()
                     .is_some_and(|name| name.contains("calculate_satellite_orbital_apogee"))
             })),
