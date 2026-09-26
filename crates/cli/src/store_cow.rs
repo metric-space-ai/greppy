@@ -2442,16 +2442,11 @@ mod tests {
         assert_eq!(progress["completed_spans"], 0);
         assert_eq!(progress["total_spans"], 0);
         drop(held);
-        let free_error = match acquire_base_builder(
-            &layout,
-            &identity_hash,
-            None,
-            Some(deadline),
-            None,
-        ) {
-            Ok(_) => panic!("expired caller acquired a free Base builder lease"),
-            Err(error) => error,
-        };
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, Some(deadline), None) {
+                Ok(_) => panic!("expired caller acquired a free Base builder lease"),
+                Err(error) => error,
+            };
         assert!(free_error
             .to_string()
             .contains("deadline reached while waiting for immutable Base"));
@@ -2476,16 +2471,11 @@ mod tests {
         assert!(message.contains("cancelled while waiting for immutable Base"));
         assert!(message.contains(&identity_hash));
         drop(held);
-        let free_error = match acquire_base_builder(
-            &layout,
-            &identity_hash,
-            None,
-            None,
-            Some(&cancel),
-        ) {
-            Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
-            Err(error) => error,
-        };
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+                Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
+                Err(error) => error,
+            };
         assert!(free_error
             .to_string()
             .contains("cancelled while waiting for immutable Base"));
@@ -2506,14 +2496,8 @@ mod tests {
         let waiting_identity = identity_hash.clone();
         let waiting_publication = publication.clone();
         let waiter = std::thread::spawn(move || {
-            let lease = acquire_base_builder(
-                &waiting_layout,
-                &waiting_identity,
-                None,
-                None,
-                None,
-            )
-            .expect("consumer must acquire the lifecycle lease after its owner publishes");
+            let lease = acquire_base_builder(&waiting_layout, &waiting_identity, None, None, None)
+                .expect("consumer must acquire the lifecycle lease after its owner publishes");
             sent.send((lease, waiting_publication.is_file())).unwrap();
         });
 
