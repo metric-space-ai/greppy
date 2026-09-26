@@ -36,7 +36,7 @@ pub(crate) fn dispatch_edit_inner(
         maybe_reindex_stale(&mut store, root)?;
         let project = project_for(root)?;
         if let FreshnessServe::Refuse(freshness) =
-            freshness_serve_decision_with_policy(&store, root, &project, false, false, true)
+            freshness_serve_decision_with_policy(&store, root, &project, true, false, true)
         {
             return Err(Error::Index(indexed_stale_skip_message(
                 "symbol edit",

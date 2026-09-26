@@ -104,6 +104,57 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn symbol_edit_repairs_metadata_only_drift_without_rebuilding_graph() {
+    let fixture = Fixture::new("metadata-symbol-refresh");
+    let source = fixture.repo.join("lib.rs");
+    std::fs::write(&source, "fn indexed_definition() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        let result = Command::new("git")
+            .args(args)
+            .current_dir(&fixture.repo)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", combined(&result));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["add", "lib.rs"]);
+    git(&["commit", "-qm", "initial"]);
+    let indexed = fixture.run(&["index", "."]);
+    assert!(indexed.status.success(), "{}", combined(&indexed));
+    let db = fixture
+        .store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&fixture.repo))
+        .join("graph.db");
+    let state = || {
+        greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only())
+            .unwrap()
+            .list_workspace_states()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    };
+    let before = state();
+    git(&["commit", "--allow-empty", "-qm", "metadata only"]);
+    let head = greppy_core::GitFingerprint::capture(&fixture.repo).head_oid;
+    assert_ne!(before.head_oid, head);
+    let planned = fixture.run(&["delete", "indexed_definition", "--dry-run"]);
+    assert!(planned.status.success(), "{}", combined(&planned));
+    assert_file(&source, "fn indexed_definition() {}\n");
+    let after = state();
+    assert_eq!(after.head_oid, head);
+    assert_eq!(after.graph_generation, before.graph_generation);
+    let deleted = fixture.run(&["delete", "indexed_definition"]);
+    assert!(deleted.status.success(), "{}", combined(&deleted));
+    assert_file(&source, "");
+}
+
+#[test]
 fn symbol_edit_refreshes_source_added_after_index_and_absent_stays_absent() {
     let fixture = Fixture::new("stale-symbol-refresh");
     let source = fixture.repo.join("lib.rs");
@@ -128,7 +179,10 @@ fn symbol_edit_refreshes_source_added_after_index_and_absent_stays_absent() {
 
     let before_absent = std::fs::read(&source).unwrap();
     let absent = fixture.run(&["delete", "genuinely_absent"]);
-    assert!(!absent.status.success(), "absent symbol unexpectedly edited");
+    assert!(
+        !absent.status.success(),
+        "absent symbol unexpectedly edited"
+    );
     assert!(
         combined(&absent).contains("no symbol `genuinely_absent`"),
         "unexpected absent-symbol diagnostic: {}",
