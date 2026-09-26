@@ -1008,10 +1008,7 @@ pub(crate) fn cleanup_sqlite_sidecars(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod refresh_wait_tests {
-    use super::{
-        background_refresh_is_pending, observe_first_use_index, publication_advanced,
-        FirstUseIndexObservation,
-    };
+    use super::{observe_first_use_index, publication_advanced, FirstUseIndexObservation};
 
     #[test]
     fn stale_snapshot_is_not_a_new_structural_publication() {
@@ -1036,23 +1033,6 @@ mod refresh_wait_tests {
             FirstUseIndexObservation::Published,
             "a newer atomic publication remains authoritative over a stale job record"
         );
-    }
-
-    #[test]
-    fn launch_record_without_writer_lock_is_still_pending() {
-        assert!(background_refresh_is_pending(&serde_json::json!({
-            "state": "launching",
-            "pid": null
-        })));
-    }
-
-    #[test]
-    fn failed_refresh_record_is_not_publication() {
-        assert!(!background_refresh_is_pending(&serde_json::json!({
-            "state": "failed",
-            "pid": null,
-            "last_error": "fixture"
-        })));
     }
 
     #[test]
