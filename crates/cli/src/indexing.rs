@@ -1080,12 +1080,23 @@ pub(crate) fn dispatch_index(
     let had_overlay_binding = embedding_job
         && crate::store_cow::overlay_environment_for_recovery(&effective_root)?.is_some();
     let _embedding_overlay = if embedding_job {
-        crate::store_cow::prepare_auto_linked_worktree_overlay(
+        match crate::store_cow::prepare_auto_linked_worktree_overlay(
             &effective_root,
             &greppy_core::cache::data_root(),
             embedding_args,
             background_job.progress_path(),
-        )?
+        ) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                // Preparing a linked Base can own a delegated child. Demand
+                // cancellation closes that child's owner pipe and records the
+                // terminal reason before this error returns; route it through
+                // the guard so cancellation is not overwritten by Drop's
+                // generic unsuccessful-publication failure.
+                background_job.fail(&error);
+                return Err(error);
+            }
+        }
     } else {
         None
     };
