@@ -3600,7 +3600,18 @@ fn git_compatible_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
             return Ok(PathBuf::from(format!(r"\\{rest}")));
         }
         if let Some(rest) = text.strip_prefix(r"\\?\") {
-            return Ok(PathBuf::from(rest));
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+            {
+                return Ok(PathBuf::from(rest));
+            }
+            return Err(WorkspaceError::Unsupported(format!(
+                "unsupported Windows verbatim path for Git: {}",
+                path.display()
+            )));
         }
     }
     Ok(path.to_path_buf())
@@ -4449,7 +4460,13 @@ mod tests {
         let repository = fs::canonicalize(repository.parent().unwrap())
             .unwrap()
             .join("repo");
+        let worktree = fs::canonicalize(&worktree).unwrap();
+        let index = fs::canonicalize(index.parent().unwrap())
+            .unwrap()
+            .join("seed.index");
         assert!(path_text(&repository).unwrap().starts_with(r"\\?\"));
+        assert!(path_text(&worktree).unwrap().starts_with(r"\\?\"));
+        assert!(path_text(&index).unwrap().starts_with(r"\\?\"));
 
         init_bare(&repository, "sha1").unwrap();
         configure_git_control_template(&repository).unwrap();
@@ -4485,6 +4502,13 @@ mod tests {
             git_compatible_path(Path::new(r"C:\provider-data\g\sl1\repo")).unwrap(),
             PathBuf::from(r"C:\provider-data\g\sl1\repo")
         );
+        let unsupported = git_compatible_path(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\repo",
+        ))
+        .unwrap_err();
+        assert!(unsupported
+            .to_string()
+            .contains("unsupported Windows verbatim path for Git"));
     }
 
     #[test]
