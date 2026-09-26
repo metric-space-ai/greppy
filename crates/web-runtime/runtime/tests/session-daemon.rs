@@ -7422,7 +7422,10 @@ fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
         json!({"session_id":session,"source":"40 + 2"}),
     );
     assert_eq!(valid.status, "ok", "{valid:?}");
-    assert_eq!(valid.result.as_ref().unwrap()["value"], 42);
+    assert_eq!(
+        valid.result.as_ref().unwrap()["value"].as_f64(),
+        Some(42.0)
+    );
 }
 
 #[test]
