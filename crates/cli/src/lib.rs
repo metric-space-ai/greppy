@@ -4208,12 +4208,23 @@ fn delegated_base_owner_starting() -> bool {
     DELEGATED_BASE_STARTING.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn cancel_delegated_base_owner() -> bool {
-    DELEGATED_BASE_OWNER
+fn cancel_delegated_base_owner(demand_cancelled: bool) -> bool {
+    let owner = DELEGATED_BASE_OWNER
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .take()
-        .is_some()
+        .take();
+    if owner.is_none() {
+        return false;
+    }
+    // Publish the terminal reason before dropping the pipe writer. EOF wakes
+    // the delegated child and can make the indexing thread reach `fail()`
+    // immediately; recording cancellation afterwards races with that path and
+    // mislabels a demand-driven stop as a background-index failure.
+    if demand_cancelled {
+        BACKGROUND_DEMAND_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    drop(owner);
+    true
 }
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
@@ -4277,9 +4288,7 @@ fn start_background_demand_monitor(
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
-                    if cancel_delegated_base_owner() {
-                        BACKGROUND_DEMAND_CANCELLED
-                            .store(true, std::sync::atomic::Ordering::Release);
+                    if cancel_delegated_base_owner(true) {
                         if let Some(mut job) = job {
                             job["state"] = serde_json::json!("cancelled");
                             job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
@@ -4320,7 +4329,7 @@ fn start_background_demand_monitor(
                         continue;
                     }
                     let message = format!("automatic index demand monitor failed: {error}");
-                    if cancel_delegated_base_owner() {
+                    if cancel_delegated_base_owner(false) {
                         if let Some(mut job) = job {
                             job["state"] = serde_json::json!("failed");
                             job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
