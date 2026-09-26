@@ -664,12 +664,10 @@ mod tests {
     #[test]
     fn unknown_local_total_is_explicit() {
         let mut reporter = ProgressReporter::default();
+        let mut discovering = job("discovering_files", 0, 0);
+        discovering.unit = "files".into();
         let line = reporter
-            .observe(
-                "search-pattern",
-                Some(job("discovering_files", 0, 0)),
-                Duration::from_secs(2),
-            )
+            .observe("search-pattern", Some(discovering), Duration::from_secs(2))
             .unwrap();
         assert!(line.contains("files total unknown"), "{line}");
         assert!(
