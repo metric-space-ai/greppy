@@ -606,6 +606,39 @@ pub(crate) fn resolve_root(root: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(workspace_locator::resolve_workspace_root(&cwd))
 }
 
+/// Base used to join user-provided file operands.
+///
+/// [`resolve_root`] remains the workspace identity: graph/store, edit
+/// transaction locks, journal, undo, verification, containment, receipts,
+/// handles and continuation packs. An explicit `--root` inside a repository
+/// is still promoted there. File operands must not follow that promotion —
+/// `--root R/etc` plus `probe.conf` means `R/etc/probe.conf`, not
+/// `R/probe.conf`.
+///
+/// When `--root` is omitted the file operand base is the workspace root, so
+/// existing repository-relative behavior is unchanged.
+pub(crate) fn resolve_file_operand_base(
+    root: Option<&str>,
+    workspace_root: &std::path::Path,
+) -> std::path::PathBuf {
+    match root {
+        Some(r) => absolutize_path(std::path::Path::new(r)),
+        None => workspace_root.to_path_buf(),
+    }
+}
+
+/// Join a user-provided file operand to the file operand base.
+/// Absolute operands stay absolute so relative `../` traversal can still be
+/// refused separately from explicit diagnostic paths.
+pub(crate) fn file_operand_path(file_base: &std::path::Path, file: &str) -> std::path::PathBuf {
+    let supplied = std::path::Path::new(file);
+    if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        file_base.join(supplied)
+    }
+}
+
 /// The flag clap rejected, e.g. `--regex` from `unexpected argument '--regex' found`.
 pub(crate) fn unknown_flag_name(clap_message: &str) -> Option<String> {
     let unknown = clap_message
@@ -847,5 +880,55 @@ mod positional_recovery_tests {
         .unwrap();
         assert_eq!(stray, "parse_path");
         assert_eq!(repaired, &argv[..2]);
+    }
+}
+
+#[cfg(test)]
+mod file_operand_base_tests {
+    use super::*;
+
+    fn workspace_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("etc");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        (dir, repo, nested)
+    }
+
+    #[test]
+    fn explicit_subdirectory_root_keeps_workspace_identity_and_a_separate_file_base() {
+        let (_dir, repo, nested) = workspace_fixture();
+        let nested_slash = format!("{}/", nested.display());
+        for explicit in [nested.to_str().unwrap(), nested_slash.as_str()] {
+            let workspace = resolve_root(Some(explicit)).unwrap();
+            assert_eq!(workspace, repo.canonicalize().unwrap());
+            let file_base = resolve_file_operand_base(Some(explicit), &workspace);
+            assert_eq!(file_base, nested.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn omitted_root_uses_the_workspace_for_file_operands() {
+        let (_dir, repo, _nested) = workspace_fixture();
+        let workspace = repo.canonicalize().unwrap();
+        let file_base = resolve_file_operand_base(None, &workspace);
+        assert_eq!(file_base, workspace);
+        assert_eq!(
+            resolve_root(Some(repo.to_str().unwrap())).unwrap(),
+            workspace
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_spelling_of_an_explicit_root_canonicalizes_the_file_base() {
+        let (_dir, repo, nested) = workspace_fixture();
+        let link = repo.join("etc-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        let workspace = resolve_root(Some(link.to_str().unwrap())).unwrap();
+        assert_eq!(workspace, repo.canonicalize().unwrap());
+        let file_base = resolve_file_operand_base(Some(link.to_str().unwrap()), &workspace);
+        assert_eq!(file_base, nested.canonicalize().unwrap());
     }
 }

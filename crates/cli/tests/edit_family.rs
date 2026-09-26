@@ -39,8 +39,25 @@ impl Fixture {
         command
     }
 
+    fn command_in(&self, cwd: &Path) -> Command {
+        let mut command = Command::new(bin());
+        command
+            .current_dir(cwd)
+            .env("GREPPY_STORE_DIR", &self.store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1");
+        command
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.command()
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run greppy")
+    }
+
+    fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.command_in(cwd)
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -84,6 +101,58 @@ fn combined(output: &Output) -> String {
 
 fn assert_file(path: &Path, expected: &str) {
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+}
+
+fn nested_collision(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    std::fs::write(fixture.base.join("probe.conf"), "CWD_SENTINEL\n").unwrap();
+    std::fs::write(fixture.repo.join("probe.conf"), "REPO_SENTINEL\n").unwrap();
+    let nested = fixture.repo.join("etc");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("probe.conf"), "SUBDIR_SENTINEL\n").unwrap();
+    (fixture.base.clone(), nested)
+}
+
+fn assert_collision_untouched(fixture: &Fixture, nested: &Path, nested_expected: &str) {
+    assert_file(&fixture.base.join("probe.conf"), "CWD_SENTINEL\n");
+    assert_file(&fixture.repo.join("probe.conf"), "REPO_SENTINEL\n");
+    assert_file(&nested.join("probe.conf"), nested_expected);
+}
+
+#[test]
+fn edit_preview_reads_the_explicit_root_instead_of_cwd() {
+    let fixture = Fixture::new("preview-explicit-root");
+    let target = fixture.repo.join("target-repo");
+    std::fs::create_dir_all(target.join(".git")).unwrap();
+    std::fs::write(fixture.repo.join("same.txt"), "CWD_SENTINEL\n").unwrap();
+    for relative in [false, true] {
+        let root = if relative {
+            "target-repo"
+        } else {
+            target.to_str().unwrap()
+        };
+        let output = fixture.run(&["--root", root, "write", "same.txt", "TARGET_WRITE\n"]);
+        assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+        let text = combined(&output);
+        assert!(text.contains("TARGET_WRITE"), "{text}");
+        assert!(!text.contains("CWD_SENTINEL"), "{text}");
+        assert_file(&target.join("same.txt"), "TARGET_WRITE\n");
+        assert_file(&fixture.repo.join("same.txt"), "CWD_SENTINEL\n");
+
+        let output = fixture.run(&[
+            "--root",
+            root,
+            "replace-text",
+            "same.txt",
+            "TARGET_WRITE",
+            "TARGET_REPLACED",
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+        let text = combined(&output);
+        assert!(text.contains("TARGET_REPLACED"), "{text}");
+        assert!(!text.contains("CWD_SENTINEL"), "{text}");
+        assert_file(&target.join("same.txt"), "TARGET_REPLACED\n");
+        assert_file(&fixture.repo.join("same.txt"), "CWD_SENTINEL\n");
+    }
 }
 
 #[test]
@@ -499,4 +568,309 @@ fn dead_edit_prefix_is_refused_and_double_dash_preserves_hyphen_payloads() {
     assert!(written.status.success(), "{receipt}");
     assert!(receipt.starts_with("applied -name.txt:1  "), "{receipt}");
     assert_file(&fixture.repo.join("-name.txt"), "-payload");
+}
+
+#[test]
+fn nested_root_file_edits_select_the_subdir_not_cwd_or_repo_sentinels() {
+    let fixture = Fixture::new("nested-root-edits");
+    let (cwd, nested) = nested_collision(&fixture);
+    let absolute = nested.to_str().unwrap();
+    let trailing = format!("{absolute}/");
+    let mut roots = vec![
+        ("absolute", absolute.to_string()),
+        ("relative", "repo/etc".to_string()),
+        ("trailing-slash", trailing),
+    ];
+    #[cfg(unix)]
+    {
+        let link = cwd.join("etc-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        roots.push(("symlink", "etc-link".to_string()));
+    }
+
+    let first_root = roots[0].1.clone();
+    let dry_once = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            &first_root,
+            "replace-text",
+            "probe.conf",
+            "SUBDIR_SENTINEL",
+            "DRY_RUN",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(dry_once.status.code(), Some(0), "{}", combined(&dry_once));
+    assert_collision_untouched(&fixture, &nested, "SUBDIR_SENTINEL\n");
+    let undo_after_dry = fixture.run(&["undo"]);
+    let undo_dry_text = combined(&undo_after_dry);
+    assert!(
+        undo_dry_text.contains("nothing to undo"),
+        "dry-run must not journal: {undo_dry_text}"
+    );
+
+    for (label, root) in &roots {
+        std::fs::write(nested.join("probe.conf"), "SUBDIR_SENTINEL\n").unwrap();
+        let dry = fixture.run_in(
+            &cwd,
+            &[
+                "--root",
+                root,
+                "replace-text",
+                "probe.conf",
+                "SUBDIR_SENTINEL",
+                "DRY_RUN",
+                "--dry-run",
+            ],
+        );
+        let dry_text = combined(&dry);
+        assert_eq!(dry.status.code(), Some(0), "{label}: {dry_text}");
+        assert!(
+            dry_text.contains("would apply etc/probe.conf"),
+            "{label}: {dry_text}"
+        );
+        assert!(!dry_text.contains("CWD_SENTINEL"), "{label}: {dry_text}");
+        assert!(!dry_text.contains("REPO_SENTINEL"), "{label}: {dry_text}");
+        assert_collision_untouched(&fixture, &nested, "SUBDIR_SENTINEL\n");
+
+        let applied = fixture.run_in(
+            &cwd,
+            &[
+                "--root",
+                root,
+                "replace-text",
+                "probe.conf",
+                "SUBDIR_SENTINEL",
+                "SUBDIR_REPLACED",
+            ],
+        );
+        let applied_text = combined(&applied);
+        assert_eq!(applied.status.code(), Some(0), "{label}: {applied_text}");
+        assert!(
+            applied_text.contains("etc/probe.conf"),
+            "{label}: {applied_text}"
+        );
+        assert!(
+            applied_text.contains("SUBDIR_REPLACED"),
+            "{label}: {applied_text}"
+        );
+        assert!(
+            !applied_text.contains("CWD_SENTINEL"),
+            "{label}: {applied_text}"
+        );
+        assert!(
+            !applied_text.contains("REPO_SENTINEL"),
+            "{label}: {applied_text}"
+        );
+        assert_collision_untouched(&fixture, &nested, "SUBDIR_REPLACED\n");
+
+        std::fs::write(nested.join("probe.conf"), "line-one\nline-two\n").unwrap();
+        let lines = fixture.run_in(
+            &cwd,
+            &[
+                "--root",
+                root,
+                "replace-lines",
+                "probe.conf",
+                "1:1",
+                "LINE-ONE",
+            ],
+        );
+        assert_eq!(
+            lines.status.code(),
+            Some(0),
+            "{label}: {}",
+            combined(&lines)
+        );
+        assert!(
+            combined(&lines).contains("etc/probe.conf"),
+            "{}",
+            combined(&lines)
+        );
+        assert_file(&nested.join("probe.conf"), "LINE-ONE\nline-two\n");
+        assert_file(&fixture.repo.join("probe.conf"), "REPO_SENTINEL\n");
+
+        let inserted = fixture.run_in(
+            &cwd,
+            &[
+                "--root",
+                root,
+                "insert-lines",
+                "probe.conf",
+                "0",
+                "INSERTED",
+            ],
+        );
+        assert_eq!(
+            inserted.status.code(),
+            Some(0),
+            "{label}: {}",
+            combined(&inserted)
+        );
+        assert_file(&nested.join("probe.conf"), "INSERTED\nLINE-ONE\nline-two\n");
+
+        let deleted = fixture.run_in(&cwd, &["--root", root, "delete-lines", "probe.conf", "1:1"]);
+        assert_eq!(
+            deleted.status.code(),
+            Some(0),
+            "{label}: {}",
+            combined(&deleted)
+        );
+        assert_file(&nested.join("probe.conf"), "LINE-ONE\nline-two\n");
+
+        let written = fixture.run_in(
+            &cwd,
+            &["--root", root, "write", "created.conf", "CREATED\n"],
+        );
+        let written_text = combined(&written);
+        assert_eq!(written.status.code(), Some(0), "{label}: {written_text}");
+        assert!(
+            written_text.contains("etc/created.conf"),
+            "{label}: {written_text}"
+        );
+        assert_file(&nested.join("created.conf"), "CREATED\n");
+        assert!(!cwd.join("created.conf").exists());
+        assert!(!fixture.repo.join("created.conf").exists());
+        std::fs::remove_file(nested.join("created.conf")).unwrap();
+    }
+
+    std::fs::remove_file(nested.join("probe.conf")).unwrap();
+    let missing = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "replace-text",
+            "probe.conf",
+            "REPO_SENTINEL",
+            "SHOULD_NOT",
+        ],
+    );
+    let missing_text = combined(&missing);
+    assert_ne!(missing.status.code(), Some(0), "{missing_text}");
+    assert!(
+        missing_text.contains("no file `probe.conf`"),
+        "{missing_text}"
+    );
+    assert_file(&fixture.repo.join("probe.conf"), "REPO_SENTINEL\n");
+    assert_file(&cwd.join("probe.conf"), "CWD_SENTINEL\n");
+}
+
+#[test]
+fn nested_root_patch_stays_atomic_and_workspace_relative() {
+    let fixture = Fixture::new("nested-root-patch");
+    let (cwd, nested) = nested_collision(&fixture);
+    std::fs::write(nested.join("first.txt"), "one\n").unwrap();
+    std::fs::write(nested.join("second.txt"), "two\n").unwrap();
+    std::fs::write(fixture.repo.join("first.txt"), "REPO_FIRST\n").unwrap();
+    std::fs::write(fixture.repo.join("second.txt"), "REPO_SECOND\n").unwrap();
+    let root = nested.to_str().unwrap();
+
+    let ok = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            root,
+            "patch",
+            "--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n",
+        ],
+    );
+    let ok_text = combined(&ok);
+    assert_eq!(ok.status.code(), Some(0), "{ok_text}");
+    assert!(ok_text.contains("etc/first.txt"), "{ok_text}");
+    assert!(ok_text.contains("etc/second.txt"), "{ok_text}");
+    assert_file(&nested.join("first.txt"), "ONE\n");
+    assert_file(&nested.join("second.txt"), "TWO\n");
+    assert_file(&fixture.repo.join("first.txt"), "REPO_FIRST\n");
+    assert_file(&fixture.repo.join("second.txt"), "REPO_SECOND\n");
+
+    std::fs::write(nested.join("first.txt"), "one\n").unwrap();
+    std::fs::write(nested.join("second.txt"), "two\n").unwrap();
+    let failed = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            root,
+            "patch",
+            "--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-one\n+ONE\n--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-missing\n+TWO\n",
+        ],
+    );
+    let failed_text = combined(&failed);
+    assert_eq!(failed.status.code(), Some(13), "{failed_text}");
+    assert!(failed_text.contains("nothing written"), "{failed_text}");
+    assert_file(&nested.join("first.txt"), "one\n");
+    assert_file(&nested.join("second.txt"), "two\n");
+    assert_file(&fixture.repo.join("first.txt"), "REPO_FIRST\n");
+}
+
+#[test]
+fn undo_from_repo_root_reverses_a_nested_root_edit() {
+    let fixture = Fixture::new("nested-root-undo");
+    let (cwd, nested) = nested_collision(&fixture);
+    let output = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "replace-text",
+            "probe.conf",
+            "SUBDIR_SENTINEL",
+            "SUBDIR_EDITED",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", combined(&output));
+    assert_collision_untouched(&fixture, &nested, "SUBDIR_EDITED\n");
+
+    let undone = fixture.run(&["undo"]);
+    let undone_text = combined(&undone);
+    assert_eq!(undone.status.code(), Some(0), "{undone_text}");
+    assert!(undone_text.contains("etc/probe.conf"), "{undone_text}");
+    assert_collision_untouched(&fixture, &nested, "SUBDIR_SENTINEL\n");
+}
+
+#[test]
+fn nested_root_read_handle_drives_replace_span() {
+    let fixture = Fixture::new("nested-root-handle");
+    let (cwd, nested) = nested_collision(&fixture);
+    let read = fixture.run_in(
+        &cwd,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "probe.conf",
+            "--handle",
+            "--all",
+        ],
+    );
+    let read_text = combined(&read);
+    assert_eq!(read.status.code(), Some(0), "{read_text}");
+    assert!(read_text.contains("etc/probe.conf"), "{read_text}");
+    assert!(read_text.contains("SUBDIR_SENTINEL"), "{read_text}");
+    assert!(!read_text.contains("CWD_SENTINEL"), "{read_text}");
+    assert!(!read_text.contains("REPO_SENTINEL"), "{read_text}");
+    let handle = read_text
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .expect("read-file handle");
+
+    let replaced = fixture.run(&["replace-span", handle, "FROM_HANDLE\n"]);
+    let replaced_text = combined(&replaced);
+    assert_eq!(replaced.status.code(), Some(0), "{replaced_text}");
+    assert_collision_untouched(&fixture, &nested, "FROM_HANDLE\n");
+}
+
+#[test]
+fn omitted_root_keeps_repo_relative_file_operands() {
+    let fixture = Fixture::new("omitted-root-legacy");
+    let (_cwd, nested) = nested_collision(&fixture);
+    let output = fixture.run(&["replace-text", "probe.conf", "REPO_SENTINEL", "REPO_EDITED"]);
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("applied probe.conf"), "{text}");
+    assert!(!text.contains("etc/probe.conf"), "{text}");
+    assert_file(&fixture.repo.join("probe.conf"), "REPO_EDITED\n");
+    assert_file(&nested.join("probe.conf"), "SUBDIR_SENTINEL\n");
+    assert_file(&fixture.base.join("probe.conf"), "CWD_SENTINEL\n");
 }
