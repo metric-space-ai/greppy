@@ -3143,7 +3143,12 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
     wait_for_process_exit(delegated_pid);
     let cancelled: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
-    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(
+        cancelled["state"],
+        "cancelled",
+        "delegated cancellation recorded the wrong terminal state; job={cancelled}; query_log={}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
 }
 
 #[cfg(unix)]
