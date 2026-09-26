@@ -2584,8 +2584,8 @@ fn index_publishes_graph_when_embedding_backend_is_unavailable() {
 
 #[cfg(unix)]
 #[test]
-fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
-    let (repo, store, _scratch) = make_repo("large-drift-job", "old_large_drift_marker");
+fn concurrent_large_drift_queries_share_one_refresh_and_return_fresh_graph() {
+    let (repo, store, scratch) = make_repo("large-drift-job", "old_large_drift_marker");
     for index in 0..11 {
         std::fs::write(
             repo.join(format!("extra-{index}.rs")),
@@ -2608,83 +2608,180 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         .unwrap();
     }
 
-    let ready = store.join("background-ready");
-    let ready_string = ready.to_string_lossy().into_owned();
-    let envs = [
-        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
-        ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
-        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
-    ];
-    let (code, out, err) = run_with_env(
-        &[
-            "search-symbol",
-            "--json",
-            "--diagnostics",
-            "old_large_drift_marker",
-        ],
-        &repo,
-        &store,
-        &envs,
-    );
-    assert_eq!(
-        code, 75,
-        "a refresh in flight is retryable, not a permanent miss; stderr={err}"
-    );
-    let first: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(first["freshness"]["state"], "refreshing");
-    assert!(first["hits"].as_array().unwrap().is_empty());
-
+    let ready = scratch.0.join("large-drift-ready");
+    let release = scratch.0.join("large-drift-release");
+    let spawn = |symbol: &str, demand_ready: &Path| {
+        let mut command = Command::new(bin());
+        command
+            .args(["search-symbol", symbol])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        ReapedQuery::new(command.spawn().expect("spawn large-drift query"))
+    };
+    let first_demand = scratch.0.join("large-drift-first-demand");
+    let second_demand = scratch.0.join("large-drift-second-demand");
+    let mut first = spawn("changed_extra_10", &first_demand);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() {
+    while !ready.exists() || !first_demand.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
         assert!(
             std::time::Instant::now() < deadline,
-            "background index never reached publish failpoint"
+            "large-drift writer did not reach publication hold"
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let job_path = db.parent().unwrap().join("index.job");
     let first_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let pid = first_job["pid"].as_u64().expect("background pid") as u32;
     assert_eq!(first_job["state"], "syncing_snapshot");
-    assert_eq!(first_job["completed_spans"], 0);
-    assert_eq!(first_job["total_spans"], 0);
-    assert_eq!(first_job["progress_unit"], "steps");
 
-    let (code, out, err) = run_with_env(
-        &[
-            "search-symbol",
-            "--json",
-            "--diagnostics",
-            "old_large_drift_marker",
-        ],
-        &repo,
-        &store,
-        &envs,
-    );
-    assert_eq!(
-        code, 75,
-        "second stale query stays a retryable refusal while the same refresh runs; stderr={err}"
-    );
-    let second: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(second["freshness"]["state"], "refreshing");
-    assert!(second["hits"].as_array().unwrap().is_empty());
+    let mut second = spawn("changed_extra_9", &second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second large-drift query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let second_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     assert_eq!(second_job["pid"].as_u64(), Some(pid as u64));
+    assert!(process_is_running(pid), "shared refresh must remain alive");
     assert_eq!(
         std::fs::read(&db).unwrap(),
         active_before,
-        "queries and paused background writer must not mutate active graph.db"
+        "the paused writer must not mutate the active graph before atomic publication"
     );
 
-    let status = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .expect("kill background index");
+    std::fs::write(&release, b"release\n").unwrap();
+    let first = first.wait_with_output(std::time::Duration::from_secs(15));
+    let second = second.wait_with_output(std::time::Duration::from_secs(15));
     assert!(
-        status.success(),
-        "background index process must be killable"
+        first.status.success(),
+        "first query failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second query failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("changed_extra_10"),
+        "first query did not return the newly published symbol: {first:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("changed_extra_9"),
+        "second query did not return the newly published symbol: {second:?}"
+    );
+    assert!(
+        !job_path.exists(),
+        "successful publication must remove index.job"
+    );
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn large_drift_semantic_query_waits_for_vector_complete_publication() {
+    let (repo, store, _scratch) = make_repo("large-semantic-drift", "old_semantic_marker");
+    for index in 0..11 {
+        std::fs::write(
+            repo.join(format!("semantic-{index}.rs")),
+            format!("pub fn initial_semantic_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    let (code, out, err) = run_with_inference(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial vector index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("initial semantic graph");
+    let initial_generation = greppy_store::Store::open(&db)
+        .unwrap()
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("initial workspace state")
+        .graph_generation;
+
+    for index in 0..11 {
+        let source = if index == 10 {
+            "/// Calculate a spacecraft's orbital apogee from telemetry radius and planet radius.\n\
+             pub fn calculate_satellite_orbital_apogee(telemetry_radius: f64, planet_radius: f64) -> f64 {\n\
+                 telemetry_radius - planet_radius\n\
+             }\n"
+                .to_owned()
+        } else {
+            format!(
+                "pub fn changed_semantic_{index}() -> usize {{ {} }}\n",
+                index + 1
+            )
+        };
+        std::fs::write(repo.join(format!("semantic-{index}.rs")), source).unwrap();
+    }
+    let (code, out, err) = run_with_inference(
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "calculate spacecraft orbital apogee from telemetry and planet radius",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "semantic query must own the large-drift vector publication: {out}\n{err}"
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|error| panic!("invalid JSON: {error}; {out}"));
+    assert_eq!(result["fresh"], true, "{result}");
+    assert!(
+        result["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().any(|hit| {
+                hit["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("calculate_satellite_orbital_apogee"))
+            })),
+        "semantic query did not use the newly published vector generation: {result}"
+    );
+    assert!(
+        !out.contains("initial_semantic_"),
+        "fresh semantic results must not expose names from the stale generation: {out}"
+    );
+    let refreshed = greppy_store::Store::open(&db).unwrap();
+    let refreshed_generation = refreshed
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("refreshed workspace state")
+        .graph_generation;
+    assert!(
+        refreshed_generation > initial_generation,
+        "large drift must publish a new graph generation"
+    );
+    drop(refreshed);
+    let (status_code, status_out, status_err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(status_code, 0, "{status_out}\n{status_err}");
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["healthy"], true, "{status}");
+    assert_eq!(status["embedding_complete"], true, "{status}");
+    assert!(
+        !db.parent().unwrap().join("index.job").exists(),
+        "completed semantic refresh must remove index.job"
     );
 }
 
@@ -2862,6 +2959,48 @@ fn signal_process(pid: u32, signal: libc::c_int) {
 }
 
 #[cfg(unix)]
+struct ReapedQuery(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl ReapedQuery {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.as_mut().expect("query child").try_wait()
+    }
+
+    fn wait_with_output(mut self, timeout: std::time::Duration) -> std::process::Output {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "query did not finish within {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.0
+            .take()
+            .expect("query child")
+            .wait_with_output()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReapedQuery {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
     let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
     unsafe { libc::kill(pid, 0) == 0 }
@@ -2931,15 +3070,6 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
 #[cfg(all(unix, not(feature = "ci-test-assets")))]
 #[test]
 fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
-    struct ReapedQuery(std::process::Child);
-    impl Drop for ReapedQuery {
-        fn drop(&mut self) {
-            if self.0.try_wait().ok().flatten().is_none() {
-                let _ = self.0.kill();
-            }
-            let _ = self.0.wait();
-        }
-    }
     let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
     let linked = scratch.0.join("linked");
     git(
@@ -2977,11 +3107,11 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
         .stderr(log)
         .spawn()
         .expect("spawn linked first-use query");
-    let mut query = ReapedQuery(query);
+    let mut query = ReapedQuery::new(query);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !delegated_ready.exists() || !demand_ready.exists() {
         assert!(
-            query.0.try_wait().unwrap().is_none(),
+            query.try_wait().unwrap().is_none(),
             "query exited early: {}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
         );
@@ -3008,8 +3138,8 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
-    signal_process(query.0.id(), libc::SIGKILL);
-    let status = query.0.wait().unwrap();
+    signal_process(query.0.as_ref().expect("query child").id(), libc::SIGKILL);
+    let status = query.0.take().expect("query child").wait().unwrap();
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGKILL)
