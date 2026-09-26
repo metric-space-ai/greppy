@@ -3690,6 +3690,7 @@ fn filter_ignored_paths(
 }
 
 const WEB_CURRENT_SCOPE_PATH: &str = ".greppy/web/current.json";
+const WEB_CURRENT_SCOPE_ANCESTORS: [&str; 2] = [".greppy", ".greppy/web"];
 
 fn filter_agent_owned_ephemeral_paths(
     worktree: &Path,
@@ -3714,7 +3715,9 @@ fn filter_agent_owned_ephemeral_paths(
         ],
     )?;
     if baseline_entry.trim().is_empty() {
-        paths.retain(|path| path != WEB_CURRENT_SCOPE_PATH);
+        paths.retain(|path| {
+            path != WEB_CURRENT_SCOPE_PATH && !WEB_CURRENT_SCOPE_ANCESTORS.contains(&path.as_str())
+        });
     }
     Ok(paths)
 }
@@ -3956,6 +3959,8 @@ mod tests {
         git(root.path(), &["commit", "--allow-empty", "-q", "-m", "empty"]);
         let empty_tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
         let changed = vec![
+            ".greppy".to_string(),
+            ".greppy/web".to_string(),
             WEB_CURRENT_SCOPE_PATH.to_string(),
             "WEB_REPORT.md".to_string(),
         ];
@@ -3975,7 +3980,12 @@ mod tests {
         let user_tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
         assert_eq!(
             filter_agent_owned_ephemeral_paths(root.path(), &user_tree, changed).unwrap(),
-            [WEB_CURRENT_SCOPE_PATH, "WEB_REPORT.md"]
+            [
+                ".greppy",
+                ".greppy/web",
+                WEB_CURRENT_SCOPE_PATH,
+                "WEB_REPORT.md"
+            ]
         );
     }
 
@@ -4464,7 +4474,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_baseline_proposal_applies_only_agent_delta_and_preserves_index() {
+    fn dirty_baseline_proposal_excludes_web_runtime_state_and_preserves_index() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -4834,6 +4844,33 @@ mod tests {
             .core
             .write(&workspace.handle, "cache/output.bin", 0, b"ignored")
             .unwrap();
+        fs::create_dir_all(workspace.worktree_path().join(".greppy/web")).unwrap();
+        fs::write(
+            workspace.worktree_path().join(WEB_CURRENT_SCOPE_PATH),
+            b"{\"session\":\"runtime-only\"}\n",
+        )
+        .unwrap();
+        workspace
+            .core
+            .mkdir(&workspace.handle, ".greppy", 0o755)
+            .unwrap();
+        workspace
+            .core
+            .mkdir(&workspace.handle, ".greppy/web", 0o755)
+            .unwrap();
+        workspace
+            .core
+            .create_file(&workspace.handle, WEB_CURRENT_SCOPE_PATH, 0o100644)
+            .unwrap();
+        workspace
+            .core
+            .write(
+                &workspace.handle,
+                WEB_CURRENT_SCOPE_PATH,
+                0,
+                b"{\"session\":\"runtime-only\"}\n",
+            )
+            .unwrap();
         let outcome = workspace.finish("agent result").unwrap();
         let (commit, ref_name, patch) = match outcome {
             RunOutcome::Proposal {
@@ -4849,6 +4886,14 @@ mod tests {
         assert!(patch.contains("+agent"));
         assert!(!patch.lines().any(|line| line == "-base"));
         assert!(git(&repo, &["ls-tree", "-r", &commit, "--", "cache"]).is_empty());
+        assert!(
+            git(
+                &repo,
+                &["ls-tree", "-r", &commit, "--", WEB_CURRENT_SCOPE_PATH]
+            )
+            .is_empty()
+        );
+        assert!(!patch.contains(WEB_CURRENT_SCOPE_PATH));
 
         let index = git_path(&repo, "index").unwrap();
         let index_before = fs::read(&index).unwrap();
