@@ -3430,6 +3430,7 @@ fn shared_git_layer_identity_matches(
 }
 
 fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
+    let path = git_compatible_path(path)?;
     let output = private_git_command()
         .args([
             "init",
@@ -3437,7 +3438,7 @@ fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
             "--quiet",
             "--template=",
             &format!("--object-format={object_format}"),
-            path_text(path)?,
+            path_text(&path)?,
         ])
         .output()?;
     output_text("git init --bare private workspace repository", output)?;
@@ -3445,13 +3446,14 @@ fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
 }
 
 fn configure_git_control_template(git_dir: &Path) -> Result<(), WorkspaceError> {
+    let git_dir = git_compatible_path(git_dir)?;
     for (key, value) in [
         ("core.bare", "false"),
         ("core.autocrlf", "false"),
         ("core.symlinks", "true"),
     ] {
         let output = private_git_command()
-            .args(["--git-dir", path_text(git_dir)?, "config", key, value])
+            .args(["--git-dir", path_text(&git_dir)?, "config", key, value])
             .output()?;
         output_text(&format!("git config {key}"), output)?;
     }
@@ -3464,10 +3466,11 @@ fn commit_tree_in_git_dir(
     parent: &str,
     message: &str,
 ) -> Result<String, WorkspaceError> {
+    let git_dir = git_compatible_path(git_dir)?;
     let output = private_git_command()
         .args([
             "--git-dir",
-            path_text(git_dir)?,
+            path_text(&git_dir)?,
             "commit-tree",
             tree,
             "-p",
@@ -3525,12 +3528,14 @@ fn hash_blob(
     worktree: &Path,
     bytes: &[u8],
 ) -> Result<String, WorkspaceError> {
+    let private_git_dir = git_compatible_path(private_git_dir)?;
+    let worktree = git_compatible_path(worktree)?;
     let mut child = private_git_command()
         .args([
             "--git-dir",
-            path_text(private_git_dir)?,
+            path_text(&private_git_dir)?,
             "--work-tree",
-            path_text(worktree)?,
+            path_text(&worktree)?,
             "hash-object",
             "-w",
             "--stdin",
@@ -3553,11 +3558,14 @@ fn git_private(
     index: Option<&Path>,
     args: &[&str],
 ) -> Result<String, WorkspaceError> {
+    let private_git_dir = git_compatible_path(private_git_dir)?;
+    let worktree = git_compatible_path(worktree)?;
+    let index = index.map(git_compatible_path).transpose()?;
     let mut command = private_git_command();
     command
-        .args(["--git-dir", path_text(private_git_dir)?])
-        .args(["--work-tree", path_text(worktree)?]);
-    if let Some(index) = index {
+        .args(["--git-dir", path_text(&private_git_dir)?])
+        .args(["--work-tree", path_text(&worktree)?]);
+    if let Some(index) = index.as_ref() {
         command.env("GIT_INDEX_FILE", index);
     }
     let output = command.args(args).output()?;
@@ -3582,6 +3590,20 @@ fn private_git_command() -> Command {
     {
         Command::new("git")
     }
+}
+
+fn git_compatible_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    #[cfg(windows)]
+    {
+        let text = path_text(path)?;
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(path.to_path_buf())
 }
 
 fn commit_tree(
@@ -4424,6 +4446,10 @@ mod tests {
         fs::create_dir_all(repository.parent().unwrap()).unwrap();
         fs::create_dir_all(&worktree).unwrap();
         fs::create_dir_all(index.parent().unwrap()).unwrap();
+        let repository = fs::canonicalize(repository.parent().unwrap())
+            .unwrap()
+            .join("repo");
+        assert!(path_text(&repository).unwrap().starts_with(r"\\?\"));
 
         init_bare(&repository, "sha1").unwrap();
         configure_git_control_template(&repository).unwrap();
@@ -4442,6 +4468,23 @@ mod tests {
         )
         .unwrap();
         assert!(index.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_git_paths_remove_only_windows_verbatim_prefixes() {
+        assert_eq!(
+            git_compatible_path(Path::new(r"\\?\C:\provider-data\g\sl1\repo")).unwrap(),
+            PathBuf::from(r"C:\provider-data\g\sl1\repo")
+        );
+        assert_eq!(
+            git_compatible_path(Path::new(r"\\?\UNC\server\share\repo")).unwrap(),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            git_compatible_path(Path::new(r"C:\provider-data\g\sl1\repo")).unwrap(),
+            PathBuf::from(r"C:\provider-data\g\sl1\repo")
+        );
     }
 
     #[test]
