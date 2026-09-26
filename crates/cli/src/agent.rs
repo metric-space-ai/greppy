@@ -574,13 +574,6 @@ fn run_agent(
     let shared_data_root = greppy_core::cache::data_root();
     let deadline_total = args.deadline_secs.map(Duration::from_secs);
     let deadline = deadline_total.map(|total| Instant::now() + total);
-    let startup_cancel = (!interactive && !serve).then(|| Arc::new(AtomicBool::new(false)));
-    #[cfg(unix)]
-    let _headless_signals = startup_cancel
-        .as_ref()
-        .map(|cancel| headless_signals::Guard::install(Arc::clone(cancel)));
-    #[cfg(not(unix))]
-    let _headless_signals = startup_cancel.as_ref().map(|_| ());
 
     // Stable and disposable agent worktrees have cache/run-id basenames that
     // are unrelated to the source repository. Pin one logical project name so
@@ -800,7 +793,7 @@ fn run_agent(
                 no_gpu: false,
             },
             deadline,
-            startup_cancel.as_deref(),
+            None,
         ) {
             Ok(prepared) => {
                 if !interactive {
@@ -817,13 +810,8 @@ fn run_agent(
                 Some(prepared)
             }
             Err(error) => {
-                let cancelled = startup_cancel
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Acquire));
                 let deadline_reached = deadline.is_some_and(|limit| Instant::now() >= limit);
-                let (exit, message) = if cancelled {
-                    (EXIT_CANCELLED, "stopped: cancelled by user".to_string())
-                } else if deadline_reached {
+                let (exit, message) = if deadline_reached {
                     (
                         EXIT_INCOMPLETE,
                         format!(
@@ -987,7 +975,21 @@ fn run_agent(
         deadline_total,
         ..AgentConfig::default()
     };
-    config.cancel = startup_cancel;
+    #[cfg(unix)]
+    let _headless_signals = if !interactive && !serve {
+        let cancel = Arc::new(AtomicBool::new(false));
+        config.cancel = Some(Arc::clone(&cancel));
+        Some(headless_signals::Guard::install(cancel))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let _headless_signals = if !interactive && !serve {
+        config.cancel = Some(Arc::new(AtomicBool::new(false)));
+        Some(())
+    } else {
+        None
+    };
 
     let repository = cwd
         .file_name()

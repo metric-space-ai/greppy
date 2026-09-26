@@ -983,13 +983,6 @@ fn acquire_base_builder(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BaseBuilderLease> {
     loop {
-        if let Some(lease) = layout
-            .acquire_builder(true)
-            .map_err(|error| Error::io("acquire Base Store builder lease", error))?
-        {
-            return Ok(lease);
-        }
-        report_base_phase(progress_path, "waiting_for_base_builder");
         if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
             return Err(Error::Lock(format!(
                 "cancelled while waiting for immutable Base {identity_hash} publication"
@@ -1004,6 +997,13 @@ fn acquire_base_builder(
                 lock_path.display()
             )));
         }
+        if let Some(lease) = layout
+            .acquire_builder(true)
+            .map_err(|error| Error::io("acquire Base Store builder lease", error))?
+        {
+            return Ok(lease);
+        }
+        report_base_phase(progress_path, "waiting_for_base_builder");
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
@@ -2397,7 +2397,7 @@ mod tests {
         let identity_hash = identity.hash().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
-        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
         let progress_path = data_root.path().join("index.job");
         crate::write_background_job(
             &progress_path,
@@ -2441,6 +2441,20 @@ mod tests {
         assert_eq!(progress["progress_unit"], "steps");
         assert_eq!(progress["completed_spans"], 0);
         assert_eq!(progress["total_spans"], 0);
+        drop(held);
+        let free_error = match acquire_base_builder(
+            &layout,
+            &identity_hash,
+            None,
+            Some(deadline),
+            None,
+        ) {
+            Ok(_) => panic!("expired caller acquired a free Base builder lease"),
+            Err(error) => error,
+        };
+        assert!(free_error
+            .to_string()
+            .contains("deadline reached while waiting for immutable Base"));
     }
 
     #[test]
@@ -2451,14 +2465,30 @@ mod tests {
         let identity_hash = identity.hash().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
-        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(true);
 
-        let error = acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel))
-            .expect_err("cancelled consumer must not wait for or acquire the builder lease");
+        let error = match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+            Ok(_) => panic!("cancelled consumer acquired the held Base builder lease"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("cancelled while waiting for immutable Base"));
         assert!(message.contains(&identity_hash));
+        drop(held);
+        let free_error = match acquire_base_builder(
+            &layout,
+            &identity_hash,
+            None,
+            None,
+            Some(&cancel),
+        ) {
+            Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
+            Err(error) => error,
+        };
+        assert!(free_error
+            .to_string()
+            .contains("cancelled while waiting for immutable Base"));
     }
 
     #[test]
