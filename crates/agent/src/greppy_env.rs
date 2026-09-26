@@ -259,7 +259,7 @@ fn greppy_guard(args: &[String]) -> Option<String> {
         return Some("greppy tool requires a non-empty args array".to_string());
     }
     let first = args[0].as_str();
-    if first == "-p" || first == "agent" {
+    if first == "-p" || (first == "agent" && !agent_help_invocation(args)) {
         return Some(format!(
             "nested agent runs are not supported (first arg {first:?}) — you are \
              the agent; carry out the task directly with the other greppy commands"
@@ -288,6 +288,26 @@ fn greppy_guard(args: &[String]) -> Option<String> {
         );
     }
     None
+}
+
+/// Help-only `agent` shapes that may reach clap without enabling an agent
+/// launch or an administrative operation.
+pub fn agent_help_invocation(args: &[String]) -> bool {
+    let help = |value: &str| matches!(value, "--help" | "-h");
+    let command = |value: &str| !value.is_empty() && !value.starts_with('-');
+    match args {
+        [agent, flag] => agent == "agent" && help(flag),
+        [agent, subcommand, flag] => {
+            agent == "agent" && command(subcommand) && help(flag)
+        }
+        [agent, sessions, subcommand, flag] => {
+            agent == "agent"
+                && sessions == "sessions"
+                && command(subcommand)
+                && help(flag)
+        }
+        _ => false,
+    }
 }
 
 fn parse_string_array(arguments: &Value, field: &str) -> Result<Vec<String>, String> {
@@ -949,6 +969,37 @@ exit 2
         assert!(out.is_error);
         assert!(out.content.contains("agent"), "content={}", out.content);
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn guard_allows_only_bounded_agent_help_shapes() {
+        for args in [
+            vec!["agent", "--help"],
+            vec!["agent", "list", "--help"],
+            vec!["agent", "sessions", "--help"],
+            vec!["agent", "sessions", "list", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(greppy_guard(&args), None, "args={args:?}");
+        }
+
+        for args in [
+            vec!["agent"],
+            vec!["agent", "sessions", "list"],
+            vec!["agent", "apply", "refs/greppy/agent/example"],
+            vec!["agent", "apply", "refs/greppy/agent/example", "--help"],
+            vec!["agent", "--", "--help"],
+            vec!["agent", "", "--help"],
+            vec!["agent", "-invalid", "--help"],
+            vec!["agent", "sessions", "--", "--help"],
+            vec!["agent", "sessions", "", "--help"],
+            vec!["agent", "sessions", "-invalid", "--help"],
+            vec!["agent", "--help", "trailing"],
+            vec!["-p", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(greppy_guard(&args).is_some(), "args={args:?}");
+        }
     }
 
     #[test]

@@ -913,7 +913,12 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    if agent::is_agent_tui_invocation(&argv) && !is_agent_admin_invocation(&argv) {
+    let agent_help_in_agent_run = std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some()
+        && agent_help_invocation(&argv);
+    if agent::is_agent_tui_invocation(&argv)
+        && !is_agent_admin_invocation(&argv)
+        && !agent_help_in_agent_run
+    {
         return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
@@ -1831,6 +1836,18 @@ fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
                 || token == "interrupt"
                 || token == "quit"
         })
+}
+
+fn agent_help_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = grep_passthrough_args(argv);
+    let Some(args) = rest
+        .iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    greppy_agent::greppy_env::agent_help_invocation(&args)
 }
 
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
