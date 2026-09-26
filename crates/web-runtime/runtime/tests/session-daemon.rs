@@ -6294,6 +6294,72 @@ fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
 }
 
 #[test]
+fn false_workflow_expectation_keeps_cpu_and_explicit_tab_usable() {
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><button id='reviews' onclick='window.clicks++'>Reviews</button><script>window.clicks=0</script></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-workflow-wait-cpu-{}.sock",
+        std::process::id()
+    ));
+    let supervisor = Supervisor::spawn(&socket, "run_workflow_wait_cpu", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_wait_cpu", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("workflow wait CPU request")
+    };
+    let created = call(
+        "web.session.create",
+        json!({"profile":"project","limits":{"content_cpu_ms":5_000}}),
+    );
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let tab = went.result.as_ref().unwrap()["tab_id"].as_str().unwrap();
+    let worker = content_worker_pid(supervisor.child.id()).expect("content worker");
+
+    let waited = call(
+        "web.workflow",
+        json!({
+            "version":1,
+            "session_id":session,
+            "tab_id":tab,
+            "steps":[{
+                "action":{"operation":"click","selector":{"type":"css","value":"#reviews"}},
+                "expect":{"condition":{"query":"text~/\u{00a0}/i"},"timeout_ms":2_000}
+            }]
+        }),
+    );
+    assert_eq!(waited.status, "error", "{waited:?}");
+    assert_eq!(waited.error.as_ref().unwrap().code, "TIMEOUT", "{waited:?}");
+    assert!(waited.metrics.content_cpu_ms < 5_000, "{waited:?}");
+    let detail = waited.result.as_ref().unwrap();
+    assert_eq!(detail["failed_step"], 1, "{waited:?}");
+    assert_eq!(detail["steps"][0]["action"]["status"], "ok", "{waited:?}");
+    assert_eq!(
+        content_worker_pid(supervisor.child.id()),
+        Some(worker),
+        "an ordinary false expectation must not exhaust quota and reset tabs"
+    );
+
+    let checked = call(
+        "web.evaluate",
+        json!({"session_id":session,"tab_id":tab,"source":"window.clicks"}),
+    );
+    assert_eq!(checked.status, "ok", "same explicit tab must survive: {checked:?}");
+    assert_eq!(checked.result.as_ref().unwrap()["value"].as_f64(), Some(1.0));
+}
+
+#[test]
 fn native_boolean_wait_rebinds_after_navigation_and_same_url_reload() {
     let fixture = serve_fixture(r#"<!doctype html><html><head><title>Navigation wait</title>
 <script>
