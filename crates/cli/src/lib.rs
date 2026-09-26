@@ -8381,16 +8381,28 @@ mod release_embedded_model_guards {
 /// makes the unchanged fast path constant-time without accepting stale or torn
 /// payloads.
 mod embeddinggemma_assets {
+    const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
+    const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
+    const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
+    const TOK_NAME: &str = "tokenizer.json";
+
+    /// Return the eventual model paths without creating or verifying assets.
+    pub fn identity_paths() -> (String, String) {
+        let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
+        (
+            root.join(GGUF_SHA).join(GGUF_NAME).to_string_lossy().into_owned(),
+            root.join(TOK_SHA).join(TOK_NAME).to_string_lossy().into_owned(),
+        )
+    }
+
     pub fn paths() -> Option<(String, String)> {
-        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
-        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         #[cfg(not(debug_assertions))]
         {
             static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
-            let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
-            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            let gguf = extract(&root, GGUF_SHA, GGUF_NAME, GGUF)?;
+            let tok = extract(&root, TOK_SHA, TOK_NAME, TOK)?;
             return Some((gguf, tok));
         }
         #[cfg(debug_assertions)]
@@ -8398,13 +8410,13 @@ mod embeddinggemma_assets {
             let gguf = super::extract_repo_model_asset(
                 &root,
                 GGUF_SHA,
-                "embeddinggemma-300M-Q4_K.gguf",
+                GGUF_NAME,
                 env!("GREPPY_EMBEDDED_GGUF_PATH"),
             )?;
             let tok = super::extract_repo_model_asset(
                 &root,
                 TOK_SHA,
-                "tokenizer.json",
+                TOK_NAME,
                 env!("GREPPY_EMBEDDED_TOK_PATH"),
             )?;
             Some((gguf, tok))

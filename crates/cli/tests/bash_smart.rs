@@ -55,6 +55,44 @@ fn run(workspace: &Workspace, args: &[&str]) -> Output {
     command(workspace).args(args).output().expect("run greppy")
 }
 
+#[test]
+fn cold_unavailable_daemon_does_not_materialize_embedded_model() {
+    let workspace = fresh_workspace("cold-no-daemon");
+    let fixture = workspace.repo.join("failed-output.txt");
+    let output_lines = (0..128)
+        .map(|i| {
+            let name = (0..4)
+                .map(|place| char::from(b'a' + ((i / 26usize.pow(place)) % 26) as u8))
+                .collect::<String>();
+            format!("fn source_{name}() {{ error.next_action(); }}\n")
+        })
+        .collect::<String>();
+    std::fs::write(&fixture, output_lines).unwrap();
+    let output = Command::new(bin())
+        .current_dir(&workspace.repo)
+        .env("GREPPY_STORE_DIR", &workspace.store)
+        .env("GREPPY_SHARED_INFERENCE_ROOT", &workspace.store)
+        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "cat \"$1\"; exit 1",
+            "failed-log-fixture",
+            fixture.to_str().expect("UTF-8 fixture path"),
+        ])
+        .output()
+        .expect("run greppy");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 1"));
+    assert!(
+        !workspace.store.join("models").exists(),
+        "daemon readiness probing must not extract embedded model assets"
+    );
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -651,7 +689,10 @@ fn active_index_writer_never_blocks_command_execution() {
     let long_output = run(
         &workspace,
         &[
-            "bash-smart", "--", "sh", "-c",
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
             "i=0; while [ $i -lt 500 ]; do printf 'test case_%s ... ok\\n' \"$i\"; printf 'detail case_%s\\n' \"$i\" >&2; i=$((i+1)); done",
         ],
     );
