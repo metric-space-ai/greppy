@@ -103,6 +103,40 @@ fn assert_file(path: &Path, expected: &str) {
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
 }
 
+#[test]
+fn symbol_edit_refreshes_source_added_after_index_and_absent_stays_absent() {
+    let fixture = Fixture::new("stale-symbol-refresh");
+    let source = fixture.repo.join("lib.rs");
+    std::fs::write(&source, "fn indexed_definition() {}\n").unwrap();
+
+    let indexed = fixture.run(&["index", "."]);
+    assert!(
+        indexed.status.success(),
+        "initial index failed: {}",
+        combined(&indexed)
+    );
+
+    let drifted = "fn indexed_definition() {}\nfn added_after_index() { println!(\"fresh\"); }\n";
+    std::fs::write(&source, drifted).unwrap();
+    let deleted = fixture.run(&["delete", "added_after_index"]);
+    assert!(
+        deleted.status.success(),
+        "stale symbol edit did not refresh: {}",
+        combined(&deleted)
+    );
+    assert_file(&source, "fn indexed_definition() {}\n");
+
+    let before_absent = std::fs::read(&source).unwrap();
+    let absent = fixture.run(&["delete", "genuinely_absent"]);
+    assert!(!absent.status.success(), "absent symbol unexpectedly edited");
+    assert!(
+        combined(&absent).contains("no symbol `genuinely_absent`"),
+        "unexpected absent-symbol diagnostic: {}",
+        combined(&absent)
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), before_absent);
+}
+
 fn nested_collision(fixture: &Fixture) -> (PathBuf, PathBuf) {
     std::fs::write(fixture.base.join("probe.conf"), "CWD_SENTINEL\n").unwrap();
     std::fs::write(fixture.repo.join("probe.conf"), "REPO_SENTINEL\n").unwrap();
