@@ -36,6 +36,7 @@ pub struct AgentWorkspace {
     baseline_tree: String,
     baseline_view_commit: String,
     provider_instance: String,
+    provider_data_root: PathBuf,
     data_root: PathBuf,
     core: WorkspaceCore,
     handle: WorkspaceHandle,
@@ -177,11 +178,18 @@ impl AgentWorkspace {
         validate_run_id(run_id)?;
         let started = Instant::now();
         trace_workspace_phase(run_id, "start", started);
-        let data_root = workspace_data_root()?;
-        let provider = ProviderInstallation::require_healthy(&data_root)?;
+        let configured_data_root = workspace_data_root()?;
+        let provider = ProviderInstallation::require_healthy(&configured_data_root)?;
         trace_workspace_phase(run_id, "provider-healthy", started);
         provider.doctor_io(&format!("startup-{run_id}"))?;
         trace_workspace_phase(run_id, "provider-io-verified", started);
+        // The provider configuration is trusted only after its control manifest
+        // and mounted marker agree and a live I/O probe succeeds. Resolve that
+        // app-owned path here, before deriving any tool-writable children. The
+        // generic sandbox still receives physical, symlink-free roots and keeps
+        // rejecting arbitrary symlink components supplied from elsewhere.
+        let data_root =
+            canonicalize_trusted_provider_path("data root", provider.data_root())?;
         #[cfg(target_os = "macos")]
         {
             greppy_workspace_core::spawn_repository_tracker_for(
@@ -230,6 +238,16 @@ impl AgentWorkspace {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
+        // This mounted path is provider-authenticated above and now exists.
+        // Resolve configured storage symlinks before it crosses the sandbox's
+        // no-symlink writable-root boundary.
+        let worktree = match canonicalize_trusted_provider_path("workspace", &worktree) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                return Err(error);
+            }
+        };
         trace_workspace_phase(run_id, "content-visible", started);
         let (git_baseline, git_baseline_owns_chunks, baseline_tree, baseline_view_commit) =
             match prepare_git_control_baseline(
@@ -270,6 +288,14 @@ impl AgentWorkspace {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
             return Err(error);
         }
+        let private_git_dir =
+            match canonicalize_trusted_provider_path("private Git workspace", &private_git_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                    return Err(error);
+                }
+            };
         trace_workspace_phase(run_id, "git-namespace-visible", started);
         let initialized = initialize_private_git(
             &worktree,
@@ -302,6 +328,7 @@ impl AgentWorkspace {
             baseline_tree,
             baseline_view_commit,
             provider_instance,
+            provider_data_root: configured_data_root,
             data_root,
             core,
             handle,
@@ -475,15 +502,23 @@ impl AgentWorkspace {
     }
 
     fn verify_identity(&self) -> Result<(), WorkspaceError> {
-        let provider = ProviderInstallation::require_healthy(&self.data_root)?;
+        let provider = ProviderInstallation::require_healthy(&self.provider_data_root)?;
         if provider.manifest().instance_id != self.provider_instance {
             return Err(WorkspaceError::Tampered {
                 path: self.worktree.clone(),
                 detail: "provider instance changed during the agent run".into(),
             });
         }
-        if provider.workspace_path(&self.run_id)? != self.worktree
-            || provider.workspace_path(self.git_handle.id())? != self.private_git_dir
+        let expected_worktree = canonicalize_trusted_provider_path(
+            "workspace",
+            &provider.workspace_path(&self.run_id)?,
+        )?;
+        let expected_private_git = canonicalize_trusted_provider_path(
+            "private Git workspace",
+            &provider.workspace_path(self.git_handle.id())?,
+        )?;
+        if expected_worktree != self.worktree
+            || expected_private_git != self.private_git_dir
             || !self.private_git_dir.is_dir()
         {
             return Err(WorkspaceError::Tampered {
@@ -2865,6 +2900,25 @@ pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
     }
 }
 
+/// Resolve a path owned and authenticated by the workspace provider before it
+/// becomes a writable sandbox root.
+///
+/// This is deliberately separate from sandbox root preparation: callers must
+/// first verify the provider manifest, mounted identity, and live I/O. The
+/// sandbox can therefore retain its stronger rule that every root it receives
+/// is already free of symlink components.
+fn canonicalize_trusted_provider_path(
+    kind: &str,
+    path: &Path,
+) -> Result<PathBuf, WorkspaceError> {
+    fs::canonicalize(path).map_err(|error| {
+        WorkspaceError::AdapterUnavailable(format!(
+            "cannot resolve provider {kind} {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(unix)]
 fn home_dir() -> Result<PathBuf, WorkspaceError> {
     std::env::var_os("HOME")
@@ -3773,6 +3827,48 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const APPLY_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_applies_proposal";
     const PROPOSAL_CRASH_CHILD_TEST: &str = "workspace::tests::crash_child_publishes_proposal";
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_namespaces_are_physical_before_sandbox_use() {
+        let root = tempfile::tempdir().unwrap();
+        let physical_mount = root.path().join("physical-mount");
+        let configured_mount = root.path().join("configured-mount");
+        let physical_worktree = physical_mount.join("workspaces/run");
+        let physical_git = physical_mount.join("workspaces/run-git");
+        fs::create_dir_all(&physical_worktree).unwrap();
+        fs::create_dir_all(&physical_git).unwrap();
+        std::os::unix::fs::symlink(&physical_mount, &configured_mount).unwrap();
+
+        let worktree = canonicalize_trusted_provider_path(
+            "workspace",
+            &configured_mount.join("workspaces/run"),
+        )
+        .unwrap();
+        let private_git = canonicalize_trusted_provider_path(
+            "private Git workspace",
+            &configured_mount.join("workspaces/run-git"),
+        )
+        .unwrap();
+        let prepared = crate::sandbox::prepare_writable_roots(&[
+            worktree.clone(),
+            private_git.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            prepared,
+            vec![
+                physical_worktree.canonicalize().unwrap(),
+                physical_git.canonicalize().unwrap(),
+            ]
+        );
+
+        let untrusted = root.path().join("untrusted-root");
+        std::os::unix::fs::symlink(root.path().join("outside"), &untrusted).unwrap();
+        let error = crate::sandbox::prepare_writable_roots(&[untrusted]).unwrap_err();
+        assert!(error.to_string().contains("symlink component (refusing)"));
+    }
 
     #[test]
     fn filtering_many_ignored_paths_does_not_deadlock_on_git_output() {
