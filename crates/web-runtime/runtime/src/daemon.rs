@@ -9,7 +9,7 @@ use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
     new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -32,6 +32,28 @@ fn isolated_id(value: &str) -> Result<&str, String> {
         return Err("session/request id is not an isolated path component".to_owned());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod network_record_tests {
+    use super::*;
+
+    #[test]
+    fn completed_response_metadata_and_failure_enrich_request() {
+        let requests = json!([{ "requestId": "fetch:0", "url": "https://fixture.invalid" }]);
+        let responses = json!([{
+            "requestId": "fetch:0", "status": 200, "statusText": "OK", "ok": true,
+            "byteLength": 7, "bodyBytes": 7, "fromCache": false,
+            "failure": { "errorText": "body reset" }, "headers": { "x-test": "yes" }
+        }]);
+        let enriched = enrich_network_records(requests, &responses);
+        let record = &enriched[0];
+        assert_eq!(record["bodyBytes"], 7);
+        assert_eq!(record["fromCache"], false);
+        assert_eq!(record["failure"]["errorText"], "body reset");
+        assert_eq!(record["responseHeaders"]["x-test"], "yes");
+        assert!(network_record_failed(record));
+    }
 }
 
 fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<PathBuf, String> {
@@ -666,6 +688,56 @@ struct Daemon {
     workflow_defer_observation: bool,
 }
 
+fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
+    let Some(rows) = requests.as_array_mut() else {
+        return json!([]);
+    };
+    let response_rows = responses.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for request in rows {
+        let Some(request_id) = request.get("requestId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(response) = response_rows
+            .iter()
+            .find(|response| response.get("requestId").and_then(Value::as_str) == Some(request_id))
+        else {
+            continue;
+        };
+        let response = redact_json(response.clone());
+        let Some(object) = request.as_object_mut() else {
+            continue;
+        };
+        for key in [
+            "status",
+            "statusText",
+            "ok",
+            "byteLength",
+            "bodyBytes",
+            "fromCache",
+            "failure",
+        ] {
+            if let Some(value) = response.get(key) {
+                object.insert(key.to_owned(), value.clone());
+            }
+        }
+        if let Some(headers) = response.get("headers") {
+            object.insert("responseHeaders".into(), headers.clone());
+        }
+    }
+    requests
+}
+
+fn network_record_failed(record: &Value) -> bool {
+    record
+        .get("failure")
+        .is_some_and(|failure| !failure.is_null())
+        || record.get("ok").and_then(Value::as_bool) == Some(false)
+        || record
+            .get("status")
+            .and_then(Value::as_u64)
+            .is_some_and(|status| status >= 400)
+}
+
 impl Daemon {
     fn start(
         config: DaemonConfig,
@@ -809,30 +881,16 @@ impl Daemon {
         // click, observe -- reported nothing about what they cost. Time the
         // dispatch here and fill in whatever the handler left empty.
         let dispatch_started = Instant::now();
-        let content_before = sample_cpu_ms(self.content.pid());
-        let controller_before = sample_cpu_ms(self.controller.pid());
+        let content_pid_before = self.content.pid();
+        let controller_pid_before = self.controller.pid();
+        let content_cpu_before_ns = sample_cpu_ns(content_pid_before);
+        let controller_cpu_before_ns = sample_cpu_ns(controller_pid_before);
         let session_id = request
             .payload
             .get("session_id")
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .or_else(|| request.session_id.clone());
-        if let Some(session) = session_id
-            .as_ref()
-            .and_then(|session_id| self.sessions.get_mut(session_id))
-        {
-            // Start a new session's CPU accounting before any supervisor
-            // preflight. `session.networkBytes` below is real controller work
-            // performed for this request and must not sit outside the budget.
-            let _ = session_cpu_delta_ms(
-                &mut session.content_cpu_baseline,
-                self.content.pid(),
-            );
-            let _ = session_cpu_delta_ms(
-                &mut session.controller_cpu_baseline,
-                self.controller.pid(),
-            );
-        }
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
@@ -845,20 +903,17 @@ impl Daemon {
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let limit_request = request.clone();
+        let trace_started = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|session| session.trace.as_ref())
+            .map(|_| crate::playwright_trace::trace_time_ms());
         let mut response = self.dispatch_operation(request);
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
         }
         if response.metrics.peak_rss_bytes == 0 {
             response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
-        }
-        if response.metrics.content_cpu_ms == 0 {
-            response.metrics.content_cpu_ms =
-                sample_cpu_ms(self.content.pid()).saturating_sub(content_before);
-        }
-        if response.metrics.controller_cpu_ms == 0 {
-            response.metrics.controller_cpu_ms =
-                sample_cpu_ms(self.controller.pid()).saturating_sub(controller_before);
         }
         if response.metrics.network_bytes == 0 {
             if let Some(before) = bytes_before {
@@ -873,47 +928,88 @@ impl Daemon {
                 }
             }
         }
-        // The pre-dispatch check in `with_session_page` protects every later
-        // operation from CPU already consumed by this session. The first
-        // operation starts the per-worker baseline, though, so its actual CPU
-        // can only be judged here. Enforce the same cumulative session budget
-        // before returning success; otherwise a one-shot request can exceed a
-        // 1 ms limit while reporting the overage only in metrics.
-        if response.status == "ok" {
-            if let Some(session_id) = session_id {
-                let content_pid = self.content.pid();
-                let controller_pid = self.controller.pid();
-                let measured_content_cpu_ms = response.metrics.content_cpu_ms;
-                let measured_controller_cpu_ms = response.metrics.controller_cpu_ms;
-                let cpu_limit_error = self.sessions.get_mut(&session_id).and_then(|session| {
-                    let content_cpu = Duration::from_millis(
-                        session_cpu_delta_ms(&mut session.content_cpu_baseline, content_pid)
-                            .max(measured_content_cpu_ms),
+        let content_pid_after = self.content.pid();
+        let controller_pid_after = self.controller.pid();
+        let content_cpu_after_ns = sample_cpu_ns(content_pid_after);
+        let controller_cpu_after_ns = sample_cpu_ns(controller_pid_after);
+        let mut observed_content_cpu_ns = process_cpu_delta_ns(
+            content_pid_before,
+            content_cpu_before_ns,
+            content_pid_after,
+            content_cpu_after_ns,
+        );
+        let mut observed_controller_cpu_ns = process_cpu_delta_ns(
+            controller_pid_before,
+            controller_cpu_before_ns,
+            controller_pid_after,
+            controller_cpu_after_ns,
+        );
+        if let Some(session_id) = session_id.as_deref() {
+            if let Some(session) = self.sessions.get_mut(session_id) {
+                (observed_content_cpu_ns, observed_controller_cpu_ns) = account_operation_cpu(
+                    session,
+                    &mut response,
+                    (content_pid_before, content_cpu_before_ns),
+                    (content_pid_after, content_cpu_after_ns),
+                    (controller_pid_before, controller_cpu_before_ns),
+                    (controller_pid_after, controller_cpu_after_ns),
+                );
+            }
+        }
+        if response.metrics.content_cpu_ms == 0 {
+            response.metrics.content_cpu_ms = observed_content_cpu_ns / 1_000_000;
+        }
+        if response.metrics.controller_cpu_ms == 0 {
+            response.metrics.controller_cpu_ms = observed_controller_cpu_ns / 1_000_000;
+        }
+        // Charge this serialized operation even when it failed. The counters
+        // are independent of worker PIDs, so a respawn cannot reset or
+        // underflow a session's cumulative quota.
+        let cpu_limit_error = session_id.as_deref().and_then(|session_id| {
+            self.sessions.get_mut(session_id).and_then(|session| {
+                session
+                    .limits
+                    .check_cpu_time(
+                        Duration::from_nanos(session.content_cpu_used_ns),
+                        session.limits.content_cpu_time,
+                        "content",
+                    )
+                    .and_then(|_| {
+                        session.limits.check_cpu_time(
+                            Duration::from_nanos(session.controller_cpu_used_ns),
+                            session.limits.controller_cpu_time,
+                            "controller",
+                        )
+                    })
+                    .err()
+            })
+        });
+        if let Some(message) = cpu_limit_error {
+            if response.status == "ok" {
+                let metrics = response.metrics.clone();
+                response = limit_error(&limit_request, message);
+                response.metrics = metrics;
+            }
+            if let Some(session_id) = session_id.as_deref() {
+                if let Some(session) = self.sessions.get_mut(session_id) {
+                    let _ = session.transition(SessionState::Failed);
+                }
+            }
+        }
+        if !matches!(
+            limit_request.operation.as_str(),
+            "web.trace.start" | "web.trace.stop"
+        ) {
+            if let Some(session_id) = session_id.as_deref() {
+                if let (Some(session), Some(started)) =
+                    (self.sessions.get_mut(session_id), trace_started)
+                {
+                    record_trace_outcome(
+                        &mut session.trace,
+                        &limit_request.operation,
+                        started,
+                        &mut response,
                     );
-                    let controller_cpu = Duration::from_millis(
-                        session_cpu_delta_ms(&mut session.controller_cpu_baseline, controller_pid)
-                            .max(measured_controller_cpu_ms),
-                    );
-                    let error = session
-                        .limits
-                        .check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")
-                        .and_then(|_| {
-                            session.limits.check_cpu_time(
-                                controller_cpu,
-                                session.limits.controller_cpu_time,
-                                "controller",
-                            )
-                        })
-                        .err();
-                    if error.is_some() {
-                        let _ = session.transition(SessionState::Failed);
-                    }
-                    error
-                });
-                if let Some(message) = cpu_limit_error {
-                    let metrics = response.metrics.clone();
-                    response = limit_error(&limit_request, message);
-                    response.metrics = metrics;
                 }
             }
         }
@@ -939,6 +1035,8 @@ impl Daemon {
             "web.result.next" => self.web_result_next(&request),
             "web.artifact.show" => self.web_artifact_show(&request),
             "web.artifact.path" => self.web_artifact_path(&request),
+            "web.trace.start" => self.web_trace_start(&request),
+            "web.trace.stop" => self.web_trace_stop(&request),
             "web.goto" => self.web_goto(&request),
             "web.back" => self.web_history(&request, "page.goBack", "web.back"),
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
@@ -1307,7 +1405,7 @@ impl Daemon {
                 let _ = session.transition(SessionState::Closing);
                 if let Some(page) = session.page_id.take() {
                     if self.content.is_running() {
-                        let _ = self.engine_call("page.close", json!({ "page": page }));
+                        let _ = self.engine_call("session.closePage", json!({ "page": page }));
                     }
                 }
                 let _ = session.transition(SessionState::Closed);
@@ -1381,7 +1479,67 @@ impl Daemon {
                 return engine_error(request, error, 33);
             }
         }
+        let bind_session_page = request
+            .payload
+            .get("bind_session_page")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let bound_page = if bind_session_page {
+            match self
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.page_id.clone())
+            {
+                Some(page) => Some(page),
+                None => {
+                    if let Some(session) = self.sessions.get(&session_id) {
+                        if let Err(message) =
+                            session.limits.check_pages(session.pages.saturating_add(1))
+                        {
+                            return limit_error(request, message);
+                        }
+                    }
+                    match self.engine_call("session.ensurePage", json!({})) {
+                        Ok(result) => {
+                            let Some(page) = result
+                                .get("page")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                            else {
+                                return engine_error(request, "session has no page", 34);
+                            };
+                            if let Some(session) = self.sessions.get_mut(&session_id) {
+                                session.page_id = Some(page.clone());
+                                session.pages = 1;
+                            }
+                            Some(page)
+                        }
+                        Err(error) => return engine_error(request, error, 34),
+                    }
+                }
+            }
+        } else {
+            None
+        };
         if let Some(session) = self.sessions.get_mut(&session_id) {
+            if let Err(message) = session
+                .limits
+                .check_cpu_time(
+                    Duration::from_nanos(session.content_cpu_used_ns),
+                    session.limits.content_cpu_time,
+                    "content",
+                )
+                .and_then(|_| {
+                    session.limits.check_cpu_time(
+                        Duration::from_nanos(session.controller_cpu_used_ns),
+                        session.limits.controller_cpu_time,
+                        "controller",
+                    )
+                })
+            {
+                let _ = session.transition(SessionState::Failed);
+                return limit_error(request, message);
+            }
             if let Err(message) = session.begin_operation(&request.request_id) {
                 return Response::error(
                     request,
@@ -1425,7 +1583,7 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let (specifier, source) = match (file, source) {
+        let (specifier, mut source) = match (file, source) {
             (Some(path), maybe_text) => {
                 let text = match maybe_text {
                     Some(text) => text,
@@ -1483,6 +1641,15 @@ impl Daemon {
                 );
             }
         };
+        if let Some(page) = bound_page {
+            let page = serde_json::to_string(&page)
+                .expect("a runtime page id is always JSON serializable");
+            source = format!(
+                "import {{ greppyAttachPage }} from \"playwright\";\n\
+                 const {{ browser, context, page }} = await greppyAttachPage({page});\n\
+                 {source}"
+            );
+        }
         let _stage_guard = if specifier != "greppy:stdin" {
             Some(ScriptStageGuard {
                 run_id: self.run_id.clone(),
@@ -1626,14 +1793,21 @@ impl Daemon {
                     .get("stdout")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                let stored = self.store_trace_archives(request, &session_id, &result);
+                let trace_artifacts = stored.artifacts;
+                let trace_exports = stored.exports;
+                let trace_warning = stored.warning;
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
                         "session_id": session_id,
                         "completed": true,
                         "stdout": stdout,
+                        "trace_exports": trace_exports,
                     }),
                 );
+                response.artifacts = trace_artifacts;
+                append_optional_warning(&mut response, trace_warning.as_deref());
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -1644,6 +1818,13 @@ impl Daemon {
                 response
             }
             Err(error) => {
+                let failure_trace_storage = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<crate::supervisor::ScriptFailure>())
+                    .map(|failure| self.store_trace_archives(request, &session_id, &failure.result))
+                    .unwrap_or_else(StoredTraceArchives::empty);
+                let failure_trace_artifacts = failure_trace_storage.artifacts;
+                let failure_trace_warning = failure_trace_storage.warning;
                 let message = error.to_string();
                 if message.contains("cancelled") {
                     let pair = (session_id.clone(), operation_id.clone());
@@ -1692,7 +1873,10 @@ impl Daemon {
                                     "retry greppy web run",
                                 );
                                 object.session_id = Some(session_id.clone());
-                                return Response::error(request, object);
+                                let mut response = Response::error(request, object);
+                                response.artifacts = failure_trace_artifacts;
+                                append_optional_warning(&mut response, failure_trace_warning.as_deref());
+                                return response;
                             }
                         }
                     }
@@ -1706,7 +1890,10 @@ impl Daemon {
                             "retry greppy web run",
                         );
                         object.session_id = Some(session_id.clone());
-                        return Response::error(request, object);
+                        let mut response = Response::error(request, object);
+                        response.artifacts = failure_trace_artifacts;
+                        append_optional_warning(&mut response, failure_trace_warning.as_deref());
+                        return response;
                     }
                     self.journal(
                         &session_id,
@@ -1732,7 +1919,10 @@ impl Daemon {
                         "retry the script or send a new web.run",
                     );
                     object.session_id = Some(session_id.clone());
-                    return Response::error(request, object);
+                    let mut response = Response::error(request, object);
+                    response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
+                    return response;
                 }
                 if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
                     let content_cpu_ms = cpu_ms_since(content_pid, content_cpu_baseline_ns);
@@ -1752,14 +1942,16 @@ impl Daemon {
                     );
                     object.session_id = Some(session_id.clone());
                     let mut response = Response::error(request, object);
-                    if let Ok(manifest) = self.store.put(
-                        format!(
-                            "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
-                        )
-                        .as_bytes(),
-                        "application/json",
+                    response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
+                    let timeout_manifest = format!(
+                        "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
+                    );
+                    if let Ok(manifest) = self.store_bytes(
+                        request,
                         &session_id,
-                        &self.run_id,
+                        timeout_manifest.as_bytes(),
+                        "application/json",
                         "web.run.timeout",
                         false,
                     ) {
@@ -1776,6 +1968,8 @@ impl Daemon {
                 }
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
                     let mut response = limit_error(request, limit);
+                    response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
                     if let Some(error) = response.error.as_mut() {
                         error.session_id = Some(session_id);
                     }
@@ -1803,6 +1997,8 @@ impl Daemon {
                 // came to look like a broken counter rather than a missing
                 // assignment.
                 let mut response = Response::error(request, object);
+                response.artifacts = failure_trace_artifacts;
+                append_optional_warning(&mut response, failure_trace_warning.as_deref());
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -1844,11 +2040,9 @@ impl Daemon {
         let session = self.sessions.get_mut(session_id).ok_or("observation session no longer exists")?;
         let elapsed = session.started.elapsed();
         session.limits.check_wall_time(elapsed)?;
-        let content_cpu = Duration::from_millis(session_cpu_delta_ms(
-            &mut session.content_cpu_baseline, self.content.pid(),
-        ));
+        let content_cpu = Duration::from_nanos(session.content_cpu_used_ns);
         session.limits.check_cpu_time(content_cpu, session.limits.content_cpu_time, "content")?;
-        let timeout = session.limits.wall_time.saturating_sub(elapsed).min(budget);
+        let timeout = session.limits.operation_budget(elapsed, budget);
         if timeout.is_zero() {
             return Err("observation has no remaining request/session budget".into());
         }
@@ -1865,6 +2059,7 @@ impl Daemon {
             .and_then(|session| session.locator_snapshots.get(page)).cloned();
         let mut tree = self.engine_call_timed_with_recovery("page.observe", json!({
             "page": page, "snapshot": proposed,
+            "expected_snapshot": previous.as_ref().map(|snapshot| snapshot.token.as_str()),
             "ref_first": range.first, "ref_last": range.last,
             "query": query, "include_html": include_html,
         }), timeout, recover_worker)?;
@@ -1914,13 +2109,75 @@ impl Daemon {
         page: &str,
         mut result: serde_json::Value,
     ) -> Response {
-        // Observe exactly once, before the original operation becomes idle.
-        // Observation failure cannot replay or erase a completed side effect.
-        let state = if self.workflow_defer_observation {
-            None
-        } else {
-            Some(page_state_envelope(self.observe_page(session_id, page)))
-        };
+        // Consume only a terminal failure produced by this action's native
+        // navigation. This check must run even when a workflow defers the
+        // full page observation until a later step.
+        let terminal_failure = result
+            .get("navigation_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|navigation_epoch| {
+                match self.engine_call(
+                    "page.take_navigation_failure",
+                    json!({ "page": page, "navigation_epoch": navigation_epoch }),
+                ) {
+                    Ok(value) => value
+                        .get("failure")
+                        .cloned()
+                        .filter(|value| !value.is_null())
+                        .map(|failure| {
+                            let request_id = failure
+                                .get("requestId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown");
+                            let url = failure
+                                .get("url")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown");
+                            let error = failure
+                                .get("errorText")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("transport failure");
+                            let kind = failure
+                                .get("kind")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("transport");
+                            let detail = format!(
+                                "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                            );
+                            if kind == "policy_denied" {
+                                format!("policy_denied: {detail}")
+                            } else {
+                                detail
+                            }
+                        }),
+                    Err(error) => Some(format!("navigation failure check failed: {error}")),
+                }
+            });
+        if let Some(object) = result.as_object_mut() {
+            object.remove("navigation_epoch");
+        }
+        let observation = (!self.workflow_defer_observation && terminal_failure.is_none())
+            .then(|| self.observe_page(session_id, page));
+        let navigation_error = terminal_failure.or_else(|| match observation.as_ref() {
+            Some(Err(error))
+                if error.starts_with("navigation failed: ")
+                    || error.starts_with("policy_denied: navigation failed: ") => Some(error.clone()),
+            _ => None,
+        });
+        if let Some(error) = navigation_error {
+            self.finish_session(session_id);
+            let mut response = engine_error(request, error, 34);
+            if let Some(object) = result.as_object_mut() {
+                object.insert("session_id".into(), json!(session_id));
+                object.insert("tab_id".into(), json!(page));
+                object.insert("ok".into(), json!(false));
+                object.insert("partial".into(), json!(true));
+                object.insert("untrusted_content_boundary".into(), json!("UNTRUSTED_PAGE_CONTENT"));
+            }
+            response.result = Some(result);
+            return response;
+        }
+        let state = observation.map(page_state_envelope);
         if let Some(object) = result.as_object_mut() {
             // Identity comes from the resolved native target, including an
             // implicit active tab, not from an optional CLI request field.
@@ -2756,6 +3013,8 @@ impl Daemon {
             Ok((session_id, page)) => {
                 let mut console = json!([]);
                 let mut requests = json!([]);
+                let mut request_retention = json!({});
+                let mut response_retention = json!({});
                 if kind != "network" {
                     match self.engine_call("page.consoleMessages", json!({ "page": page })) {
                         Ok(value) => {
@@ -2770,6 +3029,8 @@ impl Daemon {
                 if kind != "console" {
                     match self.engine_call("page.requests", json!({ "page": page })) {
                         Ok(value) => {
+                            request_retention =
+                                value.get("retention").cloned().unwrap_or(json!({}));
                             requests = value
                                 .get("requests")
                                 .cloned()
@@ -2779,6 +3040,64 @@ impl Daemon {
                             self.finish_session(&session_id);
                             return engine_error(request, error, 34);
                         }
+                    }
+                }
+                if kind == "network" {
+                    let responses =
+                        match self.engine_call("page.responses", json!({ "page": page })) {
+                            Ok(value) => {
+                                response_retention =
+                                    value.get("retention").cloned().unwrap_or(json!({}));
+                                value
+                                    .get("responses")
+                                    .cloned()
+                                    .unwrap_or_else(|| value.clone())
+                            }
+                            Err(error) => {
+                                self.finish_session(&session_id);
+                                return engine_error(request, error, 34);
+                            }
+                        };
+                    requests = enrich_network_records(requests, &responses);
+                    if request.payload.get("filter").and_then(Value::as_str) == Some("failed") {
+                        requests = Value::Array(
+                            requests
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|record| network_record_failed(record))
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    if let Some(query) = request.payload.get("query").and_then(Value::as_str) {
+                        let predicates = match greppy_web_client::record_query::parse(query) {
+                            Ok(predicates) => predicates,
+                            Err(message) => {
+                                self.finish_session(&session_id);
+                                return Response::error(
+                                    request,
+                                    ErrorObject::new(
+                                        "invalid_argument",
+                                        format!("web network: {message}"),
+                                        request.request_id.clone(),
+                                        30,
+                                        "use the web match predicate grammar, for example `status>=400`",
+                                    ),
+                                );
+                            }
+                        };
+                        requests = Value::Array(
+                            requests
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|record| {
+                                    greppy_web_client::record_query::matches(record, &predicates)
+                                })
+                                .cloned()
+                                .collect(),
+                        );
                     }
                 }
                 self.finish_session(&session_id);
@@ -2797,6 +3116,20 @@ impl Daemon {
                     }
                     if kind != "console" {
                         object.insert("requests".into(), requests);
+                    }
+                    if kind == "network" {
+                        let complete = request_retention.get("complete").and_then(Value::as_bool)
+                            == Some(true)
+                            && response_retention.get("complete").and_then(Value::as_bool)
+                                == Some(true);
+                        object.insert(
+                            "coverage".into(),
+                            json!({
+                                "complete": complete,
+                                "requests": request_retention,
+                                "responses": response_retention,
+                            }),
+                        );
                     }
                 }
                 Response::ok(request, result)
@@ -2868,8 +3201,7 @@ impl Daemon {
             }
         };
         let session_remaining = self.sessions.get(&session_id)
-            .map(|session| session.limits.wall_time.saturating_sub(session.started.elapsed()))
-            .unwrap_or(Duration::ZERO);
+            .and_then(|session| session.limits.remaining_wall_time(session.started.elapsed()));
         let budget = crate::wait_contract::remaining_wait_budget(
             request.deadline_ms, timeout_ms, started.elapsed(), session_remaining,
         );
@@ -3137,6 +3469,12 @@ impl Daemon {
                         if let (Some(dispatch), Some(object)) = (dispatch, response.as_object_mut())
                         {
                             object.insert("dispatch".into(), dispatch);
+                        }
+                        if let (Some(navigation_epoch), Some(object)) = (
+                            result.get("navigation_epoch").cloned(),
+                            response.as_object_mut(),
+                        ) {
+                            object.insert("navigation_epoch".into(), navigation_epoch);
                         }
                         self.finish_action_with_page_state(request, &session_id, &page, response)
                     }
@@ -3482,20 +3820,8 @@ impl Daemon {
         };
         let content_rss = sample_rss_bytes(self.content.pid());
         let controller_rss = sample_rss_bytes(self.controller.pid());
-        let content_pid = self.content.pid();
-        let controller_pid = self.controller.pid();
         let wall_time_error = self.sessions.get_mut(&session_id).and_then(|session| {
             session.peak_rss_bytes = session.peak_rss_bytes.max(content_rss);
-            // Budget the CPU this SESSION used, not the worker lifetime
-            // (finding 039); a respawned worker resets the baseline.
-            let content_cpu = Duration::from_millis(session_cpu_delta_ms(
-                &mut session.content_cpu_baseline,
-                content_pid,
-            ));
-            let controller_cpu = Duration::from_millis(session_cpu_delta_ms(
-                &mut session.controller_cpu_baseline,
-                controller_pid,
-            ));
             if let Err(message) = session.begin_operation(&request.request_id) {
                 Some(("engine", message))
             } else if let Err(message) = session.limits.check_wall_time(session.started.elapsed()) {
@@ -3508,14 +3834,14 @@ impl Daemon {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                content_cpu,
+                Duration::from_nanos(session.content_cpu_used_ns),
                 session.limits.content_cpu_time,
                 "content",
             ) {
                 let _ = session.transition(SessionState::Failed);
                 Some(("limit", message))
             } else if let Err(message) = session.limits.check_cpu_time(
-                controller_cpu,
+                Duration::from_nanos(session.controller_cpu_used_ns),
                 session.limits.controller_cpu_time,
                 "controller",
             ) {
@@ -3588,7 +3914,7 @@ impl Daemon {
         let profile_result = if let Some(end) = deadline {
             let remaining = end.saturating_duration_since(Instant::now());
             let remaining = self.sessions.get(&session_id)
-                .map(|session| remaining.min(session.limits.wall_time.saturating_sub(session.started.elapsed())))
+                .map(|session| session.limits.operation_budget(session.started.elapsed(), remaining))
                 .unwrap_or(Duration::ZERO);
             if remaining < Duration::from_millis(1) {
                 Err("timeout: no remaining wait setup budget".into())
@@ -3740,6 +4066,124 @@ impl Daemon {
                 sensitive,
             )
             .map_err(|error| engine_error(request, error.to_string(), 39))
+    }
+
+    fn store_trace_archives(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        result: &serde_json::Value,
+    ) -> StoredTraceArchives {
+        let mut artifacts = Vec::new();
+        let mut exports = Vec::new();
+        let Some(archives) = result
+            .get("trace_archives")
+            .and_then(|value| value.as_array())
+        else {
+            return StoredTraceArchives { artifacts, exports, warning: None };
+        };
+        for archive in archives {
+            let Some(encoded) = archive.get("encoded").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let bytes = match decode_base64(encoded) {
+                Ok(bytes) => bytes,
+                Err(error) => return StoredTraceArchives::failed(artifacts, exports, error),
+            };
+            let manifest = match self.store_bytes(
+                request,
+                session_id,
+                &bytes,
+                "application/zip",
+                "web.run.trace",
+                true,
+            ) {
+                Ok(manifest) => manifest,
+                Err(response) => {
+                    let warning = response.error
+                        .map(|error| error.message.to_string())
+                        .unwrap_or_else(|| "trace archive storage failed".into());
+                    return StoredTraceArchives::failed(artifacts, exports, warning);
+                }
+            };
+            let digest = manifest.digest.hex;
+            let requested_path = archive
+                .get("requested_path")
+                .and_then(|value| value.as_str())
+                .filter(|path| !path.is_empty());
+            if let Some(path) = requested_path {
+                exports.push(json!({"id":digest.clone(),"path":path}));
+            }
+            artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true,"requested_path":requested_path}));
+        }
+        StoredTraceArchives { artifacts, exports, warning: None }
+    }
+
+    fn web_trace_start(&mut self, request: &Request) -> Response {
+        let Some(session_id) = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or(request.session_id.as_deref())
+        else {
+            return protocol_error(request, "web.trace.start requires session_id");
+        };
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return missing_session(request, session_id);
+        };
+        if session.trace.is_some() {
+            return protocol_error(request, "a trace is already recording for this session");
+        }
+        match crate::playwright_trace::TraceRecorder::new() {
+            Ok(trace) => {
+                session.trace = Some(trace);
+                Response::ok(
+                    request,
+                    json!({"session_id":session_id,"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}),
+                )
+            }
+            Err(error) => engine_error(request, error, 39),
+        }
+    }
+
+    fn web_trace_stop(&mut self, request: &Request) -> Response {
+        let Some(session_id) = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or(request.session_id.as_deref())
+            .map(str::to_owned)
+        else {
+            return protocol_error(request, "web.trace.stop requires session_id");
+        };
+        let Some(trace) = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.trace.take())
+        else {
+            return protocol_error(request, "no trace is recording for this session");
+        };
+        let bytes = trace.finish();
+        match self.store_bytes(
+            request,
+            &session_id,
+            &bytes,
+            "application/zip",
+            "web.trace.stop",
+            true,
+        ) {
+            Ok(manifest) => {
+                let digest = manifest.digest.hex;
+                let artifact = json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true});
+                let mut response = Response::ok(
+                    request,
+                    json!({"session_id":session_id,"artifact":artifact.clone(),"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}),
+                );
+                response.artifacts.push(artifact);
+                response
+            }
+            Err(response) => response,
+        }
     }
 
     fn search_url(&self, query: &str) -> String {
@@ -4292,6 +4736,72 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn append_nonfatal_warning(response: &mut Response, message: &str) {
+    let warning: String = message.chars().take(256).collect();
+    let result = response
+        .result
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut();
+    let Some(result) = result else { return };
+    let warnings = result
+        .entry("warnings")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(warnings) = warnings.as_array_mut() {
+        warnings.push(json!(warning));
+    }
+}
+
+fn append_optional_warning(response: &mut Response, warning: Option<&str>) {
+    if let Some(warning) = warning {
+        append_nonfatal_warning(response, warning);
+    }
+}
+
+struct StoredTraceArchives {
+    artifacts: Vec<serde_json::Value>,
+    exports: Vec<serde_json::Value>,
+    warning: Option<String>,
+}
+
+impl StoredTraceArchives {
+    fn empty() -> Self {
+        Self {
+            artifacts: Vec::new(),
+            exports: Vec::new(),
+            warning: None,
+        }
+    }
+
+    fn failed(
+        artifacts: Vec<serde_json::Value>,
+        exports: Vec<serde_json::Value>,
+        warning: impl Into<String>,
+    ) -> Self {
+        Self {
+            artifacts,
+            exports,
+            warning: Some(warning.into().chars().take(256).collect()),
+        }
+    }
+}
+
+fn record_trace_outcome(
+    trace: &mut Option<crate::playwright_trace::TraceRecorder>,
+    operation: &str,
+    started: u64,
+    response: &mut Response,
+) {
+    let Some(recorder) = trace.as_mut() else {
+        return;
+    };
+    if let Err(message) = recorder.record(operation, started, response.status != "ok") {
+        if response.status == "ok" {
+            append_nonfatal_warning(response, &message);
+        }
+        *trace = None;
+    }
+}
+
 fn protocol_error(request: &Request, message: &str) -> Response {
     Response::error(
         request,
@@ -4714,28 +5224,50 @@ fn sample_rss_bytes(pid: u32) -> u64 {
     kb.saturating_mul(1024)
 }
 
-/// CPU spent since this session's baseline for the given worker, resetting
-/// the baseline when the worker was respawned (pid changed) so a fresh
-/// process never inherits or wrongly credits another lifetime (finding 039).
-fn session_cpu_delta_ms(baseline: &mut Option<(u32, u64)>, pid: u32) -> u64 {
-    let now_ns = sample_cpu_ns(pid);
-    match baseline {
-        Some((base_pid, base_ns)) if *base_pid == pid => {
-            now_ns.saturating_sub(*base_ns) / 1_000_000
-        }
-        _ => {
-            *baseline = Some((pid, now_ns));
-            0
-        }
-    }
-}
-
+#[cfg(test)]
 fn sample_cpu_ms(pid: u32) -> u64 {
     sample_cpu_ns(pid) / 1_000_000
 }
 
+/// Return CPU from one serialized operation interval. A worker replacement
+/// ends the interval; its new lifetime is measured from its own next sample.
+fn process_cpu_delta_ns(before_pid: u32, before_ns: u64, after_pid: u32, after_ns: u64) -> u64 {
+    (before_pid == after_pid).then_some(after_ns.saturating_sub(before_ns)).unwrap_or(0)
+}
+
+fn account_operation_cpu(
+    session: &mut Session,
+    response: &mut Response,
+    content_before: (u32, u64),
+    content_after: (u32, u64),
+    controller_before: (u32, u64),
+    controller_after: (u32, u64),
+) -> (u64, u64) {
+    let content_ns = process_cpu_delta_ns(
+        content_before.0,
+        content_before.1,
+        content_after.0,
+        content_after.1,
+    );
+    let controller_ns = process_cpu_delta_ns(
+        controller_before.0,
+        controller_before.1,
+        controller_after.0,
+        controller_after.1,
+    );
+    session.content_cpu_used_ns = session.content_cpu_used_ns.saturating_add(content_ns);
+    session.controller_cpu_used_ns = session.controller_cpu_used_ns.saturating_add(controller_ns);
+    if response.metrics.content_cpu_ms == 0 {
+        response.metrics.content_cpu_ms = content_ns / 1_000_000;
+    }
+    if response.metrics.controller_cpu_ms == 0 {
+        response.metrics.controller_cpu_ms = controller_ns / 1_000_000;
+    }
+    (content_ns, controller_ns)
+}
+
 fn cpu_ms_since(pid: u32, baseline_ns: u64) -> u64 {
-    sample_cpu_ns(pid).saturating_sub(baseline_ns) / 1_000_000
+    process_cpu_delta_ns(pid, baseline_ns, pid, sample_cpu_ns(pid)) / 1_000_000
 }
 
 fn sample_cpu_ns(pid: u32) -> u64 {
@@ -4858,17 +5390,37 @@ fn gate_session_engine(
     session
         .limits
         .check_controller_memory(sample_rss_bytes(controller_pid))?;
+    let content_cpu_ns = session.content_cpu_used_ns.saturating_add(process_cpu_delta_ns(
+        content_pid,
+        content_cpu_baseline_ns,
+        content_pid,
+        sample_cpu_ns(content_pid),
+    ));
+    let controller_cpu_ns = session
+        .controller_cpu_used_ns
+        .saturating_add(process_cpu_delta_ns(
+            controller_pid,
+            controller_cpu_baseline_ns,
+            controller_pid,
+            sample_cpu_ns(controller_pid),
+        ));
     session.limits.check_cpu_time(
-        Duration::from_millis(cpu_ms_since(content_pid, content_cpu_baseline_ns)),
+        Duration::from_nanos(content_cpu_ns),
         session.limits.content_cpu_time,
         "content",
     )?;
     session.limits.check_cpu_time(
-        Duration::from_millis(cpu_ms_since(controller_pid, controller_cpu_baseline_ns)),
+        Duration::from_nanos(controller_cpu_ns),
         session.limits.controller_cpu_time,
         "controller",
     )?;
     match method {
+        "session.attachPage" => {
+            let requested = _params.get("page").and_then(|value| value.as_str());
+            if requested != session.page_id.as_deref() {
+                return Err("session active page does not match requested page".to_owned());
+            }
+        }
         "browser.newContext" => {
             session
                 .limits
@@ -5064,8 +5616,6 @@ impl Daemon {
             response.metrics.network_bytes = session.network_bytes;
             response.metrics.peak_rss_bytes = session.peak_rss_bytes;
         }
-        response.metrics.content_cpu_ms = sample_cpu_ms(self.content.pid());
-        response.metrics.controller_cpu_ms = sample_cpu_ms(self.controller.pid());
         if response.metrics.peak_rss_bytes == 0 {
             response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
         }
@@ -5097,10 +5647,11 @@ pub fn socket_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod script_stage_tests {
     use super::{
-        bind_socket_healing_stale, copy_granted_modules, isolated_id, path_is_within_root,
-        refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
-        stage_script_for_controller,
+        bind_socket_healing_stale, copy_granted_modules, isolated_id,
+        path_is_within_root, refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
+        stage_script_for_controller, record_trace_outcome,
     };
+    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -5125,6 +5676,40 @@ mod script_stage_tests {
         assert!(super::parse_result_cursor("offset=12").is_err());
         assert!(super::parse_result_cursor("sha256:short:0").is_err());
         assert!(super::parse_result_cursor(&format!("sha256:{digest}:x")).is_err());
+    }
+
+    #[test]
+    fn trace_overflow_warning_preserves_completed_mutation_outcome() {
+        let request = super::Request::new("trace-overflow", "web.click", json!({}));
+        let mut mutation_count = 0;
+        mutation_count += 1;
+        let mut response = super::Response::ok(
+            &request,
+            json!({"clicked": true, "mutation_count": mutation_count}),
+        );
+        let mut trace = crate::playwright_trace::TraceRecorder::new().unwrap();
+        trace.fill_to_recording_limit();
+        let mut trace = Some(trace);
+        record_trace_outcome(
+            &mut trace,
+            "web.click",
+            crate::playwright_trace::trace_time_ms(),
+            &mut response,
+        );
+
+        assert_eq!(mutation_count, 1);
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.result.as_ref().unwrap()["clicked"], true);
+        assert_eq!(
+            response.result.as_ref().unwrap()["mutation_count"],
+            1
+        );
+        let warning = response.result.as_ref().unwrap()["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("trace recording exceeded"));
+        assert!(warning.chars().count() <= 256);
+        assert!(trace.is_none(), "overflowed recorder must be discarded");
     }
 
     #[test]
@@ -5332,22 +5917,104 @@ mod redirect_chain_tests {
     }
 
     #[test]
-    fn session_cpu_delta_starts_at_zero_and_resets_for_a_new_worker() {
-        let pid = std::process::id();
-        let mut baseline = None;
-        assert_eq!(super::session_cpu_delta_ms(&mut baseline, pid), 0);
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_millis(20) {
-            std::hint::black_box((0..10_000_u64).sum::<u64>());
-        }
-        assert!(super::session_cpu_delta_ms(&mut baseline, pid) > 0);
-        let replacement_pid = pid.saturating_add(1);
-        assert_eq!(
-            super::session_cpu_delta_ms(&mut baseline, replacement_pid),
-            0,
-            "a replacement worker must not inherit its predecessor's CPU"
+    fn serialized_operation_cpu_deltas_stay_with_their_session() {
+        let mut session_a = super::Session::new("a", "run", super::NetworkProfile::Research);
+        let mut session_b = super::Session::new("b", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("cpu", "web.read", json!({}));
+        let mut failed = super::Response::error(
+            &request,
+            super::ErrorObject::new("failed", "failed", "cpu", 1, "retry"),
         );
-        assert_eq!(baseline.map(|entry| entry.0), Some(replacement_pid));
+        failed.metrics.content_cpu_ms = 999_999;
+        failed.metrics.controller_cpu_ms = 999_999;
+
+        super::account_operation_cpu(
+            &mut session_a,
+            &mut failed,
+            (7, 100),
+            (7, 110),
+            (9, 200),
+            (9, 203),
+        );
+        super::account_operation_cpu(
+            &mut session_b,
+            &mut failed,
+            (7, 110),
+            (7, 150),
+            (9, 203),
+            (9, 210),
+        );
+        super::account_operation_cpu(
+            &mut session_a,
+            &mut failed,
+            (7, 150),
+            (7, 151),
+            (9, 210),
+            (9, 211),
+        );
+
+        assert_eq!(session_a.content_cpu_used_ns, 11);
+        assert_eq!(session_b.content_cpu_used_ns, 40);
+        assert_eq!(session_a.controller_cpu_used_ns, 4);
+        assert_eq!(session_b.controller_cpu_used_ns, 7);
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.metrics.content_cpu_ms, 999_999);
+    }
+
+    #[test]
+    fn repeated_session_operations_exhaust_the_cumulative_cpu_limit() {
+        let mut session = super::Session::new("cpu", "run", super::NetworkProfile::Research);
+        session.limits.content_cpu_time = std::time::Duration::from_nanos(10);
+
+        session.content_cpu_used_ns += 6;
+        assert!(session.limits.check_cpu_time(
+            std::time::Duration::from_nanos(session.content_cpu_used_ns),
+            session.limits.content_cpu_time,
+            "content",
+        ).is_ok());
+
+        session.content_cpu_used_ns += 5;
+        assert!(session.limits.check_cpu_time(
+            std::time::Duration::from_nanos(session.content_cpu_used_ns),
+            session.limits.content_cpu_time,
+            "content",
+        ).is_err());
+    }
+
+    #[test]
+    fn worker_restart_does_not_reset_or_underflow_session_cpu() {
+        let mut session = super::Session::new("restart", "run", super::NetworkProfile::Research);
+        let request = super::Request::new("restart", "web.read", json!({}));
+        let mut response = super::Response::ok(&request, json!({}));
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (11, 100),
+            (11, 107),
+            (12, 5),
+            (12, 8),
+        );
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (11, 107),
+            (12, 1),
+            (12, 8),
+            (13, 1),
+        );
+        assert_eq!(session.content_cpu_used_ns, 7);
+        assert_eq!(session.controller_cpu_used_ns, 3);
+
+        super::account_operation_cpu(
+            &mut session,
+            &mut response,
+            (12, 1),
+            (12, 4),
+            (13, 1),
+            (13, 4),
+        );
+        assert_eq!(session.content_cpu_used_ns, 10);
+        assert_eq!(session.controller_cpu_used_ns, 6);
     }
 
     #[test]

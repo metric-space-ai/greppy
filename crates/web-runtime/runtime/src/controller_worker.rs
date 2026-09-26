@@ -30,6 +30,7 @@ struct EngineBridge {
     next_id: Arc<AtomicU64>,
     stdout: Arc<Mutex<File>>,
     script_stdout: Arc<Mutex<Vec<String>>>,
+    trace_archives: Arc<Mutex<CapturedTraceArchives>>,
     pending: Arc<
         Mutex<
             HashMap<
@@ -38,6 +39,74 @@ struct EngineBridge {
             >,
         >,
     >,
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn captured_trace_limit_applies_to_aggregate_archives() {
+        let mut captured = CapturedTraceArchives::default();
+        captured
+            .push(&vec![0; 3 * 1024 * 1024], "a.zip".into())
+            .unwrap();
+        captured
+            .push(&vec![0; 3 * 1024 * 1024], "b.zip".into())
+            .unwrap();
+        assert!(captured.push(&[0], "c.zip".into()).is_err());
+        assert_eq!(captured.encoded_bytes, MAX_CAPTURED_TRACE_BYTES);
+        assert_eq!(captured.entries.len(), 2);
+        captured.reset();
+        assert_eq!(captured.encoded_bytes, 0);
+        assert!(captured.entries.is_empty());
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedTraceArchives {
+    entries: Vec<CapturedTraceArchive>,
+    encoded_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CapturedTraceArchive {
+    encoded: String,
+    requested_path: String,
+}
+
+const MAX_CAPTURED_TRACE_BYTES: usize = 8 * 1024 * 1024;
+
+#[op2(fast)]
+fn op_trace_limit_bytes() -> u32 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("GREPPY_TEST_TRACE_LIMIT_BYTES") {
+        if let Ok(value) = value.parse::<u32>() {
+            return value.max(1);
+        }
+    }
+    MAX_CAPTURED_TRACE_BYTES as u32
+}
+
+impl CapturedTraceArchives {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn push(&mut self, archive: &[u8], requested_path: String) -> Result<(), JsErrorBox> {
+        let encoded_len = archive.len().saturating_add(2) / 3 * 4;
+        if self.encoded_bytes.saturating_add(encoded_len) > MAX_CAPTURED_TRACE_BYTES {
+            return Err(JsErrorBox::generic(
+                "captured trace archives exceeded the 8 MiB per-script limit",
+            ));
+        }
+        self.encoded_bytes += encoded_len;
+        self.entries.push(CapturedTraceArchive {
+            encoded: base64_encode_png(archive),
+            requested_path,
+        });
+        Ok(())
+    }
 }
 
 struct PlaywrightLoader {
@@ -311,9 +380,32 @@ fn op_read_temp_png(#[string] path: String) -> Result<String, JsErrorBox> {
     Ok(base64_encode_png(&bytes))
 }
 
+#[op2]
+#[string]
+fn op_capture_trace_archive(
+    state: Rc<RefCell<OpState>>,
+    #[string] trace: String,
+    #[string] requested_path: String,
+) -> Result<String, JsErrorBox> {
+    let archive = crate::playwright_trace::archive_jsonl(trace.as_bytes(), b"")
+        .map_err(|error| JsErrorBox::generic(error))?;
+    let archives = {
+        let state = state.borrow();
+        Arc::clone(&state.borrow::<EngineBridge>().trace_archives)
+    };
+    let mut captured = archives.lock().unwrap_or_else(|error| error.into_inner());
+    captured.push(&archive, requested_path)?;
+    Ok("captured".to_owned())
+}
+
+#[op2(fast)]
+fn op_trace_time_ms() -> f64 {
+    crate::playwright_trace::trace_time_ms() as f64
+}
+
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive, op_trace_time_ms, op_trace_limit_bytes],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);
@@ -339,10 +431,12 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     let stdout = Arc::new(Mutex::new(protocol_out));
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let script_stdout = Arc::new(Mutex::new(Vec::new()));
+    let trace_archives = Arc::new(Mutex::new(CapturedTraceArchives::default()));
     let bridge = EngineBridge {
         next_id: Arc::new(AtomicU64::new(1)),
         stdout: Arc::clone(&stdout),
         script_stdout: Arc::clone(&script_stdout),
+        trace_archives: Arc::clone(&trace_archives),
         pending: Arc::clone(&pending),
     };
     let mut runtime = new_js_runtime(bridge.clone(), None);
@@ -450,6 +544,11 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .clear();
+                bridge
+                    .trace_archives
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .reset();
                 let result = run_script(
                     &tokio_runtime,
                     &mut runtime,
@@ -457,18 +556,39 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     source,
                     fixture_url,
                 );
+                if result.is_err() {
+                    let _ = runtime.execute_script(
+                        "<greppy-trace-failure-drain>",
+                        "globalThis.__greppyCaptureActiveTrace?.()",
+                    );
+                }
                 let captured = bridge
                     .script_stdout
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .join("\n");
-                let payload = serde_json::json!({ "stdout": captured });
+                let trace_archives = std::mem::take(
+                    &mut *bridge
+                        .trace_archives
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "encoded": entry.encoded,
+                        "requested_path": entry.requested_path,
+                    })
+                })
+                .collect::<Vec<_>>();
+                let payload =
+                    serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(()) => write_message(
-                        &mut *stdout,
-                        &Message::script_complete(true, payload, None),
-                    )?,
+                    Ok(()) => {
+                        write_message(&mut *stdout, &Message::script_complete(true, payload, None))?
+                    }
                     Err(error) => write_message(
                         &mut *stdout,
                         &Message::script_complete(false, payload, Some(error)),

@@ -140,6 +140,40 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
+/// First parser failure in the proposed content. Coordinates are one-based;
+/// columns count bytes, as in tree-sitter, rather than displayed characters.
+pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            let start = node.start_position();
+            let reason = if node.is_missing() {
+                format!("missing `{}`", node.kind())
+            } else {
+                "unexpected syntax".to_string()
+            };
+            return Some(format!(
+                "{}:{} (tree-sitter: {reason}; column is a byte offset)",
+                start.row + 1,
+                start.column + 1
+            ));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
 /// The kinds of the ancestor chain (parent -> root, leaf excluded) of the
 /// smallest node covering `range`. This is the structural CONTEXT the edited
 /// bytes live in.
@@ -239,6 +273,47 @@ mod tests {
             range,
             replacement: replacement.to_vec(),
         }
+    }
+
+    #[test]
+    fn css_named_container_queries_are_valid_without_weakening_syntax_errors() {
+        let css = greppy_parser::language_for_path(std::path::Path::new("editor.css"));
+        let valid = br#"@container mail-content-editor (max-width: 460px) {
+  .editor { color: red; }
+}
+@container sidebar style(--theme: dark) {
+  .message { display: block; }
+}
+"#;
+        assert_eq!(
+            syntax_counts(css, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert_eq!(first_syntax_diagnostic(css, valid), None);
+
+        let malformed_query = br#"@container mail-content-editor (max-width 460px) {
+  .editor { color: red; }
+}
+"#;
+        let query_counts = syntax_counts(css, malformed_query).unwrap();
+        assert!(
+            query_counts.errors + query_counts.missing > 0,
+            "malformed container query must remain an atomic edit failure"
+        );
+        assert!(first_syntax_diagnostic(css, malformed_query).is_some());
+
+        let malformed_body = br#"@container mail-content-editor (max-width: 460px) {
+  .editor { color: red; }
+"#;
+        let body_counts = syntax_counts(css, malformed_body).unwrap();
+        assert!(
+            body_counts.errors + body_counts.missing > 0,
+            "malformed container body must remain an atomic edit failure"
+        );
+        assert!(first_syntax_diagnostic(css, malformed_body).is_some());
     }
 
     #[test]

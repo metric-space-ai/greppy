@@ -320,6 +320,7 @@ pub(crate) fn emit_edit_outcome(
     outcome: EditResult<EditRecord>,
     json: bool,
     report: Option<String>,
+    root_path: &std::path::Path,
 ) -> Result<i32> {
     let report_path = report.as_deref();
     match outcome {
@@ -383,7 +384,7 @@ pub(crate) fn emit_edit_outcome(
                 // address lines: a min-max span would mark untouched lines
                 // between the sites as changed, which is worse than no echo.
                 if record.published && !record.already_as_sent && record.headline.is_none() {
-                    print_landed_span(&record);
+                    print_landed_span(&record, root_path);
                 }
                 for note in &record.notes {
                     println!("{note}");
@@ -421,13 +422,13 @@ pub(crate) fn emit_edit_outcome(
 /// numbered read-file style. Only the single-file, known-span case — multi-site
 /// edits keep their per-site address lines. Long spans are elided in the
 /// middle: the evidence a verifier needs is the seams, not the body it wrote.
-fn print_landed_span(record: &super::EditRecord) {
+fn print_landed_span(record: &super::EditRecord, root_path: &std::path::Path) {
     const CONTEXT: usize = 3;
     const HEAD_TAIL: usize = 6;
     let (Some((first, last)), [file]) = (record.span, record.files.as_slice()) else {
         return;
     };
-    let Ok(content) = std::fs::read_to_string(file) else {
+    let Ok(content) = std::fs::read_to_string(root_path.join(file)) else {
         return;
     };
     let lines: Vec<&str> = content.lines().collect();
@@ -560,128 +561,6 @@ pub(crate) fn print_search_source(source: &str) {
     for line in source.lines() {
         println!("{line}");
     }
-}
-
-pub(crate) fn print_search_code_no_matches(
-    _query: &str,
-    _fixed: bool,
-    _path_filters: &QueryPathFilters,
-) {
-    println!("no matches");
-}
-
-pub(crate) fn print_search_code_entries(entries: &[SearchCodeEntry]) {
-    for entry in entries {
-        match entry {
-            SearchCodeEntry::Unenclosed(hit) => println!("{}", hit.location),
-            SearchCodeEntry::Definition(definition) => print_search_row(
-                &definition.file,
-                definition.start_line,
-                definition
-                    .qualified_name
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(&definition.qualified_name),
-                None,
-                false,
-            ),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_search_code_results_with_format(
-    store: &greppy_store::Store,
-    query: &str,
-    project: &str,
-    status: &str,
-    index_freshness: Option<&serde_json::Value>,
-    total_exact: usize,
-    hits: &[greppy_search::CodeHit],
-    path_filters: &QueryPathFilters,
-    root_path: &std::path::Path,
-    json: bool,
-    no_code: bool,
-    fixed: bool,
-    resolve_definitions: bool,
-) -> Result<()> {
-    if !json {
-        if hits.is_empty() {
-            print_search_code_no_matches(query, fixed, path_filters);
-        } else if no_code {
-            for hit in hits {
-                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-            }
-        } else {
-            let entries =
-                search_code_entries(store, project, root_path, hits, resolve_definitions)?;
-            print_search_code_entries(&entries);
-        }
-        return Ok(());
-    }
-
-    let incomplete_providers = incomplete_provider_json(store, project)?;
-    let shown = hits.len();
-    let omitted = total_exact.saturating_sub(shown);
-    let rows = if no_code {
-        hits.iter()
-            .map(|hit| {
-                serde_json::json!({
-                    "location": hit.location,
-                    "rank": hit.rank,
-                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        search_code_entries(store, project, root_path, hits, resolve_definitions)?
-            .iter()
-            .map(search_code_entry_json)
-            .collect::<Vec<_>>()
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "command": "search-pattern",
-            "status": status,
-            "result_status": if hits.is_empty() { "no_matches" } else { "ok" },
-            "query": query,
-            "pattern_mode": if fixed { "fixed" } else { "regex" },
-            "project": project,
-            "path_filters": path_filters.json_value(),
-            "backend": "live-filesystem",
-            "fresh": true,
-            "freshness": if resolve_definitions {
-                index_freshness.cloned().unwrap_or(serde_json::Value::Null)
-            } else {
-                serde_json::Value::Null
-            },
-            "index_freshness": if resolve_definitions {
-                serde_json::Value::Null
-            } else {
-                index_freshness.cloned().unwrap_or(serde_json::Value::Null)
-            },
-            "provider_complete": incomplete_providers.is_empty(),
-            "incomplete_provider_count": incomplete_providers.len(),
-            "incomplete_providers": incomplete_providers,
-            "total_exact": total_exact,
-            "shown": shown,
-            "omitted": omitted,
-            "truncated": omitted > 0,
-            "next": if hits.is_empty() {
-                vec![
-                    format!("greppy search-symbol {}", shell_example_arg(query)),
-                    "retry without --path/--kind".to_string(),
-                    "greppy index .".to_string(),
-                ]
-            } else {
-                Vec::new()
-            },
-            "hits": rows,
-        }))
-        .map_err(|error| Error::Invalid(format!("serialize search-code JSON: {error}")))?
-    );
-    Ok(())
 }
 
 /// Render the resolved `context` definitions — shared by the exact-name

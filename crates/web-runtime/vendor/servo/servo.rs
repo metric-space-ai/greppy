@@ -414,6 +414,15 @@ impl ServoInner {
                     self.delegate.borrow().load_web_resource(web_resource_load);
                 }
             },
+            NetToEmbedderMsg::WebResourceResponseCompleted(webview_id, response) => {
+                if let Some(webview) =
+                    webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
+                {
+                    webview
+                        .delegate()
+                        .web_resource_response_completed(webview, response);
+                }
+            },
             NetToEmbedderMsg::RequestAuthentication(
                 webview_id,
                 url,
@@ -754,10 +763,12 @@ impl ServoInner {
                 webview_id,
                 pipeline_id,
                 servo_url,
+                is_for_main_frame,
             ) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let request = NavigationRequest {
                         url: servo_url.into_url(),
+                        is_for_main_frame,
                         pipeline_id,
                         constellation_proxy: self.constellation_proxy.clone(),
                         response_sent: false,

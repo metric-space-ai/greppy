@@ -60,7 +60,9 @@ Do **not** commit or depend on `vendor/mozjs_sys`. Apple `ld -r -unexported_symb
 `crates/web-runtime/build-support/localize_js_static.rs` is the deterministic pipeline:
 
 - macOS: patch `Unified_cpp_js_src_irregexp0.o` inside `libjs_static.a` **and** `libmozjs_sys-*.rlib` (rustc links the rlib members, not only the `.a`): same-length rename `v8::internal` → `sm::internal` for Isolate D1/D2 and PrintF, then clear Mach-O `N_PEXT`. nmedit localization still coalesces with V8 private-extern destructors on ld64.
-- Linux: `objcopy --localize-symbols`
+- Linux: namespace SpiderMonkey's overlapping ICU definitions and its local
+  ICU COMDAT group signatures with `objcopy --redefine-syms`; a remaining
+  original group signature fails the build before the final executable link.
 - Windows: explicit unsatisfied gate (build fails)
 - defined-symbol intersection against `librusty_v8.a`: any non-ICU overlap fails the build; ICU 77 coalescing is counted and permitted; mixed ICU versions fail
 

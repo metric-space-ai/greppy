@@ -89,7 +89,7 @@ pub(super) fn dispatch_inner(command: WebCommand, root: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::common::{
-        export_regular_file, find_binary, images_from_dist, runtime_executable_name,
+        export_regular_file, find_binary, images_from_dist, runtime_executable_name, RunMode,
     };
     use super::sessions::SessionCommand;
     use super::*;
@@ -118,6 +118,67 @@ mod tests {
                 command: WebCommand::Sessions(SessionsCommand::Status { json: true })
             })
         ));
+    }
+
+    #[test]
+    fn parse_web_network_accepts_record_query() {
+        let cli = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "network",
+            "status>=400 url~/missing/",
+            "--session",
+            "wrs_1",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Diagnose(DiagnoseCommand::Network {
+                    query: Some(query),
+                    failed: false,
+                    session: Some(session),
+                    json: true,
+                })
+            }) if query == "status>=400 url~/missing/" && session == "wrs_1"
+        ));
+    }
+
+    #[test]
+    fn parse_web_read_accepts_positional_and_flagged_urls() {
+        for operand in [
+            vec!["https://example.com/article"],
+            vec!["--url", "https://example.com/article"],
+        ] {
+            let mut argv = vec!["greppy", "web", "read"];
+            argv.extend(operand);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Some(Command::Web {
+                command:
+                    WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
+                        url,
+                        positional_url,
+                        ..
+                    })),
+            }) = cli.command
+            else {
+                panic!("expected web read")
+            };
+            assert_eq!(
+                url.or(positional_url).as_deref(),
+                Some("https://example.com/article")
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "greppy",
+            "web",
+            "read",
+            "https://one.example/",
+            "--url",
+            "https://two.example/",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -278,12 +339,12 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Read {
+                command: WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
                     url: Some(url),
                     session: Some(session),
                     json: true,
                     ..
-                })
+                }))
             }) if url == "https://example.com/article" && session == "wrs_1"
         ));
         let cli = Cli::try_parse_from([
@@ -414,12 +475,12 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Read {
+                command: WebCommand::Results(ResultsCommand::Read(results::ReadArgs {
                     fixture_url: Some(fixture_url),
                     search_endpoint: Some(search_endpoint),
                     json: true,
                     ..
-                })
+                }))
             }) if fixture_url == "http://127.0.0.1:9/page.html"
                 && search_endpoint == "http://127.0.0.1:9/search"
         ));
@@ -577,6 +638,8 @@ mod tests {
             "greppy",
             "web",
             "run",
+            "--mode",
+            "active",
             "--session",
             "wrs_1",
             "--script-file",
@@ -587,9 +650,42 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web {
-                command: WebCommand::Results(ResultsCommand::Run { json: true, .. })
+                command: WebCommand::Results(ResultsCommand::Run {
+                    mode: RunMode::Active,
+                    json: true,
+                    ..
+                })
             })
         ));
+
+        let cli =
+            Cli::try_parse_from(["greppy", "web", "run", "--script-file", "spec.mjs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web {
+                command: WebCommand::Results(ResultsCommand::Run {
+                    mode: RunMode::Standalone,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_unknown_web_run_mode_with_choices() {
+        let error = Cli::try_parse_from([
+            "greppy",
+            "web",
+            "run",
+            "--mode",
+            "attached",
+            "--script-file",
+            "spec.mjs",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("active"), "{error}");
+        assert!(error.contains("standalone"), "{error}");
     }
 
     #[test]

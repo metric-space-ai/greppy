@@ -17,7 +17,6 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const BASE_BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -108,7 +107,7 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
 /// absent. This is only for the explicit index recovery path: steady-state
 /// readers must continue to fail closed instead of opening an incomplete
 /// overlay.
-fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
+pub(crate) fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
     overlay_environment_inner(root, true)
 }
 
@@ -327,8 +326,31 @@ pub(crate) fn overlay_freshness_proof(
     let identities = store
         .list_file_identities(project)
         .map_err(|error| Error::Store(format!("read Store-CoW file identities: {error}")))?;
+    let mut missing_dirty = std::collections::BTreeSet::new();
     for rel_path in &dirty {
-        if !persisted_delta_path_matches(root, store, project, rel_path, &identities)? {
+        match std::fs::symlink_metadata(root.join(rel_path)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_dirty.insert((*rel_path).to_owned());
+            }
+            Err(error) => {
+                return Err(Error::io(
+                    format!("stat Store-CoW Delta path {rel_path}"),
+                    error,
+                ));
+            }
+        }
+    }
+    let sparse_blobs = persisted_sparse_delta_blobs(root, &missing_dirty)?;
+    for rel_path in &dirty {
+        if !persisted_delta_path_matches(
+            root,
+            store,
+            project,
+            rel_path,
+            &identities,
+            &sparse_blobs,
+        )? {
             return Ok(Some(OverlayFreshnessProof::Stale {
                 changed_paths: vec![(*rel_path).to_owned()],
                 reason: "a Store-CoW Delta path changed after it was indexed".into(),
@@ -406,18 +428,42 @@ fn persisted_delta_path_matches(
     project: &str,
     rel_path: &str,
     identities: &std::collections::HashMap<String, greppy_store::FileIdentity>,
+    sparse_blobs: &std::collections::HashMap<String, SparseDeltaBlob>,
 ) -> Result<bool> {
     let path = root.join(rel_path);
-    let metadata = std::fs::metadata(&path)
-        .map_err(|error| Error::io(format!("stat Store-CoW Delta path {rel_path}"), error))?;
-    if !metadata.is_file() {
-        return Ok(false);
-    }
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(blob) = sparse_blobs.get(rel_path) else {
+                return Ok(false);
+            };
+            if let Some(state) = store.get_file_state(project, rel_path).map_err(|error| {
+                Error::Store(format!("read sparse Store-CoW file state: {error}"))
+            })? {
+                return Ok(state.size >= 0
+                    && blob.size == state.size as u64
+                    && blob.sha256 == state.sha256);
+            }
+            let skip = store
+                .get_index_skip(project, rel_path)
+                .map_err(|error| Error::Store(format!("read sparse Store-CoW skip: {error}")))?;
+            return Ok(skip.is_some_and(|skip| skip.reason == "discovery_filtered"));
+        }
+        Err(error) => {
+            return Err(Error::io(
+                format!("stat Store-CoW Delta path {rel_path}"),
+                error,
+            ));
+        }
+    };
     let current = greppy_discover::stable_metadata(&metadata);
     if let Some(state) = store
         .get_file_state(project, rel_path)
         .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
     {
+        if !metadata.is_file() {
+            return Ok(false);
+        }
         let identity = identities.get(rel_path);
         let stat_matches = state.size >= 0
             && state.size as u64 == current.size
@@ -446,6 +492,163 @@ fn persisted_delta_path_matches(
             && skip.file_id == current.file_id);
     }
     Ok(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SparseDeltaBlob {
+    size: u64,
+    sha256: String,
+}
+
+struct ReapedChild(Option<std::process::Child>);
+
+impl ReapedChild {
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("child is present until wait")
+    }
+
+    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.take().expect("child is present until wait").wait()
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn persisted_sparse_delta_blobs(
+    root: &Path,
+    rel_paths: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::HashMap<String, SparseDeltaBlob>> {
+    if rel_paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-files", "-v", "--stage", "-z", "--"])
+        .args(rel_paths);
+    let listed = command
+        .output()
+        .map_err(|error| Error::io("inspect sparse Store-CoW Delta path", error))?;
+    if !listed.status.success() {
+        return Err(Error::Invalid(format!(
+            "git ls-files for sparse Store-CoW Delta failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
+    }
+    let mut entries = Vec::new();
+    for field in nul_fields(&listed.stdout)? {
+        let Some((header, rel_path)) = field.split_once('\t') else {
+            return Err(Error::Invalid(
+                "malformed sparse git ls-files record".into(),
+            ));
+        };
+        let columns = header.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 4 || columns[0] != "S" || columns[3] != "0" {
+            continue;
+        }
+        if !rel_paths.contains(rel_path) {
+            return Err(Error::Invalid(format!(
+                "git ls-files returned unexpected sparse path `{rel_path}`"
+            )));
+        }
+        entries.push((rel_path.to_owned(), columns[2].to_owned()));
+    }
+    if entries.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::io("read sparse Store-CoW Delta blob", error))?;
+    let mut child = ReapedChild(Some(child));
+    use std::io::{BufRead, Read, Write};
+    let mut stdin = child
+        .child_mut()
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Invalid("git cat-file stdin is unavailable".into()))?;
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Invalid("git cat-file stdout is unavailable".into()))?;
+    let mut stdout = std::io::BufReader::new(stdout);
+    let mut blobs = std::collections::HashMap::new();
+    for (rel_path, expected_oid) in &entries {
+        writeln!(&mut stdin, "{expected_oid}")
+            .and_then(|_| stdin.flush())
+            .map_err(|error| Error::io("request sparse Store-CoW Delta blob", error))?;
+        let mut header = String::new();
+        stdout
+            .read_line(&mut header)
+            .map_err(|error| Error::io("read sparse git cat-file header", error))?;
+        let header = header.trim_end_matches('\n');
+        let columns = header.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 3 || columns[0] != expected_oid || columns[1] != "blob" {
+            return Err(Error::Invalid(format!(
+                "unexpected sparse git cat-file header `{header}`"
+            )));
+        }
+        let size = columns[2]
+            .parse::<usize>()
+            .map_err(|_| Error::Invalid(format!("invalid sparse blob size in `{header}`")))?;
+        if size as u64 > greppy_freshness::incremental::MAX_FILE_SIZE_BYTES {
+            return Err(Error::Invalid(format!(
+                "sparse Store-CoW Delta blob `{rel_path}` exceeds the indexed file size limit"
+            )));
+        }
+        let mut content = vec![0; size];
+        stdout
+            .read_exact(&mut content)
+            .map_err(|error| Error::io("read sparse git cat-file content", error))?;
+        let mut newline = [0u8; 1];
+        stdout
+            .read_exact(&mut newline)
+            .map_err(|error| Error::io("finish sparse git cat-file content", error))?;
+        if newline != [b'\n'] {
+            return Err(Error::Invalid(
+                "malformed sparse git cat-file content terminator".into(),
+            ));
+        }
+        if blobs
+            .insert(
+                rel_path.clone(),
+                SparseDeltaBlob {
+                    size: size as u64,
+                    sha256: greppy_store::file_state::sha256_hex(&content),
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Invalid(format!(
+                "duplicate sparse Store-CoW Delta path `{rel_path}`"
+            )));
+        }
+    }
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| Error::io("finish sparse Store-CoW Delta blob batch", error))?;
+    if !status.success() {
+        return Err(Error::Invalid(format!(
+            "git cat-file for sparse Store-CoW Delta failed with {status}"
+        )));
+    }
+    Ok(blobs)
 }
 
 fn paths_resolve_equal(left: &Path, right: &Path) -> bool {
@@ -776,10 +979,24 @@ fn acquire_base_builder(
     layout: &BaseStoreLayout,
     identity_hash: &str,
     progress_path: Option<&Path>,
-    max_wait: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BaseBuilderLease> {
-    let started = std::time::Instant::now();
     loop {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Error::Lock(format!(
+                "cancelled while waiting for immutable Base {identity_hash} publication"
+            )));
+        }
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            let lock_path = layout
+                .builder_lock_path()
+                .map_err(|error| Error::io("resolve Base builder lock", error))?;
+            return Err(Error::Lock(format!(
+                "deadline reached while waiting for immutable Base {identity_hash} publication; lock {}",
+                lock_path.display()
+            )));
+        }
         if let Some(lease) = layout
             .acquire_builder(true)
             .map_err(|error| Error::io("acquire Base Store builder lease", error))?
@@ -787,16 +1004,7 @@ fn acquire_base_builder(
             return Ok(lease);
         }
         report_base_phase(progress_path, "waiting_for_base_builder");
-        if started.elapsed() >= max_wait {
-            let lock_path = layout
-                .builder_lock_path()
-                .map_err(|error| Error::io("resolve Base builder lock", error))?;
-            return Err(Error::Lock(format!(
-                "another worktree is building immutable Base {identity_hash}; lock {}; wait for that build to publish, then rerun `greppy index`",
-                lock_path.display()
-            )));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250).min(max_wait));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
@@ -829,6 +1037,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         ENV_BASE_REUSED,
         ENV_FALLBACK_REASON,
         ENV_DISABLE_AUTO_LINKED_WORKTREE,
+        greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
     ];
     let restore = names
         .into_iter()
@@ -837,6 +1046,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
     std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, &project);
     std::env::set_var(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1");
 
+    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
     let outcome = (|| {
         // Keep an existing worktree pinned to its verified Base. Advancing the
         // primary checkout must not force every already-indexed worktree to
@@ -847,7 +1057,8 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         };
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
-                Some(prepared) => prepared,
+                Some(prepared) => Some(prepared),
+                None if structural_first_use => None,
                 None => {
                     // Only the first worktree for this immutable Git tree needs a
                     // clean materialization. Every later worktree opens the
@@ -855,9 +1066,23 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                     // from a stale Delta binding, rebuild that binding's pinned
                     // commit rather than silently moving it to the primary HEAD.
                     report_base_phase(progress_path, "preparing_base_checkout");
-                    let clean =
-                        TemporaryBaseWorktree::create(&primary, shared_data_root, &base_commit)?;
-                    prepare_base_store_paths(
+                    let clean = TemporaryBaseWorktree::create(&primary, &base_commit)?;
+                    let mut inherited_leases =
+                        std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES)
+                            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                    inherited_leases.push(clean.lease_root().to_path_buf());
+                    let inherited_leases =
+                        std::env::join_paths(inherited_leases).map_err(|error| {
+                            Error::Invalid(format!(
+                                "cannot pass temporary Base checkout lease to index child: {error}"
+                            ))
+                        })?;
+                    std::env::set_var(
+                        greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
+                        inherited_leases,
+                    );
+                    Some(prepare_base_store_paths(
                         &primary,
                         clean.path(),
                         clean.path(),
@@ -865,24 +1090,37 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         shared_data_root,
                         embedding_args,
                         progress_path,
-                    )?
+                        None,
+                        None,
+                    )?)
                 }
             };
-        configure_overlay_environment(&prepared, &base_commit);
-        eprintln!(
-            "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",
-            &prepared.identity_hash[..12],
-            base_commit,
-            if prepared.reused { "reused" } else { "created" },
-        );
+        if let Some(prepared) = prepared.as_ref() {
+            configure_overlay_environment(prepared, &base_commit);
+            eprintln!(
+                "greppy index: linked worktree uses shared Base {} at {} ({}); only the Git/dirty Delta will be indexed",
+                &prepared.identity_hash[..12],
+                base_commit,
+                if prepared.reused { "reused" } else { "created" },
+            );
+        }
         Ok::<_, Error>(prepared)
     })();
 
     match outcome {
-        Ok(prepared) => Ok(Some(AutoLinkedWorktreeOverlay {
+        Ok(Some(prepared)) => Ok(Some(AutoLinkedWorktreeOverlay {
             _prepared: prepared,
             restore,
         })),
+        Ok(None) => {
+            for (name, value) in restore.into_iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Ok(None)
+        }
         Err(error) => {
             for (name, value) in restore.into_iter().rev() {
                 match value {
@@ -903,19 +1141,33 @@ struct TemporaryBaseWorktree {
 }
 
 impl TemporaryBaseWorktree {
-    fn create(primary: &Path, shared_data_root: &Path, base_commit: &str) -> Result<Self> {
+    fn create(primary: &Path, base_commit: &str) -> Result<Self> {
         #[cfg(debug_assertions)]
         if std::env::var_os(ENV_TEST_FORBID_TEMP_BASE_CHECKOUT).is_some() {
             return Err(Error::Invalid(
                 "test forbids a second temporary Base checkout".into(),
             ));
         }
-        std::fs::create_dir_all(shared_data_root)
-            .map_err(|error| Error::io("create shared Base root", error))?;
+        let scratch_root = temporary_base_checkout_root()?;
+        // A killed Base builder can leave its disposable checkout behind. Keep
+        // the existing lease-aware reclamation after moving these directories
+        // away from the persistent Base Store root.
+        let _ = greppy_core::cache::reap_stale_base_build_dirs(
+            &scratch_root,
+            greppy_core::cache::BASE_BUILD_STAGING_TTL,
+        );
         let parent = tempfile::Builder::new()
             .prefix("greppy-linked-base-checkout-")
-            .tempdir_in(shared_data_root)
-            .map_err(|error| Error::io("create clean Base checkout parent", error))?;
+            .tempdir_in(&scratch_root)
+            .map_err(|error| {
+                Error::io(
+                    format!(
+                        "create clean Base checkout under scratch directory {}",
+                        scratch_root.display()
+                    ),
+                    error,
+                )
+            })?;
         let lease = greppy_core::cache::create_base_build_staging_lease(parent.path())
             .map_err(|error| Error::io("lease clean Base checkout", error))?;
         let path = parent.path().join("worktree");
@@ -944,6 +1196,41 @@ impl TemporaryBaseWorktree {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn lease_root(&self) -> &Path {
+        self._parent.path()
+    }
+}
+
+fn temporary_base_checkout_root() -> Result<PathBuf> {
+    // Honor TMPDIR consistently on every platform. Rust's Windows
+    // `temp_dir()` follows GetTempPath and would otherwise ignore an explicit
+    // scratch directory supplied by the caller.
+    let root = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    if !root.is_absolute() {
+        return Err(Error::Invalid(format!(
+            "temporary Base checkout directory must be absolute: {}",
+            root.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&root).map_err(|error| {
+        Error::io(
+            format!(
+                "inspect temporary Base checkout directory {}; set TMPDIR to an existing writable scratch directory",
+                root.display()
+            ),
+            error,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(Error::Invalid(format!(
+            "temporary Base checkout directory is not a directory: {}; set TMPDIR to an existing writable scratch directory",
+            root.display()
+        )));
+    }
+    Ok(root)
 }
 
 fn base_identity(workspace: &greppy_agent::workspace::AgentWorkspace) -> Result<BaseStoreIdentity> {
@@ -1065,25 +1352,27 @@ impl Drop for TemporaryBaseWorktree {
 
 fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
     let expected_repository = canonical_repository_identity(root)?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-        .map_err(|error| Error::io("list linked Git worktrees", error))?;
-    if !output.status.success() {
-        return Err(Error::Invalid(format!(
-            "cannot list linked Git worktrees: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    for field in output.stdout.split(|byte| *byte == 0) {
-        let Some(path) = field.strip_prefix(b"worktree ") else {
-            continue;
-        };
-        let path = std::str::from_utf8(path)
-            .map_err(|_| Error::Invalid("Git worktree path is not valid UTF-8".into()))?;
-        let candidate = PathBuf::from(path);
+    let paths = compatible_worktree_paths(
+        || {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(root)
+                .args(["worktree", "list", "--porcelain", "-z"]);
+            let output = command
+                .output()
+                .map_err(|error| Error::io("list linked Git worktrees", error))?;
+            if output.status.success() {
+                Ok(output.stdout)
+            } else {
+                Err(Error::Invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                ))
+            }
+        },
+        || canonical_repository_common_dir(root),
+    )?;
+    for candidate in paths {
         if candidate.join(".git").is_dir()
             && canonical_repository_identity(&candidate)? == expected_repository
         {
@@ -1096,10 +1385,53 @@ fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
     )))
 }
 
+fn compatible_worktree_paths(
+    list_nul: impl FnOnce() -> Result<Vec<u8>>,
+    common_dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    match list_nul() {
+        Ok(output) => parse_nul_worktree_paths(&output),
+        Err(nul_error) => {
+            let common_dir = common_dir().map_err(|common_error| {
+                Error::Invalid(format!(
+                    "cannot list linked Git worktrees with NUL porcelain output: {nul_error}; cannot resolve the common Git directory: {common_error}"
+                ))
+            })?;
+            if common_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
+                return Err(Error::Invalid(format!(
+                    "cannot list linked Git worktrees with NUL porcelain output: {nul_error}; common Git directory {} does not identify a primary checkout",
+                    common_dir.display()
+                )));
+            }
+            let primary = common_dir.parent().ok_or_else(|| {
+                Error::Invalid(format!(
+                    "common Git directory {} has no parent checkout",
+                    common_dir.display()
+                ))
+            })?;
+            Ok(vec![primary.to_path_buf()])
+        }
+    }
+}
+
+fn parse_nul_worktree_paths(output: &[u8]) -> Result<Vec<PathBuf>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(PathBuf::from)
+                .map_err(|_| Error::Invalid("Git worktree path is not valid UTF-8".into()))
+        })
+        .collect()
+}
+
 pub(crate) fn prepare_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     prepare_base_store_paths(
         workspace.repo_root(),
@@ -1109,6 +1441,8 @@ pub(crate) fn prepare_base_store(
         shared_data_root,
         embedding_args,
         None,
+        deadline,
+        cancel,
     )
 }
 
@@ -1120,6 +1454,8 @@ fn prepare_base_store_paths(
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
     progress_path: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     let identity = base_identity_parts(repo_root, base_commit)?;
     let identity_hash = identity
@@ -1141,12 +1477,12 @@ fn prepare_base_store_paths(
         }
     }
 
-    // Never disappear into a blocking flock behind another worktree's Base
-    // build. That build can legitimately take minutes, but this caller must
-    // remain observable and bounded so agents can retry the completed Base
-    // instead of abandoning Greppy as hung.
+    // Poll rather than blocking in flock so progress remains observable. A
+    // matching live builder owns publication; wait for its OS lock to release,
+    // then validate and reuse its completed Base below. If it dies or fails,
+    // the same lock release elects this caller as the replacement builder.
     let builder_lease =
-        acquire_base_builder(&layout, &identity_hash, progress_path, BASE_BUILDER_WAIT)?;
+        acquire_base_builder(&layout, &identity_hash, progress_path, deadline, cancel)?;
     if let Ok(manifest) = layout.read_verified_manifest() {
         if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
@@ -1256,14 +1592,37 @@ fn prepare_base_store_paths(
         .env_remove(ENV_MODE)
         .env_remove(ENV_BASE_PATH)
         .env_remove(ENV_BASE_COMMIT)
-        .stdin(Stdio::null())
+        .env(crate::ENV_BASE_BUILD_OWNER_STDIN, "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null());
     if let Some(path) = progress_path {
         command.env(crate::ENV_DELEGATED_BACKGROUND_JOB, path);
     }
-    let status = command
-        .status()
-        .map_err(|error| Error::io("start immutable Base index build", error))?;
+    crate::begin_delegated_base_owner();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            crate::clear_delegated_base_owner();
+            return Err(Error::io("start immutable Base index build", error));
+        }
+    };
+    // Child::wait closes a still-attached stdin. Take the pipe and retain its
+    // writer explicitly so EOF means that this owner died, not that it waited.
+    let owner_writer = match child.stdin.take() {
+        Some(owner) => owner,
+        None => {
+            crate::clear_delegated_base_owner();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Invalid(
+                "immutable Base index build has no owner pipe".into(),
+            ));
+        }
+    };
+    crate::register_delegated_base_owner(owner_writer);
+    let status = child.wait();
+    crate::clear_delegated_base_owner();
+    let status = status.map_err(|error| Error::io("wait for immutable Base index build", error))?;
     if !status.success() {
         return Err(Error::Invalid(format!(
             "immutable Base index build exited {status}"
@@ -1674,21 +2033,22 @@ fn base_identity_parts(repo: &Path, base_commit: &str) -> Result<BaseStoreIdenti
 }
 
 pub(crate) fn canonical_repository_identity(repo: &Path) -> Result<String> {
-    let common_dir = git_output(
+    let common_path = canonical_repository_common_dir(repo)?;
+    Ok(format!("git-common-dir:{}", common_path.display()))
+}
+
+fn canonical_repository_common_dir(repo: &Path) -> Result<PathBuf> {
+    let path = git_path_output(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .or_else(|_| git_output(repo, &["rev-parse", "--git-common-dir"]))?;
-    let common_path = {
-        let path = PathBuf::from(&common_dir);
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            repo.join(path)
-        };
-        absolute.canonicalize().unwrap_or(absolute)
+    .or_else(|_| git_path_output(repo, &["rev-parse", "--git-common-dir"]))?;
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
     };
-    Ok(format!("git-common-dir:{}", common_path.display()))
+    Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
 pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<VisibilityIndex> {
@@ -1783,6 +2143,38 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     Ok(value)
 }
 
+fn git_path_output(root: &Path, args: &[&str]) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| Error::io(format!("run git {}", args.join(" ")), error))?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut value = output.stdout;
+    if value.last() == Some(&b'\n') {
+        value.pop();
+        if value.last() == Some(&b'\r') {
+            value.pop();
+        }
+    }
+    if value.is_empty() {
+        return Err(Error::Invalid(format!(
+            "git {} returned empty output",
+            args.join(" ")
+        )));
+    }
+    let value = String::from_utf8(value)
+        .map_err(|_| Error::Invalid(format!("git {} returned non-UTF-8", args.join(" "))))?;
+    Ok(PathBuf::from(value))
+}
+
 fn nul_fields(bytes: &[u8]) -> Result<Vec<String>> {
     bytes
         .split(|byte| *byte == 0)
@@ -1805,6 +2197,25 @@ fn take_field(fields: &[String], index: &mut usize, status: &str) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TmpdirRestore(Option<std::ffi::OsString>);
+
+    impl TmpdirRestore {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TmpdirRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+    }
 
     fn git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1832,6 +2243,121 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn worktree_list_prefers_nul_porcelain_and_preserves_newlines() {
+        let mut common_dir_called = false;
+        let paths = compatible_worktree_paths(
+            || {
+                Ok(b"worktree /repo with spaces\0HEAD deadbeef\0\0worktree /repo\nwith-newline\0bare\0\0".to_vec())
+            },
+            || {
+                common_dir_called = true;
+                Ok(PathBuf::from("/unused/.git"))
+            },
+        )
+        .unwrap();
+
+        assert!(!common_dir_called);
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/repo with spaces"),
+                PathBuf::from("/repo\nwith-newline")
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_list_falls_back_to_common_dir_without_parsing_legacy_output() {
+        let paths = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Ok(PathBuf::from("/primary path\nwith-newline/.git")),
+        )
+        .unwrap();
+
+        assert_eq!(paths, [PathBuf::from("/primary path\nwith-newline")]);
+    }
+
+    #[test]
+    fn worktree_list_reports_modern_and_common_dir_failures() {
+        let error = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Err(Error::Invalid("not a git repository".into())),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown switch `z'"), "{error}");
+        assert!(error.contains("not a git repository"), "{error}");
+    }
+
+    #[test]
+    fn worktree_list_rejects_bare_common_dir_fallback() {
+        let error = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Ok(PathBuf::from("/repositories/project.git")),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("does not identify a primary checkout"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn temporary_base_checkout_uses_tmpdir_and_cleans_up() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _restore = TmpdirRestore::set(scratch.path());
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let checkout = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
+        let checkout_parent = checkout._parent.path().to_path_buf();
+        assert_eq!(checkout_parent.parent(), Some(scratch.path()));
+        assert!(checkout.path().join(".git").is_file());
+
+        drop(checkout);
+        assert!(!checkout_parent.exists());
+        assert!(git(repo.path(), &["worktree", "list", "--porcelain"])
+            .lines()
+            .all(|line| !line.contains("greppy-linked-base-checkout-")));
+    }
+
+    #[test]
+    fn temporary_base_checkout_refuses_missing_configured_tmpdir() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch_parent = tempfile::tempdir().unwrap();
+        let missing = scratch_parent.path().join("missing-scratch");
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let _restore = TmpdirRestore::set(&missing);
+
+        let error = match TemporaryBaseWorktree::create(repo.path(), &commit) {
+            Ok(_) => panic!("missing TMPDIR unexpectedly accepted"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("temporary Base checkout directory"),
+            "{message}"
+        );
+        assert!(
+            message.contains(missing.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(
+            !missing.exists(),
+            "invalid TMPDIR must not be created or bypassed"
+        );
     }
 
     #[test]
@@ -1864,14 +2390,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_base_builder_wait_is_bounded_and_actionable() {
+    fn concurrent_base_builder_wait_honors_caller_deadline() {
         let repo = fixture();
         let commit = git(repo.path(), &["rev-parse", "HEAD"]);
         let identity = base_identity_parts(repo.path(), &commit).unwrap();
         let identity_hash = identity.hash().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
-        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
         let progress_path = data_root.path().join("index.job");
         crate::write_background_job(
             &progress_path,
@@ -1887,11 +2413,13 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(20);
         let error = match acquire_base_builder(
             &layout,
             &identity_hash,
             Some(&progress_path),
-            std::time::Duration::from_millis(20),
+            Some(deadline),
+            None,
         ) {
             Ok(_) => panic!("second Base builder unexpectedly acquired the held lease"),
             Err(error) => error,
@@ -1899,9 +2427,8 @@ mod tests {
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let message = error.to_string();
-        assert!(message.contains("another worktree is building immutable Base"));
+        assert!(message.contains("deadline reached while waiting for immutable Base"));
         assert!(message.contains(&identity_hash));
-        assert!(message.contains("rerun `greppy index`"));
         assert!(message.contains(
             layout
                 .builder_lock_path()
@@ -1914,6 +2441,78 @@ mod tests {
         assert_eq!(progress["progress_unit"], "steps");
         assert_eq!(progress["completed_spans"], 0);
         assert_eq!(progress["total_spans"], 0);
+        drop(held);
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, Some(deadline), None) {
+                Ok(_) => panic!("expired caller acquired a free Base builder lease"),
+                Err(error) => error,
+            };
+        assert!(free_error
+            .to_string()
+            .contains("deadline reached while waiting for immutable Base"));
+    }
+
+    #[test]
+    fn concurrent_base_builder_wait_honors_cancellation() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+
+        let error = match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+            Ok(_) => panic!("cancelled consumer acquired the held Base builder lease"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("cancelled while waiting for immutable Base"));
+        assert!(message.contains(&identity_hash));
+        drop(held);
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+                Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
+                Err(error) => error,
+            };
+        assert!(free_error
+            .to_string()
+            .contains("cancelled while waiting for immutable Base"));
+    }
+
+    #[test]
+    fn concurrent_base_consumer_waits_for_owner_publication_lock() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let owner = layout.acquire_builder(true).unwrap().unwrap();
+        let publication = layout.directory.join("test-publication-complete");
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiting_layout = layout.clone();
+        let waiting_identity = identity_hash.clone();
+        let waiting_publication = publication.clone();
+        let waiter = std::thread::spawn(move || {
+            let lease = acquire_base_builder(&waiting_layout, &waiting_identity, None, None, None)
+                .expect("consumer must acquire the lifecycle lease after its owner publishes");
+            sent.send((lease, waiting_publication.is_file())).unwrap();
+        });
+
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        std::fs::create_dir_all(&layout.directory).unwrap();
+        std::fs::write(&publication, b"published").unwrap();
+        drop(owner);
+        let (consumer, observed_publication) = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("consumer did not resume after Base owner released publication lock");
+        assert!(observed_publication);
+        drop(consumer);
+        waiter.join().unwrap();
     }
 
     #[test]
@@ -2007,6 +2606,203 @@ mod tests {
             &store,
             "p",
             ".github/workflows/ci.yml",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn sparse_checkout_delta_freshness_uses_the_staged_blob() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".github/workflows")).unwrap();
+        std::fs::write(repo.path().join("docs/added.rs"), "fn added() {}\n").unwrap();
+        std::fs::write(repo.path().join("docs/[literal].rs"), "fn literal() {}\n").unwrap();
+        std::fs::write(repo.path().join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        git(
+            repo.path(),
+            &[
+                "add",
+                "docs/added.rs",
+                "docs/[literal].rs",
+                ".github/workflows/ci.yml",
+            ],
+        );
+        git(repo.path(), &["commit", "-q", "-m", "add sparse files"]);
+
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "docs/added.rs".to_string(),
+                "docs/[literal].rs".to_string(),
+                ".github/workflows/ci.yml".to_string(),
+            ])),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store
+            .get_file_state("p", "docs/added.rs")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .get_index_skip("p", ".github/workflows/ci.yml")
+                .unwrap()
+                .unwrap()
+                .reason,
+            "discovery_filtered"
+        );
+        assert!(store
+            .get_file_state("p", "docs/[literal].rs")
+            .unwrap()
+            .is_some());
+
+        git(repo.path(), &["sparse-checkout", "init", "--cone"]);
+        git(repo.path(), &["sparse-checkout", "set", "src"]);
+        assert!(!repo.path().join("docs/added.rs").exists());
+        assert!(!repo.path().join("docs/[literal].rs").exists());
+        assert!(!repo.path().join(".github/workflows/ci.yml").exists());
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("docs/added.rs"));
+        assert!(visibility.is_dirty_path("docs/[literal].rs"));
+        assert!(visibility.is_dirty_path(".github/workflows/ci.yml"));
+        let sparse_paths = std::collections::BTreeSet::from([
+            "docs/added.rs".to_string(),
+            "docs/[literal].rs".to_string(),
+            ".github/workflows/ci.yml".to_string(),
+        ]);
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            ".github/workflows/ci.yml",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+
+        let replacement = repo.path().join("replacement.rs");
+        std::fs::write(&replacement, "fn replacement() {}\n").unwrap();
+        let replacement_oid = git(
+            repo.path(),
+            &["hash-object", "-w", replacement.to_str().unwrap()],
+        );
+        let cache_entry = format!("100644,{replacement_oid},docs/added.rs");
+        git(repo.path(), &["update-index", "--cacheinfo", &cache_entry]);
+        git(
+            repo.path(),
+            &["update-index", "--skip-worktree", "docs/added.rs"],
+        );
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+
+        git(
+            repo.path(),
+            &["update-index", "--force-remove", "docs/added.rs"],
+        );
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_symlink_skip_uses_symlink_identity_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = fixture();
+        std::fs::write(repo.path().join("AGENTS.md"), "small target\n").unwrap();
+        symlink("AGENTS.md", repo.path().join("CLAUDE.md")).unwrap();
+        git(repo.path(), &["add", "AGENTS.md", "CLAUDE.md"]);
+        git(repo.path(), &["commit", "-q", "-m", "add tracked symlink"]);
+
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["CLAUDE.md".to_string()])),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store.get_index_skip("p", "CLAUDE.md").unwrap().is_some());
+        assert!(store.get_file_state("p", "CLAUDE.md").unwrap().is_none());
+
+        // Target content is not the identity of the tracked link.
+        std::fs::write(repo.path().join("AGENTS.md"), "different target content\n").unwrap();
+
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+
+        std::fs::remove_file(repo.path().join("CLAUDE.md")).unwrap();
+        symlink("MISSING.md", repo.path().join("CLAUDE.md")).unwrap();
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+        // A broken link is also a valid filtered entry after refresh.
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store.get_file_state("p", "CLAUDE.md").unwrap().is_none());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         )
         .unwrap());

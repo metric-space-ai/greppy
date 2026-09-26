@@ -461,10 +461,30 @@ fn splice(mut a: TcpStream, mut b: TcpStream, transferred: Arc<AtomicU64>) -> io
     let mut a_read = a.try_clone()?;
     let mut b_write = b.try_clone()?;
     let up_counter = Arc::clone(&transferred);
-    let up = thread::spawn(move || copy_counted(&mut a_read, &mut b_write, &up_counter));
+    let up = thread::spawn(move || {
+        let result = copy_counted(&mut a_read, &mut b_write, &up_counter);
+        if result.is_err() {
+            // Wake the other copy before joining it: a reset must not leave
+            // the peer waiting for bytes on a connection that already failed.
+            let _ = a_read.shutdown(std::net::Shutdown::Both);
+            let _ = b_write.shutdown(std::net::Shutdown::Both);
+        } else {
+            // Forward EOF without discarding a response still coming back.
+            let _ = b_write.shutdown(std::net::Shutdown::Write);
+        }
+        result
+    });
     let down = copy_counted(&mut b, &mut a, &transferred);
-    let _ = up.join();
-    down.map(|_| ())
+    if down.is_err() {
+        let _ = a.shutdown(std::net::Shutdown::Both);
+        let _ = b.shutdown(std::net::Shutdown::Both);
+    } else {
+        let _ = a.shutdown(std::net::Shutdown::Write);
+    }
+    let up = up
+        .join()
+        .map_err(|_| io::Error::other("proxy upload worker panicked"))?;
+    down.and(up).map(|_| ())
 }
 
 #[cfg(test)]
@@ -843,5 +863,85 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(proxy.active_connections(), 0);
+    }
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        for stream in [&client, &server] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+        }
+        (client, server)
+    }
+
+    #[test]
+    fn splice_reset_wakes_the_other_direction_before_join() {
+        use std::os::fd::AsRawFd;
+
+        let (mut client, proxy_client) = connected_pair();
+        let (proxy_server, mut origin) = connected_pair();
+        proxy_client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = splice(proxy_client, proxy_server, Arc::new(AtomicU64::new(0)));
+            let _ = done.send(result);
+        });
+
+        client.write_all(b"request").unwrap();
+        let mut request = [0_u8; 7];
+        origin.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"request");
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                origin.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of_val(&linger) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "set abortive origin close");
+        drop(origin);
+
+        let result = completed.recv_timeout(Duration::from_secs(2));
+        // Unblock and join the worker even if this assertion would fail on
+        // a regression, so the test never leaves a blocked proxy behind.
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        worker.join().expect("splice worker");
+        let result = result.expect("splice must finish promptly after reset");
+        assert!(result.is_err(), "reset must remain an error: {result:?}");
+    }
+
+    #[test]
+    fn splice_client_half_close_preserves_complete_server_reply() {
+        let (mut client, proxy_client) = connected_pair();
+        let (proxy_server, mut origin) = connected_pair();
+        let worker = thread::spawn(move || {
+            splice(proxy_client, proxy_server, Arc::new(AtomicU64::new(0)))
+        });
+
+        client.write_all(b"request").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut request = Vec::new();
+        origin.read_to_end(&mut request).unwrap();
+        assert_eq!(request, b"request");
+        origin.write_all(b"complete reply").unwrap();
+        origin.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"complete reply");
+        worker.join().expect("splice worker").expect("clean splice");
     }
 }

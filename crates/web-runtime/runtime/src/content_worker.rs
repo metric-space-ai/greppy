@@ -11,11 +11,11 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
-    RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
+    RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,6 +35,7 @@ const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
+const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -335,6 +336,7 @@ struct Delegate {
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
+    dropped_requests: Cell<u64>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
@@ -349,6 +351,13 @@ struct Delegate {
     denied_navigation: RefCell<Option<String>>,
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
+    dropped_responses: Cell<u64>,
+    current_main_frame_request: RefCell<Option<String>>,
+    main_frame_navigation_epoch: Cell<u64>,
+    navigation_intent_generation: Cell<u64>,
+    pending_navigation_intent: RefCell<Option<(u64, String, Option<String>)>>,
+    promoted_navigation_url: RefCell<Option<String>>,
+    navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     /// Main-document lifecycle, owned by Servo rather than page script. A
@@ -378,6 +387,7 @@ impl Delegate {
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
+            dropped_requests: Cell::new(0),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
@@ -391,6 +401,13 @@ impl Delegate {
             denied_navigation: RefCell::new(None),
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
+            dropped_responses: Cell::new(0),
+            current_main_frame_request: RefCell::new(None),
+            main_frame_navigation_epoch: Cell::new(0),
+            navigation_intent_generation: Cell::new(0),
+            pending_navigation_intent: RefCell::new(None),
+            promoted_navigation_url: RefCell::new(None),
+            navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
@@ -401,17 +418,57 @@ impl Delegate {
         }
     }
 
-    fn mark_request_failure(&self, url: &str, error_text: &str) {
-        if let Some(row) = self
-            .requests
-            .borrow_mut()
-            .iter_mut()
-            .rev()
-            .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url))
+    fn mark_request_failure(&self, request_id: &str, error_text: &str) {
+        if let Some(row) =
+            self.requests.borrow_mut().iter_mut().rev().find(|row| {
+                row.get("requestId").and_then(|value| value.as_str()) == Some(request_id)
+            })
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
         }
+    }
+
+    fn record_main_frame_failure(&self, request_id: &str, url: &str, error_text: &str, kind: &str) {
+        if self.current_main_frame_request.borrow().as_deref() == Some(request_id) {
+            let preserve_specific_failure = kind == "transport"
+                && self
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|failure| {
+                        failure.get("requestId").and_then(|value| value.as_str())
+                            == Some(request_id)
+                            && failure.get("kind").and_then(|value| value.as_str())
+                                != Some("transport")
+                    });
+            if preserve_specific_failure {
+                return;
+            }
+            self.navigation_failure.replace(Some(json!({
+                "requestId": request_id,
+                "url": url,
+                "errorText": error_text,
+                "kind": kind,
+                "navigationEpoch": self.main_frame_navigation_epoch.get(),
+            })));
+            self.wake.wake();
+        }
+    }
+
+    fn navigation_failure_after(
+        &self,
+        kind: &str,
+        baseline_epoch: u64,
+    ) -> Option<serde_json::Value> {
+        let current_epoch = self.main_frame_navigation_epoch.get();
+        self.navigation_failure
+            .borrow()
+            .as_ref()
+            .filter(|failure| {
+                navigation_failure_matches_after(failure, kind, current_epoch, baseline_epoch)
+            })
+            .cloned()
     }
 
     fn note_wait_signal(&self, text: &str) {
@@ -434,7 +491,47 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+    fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=intent main_frame={} url={}",
+                navigation.is_for_main_frame, navigation.url
+            );
+        }
+        if !navigation.is_for_main_frame {
+            match decide_url(self.profile.get(), navigation.url.as_str()) {
+                UrlDecision::Allow => navigation.allow(),
+                UrlDecision::Deny { .. } => navigation.deny(),
+            }
+            return;
+        }
+        let generation = self.navigation_intent_generation.get().wrapping_add(1);
+        self.navigation_intent_generation.set(generation);
+        let decision = decide_url(self.profile.get(), navigation.url.as_str());
+        let denied = match &decision {
+            UrlDecision::Deny { reason } => Some((*reason).to_owned()),
+            UrlDecision::Allow => None,
+        };
+        self.pending_navigation_intent.replace(Some((
+            generation,
+            navigation.url.to_string(),
+            denied,
+        )));
+        self.wake.wake();
+        if matches!(decision, UrlDecision::Deny { .. }) {
+            navigation.deny();
+            return;
+        }
+        navigation.allow();
+    }
+
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=load-status status={status:?} epoch={}",
+                self.main_frame_navigation_epoch.get()
+            );
+        }
         if status == LoadStatus::HeadParsed {
             self.document_generation
                 .set(self.document_generation.get().wrapping_add(1));
@@ -554,6 +651,10 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
+        let request_id = format!(
+            "{}:{}",
+            load.request.id.fetch_id, load.request.id.redirect_count
+        );
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -591,7 +692,29 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow if abort_match => Some("net::ERR_FAILED".to_owned()),
             UrlDecision::Allow => None,
         };
-        self.requests.borrow_mut().push(json!({
+        let mut requests = self.requests.borrow_mut();
+        if load.request.is_for_main_frame {
+            let promoted = self.promoted_navigation_url.borrow().as_deref() == Some(url.as_str());
+            if !load.request.is_redirect && !promoted {
+                self.main_frame_navigation_epoch
+                    .set(self.main_frame_navigation_epoch.get().wrapping_add(1));
+            }
+            if promoted {
+                self.promoted_navigation_url.replace(None);
+            }
+            self.current_main_frame_request
+                .replace(Some(request_id.clone()));
+            self.navigation_failure.replace(None);
+            if NavTrace::enabled() {
+                eprintln!(
+                    "web-runtime: nav-event phase=request request_id={request_id} redirect={} promoted={promoted} epoch={} url={url}",
+                    load.request.is_redirect,
+                    self.main_frame_navigation_epoch.get()
+                );
+            }
+        }
+        requests.push(json!({
+            "requestId": request_id,
             "url": url,
             "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
@@ -599,10 +722,17 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
+        retain_bounded(
+            &mut requests,
+            &self.dropped_requests,
+            MAX_NETWORK_RECORDS_PER_PAGE,
+        );
+        drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
+                self.record_main_frame_failure(&request_id, &url, reason, "policy_denied");
             }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url))
@@ -633,9 +763,15 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
-                self.mark_request_failure(&url, "net::ERR_FAILED");
+                self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
+                    self.record_main_frame_failure(
+                        &request_id,
+                        &url,
+                        "net::ERR_FAILED",
+                        "route_aborted",
+                    );
                 }
                 load.intercept(WebResourceResponse::new(request_url))
                     .cancel();
@@ -658,7 +794,9 @@ impl WebViewDelegate for Delegate {
                 intercepted.finish();
                 let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
                 let body_b64 = base64_encode(&body);
-                self.last_responses.borrow_mut().push(json!({
+                let mut responses = self.last_responses.borrow_mut();
+                responses.push(json!({
+                    "requestId": request_id,
                     "url": request_url.to_string(),
                     "status": status,
                     "statusText": status_text,
@@ -669,6 +807,12 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
+                retain_bounded(
+                    &mut responses,
+                    &self.dropped_responses,
+                    MAX_NETWORK_RECORDS_PER_PAGE,
+                );
+                drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
                 let is_download = lower.contains("octet-stream") || lower.contains("attachment");
@@ -701,6 +845,153 @@ impl WebViewDelegate for Delegate {
             _ => {}
         }
     }
+    fn web_resource_response_completed(
+        &self,
+        _webview: WebView,
+        response: WebResourceResponseCompleted,
+    ) {
+        let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=response-completed request_id={request_id} failure={:?} epoch={} url={}",
+                response.failure,
+                self.main_frame_navigation_epoch.get(),
+                response.url
+            );
+        }
+        let headers: serde_json::Map<String, serde_json::Value> = response
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), json!(value)))
+            })
+            .collect();
+        let mut row = json!({
+            "requestId": request_id,
+            "url": response.url.to_string(),
+            "statusText": String::from_utf8_lossy(&response.status_message),
+            "bodyBytes": response.body_bytes,
+            "byteLength": response.body_bytes,
+            "fromCache": response.from_cache,
+            "headers": headers,
+        });
+        if let Some(status) = response.status_code {
+            row["status"] = json!(status);
+            row["ok"] = json!((200..400).contains(&status));
+            if status == 204
+                && self.current_main_frame_request.borrow().as_deref() == Some(request_id.as_str())
+            {
+                self.record_main_frame_failure(
+                    &request_id,
+                    response.url.as_str(),
+                    "HTTP 204 No Content cannot create a document",
+                    "no_document",
+                );
+            }
+        }
+        if let Some(failure) = response.failure {
+            row["failure"] = json!({ "errorText": failure.clone() });
+            self.record_main_frame_failure(
+                &request_id,
+                response.url.as_str(),
+                &failure,
+                "transport",
+            );
+        }
+        let mut responses = self.last_responses.borrow_mut();
+        if let Some(existing) = responses.iter_mut().find(|existing| {
+            existing.get("requestId").and_then(|id| id.as_str()) == Some(request_id.as_str())
+        }) {
+            merge_terminal_response(existing, row);
+        } else {
+            responses.push(row);
+            retain_bounded(
+                &mut responses,
+                &self.dropped_responses,
+                MAX_NETWORK_RECORDS_PER_PAGE,
+            );
+        }
+        self.wake.wake();
+    }
+}
+
+fn retain_bounded(records: &mut Vec<serde_json::Value>, dropped: &Cell<u64>, limit: usize) {
+    let excess = records.len().saturating_sub(limit);
+    if excess != 0 {
+        records.drain(..excess);
+        dropped.set(dropped.get().saturating_add(excess as u64));
+    }
+}
+
+fn network_retention_metadata(retained: usize, dropped: u64) -> serde_json::Value {
+    json!({
+        "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+        "retained": retained,
+        "dropped": dropped,
+        "complete": dropped == 0,
+    })
+}
+
+fn response_information_score(response: &serde_json::Value) -> usize {
+    let failure = response
+        .get("failure")
+        .is_some_and(|value| !value.is_null()) as usize
+        * 1_000;
+    let status = response
+        .get("status")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 100;
+    let headers = response
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .map_or(0, |value| value.len() * 10);
+    let body = response
+        .get("bodyBytes")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 10;
+    failure + status + headers + body
+}
+
+fn merge_terminal_response(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    let existing_key = (response_information_score(existing), existing.to_string());
+    let incoming_key = (response_information_score(&incoming), incoming.to_string());
+    let (mut richer, other) = if incoming_key > existing_key {
+        (incoming, existing.clone())
+    } else {
+        (existing.clone(), incoming)
+    };
+    let Some(richer_object) = richer.as_object_mut() else {
+        return;
+    };
+    let Some(other_object) = other.as_object() else {
+        return;
+    };
+    for (key, value) in other_object {
+        let missing = richer_object.get(key).is_none_or(|current| {
+            current.is_null()
+                || current.as_str().is_some_and(str::is_empty)
+                || current.as_object().is_some_and(serde_json::Map::is_empty)
+        });
+        if missing {
+            richer_object.insert(key.clone(), value.clone());
+        }
+    }
+    for key in ["bodyBytes", "byteLength"] {
+        if let Some(maximum) = [richer_object.get(key), other_object.get(key)]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_u64)
+            .max()
+        {
+            richer_object.insert(key.to_owned(), json!(maximum));
+        }
+    }
+    *existing = richer;
 }
 
 fn extra_request_headers(extras: &[(String, String)]) -> http::HeaderMap {
@@ -1000,11 +1291,9 @@ impl ContentEngine {
 
     /// How far a navigation must get before `goto` returns.
     ///
-    /// Playwright lets the caller choose; the runtime used to wait for the
-    /// full load in every case. On a page whose sub-resource never finishes,
-    /// `readyState` stays `loading` forever, so `goto` timed out on a document
-    /// that was parsed, titled and fully readable -- three pages of the pinned
-    /// corpus fail exactly this way.
+    /// Playwright lets the caller choose. Servo's HeadParsed signal is only a
+    /// parsing progress marker, while Complete is the full-load boundary; the
+    /// document-start lifecycle receipt supplies DOMContentLoaded between them.
     fn load_committed_for(
         &self,
         webview: &WebView,
@@ -1013,31 +1302,20 @@ impl ContentEngine {
     ) -> bool {
         match (webview.load_status(), until) {
             (LoadStatus::Complete, _) => true,
-            // The document is parsed: the DOM is there and can be read, which
-            // is exactly what `domcontentloaded` promises.
-            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded) => true,
-            _ => self.load_committed(webview, last_js),
-        }
-    }
-
-    fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
-        match webview.load_status() {
-            LoadStatus::Complete => true,
-            // Poll readyState at 25ms, not 200ms. Large documents sit in
-            // HeadParsed for their whole parse; on the release build the
-            // 200ms cadence alone cost ~1.3s of a 2.1s navigation commit
-            // (nav-trace, page 044) while each evaluate costs well under a
-            // millisecond of CPU.
-            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(25) => {
+            // HeadParsed is earlier than DOMContentLoaded. In particular,
+            // readyState `interactive` is also too early while deferred
+            // scripts are still pending, so use the document-start listener
+            // installed by the user-content bundle as the lifecycle receipt.
+            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded)
+                if last_js.elapsed() >= Duration::from_millis(25) =>
+            {
                 *last_js = Instant::now();
                 match self.evaluate_until(
                     webview.clone(),
-                    "document.readyState",
+                    "globalThis.__greppyDOMContentLoaded === true",
                     Duration::from_millis(150),
                 ) {
-                    Ok(JSValue::String(state)) => {
-                        load_status_allows_navigation(LoadStatus::HeadParsed, Some(&state))
-                    }
+                    Ok(JSValue::Boolean(loaded)) => loaded,
                     _ => false,
                 }
             }
@@ -1051,7 +1329,7 @@ impl ContentEngine {
         timeout: Duration,
         url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
-        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, url_settled)
+        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, || false, url_settled)
     }
 
     fn spin_until_loaded_until(
@@ -1059,6 +1337,7 @@ impl ContentEngine {
         webview: &WebView,
         timeout: Duration,
         until: WaitUntil,
+        mut terminal_failure: impl FnMut() -> bool,
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
@@ -1068,12 +1347,20 @@ impl ContentEngine {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
                 return Ok(true);
             }
             self.servo.spin_event_loop();
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
@@ -1081,6 +1368,7 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
@@ -1090,6 +1378,7 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready | WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
+                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
@@ -1397,14 +1686,18 @@ impl ContentEngine {
         let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| {
             let concise = match &error {
+                servo::JavaScriptEvaluationError::CompilationFailure => Some(
+                    "page JavaScript could not be compiled; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression"
+                        .to_owned(),
+                ),
                 servo::JavaScriptEvaluationError::EvaluationFailure(Some(info)) => {
                     crate::locator_diagnostics::concise_selection_failure(&info.message)
+                        .map(str::to_owned)
                 }
                 _ => None,
             };
             io::Error::other(
                 concise
-                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("page JavaScript failed: {error:?}")),
             )
         })
@@ -1947,6 +2240,80 @@ impl ContentEngine {
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
+            "session.attachPage" => {
+                let page = required_str(&params, "page")?;
+                let (page_generation, context_id, browser_id, url) =
+                    match self.pages.get(&page) {
+                        Some(PageSlot::Live {
+                            pair,
+                            generation,
+                            context_id,
+                            browser_id,
+                        }) => (
+                            *generation,
+                            context_id.clone(),
+                            browser_id.clone(),
+                            pair.0
+                                .url()
+                                .map(|url| url.to_string())
+                                .unwrap_or_else(|| "about:blank".to_owned()),
+                        ),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "session active page is unavailable",
+                            ))
+                        }
+                    };
+                let browser = browser_id
+                    .unwrap_or_else(|| self.alloc_id("browser"));
+                if !self.browsers.contains_key(&browser) {
+                    self.browsers.insert(
+                        browser.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: None,
+                        },
+                    );
+                }
+                let context = context_id
+                    .unwrap_or_else(|| self.alloc_id("context"));
+                if !self.contexts.contains_key(&context) {
+                    self.contexts.insert(
+                        context.clone(),
+                        ObjectLife::Live {
+                            generation: 1,
+                            parent: Some(browser.clone()),
+                        },
+                    );
+                }
+                if let Some(PageSlot::Live {
+                    context_id,
+                    browser_id,
+                    ..
+                }) = self.pages.get_mut(&page)
+                {
+                    *context_id = Some(context.clone());
+                    *browser_id = Some(browser.clone());
+                }
+                let context_generation = match self.contexts.get(&context) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("BrowserContext")),
+                };
+                let browser_generation = match self.browsers.get(&browser) {
+                    Some(ObjectLife::Live { generation, .. }) => *generation,
+                    _ => return Err(object_disposed("Browser")),
+                };
+                Ok(json!({
+                    "browser": browser,
+                    "browserGeneration": browser_generation,
+                    "context": context,
+                    "contextGeneration": context_generation,
+                    "page": page,
+                    "pageGeneration": page_generation,
+                    "url": url,
+                }))
+            }
             "session.networkBytes" => {
                 // Real bytes relayed through the policy proxy, both
                 // directions — the metric behind web.run's network_bytes,
@@ -1988,38 +2355,48 @@ impl ContentEngine {
                 // Extra headers ride WebResourceLoad::continue_with_headers in
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
+                delegate.navigation_failure.replace(None);
+                let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 webview.load(url.clone());
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                let until = WaitUntil::from_params(&params);
+                let until = WaitUntil::from_params(&params)?;
                 let engine = &*self;
                 let mut last_stamp = Instant::now() - Duration::from_millis(200);
-                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
-                    if denied.denied_navigation.borrow().is_some() {
-                        return true;
-                    }
-                    let url_settled = loading.url().is_some_and(|current| {
-                        urls_match(&current, &expected)
-                            || previous.as_ref().is_some_and(|old| current != *old)
-                    });
-                    if !url_settled || !stamped {
-                        return url_settled;
-                    }
-                    // Poll at the same 25ms cadence the readyState probe uses.
-                    if last_stamp.elapsed() < Duration::from_millis(25) {
-                        return false;
-                    }
-                    last_stamp = Instant::now();
-                    matches!(
-                        engine.evaluate_until(
-                            loading.clone(),
-                            "typeof window.__greppyNavStamp === 'undefined'",
-                            Duration::from_millis(150),
-                        ),
-                        Ok(JSValue::Boolean(true))
-                    )
-                })? {
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || {
+                        denied.denied_navigation.borrow().is_some()
+                            || denied
+                                .navigation_failure_after("no_document", navigation_epoch_before)
+                                .is_some()
+                    },
+                    || {
+                        let url_settled = loading.url().is_some_and(|current| {
+                            urls_match(&current, &expected)
+                                || previous.as_ref().is_some_and(|old| current != *old)
+                        });
+                        if !url_settled || !stamped {
+                            return url_settled;
+                        }
+                        // Poll at the same 25ms cadence the readyState probe uses.
+                        if last_stamp.elapsed() < Duration::from_millis(25) {
+                            return false;
+                        }
+                        last_stamp = Instant::now();
+                        matches!(
+                            engine.evaluate_until(
+                                loading.clone(),
+                                "typeof window.__greppyNavStamp === 'undefined'",
+                                Duration::from_millis(150),
+                            ),
+                            Ok(JSValue::Boolean(true))
+                        )
+                    },
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -2034,6 +2411,26 @@ impl ContentEngine {
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
                     ));
+                }
+                let no_document = delegate
+                    .navigation_failure_after("no_document", navigation_epoch_before);
+                if let Some(failure) = no_document {
+                    delegate.navigation_failure.borrow_mut().take();
+                    let request_id = failure
+                        .get("requestId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let failure_url = failure
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let epoch = failure
+                        .get("navigationEpoch")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    return Err(io::Error::other(format!(
+                        "navigation failed: HTTP 204 No Content cannot create a document (kind=no_document, request_id={request_id}, navigation_epoch={epoch}, url={failure_url})"
+                    )));
                 }
                 if let Some(final_url) = webview.url() {
                     if let UrlDecision::Deny { reason } =
@@ -2079,12 +2476,9 @@ impl ContentEngine {
                     .url()
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| url.to_string());
+                let current_request = delegate.current_main_frame_request.borrow().clone();
                 let recorded = delegate.last_responses.borrow();
-                let matched = recorded.iter().rev().find(|row| {
-                    row.get("url")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|recorded_url| recorded_url == final_url)
-                });
+                let matched = response_for_request(&recorded, current_request.as_deref());
                 let http = url.scheme() == "http" || url.scheme() == "https";
                 let recorded_status = matched
                     .and_then(|row| row.get("status"))
@@ -2098,6 +2492,10 @@ impl ContentEngine {
                     .and_then(|row| row.get("headers"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let recorded_failure = matched
+                    .and_then(|row| row.pointer("/failure/errorText"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
                 drop(recorded);
                 // A failed probe means UNKNOWN, never "empty": on a page
                 // whose script thread is still busy (a 7.6MB spec mid-parse)
@@ -2110,10 +2508,11 @@ impl ContentEngine {
                     Ok(JSValue::String(text)) => Some(text),
                     _ => None,
                 };
-                if let Some(text) = &text {
-                    if text.contains("Could not load the requested page") {
-                        return Err(io::Error::other(format!("navigation failed: {text}")));
-                    }
+                if let Some(failure) = recorded_failure {
+                    delegate.navigation_failure.borrow_mut().take();
+                    return Err(io::Error::other(format!(
+                        "navigation failed: {failure}"
+                    )));
                 }
                 let html =
                     match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
@@ -2121,8 +2520,9 @@ impl ContentEngine {
                         _ => None,
                     };
                 // CONNECT-tunneled fetches often never match last_responses, so a
-                // missing recorded status is not proof of failure. The Servo error
-                // shell is already rejected above; accept a rendered document.
+                // missing recorded status is not proof of failure. A typed
+                // terminal transport failure is rejected above; otherwise accept
+                // a rendered document.
                 //
                 // Empty innerText plus tiny HTML is not proof either: a
                 // <frameset> page has no body at all, so its innerText is
@@ -2148,6 +2548,7 @@ impl ContentEngine {
                 }
                 let status = recorded_status.unwrap_or(200);
                 Ok(json!({
+                    "requestId": current_request,
                     "url": final_url,
                     "status": status,
                     "statusText": if status_text.is_empty() && status < 400 {
@@ -2161,8 +2562,9 @@ impl ContentEngine {
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
-                Ok(json!({ "dispatch": dispatch }))
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.tap" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -2356,6 +2758,65 @@ impl ContentEngine {
                 self.dispose_page(&page_id);
                 Ok(json!({}))
             }
+            "session.closePage" => {
+                let page_id = required_str(&params, "page")?;
+                let (context_id, browser_id) = match self.pages.get(&page_id) {
+                    Some(PageSlot::Live {
+                        context_id,
+                        browser_id,
+                        ..
+                    }) => (context_id.clone(), browser_id.clone()),
+                    _ => (None, None),
+                };
+                self.dispose_page(&page_id);
+                if let Some(context_id) = context_id {
+                    let still_used = self.pages.values().any(|slot| {
+                        matches!(
+                            slot,
+                            PageSlot::Live {
+                                context_id: Some(owner),
+                                ..
+                            } if owner == &context_id
+                        )
+                    });
+                    if !still_used {
+                        let generation = match self.contexts.get(&context_id) {
+                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
+                            _ => None,
+                        };
+                        if let Some(generation) = generation {
+                            self.contexts.insert(
+                                context_id,
+                                ObjectLife::Disposed { generation },
+                            );
+                        }
+                    }
+                }
+                if let Some(browser_id) = browser_id {
+                    let still_used = self.pages.values().any(|slot| {
+                        matches!(
+                            slot,
+                            PageSlot::Live {
+                                browser_id: Some(owner),
+                                ..
+                            } if owner == &browser_id
+                        )
+                    });
+                    if !still_used {
+                        let generation = match self.browsers.get(&browser_id) {
+                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
+                            _ => None,
+                        };
+                        if let Some(generation) = generation {
+                            self.browsers.insert(
+                                browser_id,
+                                ObjectLife::Disposed { generation },
+                            );
+                        }
+                    }
+                }
+                Ok(json!({}))
+            }
             "page.isClosed" => {
                 let page_id = required_str(&params, "page")?;
                 let closed = !matches!(self.pages.get(&page_id), Some(PageSlot::Live { .. }));
@@ -2385,9 +2846,28 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
+            "page.take_navigation_failure" => {
+                let page_id = required_str(&params, "page")?;
+                let expected_epoch = params
+                    .get("navigation_epoch")
+                    .and_then(serde_json::Value::as_u64);
+                let (_, delegate) = self.page(&page_id)?.clone();
+                let matches_action = delegate
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .and_then(|failure| failure.get("navigationEpoch"))
+                    .and_then(serde_json::Value::as_u64)
+                    == expected_epoch;
+                let failure = matches_action
+                    .then(|| delegate.navigation_failure.borrow_mut().take())
+                    .flatten();
+                Ok(json!({ "failure": failure }))
+            }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
+                let expected_snapshot = params.get("expected_snapshot").and_then(|value| value.as_str());
                 let first = params
                     .get("ref_first")
                     .and_then(|value| value.as_u64())
@@ -2396,7 +2876,21 @@ impl ContentEngine {
                     .get("ref_last")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                if let Some(failure) = delegate.navigation_failure.borrow_mut().take() {
+                    let request_id = failure.get("requestId").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
+                    let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let detail = format!(
+                        "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                    );
+                    return Err(io::Error::other(if kind == "policy_denied" {
+                        format!("policy_denied: {detail}")
+                    } else {
+                        detail
+                    }));
+                }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
                     .get("include_html")
@@ -2404,7 +2898,7 @@ impl ContentEngine {
                     .unwrap_or(false);
                 match self.evaluate(
                     webview,
-                    &observe_script(snapshot, first, last, query, include_html),
+                    &observe_script(snapshot, first, last, query, include_html, expected_snapshot),
                 )? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
@@ -2539,14 +3033,15 @@ impl ContentEngine {
                 // assignment. Reuse the same acknowledged native click path
                 // as `locator.click` so click/input/change and framework
                 // handlers all observe one real transition (Fund 033).
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
                 let actual = self.locator_checked_state(&params)?;
                 if actual != checked {
                     return Err(io::Error::other(format!(
                         "checkbox activation did not produce the requested state: expected checked={checked}, observed checked={actual}"
                     )));
                 }
-                Ok(json!({ "dispatch": dispatch }))
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
@@ -2784,13 +3279,23 @@ impl ContentEngine {
                 if let Some(timeout) = params.get("timeout") {
                     goto_params["timeout"] = timeout.clone();
                 }
+                if let Some(wait_until) = params.get("waitUntil") {
+                    goto_params["waitUntil"] = wait_until.clone();
+                }
                 self.handle("page.goto", goto_params)
             }
             "page.waitForLoadState" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                if !self.spin_until_loaded(&loading, call_timeout(&params), || true)? {
+                let until = WaitUntil::from_params(&params)?;
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || false,
+                    || true,
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out waiting for load state",
@@ -3131,13 +3636,24 @@ impl ContentEngine {
             }
             "page.requests" => {
                 let page_id = required_str(&params, "page")?;
+                let delegate = &self.page(&page_id)?.1;
+                let retained = delegate.requests.borrow().len();
+                let dropped = delegate.dropped_requests.get();
                 Ok(json!({
-                    "requests": crate::daemon::redact_json(json!(self.page(&page_id)?.1.requests.borrow().clone()))
+                    "requests": crate::daemon::redact_json(json!(delegate.requests.borrow().clone())),
+                    "retention": network_retention_metadata(retained, dropped)
                 }))
             }
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
-                Ok(json!({ "responses": self.page(&page_id)?.1.last_responses.borrow().clone() }))
+                let delegate = &self.page(&page_id)?.1;
+                let responses = delegate.last_responses.borrow().clone();
+                let retained = responses.len();
+                let dropped = delegate.dropped_responses.get();
+                Ok(json!({
+                    "responses": responses,
+                    "retention": network_retention_metadata(retained, dropped)
+                }))
             }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
@@ -3582,9 +4098,13 @@ impl ContentEngine {
         &mut self,
         params: &serde_json::Value,
         resolved: &ResolvedNode,
-    ) -> io::Result<String> {
+    ) -> io::Result<(String, Option<u64>)> {
         let page_id = required_str(params, "page")?;
         let (webview, delegate) = self.page(&page_id)?.clone();
+        let action_started = Instant::now();
+        let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+        let navigation_intent_before = delegate.navigation_intent_generation.get();
+        let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
             std::process::id(),
@@ -3621,6 +4141,49 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
+        if let Some((generation, url, denied)) = delegate
+            .pending_navigation_intent
+            .borrow()
+            .clone()
+            .filter(|(generation, _, _)| *generation != navigation_intent_before)
+            .filter(|_| delegate.main_frame_navigation_epoch.get() == navigation_epoch_before)
+        {
+            let epoch = delegate.main_frame_navigation_epoch.get().wrapping_add(1);
+            delegate.main_frame_navigation_epoch.set(epoch);
+            let request_id = format!("navigation-intent:{generation}");
+            delegate
+                .current_main_frame_request
+                .replace(Some(request_id.clone()));
+            delegate.promoted_navigation_url.replace(Some(url.clone()));
+            delegate.navigation_failure.replace(None);
+            if let Some(reason) = denied {
+                delegate.record_main_frame_failure(&request_id, &url, &reason, "policy_denied");
+            }
+        }
+        let navigation_epoch_after = delegate.main_frame_navigation_epoch.get();
+        let navigation_epoch =
+            (navigation_epoch_after != navigation_epoch_before).then_some(navigation_epoch_after);
+        if let Some(expected_epoch) = navigation_epoch {
+            let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
+            if !self.spin_until_loaded_until(
+                &webview,
+                remaining,
+                WaitUntil::Load,
+                || {
+                    let failure = delegate.navigation_failure.borrow();
+                    navigation_failure_belongs_to_epoch(failure.as_ref(), expected_epoch)
+                },
+                || {
+                    delegate.document_generation.get() != document_generation_before
+                        && delegate.main_frame_navigation_epoch.get() == expected_epoch
+                },
+            )? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for click navigation",
+                ));
+            }
+        }
         if let Some(selector) = params
             .get("selector")
             .and_then(|value| value.get("value"))
@@ -3628,7 +4191,7 @@ impl ContentEngine {
         {
             let _ = self.assign_pending_files(&page_id, selector);
         }
-        Ok(dispatch)
+        Ok((dispatch, navigation_epoch))
     }
 
     fn locator_checked_state(&self, params: &serde_json::Value) -> io::Result<bool> {
@@ -4072,6 +4635,16 @@ impl NavTrace {
         );
         }
     }
+
+    fn timeout(&self, webview: &WebView) {
+        if self.started.is_some() {
+            eprintln!(
+                "web-runtime: nav-event phase=wait-timeout load_status={:?} url={:?}",
+                webview.load_status(),
+                webview.url().map(|url| url.to_string())
+            );
+        }
+    }
 }
 
 /// Engine preferences for a content worker reachable only through `proxy_uri`.
@@ -4236,19 +4809,42 @@ fn click_at(
     )
 }
 
-fn load_status_allows_navigation(status: LoadStatus, ready_state: Option<&str>) -> bool {
-    match status {
-        LoadStatus::Complete => true,
-        LoadStatus::HeadParsed => matches!(ready_state, Some("complete") | Some("interactive")),
-        LoadStatus::Started => false,
-    }
-}
-
 fn urls_match(current: &Url, expected: &Url) -> bool {
     current.scheme() == expected.scheme()
         && current.host() == expected.host()
         && current.port_or_known_default() == expected.port_or_known_default()
         && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
+}
+
+fn navigation_failure_belongs_to_epoch(
+    failure: Option<&serde_json::Value>,
+    expected_epoch: u64,
+) -> bool {
+    failure
+        .and_then(|value| value.get("navigationEpoch"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(expected_epoch)
+}
+
+fn navigation_failure_matches_after(
+    failure: &serde_json::Value,
+    kind: &str,
+    current_epoch: u64,
+    baseline_epoch: u64,
+) -> bool {
+    current_epoch > baseline_epoch
+        && failure.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+        && navigation_failure_belongs_to_epoch(Some(failure), current_epoch)
+}
+
+fn response_for_request<'a>(
+    responses: &'a [serde_json::Value],
+    request_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let request_id = request_id?;
+    responses.iter().rev().find(|row| {
+        row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id)
+    })
 }
 
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
@@ -4385,6 +4981,112 @@ mod serialize_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn click_navigation_epoch_survives_redirect_request_id_changes() {
+        let aborted = json!({
+            "requestId": "different-fetch-uuid:2",
+            "navigationEpoch": 7,
+            "url": "http://example.test/end",
+            "errorText": "net::ERR_FAILED",
+        });
+        assert!(
+            navigation_failure_belongs_to_epoch(Some(&aborted), 7),
+            "terminal failure must settle an aborted navigation without a document commit"
+        );
+        assert!(!navigation_failure_belongs_to_epoch(Some(&aborted), 6));
+    }
+
+    #[test]
+    fn stale_completion_before_new_navigation_epoch_cannot_abort_goto() {
+        let prior_completion = json!({
+            "requestId": "prior:0",
+            "navigationEpoch": 11,
+            "kind": "no_document",
+        });
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            11,
+            11,
+        ));
+
+        let current_completion = json!({
+            "requestId": "current:0",
+            "navigationEpoch": 12,
+            "kind": "no_document",
+        });
+        assert!(navigation_failure_matches_after(
+            &current_completion,
+            "no_document",
+            12,
+            11,
+        ));
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            12,
+            11,
+        ));
+    }
+
+    #[test]
+    fn current_request_identity_beats_stale_same_url_response() {
+        let responses = vec![
+            json!({"requestId":"old:0","url":"http://example.test/same","failure":{"errorText":"stale"}}),
+            json!({"requestId":"current:0","url":"http://example.test/same","status":200}),
+        ];
+        let current = response_for_request(&responses, Some("current:0")).unwrap();
+        assert_eq!(current["status"], 200);
+        assert!(current.get("failure").is_none());
+        assert!(response_for_request(&responses, Some("missing:0")).is_none());
+    }
+
+    #[test]
+    fn terminal_response_merge_is_order_independent_and_keeps_failure_details() {
+        let streamed = json!({
+            "requestId": "fetch:0", "status": 200, "statusText": "OK",
+            "headers": { "content-type": "text/plain" },
+            "bodyBytes": 7, "byteLength": 7,
+            "failure": { "errorText": "body reset" }
+        });
+        let generic = json!({
+            "requestId": "fetch:0", "statusText": "", "headers": {},
+            "bodyBytes": 0, "byteLength": 0,
+            "failure": { "errorText": "network error" }
+        });
+        let mut first = streamed.clone();
+        merge_terminal_response(&mut first, generic.clone());
+        let mut second = generic;
+        merge_terminal_response(&mut second, streamed);
+        assert_eq!(first, second);
+        assert_eq!(first["status"], 200);
+        assert_eq!(first["byteLength"], 7);
+        assert_eq!(first["headers"]["content-type"], "text/plain");
+        assert!(first["failure"]["errorText"].is_string());
+    }
+
+    #[test]
+    fn bounded_network_retention_reports_dropped_and_retained_counts() {
+        let dropped = Cell::new(0);
+        let mut records = vec![json!(1), json!(2), json!(3)];
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(2), json!(3)]);
+        assert_eq!(dropped.get(), 1);
+        records.push(json!(4));
+        retain_bounded(&mut records, &dropped, 2);
+        assert_eq!(records, vec![json!(3), json!(4)]);
+        assert_eq!(dropped.get(), 2);
+        assert_eq!(
+            network_retention_metadata(records.len(), dropped.get()),
+            json!({
+                "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+                "retained": 2,
+                "dropped": 2,
+                "complete": false,
+            })
+        );
+    }
+
+    #[test]
     fn serialize_jsvalue_keeps_undefined_and_non_finite_distinct() {
         assert_eq!(
             serialize_jsvalue(JSValue::Undefined).unwrap(),
@@ -4452,25 +5154,16 @@ mod serialize_tests {
     }
 
     #[test]
-    fn headparsed_with_interactive_ready_state_commits_navigation() {
-        assert!(load_status_allows_navigation(LoadStatus::Complete, None));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("interactive")
-        ));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("complete")
-        ));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("loading")
-        ));
-        assert!(!load_status_allows_navigation(LoadStatus::HeadParsed, None));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::Started,
-            Some("complete")
-        ));
+    fn wait_until_keeps_navigation_milestones_distinct() {
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "load" })).unwrap(),
+            WaitUntil::Load
+        );
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "domcontentloaded" })).unwrap(),
+            WaitUntil::DomContentLoaded
+        );
+        assert!(WaitUntil::from_params(&json!({ "waitUntil": "commit" })).is_err());
     }
 
     #[test]
@@ -4959,7 +5652,7 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml, expectedSnapshot) {
   __GREPPY_NATIVE_LABEL_TEXT__
   __GREPPY_SELECT_CHOICES__
   __GREPPY_WORKING_SCOPE__
@@ -4978,7 +5671,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   const referenceAttributes = [];
   let registry = null;
   if (snapshot != null) {
-    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
+    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last, expectedSnapshot);
     window.__greppyObservedRefs = registry;
     snapshot = registry.snapshot;
     if (document.documentElement && document.documentElement.getAttribute(snapshotAttr) !== snapshot) {
@@ -5125,7 +5818,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
     if (includeHtml) tree.scoped_html = selectedScope.roots.map(function(node) { return node.outerHTML; }).join('\n');
   }
   return JSON.stringify(tree);
-})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__)"#;
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__, __GREPPY_EXPECTED_SNAPSHOT__)"#;
 
 fn observe_script(
     snapshot: Option<&str>,
@@ -5133,6 +5826,7 @@ fn observe_script(
     last: u64,
     query: Option<&str>,
     include_html: bool,
+    expected_snapshot: Option<&str>,
 ) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS
@@ -5167,6 +5861,10 @@ fn observe_script(
         .replace("__GREPPY_REF_FIRST__", &first.to_string())
         .replace("__GREPPY_REF_LAST__", &last.to_string())
         .replace("__GREPPY_SNAPSHOT__", &encoded)
+        .replace(
+            "__GREPPY_EXPECTED_SNAPSHOT__",
+            &serde_json::to_string(&expected_snapshot).expect("expected snapshot serializes"),
+        )
         .replace(
             "__GREPPY_INCLUDE_HTML__",
             if include_html { "true" } else { "false" },
@@ -5485,10 +6183,14 @@ enum WaitUntil {
 }
 
 impl WaitUntil {
-    fn from_params(params: &serde_json::Value) -> Self {
+    fn from_params(params: &serde_json::Value) -> io::Result<Self> {
         match params.get("waitUntil").and_then(|value| value.as_str()) {
-            Some("domcontentloaded") | Some("commit") => Self::DomContentLoaded,
-            _ => Self::Load,
+            Some("domcontentloaded") => Ok(Self::DomContentLoaded),
+            None | Some("load") => Ok(Self::Load),
+            Some(value) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported waitUntil value `{value}`"),
+            )),
         }
     }
 }

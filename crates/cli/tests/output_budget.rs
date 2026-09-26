@@ -31,6 +31,38 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
     })
 }
 
+fn ambiguous_read_fixture() -> &'static (PathBuf, PathBuf) {
+    static FIXTURE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let base = std::env::temp_dir().join(format!(
+            "greppy-cli-output-budget-ambiguous-read-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let store = base.join("store");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        for index in 0..83 {
+            std::fs::write(
+                repo.join(format!(
+                    "src/duplicate_definition_with_long_fixture_path_{index:03}.rs"
+                )),
+                format!("pub fn main() {{ println!(\"duplicate {index}\"); }}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            repo.join("src/unique.rs"),
+            "pub fn singular() -> usize { 7 }\n",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run(&repo, &store, &["index", "."]);
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+        (repo, store)
+    })
+}
+
 fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
     let output = Command::new(bin())
         .args(args)
@@ -44,6 +76,102 @@ fn run(repo: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+fn candidate_paths(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("src/duplicate_definition_with_long_fixture_path_"))
+        .collect()
+}
+
+fn continuation_offset(output: &str) -> usize {
+    let retry = output
+        .lines()
+        .find_map(|line| line.strip_prefix("try: "))
+        .expect("truncated output carries a retry command");
+    let marker = "--offset ";
+    retry
+        .split_once(marker)
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .expect("retry command carries a numeric offset")
+}
+
+#[test]
+fn ambiguous_read_text_budget_preserves_failure_and_pages_without_duplicates() {
+    let (repo, store) = ambiguous_read_fixture();
+    let budget = 3_000usize;
+    let (code, first_stdout, first_stderr) =
+        run(repo, store, &["read", "main", "--max-bytes", "3000"]);
+    assert_eq!(code, 1, "stdout={first_stdout}\nstderr={first_stderr}");
+    assert!(
+        first_stdout.len() <= budget,
+        "{} bytes\n{first_stdout}",
+        first_stdout.len()
+    );
+    assert!(first_stdout.contains("`main` is 83 definitions"));
+    assert!(first_stdout.contains("truncated: true"));
+    let first_paths = candidate_paths(&first_stdout);
+    assert!(!first_paths.is_empty(), "{first_stdout}");
+    let offset = continuation_offset(&first_stdout);
+    assert!(offset > 0, "{first_stdout}");
+
+    let offset_arg = offset.to_string();
+    let (code, second_stdout, second_stderr) = run(
+        repo,
+        store,
+        &[
+            "read",
+            "main",
+            "--max-bytes",
+            "3000",
+            "--offset",
+            &offset_arg,
+        ],
+    );
+    assert_eq!(code, 1, "stdout={second_stdout}\nstderr={second_stderr}");
+    assert!(
+        second_stdout.len() <= budget,
+        "{} bytes\n{second_stdout}",
+        second_stdout.len()
+    );
+    let second_paths = candidate_paths(&second_stdout);
+    assert!(!second_paths.is_empty(), "{second_stdout}");
+    assert!(
+        first_paths
+            .iter()
+            .all(|candidate| !second_paths.contains(candidate)),
+        "first={first_paths:?} second={second_paths:?}"
+    );
+}
+
+#[test]
+fn ambiguous_read_json_and_unique_read_obey_the_same_budget() {
+    let (repo, store) = ambiguous_read_fixture();
+    let budget = 3_000usize;
+    let (code, stdout, stderr) = run(
+        repo,
+        store,
+        &["read", "main", "--json", "--max-bytes", "3000"],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.len() <= budget, "{} bytes\n{stdout}", stdout.len());
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["status"], "ambiguous");
+    assert_eq!(value["total"], 83);
+    assert_eq!(value["truncated"], true);
+    assert!(!value["candidates"].as_array().unwrap().is_empty());
+    assert!(value["try"].as_str().unwrap().contains("--offset "));
+
+    let (code, stdout, stderr) = run(repo, store, &["read", "singular", "--max-bytes", "3000"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.len() <= budget, "{} bytes\n{stdout}", stdout.len());
+    assert!(
+        stdout.contains("pub fn singular() -> usize { 7 }"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("truncated: true"), "{stdout}");
 }
 
 // 0.3.0 contract (AGENTS.md, "ON EVERY COMMAND"): --limit caps the results

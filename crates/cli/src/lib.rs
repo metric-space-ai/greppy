@@ -25,19 +25,25 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A binary without a GPU backend is not buildable, the same way a binary
-/// without the embedded models is not buildable. Nothing fails at runtime when
-/// the backend is missing — the work just takes twenty times longer, measured
-/// on this repo at 7.5 s against 0.3 s for one navigation summary — so the
-/// mistake is invisible unless the compiler refuses it. Building on a platform
-/// that has no backend, or measuring against the CPU path, is
-/// `--features cpu-only`.
+#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
+compile_error!(
+    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
+     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
+     debug and numerical-reference use"
+);
+
+#[cfg(test)]
+mod build_policy;
+
+/// Product binaries require compiled GPU implementations for both inference
+/// workloads. The CUDA constants include the build-script signal emitted only
+/// after nvcc creates the shared backend, so a requested feature is not enough.
 #[cfg(not(feature = "cpu-only"))]
 const _: () = assert!(
-    greppy_embed_native::HAS_GPU_BACKEND,
-    "no GPU backend for this target. Metal is enabled for macOS and CUDA for \
-     Linux/Windows in crates/cli/Cargo.toml; if this target genuinely has \
-     neither, build with --features cpu-only."
+    greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
+    "Greppy requires compiled GPU backends for both embeddings and summaries. \
+     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
+     `cpu-only` is restricted to debug and numerical-reference use"
 );
 
 // Route this module's stdout through one optional collector. Query commands
@@ -69,6 +75,7 @@ use nav::*;
 mod inference;
 use inference::*;
 mod freshness;
+mod query_progress;
 use freshness::*;
 mod emit;
 use emit::*;
@@ -177,6 +184,7 @@ const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
+const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
@@ -385,7 +393,11 @@ pub enum CacheCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove one worktree's verified store, or every verified cache object.
+    /// Remove the selected worktree store and repository-wide shared agent Bases.
+    ///
+    /// --root also selects shared agent Bases used by linked worktrees of the
+    /// same repository. --all selects every verified cache object. Locked
+    /// stores are retained and reported; --yes is required.
     Clear {
         #[arg(long)]
         all: bool,
@@ -683,6 +695,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
+    // An explicit ripgrep token owns every following option. In particular,
+    // `--json` is a valid ripgrep output flag as well as a Greppy navigation
+    // flag; diagnosing it here prevented `greppy rg --json ...` from ever
+    // reaching the byte-exact passthrough dispatcher.
+    if matches!(verb, "rg" | "ripgrep") {
+        return None;
+    }
     if let Some(flag) = rest
         .iter()
         .skip(1)
@@ -755,6 +774,84 @@ pub fn startup_trace(phase: &str) {
     );
 }
 
+/// Private contract used by the immutable Base builder to bind its staging
+/// index process to the builder's lifetime.
+pub const ENV_BASE_BUILD_OWNER_STDIN: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
+
+fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce()) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match owner.read(&mut byte) {
+            Ok(0) => {
+                owner_lost();
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                owner_lost();
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Installs the lifetime guard for a nested immutable Base staging index.
+///
+/// The parent holds the write side of stdin until the nested index exits. If
+/// the parent disappears, EOF stops this process before it can keep indexing a
+/// staging database that no surviving process can publish. The marker is
+/// removed before CLI dispatch so model daemons spawned by this process do not
+/// inherit the internal ownership contract.
+pub fn install_base_build_owner_watchdog() {
+    let marker = std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN);
+    if marker.is_none() {
+        return;
+    }
+    std::env::remove_var(ENV_BASE_BUILD_OWNER_STDIN);
+    if let Err(error) = std::thread::Builder::new()
+        .name("greppy-base-build-owner".into())
+        .spawn(|| {
+            watch_base_build_owner(std::io::stdin(), || std::process::exit(73));
+        })
+    {
+        eprintln!("greppy: cannot install immutable Base owner guard: {error}");
+        std::process::exit(73);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_owner_watchdog_descendant_probe() -> Option<u8> {
+    std::env::var_os("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE")
+        .map(|_| u8::from(std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN).is_some()))
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn run_base_build_owner_watchdog_test_harness() -> Option<u8> {
+    let hold_ms = std::env::var("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let descendant = std::process::Command::new(std::env::current_exe().ok()?)
+        .env("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE", "1")
+        .env_remove("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .env_remove("GREPPY_TEST_BASE_OWNER_READY")
+        .status()
+        .ok()?;
+    if !descendant.success() {
+        return Some(74);
+    }
+    if let Some(ready) = std::env::var_os("GREPPY_TEST_BASE_OWNER_READY") {
+        if std::fs::write(ready, format!("{}\n", std::process::id())).is_err() {
+            return Some(74);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    Some(0)
+}
+
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     startup_trace("run_os.enter");
     // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool
@@ -816,7 +913,12 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    if agent::is_agent_tui_invocation(&argv) && !is_agent_admin_invocation(&argv) {
+    let agent_help_in_agent_run = std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some()
+        && agent_help_invocation(&argv);
+    if agent::is_agent_tui_invocation(&argv)
+        && !is_agent_admin_invocation(&argv)
+        && !agent_help_in_agent_run
+    {
         return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
@@ -976,6 +1078,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                         "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
                          No observation was run. Use `greppy web observe QUERY` for matching visible \
                          regions, or omit QUERY for the unfiltered page."
+                    );
+                } else if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("wait")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                         `greppy web wait 'text~/WORD/i'` for partial text, or \
+                         `greppy web wait --url '~/PATTERN/'` for a URL."
                     );
                 } else if sub == "path" && stray == "--code" {
                     println!(
@@ -1648,6 +1763,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    let _query_progress = query_progress::for_command(cli.command.as_ref(), cli.root.as_deref());
     // If a recognised subcommand matched, dispatch it. Otherwise treat
     // the trailing args as a `grep` passthrough. This makes both
     //   greppy grep -R foo .
@@ -1720,6 +1836,18 @@ fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
                 || token == "interrupt"
                 || token == "quit"
         })
+}
+
+fn agent_help_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = grep_passthrough_args(argv);
+    let Some(args) = rest
+        .iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    greppy_agent::greppy_env::agent_help_invocation(&args)
 }
 
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
@@ -3745,6 +3873,23 @@ fn nav_freshness_json(
     root: Option<&str>,
     project: &str,
 ) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, false)
+}
+
+fn nav_freshness_json_uncached(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, true)
+}
+
+fn nav_freshness_json_with_policy(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    force_uncached: bool,
+) -> serde_json::Value {
     let overrides = match discover_overrides_from_env() {
         Ok(overrides) => overrides,
         Err(e) => {
@@ -3840,13 +3985,25 @@ fn nav_freshness_json(
             }
         }
     }
-    match greppy_freshness::check_files_report_with_overrides(
-        store,
-        &root_path,
-        project,
-        NAV_FRESHNESS_BUDGET,
-        &overrides,
-    ) {
+    let report = if force_uncached {
+        greppy_freshness::check_files_report_with_ttl(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+            std::time::Duration::ZERO,
+        )
+    } else {
+        greppy_freshness::check_files_report_with_overrides(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+        )
+    };
+    match report {
         Ok(report) => {
             let (fresh, state_name, reasons) = match report.state.outcome {
                 greppy_freshness::FreshnessOutcome::Fresh => (true, "fresh", Vec::<String>::new()),
@@ -3861,7 +4018,7 @@ fn nav_freshness_json(
                     (false, "unknown", reasons)
                 }
             };
-            serde_json::json!({
+            let mut freshness = serde_json::json!({
                 "fresh": fresh,
                 "state": state_name,
                 "reasons": reasons,
@@ -3878,7 +4035,21 @@ fn nav_freshness_json(
                     "include": ENV_DISCOVER_INCLUDE,
                     "exclude": ENV_DISCOVER_EXCLUDE,
                 },
-            })
+            });
+            // An active writer prevents persisting a metadata-only fingerprint
+            // update, not reading content-equivalent graph rows. The completed
+            // inventory proof above must establish zero changed files and no
+            // root, scope, indexer-version or unknown-state drift. Keep the
+            // pending metadata visible rather than pretending it was persisted.
+            if metadata_only_fingerprint_drift(&freshness) && workspace_writer_active(root) {
+                freshness["metadata_drift_reasons"] = freshness["reasons"].clone();
+                freshness["metadata_refresh_pending"] = serde_json::json!(true);
+                freshness["source"] = serde_json::json!("verified_published_snapshot");
+                freshness["fresh"] = serde_json::json!(true);
+                freshness["state"] = serde_json::json!("fresh");
+                freshness["reasons"] = serde_json::json!([]);
+            }
+            freshness
         }
         Err(e) => serde_json::json!({
             "fresh": false,
@@ -4023,12 +4194,216 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
 
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
+const ENV_BACKGROUND_DEMAND_LOCK: &str = "GREPPY_BACKGROUND_DEMAND_LOCK";
+static DELEGATED_BASE_OWNER: std::sync::Mutex<Option<std::process::ChildStdin>> =
+    std::sync::Mutex::new(None);
+static DELEGATED_BASE_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BACKGROUND_DEMAND_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn begin_delegated_base_owner() {
+    DELEGATED_BASE_STARTING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn register_delegated_base_owner(owner: std::process::ChildStdin) {
+    *DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(owner);
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_delegated_base_owner() {
+    DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn delegated_base_owner_starting() -> bool {
+    DELEGATED_BASE_STARTING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn cancel_delegated_base_owner(demand_cancelled: bool) -> bool {
+    let owner = DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if owner.is_none() {
+        return false;
+    }
+    // Publish the terminal reason before dropping the pipe writer. EOF wakes
+    // the delegated child and can make the indexing thread reach `fail()`
+    // immediately; recording cancellation afterwards races with that path and
+    // mislabels a demand-driven stop as a background-index failure.
+    if demand_cancelled {
+        BACKGROUND_DEMAND_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    drop(owner);
+    true
+}
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(BACKGROUND_JOB_FILE)
+}
+
+fn background_job_demand_name(root: &std::path::Path) -> String {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    format!("workspace-{hash}.query-demand")
+}
+
+fn acquire_background_job_demand(
+    root: &std::path::Path,
+) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    greppy_core::cache::acquire_named_lock(
+        &background_job_demand_name(root),
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+}
+
+fn start_background_demand_monitor(
+    job_path: &std::path::Path,
+    terminal: std::sync::Arc<std::sync::Mutex<bool>>,
+    expected_pid: u32,
+    expected_generation: u64,
+) {
+    let Some(lock_name) = std::env::var_os(ENV_BACKGROUND_DEMAND_LOCK) else {
+        return;
+    };
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    let job_path = job_path.to_owned();
+    let monitor_path = job_path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("greppy-query-demand".into())
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    if cancel_delegated_base_owner(true) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner(false) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        let owned = read_background_job(&monitor_path).is_some_and(|job| {
+            background_demand_may_cancel(Some(&job), false, expected_pid, expected_generation)
+        });
+        if owned {
+            finish_background_demand_monitor(
+                &monitor_path,
+                "failed",
+                &format!("automatic index demand monitor could not start: {error}"),
+                70,
+            );
+        }
+        std::process::exit(70);
+    }
+}
+
+fn background_demand_may_cancel(
+    job: Option<&serde_json::Value>,
+    terminal: bool,
+    expected_pid: u32,
+    expected_generation: u64,
+) -> bool {
+    !terminal
+        && job.is_some_and(|job| {
+            job.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(expected_pid))
+                && job
+                    .get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(expected_generation)
+        })
+}
+
+fn finish_background_demand_monitor(
+    job_path: &std::path::Path,
+    state: &str,
+    detail: &str,
+    exit_code: i32,
+) -> ! {
+    if let Some(mut job) = read_background_job(job_path) {
+        job["state"] = serde_json::json!(state);
+        job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+        job["last_error"] = serde_json::json!(detail);
+        let _ = write_background_job(job_path, &job);
+    }
+    std::process::exit(exit_code);
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -4065,6 +4440,25 @@ fn process_is_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+fn background_job_writer_active(root: &std::path::Path) -> bool {
+    matches!(
+        greppy_freshness::try_acquire(&workspace_locator::store_path(root)),
+        Err(greppy_freshness::LockError::Held { .. })
+    )
+}
+
+fn background_job_spawn_active(root: &std::path::Path) -> bool {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    matches!(
+        greppy_core::cache::acquire_named_lock(
+            &format!("workspace-{hash}.job-spawn"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        ),
+        Ok(None)
+    )
 }
 
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
@@ -4164,6 +4558,7 @@ struct BackgroundJobGuard {
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
+    demand_terminal: std::sync::Arc<std::sync::Mutex<bool>>,
     complete: bool,
 }
 
@@ -4175,6 +4570,7 @@ impl BackgroundJobGuard {
         let detached = direct_path.is_some();
         let delegated = direct_path.is_none() && delegated_path.is_some();
         let path = direct_path.or(delegated_path);
+        let demand_terminal = std::sync::Arc::new(std::sync::Mutex::new(false));
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
@@ -4199,6 +4595,20 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
+        let target_generation = std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if detached {
+            if let Some(path) = &path {
+                start_background_demand_monitor(
+                    path,
+                    demand_terminal.clone(),
+                    std::process::id(),
+                    target_generation,
+                );
+            }
+        }
         Self {
             path,
             detached,
@@ -4211,10 +4621,7 @@ impl BackgroundJobGuard {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(unix_now_secs_cli),
-            target_generation: std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            target_generation,
             backend: published
                 .as_ref()
                 .and_then(|job| job.get("backend"))
@@ -4244,6 +4651,7 @@ impl BackgroundJobGuard {
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
+            demand_terminal,
             complete: false,
         }
     }
@@ -4419,6 +4827,7 @@ impl BackgroundJobGuard {
     }
 
     fn complete(&mut self) {
+        self.publication_finished();
         self.complete = true;
         if self.delegated {
             self.write_state("base_graph_ready", None);
@@ -4434,8 +4843,42 @@ impl BackgroundJobGuard {
         self.path.as_deref()
     }
 
+    fn publication_finished(&self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
+    pub(crate) fn publication_boundary<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T>,
+        committed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let mut terminal = self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = publish()?;
+        if committed(&result) {
+            *terminal = true;
+        }
+        Ok(result)
+    }
+
     fn fail(&mut self, error: &Error) {
-        self.write_state("failed", Some(&error.to_string()));
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        if BACKGROUND_DEMAND_CANCELLED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.write_state(
+                "cancelled",
+                Some("automatic index stopped after its last query waiter exited"),
+            );
+        } else {
+            self.write_state("failed", Some(&error.to_string()));
+        }
         self.complete = true;
     }
 
@@ -4444,6 +4887,10 @@ impl BackgroundJobGuard {
     /// state with the degradation reason so the next semantic query
     /// retries the remaining vectors; the published graph stays live.
     fn degraded(&mut self, reason: &str) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
@@ -4486,6 +4933,10 @@ mod background_progress_tests {
 
 impl Drop for BackgroundJobGuard {
     fn drop(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         if self.complete {
             return;
         }
@@ -4562,16 +5013,27 @@ pub(crate) enum BackgroundJobLaunch {
     Owned {
         child: std::process::Child,
         path: std::path::PathBuf,
+        demand: Option<greppy_core::cache::FileLock>,
     },
     Attached {
         path: std::path::PathBuf,
+        root: std::path::PathBuf,
+        // Retaining this lease, rather than reading it, keeps shared work alive.
+        _demand: Option<greppy_core::cache::FileLock>,
     },
 }
 
 impl BackgroundJobLaunch {
     pub(crate) fn path(&self) -> &std::path::Path {
         match self {
-            Self::Owned { path, .. } | Self::Attached { path } => path,
+            Self::Owned { path, .. } | Self::Attached { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn owner_is_active(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Owned { child, .. } => child.try_wait().map(|status| status.is_none()),
+            Self::Attached { root, .. } => Ok(background_job_writer_active(root)),
         }
     }
 }
@@ -4596,24 +5058,31 @@ fn spawn_background_job_handle(
     if greppy_core::cache::ensure_workspace_store(&root).is_err() {
         return None;
     }
+    let demand_name = background_job_demand_name(&root);
+    let Ok(Some(demand)) = acquire_background_job_demand(&root) else {
+        return None;
+    };
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_DEMAND_READY") {
+        let _ = std::fs::write(path, b"ready\n");
+    }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
         &format!("workspace-{hash}.job-spawn"),
         greppy_core::cache::LockMode::Exclusive,
+        // `false` is the blocking mode: concurrent first queries serialize
+        // here, then the follower observes and attaches to the active writer.
         false,
     ) else {
         return None;
     };
     let job_path = background_job_path(&root);
-    if let Some(job) = read_background_job(&job_path) {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive)
-        {
-            return Some(BackgroundJobLaunch::Attached { path: job_path });
-        }
+    if background_job_writer_active(&root) {
+        return Some(BackgroundJobLaunch::Attached {
+            path: job_path,
+            root,
+            _demand: Some(demand),
+        });
     }
     let target_generation = greppy_store::Store::open_with(
         &workspace_locator::store_path(&root),
@@ -4683,9 +5152,19 @@ fn spawn_background_job_handle(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
             target_generation.to_string(),
         )
+        .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
+        command.env(ENV_STRUCTURAL_FIRST_USE, "1");
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GREPPY_TEST_BACKGROUND_SPAWN_FAIL").is_some() {
+        command = std::process::Command::new(
+            root.join("__greppy_deliberately_missing_background_indexer__"),
+        );
+    }
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
@@ -4727,9 +5206,45 @@ fn spawn_background_job_handle(
         let _ = child.wait();
         return None;
     }
+    // The spawn lock remains held until the child either owns the portable
+    // workspace writer lock or has exited. A later launcher can therefore use
+    // that OS lock as the ownership identity without a PID/start-time race.
+    // There is intentionally no elapsed-time takeover: process exit and lock
+    // acquisition are the only state transitions.
+    loop {
+        if background_job_writer_active(&root) {
+            break;
+        }
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let recorded_failure = read_background_job(&job_path).is_some_and(|job| {
+                        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+                    });
+                    if !recorded_failure {
+                        value["state"] = serde_json::json!("failed");
+                        value["last_error"] = serde_json::json!(format!(
+                            "background {kind} exited before acquiring the workspace writer lock: {status}"
+                        ));
+                        let _ = write_background_job(&job_path, &value);
+                    }
+                }
+                break;
+            }
+            Err(error) => {
+                value["state"] = serde_json::json!("failed");
+                value["last_error"] =
+                    serde_json::json!(format!("observe background {kind} startup: {error}"));
+                let _ = write_background_job(&job_path, &value);
+                break;
+            }
+        }
+    }
     Some(BackgroundJobLaunch::Owned {
         child,
         path: job_path,
+        demand: Some(demand),
     })
 }
 
@@ -4742,11 +5257,15 @@ fn spawn_background_job(
     let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
         return false;
     };
-    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+    if let BackgroundJobLaunch::Owned {
+        mut child, demand, ..
+    } = launch
+    {
         // Detached refreshes still need a reaper in this long-lived process.
         let _ = std::thread::Builder::new()
             .name("greppy-index-reaper".into())
             .spawn(move || {
+                let _demand = demand;
                 let _ = child.wait();
             });
     }
@@ -4771,6 +5290,13 @@ fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> boo
     spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
 }
 
+pub(crate) fn spawn_background_embed_handle(
+    root: Option<&str>,
+    cfg: &EmbeddingModelConfig,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg))
+}
+
 fn format_embedding_eta(seconds: u64) -> String {
     let minutes = seconds / 60;
     let remainder = seconds % 60;
@@ -4781,13 +5307,6 @@ fn format_embedding_eta(seconds: u64) -> String {
     } else {
         format!("{minutes}m {remainder}s")
     }
-}
-
-#[derive(Clone, Copy)]
-struct SemanticFallbackContext<'a> {
-    query: &'a str,
-    paths: &'a [String],
-    root: Option<&'a str>,
 }
 
 /// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each
@@ -5431,18 +5950,28 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if id.is_empty() {
         return Err(Error::Invalid("expand requires an id".into()));
     }
+    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
+    // File and command-output continuations live in the workspace-local pack
+    // store and do not depend on graph completeness. Serve them before opening
+    // a linked-worktree overlay, whose immutable Base may have been cleaned up.
+    let pack_store = open_default_store_pack_writer(root)?;
+    if let Some(pack) = pack_store.get_expand_pack(&lookup_id)? {
+        #[cfg(feature = "bash-smart")]
+        if pack.command == "bash-smart" {
+            return bash_smart::expand(&pack_store, pack, json);
+        }
+        if pack.command == "read-file" {
+            return dispatch_read_expand(&pack_store, &pack, json, root);
+        }
+    }
+    drop(pack_store);
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
     let Some(pack) = store.get_expand_pack(&lookup_id)? else {
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
-    #[cfg(feature = "bash-smart")]
-    if pack.command == "bash-smart" {
-        return bash_smart::expand(&store, pack, json);
-    }
-    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
+    if pack.command == "read-smart" {
         return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
@@ -6850,7 +7379,6 @@ struct SearchCodeMatchLine {
 
 #[derive(Debug)]
 struct SearchCodeDefinitionEntry {
-    node_id: i64,
     qualified_name: String,
     file: String,
     start_line: i64,
@@ -6858,12 +7386,6 @@ struct SearchCodeDefinitionEntry {
     source: String,
     handle: String,
     matches: Vec<SearchCodeMatchLine>,
-}
-
-#[derive(Debug)]
-enum SearchCodeEntry {
-    Definition(SearchCodeDefinitionEntry),
-    Unenclosed(SearchCodeMatchLine),
 }
 
 fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {
@@ -6964,17 +7486,32 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
+    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default(), None)
+}
+
+fn live_grep_code_hits_pattern_scoped(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
+    path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
+) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
-    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
+    if let Some(progress) = progress {
+        progress.phase("scanning_files", paths.len(), "files");
+    }
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, progress)
 }
 
 fn source_code_hits_ranked(
@@ -7005,6 +7542,7 @@ fn live_grep_search_code_paths_pattern(
     root_path: &std::path::Path,
     paths: &[String],
     fixed: bool,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -7016,6 +7554,7 @@ fn live_grep_search_code_paths_pattern(
         ["-HnIE", "--", query]
     };
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
             .args(grep_args)
@@ -7025,7 +7564,7 @@ fn live_grep_search_code_paths_pattern(
         let out = match out {
             Ok(out) => out,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
-                return internal_literal_search_code_paths(query, root_path, paths);
+                return internal_literal_search_code_paths(query, root_path, paths, progress);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Invalid(
@@ -7045,6 +7584,10 @@ fn live_grep_search_code_paths_pattern(
         }
         let text = String::from_utf8_lossy(&out.stdout);
         hits.extend(text.lines().filter_map(parse_grep_code_hit));
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
     Ok(hits)
 }
@@ -7057,12 +7600,16 @@ fn internal_literal_search_code_paths(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(progress) = progress {
+            progress.completed(index);
+        }
         let absolute = root_path.join(path);
         let bytes = match std::fs::read(&absolute) {
             Ok(bytes) => bytes,
@@ -7081,6 +7628,9 @@ fn internal_literal_search_code_paths(
                 });
             }
         }
+    }
+    if let Some(progress) = progress {
+        progress.completed(paths.len());
     }
     Ok(hits)
 }
@@ -7259,6 +7809,31 @@ fn absolutize_path(p: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Canonicalize the deepest existing ancestor while retaining a missing
+/// lexical suffix. This keeps deleted-file filters comparable with a
+/// canonical repository root without requiring the filtered path to exist.
+fn canonicalize_with_missing_suffix(p: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
+}
+
 /// Walk up from `start` looking for a repository marker. Returns the
 /// first ancestor (including `start`) that contains a marker, or `start`
 /// itself when none is found. Pure path logic so it is unit-testable
@@ -7333,26 +7908,40 @@ impl QueryPathFilters {
             .map(|filter| filter.shown.as_str())
             .collect::<Vec<_>>())
     }
+
+    fn repo_prefixes(&self) -> Vec<String> {
+        self.filters
+            .iter()
+            .filter_map(|filter| filter.repo_prefix.clone())
+            .collect()
+    }
 }
 
 fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    // Normalize both sides through their deepest existing ancestor so platform
+    // aliases (for example macOS /var -> /private/var), Windows path
+    // normalization, and deleted-file suffixes remain comparable.
+    let normalized_root = canonicalize_with_missing_suffix(root_path);
     let supplied = std::path::Path::new(raw);
     let candidate = if supplied.is_absolute() {
-        absolutize_path(supplied)
+        supplied.to_path_buf()
     } else {
         let cwd = std::env::current_dir().ok();
         let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
         if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
-            absolutize_path(path)
+            path.to_path_buf()
         } else if root_path.join(supplied).exists() {
-            absolutize_path(&root_path.join(supplied))
-        } else if let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(root_path)) {
+            root_path.join(supplied)
+        } else if let Some(cwd) =
+            cwd.filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root))
+        {
             cwd.join(supplied)
         } else {
             root_path.join(supplied)
         }
     };
-    let relative = candidate.strip_prefix(root_path).ok()?;
+    let candidate = canonicalize_with_missing_suffix(&candidate);
+    let relative = candidate.strip_prefix(&normalized_root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
@@ -9303,6 +9892,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9364,6 +9954,7 @@ const BUDGET_ARRAY_FIELDS: &[&str] = &[
     "callers",
     "references",
     "callees",
+    "candidates",
 ];
 
 fn result_item_count(value: &serde_json::Value) -> usize {
@@ -9851,11 +10442,8 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("unresolved textual candidates:")
 }
 
-fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
-    if exit_code != 0 {
-        return bytes.to_vec();
-    }
     let mut priority = Vec::new();
     let mut content = Vec::new();
     for line in text.lines() {
@@ -9885,11 +10473,25 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || selected.pop().is_none()
         {
             return rendered;
         }
+        if selected.pop().is_none() {
+            return hard_cap_text_output(rendered, spec.max_bytes.unwrap_or(usize::MAX));
+        }
     }
+}
+
+fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&rendered[..end]).is_err() {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered
 }
 
 /// Translate a `Result<i32>` into the actual exit code we should return.

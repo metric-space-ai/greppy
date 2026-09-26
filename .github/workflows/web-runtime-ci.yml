@@ -17,7 +17,8 @@ permissions:
 
 concurrency:
   group: web-runtime-compatibility-${{ github.ref }}
-  cancel-in-progress: true
+  # Finish active browser suites; only queued superseded revisions may be replaced.
+  cancel-in-progress: false
 
 jobs:
   session-daemon:
@@ -40,6 +41,14 @@ jobs:
           --manifest-path crates/web-runtime/Cargo.toml
           --package web-runtime --no-default-features
           --lib capability_frame -- --test-threads=1
+
+      - name: Check cumulative CPU attribution across sessions and worker restarts
+        shell: bash
+        run: >-
+          cargo test --locked
+          --manifest-path crates/web-runtime/Cargo.toml
+          --package web-runtime --no-default-features
+          --lib cpu -- --test-threads=1
 
       - name: Build exact Greppy CLI test asset
         shell: bash

@@ -27,6 +27,43 @@ function throwObjectDisposed(kind) {
 const disposedPages = new Set();
 const disposedContexts = new Set();
 const disposedBrowsers = new Set();
+let activeTrace = null;
+const pageContexts = new Map();
+const traceLimitBytes = Number(ops.op_trace_limit_bytes()) || 8 * 1024 * 1024;
+
+function traceTime() {
+  return ops.op_trace_time_ms();
+}
+
+function traceEvent(value, recorder = activeTrace) {
+  if (!recorder || recorder !== activeTrace || recorder.truncated) return;
+  const line = JSON.stringify(value) + "\n";
+  recorder.bytes += line.length;
+  if (recorder.bytes > traceLimitBytes) {
+    recorder.lines = [];
+    recorder.bytes = 0;
+    recorder.truncated = true;
+    console.warn("warning: trace recording stopped after exceeding the 8 MiB in-memory limit");
+    return;
+  }
+  recorder.lines.push(line);
+}
+
+globalThis.__greppyCaptureActiveTrace = () => {
+  if (!activeTrace) return;
+  if (activeTrace.truncated) {
+    activeTrace = null;
+    return;
+  }
+  traceEvent({ type: "event", time: traceTime(), class: "Greppy", method: "scriptFailed" });
+  if (activeTrace.truncated) {
+    activeTrace = null;
+    return;
+  }
+  const trace = activeTrace.lines.join("");
+  activeTrace = null;
+  ops.op_capture_trace_archive(trace, "");
+};
 
 function screenshotBuffer(result) {
   if (result && result.png_path) {
@@ -55,11 +92,20 @@ function engineCall(method, params) {
   if (payload.timeout == null) {
     payload.timeout = 30_000;
   }
-  const result = ops.op_engine_call(method, payload);
+  const recorder = activeTrace && (payload.context === activeTrace.context || pageContexts.get(payload.page) === activeTrace.context) ? activeTrace : null;
+  const callId = recorder ? "call@" + recorder.next++ : null;
+  if (callId) traceEvent({ type: "before", callId, startTime: traceTime(), apiName: method, class: "Greppy", method, params: {} }, recorder);
+  let result;
+  try { result = ops.op_engine_call(method, payload); }
+  catch (error) {
+    if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } }, recorder);
+    throw error;
+  }
   if (result && typeof result.then === "function") {
     return result.then(
-      (value) => value,
+      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), result: {} }, recorder); return value; },
       (error) => {
+        if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } }, recorder);
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
@@ -75,6 +121,30 @@ function engineCall(method, params) {
     );
   }
   return result;
+}
+
+async function rejectActionNavigationFailure(page, actionResult) {
+  const navigationEpoch = actionResult && actionResult.navigation_epoch;
+  if (navigationEpoch == null) return;
+  const result = await engineCall("page.take_navigation_failure", {
+    page: page._id,
+    navigation_epoch: navigationEpoch,
+  });
+  const failure = result && result.failure;
+  if (!failure) return;
+  const kind = String(failure.kind || "transport");
+  const requestId = String(failure.requestId || "unknown");
+  const url = String(failure.url || "unknown");
+  const detail = String(failure.errorText || "transport failure");
+  const error = new Error(
+    `navigation failed: ${detail} (kind=${kind}, request_id=${requestId}, url=${url})`,
+  );
+  error.name = "NavigationError";
+  error.code = kind;
+  error.kind = kind;
+  error.requestId = requestId;
+  error.url = url;
+  throw error;
 }
 
 function locatorParams(locator, extra) {
@@ -487,9 +557,15 @@ class Locator {
     if (this._selector && this._selector.type === "css" && this._selector.value) {
       this._page._lastFileSelector = this._selector.value;
     }
-    await engineCall("locator.click", {
+    const result = await engineCall("locator.click", {
       ...locatorParams(this, { timeout }),
     });
+    await rejectActionNavigationFailure(this._page, result);
+    if (result && result.navigation_epoch != null) {
+      // The native action waited for this navigation. Publish its final URL
+      // before returning so synchronous page.url() cannot report the old page.
+      await this._page._flushNavigation();
+    }
     await this._page._flushPopups();
   }
 
@@ -1916,8 +1992,9 @@ class Page {
         this._dispatchNetworkUntilSettled(),
         this._dispatchFrames(),
       ]);
-      this._emitLoad();
+      this._emitLoad(waitUntil);
       return this._responseFromRecord({
+        requestId: result.requestId,
         url: this._url,
         status: result.status == null ? 0 : Number(result.status),
         statusText: result.statusText || "",
@@ -1981,7 +2058,9 @@ class Page {
       frame: () => this.mainFrame(),
       response: async () => {
         const result = await engineCall("page.responses", { page: this._id });
-        const hit = (result.responses || []).find((row) => row.url === rec.url);
+        const hit = (result.responses || []).find(
+          (row) => String(row.requestId || "") === String(rec.requestId || ""),
+        );
         if (!hit) return null;
         return this._responseFromRecord(hit);
       },
@@ -2010,7 +2089,12 @@ class Page {
       text: async () => decodeUtf8(bytes()),
       json: async () => JSON.parse(decodeUtf8(bytes())),
       request: () =>
-        request || this._requestFromRecord({ url: rec.url, method: "GET" }),
+        request ||
+        this._requestFromRecord({
+          requestId: rec.requestId,
+          url: rec.url,
+          method: rec.method || "GET",
+        }),
     }, "Response");
   }
 
@@ -2056,21 +2140,23 @@ class Page {
       const rec = requests[index];
       const key = String(rec.method || "GET") + " " + String(rec.url) + " " + index;
       const request = this._requestFromRecord(rec, requests);
-      const hit = responses.find((row) => row.url === rec.url);
+      const hit = responses.find(
+        (row) => String(row.requestId || "") === String(rec.requestId || ""),
+      );
       if (!this._emittedNetwork.has(key + " req")) {
         this._emittedNetwork.add(key + " req");
         this._emit("request", request);
       }
-      if (hit) {
+      if (request.failure()) {
+        if (!this._emittedNetwork.has(key + " fail")) {
+          this._emittedNetwork.add(key + " fail");
+          this._emit("requestfailed", request);
+        }
+      } else if (hit) {
         if (!this._emittedNetwork.has(key + " fin")) {
           this._emittedNetwork.add(key + " fin");
           this._emit("response", this._responseFromRecord(hit, request));
           this._emit("requestfinished", request);
-        }
-      } else if (request.failure()) {
-        if (!this._emittedNetwork.has(key + " fail")) {
-          this._emittedNetwork.add(key + " fail");
-          this._emit("requestfailed", request);
         }
       } else if (settle) {
         if (!this._emittedNetwork.has(key + " fin")) {
@@ -2252,6 +2338,7 @@ class Page {
     if (!page) {
       page = new Page(id);
       page._context = this._context;
+      if (this._context) pageContexts.set(id, this._context._id);
       if (this._context) {
         this._context._pages = this._context._pages || [];
         this._context._pages.push(page);
@@ -2325,20 +2412,21 @@ class Page {
     navigationTimeout(this._timeout, options, "Page.setContent");
     await engineCall("page.setContent", { page: this._id, html: String(html) });
     await this._dispatchFrames();
-    this._emitLoad();
+    this._emitLoad("load");
   }
 
   async reload(options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.reload");
-    await engineCall("page.reload", { page: this._id, timeout });
+    const waitUntil = (options && options.waitUntil) || "load";
+    await engineCall("page.reload", { page: this._id, timeout, waitUntil });
     await this._flushNavigation();
     await this._dispatchFrames();
-    this._emitLoad();
+    this._emitLoad(waitUntil);
   }
 
-  _emitLoad() {
+  _emitLoad(waitUntil = "load") {
     this._emit("domcontentloaded", this);
-    this._emit("load", this);
+    if (waitUntil === "load") this._emit("load", this);
   }
 
   async waitForTimeout(ms) {
@@ -2351,7 +2439,11 @@ class Page {
     }
     refuseLocatorOptions("Page.waitForLoadState", options, ["timeout"]);
     const timeout = (options && options.timeout) || this._timeout || 30_000;
-    await engineCall("page.waitForLoadState", { page: this._id, timeout });
+    await engineCall("page.waitForLoadState", {
+      page: this._id,
+      timeout,
+      waitUntil: state || "load",
+    });
   }
 
   waitForNavigation(options) {
@@ -2665,6 +2757,7 @@ class Page {
       }
       const page = new Page(this._openerId);
       page._context = this._context;
+      if (this._context) pageContexts.set(this._openerId, this._context._id);
       return page;
     }
     const result = await engineCall("page.opener", { page: this._id });
@@ -2675,6 +2768,7 @@ class Page {
     }
     const page = new Page(result.page);
     page._context = this._context;
+    if (this._context) pageContexts.set(result.page, this._context._id);
     return page;
   }
 
@@ -2813,13 +2907,24 @@ class BrowserContext {
     this._initScripts = [];
     this._closed = false;
     this._handlers = {};
-    this.tracing = withUnsupported(
-      {
-        start: async () => unsupported("BrowserContext.tracing.start")(),
-        stop: async () => unsupported("BrowserContext.tracing.stop")(),
+    this.tracing = withUnsupported({
+      start: async (options = {}) => {
+        for (const key of ["screenshots", "snapshots", "sources"]) if (options[key]) throw new Error(`Tracing.start option ${key} is unsupported`);
+        if (activeTrace) throw new Error("a trace is already recording in this controller");
+        activeTrace = { context: this._id, lines: [], bytes: 0, next: 1, truncated: false };
+        traceEvent({ version: 8, type: "context-options", origin: "library", browserName: "greppy", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: traceTime(), sdkLanguage: "javascript" });
       },
-      "Tracing",
-    );
+      stop: async (options = {}) => {
+        for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);
+        if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
+        if (activeTrace.truncated) {
+          activeTrace = null;
+          throw new Error("trace recording was truncated after exceeding the 8 MiB in-memory limit; no archive was exported");
+        }
+        const trace = activeTrace.lines.join(""); activeTrace = null;
+        ops.op_capture_trace_archive(trace, options.path == null ? "" : String(options.path));
+      },
+    }, "Tracing");
     this.clock = withUnsupported(
       {
         install: unsupported("Clock.install"),
@@ -2855,6 +2960,7 @@ class BrowserContext {
     });
     const page = new Page(result.page, result.generation);
     page._context = this;
+    pageContexts.set(result.page, this._id);
     this._lastPage = result.page;
     this._pages = this._pages || [];
     this._pages.push(page);
@@ -3332,6 +3438,21 @@ const chromium = withUnsupported(
   "BrowserType",
 );
 
+async function greppyAttachPage(pageId) {
+  const result = await engineCall("session.attachPage", { page: pageId });
+  const browser = new Browser(result.browser, result.browserGeneration);
+  const context = new BrowserContext(result.context, result.contextGeneration);
+  const page = new Page(result.page, result.pageGeneration);
+  page._url = result.url || "about:blank";
+  context._browser = browser;
+  context._pages = [page];
+  context._lastPage = result.page;
+  browser._contexts = [context];
+  page._context = context;
+  pageContexts.set(result.page, result.context);
+  return { browser, context, page };
+}
+
 const firefox = withUnsupported(
   {
     async launch() {
@@ -3375,7 +3496,7 @@ const Credentials = withUnsupported({}, "Credentials");
 const Logger = withUnsupported({}, "Logger");
 const WebError = withUnsupported({}, "WebError");
 
-export { chromium, firefox, webkit, selectors, errors, TimeoutError, Debugger, Credentials, Logger, WebError };
+export { chromium, firefox, webkit, selectors, errors, TimeoutError, Debugger, Credentials, Logger, WebError, greppyAttachPage };
 export const request = withUnsupported({}, "APIRequest");
 export const devices = withUnsupported({}, "devices");
 export default { chromium, firefox, webkit, request, selectors, devices, errors, Debugger, Credentials, Logger, WebError };

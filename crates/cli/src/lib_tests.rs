@@ -1,6 +1,82 @@
 use super::*;
 use clap::Parser;
 
+struct InterruptedOnce {
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for InterruptedOnce {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if read == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            let _ = buffer;
+            Ok(0)
+        }
+    }
+}
+
+#[test]
+fn base_build_owner_watchdog_retries_interrupted_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut cancelled = false;
+    watch_base_build_owner(
+        InterruptedOnce {
+            reads: reads.clone(),
+        },
+        || cancelled = true,
+    );
+    assert!(cancelled);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[cfg(not(feature = "cpu-only"))]
+#[test]
+fn product_build_contains_embedding_and_summary_gpu_backends() {
+    assert!(greppy_embed_native::HAS_GPU_BACKEND);
+    assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+}
+
+#[cfg(unix)]
+#[test]
+fn query_path_filters_normalize_alias_roots_for_existing_and_missing_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_root = temp.path().join("real-root");
+    std::fs::create_dir_all(real_root.join("src")).unwrap();
+    std::fs::write(real_root.join("src/existing.rs"), "fn existing() {}\n").unwrap();
+    let alias_root = temp.path().join("alias-root");
+    symlink(&real_root, &alias_root).unwrap();
+
+    for (raw, expected) in [
+        ("src/existing.rs".to_owned(), "src/existing.rs"),
+        ("src/deleted.rs".to_owned(), "src/deleted.rs"),
+        (
+            alias_root
+                .join("src/existing.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/existing.rs",
+        ),
+        (
+            alias_root
+                .join("src/deleted.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/deleted.rs",
+        ),
+    ] {
+        assert_eq!(
+            normalize_query_filter_path(&alias_root, &raw).as_deref(),
+            Some(expected),
+            "failed to normalize {raw} through alias root {}",
+            alias_root.display()
+        );
+    }
+}
+
 fn drift_json(reason: &str) -> serde_json::Value {
     serde_json::json!({ "reasons": [reason] })
 }
@@ -44,7 +120,10 @@ fn transient_freshness_states_never_trigger_reindex() {
 fn inline_auto_reindex_never_hides_model_loading_or_large_full_rebuilds() {
     assert!(auto_reindex_inline_allowed(false, 128, false));
     assert!(!auto_reindex_inline_allowed(false, 129, false));
-    assert!(auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(!auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(auto_reindex_inline_allowed(false, 128, true));
+    assert!(!auto_reindex_inline_allowed(false, 129, true));
+    assert!(!auto_reindex_inline_allowed(false, -1, true));
     assert!(!auto_reindex_inline_allowed(true, 1, false));
     assert!(!auto_reindex_inline_allowed(true, 1, true));
 }
@@ -186,6 +265,73 @@ fn embedding_progress_message_names_backend_counts_and_eta() {
     assert_eq!(
         embedding_progress_text(&progress),
         "semantic index building — 412/2443 spans, ETA ~2m 14s (backend metal)"
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_propagates_recorded_failure() {
+    let failure = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "GPU inference stopped",
+    });
+    assert_eq!(
+        background_embedding_failure(failure).as_deref(),
+        Some("GPU inference stopped")
+    );
+    assert!(background_embedding_failure(serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding",
+        "last_error": null,
+    }))
+    .is_none());
+}
+
+#[test]
+fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
+    let active = serde_json::json!({"kind": "embedding", "state": "embedding"});
+    assert_eq!(
+        observe_background_embedding(Some(&active), true, false, false),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, true, false),
+        BackgroundEmbeddingObservation::Published
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_propagates_failed_owner_after_release() {
+    let failed = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "model execution failed",
+    });
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, false, false),
+        BackgroundEmbeddingObservation::Failed("model execution failed".into())
+    );
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, true, false),
+        BackgroundEmbeddingObservation::Published,
+        "verified publication outranks a stale failed job record"
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_follows_structural_owner_into_embedding() {
+    let index = serde_json::json!({"kind": "index", "state": "refreshing"});
+    assert_eq!(
+        observe_background_embedding(Some(&index), true, false, true),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, true),
+        BackgroundEmbeddingObservation::FollowIndex
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, false),
+        BackgroundEmbeddingObservation::MissingPublication
     );
 }
 
@@ -664,6 +810,32 @@ fn parse_path_disambiguation_and_hyphen_values() {
 }
 
 #[test]
+fn ambiguous_read_failure_respects_explicit_stdout_budget() {
+    let cli = Cli::try_parse_from(["greppy", "read", "main", "--max-bytes", "3000"])
+        .expect("read accepts a global byte budget");
+    let spec = output_budget_spec(&cli).expect("read must enable shared output capture");
+    assert_eq!(spec.command, "read");
+    assert_eq!(spec.max_bytes, Some(3000));
+
+    let mut output = String::from("`main` is 83 definitions\n");
+    for index in 0..83 {
+        output.push_str(&format!(
+            "crates/example/src/long_module_name_{index}/implementation.rs:{}\n",
+            index + 1
+        ));
+    }
+    let rendered = budget_text_output(output.as_bytes(), &spec, 1);
+    assert!(rendered.len() <= 3000, "{} bytes", rendered.len());
+    let rendered = String::from_utf8(rendered).unwrap();
+    assert!(rendered.contains("truncated: true"), "{rendered}");
+    assert!(
+        rendered.contains("try: greppy read --offset "),
+        "{rendered}"
+    );
+    assert!(rendered.contains("`main` is 83 definitions"), "{rendered}");
+}
+
+#[test]
 fn parse_plus_uses_vectors_without_a_public_flag() {
     let cli =
         Cli::try_parse_from(["greppy", "plus", "--json", "--k", "5", "refund workflow"]).unwrap();
@@ -696,7 +868,7 @@ fn embedding_config_defaults_to_bundled_embeddinggemma_when_no_flags() {
     // ran on the lexical/algorithmic path with no vectors at all.
     let cfg = embedding_config_required(EmbeddingCliArgs {
         device: None,
-        no_gpu: true,
+        no_gpu: false,
     })
     .expect("no-flags embedding config must resolve to the embedded model, not error");
     assert!(
@@ -771,19 +943,77 @@ fn embedding_device_preference_obeys_cli_and_env() {
         inference_device_identity(&greppy_embed_native::DevicePreference::Cuda),
         "cuda:2"
     );
-    assert_eq!(
-        embedding_device_preference(Some("cpu"), true).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let explicit_cpu = embedding_device_preference(Some("cpu"), false);
+    let no_gpu_cpu = embedding_device_preference(None, true);
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+        assert!(matches!(
+            no_gpu_cpu,
+            Err(Error::Invalid(message)) if message.contains("platform GPU")
+        ));
+    } else {
+        assert_eq!(
+            explicit_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+        assert_eq!(
+            no_gpu_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+    }
+
+    // Summary inference shares the product GPU contract and must reject
+    // an explicit CPU selector independently of the no-GPU switch.
+    unsafe {
+        std::env::set_var(ENV_DEVICE, "cpu");
+    }
+    let summary_explicit_cpu = qwen_summary_device_preference();
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            summary_explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("GREPPY_DEVICE=cpu")
+        ));
+    } else {
+        assert_eq!(
+            summary_explicit_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_NO_GPU, "1");
     }
-    assert_eq!(
-        embedding_device_preference(Some("cuda"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let env_cpu = embedding_device_preference(Some("cuda"), false);
+    let summary_env_cpu = qwen_summary_device_preference();
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+        assert!(matches!(
+            summary_env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+    } else {
+        assert_eq!(env_cpu.unwrap(), greppy_embed_native::DevicePreference::Cpu);
+        assert_eq!(
+            summary_env_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
@@ -1463,6 +1693,36 @@ fn graph_index_progress_publishes_real_phase_and_file_counts() {
 }
 
 #[test]
+fn degraded_overlay_retains_exact_background_failure() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("overlay-embedding-degraded");
+    let job_path = root.join("index.job");
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
+    unsafe {
+        std::env::set_var("GREPPY_BACKGROUND_JOB", &job_path);
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+
+    let mut guard = BackgroundJobGuard::from_env();
+    record_overlay_job_outcome(
+        &mut guard,
+        &Ok(OverlayIndexOutcome::Degraded(
+            "2 of 2 embedding documents failed inference".into(),
+        )),
+    );
+    drop(guard);
+
+    let job = read_background_job(&job_path).expect("degraded overlay keeps failure record");
+    assert_eq!(job["state"], "failed");
+    assert_eq!(
+        job["last_error"],
+        "2 of 2 embedding documents failed inference"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn global_root_parses_before_and_after_subcommand() {
     // RV-006: `--root` is a global flag, accepted on either side of
     // the subcommand. Both spellings must land in `cli.root`.
@@ -1723,6 +1983,7 @@ fn internal_source_search_is_literal_line_numbered_and_binary_safe() {
         "needle.*literal",
         &root,
         &["source.rs".into(), "binary.bin".into()],
+        None,
     )
     .unwrap();
     assert_eq!(hits.len(), 1);
@@ -1991,6 +2252,31 @@ fn qualified_query_resolves_to_owner_node() {
     );
 }
 
+#[test]
+fn file_qualified_single_and_multi_resolvers_agree() {
+    let store = store_with_defs(&[
+        ("Function", "src/first.rs", "Function", "run"),
+        ("Function", "src/second.rs", "Function", "run"),
+    ]);
+    let first = id_of(&store, "src/first.rs", "Function", "run");
+    for selector in ["src/first.rs::run", "src/first.rs::Function::run"] {
+        assert_eq!(
+            resolve_symbol_nodes(&store, Some(selector)).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            resolve_symbol_id(&store, Some(selector)).unwrap(),
+            Some(first)
+        );
+    }
+    for selector in ["missing.rs::run", "src/first.rs::missing"] {
+        assert!(resolve_symbol_nodes(&store, Some(selector))
+            .unwrap()
+            .is_empty());
+        assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
+    }
+}
+
 /// REGRESSION 2: never-guess. A qualified query whose `Owner.member`
 /// matches MORE THAN ONE node (same owner in two files) returns the
 /// full candidate set — never one arbitrary pick — and a query whose
@@ -2050,6 +2336,58 @@ fn bare_name_query_is_unchanged_and_aggregates() {
     assert_eq!(got, want);
     // And a bare name still enters neither qualified branch.
     assert_eq!(split_qualified("get"), None);
+}
+
+#[test]
+fn path_qualified_value_definitions_are_addressable_without_broadening_bare_aggregation() {
+    let store = store_with_defs(&[
+        (
+            "Variable",
+            "src/core/gateway.rs",
+            "Variable",
+            "EMAIL_RUNTIME_ENV_KEYS",
+        ),
+        ("Field", "src/model.rs", "Config", "email"),
+        ("Method", "src/service.rs", "Service", "email"),
+    ]);
+    let variable = id_of(
+        &store,
+        "src/core/gateway.rs",
+        "Variable",
+        "EMAIL_RUNTIME_ENV_KEYS",
+    );
+    let field = id_of(&store, "src/model.rs", "Config", "email");
+
+    assert_eq!(
+        resolve_symbol_nodes(
+            &store,
+            Some("src/core/gateway.rs::Variable::EMAIL_RUNTIME_ENV_KEYS")
+        )
+        .unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/core/gateway.rs::EMAIL_RUNTIME_ENV_KEYS")).unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Config::email")).unwrap(),
+        vec![field]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Field::email")).unwrap(),
+        vec![field]
+    );
+    assert!(
+        resolve_symbol_nodes(&store, Some("missing/model.rs::email"))
+            .unwrap()
+            .is_empty(),
+        "a missing path must not fall back to a same-named definition"
+    );
+
+    let bare = resolve_symbol_nodes(&store, Some("email")).unwrap();
+    assert_eq!(bare.len(), 1, "bare aggregation remains primary-only");
+    assert_ne!(bare[0], field);
 }
 
 /// Seed a provider_state row so the completeness helpers have data.
@@ -2182,4 +2520,85 @@ fn cache_commands_parse_with_stable_public_flags() {
             }
         })
     ));
+}
+
+#[test]
+fn workspace_query_demand_is_shared_across_structural_and_embedding_waiters() {
+    let root = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let name = background_job_demand_name(root.path());
+    let structural = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let embedding = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the automatic writer must see demand from both job kinds"
+    );
+    drop(structural);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the remaining cross-kind waiter must preserve the writer"
+    );
+    drop(embedding);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_some(),
+        "the writer may stop only after the final workspace waiter exits"
+    );
+}
+
+#[test]
+fn completed_publication_and_successor_identity_block_demand_cancellation() {
+    let job = serde_json::json!({
+        "pid": 41,
+        "target_generation": 9,
+        "state": "syncing_snapshot"
+    });
+    assert!(background_demand_may_cancel(Some(&job), false, 41, 9));
+    assert!(
+        !background_demand_may_cancel(Some(&job), true, 41, 9),
+        "the in-process publication latch wins before terminal record cleanup"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 42, 9),
+        "a reused PID cannot authorize cancellation"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 41, 10),
+        "a successor generation cannot be overwritten"
+    );
+    assert!(!background_demand_may_cancel(None, false, 41, 9));
 }

@@ -59,6 +59,65 @@ fn write_session(path: &Path, lines: &[&str]) {
     fs::write(path, body).unwrap();
 }
 
+#[test]
+fn agent_run_allows_help_without_agent_lifecycle_side_effects() {
+    let root = unique_temp("agent-run-help");
+    let repo = root.join("repo");
+    let store = root.join("store");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let refs_before = Command::new("git")
+        .args(["show-ref"])
+        .current_dir(&repo)
+        .output()
+        .unwrap()
+        .stdout;
+
+    for (args, expected_code, expected) in [
+        (&["agent", "--help"][..], 0, "Usage: greppy agent"),
+        (&["agent", "sessions", "--help"][..], 0, "list"),
+        (
+            &["agent", "sessions", "list", "--help"][..],
+            0,
+            "Usage: greppy agent sessions list",
+        ),
+        (&["agent", "list", "--help"][..], 64, "unrecognized subcommand"),
+    ] {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(&repo)
+            .env("GREPPY_AGENT_RUN", "1")
+            .env("GREPPY_STORE_DIR", &store)
+            .env_remove("GREPPY_MODEL")
+            .env_remove("GREPPY_ENDPOINT")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "args={args:?}\n{combined}"
+        );
+        assert!(combined.contains(expected), "args={args:?}\n{combined}");
+        assert!(
+            !combined.contains("nested agent run"),
+            "args={args:?}\n{combined}"
+        );
+    }
+
+    assert!(!store.exists(), "help must not initialize agent storage");
+    let refs_after = Command::new("git")
+        .args(["show-ref"])
+        .current_dir(&repo)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(refs_after, refs_before, "help must not create proposal refs");
+    let _ = fs::remove_dir_all(root);
+}
+
 fn setup_fixture() -> Fixture {
     let root = unique_temp("fx");
     let repo = root.join("repo");

@@ -41,8 +41,8 @@
   "entry_count": 1354,
   "status_counts": {
     "implemented": 348,
-    "unsupported": 500,
-    "unverified": 506
+    "unsupported": 497,
+    "unverified": 509
   },
   "entries": [
     {
@@ -11855,12 +11855,12 @@
       "symbol": "Tracing.start",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+        "Action-only schema v10 recording is under validation. screenshots, snapshots and sources options fail explicitly."
       ]
     },
     {
@@ -11895,12 +11895,12 @@
       "symbol": "Tracing.stop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+        "Daemon artifact export is under validation. stop({path}) is materialized safely by the CLI after web.run completes and is not readable from inside the still-running script."
       ]
     },
     {
@@ -15603,12 +15603,12 @@
       "symbol": "BrowserContext.tracing",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "No Playwright trace.zip. start/stop MUST fail with unsupported_playwright_operation. Returning request/download dumps is not tracing compatibility."
+        "Action-only recording returns a sensitive web.run artifact; stop({path}) exports after web.run completes. One controller supports one active trace at a time, so simultaneous tracing across contexts is rejected. snapshots, screenshots, sources, chunks and groups remain unsupported."
       ]
     },
     {

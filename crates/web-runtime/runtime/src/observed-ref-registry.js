@@ -1,11 +1,16 @@
 // Expression embedded into the observation script, not a page-global API.
 // Only WeakMap keys retain node identity: detached nodes are not kept alive by
 // the registry. DOM attributes are lookup hints and never prove identity.
-(function(document, previous, snapshot, first, last) {
+(function(document, previous, snapshot, first, last, expectedSnapshot) {
   if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first < 1 || last < first) {
     throw new Error('invalid observed reference allocation');
   }
-  const reuse = previous && previous.document === document && previous.identities instanceof WeakMap;
+  // History restoration can bring back a live Document with an old registry.
+  // Only retain identity in the scope the supervisor still recognizes. A
+  // restored/expired scope gets fresh references rather than resurrecting old
+  // handles or making every later observation fail scope validation.
+  const reuse = previous && previous.document === document &&
+    previous.snapshot === expectedSnapshot && previous.identities instanceof WeakMap;
   if (reuse && first <= previous.lastReserved) {
     throw new Error('observed reference allocation would recycle identifiers');
   }

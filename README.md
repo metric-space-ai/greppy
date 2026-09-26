@@ -148,10 +148,12 @@ install -m 0755 target/release/greppy "$HOME/.local/bin/greppy"
 `cargo build` fails if a model asset is missing or its SHA-256 does not match
 ([`crates/cli/build.rs`](crates/cli/build.rs)). `fetch_model_assets.sh` is
 idempotent — it verifies existing files and re-downloads only on mismatch.
-Add `--features metal`
-(Apple Silicon) or `--features cuda` (Linux/NVIDIA) for the accelerated backend;
-CPU inference always works, and the device is selected automatically (override
-with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`).
+Greppy product builds require compiled GPU backends for both embedded models.
+Supported targets are Apple Silicon with Metal and Linux x86_64 with CUDA
+(including nvcc); the platform backend is enabled automatically. The
+`cpu-only` feature is restricted to debug and numerical-reference use and is
+rejected when building a release executable. Windows has debug portability
+coverage but is not a supported product/release target.
 
 The binary embeds EmbeddingGemma (300M) and an in-house Qwen3.5 (0.8B)
 fine-tune that writes the navigation hints. The weights live on Hugging Face

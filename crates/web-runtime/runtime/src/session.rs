@@ -48,20 +48,19 @@ pub struct Session {
     pub download_bytes: u64,
     pub console_bytes: u64,
     pub peak_rss_bytes: u64,
-    /// CPU baselines so the session budget measures THIS session's work, not
-    /// the content/controller process lifetime (finding 039: the verb path
-    /// charged every session for all CPU ever burned, so a long-lived daemon
-    /// went permanently unusable after ~30s of cumulative work). Paired with
-    /// the pid so a worker respawn resets the baseline instead of producing
-    /// a bogus negative delta.
-    pub content_cpu_baseline: Option<(u32, u64)>,
-    pub controller_cpu_baseline: Option<(u32, u64)>,
+    /// CPU charged to this session's serialized operation intervals. These
+    /// counters survive worker respawns; the daemon adds only the process CPU
+    /// delta observed around each operation, so one session cannot inherit
+    /// another session's shared-worker work.
+    pub content_cpu_used_ns: u64,
+    pub controller_cpu_used_ns: u64,
     pub started: Instant,
     pub inflight_engine_request_id: Option<u64>,
     pub inflight_engine_method: Option<String>,
     pub discarded_engine_results: u64,
     pub persistent_profile: Option<String>,
     pub owner: Option<String>,
+    pub trace: Option<crate::playwright_trace::TraceRecorder>,
 }
 
 impl Session {
@@ -85,14 +84,15 @@ impl Session {
             download_bytes: 0,
             console_bytes: 0,
             peak_rss_bytes: 0,
-            content_cpu_baseline: None,
-            controller_cpu_baseline: None,
+            content_cpu_used_ns: 0,
+            controller_cpu_used_ns: 0,
             started: Instant::now(),
             inflight_engine_request_id: None,
             inflight_engine_method: None,
             discarded_engine_results: 0,
             persistent_profile: None,
             owner: None,
+            trace: None,
         }
     }
 
@@ -171,5 +171,21 @@ mod tests {
         assert_eq!(session.operation_id.as_deref(), Some("wrq_2"));
         session.transition(SessionState::Ready).unwrap();
         assert_eq!(session.state, SessionState::Ready);
+    }
+
+    #[test]
+    fn default_session_accepts_multiple_operations_after_two_minutes() {
+        let mut session = Session::new("wrs_old", "run", crate::policy::NetworkProfile::Project);
+        session.started = Instant::now() - std::time::Duration::from_secs(121);
+        session.transition(SessionState::Ready).unwrap();
+
+        for operation in ["wrq_late_1", "wrq_late_2"] {
+            session
+                .limits
+                .check_wall_time(session.started.elapsed())
+                .unwrap();
+            session.begin_operation(operation).unwrap();
+            session.transition(SessionState::Ready).unwrap();
+        }
     }
 }

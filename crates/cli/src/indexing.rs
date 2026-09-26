@@ -179,7 +179,7 @@ fn recover_completed_index_snapshot(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    let Some((_, candidate)) = candidates.into_iter().next() else {
+    if candidates.is_empty() {
         return Ok(IndexRecoveryReport {
             command: "index-recover",
             status: "no-candidate",
@@ -189,110 +189,138 @@ fn recover_completed_index_snapshot(
             owner_pid: None,
             reason: None,
         });
-    };
-    let candidate_name = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let owner_pid = candidate_name
-        .strip_prefix(&prefix)
-        .and_then(|suffix| suffix.split('.').next())
-        .and_then(|pid| pid.parse::<u32>().ok());
-    if owner_pid.is_some_and(process_is_alive) {
+    }
+
+    let candidates = candidates
+        .into_iter()
+        .map(|(_, candidate)| {
+            let owner_pid = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|suffix| suffix.split('.').next())
+                .and_then(|pid| pid.parse::<u32>().ok());
+            (candidate, owner_pid)
+        })
+        .collect::<Vec<_>>();
+
+    // A live owner means indexing may still be preparing a publication even
+    // if its writer lock is momentarily unavailable or the PID was observed
+    // through a surviving candidate. Never publish another snapshot around it.
+    if let Some((candidate, owner_pid)) = candidates
+        .iter()
+        .find(|(_, owner_pid)| owner_pid.as_ref().is_some_and(|pid| process_is_alive(*pid)))
+    {
         return Ok(IndexRecoveryReport {
             command: "index-recover",
             status: "rejected",
             root_path,
             active_store,
             candidate: Some(candidate.to_string_lossy().into_owned()),
-            owner_pid,
+            owner_pid: *owner_pid,
             reason: Some("candidate owner process is still alive".into()),
         });
     }
 
-    let validation = (|| -> Result<()> {
-        checkpoint_store_path(&candidate)?;
-        let store =
-            greppy_store::Store::open_with(&candidate, greppy_store::OpenOptions::read_only())?;
-        store.integrity_check().map_err(|error| {
-            Error::Store(format!(
-                "recovery candidate {} failed integrity_check: {error}",
-                candidate.display()
-            ))
-        })?;
-        let schema = store.schema_version()?;
-        if schema != greppy_store::migrate::CURRENT_VERSION {
-            return Err(Error::Store(format!(
-                "recovery candidate schema {schema} does not match expected {}",
-                greppy_store::migrate::CURRENT_VERSION
-            )));
+    let mut rejected = Vec::new();
+    for (candidate, owner_pid) in candidates {
+        match validate_index_recovery_candidate(&candidate, target, project, options) {
+            Ok(()) => {
+                cleanup_sqlite_sidecars(&candidate)?;
+                sync_file(&candidate)?;
+                sync_parent_dir(&candidate)?;
+                publish_store_snapshot(&candidate, active_path)?;
+                cleanup_stale_snapshot_artifacts(active_path, true)?;
+                return Ok(IndexRecoveryReport {
+                    command: "index-recover",
+                    status: "published",
+                    root_path,
+                    active_store,
+                    candidate: Some(candidate.to_string_lossy().into_owned()),
+                    owner_pid,
+                    reason: None,
+                });
+            }
+            Err(error) => rejected.push((candidate, owner_pid, error.to_string())),
         }
-        let project_row = store
-            .get_project(project)?
-            .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
-        let expected_target = absolutize_path(target);
-        if absolutize_path(std::path::Path::new(&project_row.root_path)) != expected_target {
-            return Err(Error::Store(format!(
-                "recovery candidate project root {} does not match {}",
-                project_row.root_path,
-                expected_target.display()
-            )));
-        }
-        let state = store
-            .get_workspace_state(expected_target.to_string_lossy().as_ref())?
-            .ok_or_else(|| Error::Store("recovery candidate lacks workspace fingerprint".into()))?;
-        if state.schema_version != greppy_store::migrate::CURRENT_VERSION
-            || state.indexer_version != greppy_core::INDEXER_VERSION_BASE
-        {
-            return Err(Error::Store(format!(
-                "recovery candidate fingerprint version mismatch (schema={}, indexer={})",
-                state.schema_version, state.indexer_version
-            )));
-        }
-        let freshness = greppy_freshness::check_files_report_with_ttl(
-            &store,
-            target,
-            project,
-            std::time::Duration::from_secs(300),
-            &options.discover_overrides,
-            std::time::Duration::ZERO,
-        )?;
-        if !matches!(
-            freshness.state.outcome,
-            greppy_freshness::FreshnessOutcome::Fresh
-        ) {
-            return Err(Error::Store(
-                "repository HEAD, index signature or discovered files changed after snapshot creation"
-                    .into(),
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(error) = validation {
-        return Ok(IndexRecoveryReport {
-            command: "index-recover",
-            status: "rejected",
-            root_path,
-            active_store,
-            candidate: Some(candidate.to_string_lossy().into_owned()),
-            owner_pid,
-            reason: Some(error.to_string()),
-        });
     }
-    cleanup_sqlite_sidecars(&candidate)?;
-    sync_file(&candidate)?;
-    sync_parent_dir(&candidate)?;
-    publish_store_snapshot(&candidate, active_path)?;
-    cleanup_stale_snapshot_artifacts(active_path, true)?;
+
+    let (candidate, owner_pid, reason) = rejected
+        .into_iter()
+        .next()
+        .expect("non-empty candidate list must produce a rejection");
     Ok(IndexRecoveryReport {
         command: "index-recover",
-        status: "published",
+        status: "rejected",
         root_path,
         active_store,
         candidate: Some(candidate.to_string_lossy().into_owned()),
         owner_pid,
-        reason: None,
+        reason: Some(format!("no safe completed snapshot: {reason}")),
     })
+}
+
+fn validate_index_recovery_candidate(
+    candidate: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    options: &greppy_indexer::IndexOptions,
+) -> Result<()> {
+    checkpoint_store_path(candidate)?;
+    let store = greppy_store::Store::open_with(candidate, greppy_store::OpenOptions::read_only())?;
+    store.integrity_check().map_err(|error| {
+        Error::Store(format!(
+            "recovery candidate {} failed integrity_check: {error}",
+            candidate.display()
+        ))
+    })?;
+    let schema = store.schema_version()?;
+    if schema != greppy_store::migrate::CURRENT_VERSION {
+        return Err(Error::Store(format!(
+            "recovery candidate schema {schema} does not match expected {}",
+            greppy_store::migrate::CURRENT_VERSION
+        )));
+    }
+    let project_row = store
+        .get_project(project)?
+        .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
+    let expected_target = absolutize_path(target);
+    if absolutize_path(std::path::Path::new(&project_row.root_path)) != expected_target {
+        return Err(Error::Store(format!(
+            "recovery candidate project root {} does not match {}",
+            project_row.root_path,
+            expected_target.display()
+        )));
+    }
+    let state = store
+        .get_workspace_state(expected_target.to_string_lossy().as_ref())?
+        .ok_or_else(|| Error::Store("recovery candidate lacks workspace fingerprint".into()))?;
+    if state.schema_version != greppy_store::migrate::CURRENT_VERSION
+        || state.indexer_version != greppy_core::INDEXER_VERSION_BASE
+    {
+        return Err(Error::Store(format!(
+            "recovery candidate fingerprint version mismatch (schema={}, indexer={})",
+            state.schema_version, state.indexer_version
+        )));
+    }
+    let freshness = greppy_freshness::check_files_report_with_ttl(
+        &store,
+        target,
+        project,
+        std::time::Duration::from_secs(300),
+        &options.discover_overrides,
+        std::time::Duration::ZERO,
+    )?;
+    if !matches!(
+        freshness.state.outcome,
+        greppy_freshness::FreshnessOutcome::Fresh
+    ) {
+        return Err(Error::Store(
+            "repository HEAD, index signature or discovered files changed after snapshot creation"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Result<i32> {
@@ -310,21 +338,19 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     let background_job = read_background_job(&background_job_path(&effective_root));
     let effective_root_string = effective_root.to_string_lossy().into_owned();
     let writer_active = workspace_writer_active(Some(&effective_root_string));
-    let job_state = background_job.as_ref().map(|job| {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|pid| process_is_alive(pid as u32))
-        {
-            "refreshing"
-        } else {
-            "failed"
-        }
-    });
+    let spawn_active = background_job_spawn_active(&effective_root);
     let background_state = if writer_active {
         Some("refreshing")
+    } else if spawn_active {
+        Some("starting")
     } else {
-        job_state
+        background_job.as_ref().map(|job| {
+            if job.get("state").and_then(serde_json::Value::as_str) == Some("failed") {
+                "failed"
+            } else {
+                "abandoned"
+            }
+        })
     };
     // `status` must never queue behind the writer it is meant to observe.
     // Opening the previous graph and running integrity/freshness checks can be
@@ -347,7 +373,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         let message = if progress_stalled {
             let phase = phase.unwrap_or("unknown");
             format!(
-                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the exact background_job PID, terminate only that process if it is no longer making progress, then rerun `greppy index`; the OS lock releases with its owner",
+                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the index invocation that owns writer_lock and its logs; background_job.pid is diagnostic only and must not be signaled without separate ownership proof; the OS lock releases when its actual owner exits",
                 progress_age_seconds.unwrap_or(0)
             )
         } else if background_job.is_some() {
@@ -361,6 +387,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "healthy": false,
             "store_exists": store_path.exists(),
             "writer_active": true,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "writer_lock": writer_lock,
@@ -434,6 +461,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "healthy": false,
             "store_exists": false,
             "writer_active": false,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,
@@ -509,6 +537,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                 "healthy": false,
                 "store_exists": true,
                 "writer_active": false,
+                "startup_active": spawn_active,
                 "root_path": effective_root,
                 "store_path": store_path,
                 "store_format": store_format,
@@ -663,6 +692,10 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         && diag.integrity_ok
         && project_present
         && fresh
+        && freshness
+            .get("metadata_refresh_pending")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
         && embedding_healthy
         && provider_failure_count == 0
         && coverage_warning.is_none()
@@ -676,6 +709,8 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "status": status_label,
             "healthy": healthy,
             "store_exists": true,
+            "writer_active": false,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,
@@ -847,47 +882,48 @@ pub(crate) fn dispatch_index_agent_worktree(
         crate::store_cow::ENV_FALLBACK_REASON,
     ]
     .map(|name| (name, std::env::var_os(name)));
-    let prepared_base =
-        match crate::store_cow::prepare_base_store(&workspace, &shared_data_root, embedding_args) {
-            Ok(prepared) => {
-                if !cli_json_output() {
-                    println!(
-                        "store mode: overlay (Base {}, {})",
-                        &prepared.identity_hash[..12],
-                        if prepared.reused {
-                            "reused"
-                        } else {
-                            "published"
-                        }
-                    );
-                }
-                Some(prepared)
-            }
-            Err(error) => {
-                match restore_project {
-                    Some(previous) => {
-                        std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous)
+    let prepared_base = match crate::store_cow::prepare_base_store(
+        &workspace,
+        &shared_data_root,
+        embedding_args,
+        None,
+        None,
+    ) {
+        Ok(prepared) => {
+            if !cli_json_output() {
+                println!(
+                    "store mode: overlay (Base {}, {})",
+                    &prepared.identity_hash[..12],
+                    if prepared.reused {
+                        "reused"
+                    } else {
+                        "published"
                     }
-                    None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
-                }
-                for (name, value) in cow_env {
-                    match value {
-                        Some(previous) => std::env::set_var(name, previous),
-                        None => std::env::remove_var(name),
-                    }
-                }
-                let cleanup = workspace.cleanup();
-                let cleanup_detail = cleanup
-                    .err()
-                    .map(|cleanup_error| {
-                        format!("; workspace cleanup also failed: {cleanup_error}")
-                    })
-                    .unwrap_or_default();
-                return Err(Error::Invalid(format!(
-                    "agent Base prewarm failed closed: {error}{cleanup_detail}"
-                )));
+                );
             }
-        };
+            Some(prepared)
+        }
+        Err(error) => {
+            match restore_project {
+                Some(previous) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, previous),
+                None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
+            }
+            for (name, value) in cow_env {
+                match value {
+                    Some(previous) => std::env::set_var(name, previous),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let cleanup = workspace.cleanup();
+            let cleanup_detail = cleanup
+                .err()
+                .map(|cleanup_error| format!("; workspace cleanup also failed: {cleanup_error}"))
+                .unwrap_or_default();
+            return Err(Error::Invalid(format!(
+                "agent Base prewarm failed closed: {error}{cleanup_detail}"
+            )));
+        }
+    };
     // The agent does not read the operator's data root: `greppy -p` runs with
     // GREPPY_STORE_DIR pointed at an isolated tree beside the worktree, and the
     // sandbox grants only that tree. Warming under the operator's root writes a
@@ -980,8 +1016,6 @@ pub(crate) fn dispatch_index(
         discover_overrides: discover_overrides_from_env()?,
         only_paths: None,
     };
-    let embedding_config = embedding_config_for_index(embedding_args)?;
-
     // Open the on-disk store under the workspace locator's path
     // never at `<root>/.greppy/graph.db` (which would
     // pollute `grep -R .`). The versioned platform data directory is used on
@@ -1028,15 +1062,101 @@ pub(crate) fn dispatch_index(
             return Err(Error::io(context, source));
         }
     };
-    let recovery = recover_completed_index_snapshot(
-        &store_path,
-        &target,
-        &effective_root,
-        &project,
-        &index_options,
+    // Claim the portable workspace ownership lock before resolving or
+    // materializing inference assets. Background launchers use this lock for
+    // their startup handshake and attached-query liveness; doing slow model
+    // setup first leaves a PID-only ownership gap.
+    // A graph-only command must not wait for model resolution or inference on
+    // a cold workspace. Publish the complete structural snapshot first; a
+    // later semantic command uses the normal background embedding path for
+    // this generation. Explicit `greppy index` keeps its existing policy.
+    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
+    let embedding_config = if structural_first_use {
+        None
+    } else {
+        embedding_config_for_index(embedding_args)?
+    };
+    let embedding_job =
+        std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
+    let had_overlay_binding = embedding_job
+        && crate::store_cow::overlay_environment_for_recovery(&effective_root)?.is_some();
+    let _embedding_overlay = if embedding_job {
+        match crate::store_cow::prepare_auto_linked_worktree_overlay(
+            &effective_root,
+            &greppy_core::cache::data_root(),
+            embedding_args,
+            background_job.progress_path(),
+        ) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                // Preparing a linked Base can own a delegated child. Demand
+                // cancellation closes that child's owner pipe and records the
+                // terminal reason before this error returns; route it through
+                // the guard so cancellation is not overwritten by Drop's
+                // generic unsuccessful-publication failure.
+                background_job.fail(&error);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let embedding_overlay = if had_overlay_binding {
+        crate::store_cow::overlay_spec_live(&effective_root)?
+    } else {
+        None
+    };
+    let embedding_only = embedding_job
+        && store_path.is_file()
+        && (!effective_root.join(".git").is_file() || embedding_overlay.is_some());
+    if embedding_only {
+        let cfg = embedding_config.as_ref().ok_or_else(|| {
+            Error::Invalid("background embedding job has no embedding configuration".into())
+        })?;
+        background_job.attach_foreground(background_job_path(&effective_root));
+        match complete_embeddings_from_published_graph(
+            &store_path,
+            &target,
+            &effective_root,
+            &project,
+            cfg,
+            embedding_overlay.as_ref(),
+            if background_job.has_progress_sink() {
+                Some(&mut background_job)
+            } else {
+                None
+            },
+        ) {
+            Ok(EmbeddingBuildOutcome::Complete(_)) => {
+                background_job.complete();
+                return Ok(0);
+            }
+            Ok(EmbeddingBuildOutcome::Degraded { reason, .. }) => {
+                background_job.degraded(&reason);
+                return Ok(0);
+            }
+            Err(error) => {
+                background_job.fail(&error);
+                return Err(error);
+            }
+        }
+    }
+    let recovery = background_job.publication_boundary(
+        || {
+            recover_completed_index_snapshot(
+                &store_path,
+                &target,
+                &effective_root,
+                &project,
+                &index_options,
+            )
+        },
+        |recovery| recovery.published(),
     )?;
     if recovery.published() {
+        background_job.publication_finished();
         let _ = remove_file_if_exists(&background_job_path(&effective_root));
+        background_job.complete();
         println!(
             "recovered and published completed index snapshot {}",
             recovery.candidate.as_deref().unwrap_or("unknown")
@@ -1086,12 +1206,8 @@ pub(crate) fn dispatch_index(
                 None
             },
         );
-        match &result {
-            Ok(0) => background_job.complete(),
-            Ok(_) => background_job.write_state("failed", Some("Delta index was incomplete")),
-            Err(error) => background_job.fail(error),
-        }
-        return result;
+        record_overlay_job_outcome(&mut background_job, &result);
+        return result.map(|_| 0);
     }
     // Holding the writer lock, build a fresh snapshot in a temp DB, validate
     // it, then publish it with one filesystem rename. The indexer crate still
@@ -1118,6 +1234,7 @@ pub(crate) fn dispatch_index(
             return Err(error);
         }
     };
+    background_job.publication_finished();
     let report = &snapshot.index;
 
     println!(
@@ -1196,6 +1313,26 @@ pub(crate) fn dispatch_index(
     Ok(0)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OverlayIndexOutcome {
+    Complete,
+    Degraded(String),
+}
+
+pub(crate) fn record_overlay_job_outcome(
+    background_job: &mut BackgroundJobGuard,
+    result: &Result<OverlayIndexOutcome>,
+) {
+    if result.is_ok() {
+        background_job.publication_finished();
+    }
+    match result {
+        Ok(OverlayIndexOutcome::Complete) => background_job.complete(),
+        Ok(OverlayIndexOutcome::Degraded(reason)) => background_job.degraded(reason),
+        Err(error) => background_job.fail(error),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
@@ -1209,7 +1346,7 @@ pub(crate) fn index_overlay_snapshot(
     index_options: &greppy_indexer::IndexOptions,
     announce: bool,
     mut progress: Option<&mut BackgroundJobGuard>,
-) -> Result<i32> {
+) -> Result<OverlayIndexOutcome> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
     let temp_path = unique_store_sibling(active_path, "delta-building");
     cleanup_sqlite_family(&temp_path)?;
@@ -1274,9 +1411,9 @@ pub(crate) fn index_overlay_snapshot(
             target,
             project,
             config,
-            &report,
+            report.graph_generation,
             active_path.parent().map(std::path::Path::to_path_buf),
-            progress,
+            progress.as_deref_mut(),
         )?)
     } else {
         None
@@ -1284,7 +1421,11 @@ pub(crate) fn index_overlay_snapshot(
     checkpoint_store(&store, &temp_path)?;
     drop(store);
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
-    publish_store_snapshot(&temp_path, active_path)?;
+    if let Some(job) = progress {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
     cleanup_stale_snapshot_artifacts(active_path, false)?;
 
     if announce {
@@ -1297,8 +1438,9 @@ pub(crate) fn index_overlay_snapshot(
     }
     if let Some(EmbeddingBuildOutcome::Degraded { reason, .. }) = embedding {
         eprintln!("greppy: Delta embeddings degraded: {reason}");
+        return Ok(OverlayIndexOutcome::Degraded(reason));
     }
-    Ok(0)
+    Ok(OverlayIndexOutcome::Complete)
 }
 
 pub(crate) fn index_atomic_snapshot(
@@ -1402,7 +1544,7 @@ pub(crate) fn index_atomic_snapshot_attempt(
                 target,
                 project,
                 cfg,
-                &report,
+                report.graph_generation,
                 active_path.parent().map(std::path::Path::to_path_buf),
                 background_job.as_deref_mut(),
             ) {
@@ -1467,10 +1609,14 @@ pub(crate) fn index_atomic_snapshot_attempt(
         return Ok(None);
     }
 
-    if let Some(job) = background_job {
+    if let Some(job) = background_job.as_deref_mut() {
         job.finalization_phase("publishing_snapshot");
     }
-    publish_store_snapshot(&temp_path, active_path)?;
+    if let Some(job) = background_job {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     Ok(Some(IndexSnapshotReport {
         index: report,
@@ -1480,12 +1626,72 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }))
 }
 
+fn complete_embeddings_from_published_graph(
+    active_path: &std::path::Path,
+    target: &std::path::Path,
+    effective_root: &std::path::Path,
+    project: &str,
+    cfg: &EmbeddingModelConfig,
+    overlay: Option<&crate::store_cow::OverlaySpec>,
+    mut background_job: Option<&mut BackgroundJobGuard>,
+) -> Result<EmbeddingBuildOutcome> {
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
+    let temp_path = unique_store_sibling(active_path, "embedding-next");
+    cleanup_sqlite_family(&temp_path)?;
+    seed_temp_store_from_active_if_usable(active_path, &temp_path)?;
+    let mut store = if let Some(overlay) = overlay {
+        greppy_store::Store::open_overlay(&overlay.base_path, &temp_path, &overlay.visibility)?
+    } else {
+        greppy_store::Store::open(&temp_path)?
+    };
+    let generation = store
+        .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+        .ok_or_else(|| Error::Invalid("published graph has no workspace state".into()))?
+        .graph_generation;
+    let outcome = index_embeddings_into_temp_store(
+        &mut store,
+        target,
+        project,
+        cfg,
+        generation,
+        active_path.parent().map(std::path::Path::to_path_buf),
+        background_job.as_deref_mut(),
+    )?;
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("checkpointing_wal");
+    }
+    checkpoint_store(&store, &temp_path)?;
+    drop(store);
+    let integrity =
+        greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
+    integrity.integrity_check().map_err(|error| {
+        Error::Store(format!(
+            "embedding snapshot integrity_check failed for {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    drop(integrity);
+    cleanup_sqlite_sidecars(&temp_path)?;
+    sync_file(&temp_path)?;
+    sync_parent_dir(&temp_path)?;
+    if let Some(job) = background_job.as_deref_mut() {
+        job.finalization_phase("publishing_snapshot");
+    }
+    if let Some(job) = background_job {
+        job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
+    } else {
+        publish_store_snapshot(&temp_path, active_path)?;
+    }
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
+    Ok(outcome)
+}
+
 pub(crate) fn index_embeddings_into_temp_store(
     store: &mut greppy_store::Store,
     target: &std::path::Path,
     project: &str,
     cfg: &EmbeddingModelConfig,
-    report: &greppy_indexer::IndexReport,
+    graph_generation: u64,
     _tokenizer_cache_dir: Option<std::path::PathBuf>,
     background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<EmbeddingBuildOutcome> {
@@ -1503,7 +1709,7 @@ pub(crate) fn index_embeddings_into_temp_store(
             .execute(
                 "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+                rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
             )
             .map_err(|error| {
                 Error::Store(format!("record test embedding completeness: {error}"))
@@ -1525,7 +1731,7 @@ pub(crate) fn index_embeddings_into_temp_store(
         ));
     }
     let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
-    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation);
+    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
     let embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
         // model weights and must remain observable instead of leaving status
@@ -1559,13 +1765,17 @@ pub(crate) fn index_embeddings_into_temp_store(
         // semantic query (or the spawned background job) re-runs the
         // embedding pass, reusing every vector that DID embed by content
         // hash and retrying only the failed documents.
-        let reason = format!(
+        let mut reason = format!(
             "{} of {} embedding documents failed inference",
             embedding_report.nodes_failed,
             embedding_report
                 .nodes_failed
                 .saturating_add(embedding_report.nodes_embedded)
         );
+        if let Some(cause) = provider.last_error() {
+            reason.push_str(": ");
+            reason.push_str(cause);
+        }
         return Ok(EmbeddingBuildOutcome::Degraded {
             report: Some(embedding_report),
             reason,
@@ -1577,7 +1787,7 @@ pub(crate) fn index_embeddings_into_temp_store(
         .execute(
             "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+            rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
     Ok(EmbeddingBuildOutcome::Complete(embedding_report))

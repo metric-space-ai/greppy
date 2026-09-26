@@ -1202,6 +1202,7 @@ dependencies = [
 name = "greppy-web-client"
 version = "0.3.3"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -3048,8 +3049,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-css"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbc5e18f29a2c6d6435891f42569525cf95435a3e01c2f1947abcde178686f"
+source = "git+https://github.com/tree-sitter/tree-sitter-css?rev=a93651c7bef1b73c47bdc7cd530ffa4ebffae032#a93651c7bef1b73c47bdc7cd530ffa4ebffae032"
 dependencies = [
  "cc",
  "tree-sitter-language",

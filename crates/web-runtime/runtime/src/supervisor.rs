@@ -412,6 +412,20 @@ pub(crate) fn route_until_script_complete(
     route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
+#[derive(Debug)]
+pub(crate) struct ScriptFailure {
+    pub message: String,
+    pub result: serde_json::Value,
+}
+
+impl std::fmt::Display for ScriptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ScriptFailure {}
+
 pub(crate) fn route_until_script_complete_gated(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
@@ -549,10 +563,13 @@ pub(crate) fn route_until_script_complete_gated(
                     ok, result, error, ..
                 }) => {
                     if !ok {
-                        return Err(io::Error::other(format!(
-                            "controller script failed: {}",
-                            error.unwrap_or_else(|| result.to_string())
-                        )));
+                        return Err(io::Error::other(ScriptFailure {
+                            message: format!(
+                                "controller script failed: {}",
+                                error.unwrap_or_else(|| result.to_string())
+                            ),
+                            result,
+                        }));
                     }
                     return Ok(result);
                 }
@@ -905,6 +922,8 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
         "GREPPY_WEB_TEST_IGNORE_CERTS",
+        #[cfg(debug_assertions)]
+        "GREPPY_TEST_TRACE_LIMIT_BYTES",
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",

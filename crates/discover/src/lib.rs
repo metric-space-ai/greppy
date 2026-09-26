@@ -340,6 +340,39 @@ pub fn walk_with_policy_and_overrides(
     policy: &skip::SkipPolicy,
     overrides: &WalkOverrides,
 ) -> Result<Vec<InventoryEntry>> {
+    walk_scoped_with_policy_and_overrides(root, policy, overrides, None)
+}
+
+fn scoped_hidden_components_are_explicit(relative: &str, scopes: &[String]) -> bool {
+    let mut prefix = String::new();
+    for component in relative.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if component.starts_with('.')
+            && component.len() > 1
+            && !scopes.iter().any(|scope| {
+                scope == &prefix
+                    || scope
+                        .strip_prefix(&prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk only the supplied root-relative files or subtrees while retaining the
+/// root's ignore files, skip policy, and symlink boundary.
+pub fn walk_scoped_with_policy_and_overrides(
+    root: &Path,
+    policy: &skip::SkipPolicy,
+    overrides: &WalkOverrides,
+    scopes: Option<&[String]>,
+) -> Result<Vec<InventoryEntry>> {
     use ignore::WalkBuilder;
 
     let mut entries = Vec::new();
@@ -349,6 +382,14 @@ pub fn walk_with_policy_and_overrides(
     // skip the vendored mirror if the workspace happens to be the
     // greppy project itself.
     builder.standard_filters(true);
+    // An explicit scope may itself live below a hidden ancestor (for example
+    // `.codex/task-evidence`). The ignore crate's hidden filter runs before
+    // `filter_entry`, so leave hidden filtering to the scope predicate for
+    // scoped walks. It admits hidden entries only when they are explicitly
+    // named scope components; ordinary hidden descendants remain excluded.
+    if scopes.is_some() {
+        builder.hidden(false);
+    }
     // Do not follow symlinks: a symlinked directory must not be descended
     // (loop / escape protection), and a symlinked file is handled by the
     // explicit per-entry check below.
@@ -364,6 +405,28 @@ pub fn walk_with_policy_and_overrides(
     builder.parents(!root.join(".git").exists());
     if !overrides.is_empty() {
         builder.overrides(build_ignore_overrides(root, overrides)?);
+    }
+    if let Some(scopes) = scopes {
+        let root = root.to_path_buf();
+        let scopes = scopes.to_vec();
+        builder.filter_entry(move |entry| {
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let in_scope = relative.is_empty()
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || relative == *scope
+                        || relative
+                            .strip_prefix(scope)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || scope
+                            .strip_prefix(&relative)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+            in_scope && scoped_hidden_components_are_explicit(&relative, &scopes)
+        });
     }
     let walker = builder.build();
     for dent in walker {

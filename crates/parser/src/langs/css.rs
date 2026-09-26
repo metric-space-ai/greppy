@@ -1,9 +1,9 @@
 //! CSS — onboarded via the parallel-safe registry (`crate::registry`). This
 //! whole file is the entire surface: it declares the spec + queries + grammar
 //! and self-registers with `inventory::submit!`. No shared file is edited
-//! (build.rs discovers this module automatically); the only Cargo.toml line
-//! added is the `tree-sitter-css` dependency (a crates.io release, `0.25`,
-//! which builds against tree-sitter 0.25 directly — no git/path shim needed).
+//! (build.rs discovers this module automatically). The grammar dependency is
+//! pinned to an immutable upstream tree-sitter-css commit that adds dedicated
+//! named-container and style-query syntax on top of release 0.25.0.
 //!
 //! Status: **experimental / partial**. CSS is a styling/markup language, not a
 //! programming language: it has no functions and no user call semantics, so
@@ -100,5 +100,28 @@ inventory::submit! {
         def_query: DEFINITIONS,
         call_query: "",
         import_query: "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extracts_rules_nested_in_named_and_style_containers() {
+        let source = br#"@container mail-content-editor (max-width: 460px) {
+  .editor { color: red; }
+}
+@container sidebar style(--theme: dark) {
+  .message { display: block; }
+}
+"#;
+        let language = crate::language_for_path(std::path::Path::new("editor.css"));
+        let result = crate::extract(language, source, "editor.css").unwrap();
+        let rules = result
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Rule")
+            .map(|node| (node.name.as_str(), node.start_line, node.end_line))
+            .collect::<Vec<_>>();
+        assert_eq!(rules, vec![(".editor", 2, 2), (".message", 5, 5)]);
     }
 }

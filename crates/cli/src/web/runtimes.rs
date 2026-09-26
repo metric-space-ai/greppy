@@ -13,11 +13,12 @@ pub enum RuntimesCommand {
     ///   greppy web pw 'await page.goto("http://x/"); return await page.title()'
     ///   greppy web pw --file flow.mjs
     ///
-    /// `browser`, `context` and `page` are already open when the snippet
-    /// starts, and top-level `await` works. What the snippet returns is
-    /// reported as the result. This is the escape hatch for anything no verb
-    /// covers; for a full program that manages its own browser, use
-    /// `greppy web run --script-file`.
+    /// `browser`, `context` and `page` are the selected session's existing
+    /// objects when the snippet starts, and top-level `await` works. A session
+    /// with no tab gets one blank tab. What the snippet returns is reported as
+    /// the result. This is the escape hatch for anything no verb covers; for a
+    /// full program that manages its own browser, use `greppy web run
+    /// --script-file`.
     Pw {
         /// Statements to run. Omit when using --file.
         code: Option<String>,
@@ -141,16 +142,8 @@ fn pw(
     let marker_literal = serde_json::to_string(&result_marker)
         .expect("a string result marker is always JSON serializable");
     let program = format!(
-        "import {{ chromium }} from \"playwright\";\n\
-         const browser = await chromium.launch();\n\
-         const context = await browser.newContext();\n\
-         const page = await context.newPage();\n\
-         let __value;\n\
-         try {{\n\
-           __value = await (async () => {{ {body} }})();\n\
-         }} finally {{\n\
-           try {{ await browser.close(); }} catch {{}}\n\
-         }}\n\
+        "let __value;\n\
+         __value = await (async () => {{ {body} }})();\n\
          console.log({marker_literal} + JSON.stringify(__value === undefined ? null : __value));\n"
     );
     let dir = std::path::Path::new(root.unwrap_or(".")).join(".greppy/web/pw");
@@ -178,6 +171,7 @@ fn pw(
             "session_id": session,
             "script_source": "file",
             "script_file": path.display().to_string(),
+            "bind_session_page": true,
         }),
         Some(session),
     );

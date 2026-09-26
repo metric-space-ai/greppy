@@ -25,11 +25,13 @@ pub(crate) fn remaining_wait_budget(
     request_ms: u64,
     timeout_ms: u64,
     elapsed: Duration,
-    session_remaining: Duration,
+    session_remaining: Option<Duration>,
 ) -> Duration {
-    Duration::from_millis(request_ms.min(timeout_ms))
-        .saturating_sub(elapsed)
-        .min(session_remaining)
+    let request_remaining =
+        Duration::from_millis(request_ms.min(timeout_ms)).saturating_sub(elapsed);
+    session_remaining
+        .map(|remaining| request_remaining.min(remaining))
+        .unwrap_or(request_remaining)
 }
 
 pub(crate) fn wait_io_budget(deadline: Option<Instant>, fallback: Duration) -> Duration {
@@ -103,7 +105,7 @@ mod tests {
 
     #[test]
     fn wait_never_refreshes_or_exceeds_any_budget() {
-        let session = Duration::from_secs(10);
+        let session = Some(Duration::from_secs(10));
         assert_eq!(
             remaining_wait_budget(1000, 800, Duration::from_millis(300), session),
             Duration::from_millis(500)
@@ -113,7 +115,7 @@ mod tests {
                 1000,
                 800,
                 Duration::from_millis(300),
-                Duration::from_millis(100)
+                Some(Duration::from_millis(100))
             ),
             Duration::from_millis(100)
         );
@@ -124,6 +126,10 @@ mod tests {
         assert_eq!(
             remaining_wait_budget(0, 800, Duration::ZERO, session),
             Duration::ZERO
+        );
+        assert_eq!(
+            remaining_wait_budget(1_000, 800, Duration::from_millis(300), None),
+            Duration::from_millis(500)
         );
         assert_eq!(
             wait_io_budget(Some(Instant::now()), Duration::from_millis(80)),

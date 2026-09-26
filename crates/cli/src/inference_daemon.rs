@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-pub(super) const PROTOCOL_VERSION: u32 = 3;
+// Version 4 separates clients requiring actual backend status and strict macOS
+// Metal loading from live version 3 daemons, which could silently use CPU.
+pub(super) const PROTOCOL_VERSION: u32 = 4;
 const READER_WORKERS: usize = 4;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,16 +28,17 @@ pub(super) enum RequestOutcome<T> {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SpawnOutcome {
     Spawned,
     SpawnFailed,
     Contended,
     Cooldown,
+    CoordinationFailed(String),
 }
 
 impl SpawnOutcome {
-    pub(super) fn attempted(self) -> bool {
+    pub(super) fn attempted(&self) -> bool {
         matches!(self, Self::Spawned | Self::SpawnFailed)
     }
 }
@@ -70,6 +73,7 @@ struct RuntimeStatus {
     completed_requests: u64,
     rejected_requests: u64,
     last_error: Option<String>,
+    backend: Option<String>,
 }
 
 impl Default for RuntimeStatus {
@@ -82,6 +86,7 @@ impl Default for RuntimeStatus {
             completed_requests: 0,
             rejected_requests: 0,
             last_error: None,
+            backend: None,
         }
     }
 }
@@ -517,14 +522,18 @@ pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>
     if cooldown_active(endpoint) {
         return SpawnOutcome::Cooldown;
     }
-    let Some(lock) = greppy_core::cache::acquire_named_lock(
+    let lock = match greppy_core::cache::acquire_named_lock(
         &endpoint.spawn_lock_name(),
         greppy_core::cache::LockMode::Exclusive,
         true,
-    )
-    .ok()
-    .flatten() else {
-        return SpawnOutcome::Contended;
+    ) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return SpawnOutcome::Contended,
+        Err(error) => {
+            return SpawnOutcome::CoordinationFailed(format!(
+                "cannot acquire daemon spawn lock: {error}"
+            ))
+        }
     };
     let outcome = if spawn().is_some() {
         SpawnOutcome::Spawned
@@ -839,18 +848,20 @@ fn append_windows_command_arg(command_line: &mut Vec<u16>, arg: &std::ffi::OsStr
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn serve<M, Load, Validate, Handle>(
+pub(super) fn serve<M, Load, BackendName, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
     policy: ServerPolicy,
     prewarm: bool,
     mut load: Load,
+    mut backend_name: BackendName,
     mut validate: Validate,
     mut handle: Handle,
     log_prefix: &'static str,
 ) -> !
 where
     Load: FnMut() -> Result<M, String>,
+    BackendName: FnMut(&M) -> String,
     Validate: FnMut(&str) -> Result<(), serde_json::Value>,
     Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
 {
@@ -860,6 +871,7 @@ where
         policy,
         prewarm,
         &mut load,
+        &mut backend_name,
         &mut validate,
         &mut handle,
         log_prefix,
@@ -868,18 +880,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_server<M, Load, Validate, Handle>(
+fn run_server<M, Load, BackendName, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
     policy: ServerPolicy,
     prewarm: bool,
     mut load: Load,
+    mut backend_name: BackendName,
     mut validate: Validate,
     mut handle: Handle,
     log_prefix: &'static str,
 ) -> i32
 where
     Load: FnMut() -> Result<M, String>,
+    BackendName: FnMut(&M) -> String,
     Validate: FnMut(&str) -> Result<(), serde_json::Value>,
     Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
 {
@@ -938,8 +952,9 @@ where
         set_state(&status, LifecycleState::Loading, None);
         match load() {
             Ok(loaded) => {
+                let backend = backend_name(&loaded);
                 model = Some(loaded);
-                set_state(&status, LifecycleState::Ready, None);
+                set_ready(&status, backend);
             }
             Err(error) => set_state(&status, LifecycleState::Faulted, Some(error)),
         }
@@ -977,7 +992,11 @@ where
             if model.is_none() {
                 set_state(&status, LifecycleState::Loading, None);
                 match load() {
-                    Ok(loaded) => model = Some(loaded),
+                    Ok(loaded) => {
+                        let backend = backend_name(&loaded);
+                        model = Some(loaded);
+                        set_ready(&status, backend);
+                    }
                     Err(error) => {
                         set_state(&status, LifecycleState::Faulted, Some(error.clone()));
                         set_active(&status, None);
@@ -1215,6 +1234,7 @@ fn status_response(
         "completed_requests": status.completed_requests,
         "rejected_requests": status.rejected_requests,
         "last_error": status.last_error,
+        "backend": status.backend,
         "queue_policy": "fair-round-robin-unbounded",
         "pending_requests": pending_requests,
     })
@@ -1416,6 +1436,20 @@ fn set_state(status: &Arc<Mutex<RuntimeStatus>>, state: LifecycleState, error: O
         }
         status.state = state;
         status.last_error = error;
+        if state != LifecycleState::Ready {
+            status.backend = None;
+        }
+    }
+}
+
+fn set_ready(status: &Arc<Mutex<RuntimeStatus>>, backend: String) {
+    if let Ok(mut status) = status.lock() {
+        if status.state != LifecycleState::Ready {
+            status.state_started = Instant::now();
+        }
+        status.state = LifecycleState::Ready;
+        status.last_error = None;
+        status.backend = Some(backend);
     }
 }
 
@@ -1441,6 +1475,9 @@ fn complete(status: &Arc<Mutex<RuntimeStatus>>, model_loaded: bool, error: Optio
             status.state_started = Instant::now();
         }
         status.state = next_state;
+        if !model_loaded {
+            status.backend = None;
+        }
     }
 }
 
@@ -2086,6 +2123,29 @@ fn wide_string(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_status_reports_only_the_loaded_backend() {
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        assert!(status_response(&status, "starting", 0)["backend"].is_null());
+
+        set_state(&status, LifecycleState::Loading, None);
+        assert!(status_response(&status, "loading", 0)["backend"].is_null());
+
+        set_ready(&status, "metal".into());
+        assert_eq!(status_response(&status, "ready", 0)["backend"], "metal");
+
+        set_state(&status, LifecycleState::Evicted, None);
+        assert!(status_response(&status, "evicted", 0)["backend"].is_null());
+
+        set_ready(&status, "metal".into());
+        set_state(
+            &status,
+            LifecycleState::Faulted,
+            Some("inference failed".into()),
+        );
+        assert!(status_response(&status, "faulted", 0)["backend"].is_null());
+    }
+
     /// The embedding daemon writes its response and closes. On macOS the
     /// reader could not re-arm SO_RCVTIMEO after that and dropped the
     /// buffered remainder of any frame longer than one read; the summary
@@ -2128,6 +2188,18 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
         assert!(a.address().contains("summary-"));
+    }
+
+    #[test]
+    fn new_clients_do_not_reuse_pre_gpu_contract_daemons() {
+        // Captured version 3 endpoint identities for the same Auto model.
+        // Reusing either would bypass the new loaded-backend/Metal contract.
+        for (kind, legacy) in [
+            ("embedding", "fe9209ef93b6fe7c4784c35e0eafac45"),
+            ("summary", "33cb66d9a4b281f23aa5491fc007924d"),
+        ] {
+            assert_ne!(endpoint_digest(kind, "model|prompt|auto", None), legacy);
+        }
     }
 
     #[test]
@@ -2383,6 +2455,47 @@ mod tests {
             SpawnOutcome::Contended
         );
         drop(lock);
+    }
+
+    #[test]
+    fn spawn_lock_setup_error_is_distinct_from_contention() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let invalid_store = root.path().join("not-a-directory");
+        std::fs::write(&invalid_store, b"data").unwrap();
+        let previous = std::env::var_os("GREPPY_STORE_DIR");
+        // SAFETY: serialized by the crate-wide environment lock and restored below.
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &invalid_store) };
+        let endpoint = Endpoint::for_identity(
+            "spawn-error-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let outcome = spawn_once(&endpoint, || {
+            panic!("lock setup failure must prevent spawn")
+        });
+        // SAFETY: still serialized by the crate-wide environment lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+                None => std::env::remove_var("GREPPY_STORE_DIR"),
+            }
+        }
+        match outcome {
+            SpawnOutcome::CoordinationFailed(error) => {
+                assert!(
+                    error.contains("cannot acquire daemon spawn lock"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("refusing non-directory cache namespace"),
+                    "{error}"
+                );
+            }
+            other => panic!("expected coordination failure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2666,6 +2779,7 @@ mod tests {
                     load_finished_tx.send(()).expect("signal prewarm complete");
                     Ok::<_, String>(())
                 },
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| serde_json::json!({"ok": model.is_some()}),
                 "prewarm-status-test",
@@ -2687,6 +2801,7 @@ mod tests {
                 status,
                 RequestOutcome::Response(ref value)
                     if value["state"] == "loading"
+                        && value["backend"].is_null()
                         && value["daemon_pid"].as_u64().unwrap_or_default() > 0
             ),
             "status was unavailable during prewarm load: {status:?}"
@@ -2729,7 +2844,8 @@ mod tests {
         assert!(
             matches!(
                 ready,
-                RequestOutcome::Response(ref value) if value["state"] == "ready"
+                RequestOutcome::Response(ref value)
+                    if value["state"] == "ready" && value["backend"] == "test-backend"
             ),
             "status was unavailable after a slow prewarm load: {ready:?}"
         );
@@ -2768,6 +2884,7 @@ mod tests {
                     let owner = server_loads.fetch_add(1, Ordering::SeqCst) + 1;
                     Ok::<_, String>(owner)
                 },
+                |owner| format!("test-{owner}"),
                 |raw| {
                     let value: serde_json::Value = serde_json::from_str(raw)
                         .map_err(|_| serde_json::json!({"error": "malformed request"}))?;
@@ -2856,8 +2973,10 @@ mod tests {
 
         let evict_deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let state = diagnostic(&endpoint)["state"].as_str().map(str::to_string);
+            let status = diagnostic(&endpoint);
+            let state = status["state"].as_str().map(str::to_string);
             if state.as_deref() == Some("evicted") {
+                assert!(status["backend"].is_null());
                 break;
             }
             assert!(
@@ -2876,6 +2995,7 @@ mod tests {
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
         ));
+        assert_eq!(diagnostic(&endpoint)["backend"], "test-2");
         assert_eq!(loads.load(Ordering::SeqCst), 2);
         assert_eq!(server.join().expect("server thread"), 0);
     }
@@ -2904,6 +3024,7 @@ mod tests {
                 },
                 false,
                 || Ok::<_, String>(()),
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| serde_json::json!({"ok": model.is_some()}),
                 "slow-client-test",
@@ -2967,6 +3088,7 @@ mod tests {
                     server_loads.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, String>(())
                 },
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| {
                     std::thread::sleep(Duration::from_millis(10));
@@ -3052,6 +3174,7 @@ mod tests {
                 }
                 Ok::<_, String>(())
             },
+            |_| "test-backend".to_string(),
             |_| Ok(()),
             move |_raw, model| {
                 if hang {

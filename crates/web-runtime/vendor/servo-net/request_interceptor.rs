@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use content_security_policy::Destination;
-use embedder_traits::{GenericEmbedderProxy, WebResourceRequest, WebResourceResponseMsg};
+use embedder_traits::{
+    GenericEmbedderProxy, WebResourceLoadId, WebResourceRequest, WebResourceResponseMsg,
+};
 use log::error;
 use net_traits::NetworkError;
 use net_traits::http_status::HttpStatus;
@@ -23,6 +25,10 @@ impl RequestInterceptor {
         RequestInterceptor { embedder_proxy }
     }
 
+    pub fn embedder_proxy(&self) -> GenericEmbedderProxy<NetToEmbedderMsg> {
+        self.embedder_proxy.clone()
+    }
+
     pub async fn intercept_request(
         &self,
         request: &mut Request,
@@ -32,8 +38,12 @@ impl RequestInterceptor {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let is_for_main_frame = matches!(request.destination, Destination::Document);
         let web_resource_request = WebResourceRequest {
+            id: WebResourceLoadId {
+                fetch_id: request.id.0.to_string(),
+                redirect_count: request.redirect_count,
+            },
             method: request.method.clone(),
-            url: request.url().into_url(),
+            url: request.current_url().into_url(),
             headers: request.headers.clone(),
             destination: request.destination,
             referrer_url: request.referrer.to_url().map(|url| url.as_url().clone()),

@@ -322,6 +322,20 @@ pub(crate) fn resolve_symbol_id(
     store: &greppy_store::Store,
     symbol: Option<&str>,
 ) -> Result<Option<i64>> {
+    if symbol.is_some_and(|query| split_path_qualified(query).is_some()) {
+        // Reuse the same file-qualified selector contract as read/callees.
+        // Treating the file as an owner made impact/path reject valid targets.
+        let mut candidates = Vec::new();
+        for id in resolve_symbol_nodes(store, symbol)? {
+            if let Some(node) = store.get_node(id)? {
+                candidates.push(node);
+            }
+        }
+        return Ok(candidates
+            .into_iter()
+            .min_by_key(|node| (label_rank(&node.label), node.id))
+            .map(|node| node.id));
+    }
     // Push the name filter into SQL. The old form loaded the first 10k
     // nodes of the project (ordered by qualified_name) and filtered in
     // memory — on a repo bigger than the cap (django: 56k nodes) every
@@ -393,6 +407,18 @@ pub(crate) fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
     looks_like_path.then(|| (head, &query[idx + 2..]))
 }
 
+/// Definition labels that a lossless qualified spelling may address directly.
+///
+/// Variable and Field are real value definitions with readable source spans,
+/// but they intentionally remain outside is_primary_label: bare navigation
+/// aggregates callable/type definitions and must not suddenly collect every
+/// same-named value. Exact qualified names and file-qualified queries are
+/// already narrowed, so accepting these two resolver definition labels there
+/// preserves emitted forms without broadening bare or owner/member resolution.
+fn is_addressable_definition_label(label: &str) -> bool {
+    is_primary_label(label) || matches!(label, "Variable" | "Field")
+}
+
 pub(crate) fn resolve_symbol_nodes(
     store: &greppy_store::Store,
     symbol: Option<&str>,
@@ -414,7 +440,7 @@ pub(crate) fn resolve_symbol_nodes(
                 .with_limit(10_000),
         )?
         .into_iter()
-        .filter(|row| is_primary_label(&row.label))
+        .filter(|row| is_addressable_definition_label(&row.label))
         .map(|row| row.id)
         .collect::<Vec<_>>();
         exact.sort_unstable();
@@ -446,7 +472,7 @@ pub(crate) fn resolve_symbol_nodes(
             .iter()
             .filter(|r| {
                 r.name.eq_ignore_ascii_case(name)
-                    && is_primary_label(&r.label)
+                    && is_addressable_definition_label(&r.label)
                     && indexed_path_matches_query(&r.file_path, path)
             })
             .collect();
@@ -472,9 +498,9 @@ pub(crate) fn resolve_symbol_nodes(
         };
         ids.sort_unstable();
         ids.dedup();
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
+        // A file selector is authoritative, including when it has no match.
+        // Do not recurse into the single-node resolver or guess another file.
+        return Ok(ids);
     }
     // Name filter pushed into SQL — see resolve_symbol_id for why the old
     // capped whole-project scan was wrong on large repos.
@@ -606,6 +632,39 @@ pub(crate) fn resolve_root(root: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(workspace_locator::resolve_workspace_root(&cwd))
 }
 
+/// Base used to join user-provided file operands.
+///
+/// [`resolve_root`] remains the workspace identity: graph/store, edit
+/// transaction locks, journal, undo, verification, containment, receipts,
+/// handles and continuation packs. An explicit `--root` inside a repository
+/// is still promoted there. File operands must not follow that promotion —
+/// `--root R/etc` plus `probe.conf` means `R/etc/probe.conf`, not
+/// `R/probe.conf`.
+///
+/// When `--root` is omitted the file operand base is the workspace root, so
+/// existing repository-relative behavior is unchanged.
+pub(crate) fn resolve_file_operand_base(
+    root: Option<&str>,
+    workspace_root: &std::path::Path,
+) -> std::path::PathBuf {
+    match root {
+        Some(r) => absolutize_path(std::path::Path::new(r)),
+        None => workspace_root.to_path_buf(),
+    }
+}
+
+/// Join a user-provided file operand to the file operand base.
+/// Absolute operands stay absolute so relative `../` traversal can still be
+/// refused separately from explicit diagnostic paths.
+pub(crate) fn file_operand_path(file_base: &std::path::Path, file: &str) -> std::path::PathBuf {
+    let supplied = std::path::Path::new(file);
+    if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        file_base.join(supplied)
+    }
+}
+
 /// The flag clap rejected, e.g. `--regex` from `unexpected argument '--regex' found`.
 pub(crate) fn unknown_flag_name(clap_message: &str) -> Option<String> {
     let unknown = clap_message
@@ -690,6 +749,15 @@ pub(crate) fn argv_with_stray_path_as_filter(
     argv: &[std::ffi::OsString],
     clap_message: &str,
 ) -> Option<(Vec<std::ffi::OsString>, String)> {
+    // Browser operands are URLs/selectors, not graph path filters. Otherwise
+    // unknown-flag recovery removes the inserted --path and recreates argv.
+    if grep_passthrough_args(argv)
+        .first()
+        .and_then(|arg| arg.to_str())
+        == Some("web")
+    {
+        return None;
+    }
     let stray = clap_message
         .strip_prefix("error: unexpected argument '")?
         .split('\'')
@@ -847,5 +915,55 @@ mod positional_recovery_tests {
         .unwrap();
         assert_eq!(stray, "parse_path");
         assert_eq!(repaired, &argv[..2]);
+    }
+}
+
+#[cfg(test)]
+mod file_operand_base_tests {
+    use super::*;
+
+    fn workspace_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("etc");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        (dir, repo, nested)
+    }
+
+    #[test]
+    fn explicit_subdirectory_root_keeps_workspace_identity_and_a_separate_file_base() {
+        let (_dir, repo, nested) = workspace_fixture();
+        let nested_slash = format!("{}/", nested.display());
+        for explicit in [nested.to_str().unwrap(), nested_slash.as_str()] {
+            let workspace = resolve_root(Some(explicit)).unwrap();
+            assert_eq!(workspace, repo.canonicalize().unwrap());
+            let file_base = resolve_file_operand_base(Some(explicit), &workspace);
+            assert_eq!(file_base, nested.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn omitted_root_uses_the_workspace_for_file_operands() {
+        let (_dir, repo, _nested) = workspace_fixture();
+        let workspace = repo.canonicalize().unwrap();
+        let file_base = resolve_file_operand_base(None, &workspace);
+        assert_eq!(file_base, workspace);
+        assert_eq!(
+            resolve_root(Some(repo.to_str().unwrap())).unwrap(),
+            workspace
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_spelling_of_an_explicit_root_canonicalizes_the_file_base() {
+        let (_dir, repo, nested) = workspace_fixture();
+        let link = repo.join("etc-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        let workspace = resolve_root(Some(link.to_str().unwrap())).unwrap();
+        assert_eq!(workspace, repo.canonicalize().unwrap());
+        let file_base = resolve_file_operand_base(Some(link.to_str().unwrap()), &workspace);
+        assert_eq!(file_base, nested.canonicalize().unwrap());
     }
 }

@@ -35,6 +35,11 @@ pub use sampler::{
 };
 
 pub const MODEL_ID: &str = "greppy/qwen35-0.8b-function-purpose-mtp-q4km-944k-2026-07-25";
+/// Whether the summary model has a compiled GPU implementation for this target.
+/// CUDA uses the embedding crate's build-script signal because both models share
+/// the same native CUDA dylib and a feature flag alone does not prove nvcc ran.
+pub const HAS_GPU_BACKEND: bool = cfg!(all(feature = "metal", target_os = "macos"))
+    || (cfg!(all(feature = "cuda", target_os = "linux")) && greppy_embed_native::HAS_GPU_BACKEND);
 pub const DIAGNOSTIC_TARGET_PREFILL_TOKENS: usize = 512;
 pub const DIAGNOSTIC_MAX_OUTPUT_TOKENS: usize = 128;
 

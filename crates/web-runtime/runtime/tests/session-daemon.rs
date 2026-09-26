@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use web_runtime::worker::give_child_attach_token;
@@ -715,6 +715,323 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+struct ResetServer {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ResetServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_reset_server() -> ResetServer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    listener.set_nonblocking(true).expect("nonblocking failure port");
+    let url = format!(
+        "http://{}/transport-failure",
+        listener.local_addr().unwrap()
+    );
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || loop {
+        if stopped.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // An abortive close makes the accepted-then-closed failure a
+                // deterministic TCP reset on Linux and macOS. A plain close
+                // can be interpreted as an empty orderly response by the
+                // networking stack and would not test the same failure path.
+                use std::os::fd::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                let result = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::addr_of!(linger).cast(),
+                        std::mem::size_of_val(&linger) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "set abortive TCP close");
+                drop(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    });
+    ResetServer {
+        url,
+        stop,
+        worker: Some(worker),
+    }
+}
+
+fn serve_status_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status fixture");
+    let address = listener.local_addr().expect("status fixture addr");
+    thread::spawn(move || {
+        let repeated = std::sync::atomic::AtomicUsize::new(0);
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..count]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            if path == "/jump" {
+                let location = format!("http://{address}/landed");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
+            if path == "/jump-empty" {
+                let location = format!("http://{address}/empty");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
+            if path == "/chunked" {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+                continue;
+            }
+            let (status, body) = match path {
+                "/missing" => ("404 Not Found", b"missing".as_slice()),
+                "/repeat" => {
+                    if repeated.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ("200 OK", b"repeated ok".as_slice())
+                    } else {
+                        ("404 Not Found", b"repeated missing".as_slice())
+                    }
+                }
+                "/empty" => ("204 No Content", b"".as_slice()),
+                "/landed" => ("200 OK", b"landed".as_slice()),
+                _ => ("200 OK", b"ok".as_slice()),
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}/")
+}
+
+struct NavigationLifecycleFixture {
+    origin: String,
+    events: std::sync::mpsc::Receiver<String>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
+    releases: Arc<(Mutex<HashSet<String>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+    handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+}
+
+impl NavigationLifecycleFixture {
+    fn release(&self, path: &str) {
+        let (released, wake) = &*self.releases;
+        released.lock().unwrap().insert(path.to_owned());
+        wake.notify_all();
+    }
+
+    fn wait_for(&self, path: &str) {
+        self.wait_for_all(&[path]);
+    }
+
+    fn wait_for_all(&self, paths: &[&str]) {
+        let mut pending = paths.iter().copied().collect::<HashSet<_>>();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .events
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "waiting for fixture requests {pending:?}: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                });
+            pending.remove(event.as_str());
+        }
+    }
+
+    fn assert_not_requested(&self, path: &str, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.events.recv_timeout(remaining) {
+                Ok(event) => assert_ne!(event, path, "unexpected fixture request {path}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+                Err(error) => {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "fixture event channel failed: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NavigationLifecycleFixture {
+    fn drop(&mut self) {
+        let released = self.releases.0.lock().unwrap();
+        self.stop.store(true, Ordering::Release);
+        self.releases.1.notify_all();
+        drop(released);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        let handlers = std::mem::take(&mut *self.handlers.lock().unwrap());
+        for handler in handlers {
+            let _ = handler.join();
+        }
+    }
+}
+
+fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("set lifecycle fixture nonblocking");
+    let address = listener.local_addr().expect("lifecycle fixture addr");
+    let (events_tx, events) = std::sync::mpsc::channel();
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let server_diagnostics = Arc::clone(&diagnostics);
+    let releases = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+    let server_releases = Arc::clone(&releases);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let handlers = Arc::new(Mutex::new(Vec::new()));
+    let server_handlers = Arc::clone(&handlers);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let events_tx = events_tx.clone();
+            let diagnostics = Arc::clone(&server_diagnostics);
+            let releases = Arc::clone(&server_releases);
+            let handler_stop = Arc::clone(&server_stop);
+            let handler = thread::spawn(move || {
+                let mut buffer = [0_u8; 2048];
+                let n = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        diagnostics
+                            .lock()
+                            .unwrap()
+                            .push(format!("request read error: {error}"));
+                        0
+                    }
+                };
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_owned();
+                diagnostics
+                    .lock()
+                    .unwrap()
+                    .push(format!("accepted path {path}"));
+                let _ = events_tx.send(path.clone());
+                if path.contains("-gate.") {
+                    let (released, wake) = &*releases;
+                    let mut released = released.lock().unwrap();
+                    while !released.contains(&path) && !handler_stop.load(Ordering::Acquire) {
+                        released = wake.wait(released).unwrap();
+                    }
+                    if handler_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    "/parser" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head></head><body><script src='/parser-gate.js'></script><p id='late'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/defer" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><script>window.addEventListener('DOMContentLoaded', event => event.stopImmediatePropagation(), true); try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='parsed'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>parser-finished</p><img src='/load-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/dcl-before-load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>dom-content-loaded</p><img src='/dcl-load-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/phrase" => (
+                        "text/html; charset=utf-8",
+                        b"<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>".to_vec(),
+                    ),
+                    "/dcl-returned" => ("text/plain", b"ok".to_vec()),
+                    "/load-returned" => ("text/plain", b"ok".to_vec()),
+                    path if path.ends_with(".js") => ("text/javascript", b"void 0;".to_vec()),
+                    path if path.ends_with(".png") => ("image/png", Vec::new()),
+                    _ => ("text/plain", b"not found".to_vec()),
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if let Err(error) = stream.write_all(header.as_bytes()) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write headers for {path}: {error}"));
+                }
+                if let Err(error) = stream.write_all(&body) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write body for {path}: {error}"));
+                }
+            });
+            server_handlers.lock().unwrap().push(handler);
+        }
+    });
+    NavigationLifecycleFixture {
+        origin: format!("http://{address}"),
+        events,
+        diagnostics,
+        releases,
+        stop,
+        server: Some(server),
+        handlers,
+    }
+}
+
 fn serve_site() -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -799,6 +1116,58 @@ fn run_playwright_source(
         Duration::from_secs(5),
     );
     ran
+}
+
+fn run_playwright_source_async(
+    socket: PathBuf,
+    run_id: &str,
+    source: String,
+) -> (
+    std::sync::mpsc::Receiver<greppy_web_client::Response>,
+    thread::JoinHandle<()>,
+) {
+    let run_id = run_id.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("create async navigation session");
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            &run_id,
+            "web.run",
+            json!({
+                "session_id": session_id.clone(),
+                "script_source": "inline",
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 30_000;
+        let response = unix_request(&socket, &run, Duration::from_secs(35))
+            .expect("run async navigation script");
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        );
+        let _ = tx.send(response);
+    });
+    (rx, worker)
 }
 
 fn run_playwright_source_with_limits(
@@ -2687,6 +3056,813 @@ fn route_fulfill_overrides_http_body() {
 }
 
 #[test]
+fn network_query_filters_enriched_response_records() {
+    let origin = serve_fixture("unused");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-query.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_network_query", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_query",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+            "bind_session_page": true,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network");
+    assert_eq!(filtered.status, "ok", "{filtered:?}");
+    let requests = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("network requests");
+    assert_eq!(requests.len(), 1, "{filtered:?}");
+    assert!(
+        requests[0]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/same")),
+        "{filtered:?}"
+    );
+    assert_eq!(requests[0]["status"], 404);
+    assert_eq!(requests[0]["ok"], false);
+    assert_eq!(requests[0]["byteLength"], 7);
+
+    let successful = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status=200 url~/same$/" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network successful occurrence");
+    let successes = successful.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("successful network requests");
+    assert_eq!(successes.len(), 1, "{successful:?}");
+    assert_ne!(
+        successes[0]["requestId"], requests[0]["requestId"],
+        "repeated URL occurrences must retain distinct response identities"
+    );
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network failed records");
+    let failures = failed.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("failed network requests");
+    assert_eq!(failures.len(), 2, "{failed:?}");
+    let transport = failures
+        .iter()
+        .find(|record| {
+            record["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/failed"))
+        })
+        .expect("failed transport record");
+    assert!(transport.get("status").is_none(), "{transport:?}");
+    assert!(
+        transport["failure"]["errorText"].is_string(),
+        "{transport:?}"
+    );
+}
+
+#[test]
+fn network_query_filters_real_http_and_https_responses() {
+    let origin = serve_status_fixture();
+    let https = spawn_tls_origin("network-status-origin.py");
+    let https_origin = format!("https://{}/", https.addr);
+    let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    let failed_origin = format!(
+        "http://{}/transport-failure",
+        failed_listener.local_addr().unwrap()
+    );
+    thread::spawn(move || {
+        if let Ok((stream, _)) = failed_listener.accept() {
+            drop(stream);
+        }
+    });
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-http-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-http-status.mjs");
+    let source = format!(
+        "globalThis.httpsFixtureUrl = {};\nglobalThis.failedFixtureUrl = {};\n{}",
+        serde_json::to_string(&https_origin).unwrap(),
+        serde_json::to_string(&failed_origin).unwrap(),
+        std::fs::read_to_string(&script).unwrap(),
+    );
+    let _guard = Supervisor::spawn(&socket, "run_network_http_query", |command| {
+        command
+            .arg("--fixture-url")
+            .arg(&origin)
+            .env("GREPPY_WEB_TEST_IGNORE_CERTS", "1");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_http_query",
+        "web.run",
+        json!({
+            "session_id": session_id, "script_source": "file",
+            "script_file": script.display().to_string(), "script_text": source,
+            "bind_session_page": true,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("filtered network");
+    let failures = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .unwrap();
+    assert_eq!(failures.len(), 4, "{filtered:?}");
+    for scheme in ["http://", "https://"] {
+        assert!(
+            failures.iter().any(|row| row["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(scheme) && url.ends_with("/missing"))
+                && row["status"] == 404
+                && row["byteLength"] == 7),
+            "{scheme}: {filtered:?}"
+        );
+        assert!(
+            failures.iter().any(|row| row["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(scheme) && url.ends_with("/repeat"))
+                && row["status"] == 404
+                && row["byteLength"] == 16),
+            "{scheme}: {filtered:?}"
+        );
+    }
+
+    let all = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("all network");
+    let records = all.result.as_ref().unwrap()["requests"].as_array().unwrap();
+    for base in [&origin, &https_origin] {
+        let repeated = records
+            .iter()
+            .filter(|row| {
+                row["url"]
+                    .as_str()
+                    .is_some_and(|url| url == format!("{base}repeat"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 2, "{base}: {all:?}");
+        assert_ne!(repeated[0]["requestId"], repeated[1]["requestId"]);
+        assert_eq!(
+            (
+                repeated[0]["status"].as_u64(),
+                repeated[0]["byteLength"].as_u64()
+            ),
+            (Some(200), Some(11))
+        );
+        assert_eq!(
+            (
+                repeated[1]["status"].as_u64(),
+                repeated[1]["byteLength"].as_u64()
+            ),
+            (Some(404), Some(16))
+        );
+        for (path, status, bytes) in [
+            ("jump", 302, 0),
+            ("landed", 200, 6),
+            ("chunked", 200, 11),
+            ("empty", 204, 0),
+        ] {
+            let row = records
+                .iter()
+                .find(|row| {
+                    row["url"]
+                        .as_str()
+                        .is_some_and(|url| url == format!("{base}{path}"))
+                })
+                .unwrap_or_else(|| panic!("missing {base}{path}: {all:?}"));
+            assert_eq!(
+                (row["status"].as_u64(), row["byteLength"].as_u64()),
+                (Some(status), Some(bytes)),
+                "{base}{path}: {all:?}"
+            );
+        }
+    }
+    let failed = records
+        .iter()
+        .find(|row| row["url"] == failed_origin)
+        .unwrap_or_else(|| panic!("missing transport failure: {all:?}"));
+    assert!(failed.get("status").is_none(), "{failed:?}");
+    assert!(failed["failure"]["errorText"].is_string(), "{failed:?}");
+    let failed_only = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("failed network filter");
+    assert!(
+        failed_only.result.as_ref().unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["url"] == failed_origin && row["failure"]["errorText"].is_string()),
+        "{failed_only:?}"
+    );
+}
+
+#[test]
+fn native_transport_failure_is_typed_without_classifying_page_words() {
+    let reset = spawn_reset_server();
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let refused_url = format!(
+        "http://{}/transport-failure",
+        closed_listener.local_addr().unwrap()
+    );
+    drop(closed_listener);
+    let legitimate_html = Box::leak(format!(
+        "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='refused' href='{refused_url}'>Refused transport</a><a id='reset' href='{}'>Reset transport</a></body>",
+        reset.url,
+    ).into_boxed_str());
+    let legitimate = serve_fixture(legitimate_html);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_failure", |command| {
+        command.arg("--fixture-url").arg(&legitimate);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_navigation_failure", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("navigation request")
+    };
+
+    for selector in ["#refused", "#reset"] {
+        let ordinary = call("web.session.create", json!({ "profile": "project" }));
+        let ordinary_id = ordinary.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call(
+            "web.goto",
+            json!({ "session_id": ordinary_id, "url": legitimate }),
+        );
+        assert_eq!(
+            opened.status, "ok",
+            "ordinary page words are content: {opened:?}"
+        );
+        let observed = call("web.observe", json!({ "session_id": ordinary_id }));
+        assert_eq!(
+            observed.status, "ok",
+            "ordinary page words are observable: {observed:?}"
+        );
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": ordinary_id,
+                "selector": { "type": "css", "value": selector },
+            }),
+        );
+        assert_eq!(
+            clicked.status, "error",
+            "{selector} must be typed: {clicked:?}"
+        );
+        assert_eq!(
+            clicked.error.as_ref().unwrap().code,
+            "engine_error",
+            "{clicked:?}"
+        );
+        let receipt = clicked.result.as_ref().expect("partial click receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(
+            receipt.get("dispatch").is_some(),
+            "click dispatch provenance: {receipt}"
+        );
+        assert_eq!(receipt["session_id"], ordinary_id);
+        assert!(receipt["tab_id"].is_string());
+        assert!(clicked
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("request_id="));
+    }
+
+    let failed = call("web.session.create", json!({ "profile": "project" }));
+    let failed_id = failed.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let navigation = call(
+        "web.goto",
+        json!({ "session_id": failed_id, "url": refused_url }),
+    );
+    assert_eq!(
+        navigation.status, "error",
+        "transport navigation must fail: {navigation:?}"
+    );
+    assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
+}
+
+#[test]
+fn top_level_204_terminates_without_replacing_the_document() {
+    let status_origin = serve_status_fixture();
+    let prior =
+        serve_fixture("<!doctype html><title>Prior</title><p id='prior'>preserved document</p>");
+    let subresource = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><p id='ready'>subresource page</p><img src='{status_origin}empty'>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-no-document-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_no_document", |command| {
+        command.arg("--fixture-url").arg(&prior);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_no_document", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("no-document request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = call("web.goto", json!({"session_id":session,"url":prior}));
+    assert_eq!(opened.status, "ok", "prior document: {opened:?}");
+
+    for path in ["empty", "jump-empty"] {
+        let started = Instant::now();
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "204 navigation waited for a nonexistent document: {response:?}"
+        );
+        assert_eq!(response.status, "error", "{path}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, "engine_error");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("kind=no_document"),
+            "{response:?}"
+        );
+        assert!(
+            !response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("timed out"),
+            "{response:?}"
+        );
+        let preserved = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":"document.getElementById('prior')?.textContent"}),
+        );
+        assert_eq!(preserved.status, "ok", "{preserved:?}");
+        assert_eq!(
+            preserved.result.as_ref().unwrap()["value"],
+            "preserved document"
+        );
+    }
+
+    for (path, status) in [("landed", 200), ("missing", 404)] {
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert_eq!(response.status, "ok", "{path}: {response:?}");
+        assert_eq!(response.result.as_ref().unwrap()["status"], status);
+    }
+
+    let subresource_session = call("web.session.create", json!({"profile":"project"}));
+    let subresource_session = subresource_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let subresource_loaded = call(
+        "web.goto",
+        json!({"session_id":subresource_session,"url":subresource}),
+    );
+    assert_eq!(
+        subresource_loaded.status, "ok",
+        "subresource 204 must not poison its page: {subresource_loaded:?}"
+    );
+    let observed = call("web.observe", json!({"session_id":subresource_session}));
+    assert_eq!(observed.status, "ok", "subresource isolation: {observed:?}");
+
+    let controller_session = call("web.session.create", json!({"profile":"project"}));
+    let controller_session = controller_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let controller_opened = call(
+        "web.goto",
+        json!({"session_id":controller_session,"url":prior}),
+    );
+    assert_eq!(controller_opened.status, "ok", "{controller_opened:?}");
+    let controller = call(
+        "web.run",
+        json!({
+            "session_id": controller_session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": format!(r#"
+let failure;
+try {{ await page.goto('{status_origin}empty'); }} catch (error) {{ failure = error.message; }}
+const missing = await page.goto('{status_origin}missing');
+const recovered = await page.goto('{status_origin}landed');
+console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: recovered.status() }}));
+"#),
+        }),
+    );
+    assert_eq!(controller.status, "ok", "{controller:?}");
+    let stdout = controller.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(stdout.contains("kind=no_document"), "{controller:?}");
+    assert!(stdout.contains("\"missing\":404"), "{controller:?}");
+    assert!(stdout.contains("\"recovered\":200"), "{controller:?}");
+}
+
+#[test]
+fn click_navigation_wait_handles_redirect_reload_and_bounds_delayed_javascript() {
+    let destination = serve_status_fixture();
+    let redirect_page = serve_fixture(Box::leak(format!(
+        "<!doctype html><a id='go' href='{destination}jump'>Redirect</a>"
+    ).into_boxed_str()));
+    let same_page = serve_fixture(Box::leak(
+        "<!doctype html><a id='same' href='/'>Same URL</a>".to_owned().into_boxed_str(),
+    ));
+    let delayed_page = serve_fixture(Box::leak(format!(
+        "<!doctype html><button id='later' onclick=\"setTimeout(() => location.href='{destination}landed', 50)\">Later</button>"
+    ).into_boxed_str()));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_navigation", |command| {
+        command.arg("--fixture-url").arg(&redirect_page);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("click navigation request")
+    };
+    let click_from = |url: &str, selector: &str| {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":url}));
+        assert_eq!(opened.status, "ok", "open click source: {opened:?}");
+        call("web.click", json!({
+            "session_id": session,
+            "selector": {"type":"css","value":selector},
+            "timeout": 5_000,
+        }))
+    };
+
+    let redirected = click_from(&redirect_page, "#go");
+    assert_eq!(redirected.status, "ok", "redirect chain: {redirected:?}");
+    assert!(redirected.result.as_ref().unwrap()["page_state"]["snapshot"]["url"]
+        .as_str().is_some_and(|url| url.ends_with("/landed")), "{redirected:?}");
+
+    let reloaded = click_from(&same_page, "#same");
+    assert_eq!(reloaded.status, "ok", "same URL navigation: {reloaded:?}");
+
+    let delayed = click_from(&delayed_page, "#later");
+    // The timer starts after the click returns, so this only verifies that a
+    // future script navigation does not make the originating action hang.
+    assert_eq!(
+        delayed.status, "ok",
+        "delayed JavaScript navigation: {delayed:?}"
+    );
+}
+
+#[test]
+fn click_abort_and_policy_denial_finish_with_partial_receipts() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal click request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str().unwrap().to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open terminal fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
+    assert_eq!(routed.status, "ok", "install abort route: {routed:?}");
+    for (session, selector, kind, code) in [
+        (aborted_session, "#abort", "route_aborted", "engine_error"),
+        (open_session(), "#policy", "policy_denied", "policy_denied"),
+    ] {
+        let started = Instant::now();
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": session,
+                "selector": {"type":"css","value":selector},
+                "timeout": 5_000,
+            }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "known terminal navigation exhausted its action deadline: {clicked:?}"
+        );
+        assert_eq!(clicked.status, "error", "{kind}: {clicked:?}");
+        assert_eq!(clicked.error.as_ref().unwrap().code, code);
+        assert!(
+            clicked
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{clicked:?}"
+        );
+        let receipt = clicked.result.as_ref().expect("partial action receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(receipt.get("dispatch").is_some(), "{clicked:?}");
+        assert_eq!(receipt["session_id"], session);
+        assert!(receipt["tab_id"].is_string());
+    }
+}
+
+#[test]
+fn workflow_click_terminal_failures_stop_before_expectations_or_later_steps() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a><button id='later'>Later</button>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-workflow-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_workflow_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal workflow request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open workflow fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
+    assert_eq!(routed.status, "ok", "install workflow route: {routed:?}");
+    for (session, selector, kind, code, trailing) in [
+        (
+            aborted_session,
+            "#abort",
+            "route_aborted",
+            "engine_error",
+            json!({"action":{"operation":"click","selector":{"type":"css","value":"#later"}}}),
+        ),
+        (
+            open_session(),
+            "#policy",
+            "policy_denied",
+            "policy_denied",
+            json!({"expect":{"condition":{"query":"css=#later"},"timeout_ms":1000}}),
+        ),
+    ] {
+        let response = call(
+            "web.workflow",
+            json!({
+                "version": 1,
+                "session_id": session,
+                "steps": [
+                    {"action":{"operation":"click","selector":{"type":"css","value":selector}}},
+                    trailing,
+                ],
+            }),
+        );
+        assert_eq!(response.status, "error", "{kind}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{response:?}"
+        );
+        let detail = response.result.as_ref().unwrap();
+        assert_eq!(detail["failed_step"], 1, "{response:?}");
+        assert_eq!(detail["actions_attempted"], 1, "{response:?}");
+        assert_eq!(detail["steps"].as_array().unwrap().len(), 1, "{response:?}");
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["partial"], true);
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["ok"], false);
+        assert!(
+            detail["steps"][0]["action"]["receipt"]
+                .get("dispatch")
+                .is_some(),
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
+fn denied_iframe_navigation_does_not_poison_top_level_actions() {
+    let fixture = serve_fixture(
+        "<!doctype html><button id='top' onclick=\"window.topClicked=true;const frame=document.createElement('iframe');frame.src='http://169.254.169.254/latest/meta-data/';document.body.appendChild(frame)\">Top control</button><script>window.topClicked=false</script>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-denied-iframe-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_denied_iframe", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_denied_iframe", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("denied iframe request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "top page remains usable: {opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "iframe denial is not top failure: {observed:?}");
+    let clicked = call(
+        "web.click",
+        json!({
+            "session_id": session,
+            "selector": {"type":"css","value":"#top"},
+        }),
+    );
+    assert_eq!(clicked.status, "ok", "benign top click: {clicked:?}");
+    let observed_after = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed_after.status, "ok",
+        "denied iframe created by click is not a top failure: {observed_after:?}"
+    );
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"window.topClicked"}),
+    );
+    assert_eq!(state.status, "ok", "top state: {state:?}");
+    assert_eq!(state.result.as_ref().unwrap()["value"], true, "{state:?}");
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -3206,6 +4382,458 @@ fn web_goto_navigates_a_fixture() {
 }
 
 #[test]
+fn bound_web_run_uses_only_the_named_sessions_active_page() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><head><title>Bound Session Page</title></head><body><input id=\"marker\" value=\"initial\"></body></html>",
+    );
+    let socket =
+        std::env::temp_dir().join(format!("greppy-web-bound-page-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_bound_page", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let create = |label: &str| {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("create {label}: {error}"));
+        assert_eq!(created.status, "ok", "{label}: {created:?}");
+        created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let session_a = create("a");
+    let session_b = create("b");
+    for (session, marker) in [(&session_a, "session-a"), (&session_b, "session-b")] {
+        let went = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.goto",
+                json!({ "session_id": session, "url": fixture }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("goto");
+        assert_eq!(went.status, "ok", "{went:?}");
+        let seeded = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": format!(
+                        "document.getElementById('marker').value = {marker:?}"
+                    )
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("seed marker");
+        assert_eq!(seeded.status, "ok", "{seeded:?}");
+    }
+
+    let run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": r##"
+const input = page.locator("#marker");
+const before = await input.inputValue();
+await input.fill("mutated-a");
+console.log(JSON.stringify({
+  before,
+  after: await input.inputValue(),
+  url: page.url(),
+  title: await page.title(),
+  pages: context.pages().length,
+  contexts: browser.contexts().length,
+}));
+"##,
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("bound web.run");
+    assert_eq!(run.status, "ok", "{run:?}");
+    let stdout = run.result.as_ref().unwrap()["stdout"].as_str().unwrap_or("");
+    assert!(stdout.contains("session-a"), "{run:?}");
+    assert!(stdout.contains("mutated-a"), "{run:?}");
+    assert!(stdout.contains(&fixture), "{run:?}");
+    assert!(stdout.contains("Bound Session Page"), "{run:?}");
+    assert!(stdout.contains("\"pages\":1"), "{run:?}");
+    assert!(stdout.contains("\"contexts\":1"), "{run:?}");
+
+    for (session, expected) in [(&session_a, "mutated-a"), (&session_b, "session-b")] {
+        let value = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.evaluate",
+                json!({
+                    "session_id": session,
+                    "source": "document.getElementById('marker').value"
+                }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("read marker");
+        assert_eq!(value.status, "ok", "{value:?}");
+        assert_eq!(value.result.as_ref().unwrap()["value"], expected, "{value:?}");
+    }
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": session_a,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "throw new Error('intentional-bound-failure');",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("failing bound web.run");
+    assert_eq!(failed.status, "error", "{failed:?}");
+    let after_failure = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.evaluate",
+            json!({
+                "session_id": session_a,
+                "source": "document.getElementById('marker').value"
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("read marker after failure");
+    assert_eq!(
+        after_failure.result.as_ref().unwrap()["value"],
+        "mutated-a",
+        "{after_failure:?}"
+    );
+
+    let fresh = create("fresh");
+    let fresh_run = unix_request(
+        &socket,
+        &Request::new(
+            "run_bound_page",
+            "web.run",
+            json!({
+                "session_id": fresh,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": "console.log(page.url());",
+            }),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("fresh bound web.run");
+    assert_eq!(fresh_run.status, "ok", "{fresh_run:?}");
+    assert!(
+        fresh_run.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("about:blank"),
+        "{fresh_run:?}"
+    );
+
+    for session in [session_a, session_b, fresh] {
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_page",
+                "web.session.close",
+                json!({ "session_id": session }),
+            ),
+            Duration::from_secs(5),
+        );
+    }
+}
+
+#[test]
+fn controller_locator_click_consumes_only_its_navigation_failure() {
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let refused = format!("http://{}/refused", closed_listener.local_addr().unwrap());
+    drop(closed_listener);
+    let destination = serve_status_fixture();
+    let fixture = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.__controllerCleanClicks=(window.__controllerCleanClicks||0)+1'>Clean</button>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-controller-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_controller_navigation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_controller_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("controller navigation request")
+    };
+    let create_page = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open controller fixture: {opened:?}");
+        session
+    };
+    for (selector, expected_kind, install_route) in [
+        ("#abort", "route_aborted", true),
+        ("#refused", "transport", false),
+    ] {
+        let session = create_page();
+        let script = format!(
+            r#"
+{route}
+let failure;
+try {{
+  await page.locator({selector:?}).click();
+}} catch (error) {{
+  failure = {{ name:error.name, code:error.code, kind:error.kind, requestId:error.requestId, url:error.url, message:error.message }};
+}}
+{restore_page}
+await page.locator('#clean').click();
+console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.__controllerCleanClicks) }}));
+"#,
+            restore_page = if install_route {
+                String::new()
+            } else {
+                // A real transport failure commits the engine error document;
+                // recover to a known page before targeting its clean button.
+                format!("await page.goto({fixture:?});")
+            },
+            route = if install_route {
+                "await page.route('**/aborted', route => route.abort());"
+            } else {
+                ""
+            },
+        );
+        let run = call(
+            "web.run",
+            json!({
+                "session_id": session,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": script,
+            }),
+        );
+        assert_eq!(run.status, "ok", "{selector}: {run:?}");
+        let stdout = run.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        assert!(stdout.contains(&format!("\"kind\":\"{expected_kind}\"")), "{run:?}");
+        assert!(stdout.contains("\"requestId\":"), "{run:?}");
+        assert!(stdout.contains("\"url\":"), "{run:?}");
+        assert!(stdout.contains("\"clean\":1"), "{run:?}");
+    }
+
+    let session = create_page();
+    let redirected = call(
+        "web.run",
+        json!({
+            "session_id": session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.locator('#redirect').click(); console.log(page.url());",
+        }),
+    );
+    assert_eq!(redirected.status, "ok", "redirect: {redirected:?}");
+    assert!(
+        redirected.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("/landed"),
+        "{redirected:?}"
+    );
+}
+
+#[test]
+fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let url = format!("{}/phrase", fixture.origin);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-goto-error-phrase-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_goto_error_phrase", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_goto_error_phrase",
+        &format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({url:?});
+const marker = await page.locator('#loaded').textContent();
+if (marker !== "ordinary-page-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+await browser.close();
+"#
+        ),
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ordinary-page-loaded"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn page_goto_observes_domcontentloaded_and_load_separately() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-lifecycle-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_lifecycle", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    for (name, path, gate, wait_until, marker) in [
+        (
+            "parser",
+            "/parser",
+            "/parser-gate.js",
+            "domcontentloaded",
+            "#late",
+        ),
+        (
+            "defer",
+            "/defer",
+            "/defer-gate.js",
+            "domcontentloaded",
+            "#parsed",
+        ),
+        ("load", "/load", "/load-gate.png", "load", "#parsed"),
+    ] {
+        let (navigation, worker) = run_playwright_source_async(
+            socket.clone(),
+            "run_navigation_lifecycle",
+            format!(
+                r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: {:?} }});
+const marker = await page.locator({marker:?}).textContent();
+if (marker !== "parser-finished") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+"#,
+                format!("{}{path}", fixture.origin),
+                wait_until,
+            ),
+        );
+        fixture.wait_for(gate);
+        assert!(
+            matches!(
+                navigation.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{wait_until} returned before gated {name} lifecycle work completed"
+        );
+        fixture.release(gate);
+        let completed = navigation
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("{name} navigation did not complete: {error}"));
+        assert_eq!(completed.status, "ok", "{completed:?}");
+        assert!(
+            completed.result.as_ref().unwrap()["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("parser-finished"),
+            "{completed:?}"
+        );
+        worker.join().expect("join async navigation run");
+    }
+
+    let (navigation, worker) = run_playwright_source_async(
+        socket.clone(),
+        "run_navigation_lifecycle",
+        format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: "domcontentloaded" }});
+const marker = await page.locator('#parsed').textContent();
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+await page.waitForLoadState("load");
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+if (marker !== "dom-content-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
+"#,
+            format!("{}/dcl-before-load", fixture.origin),
+            format!("{}/dcl-returned", fixture.origin),
+            format!("{}/load-returned", fixture.origin),
+        ),
+    );
+    fixture.wait_for_all(&["/dcl-load-gate.png", "/dcl-returned"]);
+    fixture.assert_not_requested("/load-returned", Duration::from_millis(300));
+    assert!(
+        matches!(
+            navigation.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "waitForLoadState(load) returned while the image response was still gated"
+    );
+    fixture.release("/dcl-load-gate.png");
+    fixture.wait_for("/load-returned");
+    let completed = navigation
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| panic!("load-state navigation did not complete: {error}"));
+    assert_eq!(completed.status, "ok", "{completed:?}");
+    assert!(
+        completed.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("dom-content-loaded"),
+        "{completed:?}"
+    );
+    worker.join().expect("join async load-state run");
+}
+
+#[test]
 fn web_artifact_show_path_and_export_a_session_object() {
     let fixture = serve_fixture("<!DOCTYPE html><html><body><p>artifact-export</p></body></html>");
     let socket =
@@ -3556,6 +5184,62 @@ box.addEventListener('change', function() { changes += 1; render(); });\
         ),
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn observed_refs_renew_after_history_restoration() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-history-refs-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_history_refs", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |operation: &str, payload| {
+        unix_request(&socket, &Request::new("run_history_refs", operation, payload), Duration::from_secs(30))
+            .expect("history request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let first = "data:text/html,%3Ctitle%3EHistoryA%3C/title%3E%3Cinput%20id='marker'%20value='A'%3E";
+    let second = "data:text/html,%3Ctitle%3EHistoryB%3C/title%3E%3Cinput%20id='marker'%20value='B'%3E";
+    let opened = call("web.goto", json!({"session_id":session,"url":first}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let old_ref = observed.result.as_ref().unwrap()["actionables"][0]["ref"].as_str().unwrap();
+    let old_number: u64 = old_ref.trim_start_matches('@').parse().unwrap();
+    let moved = call("web.goto", json!({"session_id":session,"url":second}));
+    assert_eq!(moved.status, "ok", "{moved:?}");
+    for (operation, title, value) in [
+        ("web.back", "HistoryA", "A"),
+        ("web.forward", "HistoryB", "B"),
+        ("web.back", "HistoryA", "A"),
+    ] {
+        let moved = call(operation, json!({"session_id":session}));
+        assert_eq!(moved.status, "ok", "{moved:?}");
+        let receipt = &moved.result.as_ref().unwrap()["page_state"];
+        assert_eq!(receipt["status"], "available", "history must return usable page state: {moved:?}");
+        assert_eq!(receipt["snapshot"]["title"], title, "{moved:?}");
+        let observed = call("web.observe", json!({"session_id":session,"query":"css=#marker"}));
+        assert_eq!(observed.status, "ok", "restored scope must stay observable: {observed:?}");
+        let node = &observed.result.as_ref().unwrap()["actionables"][0];
+        assert_eq!(node["value"], value, "{observed:?}");
+        assert_ne!(node["ref"], old_ref, "navigation must not revive expired handles");
+    }
+    let stale = call("web.fill", json!({"session_id":session,
+        "selector":{"type":"ref","value":old_number},"value":"must-not-write"}));
+    assert_ne!(stale.status, "ok", "expired pre-navigation ref must fail: {stale:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let fresh = observed.result.as_ref().unwrap()["actionables"][0]["ref"].as_str().unwrap();
+    let fresh_number: u64 = fresh.trim_start_matches('@').parse().unwrap();
+    let filled = call("web.fill", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_number},"value":"restored-write"}));
+    assert_eq!(filled.status, "ok", "new restored-page ref must work: {filled:?}");
+    let verified = call("web.evaluate", json!({"session_id":session,"source":"document.getElementById('marker').value"}));
+    assert_eq!(verified.status, "ok", "{verified:?}");
+    assert_eq!(verified.result.as_ref().unwrap()["value"], "restored-write");
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
 }
 
 #[test]
@@ -4610,6 +6294,72 @@ fn native_boolean_wait_is_strict_and_returns_fresh_bounded_state() {
 }
 
 #[test]
+fn false_workflow_expectation_keeps_cpu_and_explicit_tab_usable() {
+    let fixture = serve_fixture(
+        "<!doctype html><html><body><button id='reviews' onclick='window.clicks++'>Reviews</button><script>window.clicks=0</script></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-workflow-wait-cpu-{}.sock",
+        std::process::id()
+    ));
+    let supervisor = Supervisor::spawn(&socket, "run_workflow_wait_cpu", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_wait_cpu", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("workflow wait CPU request")
+    };
+    let created = call(
+        "web.session.create",
+        json!({"profile":"project","limits":{"content_cpu_ms":5_000}}),
+    );
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    let tab = went.result.as_ref().unwrap()["tab_id"].as_str().unwrap();
+    let worker = content_worker_pid(supervisor.child.id()).expect("content worker");
+
+    let waited = call(
+        "web.workflow",
+        json!({
+            "version":1,
+            "session_id":session,
+            "tab_id":tab,
+            "steps":[{
+                "action":{"operation":"click","selector":{"type":"css","value":"#reviews"}},
+                "expect":{"condition":{"query":"text~/\u{00a0}/i"},"timeout_ms":2_000}
+            }]
+        }),
+    );
+    assert_eq!(waited.status, "error", "{waited:?}");
+    assert_eq!(waited.error.as_ref().unwrap().code, "TIMEOUT", "{waited:?}");
+    assert!(waited.metrics.content_cpu_ms < 5_000, "{waited:?}");
+    let detail = waited.result.as_ref().unwrap();
+    assert_eq!(detail["failed_step"], 1, "{waited:?}");
+    assert_eq!(detail["steps"][0]["action"]["status"], "ok", "{waited:?}");
+    assert_eq!(
+        content_worker_pid(supervisor.child.id()),
+        Some(worker),
+        "an ordinary false expectation must not exhaust quota and reset tabs"
+    );
+
+    let checked = call(
+        "web.evaluate",
+        json!({"session_id":session,"tab_id":tab,"source":"window.clicks"}),
+    );
+    assert_eq!(checked.status, "ok", "same explicit tab must survive: {checked:?}");
+    assert_eq!(checked.result.as_ref().unwrap()["value"].as_f64(), Some(1.0));
+}
+
+#[test]
 fn native_boolean_wait_rebinds_after_navigation_and_same_url_reload() {
     let fixture = serve_fixture(r#"<!doctype html><html><head><title>Navigation wait</title>
 <script>
@@ -5625,6 +7375,60 @@ fn evaluate_serializes_special_values_not_json_null() {
 }
 
 #[test]
+fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
+    let fixture = serve_fixture("<!doctype html><html><body>ready</body></html>");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-js-compilation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_js_compilation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_js_compilation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("JavaScript diagnostic request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
+
+    let malformed = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"lettt badsyntax = 123"}),
+    );
+    assert_eq!(malformed.status, "error", "{malformed:?}");
+    let message = &malformed.error.as_ref().unwrap().message;
+    assert!(message.contains("could not be compiled"), "{malformed:?}");
+    assert!(message.contains("syntax"), "{malformed:?}");
+    assert!(message.contains("simpler expression"), "{malformed:?}");
+    assert!(
+        !message.contains("line "),
+        "must not invent a source position: {malformed:?}"
+    );
+
+    let valid = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"40 + 2"}),
+    );
+    assert_eq!(valid.status, "ok", "{valid:?}");
+    assert_eq!(
+        valid.result.as_ref().unwrap()["value"].as_f64(),
+        Some(42.0)
+    );
+}
+
+#[test]
 fn closed_page_and_browser_throw_object_disposed() {
     run_named_fixture("object-disposed.mjs", "run_objdisp");
 }
@@ -6158,6 +7962,353 @@ fn worker_sandbox_denies_host_secret_paths() {
 #[test]
 fn fail_closed_clock_coverage_request_and_handles() {
     run_named_fixture("fail-closed-surface.mjs", "run_failcl");
+}
+
+#[test]
+fn playwright_trace_is_context_isolated_and_daemon_stored() {
+    fn trace_entry(bytes: &[u8]) -> &str {
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        let u16_at = |offset| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        assert_eq!(u16_at(8), 0, "expected stored ZIP entry");
+        let size = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+        let name_len = u16_at(26);
+        assert_eq!(&bytes[30..30 + name_len], b"trace.trace");
+        let start = 30 + name_len + u16_at(28);
+        std::str::from_utf8(&bytes[start..start + size]).unwrap()
+    }
+    let socket = std::env::temp_dir().join(format!("greppy-web-trace-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new("run_trace", "web.session.create", json!({"profile":"project"})), Duration::from_secs(10)).unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"].as_str().unwrap().to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch();
+const first = await browser.newContext(); const second = await browser.newContext();
+const firstPage = await first.newPage(); const secondPage = await second.newPage();
+await first.tracing.start(); await secondPage.content(); await firstPage.title(); await first.tracing.stop();
+await browser.close();"#;
+    let response = unix_request(&socket, &Request::new("run_trace", "web.run", json!({"session_id":session_id,"script_text":source})), Duration::from_secs(40)).unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    let id = response.artifacts[0]["id"].as_str().unwrap();
+    let path = unix_request(&socket, &Request::new("run_trace", "web.artifact.path", json!({"session_id":session_id,"id":id})), Duration::from_secs(10)).unwrap();
+    let bytes = std::fs::read(path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    let text = trace_entry(&bytes);
+    assert!(text.contains("page.title"), "{text}");
+    assert!(!text.contains("page.content"), "{text}");
+    assert!(text.contains("\"version\":8"), "{text}");
+    assert!(!text.contains("\"version\":10"), "{text}");
+    let events = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let context_time = events
+        .iter()
+        .find(|event| event["type"] == "context-options")
+        .unwrap()["monotonicTime"]
+        .as_f64()
+        .unwrap();
+    let before = events.iter().find(|event| event["type"] == "before").unwrap();
+    let after = events.iter().find(|event| event["type"] == "after").unwrap();
+    let start = before["startTime"].as_f64().unwrap();
+    let end = after["endTime"].as_f64().unwrap();
+    assert!(start >= context_time && start - context_time < 40_000.0, "{events:?}");
+    assert!(end >= start && end - start < 40_000.0, "{events:?}");
+
+    let failing = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({ path: "failed-trace.zip" });
+await context.tracing.start(); await page.title();
+throw new Error("intentional trace fixture failure");"#;
+    let failed = unix_request(&socket, &Request::new("run_trace", "web.run", json!({"session_id":session_id,"script_text":failing})), Duration::from_secs(40)).unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, "controller_exception");
+    assert_eq!(failed.artifacts.len(), 2, "stopped and active traces must survive script failure: {failed:?}");
+    assert!(failed.artifacts.iter().any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
+
+    let async_source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+const pending = page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(7), 25)));
+await context.tracing.stop({ path: "recorder-a.zip" });
+await context.tracing.start(); await pending;
+await context.tracing.stop({ path: "recorder-b.zip" }); await browser.close();"#;
+    let async_response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.run",
+            json!({"session_id":session_id,"script_text":async_source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(async_response.status, "ok", "{async_response:?}");
+    let second_id = async_response
+        .artifacts
+        .iter()
+        .find(|artifact| artifact["requested_path"] == "recorder-b.zip")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let second_path = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.artifact.path",
+            json!({"session_id":session_id,"id":second_id}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let second_bytes =
+        std::fs::read(second_path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    // The native writer uses uncompressed ZIP entries; inspect trace.trace,
+    // allowing legitimate follow-up operations started by recorder B.
+    let trace = trace_entry(&second_bytes);
+    let mut pending = std::collections::HashSet::new();
+    for line in trace.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        match event["type"].as_str() {
+            Some("before") => {
+                assert_ne!(event["apiName"], "page.evaluate", "recorder A action leaked: {trace}");
+                assert!(pending.insert(event["callId"].as_str().unwrap().to_owned()));
+            }
+            Some("after") => {
+                assert!(pending.remove(event["callId"].as_str().unwrap()), "unmatched completion leaked from recorder A: {trace}");
+            }
+            _ => {}
+        }
+    }
+    assert!(pending.is_empty(), "recorder B did not finish its own operations: {trace}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn playwright_trace_overflow_preserves_completed_mutation() {
+    const LIMIT_ENV: &str = "GREPPY_TEST_TRACE_LIMIT_BYTES";
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-overflow-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_overflow", |command| {
+        command.env(LIMIT_ENV, "512");
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+await page.evaluate(() => { globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; });
+console.log("mutation-count=" + await page.evaluate(() => globalThis.traceMutationCount));
+try { await context.tracing.stop({ path: "truncated.zip" }); }
+catch (error) { console.log("stop-error=" + error.message); }
+await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    let stdout = response.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(stdout.lines().any(|line| line == "mutation-count=1"), "{stdout}");
+    assert!(
+        stdout.contains("trace recording stopped after exceeding"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("stop-error=trace recording was truncated"),
+        "{stdout}"
+    );
+    assert!(response.artifacts.is_empty(), "truncated trace must not be archived: {response:?}");
+}
+
+fn playwright_trace_storage_quota_response(throws: bool) -> greppy_web_client::Response {
+    let socket = std::env::temp_dir().join(format!(
+        "g-w-trace-quota-{}-{}.sock",
+        std::process::id(),
+        u8::from(throws)
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_quota", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.session.create",
+            json!({
+                "profile":"project",
+                "limits": {"max_artifact_bytes": 1500}
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ending = if throws {
+        "throw new Error(\"intentional quota fixture failure\");"
+    } else {
+        "console.log(\"mutation-count=\" + await page.evaluate(() => globalThis.traceMutationCount));"
+    };
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage();
+await page.evaluate(() => {{ globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; }});
+await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "retained.zip" }});
+await context.tracing.start();
+for (let i = 0; i < 20; i++) await page.title();
+await context.tracing.stop({{ path: "over-quota.zip" }});
+{ending}"#
+    );
+    unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap()
+}
+
+fn assert_partial_trace_quota_result(response: &greppy_web_client::Response) {
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    assert_eq!(response.artifacts[0]["requested_path"], "retained.zip");
+    let warnings = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("warnings"))
+        .and_then(|warnings| warnings.as_array())
+        .expect("bounded trace-storage warning");
+    assert_eq!(warnings.len(), 1, "{response:?}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("artifact limit exceeded"), "{warning}");
+    assert!(warning.chars().count() <= 256, "{warning}");
+}
+
+#[test]
+fn successful_script_remains_completed_when_trace_storage_hits_quota() {
+    let response = playwright_trace_storage_quota_response(false);
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.result.as_ref().unwrap()["completed"], true);
+    assert!(
+        response.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "mutation-count=1"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
+#[test]
+fn script_failure_survives_partial_trace_storage_quota_failure() {
+    let response = playwright_trace_storage_quota_response(true);
+    assert_eq!(response.status, "error", "{response:?}");
+    let error = response.error.as_ref().unwrap();
+    assert_eq!(error.code, "controller_exception", "{response:?}");
+    assert!(
+        error.message.contains("intentional quota fixture failure"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
+fn playwright_stopped_trace_survives_synthetic_classified_failure(message: &str, code: &str) {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-failure-{}-{code}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_failure", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "classified-failure.zip" }});
+throw new Error({message:?});"#
+    );
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, code, "{failed:?}");
+    assert!(
+        failed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact["requested_path"] == "classified-failure.zip"),
+        "stored trace must remain visible on {code}: {failed:?}"
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_synthetic_timeout_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
+        "timed out after stopped trace fixture",
+        "timeout",
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_synthetic_cancel_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
+        "cancelled after stopped trace fixture",
+        "cancelled",
+    );
 }
 
 #[test]
@@ -7300,7 +9451,7 @@ impl Drop for TlsHeaderOrigin {
     }
 }
 
-fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+fn spawn_tls_origin(script_name: &str) -> TlsHeaderOrigin {
     let dir = tempfile_tls_dir::TempDir::new();
     let cert = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
@@ -7332,7 +9483,9 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
         String::from_utf8_lossy(&generated.stderr)
     );
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extra-headers-origin.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(script_name);
     assert!(
         script.is_file(),
         "missing TLS origin fixture {}",
@@ -7379,6 +9532,10 @@ fn spawn_tls_header_origin() -> TlsHeaderOrigin {
         child: Some(child),
         _dir: dir,
     }
+}
+
+fn spawn_tls_header_origin() -> TlsHeaderOrigin {
+    spawn_tls_origin("extra-headers-origin.py")
 }
 
 
@@ -8036,36 +10193,28 @@ fn controller_cpu_limit_is_enforced_by_supervisor() {
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_ctlcpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
-    let created = unix_request(
+    let source = r#"
+let total = 0;
+const until = Date.now() + 100;
+while (Date.now() < until) {
+  for (let i = 0; i < 10_000; i++) total += Math.sqrt(i);
+}
+console.log(total);
+    "#;
+    let ran = run_playwright_source_with_limits(
         &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.session.create",
-            json!({ "profile": "project", "limits": { "controller_cpu_ms": 1 } }),
-        ),
-        Duration::from_secs(10),
-    )
-    .expect("create");
-    let session_id = created.result.as_ref().unwrap()["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let origin = serve_fixture("<p>ctlcpu</p>");
-    let read = unix_request(
-        &socket,
-        &Request::new(
-            "run_ctlcpu",
-            "web.read",
-            json!({ "session_id": session_id, "url": origin }),
-        ),
+        "run_ctlcpu",
+        source,
+        None,
         Duration::from_secs(15),
-    )
-    .expect("read");
-    assert_eq!(read.status, "error", "{read:?}");
-    assert_eq!(read.error.as_ref().unwrap().code, "resource_limit");
+        json!({ "controller_cpu_ms": 1 }),
+    );
+    assert_eq!(ran.status, "error", "{ran:?}");
+    assert_eq!(ran.error.as_ref().unwrap().code, "resource_limit", "{ran:?}");
+    assert!(ran.metrics.controller_cpu_ms > 0, "{ran:?}");
     assert!(
-        read.error.as_ref().unwrap().message.contains("cpu time"),
-        "{read:?}"
+        ran.error.as_ref().unwrap().message.contains("cpu time"),
+        "{ran:?}"
     );
 }
 

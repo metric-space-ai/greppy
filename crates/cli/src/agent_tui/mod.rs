@@ -79,6 +79,10 @@ pub struct TuiOutcome {
     pub force_exit: bool,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "TUI entry point owns the session, channels, and optional control server separately"
+)]
 pub fn run(
     config: TuiConfig,
     session: SessionRecord,

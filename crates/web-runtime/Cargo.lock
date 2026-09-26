@@ -2474,6 +2474,7 @@ dependencies = [
 name = "greppy-web-client"
 version = "0.3.3"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -5952,8 +5953,6 @@ dependencies = [
 [[package]]
 name = "servo-constellation"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a199d590e0e1d48a4600f4af08b50bce1ab1e65cadc0e5c5da50c007a66c7b96"
 dependencies = [
  "accesskit",
  "backtrace",
@@ -7787,6 +7786,10 @@ name = "swapper"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e454d048db5527d000bfddb77bd072bbf3a1e2ae785f16d9bd116e07c2ab45eb"
+
+[[package]]
+name = "symbol-isolation-tests"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

@@ -424,7 +424,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         names = [asset["name"] for asset in contract["assets"]]
 
-        self.assertEqual(len(names), 30)
+        self.assertEqual(len(names), 29)
         self.assertEqual(len(names), len(set(names)))
         self.assertIn(release.TRAINING_ARCHIVE_NAME, names)
         self.assertIn("build-environment-windows-x86_64.json", names)
@@ -432,6 +432,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("greppy-windows-driver-contract.json", names)
         self.assertIn("greppy-windows-driver-signature-evidence.json", names)
         self.assertIn("greppyworkspacefsp-x64.cat", names)
+        self.assertIn("runtime-footprint-macos-arm64-metal.json", names)
+        self.assertNotIn("runtime-footprint-macos-arm64-cpu.json", names)
         self.assertNotIn("greppy-windows-x86_64.zip", names)
         # Release scope (SECURITY.md): the Windows runtime footprint is measured
         # out of band (hours-long CPU index on the hosted runner), and the
@@ -523,6 +525,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         windows_build = next(
             row for row in matrix["build"] if row["name"] == "windows-x86_64"
         )
+        macos_build = next(row for row in matrix["build"] if row["name"] == "macos-arm64")
+        self.assertEqual(macos_build["footprint_devices"], "metal")
         self.assertEqual(windows_build["features"], "cpu-only")
         self.assertNotEqual(windows_build["features"], "cpu")
         self.assertIn("--features ${{ matrix.features }}", workflow)

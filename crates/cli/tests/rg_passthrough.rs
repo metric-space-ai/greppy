@@ -186,3 +186,122 @@ fn byte_exact_delegation_when_real_ripgrep_exists() {
     assert_eq!(ours.stdout, theirs.stdout);
     assert_eq!(ours.status.code(), theirs.status.code());
 }
+
+#[cfg(unix)]
+#[test]
+fn explicit_rg_json_preserves_argv_bytes_output_and_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = fixture_dir();
+    let receipt = d.join("rg-argv.txt");
+    let shim = d.join("rg-shim.sh");
+    std::fs::write(
+        &shim,
+        r#"#!/bin/sh
+: > "$RG_ARGV_RECEIPT"
+for arg in "$@"; do printf '%s\n' "$arg" >> "$RG_ARGV_RECEIPT"; done
+if [ "$2" = "absent" ]; then
+  printf '%s\n' '{"type":"summary","data":{"stats":{"matches":0}}}'
+  exit 1
+fi
+printf '%s\n' '{"type":"match","data":{"path":{"text":"a.txt"},"lines":{"text":"alpha\\n"}}}'
+printf '%s\n' 'shim diagnostic' >&2
+exit 0
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let run = |pattern: &str| {
+        Command::new(binary_path())
+            .args(["rg", "--json", pattern, "a.txt"])
+            .current_dir(&d)
+            .env("GREPPY_REAL_RG", &shim)
+            .env("RG_ARGV_RECEIPT", &receipt)
+            .env("GREPPY_STORE_DIR", unique_tempdir("store"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn greppy rg --json")
+    };
+
+    let matched = run("alpha");
+    assert_eq!(matched.status.code(), Some(0));
+    assert_eq!(
+        matched.stdout,
+        b"{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"alpha\\\\n\"}}}\n"
+    );
+    assert_eq!(matched.stderr, b"shim diagnostic\n");
+    assert_eq!(std::fs::read(&receipt).unwrap(), b"--json\nalpha\na.txt\n");
+
+    let absent = run("absent");
+    assert_eq!(absent.status.code(), Some(1));
+    assert_eq!(
+        absent.stdout,
+        b"{\"type\":\"summary\",\"data\":{\"stats\":{\"matches\":0}}}\n"
+    );
+    assert!(absent.stderr.is_empty());
+    assert_eq!(std::fs::read(&receipt).unwrap(), b"--json\nabsent\na.txt\n");
+}
+
+#[test]
+fn explicit_rg_json_matches_native_match_records_and_no_match_exit() {
+    let real_rg = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join("rg"))
+            .find(|candidate| candidate.is_file())
+    });
+    let Some(real_rg) = real_rg else {
+        eprintln!("skipping: no real ripgrep on PATH");
+        return;
+    };
+    let d = fixture_dir();
+    let run = |program: &std::path::Path, args: &[&str], pattern: &str| {
+        Command::new(program)
+            .args(args)
+            .arg(pattern)
+            .arg("a.txt")
+            .current_dir(&d)
+            .env("GREPPY_REAL_RG", &real_rg)
+            .env("GREPPY_STORE_DIR", unique_tempdir("store"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("run rg JSON comparison")
+    };
+
+    let ours = run(&binary_path(), &["rg", "--json"], "alpha");
+    let native = run(&real_rg, &["--json"], "alpha");
+    assert_eq!(ours.status.code(), native.status.code());
+    let match_records = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["type"] == "match")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(match_records(&ours.stdout), match_records(&native.stdout));
+
+    let ours_absent = run(&binary_path(), &["rg", "--json"], "absent");
+    let native_absent = run(&real_rg, &["--json"], "absent");
+    assert_eq!(ours_absent.status.code(), Some(1));
+    assert_eq!(ours_absent.status.code(), native_absent.status.code());
+    for line in String::from_utf8_lossy(&ours_absent.stdout).lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("valid ripgrep JSONL");
+    }
+}
+
+#[test]
+fn rg_json_fix_does_not_weaken_unknown_greppy_verb_diagnostics() {
+    let d = fixture_dir();
+    let output = Command::new(binary_path())
+        .args(["rgg", "--json", "alpha"])
+        .current_dir(&d)
+        .env("GREPPY_STORE_DIR", unique_tempdir("store"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn mistyped greppy verb");
+    assert_eq!(output.status.code(), Some(64));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unrecognized command `rgg`"), "{stdout}");
+}

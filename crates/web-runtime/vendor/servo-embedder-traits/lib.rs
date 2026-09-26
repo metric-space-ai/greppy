@@ -673,7 +673,14 @@ pub enum GamepadHapticEffectType {
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct WebResourceLoadId {
+    pub fetch_id: String,
+    pub redirect_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct WebResourceRequest {
+    pub id: WebResourceLoadId,
     #[serde(
         deserialize_with = "::hyper_serde::deserialize",
         serialize_with = "::hyper_serde::serialize"
@@ -689,6 +696,23 @@ pub struct WebResourceRequest {
     pub referrer_url: Option<Url>,
     pub is_for_main_frame: bool,
     pub is_redirect: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct WebResourceResponseCompleted {
+    pub id: WebResourceLoadId,
+    pub url: Url,
+    #[serde(
+        deserialize_with = "::hyper_serde::deserialize",
+        serialize_with = "::hyper_serde::serialize"
+    )]
+    #[ignore_malloc_size_of = "Defined in hyper"]
+    pub headers: HeaderMap,
+    pub status_code: Option<u16>,
+    pub status_message: Vec<u8>,
+    pub body_bytes: u64,
+    pub from_cache: bool,
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

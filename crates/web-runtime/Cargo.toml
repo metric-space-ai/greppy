@@ -1,6 +1,6 @@
 [workspace]
-members = ["phase1-probe", "runtime"]
-default-members = ["runtime"]
+members = ["phase1-probe", "runtime", "symbol-isolation-tests"]
+default-members = ["runtime", "symbol-isolation-tests"]
 resolver = "2"
 
 # Debug sha2 of the ~400MiB web-runtime image otherwise dominates worker spawn.
@@ -9,6 +9,7 @@ opt-level = 3
 
 [patch.crates-io]
 servo = { path = "vendor/servo" }
+servo-constellation = { path = "vendor/servo-constellation" }
 servo-embedder-traits = { path = "vendor/servo-embedder-traits" }
 # Forked for the inline-layout get_path fix: the released 0.5.0 walks the
 # whole token slice per line (Θ(N²) over a large document); the fork walks

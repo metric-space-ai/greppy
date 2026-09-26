@@ -259,7 +259,7 @@ fn greppy_guard(args: &[String]) -> Option<String> {
         return Some("greppy tool requires a non-empty args array".to_string());
     }
     let first = args[0].as_str();
-    if first == "-p" || first == "agent" {
+    if first == "-p" || (first == "agent" && !agent_help_invocation(args)) {
         return Some(format!(
             "nested agent runs are not supported (first arg {first:?}) — you are \
              the agent; carry out the task directly with the other greppy commands"
@@ -288,6 +288,26 @@ fn greppy_guard(args: &[String]) -> Option<String> {
         );
     }
     None
+}
+
+/// Help-only `agent` shapes that may reach clap without enabling an agent
+/// launch or an administrative operation.
+pub fn agent_help_invocation(args: &[String]) -> bool {
+    let help = |value: &str| matches!(value, "--help" | "-h");
+    let command = |value: &str| !value.is_empty() && !value.starts_with('-');
+    match args {
+        [agent, flag] => agent == "agent" && help(flag),
+        [agent, subcommand, flag] => {
+            agent == "agent" && command(subcommand) && help(flag)
+        }
+        [agent, sessions, subcommand, flag] => {
+            agent == "agent"
+                && sessions == "sessions"
+                && command(subcommand)
+                && help(flag)
+        }
+        _ => false,
+    }
 }
 
 fn parse_string_array(arguments: &Value, field: &str) -> Result<Vec<String>, String> {
@@ -623,6 +643,9 @@ pub struct SelfCheckOk {
     /// parsed for a file count. Treated as a pass (never fail on formatting
     /// drift); callers should mention it on the success diagnostic line.
     pub unrecognized_census_shape: bool,
+    /// True when the index is healthy and current but the repository has no
+    /// indexable files. This is valid for web-only or new-file agent tasks.
+    pub legitimate_empty_index: bool,
 }
 
 /// Failed startup self-check probe.
@@ -652,9 +675,10 @@ impl SelfCheckError {
 ///
 /// Two probes, both via [`GreppyEnv::call_tool`] with the env's current
 /// [`SandboxMode`] (never a raw `Command`):
-/// 1. index-backed navigation: `greppy where-am-i` — must succeed and must
-///    not report an empty repository (`N files` == 0). Unrecognized census
-///    shape is a pass (formatting drift must not abort).
+/// 1. index-backed navigation: `greppy where-am-i` — must succeed. A zero-file
+///    census is accepted only when `doctor --json` independently confirms a
+///    healthy, current zero-file generation for this exact root. Unrecognized
+///    census shape is a pass (formatting drift must not abort).
 /// 2. write probe inside the worktree:
 ///    `bash-smart -- sh -c 'printf ok > .greppy-selfcheck && rm -f .greppy-selfcheck'`.
 ///
@@ -671,16 +695,34 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
         });
     }
     let mut unrecognized_census_shape = false;
+    let mut legitimate_empty_index = false;
     match parse_where_am_i_file_count(&where_out.content) {
         Some(0) => {
-            return Err(SelfCheckError {
-                probe: "where-am-i",
-                output: truncate_chars_for_diag(&where_out.content, SELFCHECK_OUTPUT_CHARS),
-                likely_cause: "the worktree index is empty (0 files) while the tool exited \
-                     successfully — prewarm did not produce a usable index (invalid seed, \
-                     wrong store, or sandbox blocked greppy data root)"
-                    .to_string(),
-            });
+            let doctor_out = env.call_tool("greppy", &json!({"args": ["doctor", "--json"]}));
+            let healthy_empty = !doctor_out.is_error
+                && serde_json::from_str::<Value>(&doctor_out.content)
+                    .ok()
+                    .is_some_and(|doctor| {
+                        doctor.get("healthy").and_then(Value::as_bool) == Some(true)
+                            && doctor.get("project_present").and_then(Value::as_bool) == Some(true)
+                            && doctor.get("graph_generation").and_then(Value::as_u64).is_some()
+                            && doctor.pointer("/stats/files").and_then(Value::as_u64) == Some(0)
+                            && doctor
+                                .get("root_path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|root| same_physical_path(Path::new(root), env.root()))
+                    });
+            if !healthy_empty {
+                return Err(SelfCheckError {
+                    probe: "doctor --json after empty where-am-i",
+                    output: truncate_chars_for_diag(&doctor_out.content, SELFCHECK_OUTPUT_CHARS),
+                    likely_cause: "where-am-i reported 0 files, but doctor did not confirm a \
+                         healthy current zero-file generation for this worktree — prewarm may \
+                         have used an invalid seed, wrong root/store, or blocked data root"
+                        .to_string(),
+                });
+            }
+            legitimate_empty_index = true;
         }
         Some(_) => {}
         None => {
@@ -711,7 +753,15 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
 
     Ok(SelfCheckOk {
         unrecognized_census_shape,
+        legitimate_empty_index,
     })
+}
+
+fn same_physical_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Parse the hub census file count from `where-am-i` text output.
@@ -949,6 +999,37 @@ exit 2
         assert!(out.is_error);
         assert!(out.content.contains("agent"), "content={}", out.content);
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn guard_allows_only_bounded_agent_help_shapes() {
+        for args in [
+            vec!["agent", "--help"],
+            vec!["agent", "list", "--help"],
+            vec!["agent", "sessions", "--help"],
+            vec!["agent", "sessions", "list", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(greppy_guard(&args), None, "args={args:?}");
+        }
+
+        for args in [
+            vec!["agent"],
+            vec!["agent", "sessions", "list"],
+            vec!["agent", "apply", "refs/greppy/agent/example"],
+            vec!["agent", "apply", "refs/greppy/agent/example", "--help"],
+            vec!["agent", "--", "--help"],
+            vec!["agent", "", "--help"],
+            vec!["agent", "-invalid", "--help"],
+            vec!["agent", "sessions", "--", "--help"],
+            vec!["agent", "sessions", "", "--help"],
+            vec!["agent", "sessions", "-invalid", "--help"],
+            vec!["agent", "--help", "trailing"],
+            vec!["-p", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(greppy_guard(&args).is_some(), "args={args:?}");
+        }
     }
 
     #[test]
@@ -1501,6 +1582,7 @@ exit 2
         );
         let ok = run_startup_self_check(&mut env).expect("self-check must pass");
         assert!(!ok.unrecognized_census_shape);
+        assert!(!ok.legitimate_empty_index);
     }
 
     #[test]
@@ -1529,11 +1611,15 @@ exit 1
     }
 
     #[test]
-    fn self_check_empty_index_is_failure() {
+    fn self_check_empty_index_is_failure_when_doctor_is_unhealthy() {
         let (mut env, _, _) = env_with_stub(
             r#"
 if [ "$1" = "where-am-i" ]; then
   printf '/tmp/fixture — 0 files, 0 definitions\n'
+  exit 0
+fi
+if [ "$1" = "doctor" ]; then
+  printf '{"healthy":false,"project_present":true,"graph_generation":1,"stats":{"files":0},"root_path":"/tmp/fixture"}\n'
   exit 0
 fi
 printf 'ok\n'
@@ -1541,13 +1627,38 @@ exit 0
 "#,
         );
         let err = run_startup_self_check(&mut env).expect_err("empty index must fail");
-        assert_eq!(err.probe, "where-am-i");
+        assert_eq!(err.probe, "doctor --json after empty where-am-i");
         assert!(
             err.likely_cause.contains("0 files") || err.likely_cause.contains("empty"),
             "cause={}",
             err.likely_cause
         );
-        assert!(err.output.contains("0 files"), "output={}", err.output);
+        assert!(err.output.contains("healthy"), "output={}", err.output);
+    }
+
+    #[test]
+    fn self_check_accepts_doctor_verified_empty_index_for_exact_root() {
+        let root = temp_root();
+        let root_json = serde_json::to_string(root.to_str().unwrap()).unwrap();
+        let script = format!(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf '/tmp/fixture — 0 files, 0 definitions\n'
+  exit 0
+fi
+if [ "$1" = "doctor" ]; then
+  printf '{{"healthy":true,"project_present":true,"graph_generation":1,"stats":{{"files":0}},"root_path":%s}}\n' '{root_json}'
+  exit 0
+fi
+if [ "$1" = "bash-smart" ]; then exit 0; fi
+exit 2
+"#
+        );
+        let bin = write_stub(&script);
+        let mut env = GreppyEnv::with_binary(bin, root).expect("env");
+        let ok = run_startup_self_check(&mut env).expect("healthy empty index must pass");
+        assert!(ok.legitimate_empty_index);
+        assert!(!ok.unrecognized_census_shape);
     }
 
     #[test]
@@ -1570,6 +1681,7 @@ exit 0
             ok.unrecognized_census_shape,
             "must flag unrecognized census shape"
         );
+        assert!(!ok.legitimate_empty_index);
     }
 
     #[test]

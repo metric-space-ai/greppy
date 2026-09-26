@@ -301,6 +301,71 @@ fn who_calls_honours_the_module_qualifier_over_a_same_file_twin() {
 }
 
 #[test]
+fn index_upgrade_repairs_old_call_edges_without_source_edits() {
+    let (repo, store_dir) = make_graph_repo("old-call-edges");
+    let src = repo.join("src");
+    std::fs::write(src.join("lib.rs"), "mod store;\nmod app;\n").unwrap();
+    std::fs::write(src.join("store.rs"), "pub fn resolve_root() -> u32 { 1 }\n").unwrap();
+    std::fs::write(src.join("app.rs"), "use crate::store;\npub fn resolve_root() -> u32 { 2 }\npub fn use_store_root() -> u32 { store::resolve_root() }\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let db = find_graph_db(&store_dir).unwrap();
+    {
+        let store = greppy_store::Store::open(&db).unwrap();
+        // Simulate the persisted v5 defect, keeping raw callee_path metadata
+        // and unchanged file hashes so a no-op incremental run cannot repair it.
+        store
+            .conn()
+            .execute(
+                "UPDATE workspace_state SET indexer_version = 'greppy-indexer-v5'",
+                [],
+            )
+            .unwrap();
+        let changed = store.conn().execute(
+            "UPDATE edges SET target_id = (SELECT id FROM nodes WHERE name = 'resolve_root' AND file_path = 'src/app.rs')
+             WHERE edge_type = 'CALLS' AND source_id = (SELECT id FROM nodes WHERE name = 'use_store_root' AND file_path = 'src/app.rs')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            changed, 1,
+            "seed the wrong same-file twin as the persisted target"
+        );
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "upgrade must rebuild persisted edges: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/store.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("use_store_root"),
+        "missing real caller after upgrade: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/app.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !out.contains("use_store_root"),
+        "stale wrong edge survived migration: {out}\n{err}"
+    );
+    let store =
+        greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only()).unwrap();
+    assert!(store
+        .list_workspace_states()
+        .unwrap()
+        .iter()
+        .all(|state| state.indexer_version == greppy_core::INDEXER_VERSION_BASE));
+}
+
+#[test]
 fn who_calls_lists_cross_file_caller_with_file_line() {
     let (repo, store) = index_fixture("whocalls");
 
@@ -980,6 +1045,216 @@ fn trace_depth_zero_returns_only_start() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
+    let (repo, store) = make_graph_repo("search-format-contract");
+    for index in 0..8 {
+        std::fs::write(
+            repo.join(format!("src/symbol_{index}.rs")),
+            "pub fn contract_main() {}\n",
+        )
+        .unwrap();
+    }
+    for scope in ["a", "b"] {
+        std::fs::create_dir_all(repo.join("src").join(scope)).unwrap();
+        for index in 0..2 {
+            std::fs::write(
+                repo.join(format!("src/{scope}/path_{index}.rs")),
+                "pub fn path_match() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(
+        repo.join("src/kinds.rs"),
+        "pub struct ContractKind;\npub fn makeContractKind() {}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, text, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{text}\n{err}");
+    let (code, out, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["total_exact"], 8, "{out}");
+    assert_eq!(value["shown"], 3, "{out}");
+    assert_eq!(value["omitted"], 5, "{out}");
+    let locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            format!(
+                "{}:{}",
+                hit["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                hit["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        })
+        .collect::<Vec<_>>();
+    let text_locations = text
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.starts_with("src/symbol_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, locations,
+        "JSON must only change presentation"
+    );
+
+    for command in ["search-symbol", "search-pattern"] {
+        let args = [command, "path_match", "--path", "src/b", "--limit", "1"];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        assert!(text.contains("src/b/path_0.rs:1"), "{text}");
+        assert!(!text.contains("src/a/"), "{text}");
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, out, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 2,
+            "count must exclude other directory: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        assert_eq!(value["omitted"], 1, "{out}");
+        let location = if command == "search-symbol" {
+            format!(
+                "{}:{}",
+                value["hits"][0]["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                value["hits"][0]["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        } else {
+            value["hits"][0]["matches"][0]["location"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(location, "src/b/path_0.rs:1");
+        let (code, out, err) = run(
+            &[command, "ContractKind", "--kind", "struct", "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{command}: {out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 1,
+            "kind filter must precede counting: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        for query in ["QQZZABSENT987654321", "CONTRACT_MAIN"] {
+            for json in [false, true] {
+                let mut args = vec![command, query];
+                if json {
+                    args.push("--json");
+                }
+                let (code, out, err) = run(&args, &repo, &store);
+                assert_eq!(
+                    code, 1,
+                    "primary no-match must remain a miss, {args:?}: {out}\n{err}"
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(value["total_exact"], 0, "{out}");
+                    let status_key = if command == "search-symbol" {
+                        "status"
+                    } else {
+                        "result_status"
+                    };
+                    assert_eq!(value[status_key], "no_matches", "{out}");
+                    assert_eq!(value["hits"].as_array().unwrap().len(), 0, "{out}");
+                } else {
+                    assert!(out.contains("no_matches"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn search_pattern_limited_summary_does_not_expand_omitted_files() {
+    let (repo, store) = make_graph_repo("pattern-limited-summary");
+    for index in 0..30 {
+        std::fs::write(
+            repo.join(format!("src/summary_{index:02}.rs")),
+            "pub fn limited_summary_marker() {}\n",
+        )
+        .unwrap();
+    }
+    // Name-order scanning would put this file first, but the shared result
+    // order prefers files with fewer matches. Exercise a real ranking split.
+    std::fs::write(repo.join("src/summary_00.rs"),
+        "pub fn limited_summary_marker() {}\n// limited_summary_marker\n// limited_summary_marker\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &["search-pattern", "limited_summary_marker", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("32 matches in 30 files; showing 3"), "{out}");
+    let text_locations = out
+        .lines()
+        .filter(|line| line.starts_with("src/summary_"))
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "limited_summary_marker",
+            "--limit",
+            "3",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["total_exact"], 32, "{json}");
+    let json_locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, json_locations,
+        "both formats must rank the same rows"
+    );
+    assert_eq!(text_locations[0], "src/summary_01.rs:1");
+    assert!(
+        !out.contains("src/summary_29.rs"),
+        "omitted paths must not leak through the summary: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("src/summary_"))
+            .count(),
+        3,
+        "{out}"
+    );
+}
+
+#[test]
 fn search_symbols_prints_label_and_file_line() {
     let (repo, store) = index_fixture("symbols");
 
@@ -1118,16 +1393,10 @@ fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process
     (child, release)
 }
 
-/// Run `read do_it --json --diagnostics` and hand every stderr line to
-/// `on_line` as it is written, so a test can react to the exact moment the
-/// query announces its bounded wait instead of guessing a delay.
-fn run_read_observing_stderr(
-    repo: &Path,
-    store: &Path,
-    mut on_line: impl FnMut(&str) + Send + 'static,
-) -> (i32, String, String) {
-    use std::io::{BufRead, Read};
-    let mut child = Command::new(bin())
+/// Keep the actual query alive while publication is held. Its result is
+/// checked after releasing the writer, without coupling to progress wording.
+fn spawn_read_during_refresh(repo: &Path, store: &Path) -> std::process::Child {
+    Command::new(bin())
         .args(["read", "do_it", "--json", "--diagnostics"])
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
@@ -1135,28 +1404,7 @@ fn run_read_observing_stderr(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn read");
-    let stderr = child.stderr.take().unwrap();
-    let observer = std::thread::spawn(move || {
-        let mut collected = String::new();
-        for line in std::io::BufReader::new(stderr).lines() {
-            let line = line.expect("read stderr line");
-            on_line(&line);
-            collected.push_str(&line);
-            collected.push('\n');
-        }
-        collected
-    });
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .expect("read stdout");
-    let status = child.wait().expect("wait for read");
-    let err = observer.join().expect("stderr observer");
-    (status.code().unwrap_or(-1), out, err)
+        .expect("spawn read")
 }
 
 fn edit_helper_to_84(repo: &Path) {
@@ -1167,30 +1415,30 @@ fn edit_helper_to_84(repo: &Path) {
     .unwrap();
 }
 
-/// A refresh that publishes inside the bounded wait serves the fresh graph:
-/// the query announces the wait, sees the publication and returns the
-/// post-edit definition with exit 0.
+/// Ordinary queries join a healthy refresh and return the current definition.
+/// They do not ask the agent to retry just because a former 2s budget elapsed.
 #[test]
 fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
     let (repo, store) = index_fixture("read-waits-for-edit-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "publishing");
-
-    let release_on_wait = release.clone();
-    let (code, out, err) = run_read_observing_stderr(&repo, &store, move |line| {
-        if line.contains("waiting up to 2s") {
-            std::fs::write(&release_on_wait, b"").unwrap();
-        }
-    });
+    let mut query = spawn_read_during_refresh(&repo, &store);
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let premature = query.try_wait().expect("observe waiting query");
+    std::fs::write(&release, b"").unwrap();
+    let result = query.wait_with_output().expect("finish waiting query");
+    let code = result.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&result.stdout);
+    let err = String::from_utf8_lossy(&result.stderr);
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(
+        premature.is_none(),
+        "query ended before publication: {result:?}"
+    );
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 0,
         "read must observe the published refresh; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh published"),
-        "the bounded lock wait and the publication must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1201,36 +1449,28 @@ fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
             .is_some_and(|source| source.contains("answer = 84")),
         "read must return the post-edit definition: {v:?}"
     );
-
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
 }
 
-/// A refresh still held when the bounded wait ends is a temporary failure:
-/// the query says so, emits no span from the stale graph, and the same
-/// query serves the fresh definition once the refresh has published.
+/// Explicitly declining automatic healing still must not expose stale spans.
 #[test]
-fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
+fn read_with_auto_refresh_disabled_refuses_stale_spans_while_writer_is_held() {
     let (repo, store) = index_fixture("read-refuses-held-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "held");
 
-    let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
+    let (code, out, err) = run_with_env(
+        &["read", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    // Release and reap even if the following assertions expose a regression.
+    std::fs::write(&release, b"").unwrap();
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 75,
         "a held publication is a temporary failure, not an answer; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh still active")
-            && err.contains("greppy index status --json"),
-        "the bounded wait and its outcome must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1247,14 +1487,6 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
         "no source from the stale graph may leak: {out}"
     );
 
-    std::fs::write(&release, b"").unwrap();
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
     let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -1271,7 +1503,7 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
 }
 
 #[test]
-fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inline() {
+fn structural_query_with_existing_vectors_joins_refresh_and_returns_callers() {
     let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");
     let db = find_graph_db(&store).expect("indexed graph");
     let graph = rusqlite::Connection::open(db).expect("open graph for vector fixture");
@@ -1324,30 +1556,19 @@ fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inli
     );
     let elapsed = started.elapsed();
     assert_eq!(
-        code, 75,
-        "vector-backed drift must be retryable while its background refresh publishes; stderr={err}\nstdout={out}"
+        code, 0,
+        "ordinary navigation must finish after its refresh publishes; stderr={err}\nstdout={out}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(4),
-        "navigation hid the five-second index build for {elapsed:?}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && (err.contains("graph refresh published")
-                || err.contains("greppy index status --json")),
-        "bounded wait and recovery must be visible; stderr={err:?}"
+        ready.exists() && elapsed >= std::time::Duration::from_secs(5),
+        "query must join the held publication before serving: {elapsed:?}"
     );
     let value: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|error| panic!("invalid retry JSON: {error}; stdout={out:?}"));
-    assert_eq!(value["status"], "skipped_stale_index");
-    assert_eq!(value["fresh"], false);
+        .unwrap_or_else(|error| panic!("invalid query JSON: {error}; stdout={out:?}"));
+    assert_eq!(value["fresh"], true, "{value:?}");
     assert!(
-        matches!(
-            value["freshness"]["state"].as_str(),
-            Some("refreshing" | "drift")
-        ),
-        "retryable freshness state missing: {value:?}"
+        out.contains("caller") && out.contains("src/lib.rs"),
+        "actual caller evidence must be returned: {value:?}"
     );
 }
 

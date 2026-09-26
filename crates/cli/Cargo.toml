@@ -80,13 +80,14 @@ store-cow-release-perf = []
 # not a slower greppy, it is a different product -- measured on this repo, one
 # navigation summary costs 7.5 s on CPU and 0.3 s on the GPU, and nothing fails
 # when the backend is missing, so an accidental CPU build is invisible until
-# someone wonders why everything crawls. `lib.rs` asserts the backend at compile
-# time; the only way out is `--features cpu-only`, which says so out loud.
+# someone wonders why everything crawls. `lib.rs` asserts both model backends at
+# compile time.
 metal = ["greppy-embed-native/metal", "greppy-indexer/metal", "greppy-qwen35-native/metal"]
 accelerate = []
 cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda", "greppy-qwen35-native/cuda"]
-# Deliberately building without a GPU backend. Only for platforms that have
-# none, and for measuring against the CPU path.
+# Debug-only CPU inference for numerical-reference and portable platform tests.
+# `build.rs` and `lib.rs` reject this feature outside Cargo's debug profile, so
+# debug-info settings cannot accidentally permit or reject it.
 cpu-only = []
 
 # Cargo cannot make `default` depend on the target, so the platform backend is

@@ -13,10 +13,15 @@ page.context().on("requestfailed", (req) => {
 });
 const waitFailed = page.waitForEvent("requestfailed");
 let navigationFailed = false;
+const navigationStarted = Date.now();
 try {
   await page.goto(fixtureUrl + "aborted");
 } catch (_error) {
   navigationFailed = true;
+}
+const navigationElapsed = Date.now() - navigationStarted;
+if (navigationElapsed >= 10_000) {
+  throw new Error("known aborted navigation took " + navigationElapsed + "ms");
 }
 const failedReq = await waitFailed;
 if (!failed.some((url) => url.includes("aborted"))) {
