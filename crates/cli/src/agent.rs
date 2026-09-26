@@ -572,6 +572,8 @@ fn run_agent(
         }
     };
     let shared_data_root = greppy_core::cache::data_root();
+    let deadline_total = args.deadline_secs.map(Duration::from_secs);
+    let deadline = deadline_total.map(|total| Instant::now() + total);
 
     // Stable and disposable agent worktrees have cache/run-id basenames that
     // are unrelated to the source repository. Pin one logical project name so
@@ -790,6 +792,8 @@ fn run_agent(
                 device: None,
                 no_gpu: false,
             },
+            deadline,
+            None,
         ) {
             Ok(prepared) => {
                 if !interactive {
@@ -806,9 +810,22 @@ fn run_agent(
                 Some(prepared)
             }
             Err(error) => {
-                let message = format!(
-                    "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
-                );
+                let deadline_reached = deadline.is_some_and(|limit| Instant::now() >= limit);
+                let (exit, message) = if deadline_reached {
+                    (
+                        EXIT_INCOMPLETE,
+                        format!(
+                            "greppy -p: deadline reached while waiting for shared Base ({error})"
+                        ),
+                    )
+                } else {
+                    (
+                        EXIT_AGENT,
+                        format!(
+                            "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
+                        ),
+                    )
+                };
                 eprintln!("{message}");
                 if args.keep_worktree {
                     keep_worktree_on_error(&workspace);
@@ -820,7 +837,7 @@ fn run_agent(
                 return crate::agent_json::emit_error_result_opt(
                     json.as_mut(),
                     &json_session,
-                    EXIT_AGENT,
+                    exit,
                     &message,
                 );
             }
@@ -949,18 +966,6 @@ fn run_agent(
             }
         }
     }
-
-    // Wall-clock Instant is computed AFTER the self-check (and after
-    // prewarm/index) so setup does not eat the budget — only the model loop
-    // does. `deadline_total` mirrors the original N so the low-time advisory
-    // can fire at 20% remaining.
-    let (deadline, deadline_total) = match args.deadline_secs {
-        Some(secs) => {
-            let total = Duration::from_secs(secs);
-            (Some(Instant::now() + total), Some(total))
-        }
-        None => (None, None),
-    };
 
     let mut config = AgentConfig {
         max_turns: args.max_turns,

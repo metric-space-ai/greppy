@@ -17,7 +17,6 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const BASE_BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -980,10 +979,24 @@ fn acquire_base_builder(
     layout: &BaseStoreLayout,
     identity_hash: &str,
     progress_path: Option<&Path>,
-    max_wait: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BaseBuilderLease> {
-    let started = std::time::Instant::now();
     loop {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Error::Lock(format!(
+                "cancelled while waiting for immutable Base {identity_hash} publication"
+            )));
+        }
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            let lock_path = layout
+                .builder_lock_path()
+                .map_err(|error| Error::io("resolve Base builder lock", error))?;
+            return Err(Error::Lock(format!(
+                "deadline reached while waiting for immutable Base {identity_hash} publication; lock {}",
+                lock_path.display()
+            )));
+        }
         if let Some(lease) = layout
             .acquire_builder(true)
             .map_err(|error| Error::io("acquire Base Store builder lease", error))?
@@ -991,16 +1004,7 @@ fn acquire_base_builder(
             return Ok(lease);
         }
         report_base_phase(progress_path, "waiting_for_base_builder");
-        if started.elapsed() >= max_wait {
-            let lock_path = layout
-                .builder_lock_path()
-                .map_err(|error| Error::io("resolve Base builder lock", error))?;
-            return Err(Error::Lock(format!(
-                "another worktree is building immutable Base {identity_hash}; lock {}; wait for that build to publish, then rerun `greppy index`",
-                lock_path.display()
-            )));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250).min(max_wait));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
@@ -1086,6 +1090,8 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         shared_data_root,
                         embedding_args,
                         progress_path,
+                        None,
+                        None,
                     )?)
                 }
             };
@@ -1424,6 +1430,8 @@ pub(crate) fn prepare_base_store(
     workspace: &greppy_agent::workspace::AgentWorkspace,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     prepare_base_store_paths(
         workspace.repo_root(),
@@ -1433,6 +1441,8 @@ pub(crate) fn prepare_base_store(
         shared_data_root,
         embedding_args,
         None,
+        deadline,
+        cancel,
     )
 }
 
@@ -1444,6 +1454,8 @@ fn prepare_base_store_paths(
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
     progress_path: Option<&Path>,
+    deadline: Option<std::time::Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     let identity = base_identity_parts(repo_root, base_commit)?;
     let identity_hash = identity
@@ -1465,12 +1477,12 @@ fn prepare_base_store_paths(
         }
     }
 
-    // Never disappear into a blocking flock behind another worktree's Base
-    // build. That build can legitimately take minutes, but this caller must
-    // remain observable and bounded so agents can retry the completed Base
-    // instead of abandoning Greppy as hung.
+    // Poll rather than blocking in flock so progress remains observable. A
+    // matching live builder owns publication; wait for its OS lock to release,
+    // then validate and reuse its completed Base below. If it dies or fails,
+    // the same lock release elects this caller as the replacement builder.
     let builder_lease =
-        acquire_base_builder(&layout, &identity_hash, progress_path, BASE_BUILDER_WAIT)?;
+        acquire_base_builder(&layout, &identity_hash, progress_path, deadline, cancel)?;
     if let Ok(manifest) = layout.read_verified_manifest() {
         if validate_base_contents(worktree_path, &layout.graph, &identity).is_ok()
             && validate_base_summary_cache(
@@ -2378,14 +2390,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_base_builder_wait_is_bounded_and_actionable() {
+    fn concurrent_base_builder_wait_honors_caller_deadline() {
         let repo = fixture();
         let commit = git(repo.path(), &["rev-parse", "HEAD"]);
         let identity = base_identity_parts(repo.path(), &commit).unwrap();
         let identity_hash = identity.hash().unwrap();
         let data_root = tempfile::tempdir().unwrap();
         let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
-        let _held = layout.acquire_builder(true).unwrap().unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
         let progress_path = data_root.path().join("index.job");
         crate::write_background_job(
             &progress_path,
@@ -2401,11 +2413,13 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(20);
         let error = match acquire_base_builder(
             &layout,
             &identity_hash,
             Some(&progress_path),
-            std::time::Duration::from_millis(20),
+            Some(deadline),
+            None,
         ) {
             Ok(_) => panic!("second Base builder unexpectedly acquired the held lease"),
             Err(error) => error,
@@ -2413,9 +2427,8 @@ mod tests {
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let message = error.to_string();
-        assert!(message.contains("another worktree is building immutable Base"));
+        assert!(message.contains("deadline reached while waiting for immutable Base"));
         assert!(message.contains(&identity_hash));
-        assert!(message.contains("rerun `greppy index`"));
         assert!(message.contains(
             layout
                 .builder_lock_path()
@@ -2428,6 +2441,78 @@ mod tests {
         assert_eq!(progress["progress_unit"], "steps");
         assert_eq!(progress["completed_spans"], 0);
         assert_eq!(progress["total_spans"], 0);
+        drop(held);
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, Some(deadline), None) {
+                Ok(_) => panic!("expired caller acquired a free Base builder lease"),
+                Err(error) => error,
+            };
+        assert!(free_error
+            .to_string()
+            .contains("deadline reached while waiting for immutable Base"));
+    }
+
+    #[test]
+    fn concurrent_base_builder_wait_honors_cancellation() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let held = layout.acquire_builder(true).unwrap().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+
+        let error = match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+            Ok(_) => panic!("cancelled consumer acquired the held Base builder lease"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("cancelled while waiting for immutable Base"));
+        assert!(message.contains(&identity_hash));
+        drop(held);
+        let free_error =
+            match acquire_base_builder(&layout, &identity_hash, None, None, Some(&cancel)) {
+                Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
+                Err(error) => error,
+            };
+        assert!(free_error
+            .to_string()
+            .contains("cancelled while waiting for immutable Base"));
+    }
+
+    #[test]
+    fn concurrent_base_consumer_waits_for_owner_publication_lock() {
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let identity = base_identity_parts(repo.path(), &commit).unwrap();
+        let identity_hash = identity.hash().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
+        let owner = layout.acquire_builder(true).unwrap().unwrap();
+        let publication = layout.directory.join("test-publication-complete");
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiting_layout = layout.clone();
+        let waiting_identity = identity_hash.clone();
+        let waiting_publication = publication.clone();
+        let waiter = std::thread::spawn(move || {
+            let lease = acquire_base_builder(&waiting_layout, &waiting_identity, None, None, None)
+                .expect("consumer must acquire the lifecycle lease after its owner publishes");
+            sent.send((lease, waiting_publication.is_file())).unwrap();
+        });
+
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        std::fs::create_dir_all(&layout.directory).unwrap();
+        std::fs::write(&publication, b"published").unwrap();
+        drop(owner);
+        let (consumer, observed_publication) = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("consumer did not resume after Base owner released publication lock");
+        assert!(observed_publication);
+        drop(consumer);
+        waiter.join().unwrap();
     }
 
     #[test]
