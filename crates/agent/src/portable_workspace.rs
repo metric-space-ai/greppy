@@ -4330,6 +4330,7 @@ mod tests {
     }
 
     fn git(path: &Path, args: &[&str]) -> String {
+        let path = git_compatible_path(path).unwrap();
         let output = Command::new("git")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
