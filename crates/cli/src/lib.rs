@@ -7460,7 +7460,7 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
-    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default())
+    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default(), None)
 }
 
 fn live_grep_code_hits_pattern_scoped(
@@ -7468,6 +7468,7 @@ fn live_grep_code_hits_pattern_scoped(
     root_path: &std::path::Path,
     fixed: bool,
     path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
     let prefixes = path_filters.repo_prefixes();
@@ -7481,7 +7482,10 @@ fn live_grep_code_hits_pattern_scoped(
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
-    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
+    if let Some(progress) = progress {
+        progress.phase("scanning_files", paths.len(), "files");
+    }
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, progress)
 }
 
 fn source_code_hits_ranked(
@@ -7512,6 +7516,7 @@ fn live_grep_search_code_paths_pattern(
     root_path: &std::path::Path,
     paths: &[String],
     fixed: bool,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -7523,6 +7528,7 @@ fn live_grep_search_code_paths_pattern(
         ["-HnIE", "--", query]
     };
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
             .args(grep_args)
@@ -7532,7 +7538,7 @@ fn live_grep_search_code_paths_pattern(
         let out = match out {
             Ok(out) => out,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
-                return internal_literal_search_code_paths(query, root_path, paths);
+                return internal_literal_search_code_paths(query, root_path, paths, progress);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Invalid(
@@ -7552,6 +7558,10 @@ fn live_grep_search_code_paths_pattern(
         }
         let text = String::from_utf8_lossy(&out.stdout);
         hits.extend(text.lines().filter_map(parse_grep_code_hit));
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
     Ok(hits)
 }
@@ -7564,12 +7574,16 @@ fn internal_literal_search_code_paths(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(progress) = progress {
+            progress.completed(index);
+        }
         let absolute = root_path.join(path);
         let bytes = match std::fs::read(&absolute) {
             Ok(bytes) => bytes,
@@ -7588,6 +7602,9 @@ fn internal_literal_search_code_paths(
                 });
             }
         }
+    }
+    if let Some(progress) = progress {
+        progress.completed(paths.len());
     }
     Ok(hits)
 }

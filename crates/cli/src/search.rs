@@ -749,8 +749,12 @@ fn search_pattern_case_insensitive_hits(
     root_path: &std::path::Path,
     fixed: bool,
     path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Option<Vec<greppy_search::CodeHit>>> {
     const MAX_DIAGNOSTIC_FILES: usize = 1_024;
+    if let Some(progress) = progress {
+        progress.phase("discovering_diagnostic_files", 0, "files");
+    }
     let overrides = discover_overrides_from_env()?;
     let prefixes = path_filters.repo_prefixes();
     let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
@@ -770,7 +774,11 @@ fn search_pattern_case_insensitive_hits(
     if paths.len() > MAX_DIAGNOSTIC_FILES {
         return Ok(None);
     }
+    if let Some(progress) = progress {
+        progress.phase("scanning_diagnostic_files", paths.len(), "files");
+    }
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let mut command = std::process::Command::new("grep");
         command.args(["-H", "-n", "-I", "-i"]);
@@ -794,6 +802,10 @@ fn search_pattern_case_insensitive_hits(
                 .lines()
                 .filter_map(parse_grep_code_hit),
         );
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
     Ok(Some(hits))
 }
@@ -819,13 +831,15 @@ mod case_insensitive_diagnostic_tests {
             root.path(),
             false,
             &QueryPathFilters::default(),
+            None,
         )
         .unwrap();
         assert!(skipped.is_none());
         let filters = QueryPathFilters::from_args(root.path(), &["file_0.rs".to_owned()]);
-        let scoped = search_pattern_case_insensitive_hits("present", root.path(), true, &filters)
-            .unwrap()
-            .expect("one scoped file stays eligible");
+        let scoped =
+            search_pattern_case_insensitive_hits("present", root.path(), true, &filters, None)
+                .unwrap()
+                .expect("one scoped file stays eligible");
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].location, "file_0.rs:1");
     }
@@ -836,13 +850,16 @@ fn search_pattern_rows(
     root_path: &std::path::Path,
     hits: &[greppy_search::CodeHit],
     kind: Option<&str>,
+    progress: &query_progress::LocalQueryProgress,
 ) -> Result<Vec<SearchPatternRow>> {
     let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
         Default::default();
     let mut live_nodes: std::collections::HashMap<String, Vec<greppy_store::Node>> =
         Default::default();
     let mut rows = Vec::new();
-    for hit in hits {
+    progress.phase("enriching_matches", hits.len(), "matches");
+    for (index, hit) in hits.iter().enumerate() {
+        progress.completed(index);
         let Some(match_line) = parse_search_code_match(hit) else {
             continue;
         };
@@ -881,6 +898,7 @@ fn search_pattern_rows(
             test,
         });
     }
+    progress.completed(hits.len());
     let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
     for row in &rows {
         *per_file.entry(row.hit.file.clone()).or_insert(0) += 1;
@@ -1080,7 +1098,15 @@ pub(crate) fn dispatch_search_code(
         "reasons": ["literal search resolved against selected live source files"],
     });
     let status = "live-fallback";
-    let mut all_hits = live_grep_code_hits_pattern_scoped(q, &root_path, fixed, &path_filters)?;
+    let local_progress =
+        query_progress::LocalQueryProgress::start("search-pattern", "discovering_files", "files");
+    let mut all_hits = live_grep_code_hits_pattern_scoped(
+        q,
+        &root_path,
+        fixed,
+        &path_filters,
+        Some(&local_progress),
+    )?;
     // The path filter shapes the hit set BEFORE any count is taken — a count
     // from before the filter is a false number (the --kind discipline).
     all_hits.retain(|hit| {
@@ -1089,7 +1115,7 @@ pub(crate) fn dispatch_search_code(
             .is_some_and(|(file, _)| path_filters.matches(file))
     });
 
-    let rows = search_pattern_rows(&project, &root_path, &all_hits, kind)?;
+    let rows = search_pattern_rows(&project, &root_path, &all_hits, kind, &local_progress)?;
     if json {
         let mut shown: Vec<serde_json::Value> = Vec::new();
         let mut definitions = std::collections::HashMap::<String, usize>::new();
@@ -1167,8 +1193,13 @@ pub(crate) fn dispatch_search_code(
     }
 
     if rows.is_empty() {
-        let insensitive =
-            search_pattern_case_insensitive_hits(q, &root_path, fixed, &path_filters)?;
+        let insensitive = search_pattern_case_insensitive_hits(
+            q,
+            &root_path,
+            fixed,
+            &path_filters,
+            Some(&local_progress),
+        )?;
         // Finish every source scan before emitting the terminal answer.  A caller
         // may treat `status: no_matches` as completion even though the optional
         // case-insensitive diagnostic can still take substantial time on a large

@@ -1,5 +1,6 @@
 //! Compact progress for commands that can wait on index work.
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,55 @@ const MIN_FORECAST_SHIFT: Duration = Duration::from_secs(30);
 pub(crate) struct QueryProgress {
     stop: Sender<()>,
     thread: Option<JoinHandle<()>>,
+}
+
+pub(crate) struct LocalQueryProgress {
+    progress: Arc<Mutex<JobProgress>>,
+    _reporter: QueryProgress,
+}
+
+impl LocalQueryProgress {
+    pub(crate) fn start(command: &'static str, state: &str, unit: &str) -> Self {
+        let progress = Arc::new(Mutex::new(JobProgress {
+            state: state.to_owned(),
+            completed: 0,
+            total: 0,
+            unit: unit.to_owned(),
+            pid: None,
+            started_at_unix_secs: None,
+            rate_milli_spans_per_second: 0,
+            eta_unix_secs: None,
+        }));
+        let observed = Arc::clone(&progress);
+        let mut reporter = ProgressReporter::default();
+        let thread = QueryProgress::start(INITIAL_DELAY, move |elapsed| {
+            let snapshot = observed.lock().ok().map(|progress| progress.clone());
+            if let Some(line) =
+                reporter.observe_at(command, snapshot, elapsed, crate::unix_now_secs_cli())
+            {
+                eprintln!("{line}");
+            }
+        });
+        Self {
+            progress,
+            _reporter: thread,
+        }
+    }
+
+    pub(crate) fn phase(&self, state: &str, total: usize, unit: &str) {
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.state = state.to_owned();
+            progress.completed = 0;
+            progress.total = total as u64;
+            progress.unit = unit.to_owned();
+        }
+    }
+
+    pub(crate) fn completed(&self, completed: usize) {
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.completed = completed as u64;
+        }
+    }
 }
 
 impl QueryProgress {
@@ -235,10 +285,21 @@ impl ProgressReporter {
                 self.forecast_deadline = forecast.map(|(_, deadline)| deadline);
             }
             if let Some((Prognosis::Remaining(_), deadline)) = forecast {
-                should_report |= self.forecast_changed_substantially(deadline);
+                should_report |= previous_prognosis == Some(Prognosis::EstimateExceeded)
+                    || self.forecast_changed_substantially(deadline);
             } else if let Some((prognosis, _)) = forecast {
                 should_report |= previous_prognosis != Some(prognosis);
             } else if previous_prognosis.is_some() && self.prognosis.is_none() {
+                should_report = true;
+            }
+            if job.state != "embedding"
+                && !progress_changed
+                && matches!(self.prognosis, Some(Prognosis::Remaining(_)))
+                && self
+                    .forecast_deadline
+                    .is_some_and(|deadline| elapsed >= deadline)
+            {
+                self.prognosis = Some(Prognosis::EstimateExceeded);
                 should_report = true;
             }
         }
@@ -261,11 +322,15 @@ impl ProgressReporter {
 
         let progress = if job.total > 0 {
             format!("{}/{} {}", job.completed, job.total, job.unit)
+        } else if job.completed == 0 {
+            format!("{} total unknown", job.unit)
         } else {
             format!("{} {}", job.completed, job.unit)
         };
         let prognosis = if stalled {
             format!("no progress reported for {}s", STALL_AFTER.as_secs())
+        } else if job.total == 0 {
+            "phase ETA unavailable until total is known".into()
         } else if let Some(prognosis) = self.prognosis {
             format!("phase ETA {}", prognosis.label())
         } else {
@@ -530,13 +595,18 @@ mod tests {
     #[test]
     fn zero_total_stalls_once_and_resume_or_identity_change_resets_measurement() {
         let mut reporter = ProgressReporter::default();
-        assert!(reporter
+        let initial = reporter
             .observe(
                 "search",
                 Some(job("counting", 0, 0)),
-                Duration::from_secs(2)
+                Duration::from_secs(2),
             )
-            .is_some());
+            .unwrap();
+        assert!(initial.contains("spans total unknown"), "{initial}");
+        assert!(
+            initial.contains("phase ETA unavailable until total is known"),
+            "{initial}"
+        );
         let stalled = reporter
             .observe(
                 "search",
@@ -561,7 +631,11 @@ mod tests {
         let reset = reporter
             .observe("search", Some(replacement), Duration::from_secs(123))
             .unwrap();
-        assert!(reset.contains("measuring phase ETA"), "{reset}");
+        assert!(reset.contains("spans total unknown"), "{reset}");
+        assert!(
+            reset.contains("phase ETA unavailable until total is known"),
+            "{reset}"
+        );
     }
 
     #[test]
@@ -585,6 +659,85 @@ mod tests {
         });
         drop(guard);
         assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn unknown_local_total_is_explicit() {
+        let mut reporter = ProgressReporter::default();
+        let line = reporter
+            .observe(
+                "search-pattern",
+                Some(job("discovering_files", 0, 0)),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(line.contains("files total unknown"), "{line}");
+        assert!(
+            line.contains("phase ETA unavailable until total is known"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn measured_local_forecast_expires_once_and_recovers_on_progress() {
+        let mut reporter = ProgressReporter::default();
+        assert!(reporter
+            .observe(
+                "search-pattern",
+                Some(job("scanning_files", 0, 256)),
+                Duration::from_secs(2),
+            )
+            .is_some());
+
+        let measured = reporter
+            .observe(
+                "search-pattern",
+                Some(job("scanning_files", 128, 256)),
+                Duration::from_secs(4),
+            )
+            .unwrap();
+        assert!(measured.contains("phase ETA about 10s"), "{measured}");
+
+        let exceeded = reporter
+            .observe(
+                "search-pattern",
+                Some(job("scanning_files", 128, 256)),
+                Duration::from_secs(8),
+            )
+            .unwrap();
+        assert!(
+            exceeded.contains("phase ETA estimate exceeded"),
+            "{exceeded}"
+        );
+        assert!(reporter
+            .observe(
+                "search-pattern",
+                Some(job("scanning_files", 128, 256)),
+                Duration::from_secs(10),
+            )
+            .is_none());
+
+        let resumed = reporter
+            .observe(
+                "search-pattern",
+                Some(job("scanning_files", 192, 256)),
+                Duration::from_secs(12),
+            )
+            .unwrap();
+        assert!(resumed.contains("phase ETA about 10s"), "{resumed}");
+    }
+
+    #[test]
+    fn local_progress_tracks_real_phase_counters() {
+        let progress = LocalQueryProgress::start("search-pattern", "discovering_files", "files");
+        progress.phase("scanning_files", 257, "files");
+        progress.completed(128);
+
+        let snapshot = progress.progress.lock().unwrap().clone();
+        assert_eq!(snapshot.state, "scanning_files");
+        assert_eq!(snapshot.completed, 128);
+        assert_eq!(snapshot.total, 257);
+        assert_eq!(snapshot.unit, "files");
     }
 
     #[test]
