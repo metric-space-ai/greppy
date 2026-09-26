@@ -209,6 +209,14 @@ pub(crate) fn ensure_layers(
 }
 
 fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -> Result<String> {
+    ensure_empty_base_with_miss_hook(connection, baseline, || {})
+}
+
+fn ensure_empty_base_with_miss_hook(
+    connection: &mut Connection,
+    baseline: &BaselineSnapshot,
+    on_miss: impl FnOnce(),
+) -> Result<String> {
     if !baseline.base_commit.starts_with("virtual-empty:") {
         return Err(Error::UnsupportedRepository(
             "empty overlay base is missing its virtual-empty identity".into(),
@@ -228,11 +236,29 @@ fn ensure_empty_base(connection: &mut Connection, baseline: &BaselineSnapshot) -
     {
         return Ok(id);
     }
+    on_miss();
     let base_id = format!(
         "empty-base:{}",
         blake3::hash(format!("{repository}\0{}", baseline.base_commit).as_bytes()).to_hex()
     );
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(id) = transaction
+        .query_row(
+            "SELECT id FROM cow_repository_bases
+             WHERE repository = ?1 AND base_commit = ?2 AND state = 'ready'",
+            params![repository, baseline.base_commit],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if id != base_id {
+            return Err(Error::Corrupt(format!(
+                "empty repository base identity mismatch: expected {base_id}, found {id}"
+            )));
+        }
+        transaction.commit()?;
+        return Ok(base_id);
+    }
     transaction.execute(
         "INSERT INTO cow_repository_bases(id, repository, base_commit, state)
          VALUES(?1, ?2, ?3, 'broken')",
@@ -1097,6 +1123,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained_refs, entry_chunks);
+    }
+
+    #[test]
+    fn concurrent_empty_base_creation_reuses_canonical_git_namespace() {
+        let storage = tempfile::tempdir().unwrap();
+        let metadata_path = storage.path().join("metadata.sqlite3");
+        let connection = Connection::open(&metadata_path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        install_schema(&connection).unwrap();
+        drop(connection);
+        let baseline = BaselineSnapshot {
+            repository: storage.path().join("repository-identity"),
+            base_commit: "virtual-empty:private-git-control".into(),
+            baseline_hash: "private-git-baseline".into(),
+            index_hash: "private-git-index".into(),
+            index_chunks: Vec::new(),
+            directories: vec![
+                crate::BaselineDirectory {
+                    path: "objects".into(),
+                    mode: 0o040755,
+                },
+                crate::BaselineDirectory {
+                    path: "refs".into(),
+                    mode: 0o040755,
+                },
+            ],
+            entries: Vec::new(),
+            hardlink_groups: Vec::new(),
+            tracker_epoch: None,
+            tracker_generation: None,
+        };
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let metadata_path = metadata_path.clone();
+                let baseline = baseline.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut connection = Connection::open(metadata_path).unwrap();
+                    connection
+                        .busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    ensure_empty_base_with_miss_hook(&mut connection, &baseline, || {
+                        start.wait();
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+
+        let connection = Connection::open(metadata_path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT id, state FROM cow_repository_bases")
+            .unwrap();
+        let bases = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(bases, vec![(ids[0].clone(), String::from("ready"))]);
+        let entry_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cow_repository_base_entries WHERE base_id = ?1",
+                params![&ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_count, baseline.directories.len() as i64);
     }
 
     #[test]
