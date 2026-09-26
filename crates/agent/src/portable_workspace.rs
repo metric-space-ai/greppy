@@ -395,10 +395,15 @@ impl AgentWorkspace {
 
     pub fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
         self.verify_identity()?;
+        let changed_paths = filter_agent_owned_ephemeral_paths(
+            &self.worktree,
+            &self.baseline_tree,
+            self.core.changed_paths(&self.handle)?,
+        )?;
         let changed_paths = filter_ignored_paths(
             &self.worktree,
             &self.private_index,
-            self.core.changed_paths(&self.handle)?,
+            changed_paths,
         )?;
         let hardlink_groups = self.core.hardlink_groups(&self.handle, &changed_paths)?;
         if !changed_paths.is_empty() {
@@ -3684,6 +3689,36 @@ fn filter_ignored_paths(
         .collect())
 }
 
+const WEB_CURRENT_SCOPE_PATH: &str = ".greppy/web/current.json";
+
+fn filter_agent_owned_ephemeral_paths(
+    worktree: &Path,
+    baseline_tree: &str,
+    mut paths: Vec<String>,
+) -> Result<Vec<String>, WorkspaceError> {
+    if !paths.iter().any(|path| path == WEB_CURRENT_SCOPE_PATH) {
+        return Ok(paths);
+    }
+
+    // The web CLI writes this session pointer as runtime state. Exclude it only
+    // when Greppy created it during the agent run. A file already visible in the
+    // immutable baseline is user-owned and remains an ordinary proposal path.
+    let baseline_entry = git_ok(
+        worktree,
+        &[
+            "ls-tree",
+            "--name-only",
+            baseline_tree,
+            "--",
+            WEB_CURRENT_SCOPE_PATH,
+        ],
+    )?;
+    if baseline_entry.trim().is_empty() {
+        paths.retain(|path| path != WEB_CURRENT_SCOPE_PATH);
+    }
+    Ok(paths)
+}
+
 fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
     let output = Command::new("git")
         .args(["-C", path_text(cwd)?])
@@ -3910,6 +3945,38 @@ mod tests {
             .unwrap();
         assert_eq!(kept, ["kept.txt"]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proposal_filter_excludes_new_web_scope_but_preserves_baseline_file() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "test@example.test"]);
+        git(root.path(), &["config", "user.name", "Test"]);
+        git(root.path(), &["commit", "--allow-empty", "-q", "-m", "empty"]);
+        let empty_tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
+        let changed = vec![
+            WEB_CURRENT_SCOPE_PATH.to_string(),
+            "WEB_REPORT.md".to_string(),
+        ];
+        assert_eq!(
+            filter_agent_owned_ephemeral_paths(root.path(), &empty_tree, changed.clone()).unwrap(),
+            ["WEB_REPORT.md"]
+        );
+
+        fs::create_dir_all(root.path().join(".greppy/web")).unwrap();
+        fs::write(
+            root.path().join(WEB_CURRENT_SCOPE_PATH),
+            b"{\"session\":\"user-baseline\"}\n",
+        )
+        .unwrap();
+        git(root.path(), &["add", "--", WEB_CURRENT_SCOPE_PATH]);
+        git(root.path(), &["commit", "-q", "-m", "user web state"]);
+        let user_tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(
+            filter_agent_owned_ephemeral_paths(root.path(), &user_tree, changed).unwrap(),
+            [WEB_CURRENT_SCOPE_PATH, "WEB_REPORT.md"]
+        );
     }
 
     #[test]
