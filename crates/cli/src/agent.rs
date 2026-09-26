@@ -926,7 +926,9 @@ fn run_agent(
     if !interactive && !args.skip_selfcheck {
         match env.startup_self_check() {
             Ok(ok) => {
-                if ok.unrecognized_census_shape {
+                if ok.legitimate_empty_index {
+                    eprintln!("self-check ok — healthy empty index, worktree writable");
+                } else if ok.unrecognized_census_shape {
                     eprintln!(
                         "self-check ok — index answers (census shape unrecognized), worktree writable"
                     );
