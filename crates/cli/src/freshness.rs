@@ -522,10 +522,9 @@ pub(crate) fn workspace_writer_active(root: Option<&str>) -> bool {
 pub(crate) fn auto_reindex_inline_allowed(
     had_vectors: bool,
     indexed_files: i64,
-    overlay: bool,
+    _overlay: bool,
 ) -> bool {
-    !had_vectors
-        && (overlay || (0..=AUTO_REINDEX_INLINE_MAX_INDEXED_FILES).contains(&indexed_files))
+    !had_vectors && (0..=AUTO_REINDEX_INLINE_MAX_INDEXED_FILES).contains(&indexed_files)
 }
 
 /// Build a genuinely bounded small-drift refresh through the same

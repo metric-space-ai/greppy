@@ -44,7 +44,10 @@ fn transient_freshness_states_never_trigger_reindex() {
 fn inline_auto_reindex_never_hides_model_loading_or_large_full_rebuilds() {
     assert!(auto_reindex_inline_allowed(false, 128, false));
     assert!(!auto_reindex_inline_allowed(false, 129, false));
-    assert!(auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(!auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(auto_reindex_inline_allowed(false, 128, true));
+    assert!(!auto_reindex_inline_allowed(false, 129, true));
+    assert!(!auto_reindex_inline_allowed(false, -1, true));
     assert!(!auto_reindex_inline_allowed(true, 1, false));
     assert!(!auto_reindex_inline_allowed(true, 1, true));
 }

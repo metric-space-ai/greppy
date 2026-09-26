@@ -2755,6 +2755,57 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
 }
 
 #[test]
+fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
+    let (repo, store, _scratch) = make_repo("query-lifecycle", "lifecycle_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "fixture index failed: {out}\n{err}");
+    let hash = greppy_core::workspace::workspace_hash(&repo);
+    let lease = greppy_core::cache::acquire_named_lock_in(
+        &store,
+        &format!("workspace-{hash}.lease"),
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    for command in ["search-symbol", "search-pattern"] {
+        let mut child = Command::new(bin())
+            .args([command, "lifecycle_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_AUTO_REINDEX", "0")
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{command} blocked on a lifecycle lease instead of refusing it");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(75), "{output:?}");
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostic.contains("retry this query"), "{diagnostic}");
+    }
+    drop(lease);
+    let (code, out, err) = run(&["search-symbol", "lifecycle_marker"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "query must recover after lease release: {out}\n{err}"
+    );
+}
+
+#[test]
 fn r3_old_lock_contents_without_os_lock_are_harmless() {
     let (repo, store, _scratch) = make_repo("r3-stale-lock", "stale_lock_marker");
 
