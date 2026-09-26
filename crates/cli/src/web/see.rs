@@ -435,6 +435,7 @@ mod tests {
             "url!~sign_in",
             "url=http://localhost:7770/catalogsearch/",
             "URL_NOT=http://example.test/",
+            "url~product_list_order=name",
         ] {
             let error = validate_query(query).expect_err(query);
             assert!(error.contains("--url"), "{query}: {error}");
@@ -451,6 +452,7 @@ mod tests {
             "div ~ span",
             "title~meta",
             "url~meta",
+            "url~product[data-order=name]",
             "input[class~=quantity]",
             "css=div~span",
         ] {
@@ -529,11 +531,25 @@ fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
     // `title~meta`), so the ambiguous tilde-only forms must remain node
     // queries. The explicit equals/negative forms cannot be CSS selectors and
     // are safe to diagnose as mistaken --url/--title conditions.
+    let malformed_url_tilde = lower
+        .strip_prefix("url~")
+        .and_then(|rest| rest.split_once('='))
+        .is_some_and(|(name, value)| {
+            !name.is_empty()
+                && !value.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-/.?&%".contains(&byte))
+                && value
+                    .bytes()
+                    .all(|byte| !byte.is_ascii_whitespace() && !b"[]#:.>+~*'\"".contains(&byte))
+        });
     let url_like = lower.starts_with("url=")
         || lower.starts_with("url!~")
         || lower.starts_with("url!=")
         || lower.starts_with("url_not=")
-        || lower.starts_with("url_not~");
+        || lower.starts_with("url_not~")
+        || malformed_url_tilde;
     let title_like = lower.starts_with("title=") || lower.starts_with("title!~");
     if url_like {
         Some(

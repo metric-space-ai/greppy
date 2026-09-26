@@ -7375,6 +7375,60 @@ fn evaluate_serializes_special_values_not_json_null() {
 }
 
 #[test]
+fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
+    let fixture = serve_fixture("<!doctype html><html><body>ready</body></html>");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-js-compilation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_js_compilation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_js_compilation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("JavaScript diagnostic request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        call("web.goto", json!({"session_id":session,"url":fixture})).status,
+        "ok"
+    );
+
+    let malformed = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"lettt badsyntax = 123"}),
+    );
+    assert_eq!(malformed.status, "error", "{malformed:?}");
+    let message = &malformed.error.as_ref().unwrap().message;
+    assert!(message.contains("could not be compiled"), "{malformed:?}");
+    assert!(message.contains("syntax"), "{malformed:?}");
+    assert!(message.contains("simpler expression"), "{malformed:?}");
+    assert!(
+        !message.contains("line "),
+        "must not invent a source position: {malformed:?}"
+    );
+
+    let valid = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"40 + 2"}),
+    );
+    assert_eq!(valid.status, "ok", "{valid:?}");
+    assert_eq!(
+        valid.result.as_ref().unwrap()["value"].as_f64(),
+        Some(42.0)
+    );
+}
+
+#[test]
 fn closed_page_and_browser_throw_object_disposed() {
     run_named_fixture("object-disposed.mjs", "run_objdisp");
 }
