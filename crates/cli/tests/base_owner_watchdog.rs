@@ -101,3 +101,27 @@ fn ordinary_cli_is_not_gated_by_owner_pipe() {
         .unwrap();
     assert!(status.success());
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn inherited_test_hold_only_applies_to_a_delegated_base_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("must-not-be-created");
+    let mut child = ChildGuard(
+        greppy()
+            .arg("--version")
+            .env_remove(OWNER_MARKER)
+            .env(HOLD_MS, "30000")
+            .env(READY, &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(child.wait_bounded(Duration::from_secs(5)).success());
+    assert!(
+        !ready.exists(),
+        "the foreground query must reach normal dispatch"
+    );
+}
