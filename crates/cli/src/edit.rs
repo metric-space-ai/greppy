@@ -1929,6 +1929,8 @@ pub(crate) fn run_trained_write(
 
 #[derive(Debug)]
 struct TrainedPatchHunk {
+    input_hunk_number: usize,
+    input_line: usize,
     declared_old_line: usize,
     old_lines: Vec<String>,
     new_lines: Vec<String>,
@@ -1959,6 +1961,7 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
     let mut index = 0usize;
+    let mut input_hunk_number = 0usize;
     while index < lines.len() {
         if lines[index].starts_with("diff --git ") {
             // Git's next-file envelope is outside the preceding hunk. Accept
@@ -2025,6 +2028,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 index += 1;
                 continue;
             }
+            input_hunk_number += 1;
+            let input_line = index + 1;
             let declared_old_line = lines[index]
                 .split_whitespace()
                 .find(|field| field.starts_with('-'))
@@ -2069,6 +2074,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 ));
             }
             hunks.push(TrainedPatchHunk {
+                input_hunk_number,
+                input_line,
                 declared_old_line,
                 old_lines,
                 new_lines,
@@ -2147,9 +2154,33 @@ fn apply_trained_patch_file(
                 if many.contains(&declared) {
                     declared
                 } else {
+                    const MAX_REPORTED_CANDIDATES: usize = 5;
+                    let candidate_ranges = many
+                        .iter()
+                        .take(MAX_REPORTED_CANDIDATES)
+                        .map(|start| {
+                            let first_line = start + 1;
+                            let last_line = start + hunk.old_lines.len();
+                            if first_line == last_line {
+                                first_line.to_string()
+                            } else {
+                                format!("{first_line}-{last_line}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let omitted = many.len().saturating_sub(MAX_REPORTED_CANDIDATES);
+                    let omitted_suffix = if omitted == 0 {
+                        String::new()
+                    } else {
+                        format!(", and {omitted} more")
+                    };
                     return Err(EditRefusal::new(
                         "patch_context",
-                        format!("{path}: hunk context matches more than once — nothing written"),
+                        format!(
+                            "{path}: input hunk {} at patch line {} matches more than once (candidate source lines {candidate_ranges}{omitted_suffix}) — nothing written",
+                            hunk.input_hunk_number, hunk.input_line
+                        ),
                         13,
                     ));
                 }

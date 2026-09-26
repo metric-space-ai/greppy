@@ -627,6 +627,26 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_ambiguity_identifies_late_input_hunk_and_bounded_source_candidates() {
+    let fixture = Fixture::new("patch-late-ambiguity");
+    let original = "first\nsecond\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nlast\n";
+    std::fs::write(fixture.repo.join("many.txt"), original).unwrap();
+    let diff = "--- a/many.txt\n+++ b/many.txt\n@@ -1 +1,2 @@\n-first\n+FIRST\n+inserted\n@@ -2 +3 @@\n-second\n+SECOND\n@@ -10 +11 @@\n-last\n+LAST\n@@ -20 +21 @@\n-repeat\n+REPEAT\n";
+
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    let text = combined(&output);
+
+    assert_eq!(output.status.code(), Some(13), "{text}");
+    assert!(text.contains("input hunk 4 at patch line 13"), "{text}");
+    assert!(
+        text.contains("candidate source lines 3, 4, 5, 6, 7, and 2 more"),
+        "{text}"
+    );
+    assert!(text.contains("nothing written"), "{text}");
+    assert_file(&fixture.repo.join("many.txt"), original);
+}
+
+#[test]
 fn patch_accepts_git_metadata_between_files_without_changing_payload_lines() {
     let fixture = Fixture::new("patch-git-metadata");
     let one = "diff --git is file content\nindex is file content\none\n";
