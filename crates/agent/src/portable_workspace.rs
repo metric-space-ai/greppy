@@ -1964,7 +1964,11 @@ fn hash_symlink_target(target: &Path) -> String {
 #[cfg(unix)]
 fn visible_file_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o777
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    }
 }
 
 #[cfg(windows)]
@@ -4410,6 +4414,18 @@ mod tests {
             &["add", "tracked.txt", "nested/tracked.txt", ".gitignore"],
         );
         git(&repo, &["commit", "-qm", "base"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            // Baseline entries record Git modes, so ordinary group/other
+            // write bits must not look like an external change during apply
+            // or retained-journal recovery.
+            let tracked = repo.join("tracked.txt");
+            let mut permissions = fs::metadata(&tracked).unwrap().permissions();
+            permissions.set_mode(0o664);
+            fs::set_permissions(tracked, permissions).unwrap();
+        }
         // Exercise the Windows/Git-for-Windows checkout conversion explicitly
         // on every host. Recovery must restore the captured dirty bytes, not
         // bytes rewritten by checkout-index through core.autocrlf.
