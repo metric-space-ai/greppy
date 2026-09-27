@@ -1407,6 +1407,7 @@ const JS_TS_KEYWORDS: &[&str] = &[
 ///     `{file}::__file__`.
 fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> String {
     let file_qname = format!("{file_path}::__file__");
+    let mut module_variable = None;
     let mut p = node.parent();
     while let Some(cur) = p {
         if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
@@ -1429,9 +1430,46 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // lose `outer -> helper`) — keep walking to the nearest NAMED scope;
             // module-level callbacks still fall through to `__file__` below.
         }
+        if module_variable.is_none() && cur.kind() == "variable_declarator" {
+            module_variable = js_ts_module_variable_name(cur, source);
+        }
         p = cur.parent();
     }
-    file_qname
+    module_variable
+        .map(|name| format!("{file_path}::Variable::{name}"))
+        .unwrap_or(file_qname)
+}
+
+/// Return the binding name when `declarator` is one of the module Variables
+/// emitted by [`extract_js_ts_variables`]. Calls inside an anonymous callback
+/// nested in a factory expression such as
+/// `const task = Effect.gen(function* () { helper() })` otherwise fall back to
+/// `__file__`; navigation deliberately hides that synthetic anchor and would
+/// falsely report `helper` as uncalled. The real module Variable is a stable,
+/// user-addressable source node for that call.
+fn js_ts_module_variable_name<'a>(declarator: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let declaration = declarator.parent()?;
+    if !matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return None;
+    }
+    let container = declaration.parent()?;
+    let module_level = container.kind() == "program"
+        || matches!(
+            container.kind(),
+            "export_statement" | "statement" | "expression_statement"
+        ) && container
+            .parent()
+            .is_some_and(|parent| parent.kind() == "program");
+    if !module_level {
+        return None;
+    }
+    let name = declarator.child_by_field_name("name")?;
+    (name.kind() == "identifier")
+        .then(|| node_text(source, name))
+        .filter(|name| !name.is_empty())
 }
 
 /// The name of a JS/TS enclosing-function node plus the node whose ancestry
@@ -17391,6 +17429,39 @@ const mul = (a, b) => compute(a) * b;
         assert!(
             from_compute.contains(&"add") && from_compute.contains(&"mul"),
             "compute must CALL add and mul: {from_compute:?}"
+        );
+    }
+
+    #[test]
+    fn ts_call_in_factory_callback_sources_from_module_variable() {
+        let r = ts(
+            r#"
+import { helper } from "./helper";
+export const make = Effect.gen(function* () {
+    helper(platform);
+}).pipe(Effect.withSpan("make"));
+"#,
+            "src/app.ts",
+        );
+        assert!(
+            r.nodes.iter().any(|node| {
+                node.label == "Variable" && node.qualified_name == "src/app.ts::Variable::make"
+            }),
+            "module variable `make` must exist: {:?}",
+            r.nodes
+        );
+        assert!(
+            r.edges.iter().any(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.source_qualified_name == "src/app.ts::Variable::make"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("helper")
+            }),
+            "helper call must be attributed to `make`, not the hidden file anchor: {:?}",
+            r.edges
         );
     }
 

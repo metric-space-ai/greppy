@@ -391,6 +391,50 @@ fn who_calls_lists_cross_file_caller_with_file_line() {
 }
 
 #[test]
+fn who_calls_typescript_factory_callback_reports_module_variable() {
+    let root = fresh_dir("typescript-factory-callback");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        src.join("app.ts"),
+        r#"
+import { helper } from "./helper.ts";
+export const make = Effect.gen(function* () {
+    helper(platform);
+}).pipe(Effect.withSpan("make"));
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("helper.ts"),
+        "export function helper(platform: string): void {}\n",
+    )
+    .unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls should exit 0; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("src/app.ts:4") && out.contains("make") && out.contains("helper(platform)"),
+        "who-calls must report the module variable and exact call site; got: {out:?}"
+    );
+    assert!(
+        !out.contains("no callers") && !out.contains("__file__"),
+        "a real callback call must not collapse to an empty answer or file anchor: {out:?}"
+    );
+}
+
+#[test]
 fn who_calls_prints_line_span_and_expand_pack_round_trips() {
     let (repo, store) = index_fixture("whocalls-expand");
 
