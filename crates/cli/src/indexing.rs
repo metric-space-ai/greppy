@@ -1058,34 +1058,25 @@ pub(crate) fn dispatch_index(
     // diagnostic on contention. Concurrent indexers on the same path get
     // `LockError::Held`; a crashed prior holder is released by the OS. The
     // guard must outlive the complete snapshot build + publish operation.
-    let _lock = if std::env::var_os("GREPPY_BACKGROUND_JOB").is_some() {
-        // A structural query owns the background publication it started. A
-        // concurrent foreground writer can hold this lock briefly between
-        // the launch handshake and child startup; waiting here lets the
-        // existing publication wait path join it instead of turning normal
-        // contention into a false failed query.
-        Some(greppy_freshness::acquire(&store_path).map_err(Error::from)?)
-    } else {
-        match greppy_freshness::try_acquire(&store_path) {
-            Ok(lock) => Some(lock),
-            Err(greppy_freshness::LockError::Held { .. }) => {
-                // Contention is a status, not a dead end: another process is
-                // already building the very index this call wanted. Saying only
-                // that it is "running" left the caller with nothing to do next --
-                // and this fires exactly when a stale-index answer has just told
-                // them to run `greppy index`, so the two messages together used to
-                // form a loop with no exit.
-                eprintln!(
-                    "grep: another indexer is already building the index for {} — \
-                     wait for it to finish, then retry; `greppy index status --json` \
-                     reports its progress",
-                    store_path.display()
-                );
-                return Ok(EXIT_TEMPFAIL as i32);
-            }
-            Err(greppy_freshness::LockError::Io { context, source }) => {
-                return Err(Error::io(context, source));
-            }
+    let _lock = match greppy_freshness::try_acquire(&store_path) {
+        Ok(lock) => Some(lock),
+        Err(greppy_freshness::LockError::Held { .. }) => {
+            // Contention is a status, not a dead end: another process is
+            // already building the very index this call wanted. Saying only
+            // that it is "running" left the caller with nothing to do next --
+            // and this fires exactly when a stale-index answer has just told
+            // them to run `greppy index`, so the two messages together used to
+            // form a loop with no exit.
+            eprintln!(
+                "grep: another indexer is already building the index for {} — \
+                 wait for it to finish, then retry; `greppy index status --json` \
+                 reports its progress",
+                store_path.display()
+            );
+            return Ok(EXIT_TEMPFAIL as i32);
+        }
+        Err(greppy_freshness::LockError::Io { context, source }) => {
+            return Err(Error::io(context, source));
         }
     };
     // Claim the portable workspace ownership lock before resolving or
