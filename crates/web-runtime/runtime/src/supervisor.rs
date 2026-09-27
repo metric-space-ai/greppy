@@ -1064,6 +1064,8 @@ fn spawn_unix(
             .env_clear()
             .envs(inherited_worker_env())
             .env("TMPDIR", &worker_temp_root)
+            .env("TMP", &worker_temp_root)
+            .env("TEMP", &worker_temp_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -1752,19 +1754,23 @@ impl WorkerProcess {
         unregister_owned_worker(pid);
         kill_process_tree(pid);
         let deadline = Instant::now() + reap_wait;
+        let mut reaped = false;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
                 Ok(None) if Instant::now() >= deadline => {
                     kill_process_tree(pid);
-                    let _ = self.child.try_wait();
+                    reaped = self.child.try_wait().is_ok_and(|status| status.is_some());
                     break;
                 }
                 Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
                 Err(_) => break,
             }
         }
-        self.reaped = true;
+        self.reaped = reaped;
         self.input.take();
         self.join_reader_bounded(reader_wait);
         phase!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
@@ -1964,7 +1970,13 @@ impl Drop for WorkerProcess {
         if !self.reaped {
             self.kill_tree();
         }
-        self.worker_temp_dir.take();
+        if self.reaped {
+            self.worker_temp_dir.take();
+        } else if let Some(temp_dir) = self.worker_temp_dir.take() {
+            // A still-live process may hold cwd/files in this directory. Leak
+            // the bounded path for stale-dir reaping on a later clean startup.
+            std::mem::forget(temp_dir);
+        }
     }
 }
 
