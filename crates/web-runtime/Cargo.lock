@@ -6651,8 +6651,6 @@ dependencies = [
 [[package]]
 name = "servo-net-traits"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c94d0595c3031774e44beeb1dc95211316434fb98e42c47d84c409e1b0be6f0"
 dependencies = [
  "content-security-policy",
  "cookie 0.18.2",
@@ -6819,8 +6817,6 @@ dependencies = [
 [[package]]
 name = "servo-script"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65dfbd7f70531ea07597cc8d6594668ee5bb31bd81888ad18eb807d9764e869f"
 dependencies = [
  "aes",
  "aes-gcm",

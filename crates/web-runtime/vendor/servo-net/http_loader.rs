@@ -512,6 +512,7 @@ async fn obtain_response(
     method: &Method,
     request_headers: &mut HeaderMap,
     body_sender: Option<StdArc<Mutex<Option<IpcSender<BodyChunkRequest>>>>>,
+    in_memory_body: Option<GenericSharedMemory>,
     source_is_null: bool,
     pipeline_id: &Option<PipelineId>,
     request_id: Option<&str>,
@@ -528,7 +529,17 @@ async fn obtain_response(
     // https://url.spec.whatwg.org/#percent-encoded-bytes
     let encoded_url = utf8_percent_encode(url.as_str(), FRAGMENT).to_string();
 
-    let request = if let Some(chunk_requester) = body_sender {
+    let request = if let Some(bytes) = in_memory_body {
+        devtools_bytes.lock().extend_from_slice(&bytes);
+        HyperRequest::builder()
+            .method(method)
+            .uri(encoded_url)
+            .body(
+                Full::new(Bytes::copy_from_slice(&bytes))
+                    .map_err(|_| unreachable!())
+                    .boxed(),
+            )
+    } else if let Some(chunk_requester) = body_sender {
         let (sink, stream) = if source_is_null {
             // Step 4.2 of https://fetch.spec.whatwg.org/#concept-http-network-fetch
             // TODO: this should not be set for HTTP/2(currently not supported?).
@@ -2134,9 +2145,13 @@ async fn http_network_fetch(
     let (fetch_terminated_sender, mut fetch_terminated_receiver) = unbounded_channel();
 
     let body = request.body.as_ref().map(|body| body.clone_stream());
+    let in_memory_body = request
+        .body
+        .as_ref()
+        .and_then(|body| body.in_memory_bytes());
 
-    if body.is_none() {
-        // There cannot be an error streaming a non-existent body.
+    if body.is_none() || in_memory_body.is_some() {
+        // There cannot be an error streaming a non-existent or already materialized body.
         // However in such a case the channel will remain unused
         // and drop inside `obtain_response`.
         // Send the confirmation now, ensuring the receiver will not dis-connect first.
@@ -2206,6 +2221,7 @@ async fn http_network_fetch(
                 &request.method,
                 &mut request.headers,
                 body,
+                in_memory_body,
                 request
                     .body
                     .as_ref()

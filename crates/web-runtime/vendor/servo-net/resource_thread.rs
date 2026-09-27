@@ -59,7 +59,7 @@ use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
 use crate::fetch::methods::{
-    CancellationListener, FetchContext, RequestBodyStreamLifetime,
+    AutoRequestBodyStreamCloser, CancellationListener, FetchContext,
     SharedInflightKeepAliveRecords, WebSocketChannel, fetch,
     transfers_request_body_stream_to_later_manual_redirect,
 };
@@ -906,8 +906,8 @@ impl CoreResourceManager {
                     let response = Response::from_init(res_init, timing_type);
 
                     let mut fetch_params = FetchParams::new(request);
-                    let mut request_body_stream_lifetime =
-                        RequestBodyStreamLifetime::new(fetch_params.request.body.as_ref());
+                    let mut request_body_stream_closer =
+                        AutoRequestBodyStreamCloser::new(fetch_params.request.body.as_ref());
                     let response = http_redirect_fetch(
                         &mut fetch_params,
                         &mut CorsCache::default(),
@@ -922,7 +922,7 @@ impl CoreResourceManager {
                         &fetch_params.request,
                         &response,
                     ) {
-                        request_body_stream_lifetime.transfer();
+                        request_body_stream_closer.disarm();
                     }
                 },
                 None => {
