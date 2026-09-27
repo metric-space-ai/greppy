@@ -300,11 +300,17 @@ fn maybe_reindex_stale_with_capability(
     let freshness = nav_freshness_json(store, root, &project);
     if freshness_is_reindexable_stale(&freshness) {
         if structural_only {
+            // The structural publisher checkpoints and removes the active
+            // SQLite WAL before swapping the snapshot. Windows refuses that
+            // removal while this query's overlay connection still holds the
+            // old Delta open, so release the read handle before waiting for
+            // the child and reopen it after publication.
+            let replacement = greppy_store::Store::open_memory()?;
+            let previous = std::mem::replace(store, replacement);
+            drop(previous);
             let effective_root = resolve_root(root)?;
             wait_for_index_publication(root, &effective_root, "structural-workspace-drift")?;
-            if let Ok(fresh) = open_default_store_query_writer(root) {
-                *store = fresh;
-            }
+            *store = open_default_store_query_writer(root)?;
             return Ok(());
         }
         let rebuilt =
