@@ -1350,69 +1350,6 @@ pub(crate) fn record_overlay_job_outcome(
     }
 }
 
-fn snapshot_overlay_vectors(
-    active_path: &std::path::Path,
-    project: &str,
-) -> Result<Vec<greppy_store::VectorEmbedding>> {
-    if !active_path.is_file() {
-        return Ok(Vec::new());
-    }
-    let active =
-        greppy_store::Store::open_with(active_path, greppy_store::OpenOptions::read_only())?;
-    let ids = active
-        .conn()
-        .prepare("SELECT id FROM main.vector_embeddings WHERE project = ?1 ORDER BY id")
-        .and_then(|mut statement| {
-            statement
-                .query_map([project], |row| row.get::<_, i64>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(|error| Error::Store(format!("list persisted Delta vectors: {error}")))?;
-    ids.into_iter()
-        .map(|id| {
-            active
-                .get_vector_embedding(id)
-                .map_err(|error| {
-                    Error::Store(format!("read persisted Delta vector {id}: {error}"))
-                })?
-                .ok_or_else(|| Error::Store(format!("persisted Delta vector {id} disappeared")))
-        })
-        .collect()
-}
-
-fn restore_overlay_vectors(
-    store: &mut greppy_store::Store,
-    project: &str,
-    generation: u64,
-    vectors: Vec<greppy_store::VectorEmbedding>,
-) -> Result<()> {
-    let embeddings = vectors
-        .into_iter()
-        .map(|embedding| {
-            let node_id = store
-                .get_node_by_qname(project, &embedding.qualified_name)?
-                .map(|node| node.id);
-            Ok(greppy_store::NewVectorEmbedding {
-                project: embedding.project,
-                model_id: embedding.model_id,
-                prompt_version: embedding.prompt_version,
-                task: embedding.task,
-                node_id,
-                chunk_idx: embedding.chunk_idx,
-                qualified_name: embedding.qualified_name,
-                file_path: embedding.file_path,
-                start_line: embedding.start_line,
-                end_line: embedding.end_line,
-                content_sha256: embedding.content_sha256,
-                graph_generation: generation,
-                vector: embedding.vector,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    store.upsert_vector_embeddings(&embeddings)?;
-    Ok(())
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
@@ -1428,11 +1365,6 @@ pub(crate) fn index_overlay_snapshot(
     mut progress: Option<&mut BackgroundJobGuard>,
 ) -> Result<OverlayIndexOutcome> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
-    let preserved_vectors = if embedding_config.is_none() {
-        snapshot_overlay_vectors(active_path, project)?
-    } else {
-        Vec::new()
-    };
     let temp_path = unique_store_sibling(active_path, "delta-building");
     cleanup_sqlite_family(&temp_path)?;
     if overlay.visibility.changed_count() > 0 {
@@ -1485,14 +1417,6 @@ pub(crate) fn index_overlay_snapshot(
     } else {
         greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)
     }?;
-    if embedding_config.is_none() {
-        restore_overlay_vectors(
-            &mut store,
-            project,
-            report.graph_generation,
-            preserved_vectors,
-        )?;
-    }
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     crate::store_cow::mark_rust_caller_edges_repaired(&store)?;
     // The persisted Delta binding is authoritative when structural first use

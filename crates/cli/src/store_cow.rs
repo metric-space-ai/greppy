@@ -2861,6 +2861,19 @@ mod tests {
                 })
                 .unwrap();
             delta
+                .upsert_file_state(&greppy_store::FileState {
+                    project: "p".into(),
+                    rel_path: "src/deleted.rs".into(),
+                    language: "Rust".into(),
+                    sha256: "deleted".into(),
+                    mtime_ns: 0,
+                    size: 0,
+                    parser_version: "fixture".into(),
+                    extractor_version: "fixture".into(),
+                    last_indexed_generation: 7,
+                })
+                .unwrap();
+            delta
                 .upsert_file_identity(
                     "p",
                     caller_rel_path,
@@ -2943,8 +2956,8 @@ mod tests {
                     task: "code".into(),
                     node_id: None,
                     chunk_idx: 0,
-                    qualified_name: "src/caller.rs::Function::caller".into(),
-                    file_path: "src/caller.rs".into(),
+                    qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
+                    file_path: "src/alias_chain/sub.rs".into(),
                     start_line: 1,
                     end_line: 1,
                     content_sha256: "a".repeat(64),
@@ -2952,11 +2965,47 @@ mod tests {
                     vector: vec![1.0, 0.0],
                 })
                 .unwrap();
+            delta
+                .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                    project: "p".into(),
+                    model_id: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                    task: "code".into(),
+                    node_id: None,
+                    chunk_idx: 0,
+                    qualified_name: "src/caller.rs::Function::caller".into(),
+                    file_path: "src/caller.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_sha256: "b".repeat(64),
+                    graph_generation: 7,
+                    vector: vec![0.0, 1.0],
+                })
+                .unwrap();
+            delta
+                .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                    project: "p".into(),
+                    model_id: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                    task: "code".into(),
+                    node_id: None,
+                    chunk_idx: 0,
+                    qualified_name: "src/deleted.rs::Function::deleted".into(),
+                    file_path: "src/deleted.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_sha256: "c".repeat(64),
+                    graph_generation: 7,
+                    vector: vec![0.5, 0.5],
+                })
+                .unwrap();
         }
 
-        let visibility =
-            greppy_store::VisibilityIndex::new(["src/caller.rs".to_string()], Vec::<String>::new())
-                .unwrap();
+        let visibility = greppy_store::VisibilityIndex::new(
+            ["src/caller.rs".to_string()],
+            ["src/deleted.rs".to_string()],
+        )
+        .unwrap();
         {
             let delta = greppy_store::Store::open(&delta_path).unwrap();
             persist_visibility(&delta, &visibility, &base_commit).unwrap();
@@ -2992,7 +3041,8 @@ mod tests {
                 .unwrap()
                 .conn()
                 .query_row(
-                    "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                    "SELECT vector FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/alias_chain/sub.rs'",
                     [],
                     |row| row.get(0),
                 )
@@ -3054,12 +3104,39 @@ mod tests {
         let vector_after: Vec<u8> = repaired
             .conn()
             .query_row(
-                "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                "SELECT vector FROM main.vector_embeddings
+                 WHERE project = 'p' AND file_path = 'src/alias_chain/sub.rs'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(vector_after, vector_before);
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/caller.rs'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "edited caller vectors are invalidated during graph refresh"
+        );
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/deleted.rs'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "deleted file vectors are invalidated during graph refresh"
+        );
         assert_eq!(
             repaired
                 .conn()
