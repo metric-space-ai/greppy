@@ -723,6 +723,11 @@ fn obtain_response_setup_router_callback(
         let mut lock = chunk_requester.lock();
         if let Some(chunk_requester) = lock.as_mut() {
             if let Err(error) = chunk_requester.send(BodyChunkRequest::Connect(body_chan)) {
+                if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "greppy-web-body event=connect-failed sender={chunk_requester:?} error={error}"
+                    );
+                }
                 log_request_body_stream_closed("connect to the request body stream", Some(&error));
                 return Err(NetworkError::Crash(format!(
                     "Request body stream disconnected while trying to connect to the request body stream: {error}"

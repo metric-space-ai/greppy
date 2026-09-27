@@ -4,6 +4,7 @@
 
 use std::io::Cursor;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, ptr, slice, str};
 
 use encoding_rs::{Encoding, UTF_8};
@@ -56,6 +57,14 @@ use crate::dom::types::TransformStream;
 use crate::mime_multipart::{Node, read_multipart_body};
 use crate::realms::enter_auto_realm;
 use crate::task_source::SendableTaskSource;
+
+static BODY_ROUTE_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
+
+fn body_route_diagnostic(event: &str, route_id: u64, sender: &IpcSender<BodyChunkRequest>) {
+    if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+        eprintln!("greppy-web-body route={route_id} event={event} sender={sender:?}");
+    }
+}
 
 /// <https://fetch.spec.whatwg.org/#concept-body-clone>
 pub(crate) fn clone_body_stream_for_dom_body(
@@ -201,6 +210,7 @@ enum StopReading {
 /// on the stream and transmit body chunks over IPC.
 #[derive(Clone)]
 struct TransmitBodyConnectHandler {
+    route_id: u64,
     stream: Trusted<ReadableStream>,
     task_source: SendableTaskSource,
     bytes_sender: Option<IpcSender<BodyChunkResponse>>,
@@ -218,7 +228,10 @@ impl TransmitBodyConnectHandler {
         in_memory: Option<GenericSharedMemory>,
         source: BodySource,
     ) -> TransmitBodyConnectHandler {
+        let route_id = BODY_ROUTE_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed);
+        body_route_diagnostic("create", route_id, &control_sender);
         TransmitBodyConnectHandler {
+            route_id,
             stream,
             task_source,
             bytes_sender: None,
@@ -301,6 +314,9 @@ impl TransmitBodyConnectHandler {
     /// Take the IPC sender sent by `net`, so we can send body chunks with it.
     /// Also the entry point to <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
     fn start_reading(&mut self, sender: IpcSender<BodyChunkResponse>) {
+        if let Some(control_sender) = self.control_sender.as_ref() {
+            body_route_diagnostic("connect", self.route_id, control_sender);
+        }
         self.bytes_sender = Some(sender);
 
         // If we're using an actual ReadableStream, acquire a reader for it.
@@ -327,6 +343,16 @@ impl TransmitBodyConnectHandler {
     /// Otherwise, the following cycle will happen: The control sender is owned by us which keeps the control receiver
     /// alive in the router which keeps us alive.
     fn stop_reading(&mut self, reason: StopReading) {
+        if let Some(control_sender) = self.control_sender.as_ref() {
+            body_route_diagnostic(
+                match reason {
+                    StopReading::Done => "end-done",
+                    StopReading::Error => "end-error",
+                },
+                self.route_id,
+                control_sender,
+            );
+        }
         if let Some(bytes_sender) = self.bytes_sender.take() {
             match reason {
                 StopReading::Error => {

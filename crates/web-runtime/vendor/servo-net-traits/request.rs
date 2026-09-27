@@ -417,6 +417,9 @@ impl RequestBody {
     /// net never connected to that producer.
     pub fn detach_stream(&self) {
         if let Some(sender) = self.body_chunk_request_channel.lock().take() {
+            if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+                eprintln!("greppy-web-body event=detach sender={sender:?}");
+            }
             let _ = sender.send(BodyChunkRequest::Done);
         }
     }
