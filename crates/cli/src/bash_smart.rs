@@ -59,6 +59,15 @@ static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
 });
+// Cargo follows emitted warning diagnostics with a crate-level recap. It is
+// useful when the underlying diagnostics are absent, but counting both makes
+// one compiler warning look like two bash-smart warning blocks.
+static CARGO_WARNING_SUMMARY_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*warning:[\t ]+`[^`\r\n]+`(?:[\t ]+\([^\r\n)]*\))?[\t ]+generated[\t ]+([0-9]+)[\t ]+warnings?(?:[\t ]+\(run[\t ][^\r\n]*\))?[\t ]*$",
+    )
+    .expect("bash-smart Cargo warning summary regex")
+});
 // tsc/tsgo place the source location before the severity, unlike Rust's
 // leading `error:`. Require a numeric location and TS code, not arbitrary
 // prose containing the word "error". Match both plain compiler layouts.
@@ -692,6 +701,7 @@ fn detect_blocks(
         (OutputStream::Stdout, stdout_lines),
         (OutputStream::Stderr, stderr_lines),
     ] {
+        let mut stream_blocks = Vec::new();
         let mut index = 0usize;
         let mut formatting_diff = false;
         while index < lines.len() {
@@ -744,7 +754,7 @@ fn detect_blocks(
                     break;
                 }
             }
-            blocks.push(DiagnosticBlock {
+            stream_blocks.push(DiagnosticBlock {
                 kind,
                 lines: (index..end)
                     .map(|line_index| AnswerLine {
@@ -756,6 +766,31 @@ fn detect_blocks(
             });
             index = end;
         }
+        let mut filtered_blocks = Vec::with_capacity(stream_blocks.len());
+        let mut substantive_warnings = 0usize;
+        for block in stream_blocks {
+            let summary = (block.kind == BlockKind::Warning)
+                .then(|| CARGO_WARNING_SUMMARY_RE.captures(&block.lines[0].bytes))
+                .flatten();
+            if let Some(captures) = summary {
+                let summary_count = std::str::from_utf8(&captures[1])
+                    .ok()
+                    .and_then(|count| count.parse::<usize>().ok());
+                // A recap closes the preceding Cargo diagnostic group. Only
+                // suppress it when the emitted warning-block count proves it
+                // is redundant; otherwise retain the uncertain recap.
+                if summary_count != Some(substantive_warnings) {
+                    filtered_blocks.push(block);
+                }
+                substantive_warnings = 0;
+            } else {
+                if block.kind == BlockKind::Warning {
+                    substantive_warnings += 1;
+                }
+                filtered_blocks.push(block);
+            }
+        }
+        blocks.extend(filtered_blocks);
     }
     blocks
 }
@@ -2650,6 +2685,70 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Error);
         assert_eq!(blocks[0].lines.len(), 2);
         assert_eq!(blocks[1].kind, BlockKind::Warning);
+    }
+
+    #[test]
+    fn cargo_warning_summary_does_not_double_count_substantive_warning() {
+        let diagnostics = b"warning: unused variable: `x`\n --> src/main.rs:1:1\nwarning: `fixture` (bin \"fixture\") generated 1 warning\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+            assert_eq!(blocks[0].lines[1].bytes, b" --> src/main.rs:1:1");
+        }
+    }
+
+    #[test]
+    fn cargo_warning_summary_remains_as_fallback_without_diagnostic() {
+        let summary = b"warning: `fixture` (lib) generated 2 warnings (run `cargo fix --lib -p fixture` to apply 1 suggestion)\n";
+        for (stdout, stderr) in [
+            (summary.as_slice(), &b""[..]),
+            (&b""[..], summary.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines[0].bytes, &summary[..summary.len() - 1]);
+        }
+    }
+
+    #[test]
+    fn independent_warning_blocks_are_not_deduplicated() {
+        let diagnostics = b"warning: unused variable: `x`\nwarning: deprecated API\nwarning: `fixture` (bin \"fixture\") generated 2 warnings\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(blocks[1].lines[0].bytes, b"warning: deprecated API");
+    }
+
+    #[test]
+    fn later_recap_only_crate_is_not_hidden_by_an_earlier_warning_group() {
+        let diagnostics = b"warning: unused variable: `x`\nwarning: `crate-a` (lib) generated 1 warning\nwarning: `crate-b` (lib) generated 1 warning\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `crate-b` (lib) generated 1 warning"
+        );
+    }
+
+    #[test]
+    fn cargo_recap_with_greater_count_than_preceding_warnings_is_retained() {
+        let diagnostics =
+            b"warning: unused variable: `x`\nwarning: `fixture` (lib) generated 2 warnings\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `fixture` (lib) generated 2 warnings"
+        );
     }
 
     #[test]
