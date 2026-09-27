@@ -923,6 +923,10 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     let structural_status = query_json_raw(&first, &store, &["index", "status"], None);
     assert_eq!(structural_status["fresh"], true, "{structural_status:#}");
     assert_eq!(
+        structural_status["embedding_complete"], false,
+        "structurally valid Base must not report semantic completion: {structural_status:#}"
+    );
+    assert_eq!(
         structural_status["freshness"]["source"], "verified_store_cow_overlay",
         "structural v6 migration must publish a freshness proof: {structural_status:#}"
     );

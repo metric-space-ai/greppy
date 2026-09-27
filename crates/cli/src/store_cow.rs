@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 
 use greppy_core::error::{Error, Result};
 use greppy_store::{BaseBuilderLease, BaseStoreIdentity, BaseStoreLayout, VisibilityIndex};
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 pub(crate) const ENV_MODE: &str = "GREPPY_AGENT_STORE_MODE";
@@ -1618,6 +1619,11 @@ fn prepare_base_store_paths(
         command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
     }
     append_embedding_cli_args(&mut command, embedding_args);
+    if defer_migrated_embeddings {
+        command.env(crate::ENV_STRUCTURAL_FIRST_USE, "1");
+    } else {
+        command.env_remove(crate::ENV_STRUCTURAL_FIRST_USE);
+    }
     command
         .current_dir(worktree_path)
         .env("GREPPY_STORE_DIR", &staging_data)
@@ -1980,14 +1986,18 @@ fn validate_base_contents_for_project(
             [base_embedding_deferred_key(project)],
             |row| row.get(0),
         )
-        .ok();
+        .optional()
+        .map_err(|error| Error::Store(format!("read deferred Base embedding receipt: {error}")))?;
     #[cfg(debug_assertions)]
     let injected_summary_failure = std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some();
     #[cfg(not(debug_assertions))]
     let injected_summary_failure = false;
     if !injected_summary_failure
-        && completion.as_deref() != Some(expected_completion.as_str())
-        && deferred.as_deref() != Some(expected_completion.as_str())
+        && !base_embedding_receipt_valid(
+            completion.as_deref(),
+            deferred.as_deref(),
+            &expected_completion,
+        )
     {
         return Err(Error::Invalid(format!(
             "Base embedding generation is incomplete: expected completion or deferred receipt `{expected_completion}`, got completion={} deferred={}",
@@ -2007,6 +2017,14 @@ fn validate_base_contents_for_project(
         )));
     }
     Ok(())
+}
+
+fn base_embedding_receipt_valid(
+    completion: Option<&str>,
+    deferred: Option<&str>,
+    expected: &str,
+) -> bool {
+    completion == Some(expected) || deferred == Some(expected)
 }
 
 fn prepared_base_with_reader(
@@ -2535,6 +2553,23 @@ mod tests {
             previous_summary_hash,
             "published v6 summary cache remains immutable"
         );
+    }
+
+    #[test]
+    fn deferred_embedding_receipt_is_bound_to_generation_and_model() {
+        let expected = "7|model-a";
+
+        assert!(base_embedding_receipt_valid(None, Some(expected), expected));
+        assert!(!base_embedding_receipt_valid(
+            None,
+            Some("8|model-a"),
+            expected
+        ));
+        assert!(!base_embedding_receipt_valid(
+            None,
+            Some("7|model-b"),
+            expected
+        ));
     }
 
     #[test]
