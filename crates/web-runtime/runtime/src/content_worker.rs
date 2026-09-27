@@ -1853,6 +1853,88 @@ impl ContentEngine {
         self.evaluate_until(webview, script, ACTION_TIMEOUT)
     }
 
+    /// Playwright awaits a Promise returned by `page.evaluate`. Servo's
+    /// evaluate callback reports the Promise object itself, whose enumerable
+    /// property map is empty, so serialize it through a page-realm slot and
+    /// keep pumping the event loop until the Promise settles.
+    fn evaluate_awaited(
+        &self,
+        webview: WebView,
+        delegate: &Delegate,
+        script: &str,
+    ) -> io::Result<JSValue> {
+        let token = alloc_wait_nonce()?;
+        let key = Self::wait_slot_key(&token);
+        let key_js = serde_json::to_string(&key).map_err(io::Error::other)?;
+        let source_js = serde_json::to_string(script).map_err(io::Error::other)?;
+        let wrapper = format!(
+            r#"(function(key, source) {{
+  var value = eval(source);
+  if (!value || typeof value.then !== "function") return [0, value];
+  var slot = {{ done: 0, status: "", value: undefined }};
+  window[key] = slot;
+  Promise.resolve(value).then(function(resolved) {{
+    slot.done = 1; slot.status = "ok"; slot.value = resolved;
+  }}, function(error) {{
+    slot.done = 1; slot.status = "error";
+    slot.value = String(error && error.message ? error.message : error);
+  }});
+  return [1, null];
+}})({key_js}, {source_js})"#
+        );
+        let document_generation = delegate.document_generation.get();
+        let first = self.evaluate_until(webview.clone(), &wrapper, ACTION_TIMEOUT)?;
+        let JSValue::Array(mut parts) = first else {
+            return Err(io::Error::other("page.evaluate returned an invalid await envelope"));
+        };
+        if parts.len() < 2 {
+            return Err(io::Error::other("page.evaluate returned an incomplete await envelope"));
+        }
+        let value = parts.remove(1);
+        let pending = match parts.remove(0) {
+            JSValue::Number(value) => value != 0.0,
+            JSValue::Boolean(value) => value,
+            _ => false,
+        };
+        if !pending {
+            return Ok(value);
+        }
+
+        let deadline = Instant::now() + ACTION_TIMEOUT;
+        loop {
+            if delegate.document_generation.get() != document_generation {
+                self.drop_wait_slot(&webview, &token, Some(deadline));
+                return Err(io::Error::other(
+                    "page.evaluate Promise was interrupted by navigation",
+                ));
+            }
+            if let Some((status, value)) =
+                self.take_completed_wait_slot(&webview, &token, Some(deadline))?
+            {
+                return match status.as_str() {
+                    "ok" => Ok(value),
+                    "error" => Err(io::Error::other(match value {
+                        JSValue::String(message) => message,
+                        other => format!("page.evaluate Promise rejected: {other:?}"),
+                    })),
+                    other => Err(io::Error::other(format!(
+                        "page.evaluate Promise completed with invalid status {other:?}"
+                    ))),
+                };
+            }
+            if Instant::now() >= deadline {
+                self.drop_wait_slot(&webview, &token, Some(deadline));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timeout awaiting page.evaluate Promise",
+                ));
+            }
+            if !self.pump_servo(&webview, Duration::from_millis(10), deadline) {
+                self.spin_all_event_loops();
+            }
+        }
+    }
+
     fn evaluate_until(
         &self,
         webview: WebView,
@@ -2917,8 +2999,8 @@ impl ContentEngine {
             "page.evaluate" => {
                 let page_id = required_str(&params, "page")?;
                 let source = required_str(&params, "source")?;
-                let (webview, _) = self.page(&page_id)?.clone();
-                evaluate_serialized(self.evaluate(webview, &source)?)
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                evaluate_serialized(self.evaluate_awaited(webview, &delegate, &source)?)
             }
             "page.waitForFunction" | "page.waitForBoolean" => {
                 let page_id = required_str(&params, "page")?;

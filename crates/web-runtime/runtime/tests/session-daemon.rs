@@ -7430,6 +7430,49 @@ fn evaluate_serializes_special_values_not_json_null() {
 }
 
 #[test]
+fn page_evaluate_awaits_primitive_object_and_async_object_results() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-await-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalawait", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const primitive = await page.evaluate(() => 42);
+const object = await page.evaluate(() => ({ before: false, after: true }));
+const state = await page.evaluate(async () => {
+  await Promise.resolve();
+  return { before: false, after: true, reuseError: "TypeError", status: 200 };
+});
+console.log(JSON.stringify({ primitive, object, state }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalawait",
+        source,
+        None,
+        Duration::from_secs(60),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalawait", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalawait");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert_eq!(
+        ran.result.as_ref().unwrap()["stdout"].as_str().unwrap(),
+        r#"{"primitive":42,"object":{"before":false,"after":true},"state":{"before":false,"after":true,"reuseError":"TypeError","status":200}}"#
+    );
+}
+
+#[test]
 fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
     let fixture = serve_fixture("<!doctype html><html><body>ready</body></html>");
     let socket = std::env::temp_dir().join(format!(
