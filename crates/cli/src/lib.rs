@@ -186,6 +186,7 @@ const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
 const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
+const BACKGROUND_STDERR_LIMIT: usize = 16 * 1024;
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
 /// Bound the source sent to the summary daemon. Cache keys continue to use the
@@ -5219,7 +5220,9 @@ fn spawn_background_job_handle(
         .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // Keep background output out of the query terminal while retaining a
+        // bounded diagnostic when a child dies before it owns the writer lock.
+        .stderr(std::process::Stdio::piped());
     if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
@@ -5259,6 +5262,26 @@ fn spawn_background_job_handle(
             return None;
         }
     };
+    let mut stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+
+            let mut captured = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let remaining = BACKGROUND_STDERR_LIMIT.saturating_sub(captured.len());
+                        if remaining > 0 {
+                            captured.extend_from_slice(&chunk[..read.min(remaining)]);
+                        }
+                    }
+                }
+            }
+            captured
+        })
+    });
     value["pid"] = serde_json::json!(child.id());
     value["state"] = serde_json::json!(if kind == "embedding" {
         "starting"
@@ -5283,14 +5306,24 @@ fn spawn_background_job_handle(
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Ok(Some(status)) => {
                 if !status.success() {
+                    let stderr = stderr_reader
+                        .take()
+                        .and_then(|reader| reader.join().ok())
+                        .filter(|bytes| !bytes.is_empty())
+                        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+                        .filter(|text| !text.is_empty());
                     let recorded_failure = read_background_job(&job_path).is_some_and(|job| {
                         job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
                     });
                     if !recorded_failure {
                         value["state"] = serde_json::json!("failed");
-                        value["last_error"] = serde_json::json!(format!(
+                        let detail = format!(
                             "background {kind} exited before acquiring the workspace writer lock: {status}"
-                        ));
+                        );
+                        value["last_error"] = serde_json::json!(match stderr {
+                            Some(stderr) => format!("{detail}; child stderr: {stderr}"),
+                            None => detail,
+                        });
                         let _ = write_background_job(&job_path, &value);
                     }
                 }
