@@ -521,18 +521,19 @@ mod tests {
         for lexically_invalid in [
             br#"/* typeof import("*/") */"#.as_slice(),
             br#"const value = "typeof import(\"node:child_process\")"#.as_slice(),
+            br#"const value = `typeof import("node:child_process")` + ;"#.as_slice(),
             br#"const r = /typeof import("/")/;"#.as_slice(),
         ] {
             assert!(
                 syntax_counts(language, lexically_invalid)
                     .is_some_and(|counts| counts.errors + counts.missing > 0),
-                "malformed comment/string must not be hidden: {}",
+                "malformed comment/string/template/regex must not be hidden: {}",
                 String::from_utf8_lossy(lexically_invalid)
             );
             assert_eq!(
                 syntax_validation_content(language, lexically_invalid).as_ref(),
                 lexically_invalid,
-                "comment/string contents must never be rewritten"
+                "comment/string/template/regex contents must never be rewritten"
             );
         }
 
