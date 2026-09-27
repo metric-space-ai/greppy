@@ -1418,10 +1418,12 @@ pub(crate) fn index_overlay_snapshot(
         greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)
     }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
-    let base_commit = std::env::var(crate::store_cow::ENV_BASE_COMMIT)
-        .map_err(|_| Error::Invalid("overlay index missing pinned Base commit".into()))?;
-    crate::store_cow::persist_visibility(&store, &overlay.visibility, &base_commit)?;
-    crate::store_cow::persist_overlay_binding(&store, &overlay.base_path, &base_commit, project)?;
+    // The persisted Delta binding is authoritative when structural first use
+    // deliberately skips Base preparation. In that path the command-scoped
+    // environment has no pinned commit even though the existing overlay does.
+    let base_commit = overlay.base_commit.as_str();
+    crate::store_cow::persist_visibility(&store, &overlay.visibility, base_commit)?;
+    crate::store_cow::persist_overlay_binding(&store, &overlay.base_path, base_commit, project)?;
     let embedding = if let Some(config) = embedding_config {
         Some(index_embeddings_into_temp_store(
             &mut store,

@@ -25,6 +25,7 @@ const ENV_TEST_FORBID_TEMP_BASE_CHECKOUT: &str = "GREPPY_TEST_FORBID_TEMP_BASE_C
 #[derive(Debug, Clone)]
 pub(crate) struct OverlaySpec {
     pub base_path: PathBuf,
+    pub base_commit: String,
     pub visibility: VisibilityIndex,
 }
 
@@ -95,6 +96,7 @@ fn overlay_spec_inner(root: &Path, allow_cached_visibility: bool) -> Result<Opti
     };
     Ok(Some(OverlaySpec {
         base_path,
+        base_commit,
         visibility,
     }))
 }
