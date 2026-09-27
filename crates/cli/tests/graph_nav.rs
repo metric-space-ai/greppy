@@ -700,19 +700,11 @@ fn direct_navigation_json_reports_exact_counts() {
             v["freshness"]["reasons"].as_array().unwrap().is_empty(),
             "fresh graph must not report stale reasons: {v:?}"
         );
-        assert_eq!(v["provider_complete"], false);
-        assert!(
-            v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1,
-            "nav JSON must expose provider incompleteness: {v:?}"
-        );
-        assert!(
-            v["incomplete_providers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|p| p["language"] == "rust"),
-            "rust provider incompleteness must be visible: {v:?}"
-        );
+        // The Rust fixture supports the relations these commands actually
+        // query; unrelated missing capabilities do not make the answer partial.
+        assert_eq!(v["provider_complete"], true, "{v:?}");
+        assert_eq!(v["incomplete_provider_count"], 0, "{v:?}");
+        assert_eq!(v["incomplete_providers"], serde_json::json!([]));
         assert_eq!(v["total_exact"], 1);
         assert_eq!(v["shown"], 1);
         assert_eq!(v["omitted"], 0);
@@ -748,6 +740,15 @@ fn direct_navigation_json_reports_exact_counts() {
 #[test]
 fn default_json_is_answer_only_and_diagnostics_restores_the_envelope() {
     let (repo, store) = index_fixture("answer-only-json");
+
+    // Exercise a genuinely missing requested relation. A normal Rust provider
+    // is complete for who-calls, even if unrelated capabilities are partial.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls"],
+        &["usages", "semantic"],
+        0,
+    );
 
     let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
@@ -2347,7 +2348,9 @@ fn impact_json_reports_exact_scope_counts_and_metadata() {
     assert_eq!(v["project"], "repo");
     assert_eq!(v["symbol_found"], true);
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["provider_complete"], true);
+    assert_eq!(v["incomplete_provider_count"], 0);
+    assert_eq!(v["incomplete_providers"], serde_json::json!([]));
     assert_eq!(v["scope"], "transitive");
     assert_eq!(v["direction"], "incoming");
     assert_eq!(v["edge_type"], "all_references");
