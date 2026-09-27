@@ -890,14 +890,16 @@ impl Servo {
     #[servo_tracing::instrument(name = "Servo::new", skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
-        let mut opts = builder.opts.map(|opts| *opts).unwrap_or_default();
+        let mut instance_opts = builder.opts.map(|opts| *opts).unwrap_or_default();
         if cfg!(debug_assertions)
             && std::env::var("GREPPY_WEB_TEST_IGNORE_CERTS").ok().as_deref() == Some("1")
         {
-            opts.ignore_certificate_errors = true;
+            instance_opts.ignore_certificate_errors = true;
         }
-        opts::initialize_options(opts);
-        let opts = opts::get();
+        if !builder.shared_process_state {
+            opts::initialize_options(instance_opts.clone());
+        }
+        let opts = &instance_opts;
 
         // Set the preferences globally.
         // TODO: It would be better to make these private to a particular Servo instance.
@@ -916,12 +918,14 @@ impl Servo {
             Ordering::Relaxed,
         );
 
-        if !opts.multiprocess {
+        if !opts.multiprocess && !builder.shared_process_state {
             media_platform::init();
         }
 
         // Reserving a namespace to create WebViewId.
-        PipelineNamespace::install(EMBEDDER_PIPELINE_NAMESPACE_ID);
+        if !builder.shared_process_state {
+            PipelineNamespace::install(EMBEDDER_PIPELINE_NAMESPACE_ID);
+        }
 
         // Get both endpoints of a special channel for communication between
         // the client window and `Paint`. This channel is unique because
@@ -952,7 +956,7 @@ impl Servo {
 
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
-        let js_engine_setup = if !opts.multiprocess {
+        let js_engine_setup = if !opts.multiprocess && !builder.shared_process_state {
             Some(script::init())
         } else {
             None
@@ -1425,6 +1429,7 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    shared_process_state: bool,
 }
 
 impl Default for ServoBuilder {
@@ -1434,12 +1439,26 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            shared_process_state: false,
         }
     }
 }
 
 impl ServoBuilder {
     pub fn build(self) -> Servo {
+        Servo::new(self)
+    }
+
+    /// Build another in-process Servo while an existing Servo owns the
+    /// process-global JavaScript engine and embedder pipeline namespace.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep the owning Servo alive until this Servo and every
+    /// WebView created from it have been dropped. Both Servos must run on the
+    /// same embedder thread so the installed pipeline namespace remains valid.
+    pub unsafe fn build_with_shared_process_state(mut self) -> Servo {
+        self.shared_process_state = true;
         Servo::new(self)
     }
 

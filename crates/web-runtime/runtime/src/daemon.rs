@@ -1403,9 +1403,18 @@ impl Daemon {
                 let ephemeral = session.persistent_profile.is_none();
                 let _ = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
-                if let Some(page) = session.page_id.take() {
-                    if self.content.is_running() {
+                if self.content.is_running() {
+                    let mut pages = session.tabs.clone();
+                    if let Some(page) = session.page_id.take() {
+                        if !pages.contains(&page) {
+                            pages.push(page);
+                        }
+                    }
+                    for page in pages {
                         let _ = self.engine_call("session.closePage", json!({ "page": page }));
+                    }
+                    if let Some(context) = session.engine_context_id.take() {
+                        let _ = self.engine_call("context.close", json!({ "context": context }));
                     }
                 }
                 let _ = session.transition(SessionState::Closed);
@@ -2897,7 +2906,6 @@ impl Daemon {
         }
     }
 
-
     /// Tabs are pages inside one session: a `web.tab` call adds, lists,
     /// switches or closes a page while the session's cookies and storage stay
     /// shared. `session.page_id` names the active one; `session.tabs` keeps
@@ -2920,23 +2928,25 @@ impl Daemon {
                 }
                 let result = match action {
                     "new" => {
-                        let context = self.sessions.get(&session_id)
+                        let context = self
+                            .sessions
+                            .get(&session_id)
                             .and_then(|session| session.engine_context_id.clone());
                         match self.engine_call("context.newPage", json!({ "context": context })) {
-                        Ok(value) => match value.get("page").and_then(|v| v.as_str()) {
-                            Some(page) => {
-                                let page = page.to_owned();
-                                if let Some(session) = self.sessions.get_mut(&session_id) {
-                                    session.tabs.push(page.clone());
-                                    session.page_id = Some(page.clone());
-                                    session.pages = session.tabs.len() as u32;
+                            Ok(value) => match value.get("page").and_then(|v| v.as_str()) {
+                                Some(page) => {
+                                    let page = page.to_owned();
+                                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                                        session.tabs.push(page.clone());
+                                        session.page_id = Some(page.clone());
+                                        session.pages = session.tabs.len() as u32;
+                                    }
+                                    Ok(json!({ "tab": page, "active": true }))
                                 }
-                                Ok(json!({ "tab": page, "active": true }))
-                            }
-                            None => Err("engine returned no page id".to_owned()),
-                        },
-                        Err(error) => Err(error),
-                    }
+                                None => Err("engine returned no page id".to_owned()),
+                            },
+                            Err(error) => Err(error),
+                        }
                     },
                     "switch" => match target {
                         None => Err("web.tab switch requires a tab id".to_owned()),
@@ -3898,7 +3908,9 @@ impl Daemon {
                     self.finish_session(&session_id);
                     return Err(protocol_error(request, "web.wait requires an existing page; open or select a tab first"));
                 }
-                let storage_key = self.sessions.get(&session_id)
+                let storage_key = self
+                    .sessions
+                    .get(&session_id)
                     .and_then(|session| session.persistent_profile.as_ref())
                     .map(|name| format!("persistent-{name}"))
                     .unwrap_or_else(|| format!("ephemeral-{session_id}"));
@@ -3939,22 +3951,39 @@ impl Daemon {
             .unwrap_or(NetworkProfile::Research);
         let profile_result = if let Some(end) = deadline {
             let remaining = end.saturating_duration_since(Instant::now());
-            let remaining = self.sessions.get(&session_id)
-                .map(|session| session.limits.operation_budget(session.started.elapsed(), remaining))
+            let remaining = self
+                .sessions
+                .get(&session_id)
+                .map(|session| {
+                    session
+                        .limits
+                        .operation_budget(session.started.elapsed(), remaining)
+                })
                 .unwrap_or(Duration::ZERO);
             if remaining < Duration::from_millis(1) {
                 Err("timeout: no remaining wait setup budget".into())
             } else {
-                self.engine_call_timed_with_recovery("session.setProfile", json!({"page":page,"profile":profile.as_str()}), remaining, false)
+                self.engine_call_timed_with_recovery(
+                    "session.setProfile",
+                    json!({"page":page,"profile":profile.as_str()}),
+                    remaining,
+                    false,
+                )
             }
         } else {
-            self.engine_call("session.setProfile", json!({ "page": page, "profile": profile.as_str() }))
+            self.engine_call(
+                "session.setProfile",
+                json!({ "page": page, "profile": profile.as_str() }),
+            )
         };
         if let Err(error) = profile_result {
             self.finish_session(&session_id);
             if deadline.is_some() {
                 let (code, message, recovery) = crate::wait_contract::wait_error_detail(&error);
-                return Err(Response::error(request, ErrorObject::new(code, message, request.request_id.clone(), 34, recovery)));
+                return Err(Response::error(
+                    request,
+                    ErrorObject::new(code, message, request.request_id.clone(), 34, recovery),
+                ));
             }
             return Err(engine_error(request, error, 34));
         }
@@ -4474,6 +4503,7 @@ impl Daemon {
         let ids = self.replace_content_worker(reason)?;
         for session in self.sessions.values_mut() {
             session.page_id = None;
+            session.engine_context_id = None;
             session.tabs.clear();
             session.locator_snapshots.clear();
             session.pages = 0;
@@ -4486,6 +4516,7 @@ impl Daemon {
         let mut recovered = Vec::new();
         for session in self.sessions.values_mut() {
             session.page_id = None;
+            session.engine_context_id = None;
             session.tabs.clear();
             session.locator_snapshots.clear();
             session.pages = 0;

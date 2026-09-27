@@ -1191,6 +1191,16 @@ struct ContentEngine {
     _proxy: PolicyProxy,
 }
 
+impl Drop for ContentEngine {
+    fn drop(&mut self) {
+        // Additional Servo instances borrow the process-global JS engine and
+        // embedder namespace owned by `self.servo`; drop every dependent page
+        // and bundle before Rust reaches the owner's field drop.
+        self.pages.clear();
+        self.context_bundles.clear();
+    }
+}
+
 impl ContentEngine {
     fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
         trace_startup("renderer-create");
@@ -1273,11 +1283,15 @@ impl ContentEngine {
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
-        let servo = ServoBuilder::default()
-            .opts(opts)
-            .preferences(preferences)
-            .event_loop_waker(Box::new(wake.clone()))
-            .build();
+        // `self.servo` owns Servo's process-global SpiderMonkey setup and the
+        // embedder thread's pipeline namespace for the lifetime of this engine.
+        let servo = unsafe {
+            ServoBuilder::default()
+                .opts(opts)
+                .preferences(preferences)
+                .event_loop_waker(Box::new(wake.clone()))
+                .build_with_shared_process_state()
+        };
         let user_content = Rc::new(UserContentManager::new(&servo));
         user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Rc::new(EngineBundle {
@@ -1404,6 +1418,7 @@ impl ContentEngine {
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
+        let wake = self.wake_for_webview(webview);
         let mut last_js = Instant::now() - Duration::from_millis(200);
         let mut trace = NavTrace::begin();
         loop {
@@ -1435,7 +1450,7 @@ impl ContentEngine {
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                &wake,
                 &mut || false,
                 remaining.min(Duration::from_millis(10)),
             ) {
@@ -2267,7 +2282,10 @@ impl ContentEngine {
                             let bundle = self.build_bundle(storage_key)?;
                             self.contexts.insert(
                                 context.clone(),
-                                ObjectLife::Live { generation: 1, parent: None },
+                                ObjectLife::Live {
+                                    generation: 1,
+                                    parent: None,
+                                },
                             );
                             self.context_bundles.insert(context.clone(), bundle);
                             self.session_contexts.insert(session, context.clone());
@@ -2331,7 +2349,7 @@ impl ContentEngine {
                         webview,
                         delegate,
                         bundle,
-                        context_id,
+                        context_id.clone(),
                         browser_id,
                     ),
                 );
@@ -2365,6 +2383,7 @@ impl ContentEngine {
                             generation,
                             context_id,
                             browser_id,
+                            ..
                         }) => (
                             *generation,
                             context_id.clone(),
@@ -2878,63 +2897,7 @@ impl ContentEngine {
             }
             "session.closePage" => {
                 let page_id = required_str(&params, "page")?;
-                let (context_id, browser_id) = match self.pages.get(&page_id) {
-                    Some(PageSlot::Live {
-                        context_id,
-                        browser_id,
-                        ..
-                    }) => (context_id.clone(), browser_id.clone()),
-                    _ => (None, None),
-                };
                 self.dispose_page(&page_id);
-                if let Some(context_id) = context_id {
-                    let still_used = self.pages.values().any(|slot| {
-                        matches!(
-                            slot,
-                            PageSlot::Live {
-                                context_id: Some(owner),
-                                ..
-                            } if owner == &context_id
-                        )
-                    });
-                    if !still_used {
-                        let generation = match self.contexts.get(&context_id) {
-                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
-                            _ => None,
-                        };
-                        if let Some(generation) = generation {
-                            self.contexts.insert(
-                                context_id.clone(),
-                                ObjectLife::Disposed { generation },
-                            );
-                            self.context_bundles.remove(&context_id);
-                            self.session_contexts.retain(|_, context| context != &context_id);
-                        }
-                    }
-                }
-                if let Some(browser_id) = browser_id {
-                    let still_used = self.pages.values().any(|slot| {
-                        matches!(
-                            slot,
-                            PageSlot::Live {
-                                browser_id: Some(owner),
-                                ..
-                            } if owner == &browser_id
-                        )
-                    });
-                    if !still_used {
-                        let generation = match self.browsers.get(&browser_id) {
-                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
-                            _ => None,
-                        };
-                        if let Some(generation) = generation {
-                            self.browsers.insert(
-                                browser_id,
-                                ObjectLife::Disposed { generation },
-                            );
-                        }
-                    }
-                }
                 Ok(json!({}))
             }
             "page.isClosed" => {

@@ -737,7 +737,7 @@ fn serve_cookie_isolation_fixture() -> String {
                 .unwrap_or("");
             let body = format!("<!doctype html><title>cookie</title><body>{cookie}</body>");
             let set_cookie = if path == "/set" {
-                "Set-Cookie: isolation=A; Path=/; HttpOnly\r\n"
+                "Set-Cookie: isolation=A; Path=/; Max-Age=3600; HttpOnly\r\n"
             } else {
                 ""
             };
@@ -8391,6 +8391,12 @@ fn ordinary_sessions_isolate_cookie_state() {
 
     let session_a = create();
     let session_b = create();
+    let early_b = call("web.tab.new", json!({"session_id":session_b}));
+    assert_eq!(early_b.status, "ok", "{early_b:?}");
+    let tab_b = early_b.result.unwrap()["tab"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let set = call(
         "web.goto",
         json!({"session_id":session_a,"url":format!("{fixture}/set")}),
@@ -8402,6 +8408,11 @@ fn ordinary_sessions_isolate_cookie_state() {
     );
     assert_eq!(echo_a.status, "ok", "{echo_a:?}");
     assert_eq!(body(&session_a, None), "isolation=A");
+    let store_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"source":"localStorage.setItem('greppy-isolation', 'A'); localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(store_a.status, "ok", "{store_a:?}");
 
     let new_tab = call("web.tab.new", json!({"session_id":session_a}));
     assert_eq!(new_tab.status, "ok", "{new_tab:?}");
@@ -8413,16 +8424,55 @@ fn ordinary_sessions_isolate_cookie_state() {
     assert_eq!(tab_echo.status, "ok", "{tab_echo:?}");
     assert_eq!(body(&session_a, Some(&tab_a)), "isolation=A");
 
+    let stored_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"tab_id":&tab_a,"source":"localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(stored_a.status, "ok", "{stored_a:?}");
+    assert_eq!(stored_a.result.unwrap()["value"], "A");
+
     let echo_b = call(
         "web.goto",
-        json!({"session_id":session_b,"url":format!("{fixture}/echo")}),
+        json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
     );
     assert_eq!(echo_b.status, "ok", "{echo_b:?}");
     assert_eq!(
-        body(&session_b, None),
+        body(&session_b, Some(&tab_b)),
         "",
         "simultaneous ordinary session B received A's cookie"
     );
+    let stored_b = call(
+        "web.evaluate",
+        json!({"session_id":session_b,"tab_id":&tab_b,"source":"localStorage.getItem('greppy-isolation')"}),
+    );
+    assert_eq!(stored_b.status, "ok", "{stored_b:?}");
+    assert!(stored_b.result.unwrap()["value"].is_null());
+
+    for tab in [&tab_a, &session_a] {
+        let target = if tab == &session_a {
+            None
+        } else {
+            Some(tab.as_str())
+        };
+        let mut payload = json!({"session_id":session_a});
+        if let Some(target) = target {
+            payload["tab"] = json!(target);
+        }
+        let closed = call("web.tab.close", payload);
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    let reopened_a = call("web.tab.new", json!({"session_id":session_a}));
+    assert_eq!(reopened_a.status, "ok", "{reopened_a:?}");
+    let reopened_tab = reopened_a.result.unwrap()["tab"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reopened_echo = call(
+        "web.goto",
+        json!({"session_id":session_a,"tab_id":&reopened_tab,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(reopened_echo.status, "ok", "{reopened_echo:?}");
+    assert_eq!(body(&session_a, Some(&reopened_tab)), "isolation=A");
     let closed_a = call("web.session.close", json!({"session_id":session_a}));
     assert_eq!(closed_a.status, "ok", "{closed_a:?}");
 
@@ -8437,6 +8487,47 @@ fn ordinary_sessions_isolate_cookie_state() {
         "",
         "new ordinary session C received closed A's cookie"
     );
+
+    let persistent_name = format!("cookie-isolation-{}", std::process::id());
+    let persistent_first = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&persistent_name}),
+    );
+    assert_eq!(persistent_first.status, "ok", "{persistent_first:?}");
+    let persistent_first_id = persistent_first.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let persistent_set = call(
+        "web.goto",
+        json!({"session_id":persistent_first_id,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(persistent_set.status, "ok", "{persistent_set:?}");
+    let persistent_closed = call(
+        "web.session.close",
+        json!({"session_id":persistent_first_id}),
+    );
+    assert_eq!(persistent_closed.status, "ok", "{persistent_closed:?}");
+    let persistent_second = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&persistent_name}),
+    );
+    assert_eq!(persistent_second.status, "ok", "{persistent_second:?}");
+    let persistent_second_id = persistent_second.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let persistent_echo = call(
+        "web.goto",
+        json!({"session_id":persistent_second_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(persistent_echo.status, "ok", "{persistent_echo:?}");
+    assert_eq!(body(&persistent_second_id, None), "isolation=A");
+    let persistent_second_closed = call(
+        "web.session.close",
+        json!({"session_id":persistent_second_id}),
+    );
+    assert_eq!(persistent_second_closed.status, "ok", "{persistent_second_closed:?}");
     for session in [session_b, session_c] {
         let closed = call("web.session.close", json!({"session_id":session}));
         assert_eq!(closed.status, "ok", "{closed:?}");
