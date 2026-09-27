@@ -8,6 +8,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const STORE_FORMAT_VERSION: u32 = 2;
@@ -26,6 +27,7 @@ pub const ORPHAN_GRACE_SECS: u64 = 24 * 60 * 60;
 const STORE_MANIFEST_MAGIC: &str = "greppy-workspace-store";
 const AGENT_BASE_MANIFEST_MAGIC: &str = "greppy-agent-base-store";
 const LAST_USED_WRITE_GAP: Duration = Duration::from_secs(60);
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreManifest {
@@ -1517,16 +1519,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_owned_namespace(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
-    secure_private_file(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)
+    let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}.{}",
+        std::process::id(),
+        nonce,
+        timestamp
+    ));
+    let mut created = false;
+    let result = (|| {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        created = true;
+        secure_private_file(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if created && result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn ensure_owned_namespace(dir: &Path) -> io::Result<()> {
@@ -1978,6 +1994,43 @@ mod tests {
         let m = read_store_manifest(&dir).unwrap();
         assert_eq!(m.canonical_root, repo.canonicalize().unwrap());
         std::env::remove_var("GREPPY_STORE_DIR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn concurrent_absent_workspace_store_publication_is_stable() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("concurrent-manifest");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let data = base.join("data");
+        let _restore = StoreDirRestore::set(&data);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let handles = (0..8)
+            .map(|_| {
+                let start = std::sync::Arc::clone(&start);
+                let repo = repo.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    ensure_workspace_store(&repo)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent workspace store publisher panicked")
+                .unwrap();
+        }
+        let dir = workspace_store_dir(&repo);
+        let manifest = read_store_manifest(&dir).unwrap();
+        assert_eq!(manifest.canonical_root, repo.canonicalize().unwrap());
+        assert_eq!(
+            manifest.workspace_hash,
+            crate::workspace::workspace_hash(&repo)
+        );
         let _ = fs::remove_dir_all(base);
     }
 
