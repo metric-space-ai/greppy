@@ -823,7 +823,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
-    content_config_dir: Option<OwnedTempDir>,
+    worker_temp_dir: Option<OwnedTempDir>,
     reaped: bool,
 }
 
@@ -1025,9 +1025,12 @@ fn spawn_unix(
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
-        let worker_temp_root = std::env::temp_dir().canonicalize()?;
+        let worker_temp_dir = OwnedTempDir::for_content_worker()?;
+        let worker_temp_root = worker_temp_dir.path.clone();
         let content_config_dir = if worker == WorkerKind::Content {
-            Some(OwnedTempDir::for_content_worker()?)
+            let path = worker_temp_root.join("content-config");
+            fs::create_dir(&path)?;
+            Some(path)
         } else {
             None
         };
@@ -1065,7 +1068,7 @@ fn spawn_unix(
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(dir) = content_config_dir.as_ref() {
-            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", &dir.path);
+            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
         }
         if let Some(dir) = persistent_profiles.as_ref() {
             command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
@@ -1195,7 +1198,7 @@ fn spawn_unix(
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
-            content_config_dir,
+            worker_temp_dir: Some(worker_temp_dir),
             reaped: false,
         })
 }
@@ -1302,9 +1305,6 @@ fn macos_sandbox_profile(
 (allow file-write*
   {tmp}
   {persistent_profiles}
-  (subpath "/private/var/folders")
-  (subpath "/private/tmp")
-  (subpath "/tmp")
 )
 (allow sysctl-read)
 (allow mach-lookup)
@@ -1964,7 +1964,7 @@ impl Drop for WorkerProcess {
         if !self.reaped {
             self.kill_tree();
         }
-        self.content_config_dir.take();
+        self.worker_temp_dir.take();
     }
 }
 
@@ -2154,7 +2154,7 @@ mod tests {
         let profile = macos_sandbox_profile(
             Path::new("/tmp/exe"),
             Path::new("/tmp"),
-            Path::new("/tmp"),
+            Path::new("/tmp/greppy-worker-unit"),
             Some(Path::new("/var/lib/greppy/web-runtime/profiles")),
         );
         assert!(
@@ -2176,6 +2176,29 @@ mod tests {
         assert!(
             profile.contains("/var/lib/greppy/web-runtime/profiles"),
             "only the explicit persistent profile root should be added: {profile}"
+        );
+        let writes = profile
+            .split_once("(allow file-write*")
+            .and_then(|(_, tail)| tail.split_once("(allow sysctl-read)"))
+            .map(|(writes, _)| writes)
+            .expect("file-write policy block");
+        for broad_temp in [
+            "(subpath \"/private/var/folders\")",
+            "(subpath \"/private/tmp\")",
+            "(subpath \"/tmp\")",
+        ] {
+            assert!(
+                !writes.contains(broad_temp),
+                "worker write policy must not expose sibling daemon locks: {writes}"
+            );
+        }
+        assert!(
+            writes.contains("/tmp/greppy-worker-unit"),
+            "owned worker temp is missing: {writes}"
+        );
+        assert!(
+            !writes.contains("profile-locks"),
+            "daemon lock root must never enter the worker policy: {writes}"
         );
     }
 
