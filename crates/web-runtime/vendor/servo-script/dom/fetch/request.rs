@@ -437,9 +437,13 @@ impl Request {
 
         // Step 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
         let input_body = if let RequestInfo::Request(ref mut input_request) = input {
-            let mut input_request_request = input_request.request.borrow_mut();
-            request.body_stream.set(input_request.body().as_deref());
-            input_request_request.body.take()
+            let input_body = input_request.request.borrow_mut().body.take();
+            clone_body_stream_for_dom_body(
+                cx,
+                &input_request.body_stream,
+                &request.body_stream,
+            )?;
+            input_body
         } else {
             None
         };
