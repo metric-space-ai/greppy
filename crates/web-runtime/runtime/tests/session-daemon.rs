@@ -733,6 +733,24 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn decode_chunked_body(mut encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded.windows(2).position(|part| part == b"\r\n")?;
+        let size_text = std::str::from_utf8(&encoded[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            return Some(decoded);
+        }
+        if encoded.len() < size + 2 || &encoded[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[size + 2..];
+    }
+}
+
 fn serve_form_post_fixture(
     redirect_post: bool,
 ) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
@@ -749,10 +767,10 @@ fn serve_form_post_fixture(
                 .unwrap();
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
-            let (header_end, content_length) = loop {
+            let (header_end, content_length, chunked) = loop {
                 let size = stream.read(&mut chunk).unwrap_or(0);
                 if size == 0 {
-                    break (request.len(), 0);
+                    break (request.len(), 0, false);
                 }
                 request.extend_from_slice(&chunk[..size]);
                 if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -766,10 +784,19 @@ fn serve_form_post_fixture(
                                 .and_then(|value| value.trim().parse::<usize>().ok())
                         })
                         .unwrap_or(0);
-                    break (header_end, content_length);
+                    let chunked = headers.lines().any(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("transfer-encoding:")
+                            .is_some_and(|value| value.trim() == "chunked")
+                    });
+                    break (header_end, content_length, chunked);
                 }
             };
-            while request.len() < header_end + content_length {
+            while if chunked {
+                decode_chunked_body(&request[header_end..]).is_none()
+            } else {
+                request.len() < header_end + content_length
+            } {
                 let size = stream.read(&mut chunk).unwrap_or(0);
                 if size == 0 {
                     break;
@@ -784,8 +811,13 @@ fn serve_form_post_fixture(
             let posted = request_line.starts_with("POST /login ") ||
                 request_line.starts_with("POST /complete ");
             let response_body = if posted {
+                let body = if chunked {
+                    decode_chunked_body(&request[header_end..]).unwrap()
+                } else {
+                    request[header_end..header_end + content_length].to_vec()
+                };
                 body_sender
-                    .send(request[header_end..header_end + content_length].to_vec())
+                    .send(body)
                     .unwrap();
                 "<!doctype html><title>submitted</title><body>submitted</body>"
             } else {
