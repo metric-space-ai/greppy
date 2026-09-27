@@ -8563,6 +8563,17 @@ fn ordinary_sessions_isolate_cookie_state() {
     let closed_a = call("web.session.close", json!({"session_id":session_a}));
     assert_eq!(closed_a.status, "ok", "{closed_a:?}");
 
+    let surviving_b = call(
+        "web.goto",
+        json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(surviving_b.status, "ok", "{surviving_b:?}");
+    assert_eq!(
+        body(&session_b, Some(&tab_b)),
+        "",
+        "surviving ordinary session B received closed A's cookie"
+    );
+
     let session_c = create();
     let echo_c = call(
         "web.goto",
