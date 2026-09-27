@@ -767,6 +767,20 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     previous_identity.indexer_version = "greppy-indexer-v6".into();
     let previous_graph = scratch.path().join("verified-v6-base.db");
     std::fs::copy(&base_path, &previous_graph).expect("copy v6 Base graph");
+    // Publication makes the Base immutable. Only the private fixture copy
+    // may be edited to represent a previous indexer generation.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&previous_graph, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = std::fs::metadata(&previous_graph).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&previous_graph, permissions).unwrap();
+    }
+
     let mut previous_store = greppy_store::Store::open(&previous_graph).unwrap();
     let previous_project = previous_store
         .list_projects()
@@ -835,7 +849,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     }
     std::fs::remove_dir_all(base_path.parent().expect("Base graph parent"))
         .expect("remove current v7 Base generation");
-    let mut bound_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let bound_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
     let binding_raw: String = bound_delta
         .conn()
         .query_row(
