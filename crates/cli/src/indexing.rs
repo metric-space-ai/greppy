@@ -19,8 +19,12 @@ fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
     }
 }
 
-pub(crate) fn dispatch_index_status(json: bool, root: Option<&str>) -> Result<i32> {
-    dispatch_index_health("index-status", json, root)
+pub(crate) fn dispatch_index_status(
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    dispatch_index_health("index-status", json, root, embedding_args)
 }
 
 #[derive(Debug)]
@@ -323,7 +327,12 @@ fn validate_index_recovery_candidate(
     Ok(())
 }
 
-pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Result<i32> {
+pub(crate) fn dispatch_index_health(
+    command: &str,
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
     let effective_root = resolve_root(root)?;
     let project = workspace_locator::project_identity(&effective_root);
     let store_path = workspace_locator::store_path(&effective_root);
@@ -442,12 +451,12 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     let inference = (command == "doctor")
         .then(inference_registry_status)
         .transpose()?;
-    let inference_daemons = (command == "doctor").then(inference_daemon_status);
+    let inference_daemons = (command == "doctor").then(|| inference_daemon_status(embedding_args));
     let inference_diagnostics = inference.as_ref().map(|registry| {
         serde_json::json!({
             "registry": registry,
             "daemons": inference_daemons,
-            "models": inference_model_status(),
+            "models": inference_model_status(embedding_args),
         })
     });
 
@@ -641,12 +650,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                 .ok()
         })
         .unwrap_or(0);
-    let configured_embedding_model = embedding_config_optional(EmbeddingCliArgs {
-        device: None,
-        no_gpu: false,
-    })
-    .ok()
-    .flatten();
+    let configured_embedding_model = embedding_config_optional(embedding_args).ok().flatten();
     let embedding_complete = graph_generation.is_some_and(|generation| {
         let Some(model) = configured_embedding_model.as_ref() else {
             return false;
