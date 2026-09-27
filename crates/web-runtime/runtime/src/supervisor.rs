@@ -834,10 +834,15 @@ struct OwnedTempDir {
 
 impl OwnedTempDir {
     fn for_content_worker() -> io::Result<Self> {
+        Self::for_content_worker_in(&std::env::temp_dir())
+    }
+
+    fn for_content_worker_in(temp_root: &Path) -> io::Result<Self> {
         static SEQUENCE: AtomicU32 = AtomicU32::new(1);
-        reap_stale_content_worker_dirs();
+        let temp_root = temp_root.canonicalize()?;
+        reap_stale_content_worker_dirs_in(&temp_root);
         for _ in 0..32 {
-            let path = std::env::temp_dir().join(format!(
+            let path = temp_root.join(format!(
                 "greppy-web-content-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -865,9 +870,17 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn reap_stale_content_worker_dirs() {
+    let Ok(temp_root) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    reap_stale_content_worker_dirs_in(&temp_root);
+}
+
+#[cfg(unix)]
+fn reap_stale_content_worker_dirs_in(temp_root: &Path) {
     const PREFIX: &str = "greppy-web-content-";
     let self_pid = std::process::id();
-    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = fs::read_dir(temp_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1000,6 +1013,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
+        let worker_temp_root = std::env::temp_dir().canonicalize()?;
         let content_config_dir = if worker == WorkerKind::Content {
             Some(OwnedTempDir::for_content_worker()?)
         } else {
@@ -1034,6 +1048,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             .arg(role)
             .env_clear()
             .envs(inherited_worker_env())
+            .env("TMPDIR", &worker_temp_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -1204,7 +1219,10 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
         fn sandbox_free_error(errorbuf: *mut c_char);
     }
     let exe_dir = exe.parent().unwrap_or(exe);
-    let profile = macos_sandbox_profile(exe, exe_dir, tmp);
+    // Seatbelt authorizes resolved filesystem paths. TMPDIR can be a symlink
+    // (notably on the shared development host), so grant its physical target.
+    let tmp = tmp.canonicalize()?;
+    let profile = macos_sandbox_profile(exe, exe_dir, &tmp);
     let profile = CString::new(profile)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut errorbuf: *mut c_char = std::ptr::null_mut();
@@ -1955,6 +1973,22 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_worker_temp_dir_resolves_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = OwnedTempDir::for_content_worker().unwrap();
+        let physical = fixture.path.join("physical");
+        let alias = fixture.path.join("alias");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+
+        let content = OwnedTempDir::for_content_worker_in(&alias).unwrap();
+        assert!(content.path.starts_with(&physical), "{}", content.path.display());
+        assert!(!content.path.starts_with(&alias), "{}", content.path.display());
     }
 
     #[cfg(unix)]
