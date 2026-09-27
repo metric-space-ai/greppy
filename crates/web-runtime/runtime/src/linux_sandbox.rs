@@ -77,6 +77,7 @@ enum GrantKind {
     ReadFile { execute: bool },
     DeviceRw,
     WriteTree,
+    PersistentWriteTree,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,8 +121,19 @@ impl FsPathGrant {
         }
     }
 
+    fn persistent_write_tree(path: impl Into<PathBuf>, required: bool) -> Self {
+        Self {
+            path: path.into(),
+            kind: GrantKind::PersistentWriteTree,
+            required,
+        }
+    }
+
     fn is_write_tree(&self) -> bool {
-        matches!(self.kind, GrantKind::WriteTree)
+        matches!(
+            self.kind,
+            GrantKind::WriteTree | GrantKind::PersistentWriteTree
+        )
     }
 }
 
@@ -169,7 +181,7 @@ fn fs_allow_list(
     if let Some(path) = persistent_profiles {
         let path = normalize(path);
         refuse_filesystem_root(&path, "persistent profiles")?;
-        grants.push(FsPathGrant::write_tree(path, true));
+        grants.push(FsPathGrant::persistent_write_tree(path, true));
     }
 
     Ok(grants)
@@ -366,7 +378,10 @@ mod linux {
         }
         let c_path = path_c_string(&grant.path)?;
         let mut flags = libc::O_PATH | libc::O_CLOEXEC;
-        if matches!(grant.kind, GrantKind::ReadTree | GrantKind::WriteTree) {
+        if matches!(
+            grant.kind,
+            GrantKind::ReadTree | GrantKind::WriteTree | GrantKind::PersistentWriteTree
+        ) {
             flags |= libc::O_DIRECTORY;
         }
         let raw = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -432,6 +447,19 @@ mod linux {
                     | ACCESS_FS_MAKE_FIFO
                     | ACCESS_FS_MAKE_SYM
                     | ACCESS_FS_REFER
+                    | ACCESS_FS_TRUNCATE
+            }
+            GrantKind::PersistentWriteTree => {
+                ACCESS_FS_EXECUTE
+                    | ACCESS_FS_WRITE_FILE
+                    | ACCESS_FS_READ_FILE
+                    | ACCESS_FS_READ_DIR
+                    | ACCESS_FS_REMOVE_DIR
+                    | ACCESS_FS_REMOVE_FILE
+                    | ACCESS_FS_MAKE_DIR
+                    | ACCESS_FS_MAKE_REG
+                    | ACCESS_FS_MAKE_SOCK
+                    | ACCESS_FS_MAKE_FIFO
                     | ACCESS_FS_TRUNCATE
             }
         };

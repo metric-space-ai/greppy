@@ -1329,26 +1329,18 @@ impl Daemon {
                 "persistent_profile must be a short [A-Za-z0-9_-] name under the configured profile store".into(),
             );
         }
-        let root = persistent_profiles_root();
-        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-        let root = root.canonicalize().map_err(|error| error.to_string())?;
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let resolved = dir.canonicalize().map_err(|error| error.to_string())?;
-        if resolved.parent() != Some(root.as_path()) {
-            return Err("persistent_profile resolves outside the configured profile store".into());
-        }
-        crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
+        crate::profile_lock::ProfileLock::acquire_named(&persistent_profiles_root(), name)
+            .map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); } }
         self.exiting = true;
         self.sessions.clear();
-        self.profile_locks.clear();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-controller-eof"); } }
         self.controller.shutdown_or_kill();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-content-reap"); } }
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-accept-break"); } }
         self.journal(
             "runtime",
@@ -1436,8 +1428,9 @@ impl Daemon {
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
                 let ephemeral = session.persistent_profile.is_none();
-                let _ = self.profile_locks.remove(&session_id);
+                let profile_lock = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
+                let mut close_failed = false;
                 if self.content.is_running() {
                     let mut pages = session.tabs.clone();
                     if let Some(page) = session.page_id.take() {
@@ -1446,11 +1439,18 @@ impl Daemon {
                         }
                     }
                     for page in pages {
-                        let _ = self.engine_call("session.closePage", json!({ "page": page }));
+                        close_failed |= self
+                            .engine_call("session.closePage", json!({ "page": page }))
+                            .is_err();
                     }
                     if let Some(context) = session.engine_context_id.take() {
-                        let _ = self.engine_call("context.close", json!({ "context": context }));
+                        close_failed |= self
+                            .engine_call("context.close", json!({ "context": context }))
+                            .is_err();
                     }
+                }
+                if close_failed {
+                    self.content.shutdown_or_kill();
                 }
                 let _ = session.transition(SessionState::Closed);
                 self.run_control
@@ -1464,6 +1464,7 @@ impl Daemon {
                 if ephemeral {
                     self.remove_ephemeral_session_dir(&session_id);
                 }
+                drop(profile_lock);
                 Response::ok(
                     request,
                     serde_json::json!({ "session_id": session_id, "state": "closed" }),
@@ -4651,9 +4652,9 @@ impl Daemon {
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase idle-exit"); } }
         self.exiting = true;
         self.sessions.clear();
-        self.profile_locks.clear();
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
         let _ = std::fs::remove_file(&self.socket);
         self.journal(
             "runtime",
@@ -4677,13 +4678,31 @@ impl Daemon {
         for session_id in stale {
             if let Some(mut session) = self.sessions.remove(&session_id) {
                 let ephemeral = session.persistent_profile.is_none();
-                let _ = self.profile_locks.remove(&session_id);
+                let profile_lock = self.profile_locks.remove(&session_id);
+                let mut close_failed = false;
+                let mut pages = session.tabs.clone();
                 if let Some(page) = session.page_id.take() {
-                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                    if !pages.contains(&page) {
+                        pages.push(page);
+                    }
+                }
+                for page in pages {
+                    close_failed |= self
+                        .engine_call("session.closePage", json!({ "page": page }))
+                        .is_err();
+                }
+                if let Some(context) = session.engine_context_id.take() {
+                    close_failed |= self
+                        .engine_call("context.close", json!({ "context": context }))
+                        .is_err();
+                }
+                if close_failed {
+                    self.content.shutdown_or_kill();
                 }
                 if ephemeral {
                     self.remove_ephemeral_session_dir(&session_id);
                 }
+                drop(profile_lock);
             }
         }
     }
@@ -4698,6 +4717,7 @@ impl Drop for Daemon {
         self.exiting = true;
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
     }
 }
 
