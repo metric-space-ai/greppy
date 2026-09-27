@@ -1548,6 +1548,14 @@ fn prepare_base_store_paths(
     let staging_data = staging.path().join("data");
     std::fs::create_dir_all(&staging_data)
         .map_err(|error| Error::io("create Base build data directory", error))?;
+    let staged_graph = staging_data
+        .join("workspaces")
+        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
+        .join(greppy_core::workspace_hash(worktree_path))
+        .join("graph.db");
+    if seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)? {
+        report_base_phase(progress_path, "migrating_base_graph");
+    }
     let binary = std::env::current_exe()
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
     report_base_phase(progress_path, "building_base_graph");
@@ -1628,11 +1636,6 @@ fn prepare_base_store_paths(
             "immutable Base index build exited {status}"
         )));
     }
-    let staged_graph = staging_data
-        .join("workspaces")
-        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
-        .join(greppy_core::workspace_hash(worktree_path))
-        .join("graph.db");
     if !staged_graph.is_file() {
         return Err(Error::Invalid(format!(
             "Base build succeeded without graph.db at {}",
@@ -1671,6 +1674,65 @@ fn prepare_base_store_paths(
         .map_err(|error| Error::io("publish immutable Base Store", error))?;
     drop(builder_lease);
     prepared_base_with_reader(&layout, manifest, false)
+}
+
+/// Seed a v7 Base build from the verified v6 artifact with the same immutable
+/// inputs. The old published Base remains untouched; the ordinary index
+/// command opens this private copy and performs the scoped raw-edge migration.
+/// Since byte-identical nodes and vectors survive that migration, the child
+/// does not need to re-run model inference.
+fn seed_previous_indexer_base(
+    shared_data_root: &Path,
+    current_identity: &BaseStoreIdentity,
+    worktree_path: &Path,
+    staged_graph: &Path,
+) -> Result<bool> {
+    if current_identity.indexer_version != "greppy-indexer-v7" {
+        return Ok(false);
+    }
+    let mut previous_identity = current_identity.clone();
+    previous_identity.indexer_version = "greppy-indexer-v6".into();
+    let previous_layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+    let Ok(previous_manifest) = previous_layout.read_verified_manifest() else {
+        return Ok(false);
+    };
+    if previous_manifest.identity != previous_identity {
+        return Ok(false);
+    }
+    let parent = staged_graph
+        .parent()
+        .ok_or_else(|| Error::Invalid("staged Base graph has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| Error::io("create migrated Base graph directory", error))?;
+    let mut previous_graph = std::fs::File::open(&previous_layout.graph)
+        .map_err(|error| Error::io("open previous Base graph for migration", error))?;
+    let mut migrated_graph = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(staged_graph)
+        .map_err(|error| Error::io("create migrated Base graph", error))?;
+    std::io::copy(&mut previous_graph, &mut migrated_graph)
+        .map_err(|error| Error::io("copy previous Base graph for migration", error))?;
+    drop(migrated_graph);
+    let root = worktree_path.to_string_lossy();
+    let store =
+        greppy_store::Store::open_with(staged_graph, greppy_store::OpenOptions::query_writer())?;
+    store
+        .conn()
+        .execute(
+            "UPDATE main.projects SET root_path = ?1",
+            rusqlite::params![root.as_ref()],
+        )
+        .map_err(|error| Error::Store(format!("retarget migrated Base project: {error}")))?;
+    store
+        .conn()
+        .execute(
+            "UPDATE main.workspace_state SET root_path = ?1",
+            rusqlite::params![root.as_ref()],
+        )
+        .map_err(|error| Error::Store(format!("retarget migrated Base workspace: {error}")))?;
+    Ok(true)
 }
 
 fn validate_workspace_inventory(source_path: &Path, worktree_path: &Path) -> Result<usize> {
