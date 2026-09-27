@@ -33,6 +33,8 @@ pub struct Session {
     pub limits: SessionLimits,
     /// The page every operation without an explicit target acts on.
     pub page_id: Option<String>,
+    /// Content-worker browser context that owns this session's storage.
+    pub engine_context_id: Option<String>,
     /// Every page this session holds open, oldest first. `page_id` names the
     /// active one; a session with several tabs keeps them all here so a
     /// caller can switch without losing the others.
@@ -74,6 +76,7 @@ impl Session {
             profile,
             limits: SessionLimits::for_profile(profile.as_str()),
             page_id: None,
+            engine_context_id: None,
             tabs: Vec::new(),
             locator_snapshots: HashMap::new(),
             pages: 0,

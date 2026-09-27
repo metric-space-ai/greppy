@@ -426,6 +426,7 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
+        None,
     )?;
     let (mut protocol_in, protocol_out) = crate::worker::take_protocol_channel()?;
     let stdout = Arc::new(Mutex::new(protocol_out));
