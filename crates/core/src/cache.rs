@@ -568,6 +568,18 @@ pub fn legacy_workspace_store_dir(workspace_root: &Path) -> PathBuf {
 }
 
 pub fn ensure_workspace_store(workspace_root: &Path) -> io::Result<PathBuf> {
+    let workspace_root = canonical_root(workspace_root);
+    let store_root = canonical_root(&data_root());
+    if store_root.starts_with(&workspace_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "GREPPY_STORE_DIR must be outside the indexed workspace; move {} outside {}",
+                store_root.display(),
+                workspace_root.display()
+            ),
+        ));
+    }
     ensure_owned_namespace(&data_root())?;
     ensure_owned_namespace(&workspaces_root())?;
     ensure_owned_namespace(&locks_root())?;
@@ -1884,6 +1896,31 @@ mod tests {
         assert_eq!(lock.path(), root.join("locks/startup"));
         drop(lock);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_store_refuses_configured_data_root_inside_workspace() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let workspace = tempdir("store-inside-workspace");
+        let store_root = workspace.join("store");
+        let _restore = StoreDirRestore::set(&store_root);
+
+        let error = ensure_workspace_store(&workspace).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "GREPPY_STORE_DIR must be outside the indexed workspace; move {} outside {}",
+                store_root.display(),
+                workspace.display()
+            )
+        );
+        assert!(
+            !store_root.exists(),
+            "invalid cache placement must be rejected before it can create self-indexed files"
+        );
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[cfg(unix)]
