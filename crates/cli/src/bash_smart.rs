@@ -1903,6 +1903,7 @@ fn novelty_lifts(
         };
         let Some(cfg) = embedding_config_if_daemon_ready_with(
             args,
+            embedding_config_for_daemon_probe,
             |probe_cfg, key| embed_daemon::status(probe_cfg, key),
             || embedding_config_optional(args),
         ) else {
@@ -1940,16 +1941,18 @@ fn novelty_lifts(
 }
 
 #[cfg(any(unix, windows))]
-fn embedding_config_if_daemon_ready_with<S, M>(
+fn embedding_config_if_daemon_ready_with<P, S, M>(
     args: EmbeddingCliArgs<'_>,
+    probe: P,
     status: S,
     materialize: M,
 ) -> Option<EmbeddingModelConfig>
 where
+    P: FnOnce(EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>>,
     S: FnOnce(&EmbeddingModelConfig, &str) -> serde_json::Value,
     M: FnOnce() -> Result<Option<EmbeddingModelConfig>>,
 {
-    let Ok(Some(probe_cfg)) = embedding_config_for_daemon_probe(args) else {
+    let Ok(Some(probe_cfg)) = probe(args) else {
         return None;
     };
     let key = embedding_query_cache_key(&probe_cfg);
@@ -2194,6 +2197,41 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(any(unix, windows))]
+    fn deterministic_daemon_probe_config() -> EmbeddingModelConfig {
+        let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
+        let source = EmbeddingModelSource::Gguf {
+            gguf: gguf.into(),
+            tokenizer: tokenizer.into(),
+        };
+        let source_digest = embedding_source_content_digest(&source).unwrap();
+        let model_id = format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{source_digest}");
+        let mut embedded = Sha256::new();
+        for (name, digest) in [
+            (
+                "embeddinggemma-300M-Q4_K.gguf",
+                env!("GREPPY_EMBEDDED_GGUF_SHA"),
+            ),
+            ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+        ] {
+            embedded.update(name.as_bytes());
+            embedded.update([0]);
+            embedded.update(digest.as_bytes());
+            embedded.update([0]);
+        }
+        let embedded_model_id = format!(
+            "{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{:x}",
+            embedded.finalize()
+        );
+        assert_eq!(model_id, embedded_model_id);
+        EmbeddingModelConfig {
+            model_id,
+            source,
+            max_length: None,
+            device: "auto".parse().expect("auto device preference"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn spool_directory_uses_effective_private_temp_namespace() {
@@ -2289,6 +2327,7 @@ mod tests {
         let materialized = std::cell::Cell::new(false);
         let cfg = embedding_config_if_daemon_ready_with(
             args,
+            |_| Ok(Some(deterministic_daemon_probe_config())),
             |_, _| serde_json::json!({"state": "unavailable"}),
             || {
                 materialized.set(true);
@@ -2307,22 +2346,13 @@ mod tests {
             no_gpu: false,
         };
         let materialized = std::cell::Cell::new(false);
-        let probe = embedding_config_for_daemon_probe(args)
-            .unwrap()
-            .expect("probe config");
-        let source_digest = embedding_source_content_digest(&probe.source).unwrap();
-        let materialized_identity = EmbeddingModelConfig {
-            model_id: format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{source_digest}"),
-            source: probe.source,
-            max_length: probe.max_length,
-            device: probe.device,
-        };
         let cfg = embedding_config_if_daemon_ready_with(
             args,
+            |_| Ok(Some(deterministic_daemon_probe_config())),
             |_, _| serde_json::json!({"state": "ready"}),
             || {
                 materialized.set(true);
-                Ok(Some(materialized_identity))
+                Ok(Some(deterministic_daemon_probe_config()))
             },
         );
         assert!(cfg.is_some());
