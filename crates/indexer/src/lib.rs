@@ -283,7 +283,16 @@ pub fn index_with_options_and_progress(
         .map_or(!prior_state.is_empty(), |prior| prior != indexer_version)
         && !rust_reexport_migration;
     let mut only_paths = options.only_paths.clone();
-    if incompatible_index {
+    if rust_reexport_migration {
+        if let Some(paths) = only_paths.as_mut() {
+            paths.extend(
+                prior_state
+                    .iter()
+                    .filter(|state| state.language == "rust")
+                    .map(|state| state.rel_path.clone()),
+            );
+        }
+    } else if incompatible_index {
         if let Some(paths) = only_paths.as_mut() {
             paths.extend(prior_state.iter().map(|state| state.rel_path.clone()));
         }
@@ -356,7 +365,16 @@ pub fn index_with_options_and_progress(
         head_oid: fp.head_oid.clone(),
         index_signature: fp.index_signature.clone(),
         schema_version: store.schema_version()?,
-        indexer_version,
+        // Do not advertise v7 until its scoped Rust raw-edge refresh and
+        // full re-resolution have both completed. A failed migration must
+        // remain retryable on the next invocation.
+        indexer_version: if rust_reexport_migration {
+            prior_indexer_version
+                .clone()
+                .unwrap_or_else(|| indexer_version.clone())
+        } else {
+            indexer_version.clone()
+        },
         graph_generation: 0,
         updated_at: ws::now_iso8601(),
     })?;
@@ -371,16 +389,6 @@ pub fn index_with_options_and_progress(
     // across the whole run, so we read it once (the old per-file read
     // returned the same number N times).
     let generation = current_gen;
-
-    if rust_reexport_migration {
-        // v7 adds Rust-only raw-edge metadata. Forget only Rust file-state
-        // identities so the ordinary incremental path reparses those files;
-        // all other language graphs, source vectors, embeddings and model
-        // artifacts remain intact and reusable.
-        for state in prior_state.iter().filter(|state| state.language == "rust") {
-            store.delete_file_state(project_name, &state.rel_path)?;
-        }
-    }
 
     let controls = IndexControls::from_env();
     let controlled_entries = apply_large_repo_controls(&all_entries, &controls, &mut report);
@@ -438,7 +446,49 @@ pub fn index_with_options_and_progress(
     }
     let incremental = !incompatible_index && !prior_state.is_empty() && raw_edges_present;
 
-    if incremental {
+    if rust_reexport_migration && incremental {
+        refresh_unchanged_rust_raw_edges(
+            store,
+            project_name,
+            &entries,
+            worker_count,
+            &mut report,
+            progress,
+        )?;
+        let _changed_files = run_incremental(
+            store,
+            project_name,
+            &entries,
+            generation,
+            worker_count,
+            &mut report,
+            progress,
+        )?;
+        // Changed/deleted files lost stale vectors through the normal node
+        // rewrite. Every row left here still belongs to a retained node whose
+        // bytes are unchanged, so make that cached vector visible in v7.
+        store
+            .conn()
+            .execute(
+                "UPDATE main.vector_embeddings SET graph_generation = ?2 WHERE project = ?1",
+                rusqlite::params![project_name, generation as i64],
+            )
+            .map_err(sqlite_err)?;
+        // Resolver semantics changed. Replace the complete non-structural
+        // graph so an edge rejected by v7 cannot survive from v6.
+        if !store.is_overlay() {
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM main.edges WHERE project = ?1",
+                    rusqlite::params![project_name],
+                )
+                .map_err(sqlite_err)?;
+        }
+        let raw_edges = load_all_raw_edges(store, project_name)?;
+        report.edges_extracted =
+            resolve_and_persist_edges_with_progress(store, project_name, &raw_edges, progress)?;
+    } else if incremental {
         // Capture the project's **definition fingerprint** before we touch
         // any node (PHASE A deletes/re-inserts changed files' nodes). The
         // fingerprint is the exact set of node identity tuples that
@@ -561,6 +611,16 @@ pub fn index_with_options_and_progress(
     // diagnostics can expose partial language providers without depending on
     // parser internals.
     sync_provider_states(store, project_name, &all_entries, generation)?;
+
+    if rust_reexport_migration {
+        let mut migrated_state = store
+            .get_workspace_state(abs_root.to_string_lossy().as_ref())?
+            .ok_or_else(|| {
+                greppy_core::Error::Store("workspace state disappeared during v7 migration".into())
+            })?;
+        migrated_state.indexer_version = indexer_version;
+        store.upsert_workspace_state(&migrated_state)?;
+    }
 
     report.graph_generation = generation;
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
@@ -977,6 +1037,51 @@ fn run_incremental(
     // generation, so this is idempotent for them.
     bump_all_persisted_generations(store, project_name, generation)?;
     Ok(changed_files)
+}
+
+/// Re-extract only raw edges for byte-identical Rust files during the v6→v7
+/// migration. Nodes, file state, content, and vectors deliberately stay put.
+fn refresh_unchanged_rust_raw_edges(
+    store: &mut Store,
+    project_name: &str,
+    entries: &[InventoryEntry],
+    worker_count: usize,
+    report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<()> {
+    let diffs = greppy_freshness::compute_file_diff(store, project_name, entries)?;
+    let unchanged_rust = entries
+        .iter()
+        .zip(diffs.iter())
+        .enumerate()
+        .filter_map(|(idx, (entry, diff))| {
+            (matches!(diff, greppy_freshness::FileDiff::Unchanged)
+                && greppy_parser::language_for_path(&entry.abs_path) == Language::Rust)
+                .then_some((idx, entry, Language::Rust))
+        })
+        .collect::<Vec<_>>();
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
+    let (extractions, throttled) =
+        parallel_extract(&unchanged_rust, worker_count, &mut extraction_progress);
+    report.throttled_for_memory |= throttled;
+    for outcome in extractions {
+        match outcome {
+            FileOutcome::Extracted {
+                rel_path, edges, ..
+            } => {
+                persist_raw_edges_for_file(store, project_name, &rel_path, &edges)?;
+                report.files_indexed += 1;
+            }
+            FileOutcome::Unreadable { .. } => report.files_unreadable += 1,
+        }
+    }
+    Ok(())
 }
 
 /// Bulk-stamp `generation` onto every `file_state` and `index_skips` row for
@@ -2506,6 +2611,55 @@ impl UniqueResolution {
     }
 }
 
+fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -> Vec<String> {
+    let Some(module_path) = ref_path
+        .strip_suffix(name)
+        .and_then(|path| path.strip_suffix("::"))
+    else {
+        return Vec::new();
+    };
+    let mut parts = module_path.split("::").filter(|part| !part.is_empty());
+    let first = parts.next();
+    let referrer = Path::new(referrer_file);
+    let mut base = referrer
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let mut modules = Vec::new();
+    match first {
+        Some("crate") => {
+            let root_end = referrer_file
+                .rfind("/src/")
+                .map(|offset| offset + "/src".len())
+                .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+            base = root_end
+                .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                .unwrap_or_else(|| {
+                    referrer
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_path_buf()
+                });
+        }
+        Some("self") => {}
+        Some("super") => {
+            base.pop();
+        }
+        Some(part) => modules.push(part),
+        None => return Vec::new(),
+    }
+    modules.extend(parts);
+    for module in modules {
+        base.push(module);
+    }
+    let flat = base
+        .with_extension("rs")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let nested = base.join("mod.rs").to_string_lossy().replace('\\', "/");
+    vec![flat, nested]
+}
+
 impl GraphIndex {
     /// Load every node for `project` in a single query and build the
     /// lookup maps. `qualified_name` order from SQL gives a deterministic
@@ -2590,7 +2744,10 @@ impl GraphIndex {
     }
 
     fn record_import_items(&mut self, edge: &ExtractedEdge, file: &str) {
-        let Some(items) = edge.properties.get("imported_items").and_then(|value| value.as_array())
+        let Some(items) = edge
+            .properties
+            .get("imported_items")
+            .and_then(|value| value.as_array())
         else {
             return;
         };
@@ -2610,12 +2767,13 @@ impl GraphIndex {
             if name.is_empty() {
                 continue;
             }
-            let path = item.get("path").and_then(|value| value.as_str()).unwrap_or("");
-            if let Some(target) = self.unique_def_named_with_path(
-                &greppy_resolver::IMPORTABLE_LABELS,
-                name,
-                path,
-            ) {
+            let path = item
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if let Some(target) =
+                self.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+            {
                 self.record_import(file, target);
             }
         }
@@ -2861,24 +3019,30 @@ impl GraphIndex {
     }
 
     fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
-        let name = edge.properties.get("ref_name").and_then(|value| value.as_str())?;
+        let name = edge
+            .properties
+            .get("ref_name")
+            .and_then(|value| value.as_str())?;
         if name.is_empty() {
             return None;
         }
-        if let Some(module) = edge
+        if let Some(ref_path) = edge
             .properties
             .get("ref_path")
             .and_then(|value| value.as_str())
-            .and_then(|path| greppy_resolver::path_module_segment(path, name))
         {
+            let referrer_file = self.file_of(src_id)?;
+            let module_files = rust_module_files_for_path(referrer_file, ref_path, name);
             let candidates = self.defs_named(&USAGE_LABELS, name);
             let imported: Vec<i64> = candidates
                 .iter()
                 .filter(|candidate| {
-                    self.imports_by_file.iter().any(|(file, targets)| {
-                        (file.ends_with(&format!("/{module}.rs"))
-                            || file.ends_with(&format!("/{module}/mod.rs")))
-                            && targets.contains(&candidate.id)
+                    module_files.iter().any(|file| {
+                        candidate.file_path == *file
+                            || self
+                                .imports_by_file
+                                .get(file)
+                                .is_some_and(|targets| targets.contains(&candidate.id))
                     })
                 })
                 .map(|candidate| candidate.id)
@@ -2886,6 +3050,9 @@ impl GraphIndex {
             if let [id] = imported.as_slice() {
                 return Some(*id);
             }
+            // Never discard syntactic qualification and retry this as an
+            // unqualified same-file/import lookup.
+            return None;
         }
         self.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
     }
@@ -4329,7 +4496,7 @@ def Widget():
     fn rust_qualified_function_item_resolves_through_grouped_reexport() {
         let repo = setup_multifile_repo(
             "rust-reexport-function-item",
-            "mod channels; mod other;\nfn caller() { let selected = channels::target; selected(); }\n",
+            "mod channels; mod left; mod right; mod other;\nfn target() {}\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn missing_caller() { let _selected = missing::target; }\n",
             "// fixture placeholder\n",
         );
         fs::create_dir_all(repo.join("src/channels")).unwrap();
@@ -4349,10 +4516,32 @@ def Widget():
         )
         .unwrap();
         fs::write(repo.join("src/other.rs"), "pub fn target() {}\n").unwrap();
-        fs::write(repo.join("src/unrelated.py"), "def untouched():\n    return 1\n").unwrap();
+        for side in ["left", "right"] {
+            fs::create_dir_all(repo.join(format!("src/{side}/channel"))).unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/mod.rs")),
+                "pub mod channel;\n",
+            )
+            .unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/channel/mod.rs")),
+                "mod implementation; pub use implementation::target;\n",
+            )
+            .unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/channel/implementation.rs")),
+                "pub fn target() {}\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            repo.join("src/unrelated.py"),
+            "def untouched():\n    return 1\n",
+        )
+        .unwrap();
 
         let mut store = Store::open_memory().unwrap();
-        index(&mut store, &repo, "test").unwrap();
+        let initial = index(&mut store, &repo, "test").unwrap();
         let target = store
             .get_node_by_qname("test", "src/channels/command.rs::Function::target")
             .unwrap()
@@ -4380,8 +4569,61 @@ def Widget():
             .unwrap()
             .expect("unrelated homonym");
         assert!(
-            store.incoming_edges(homonym.id, None, 10).unwrap().is_empty(),
+            store
+                .incoming_edges(homonym.id, None, 10)
+                .unwrap()
+                .is_empty(),
             "module and glob evidence must not create cross-module homonym callers"
+        );
+        let left_target = store
+            .get_node_by_qname(
+                "test",
+                "src/left/channel/implementation.rs::Function::target",
+            )
+            .unwrap()
+            .expect("left channel target");
+        let right_target = store
+            .get_node_by_qname(
+                "test",
+                "src/right/channel/implementation.rs::Function::target",
+            )
+            .unwrap()
+            .expect("right channel target");
+        let left_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::left_caller")
+            .unwrap()
+            .expect("qualified left caller");
+        assert!(
+            store
+                .incoming_edges(left_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == left_caller.id),
+            "the full module path must select the left channel export"
+        );
+        assert!(
+            store
+                .incoming_edges(right_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != left_caller.id),
+            "a duplicate channel/mod.rs basename must not steal the qualified usage"
+        );
+        let local_target = store
+            .get_node_by_qname("test", "src/lib.rs::Function::target")
+            .unwrap()
+            .expect("same-file homonym");
+        let missing_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing_caller")
+            .unwrap()
+            .expect("missing-module caller");
+        assert!(
+            store
+                .incoming_edges(local_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_caller.id),
+            "missing::target must not degrade to the same-file target"
         );
 
         let untouched_before = store
@@ -4401,8 +4643,37 @@ def Widget():
                 start_line: 1,
                 end_line: 2,
                 content_sha256: "fixture-sha".into(),
-                graph_generation: 1,
+                graph_generation: initial.graph_generation,
                 vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "fixture-model".into(),
+                prompt_version: "v1".into(),
+                task: "code".into(),
+                node_id: Some(target.id),
+                chunk_idx: 0,
+                qualified_name: target.qualified_name.clone(),
+                file_path: target.file_path.clone(),
+                start_line: target.start_line,
+                end_line: target.end_line,
+                content_sha256: "rust-fixture-sha".into(),
+                graph_generation: initial.graph_generation,
+                vector: vec![0.0, 1.0],
+            })
+            .unwrap();
+        store
+            .insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: missing_caller.id,
+                target_id: local_target.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({
+                    "ref_name": "target",
+                    "ref_path": "missing::target"
+                }),
             })
             .unwrap();
         let root = greppy_discover::detect_repo_root(&repo).unwrap();
@@ -4412,23 +4683,77 @@ def Widget():
             .expect("workspace state");
         state.indexer_version = "greppy-indexer-v6".into();
         store.upsert_workspace_state(&state).unwrap();
+        fs::write(repo.join("src/other.rs"), "pub fn replacement() {}\n").unwrap();
 
-        let migration = index(&mut store, &repo, "test").unwrap();
-        assert_eq!(migration.files_indexed, 6, "only the six Rust files reparse");
+        let migration = index_with_options(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            migration.files_indexed, 12,
+            "all retained Rust files re-extract despite sparse scope"
+        );
         let untouched_after = store
             .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
             .unwrap()
             .expect("unrelated Python definition survives migration");
         assert_eq!(untouched_after.id, untouched_before.id);
+        let target_after = store
+            .get_node_by_qname("test", "src/channels/command.rs::Function::target")
+            .unwrap()
+            .expect("Rust target survives migration");
+        assert_eq!(
+            target_after.id, target.id,
+            "unchanged Rust nodes retain identity"
+        );
+        assert!(
+            store
+                .get_node_by_qname("test", "src/other.rs::Function::target")
+                .unwrap()
+                .is_none(),
+            "a genuinely changed Rust file still takes the normal incremental rewrite path"
+        );
+        assert!(store
+            .get_node_by_qname("test", "src/other.rs::Function::replacement")
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .incoming_edges(local_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_caller.id),
+            "full migration re-resolution removes a stale v6 false-positive edge"
+        );
         let preserved_vectors: i64 = store
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM vector_embeddings WHERE project='test' AND file_path='src/unrelated.py'",
-                [],
+                "SELECT COUNT(*) FROM vector_embeddings WHERE project='test' AND graph_generation=?1 AND file_path IN ('src/unrelated.py', 'src/channels/command.rs')",
+                rusqlite::params![migration.graph_generation as i64],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(preserved_vectors, 1, "unrelated source vectors survive v7 migration");
+        assert_eq!(
+            preserved_vectors, 2,
+            "Rust and Python vectors are reusable in the v7 generation"
+        );
+        let clean = index_with_options(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(clean.files_indexed, 0, "the next sparse run is clean");
     }
 
     #[test]
