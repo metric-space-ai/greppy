@@ -476,6 +476,18 @@ Effect.gen(function* () {
             )
             .unwrap();
         assert_eq!(resolved, 1, "seed the persisted v6 resolved CALLS source");
+        let usage = old
+            .conn()
+            .execute(
+                "INSERT INTO edges (project, source_id, target_id, edge_type, properties)
+                 SELECT source.project, source.id, target.id, 'USAGE', '{\"line\":2}'
+                 FROM nodes source, nodes target
+                 WHERE source.qualified_name = 'src/app.ts::__file__'
+                   AND target.name = 'helper'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(usage, 1, "seed an earlier same-anchor USAGE site");
     }
     let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
     assert_eq!(code, 0, "retained-graph who-calls should exit 0: {out}\n{err}");
@@ -485,6 +497,20 @@ Effect.gen(function* () {
             && out.contains("helper(platform)"),
         "the replacement executable must expose the retained call without reindexing: {out:?}"
     );
+    assert!(
+        !out.contains("src/app.ts:2") && !out.contains("import { helper }"),
+        "CALLS evidence must win over an earlier same-anchor USAGE: {out:?}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "helper", "--json"], &repo, &store);
+    assert_eq!(code, 0, "retained-graph JSON should exit 0: {out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let hit = &value["hits"][0];
+    assert_eq!(hit["qualified_name"], "src/app.ts::<module>", "{value}");
+    assert_eq!(hit["name"], "<module>", "{value}");
+    assert_eq!(hit["line"], 4, "{value}");
+    assert_eq!(hit["start_line"], 4, "{value}");
+    assert_eq!(hit["end_line"], 4, "{value}");
 }
 
 #[test]
