@@ -22,6 +22,9 @@ serde_json = { workspace = true }
 toml_edit = { workspace = true }
 rusqlite = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = []
 # Passthrough accelerator features to the embedding backend so bench examples

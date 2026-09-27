@@ -2154,16 +2154,20 @@ fn repaired_base_overlay_edges(store: &Store, project: &str) -> Result<Vec<NewOv
                    AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
             )
             .map_err(sqlite_err)?;
-        stmt.query_map(rusqlite::params![project], |row| {
-            let properties: String = row.get(3)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                properties,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+        let collected = stmt
+            .query_map(rusqlite::params![project], |row| {
+                let properties: String = row.get(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    properties,
+                ))
+            })
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        collected
     };
     let mut preserved = Vec::with_capacity(rows.len());
     for (source, target, edge_type, properties) in rows {
