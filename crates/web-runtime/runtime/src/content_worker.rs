@@ -1903,7 +1903,7 @@ impl ContentEngine {
         let deadline = Instant::now() + ACTION_TIMEOUT;
         loop {
             if delegate.document_generation.get() != document_generation {
-                self.drop_wait_slot(&webview, &token, Some(deadline));
+                self.drop_wait_slot(&webview, &token, None);
                 return Err(io::Error::other(
                     "page.evaluate Promise was interrupted by navigation",
                 ));
@@ -1914,7 +1914,9 @@ impl ContentEngine {
                 return match status.as_str() {
                     "ok" => Ok(value),
                     "error" => Err(io::Error::other(match value {
-                        JSValue::String(message) => message,
+                        JSValue::String(message) => {
+                            format!("page.evaluate Promise rejected: {message}")
+                        }
                         other => format!("page.evaluate Promise rejected: {other:?}"),
                     })),
                     other => Err(io::Error::other(format!(
@@ -1923,7 +1925,7 @@ impl ContentEngine {
                 };
             }
             if Instant::now() >= deadline {
-                self.drop_wait_slot(&webview, &token, Some(deadline));
+                self.drop_wait_slot(&webview, &token, None);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timeout awaiting page.evaluate Promise",
