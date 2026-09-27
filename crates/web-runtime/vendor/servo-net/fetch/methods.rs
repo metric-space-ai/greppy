@@ -130,30 +130,95 @@ impl CancellationListener {
     }
 }
 
-/// Closes the current process request body sender state when the net side fetch invocation ends.
-/// Redirect replay for navigation requests happens in a later fetch invocation with a newly
-/// deserialized "RequestBody", so each invocation owns closing only its local copy.
-pub(crate) struct AutoRequestBodyStreamCloser {
+/// Keeps the request-body sender alive for the duration of a net-side fetch invocation.
+///
+/// `RequestBody` clones in this process intentionally share their sender state. In particular,
+/// a navigation and its redirect/replay bookkeeping can overlap. Dropping one owner must only
+/// release that owner's clone; clearing the shared `Option` would invalidate every surviving
+/// owner before it can connect to the body producer.
+pub(crate) struct RequestBodyStreamLifetime {
     body: Option<RequestBody>,
 }
 
-impl AutoRequestBodyStreamCloser {
+impl RequestBodyStreamLifetime {
     pub(crate) fn new(body: Option<&RequestBody>) -> Self {
         Self {
             body: body.cloned(),
         }
     }
 
-    pub(crate) fn disarm(&mut self) {
+    pub(crate) fn transfer(&mut self) {
+        // A later redirect invocation receives its own serialized sender clone. Releasing this
+        // invocation's clone must not clear the shared state of any overlapping local owner.
         self.body = None;
     }
 }
 
-impl Drop for AutoRequestBodyStreamCloser {
-    fn drop(&mut self) {
-        if let Some(body) = self.body.take() {
-            body.close_stream();
+#[cfg(test)]
+mod request_body_stream_lifetime_tests {
+    use ipc_channel::ipc;
+    use net_traits::request::{
+        BodyChunkRequest, BodyChunkResponse, BodySource, RequestBody,
+        create_request_body_with_content,
+    };
+
+    use super::RequestBodyStreamLifetime;
+
+    fn assert_surviving_owner_can_read(after_abort: bool) {
+        let expected = "username=admin&password=secret";
+        let body = create_request_body_with_content(expected.to_owned());
+        let surviving_owner = body.clone();
+
+        if after_abort {
+            let _ = std::panic::catch_unwind(|| {
+                let _lifetime = RequestBodyStreamLifetime::new(Some(&body));
+                panic!("simulate an aborted fetch owner");
+            });
+        } else {
+            let _lifetime = RequestBodyStreamLifetime::new(Some(&body));
         }
+
+        let stream = surviving_owner.clone_stream();
+        let requester = stream.lock().clone().expect(
+            "finishing one request owner must not close a surviving owner's body stream",
+        );
+        let (response_sender, response_receiver) = ipc::channel().unwrap();
+        requester
+            .send(BodyChunkRequest::Connect(response_sender))
+            .expect("the surviving owner must still connect to the body producer");
+
+        let BodyChunkResponse::Chunk(bytes) = response_receiver.recv().unwrap() else {
+            panic!("body producer did not return the form body");
+        };
+        assert_eq!(&*bytes, expected.as_bytes());
+        assert!(matches!(
+            response_receiver.recv().unwrap(),
+            BodyChunkResponse::Done
+        ));
+    }
+
+    #[test]
+    fn surviving_body_owner_remains_readable_after_normal_completion() {
+        assert_surviving_owner_can_read(false);
+    }
+
+    #[test]
+    fn surviving_body_owner_remains_readable_after_abort() {
+        assert_surviving_owner_can_read(true);
+    }
+
+    #[test]
+    fn body_producer_disconnects_after_final_owner_drops() {
+        let (requester, producer) = ipc::channel().unwrap();
+        let body = RequestBody::new(requester, BodySource::Object, Some(1));
+        let surviving_owner = body.clone();
+        let lifetime = RequestBodyStreamLifetime::new(Some(&body));
+
+        drop(body);
+        drop(surviving_owner);
+        drop(lifetime);
+
+        assert!(producer.recv().is_err());
     }
 }
 
@@ -199,11 +264,11 @@ pub async fn fetch_with_cors_cache(
 ) -> Response {
     // Step 8. Let fetchParams be a new fetch params whose request is request
     let mut fetch_params = FetchParams::new(request);
-    // Each net side fetch invocation owns closing its local deserialized request-body sender state
-    // once this function returns, even if navigation redirect replay later starts a new fetch with
-    // a fresh "RequestBody" copy.
-    let mut request_body_stream_closer =
-        AutoRequestBodyStreamCloser::new(fetch_params.request.body.as_ref());
+    // Keep this invocation's sender clone alive until fetch returns. Other local RequestBody
+    // owners share the sender state and may overlap with this invocation, so completion here must
+    // release only this clone rather than clearing the shared sender.
+    let mut request_body_stream_lifetime =
+        RequestBodyStreamLifetime::new(fetch_params.request.body.as_ref());
     let request = &mut fetch_params.request;
 
     // Step 4. Populate request from client given request.
@@ -284,7 +349,7 @@ pub async fn fetch_with_cors_cache(
     let response = main_fetch(&mut fetch_params, cache, false, target, &mut None, context).await;
 
     if transfers_request_body_stream_to_later_manual_redirect(&fetch_params.request, &response) {
-        request_body_stream_closer.disarm();
+        request_body_stream_lifetime.transfer();
     }
 
     // Mimics <https://fetch.spec.whatwg.org/#done-flag>

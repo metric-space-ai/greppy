@@ -733,6 +733,70 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn serve_form_post_fixture() -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind form post fixture");
+    let address = listener.local_addr().expect("form post addr");
+    let (body_sender, body_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let (header_end, content_length) = loop {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break (request.len(), 0);
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let header_end = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    break (header_end, content_length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let request_line = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let response_body = if request_line.starts_with("POST /login ") {
+                body_sender
+                    .send(request[header_end..header_end + content_length].to_vec())
+                    .unwrap();
+                "<!doctype html><title>submitted</title><body>submitted</body>"
+            } else {
+                "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{address}/"), body_receiver)
+}
+
 fn serve_cookie_isolation_fixture() -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3630,6 +3694,65 @@ console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: rec
     assert!(stdout.contains("kind=no_document"), "{controller:?}");
     assert!(stdout.contains("\"missing\":404"), "{controller:?}");
     assert!(stdout.contains("\"recovered\":200"), "{controller:?}");
+}
+
+#[test]
+fn fresh_sessions_submit_complete_form_post_bodies() {
+    let (fixture, posted_bodies) = serve_form_post_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-form-post-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("form post request")
+    };
+
+    for _ in 0..3 {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        for (selector, value) in [
+            ("#username", "admin"),
+            ("#password", "secret"),
+        ] {
+            let filled = call(
+                "web.fill",
+                json!({
+                    "session_id":session,
+                    "selector":{"type":"css","value":selector},
+                    "value":value,
+                }),
+            );
+            assert_eq!(filled.status, "ok", "{filled:?}");
+        }
+        let submitted = call(
+            "web.click",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":"#submit"},
+            }),
+        );
+        assert_eq!(submitted.status, "ok", "{submitted:?}");
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
 }
 
 #[test]
