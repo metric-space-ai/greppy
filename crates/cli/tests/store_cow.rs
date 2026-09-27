@@ -680,20 +680,25 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         .unwrap()
         .expect("refreshed workspace state")
         .graph_generation;
+    let vector_node = refreshed_delta
+        .list_nodes_by_name(&project, "first_untracked_symbol", 1)
+        .unwrap()
+        .pop()
+        .expect("existing Delta vector node");
+    let vector_content = std::fs::read(first.join("src/untracked.rs")).unwrap();
     refreshed_delta
         .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
             project: project.clone(),
-            model_id: "regression-model".into(),
-            prompt_version: "regression-prompt".into(),
+            model_id: "test-code-embedder".into(),
+            prompt_version: "test-prompt-v1".into(),
             task: "retrieval_document".into(),
-            node_id: None,
+            node_id: Some(vector_node.id),
             chunk_idx: 0,
-            qualified_name: "shared_base_symbol".into(),
-            file_path: "src/base.rs".into(),
-            start_line: 1,
-            end_line: 1,
-            content_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
-                .into(),
+            qualified_name: vector_node.qualified_name,
+            file_path: vector_node.file_path,
+            start_line: vector_node.start_line,
+            end_line: vector_node.end_line,
+            content_sha256: greppy_store::file_state::sha256_hex(&vector_content),
             graph_generation: generation,
             vector: vec![1.0, 0.0],
         })
