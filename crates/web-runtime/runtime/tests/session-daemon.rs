@@ -7444,11 +7444,13 @@ const browser = await chromium.launch();
 const page = await browser.newPage();
 const primitive = await page.evaluate(() => 42);
 const object = await page.evaluate(() => ({ before: false, after: true }));
+const asyncPrimitive = await page.evaluate(async () => 7);
+const asyncString = await page.evaluate(async () => "resolved");
 const state = await page.evaluate(async () => {
   await Promise.resolve();
   return { before: false, after: true, reuseError: "TypeError", status: 200 };
 });
-console.log(JSON.stringify({ primitive, object, state }));
+console.log(JSON.stringify({ primitive, object, asyncPrimitive, asyncString, state }));
 await browser.close();
 "#;
     let ran = run_playwright_source(
@@ -7468,7 +7470,7 @@ await browser.close();
     assert_eq!(ran.status, "ok", "{ran:?}");
     assert_eq!(
         ran.result.as_ref().unwrap()["stdout"].as_str().unwrap(),
-        r#"{"primitive":42,"object":{"before":false,"after":true},"state":{"before":false,"after":true,"reuseError":"TypeError","status":200}}"#
+        r#"{"primitive":42,"object":{"before":false,"after":true},"asyncPrimitive":7,"asyncString":"resolved","state":{"before":false,"after":true,"reuseError":"TypeError","status":200}}"#
     );
 }
 
