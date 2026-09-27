@@ -7653,9 +7653,16 @@ await browser.close();
     drop(guard);
     assert_no_leftover_web_runtime_processes("run_evalawait");
     assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(value["primitive"], 42, "{value:#}");
+    assert_eq!(value["object"], json!({"before": false, "after": true}), "{value:#}");
+    assert_eq!(value["asyncPrimitive"], 7, "{value:#}");
+    assert_eq!(value["asyncString"], "resolved", "{value:#}");
     assert_eq!(
-        ran.result.as_ref().unwrap()["stdout"].as_str().unwrap(),
-        r#"{"primitive":42,"object":{"before":false,"after":true},"asyncPrimitive":7,"asyncString":"resolved","state":{"before":false,"after":true,"reuseError":"TypeError","status":200}}"#
+        value["state"],
+        json!({"before": false, "after": true, "reuseError": "TypeError", "status": 200}),
+        "{value:#}"
     );
 }
 

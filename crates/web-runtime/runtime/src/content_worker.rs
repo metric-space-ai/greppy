@@ -1926,12 +1926,6 @@ impl ContentEngine {
         }
 
         loop {
-            if delegate.document_generation.get() != document_generation {
-                self.drop_wait_slot(&webview, &token, None);
-                return Err(io::Error::other(
-                    "page.evaluate Promise was interrupted by navigation",
-                ));
-            }
             let completed = match self.take_completed_evaluate_slot(&webview, &token, deadline) {
                 Ok(completed) => completed,
                 Err(error) => {
@@ -1952,6 +1946,12 @@ impl ContentEngine {
                         "page.evaluate Promise completed with invalid status {other:?}"
                     ))),
                 };
+            }
+            if delegate.document_generation.get() != document_generation {
+                self.drop_wait_slot(&webview, &token, None);
+                return Err(io::Error::other(
+                    "page.evaluate Promise was interrupted by navigation",
+                ));
             }
             if Instant::now() >= deadline {
                 self.drop_wait_slot(&webview, &token, None);
