@@ -2861,8 +2861,8 @@ struct GraphIndex {
     rust_namespaces_by_file:
         std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
     /// Declared Cargo target files for this project. `None` means no readable
-    /// Cargo manifest was available, so the legacy source-layout fallback is
-    /// retained; `Some` is authoritative, including an empty set.
+    /// Cargo manifest was available. Uncovered files retain the conventional
+    /// source-layout fallback because target discovery is intentionally bounded.
     rust_crate_roots: Option<std::collections::HashSet<String>>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
@@ -2937,21 +2937,23 @@ fn rust_module_files_for_module_path_with_crate_roots(
     {
         match module {
             "crate" if position == 0 => {
-                base = if let Some(roots) = crate_roots {
-                    rust_crate_root_for_file(referrer_file, roots)
-                } else {
-                    let root_end = referrer_file
-                        .rfind("/src/")
-                        .map(|offset| offset + "/src".len())
-                        .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
-                    root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
-                }
-                .unwrap_or_else(|| {
-                    referrer
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .to_path_buf()
-                });
+                base = crate_roots
+                    .and_then(|roots| rust_crate_root_for_file(referrer_file, roots))
+                    .or_else(|| {
+                        // Manifest discovery is intentionally bounded. Preserve
+                        // conventional crate resolution for uncovered members.
+                        let root_end = referrer_file
+                            .rfind("/src/")
+                            .map(|offset| offset + "/src".len())
+                            .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                        root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                    })
+                    .unwrap_or_else(|| {
+                        referrer
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .to_path_buf()
+                    });
             }
             "self" if position == 0 => {}
             "super" => {
@@ -6135,6 +6137,23 @@ def Widget():
                 target.qualified_name
             );
         }
+    }
+
+    #[test]
+    fn rust_crate_root_uncovered_manifest_member_preserves_conventional_layout() {
+        let roots = std::collections::HashSet::from(["other/src/lib.rs".to_string()]);
+        let files = rust_module_files_for_module_path_with_crate_roots(
+            "crates/widget/src/nested/caller.rs",
+            "crate::helpers",
+            Some(&roots),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "crates/widget/src/helpers.rs".to_string(),
+                "crates/widget/src/helpers/mod.rs".to_string(),
+            ]
+        );
     }
 
     #[test]
