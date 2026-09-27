@@ -1719,6 +1719,64 @@ fn resolve_and_persist_edges_with_progress(
         resolved.push(new_edge(project, src_id, target_id, edge));
     }
 
+    // A Store-CoW Delta resolves only its own raw edges, but a qualified Rust
+    // reference can depend on reexports in the immutable Base. Hydrate import
+    // context only for module files reached from the Delta's imports. This
+    // preserves the O(Delta + reached modules) bound instead of scanning every
+    // Base raw edge, while allowing `channels::target` to follow a Base
+    // `pub use command::{..., target}`.
+    if store.is_overlay() {
+        let mut pending = index
+            .rust_namespaces_by_file
+            .values()
+            .flat_map(|aliases| aliases.values().flatten().cloned())
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(module_file) = pending.pop() {
+            if !seen.insert(module_file.clone()) {
+                continue;
+            }
+            for raw in store.list_raw_edges_for_file(project, &module_file)? {
+                let edge = extracted_edge_from_raw(raw);
+                if edge.edge_type != "IMPORTS" {
+                    continue;
+                }
+                let Some(src) = index.by_qname(&edge.source_qualified_name) else {
+                    continue;
+                };
+                let src_id = src.id;
+                let src_file = src.file_path.clone();
+                index.record_import_items(&edge, &src_file);
+                let Some(name) = edge
+                    .properties
+                    .get("imported_name")
+                    .and_then(|value| value.as_str())
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let path = edge
+                    .properties
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if let Some(target_id) = index
+                    .unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+                    .filter(|target_id| *target_id != src_id)
+                {
+                    index.record_import(&src_file, target_id);
+                }
+            }
+            pending.extend(
+                index
+                    .rust_namespaces_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|aliases| aliases.values().flatten().cloned()),
+            );
+        }
+    }
+
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
     for edge in edges.iter().filter(|e| e.edge_type != "IMPORTS") {
         examined += 1;
@@ -4255,6 +4313,82 @@ mod tests {
             "missing Delta metadata requires migration"
         );
         assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        drop(overlay);
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(stores);
+    }
+
+    #[test]
+    fn overlay_delta_resolves_rust_usage_through_base_reexport() {
+        let repo = setup_multifile_repo(
+            "overlay-base-reexport",
+            "mod business_os; mod channels;\n",
+            "// fixture placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/business_os")).unwrap();
+        fs::create_dir_all(repo.join("src/channels")).unwrap();
+        fs::write(repo.join("src/business_os/mod.rs"), "pub mod store;\n").unwrap();
+        let caller_source =
+            "use crate::channels;\npub fn caller() { let selected = channels::target; selected(); }\n";
+        fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
+        fs::write(
+            repo.join("src/channels/mod.rs"),
+            "mod command; pub use command::{first, target};\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/command.rs"),
+            "pub fn first() {}\npub fn target() {}\n",
+        )
+        .unwrap();
+
+        let stores = repo.with_extension("overlay-base-reexport-stores");
+        fs::create_dir_all(&stores).unwrap();
+        let base_path = stores.join("base.db");
+        let delta_path = stores.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+        }
+
+        fs::write(
+            repo.join("src/business_os/store.rs"),
+            format!("{caller_source}// dirty worktree comment\n"),
+        )
+        .unwrap();
+        let dirty_path = "src/business_os/store.rs".to_string();
+        let visibility =
+            greppy_store::VisibilityIndex::new([dirty_path.clone()], Vec::<String>::new())
+                .unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        index_with_options(
+            &mut overlay,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(std::collections::BTreeSet::from([dirty_path])),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        rebuild_overlay_edges(&mut overlay, "test").unwrap();
+
+        let target = overlay
+            .get_node_by_qname("test", "src/channels/command.rs::Function::target")
+            .unwrap()
+            .expect("Base target remains visible");
+        let caller = overlay
+            .get_node_by_qname("test", "src/business_os/store.rs::Function::caller")
+            .unwrap()
+            .expect("dirty Delta caller");
+        let incoming = overlay
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap();
+        assert!(
+            incoming.iter().any(|edge| edge.source_id == caller.id),
+            "dirty Delta usage must resolve through the Base grouped reexport: {incoming:?}"
+        );
+
         drop(overlay);
         let _ = fs::remove_dir_all(repo);
         let _ = fs::remove_dir_all(stores);
