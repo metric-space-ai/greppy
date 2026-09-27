@@ -1776,9 +1776,8 @@ fn resolve_and_persist_edges_with_progress(
             );
             if let Some(globs) = index.import_globs_by_file.get(&module_file) {
                 for glob in globs {
-                    let probe = format!("{glob}::__export__");
                     pending.extend(
-                        rust_module_files_for_path(&module_file, &probe, "__export__")
+                        rust_module_files_for_module_path(&module_file, glob)
                             .into_iter()
                             .filter(|file| index.known_files.contains(file)),
                     );
@@ -2732,8 +2731,10 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
     else {
         return Vec::new();
     };
-    let mut parts = module_path.split("::").filter(|part| !part.is_empty());
-    let first = parts.next();
+    rust_module_files_for_module_path(referrer_file, module_path)
+}
+
+fn rust_module_files_for_module_path(referrer_file: &str, module_path: &str) -> Vec<String> {
     let referrer = Path::new(referrer_file);
     let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
     let is_module_root = referrer
@@ -2745,32 +2746,32 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
     } else {
         referrer.with_extension("")
     };
-    let mut modules = Vec::new();
-    match first {
-        Some("crate") => {
-            let root_end = referrer_file
-                .rfind("/src/")
-                .map(|offset| offset + "/src".len())
-                .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
-            base = root_end
-                .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
-                .unwrap_or_else(|| {
-                    referrer
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .to_path_buf()
-                });
+    for (position, module) in module_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        match module {
+            "crate" if position == 0 => {
+                let root_end = referrer_file
+                    .rfind("/src/")
+                    .map(|offset| offset + "/src".len())
+                    .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                base = root_end
+                    .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                    .unwrap_or_else(|| {
+                        referrer
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .to_path_buf()
+                    });
+            }
+            "self" if position == 0 => {}
+            "super" => {
+                base.pop();
+            }
+            part => base.push(part),
         }
-        Some("self") => {}
-        Some("super") => {
-            base.pop();
-        }
-        Some(part) => modules.push(part),
-        None => return Vec::new(),
-    }
-    modules.extend(parts);
-    for module in modules {
-        base.push(module);
     }
     let flat = base
         .with_extension("rs")
@@ -3105,8 +3106,7 @@ impl GraphIndex {
         }
         if let Some(globs) = self.import_globs_by_file.get(module_file) {
             for glob in globs {
-                let ref_path = format!("{glob}::{name}");
-                for exported_file in rust_module_files_for_path(module_file, &ref_path, name) {
+                for exported_file in rust_module_files_for_module_path(module_file, glob) {
                     if self.known_files.contains(&exported_file) {
                         self.rust_module_export_targets_from_file(
                             &exported_file,
@@ -4412,18 +4412,20 @@ mod tests {
     fn overlay_delta_resolves_rust_usage_through_base_reexports() {
         let repo = setup_multifile_repo(
             "overlay-base-reexport",
-            "mod business_os; mod channels; mod glob_channels; mod renamed_channels;\n",
+            "mod business_os; mod channels; mod glob_channels; mod parent; mod renamed_channels;\n",
             "// fixture placeholder\n",
         );
         fs::create_dir_all(repo.join("src/business_os")).unwrap();
         fs::create_dir_all(repo.join("src/channels")).unwrap();
         fs::create_dir_all(repo.join("src/glob_channels")).unwrap();
+        fs::create_dir_all(repo.join("src/parent/child")).unwrap();
         fs::create_dir_all(repo.join("src/renamed_channels")).unwrap();
         fs::write(repo.join("src/business_os/mod.rs"), "pub mod store;\n").unwrap();
-        let caller_source = "use crate::{channels, glob_channels, renamed_channels};\n\
+        let caller_source = "use crate::{channels, glob_channels, parent::child, renamed_channels};\n\
 pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
 pub fn renamed_caller() { let selected = renamed_channels::renamed; selected(); }\n\
-pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n";
+pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n\
+pub fn super_glob_caller() { let selected = child::target; selected(); }\n";
         fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
         fs::write(
             repo.join("src/channels/mod.rs"),
@@ -4443,6 +4445,16 @@ pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n";
         fs::write(
             repo.join("src/glob_channels/command.rs"),
             "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/parent/mod.rs"),
+            "pub fn target() {}\npub mod child;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/parent/child/mod.rs"),
+            "pub use super::*;\n",
         )
         .unwrap();
         fs::write(
@@ -4502,6 +4514,11 @@ pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n";
                 "src/glob_channels/command.rs::Function::target",
                 "src/business_os/store.rs::Function::glob_caller",
                 "glob",
+            ),
+            (
+                "src/parent/mod.rs::Function::target",
+                "src/business_os/store.rs::Function::super_glob_caller",
+                "transitive super glob",
             ),
         ] {
             let target = overlay
