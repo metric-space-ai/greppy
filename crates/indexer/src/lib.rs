@@ -6156,6 +6156,8 @@ def Widget():
             vec![
                 "crates/widget/src/helpers.rs".to_string(),
                 "crates/widget/src/helpers/mod.rs".to_string(),
+                "crates/widget/src/helpers/lib.rs".to_string(),
+                "crates/widget/src/helpers/main.rs".to_string(),
             ]
         );
     }
