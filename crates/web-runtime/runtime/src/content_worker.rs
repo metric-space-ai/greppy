@@ -1318,8 +1318,14 @@ impl ContentEngine {
     }
 
     fn spin_all_event_loops(&self) {
+        if let Err(error) = self.rendering_context.make_current() {
+            eprintln!("web-runtime: root renderer make_current failed: {error:?}");
+        }
         self.servo.spin_event_loop();
         for bundle in self.context_bundles.values() {
+            if let Err(error) = bundle.rendering_context.make_current() {
+                eprintln!("web-runtime: context renderer make_current failed: {error:?}");
+            }
             bundle.servo.spin_event_loop();
         }
     }
@@ -2870,7 +2876,7 @@ impl ContentEngine {
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 match self.evaluate(webview, &inner_text_script(&selector))? {
                     JSValue::String(text) => Ok(json!({ "text": text })),
                     other => Err(io::Error::other(format!(
@@ -3071,7 +3077,7 @@ impl ContentEngine {
             }
             "page.screenshot" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = params.get("clip").and_then(|value| {
                     if !value.is_object() {
                         return None;
@@ -3107,9 +3113,14 @@ impl ContentEngine {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false)
                 {
-                    self.screenshot_png_render_complete(&webview, clip)?
+                    self.screenshot_png_render_complete(
+                        &webview,
+                        &delegate.rendering_context,
+                        &delegate.wake,
+                        clip,
+                    )?
                 } else {
-                    self.screenshot_png(&webview, clip)?
+                    self.screenshot_png(&webview, &delegate.rendering_context, clip)?
                 };
                 screenshot_engine_result(&png)
             }
@@ -3136,7 +3147,7 @@ impl ContentEngine {
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let script = format!(
                     "(function(selector) {{ {SELECTOR_RUNTIME} return greppyResolveNodes(selector).length; }})({selector})"
                 );
@@ -3290,14 +3301,14 @@ impl ContentEngine {
             "locator.screenshot" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = Some((
                     resolved.x.max(0.0) as u32,
                     resolved.y.max(0.0) as u32,
                     resolved.width.max(1.0) as u32,
                     resolved.height.max(1.0) as u32,
                 ));
-                let png = self.screenshot_png(&webview, clip)?;
+                let png = self.screenshot_png(&webview, &delegate.rendering_context, clip)?;
                 screenshot_engine_result(&png)
             }
             "locator.allTextContents" => {
@@ -3898,24 +3909,32 @@ impl ContentEngine {
                         },
                     };
                     let id = self.alloc_id("page");
-                    let (profile, wake, user_content) = match bundle.as_ref() {
+                    let (rendering_context, profile, wake, user_content) = match bundle.as_ref() {
                         Some(bundle) => (
+                            Rc::clone(&bundle.rendering_context),
                             bundle.profile.clone(),
                             bundle.wake.clone(),
                             Rc::clone(&bundle.user_content),
                         ),
                         None => (
+                            Rc::clone(&self.rendering_context),
                             self.profile.clone(),
                             self.wake.clone(),
                             Rc::clone(&self.user_content),
                         ),
                     };
                     let delegate = Rc::new(Delegate::new(
-                        Rc::clone(&self.rendering_context),
+                        rendering_context,
                         profile,
                         wake,
                         user_content,
                     ));
+                    if let Some(bundle) = bundle.as_ref() {
+                        debug_assert!(Rc::ptr_eq(
+                            &delegate.rendering_context,
+                            &bundle.rendering_context
+                        ));
+                    }
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(
                         id.clone(),
@@ -4534,17 +4553,22 @@ impl ContentEngine {
     fn screenshot_png_render_complete(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
+        wake: &WakeFlag,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        self.rendering_context.present();
+        rendering_context.present();
         let saved = Rc::new(RefCell::new(None));
         let callback = Rc::clone(&saved);
         webview.take_screenshot(None, move |result| {
             *callback.borrow_mut() = Some(result);
         });
         let pending = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
+        if !self.spin_until_on(wake, ACTION_TIMEOUT, move || pending.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out waiting for complete rendering; retry without renderComplete for an instant screenshot",
@@ -4561,6 +4585,7 @@ impl ContentEngine {
     fn screenshot_png(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
         // An agent's screenshot means "what does the page look like NOW".
@@ -4576,8 +4601,11 @@ impl ContentEngine {
         // holds the freshly painted frame until present swaps it away. The
         // present afterwards keeps the swap chain producing frames so
         // locator actionability never sees `stable` (event_loop_stalled).
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        let size = self.rendering_context.size2d();
+        let size = rendering_context.size2d();
         let rect = servo::DeviceIntRect::from_size(servo::DeviceIntSize::new(
             size.width as i32,
             size.height as i32,
@@ -4585,15 +4613,18 @@ impl ContentEngine {
         // `read_to_image` returns None only when nothing has rendered yet
         // (a page that has not produced its first frame). Give that first
         // frame a short window instead of the old 30s readiness wait.
-        let mut image = self.rendering_context.read_to_image(rect);
-        self.rendering_context.present();
+        let mut image = rendering_context.read_to_image(rect);
+        rendering_context.present();
         if image.is_none() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while image.is_none() && Instant::now() < deadline {
                 self.spin_all_event_loops();
+                rendering_context.make_current().map_err(|error| {
+                    io::Error::other(format!("renderer make_current failed: {error:?}"))
+                })?;
                 webview.paint();
-                image = self.rendering_context.read_to_image(rect);
-                self.rendering_context.present();
+                image = rendering_context.read_to_image(rect);
+                rendering_context.present();
             }
         }
         let image = image.ok_or_else(|| {
