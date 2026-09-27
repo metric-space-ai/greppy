@@ -141,25 +141,23 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
-/// Build a validation-only view for TypeScript import-type queries that the
-/// bundled grammar reports as errors below an outer `typeof`.
+/// Build a validation-only view for an import-type query that the bundled
+/// grammar has already placed inside a `type_arguments` node but reports an
+/// ERROR/MISSING token at the closing generic delimiter.
 ///
-/// Candidates are recognized by a small lexical scanner, only in normal code
-/// (never comments, strings, or templates), and only when the raw parse has an
-/// ERROR/MISSING node at that candidate. Horizontal whitespace is accepted,
-/// while newlines and line continuations are deliberately left untouched.
-/// Replacing only the `import("literal")` portion with a one-byte identifier
-/// plus spaces preserves every byte and line coordinate.
+/// The parse-tree ancestry is the authority for type context. Text that merely
+/// resembles `typeof import("...")` in a comment, string, template, regex, or
+/// value expression cannot qualify. The substituted span preserves length and
+/// retains every newline, so subsequent tree coordinates still name the
+/// proposed source.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
-    if language != (Language::TypeScript { tsx: false }) &&
-        language != (Language::TypeScript { tsx: true })
-    {
+    if !matches!(language, Language::TypeScript { .. }) {
         return Cow::Borrowed(content);
     }
-
     let Ok(raw_tree) = greppy_parser::parse(language, content) else {
         return Cow::Borrowed(content);
     };
+
     let mut error_offsets = Vec::new();
     let mut tree_cursor = raw_tree.walk();
     let mut reached_root = false;
@@ -188,127 +186,110 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
     fn identifier_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
     }
-    fn horizontal_space(byte: u8) -> bool {
-        matches!(byte, b' ' | b'\t' | 0x0c)
-    }
-    fn skip_quoted(content: &[u8], start: usize, quote: u8) -> usize {
-        let mut cursor = start + 1;
-        while let Some(&byte) = content.get(cursor) {
-            if byte == b'\\' {
-                cursor += 2;
-                continue;
-            }
-            cursor += 1;
-            if byte == quote || byte == b'\n' || byte == b'\r' {
-                break;
-            }
-        }
-        cursor
-    }
-
     let mut normalized: Option<Vec<u8>> = None;
-    let mut cursor = 0usize;
-    while cursor < content.len() {
-        match (content.get(cursor), content.get(cursor + 1)) {
-            (Some(b'/'), Some(b'/')) => {
-                cursor += 2;
-                while !matches!(content.get(cursor), None | Some(b'\n' | b'\r')) {
-                    cursor += 1;
-                }
-                continue;
-            },
-            (Some(b'/'), Some(b'*')) => {
-                cursor += 2;
-                while cursor + 1 < content.len() &&
-                    !matches!((content[cursor], content[cursor + 1]), (b'*', b'/'))
-                {
-                    cursor += 1;
-                }
-                cursor = (cursor + 2).min(content.len());
-                continue;
-            },
-            (Some(&quote @ (b'\'' | b'"' | b'`')), _) => {
-                cursor = skip_quoted(content, cursor, quote);
-                continue;
-            },
-            _ => {},
-        }
-
-        const TYPEOF: &[u8] = b"typeof";
-        if !content[cursor..].starts_with(TYPEOF) ||
-            cursor.checked_sub(1).and_then(|at| content.get(at)).is_some_and(|b| identifier_byte(*b)) ||
-            content.get(cursor + TYPEOF.len()).is_some_and(|b| identifier_byte(*b))
-        {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        cursor += TYPEOF.len();
-        let whitespace_start = cursor;
-        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
-            cursor += 1;
-        }
-        if cursor == whitespace_start || !content[cursor..].starts_with(b"import") ||
-            content.get(cursor + b"import".len()).is_some_and(|b| identifier_byte(*b))
+    let mut scan = 0usize;
+    while scan + b"typeof".len() <= content.len() {
+        let Some(relative) = content[scan..]
+            .windows(b"typeof".len())
+            .position(|window| window == b"typeof")
+        else {
+            break;
+        };
+        let start = scan + relative;
+        scan = start + b"typeof".len();
+        if start
+            .checked_sub(1)
+            .and_then(|at| content.get(at))
+            .is_some_and(|byte| identifier_byte(*byte)) ||
+            content.get(scan).is_some_and(|byte| identifier_byte(*byte))
         {
             continue;
         }
-        let import_start = cursor;
-        cursor += b"import".len();
-        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
-            cursor += 1;
-        }
-        if content.get(cursor) != Some(&b'(') {
-            continue;
-        }
-        cursor += 1;
-        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
-            cursor += 1;
-        }
-        let quote_at = cursor;
-        let Some(&quote @ (b'\'' | b'"')) = content.get(quote_at) else {
+        let Some(type_node) = raw_tree
+            .root_node()
+            .descendant_for_byte_range(start, scan)
+        else {
             continue;
         };
-        cursor = quote_at + 1;
+        let mut ancestor = Some(type_node);
+        let mut in_type_arguments = false;
+        while let Some(node) = ancestor {
+            if node.kind() == "type_arguments" {
+                in_type_arguments = true;
+                break;
+            }
+            ancestor = node.parent();
+        }
+        if !in_type_arguments {
+            continue;
+        }
+
+        let whitespace_start = scan;
+        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            scan += 1;
+        }
+        if scan == whitespace_start || !content[scan..].starts_with(b"import") {
+            continue;
+        }
+        let import_start = scan;
+        scan += b"import".len();
+        if content.get(scan).is_some_and(|byte| identifier_byte(*byte)) {
+            continue;
+        }
+        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            scan += 1;
+        }
+        if content.get(scan) != Some(&b'(') {
+            continue;
+        }
+        scan += 1;
+        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            scan += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = content.get(scan) else {
+            continue;
+        };
+        scan += 1;
         let mut escaped = false;
-        while let Some(&byte) = content.get(cursor) {
+        let mut line_continuation = false;
+        while let Some(&byte) = content.get(scan) {
             if escaped {
-                if byte == b'\n' || byte == b'\r' {
-                    break;
-                }
+                line_continuation |= matches!(byte, b'\n' | b'\r');
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
             } else if byte == quote {
                 break;
-            } else if byte == b'\n' || byte == b'\r' {
+            } else if matches!(byte, b'\n' | b'\r') {
                 break;
             }
-            cursor += 1;
+            scan += 1;
         }
-        if content.get(cursor) != Some(&quote) {
+        if line_continuation || content.get(scan) != Some(&quote) {
             continue;
         }
-        cursor += 1;
-        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
-            cursor += 1;
+        scan += 1;
+        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            scan += 1;
         }
-        if content.get(cursor) != Some(&b')') {
+        if content.get(scan) != Some(&b')') {
             continue;
         }
-        let import_end = cursor + 1;
+        let import_end = scan + 1;
         if !error_offsets
             .iter()
             .any(|error| *error >= start && *error <= import_end + 1)
         {
-            cursor = import_end;
             continue;
         }
+
         let output = normalized.get_or_insert_with(|| content.to_vec());
-        let span = &mut output[import_start..import_end];
-        span.fill(b' ');
-        span[0] = b'T';
-        cursor = import_end;
+        for (offset, byte) in output[import_start..import_end].iter_mut().enumerate() {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = if offset == 0 { b'T' } else { b' ' };
+            }
+        }
+        scan = import_end;
     }
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
@@ -512,6 +493,7 @@ mod tests {
         for valid_whitespace in [
             br#"type ChildProcess = typeof  import ("node:child_process");"#.as_slice(),
             b"type ChildProcess = typeof\timport\t(\t'node:child_process'\t);".as_slice(),
+            b"const value = call<typeof\n  import(\n    \"node:child_process\"\n  )>();".as_slice(),
         ] {
             assert_eq!(
                 syntax_counts(language, valid_whitespace),
@@ -539,6 +521,7 @@ mod tests {
         for lexically_invalid in [
             br#"/* typeof import("*/") */"#.as_slice(),
             br#"const value = "typeof import(\"node:child_process\")"#.as_slice(),
+            br#"const r = /typeof import("/")/;"#.as_slice(),
         ] {
             assert!(
                 syntax_counts(language, lexically_invalid)
