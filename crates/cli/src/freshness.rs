@@ -640,6 +640,23 @@ pub(crate) fn freshness_json_is_fresh(freshness: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn recover_missing_query_base(root: Option<&str>, effective_root: &Path) -> Result<()> {
+    if !auto_reindex_enabled() {
+        return Ok(());
+    }
+    if let Some((base_path, _)) =
+        crate::store_cow::overlay_environment_for_recovery(effective_root)?
+    {
+        if !base_path.is_file() {
+            // Join the ordinary coordinated structural publication before any
+            // reader attaches the overlay. Never serve the incomplete Delta or
+            // require the caller to run a separate index command.
+            wait_for_first_use_index(root, effective_root)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     // The graph DB lives under the platform locator, never at
     // `<cwd>/.greppy/graph.db`. When no
@@ -655,6 +672,7 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
     }
+    recover_missing_query_base(root, &effective_root)?;
     if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment(&effective_root)?
     {
         greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
@@ -941,6 +959,9 @@ fn open_default_store_writer(
 ) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
     let path = workspace_locator::store_path(&effective_root);
+    if require_existing_index {
+        recover_missing_query_base(root, &effective_root)?;
+    }
     if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
         greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
             Error::io(

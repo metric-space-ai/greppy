@@ -1103,6 +1103,114 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
 }
 
 #[test]
+fn normal_query_recovers_missing_persisted_base_without_semantic_rebuild() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let linked = scratch.path().join("linked");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/lib.rs"),
+        "pub fn target() -> i32 { 1 }\npub fn old_caller() -> i32 { target() }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(&primary, &["config", "user.email", "recovery@test.invalid"]);
+    git(&primary, &["config", "user.name", "Base Recovery"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    let pinned_commit = git(&primary, &["rev-parse", "HEAD"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    index(&linked, &store, None);
+    let before = query_json_raw(&linked, &store, &["index", "status"], None);
+    let missing_base = PathBuf::from(before["store_cow"]["base_path"].as_str().unwrap());
+    let delta_path = PathBuf::from(before["store_path"].as_str().unwrap());
+    std::fs::write(primary.join("src/later.rs"), "pub fn later_primary() {}\n").unwrap();
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "advance primary"]);
+    std::fs::write(
+        linked.join("src/lib.rs"),
+        "pub fn target() -> i32 { 1 }\npub fn live_caller() -> i32 { target() }\n",
+    )
+    .unwrap();
+    std::fs::remove_file(&missing_base).unwrap();
+
+    let query = ["who-calls", "target", "--json", "--all"];
+    let (disabled_code, _, disabled_err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    assert_eq!(disabled_code, 64, "{disabled_err}");
+    assert!(
+        disabled_err.contains("Base Store is missing"),
+        "{disabled_err}"
+    );
+    assert!(!missing_base.exists(), "explicit opt-out must not rebuild");
+
+    // No explicit index command or retry: the first normal query must join
+    // structural publication and answer from the recovered Base plus dirty Delta.
+    let (code, out, err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[("GREPPY_AUTO_REINDEX", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("live_caller"), "{out}");
+    assert!(!out.contains("old_caller"), "{out}");
+    assert!(missing_base.is_file());
+    let delta = greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+        .unwrap();
+    let binding: String = delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'store_cow.binding.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+    assert_eq!(binding["base_commit"], pinned_commit);
+    let base =
+        greppy_store::Store::open_with(&missing_base, greppy_store::OpenOptions::read_only())
+            .unwrap();
+    let deferred: i64 = base
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM schema_meta WHERE key LIKE 'store_cow.embedding_deferred.v1:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(deferred > 0, "query recovery must defer semantic inference");
+    drop(base);
+    drop(delta);
+    let (warm_code, warm_out, warm_err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(warm_code, 0, "{warm_out}\n{warm_err}");
+    assert!(warm_out.contains("live_caller"), "{warm_out}");
+}
+
+#[test]
 fn cold_linked_structural_query_uses_complete_private_graph_without_building_a_base() {
     let scratch = tempfile::tempdir().unwrap();
     let primary = scratch.path().join("primary");
