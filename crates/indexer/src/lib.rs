@@ -3124,12 +3124,16 @@ impl GraphIndex {
         if !seen.insert((module_file.to_string(), name.to_string())) {
             return;
         }
+        let initial_count = targets.len();
         targets.extend(
             self.defs_named(labels, name)
                 .into_iter()
                 .filter(|node| node.file_path == module_file)
                 .map(|node| node.id),
         );
+        if targets.len() > initial_count {
+            return;
+        }
         if let Some(aliases) = self
             .import_aliases_by_file
             .get(module_file)
@@ -3164,6 +3168,15 @@ impl GraphIndex {
                     );
                 }
             }
+        }
+        // An explicit binding shadows glob imports even when its target is
+        // unresolved; do not invent a different binding through a glob.
+        if self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return;
         }
         if let Some(globs) = self.import_globs_by_file.get(module_file) {
             for glob in globs {
@@ -3217,8 +3230,24 @@ impl GraphIndex {
             .iter()
             .filter(|node| node.file_path == referrer_file)
             .collect::<Vec<_>>();
-        if let [target] = local.as_slice() {
+        if let Some(target) = local
+            .iter()
+            .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+        {
             return UniqueResolution::Unique(target.id);
+        }
+        if self
+            .import_alias_sources_by_file
+            .get(referrer_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            let exported =
+                self.rust_module_export_targets(&[referrer_file.to_string()], name, labels);
+            return match exported.as_slice() {
+                [target] => UniqueResolution::Unique(*target),
+                [] => UniqueResolution::Unresolved,
+                _ => UniqueResolution::Ambiguous,
+            };
         }
         if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
             let module_files = globs
@@ -4486,6 +4515,7 @@ mod tests {
         let caller_source =
             "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
 use crate::bare_glob::*;\n\
+use crate::alias_chain::outer;\n\
 use super::*;\n\
 pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
 pub fn renamed_caller() { let selected = renamed_channels::renamed; selected(); }\n\
@@ -4495,7 +4525,9 @@ pub fn alias_chain_caller() { let selected = alias_chain::outer; selected(); }\n
 pub fn delta_crate_glob_caller() { let selected = bare_target; selected(); }\n\
 pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n\
 pub fn shadow_target() {}\n\
-pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n";
+pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n\
+pub struct Shadow; impl Shadow { pub fn shadow_target() {} }\n\
+pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
         fs::write(
             repo.join("src/alias_chain/mod.rs"),
@@ -4630,6 +4662,11 @@ pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n";
                 "src/business_os/store.rs::Function::shadow_target",
                 "src/business_os/store.rs::Function::local_shadow_caller",
                 "local item shadows Base glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::imported_alias_caller",
+                "explicit import of chained reexport",
             ),
         ] {
             let target = overlay
