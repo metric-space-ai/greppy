@@ -1908,6 +1908,35 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn agent_base_staging_manifest_name_matches_platform_contract() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("agent-base-staging-name");
+        let _restore = StoreDirRestore::set(&base.join("data"));
+        let identity_hash = "a".repeat(64);
+        let repository_hash = "b".repeat(64);
+        let short_name = format!(".building-{}-1-2", &identity_hash[..16]);
+        let directory = agent_base_stores_root()
+            .join(repository_hash)
+            .join(&short_name);
+        fs::create_dir_all(&directory).unwrap();
+
+        #[cfg(windows)]
+        {
+            write_agent_base_manifest(&directory, &identity_hash, "repo").unwrap();
+            let manifest = read_agent_base_manifest(&directory).unwrap();
+            assert_eq!(manifest.identity_hash, identity_hash);
+            assert!(write_agent_base_manifest(&directory, &"c".repeat(64), "repo").is_err());
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(write_agent_base_manifest(&directory, &identity_hash, "repo").is_err());
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[cfg(unix)]
     #[test]
     fn owned_data_root_symlink_is_resolved_but_descendant_symlinks_are_rejected() {

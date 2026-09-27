@@ -278,31 +278,22 @@ impl BaseStoreLayout {
             .parent()
             .ok_or_else(|| invalid_data("Base Store layout has no parent"))?;
         fs::create_dir_all(parent)?;
-        let suffix = if cfg!(windows) {
-            // Keep the staging path below Windows' legacy MAX_PATH limit.
-            // The published manifest still authenticates the complete
-            // identity hash; the prefix only identifies the private build
-            // directory while it is being assembled.
-            format!(
-                ".building-{}-{}-{}",
-                &expected_hash[..16],
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
+        // Windows filesystem/security calls are sensitive to the length of
+        // this private staging path. Keep the published manifest's complete
+        // identity hash, while shortening only the temporary directory name.
+        let staging_identity: &str = if cfg!(windows) {
+            &expected_hash[..16]
         } else {
-            format!(
-                ".building-{}-{}-{}",
-                expected_hash,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
+            expected_hash.as_str()
         };
+        let suffix = format!(
+            ".building-{staging_identity}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let building = parent.join(suffix);
         fs::create_dir(&building)?;
         greppy_core::cache::write_agent_base_manifest(
