@@ -436,17 +436,8 @@ impl Request {
         request.request.borrow_mut().headers = request.Headers(cx).get_headers_list();
 
         // Step 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
-        let input_body = if let RequestInfo::Request(ref mut input_request) = input {
-            if input_body_is_unusable {
-                return Err(Error::Type(c"Input body is unusable".to_owned()));
-            }
-            let input_body = input_request.request.borrow().body.clone();
-            clone_body_stream_for_dom_body(
-                cx,
-                &input_request.body_stream,
-                &request.body_stream,
-            )?;
-            input_body
+        let input_body = if let RequestInfo::Request(ref input_request) = input {
+            input_request.request.borrow().body.clone()
         } else {
             None
         };
@@ -521,6 +512,18 @@ impl Request {
         // There are multiple reassignments to similar values. In the end, all end up as
         // final_body. Therefore, final_body is equivalent to inputOrInitBody
         let init_body_is_non_null = init_body.is_some();
+        if !init_body_is_non_null && input_body.is_some() {
+            if input_body_is_unusable {
+                return Err(Error::Type(c"Input body is unusable".to_owned()));
+            }
+            if let RequestInfo::Request(ref input_request) = input {
+                clone_body_stream_for_dom_body(
+                    cx,
+                    &input_request.body_stream,
+                    &request.body_stream,
+                )?;
+            }
+        }
         let final_body = init_body.or(input_body);
 
         // Step 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:

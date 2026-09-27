@@ -3837,6 +3837,10 @@ const state = await page.evaluate(async () => {
   try { new Request(locked); } catch (error) { lockedError = error.name; }
   reader.releaseLock();
   const lockedResponse = await fetch(locked);
+  const consumed = new Request('/complete', { method: 'POST', body: 'body=old' });
+  await consumed.text();
+  const replacement = new Request(consumed, { body: 'body=replacement' });
+  const replacementResponse = await fetch(replacement);
   return {
     before,
     after,
@@ -3846,6 +3850,8 @@ const state = await page.evaluate(async () => {
     constructedStatus: constructedResponse.status,
     lockedError,
     lockedStatus: lockedResponse.status,
+    consumedUsed: consumed.bodyUsed,
+    replacementStatus: replacementResponse.status,
   };
 });
 console.log(JSON.stringify(state));
@@ -3865,7 +3871,14 @@ console.log(JSON.stringify(state));
     assert_eq!(state["constructedStatus"], 200, "{state:#}");
     assert_eq!(state["lockedError"], "TypeError", "{state:#}");
     assert_eq!(state["lockedStatus"], 200, "{state:#}");
-    for body in [b"body=once", b"body=source", b"body=locked"] {
+    assert_eq!(state["consumedUsed"], true, "{state:#}");
+    assert_eq!(state["replacementStatus"], 200, "{state:#}");
+    for body in [
+        b"body=once".as_slice(),
+        b"body=source".as_slice(),
+        b"body=locked".as_slice(),
+        b"body=replacement".as_slice(),
+    ] {
         assert_eq!(
             posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
             body
