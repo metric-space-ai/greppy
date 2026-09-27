@@ -58,9 +58,11 @@ pub enum FileDiff {
 ///
 /// 1. **stat tier** — compare the persisted `(size, mtime_ns, ctime_ns,
 ///    file_id)` against the on-disk stat (already captured by the discover
-///    walk, so this usually costs zero extra syscalls). Only a complete match
-///    is `Unchanged` without reading the body. Same-size replacements with a
-///    restored mtime still change ctime and/or file identity.
+///    walk, so this usually costs zero extra syscalls). Sub-second identities
+///    can fast-path immediately. Whole-second identities additionally require
+///    a persisted content proof captured after their timestamp bucket closed;
+///    this handles HFS+ same-size writes whose mtime, ctime and inode all stay
+///    unchanged without permanently hashing the file on every query.
 /// 2. **hash tier** — only files whose stat drifted (or that have no
 ///    persisted row / a `mtime_ns == 0` sentinel row) are read and
 ///    content-hashed, exactly as before. A touch that does not change
@@ -88,6 +90,8 @@ pub fn compute_file_diff(
     let persisted = store.list_file_states(project)?;
     let persisted_skips = store.list_index_skips(project)?;
     let identities = store.list_file_identities(project)?;
+    let mut coarse_proofs = read_coarse_timestamp_proofs(store);
+    let mut coarse_proofs_changed = false;
     let mut diffs = Vec::with_capacity(inventory.len());
     let max_size = max_file_size_bytes();
 
@@ -166,7 +170,13 @@ pub fn compute_file_diff(
             match persisted {
                 // Unchanged iff a row exists and both size & mtime
                 // line up with the current stat.
-                Some(p) if stat_identity_matches(&p, &current) => {
+                Some(p)
+                    if stat_fast_path_safe(
+                        &p,
+                        &current,
+                        coarse_proofs.get(&coarse_timestamp_proof_key(project, &entry.rel_path)),
+                    ) =>
+                {
                     diffs.push(FileDiff::Unchanged);
                 }
                 // No row, or stat drifted → treat as Modified so the
@@ -185,15 +195,24 @@ pub fn compute_file_diff(
         // "mtime unknown" sentinel some writers record; never fast-path
         // it (fall through to the hash tier).
         if let Some(p) = by_rel.get(&entry.rel_path) {
-            if stat_identity_matches(p, &current) {
+            if stat_fast_path_safe(
+                p,
+                &current,
+                coarse_proofs.get(&coarse_timestamp_proof_key(project, &entry.rel_path)),
+            ) {
                 by_rel.remove(&entry.rel_path);
                 diffs.push(FileDiff::Unchanged);
                 continue;
             }
         }
 
+        // Capture the observation boundary before the read. On a coarse
+        // filesystem, bytes read before the timestamp bucket closes cannot be
+        // certified by a clock sample taken after the read: a same-size write
+        // can race between the byte read and the indistinguishable final stat.
+        let hash_observation_started_ns = system_time_ns();
         // Hash tier (stat drifted or file unknown): safe to read + hash.
-        let (bytes, _) = read_stable_file(&entry.abs_path).map_err(|error| {
+        let (bytes, stable) = read_stable_file(&entry.abs_path).map_err(|error| {
             greppy_core::Error::io(format!("stable read {}", entry.abs_path.display()), error)
         })?;
         let sha = sha256_hex(&bytes);
@@ -203,8 +222,23 @@ pub fn compute_file_diff(
                 entry: entry.clone(),
                 old_sha256: p.sha256,
             }),
-            Some(_) => diffs.push(FileDiff::Unchanged),
+            Some(p) => {
+                if let Some(proof) =
+                    coarse_timestamp_proof(&p, &stable, hash_observation_started_ns)
+                {
+                    coarse_proofs
+                        .insert(coarse_timestamp_proof_key(project, &entry.rel_path), proof);
+                    coarse_proofs_changed = true;
+                }
+                diffs.push(FileDiff::Unchanged);
+            }
         }
+    }
+
+    if coarse_proofs_changed {
+        // The proof cache is an optimisation beside the read-only graph DB.
+        // A failed write only makes the next check hash coarse files again.
+        let _ = write_coarse_timestamp_proofs(store, &coarse_proofs);
     }
 
     // Anything left in by_rel is a deletion.
@@ -245,6 +279,178 @@ fn stat_identity_matches(persisted: &PersistedStat, current: &CurrentStat) -> bo
         && persisted.file_id.is_some()
         && current.file_id.is_some()
         && persisted.file_id == current.file_id
+}
+
+const COARSE_TIMESTAMP_QUANTUM_NS: i64 = 1_000_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoarseTimestampProof {
+    sha256: String,
+    size: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+    file_id: u64,
+    observation_started_ns: i64,
+}
+
+fn has_whole_second_identity(persisted: &PersistedStat) -> bool {
+    persisted.mtime_ns % COARSE_TIMESTAMP_QUANTUM_NS == 0
+        && persisted
+            .ctime_ns
+            .is_some_and(|value| value % COARSE_TIMESTAMP_QUANTUM_NS == 0)
+}
+
+fn coarse_bucket_end_ns(persisted: &PersistedStat) -> Option<i64> {
+    persisted
+        .ctime_ns
+        .map(|ctime| persisted.mtime_ns.max(ctime))?
+        .checked_add(COARSE_TIMESTAMP_QUANTUM_NS)
+}
+
+fn stat_fast_path_safe(
+    persisted: &PersistedStat,
+    current: &CurrentStat,
+    proof: Option<&CoarseTimestampProof>,
+) -> bool {
+    if !stat_identity_matches(persisted, current) {
+        return false;
+    }
+    if !has_whole_second_identity(persisted) {
+        return true;
+    }
+    let Some(proof) = proof else {
+        return false;
+    };
+    proof.sha256 == persisted.sha256
+        && proof.size == persisted.size
+        && proof.mtime_ns == persisted.mtime_ns
+        && Some(proof.ctime_ns) == persisted.ctime_ns
+        && Some(proof.file_id) == persisted.file_id
+        && coarse_bucket_end_ns(persisted)
+            .is_some_and(|bucket_end| proof.observation_started_ns >= bucket_end)
+}
+
+fn coarse_timestamp_proof(
+    persisted: &PersistedStat,
+    stable: &greppy_discover::StableFileMetadata,
+    observation_started_ns: i64,
+) -> Option<CoarseTimestampProof> {
+    if !has_whole_second_identity(persisted) {
+        return None;
+    }
+    let current = CurrentStat {
+        size: stable.size,
+        mtime_ns: stable.mtime_ns,
+        ctime_ns: stable.ctime_ns,
+        file_id: stable.file_id,
+    };
+    if !stat_identity_matches(persisted, &current) {
+        return None;
+    }
+    if !coarse_bucket_end_ns(persisted)
+        .is_some_and(|bucket_end| observation_started_ns >= bucket_end)
+    {
+        return None;
+    }
+    let (Some(ctime_ns), Some(file_id)) = (persisted.ctime_ns, persisted.file_id) else {
+        return None;
+    };
+    Some(CoarseTimestampProof {
+        sha256: persisted.sha256.clone(),
+        size: persisted.size,
+        mtime_ns: persisted.mtime_ns,
+        ctime_ns,
+        file_id,
+        observation_started_ns,
+    })
+}
+
+fn coarse_timestamp_proof_path(store: &Store) -> Option<std::path::PathBuf> {
+    let database = store.conn().path()?;
+    if database.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("{database}.coarseproof")))
+}
+
+fn coarse_timestamp_proof_key(project: &str, rel_path: &str) -> String {
+    let mut identity = Vec::with_capacity(project.len() + rel_path.len() + 1);
+    identity.extend_from_slice(project.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(rel_path.as_bytes());
+    sha256_hex(&identity)
+}
+
+fn read_coarse_timestamp_proofs(
+    store: &Store,
+) -> std::collections::HashMap<String, CoarseTimestampProof> {
+    let Some(path) = coarse_timestamp_proof_path(store) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return std::collections::HashMap::new();
+    };
+    let mut lines = body.lines();
+    if lines.next() != Some("v1") {
+        return std::collections::HashMap::new();
+    }
+    lines
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let key = fields.next()?.to_owned();
+            let proof = CoarseTimestampProof {
+                sha256: fields.next()?.to_owned(),
+                size: fields.next()?.parse().ok()?,
+                mtime_ns: fields.next()?.parse().ok()?,
+                ctime_ns: fields.next()?.parse().ok()?,
+                file_id: fields.next()?.parse().ok()?,
+                observation_started_ns: fields.next()?.parse().ok()?,
+            };
+            (fields.next().is_none()).then_some((key, proof))
+        })
+        .collect()
+}
+
+fn write_coarse_timestamp_proofs(
+    store: &Store,
+    proofs: &std::collections::HashMap<String, CoarseTimestampProof>,
+) -> std::io::Result<()> {
+    let Some(path) = coarse_timestamp_proof_path(store) else {
+        return Ok(());
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut entries: Vec<_> = proofs.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut body = String::from("v1\n");
+    for (key, proof) in entries {
+        use std::fmt::Write;
+        let _ = writeln!(
+            body,
+            "{} {} {} {} {} {} {}",
+            key,
+            proof.sha256,
+            proof.size,
+            proof.mtime_ns,
+            proof.ctime_ns,
+            proof.file_id,
+            proof.observation_started_ns
+        );
+    }
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), system_time_ns()));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(tmp, path)
+}
+
+fn system_time_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(error) => i64::try_from(error.duration().as_nanos())
+            .map(|value| -value)
+            .unwrap_or(i64::MIN),
+    }
 }
 
 fn skip_identity_matches(
@@ -884,10 +1090,151 @@ mod tests {
 
         let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
         assert_eq!(diffs.len(), 1);
+        if metadata.mtime_ns.unwrap() % COARSE_TIMESTAMP_QUANTUM_NS == 0
+            && metadata.ctime_ns.unwrap() % COARSE_TIMESTAMP_QUANTUM_NS == 0
+        {
+            assert!(matches!(diffs[0], FileDiff::Modified { .. }));
+        } else {
+            assert_eq!(diffs[0], FileDiff::Unchanged);
+        }
+    }
+
+    #[test]
+    fn coarse_exact_stat_match_without_proof_hashes_and_detects_change() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+
+        let dir = tempdir_via_env();
+        let mut entry = make_entry(&dir, "src/coarse.rs", "new-body");
+        entry.size = Some(8);
+        entry.mtime_ns = Some(10_000_000_000);
+        entry.ctime_ns = Some(10_000_000_000);
+        entry.file_id = Some(42);
+        store
+            .upsert_file_state(&FileState {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "rust".into(),
+                sha256: sha256_hex(b"old-body"),
+                mtime_ns: 10_000_000_000,
+                size: 8,
+                parser_version: "x".into(),
+                extractor_version: "x".into(),
+                last_indexed_generation: 1,
+            })
+            .unwrap();
+        store
+            .upsert_file_identity(
+                "p",
+                &entry.rel_path,
+                FileIdentity {
+                    ctime_ns: entry.ctime_ns,
+                    file_id: entry.file_id,
+                },
+            )
+            .unwrap();
+
+        let diffs = compute_file_diff(&store, "p", &[entry]).unwrap();
+        assert!(matches!(diffs.as_slice(), [FileDiff::Modified { .. }]));
+    }
+
+    #[test]
+    fn coarse_proof_rejects_a_read_that_started_before_bucket_closed() {
+        let persisted = PersistedStat {
+            sha256: sha256_hex(b"old-body"),
+            size: 8,
+            mtime_ns: 10_000_000_000,
+            ctime_ns: Some(10_000_000_000),
+            file_id: Some(42),
+        };
+        let stable = greppy_discover::StableFileMetadata {
+            size: 8,
+            mtime_ns: Some(10_000_000_000),
+            ctime_ns: Some(10_000_000_000),
+            file_id: Some(42),
+        };
+
+        // Simulate a read that starts one nanosecond before the bucket closes
+        // and completes afterward. Its before/after stat can still be exactly
+        // equal if a same-size HFS+ write lands during the read, so completion
+        // time must never be used to mint the proof.
+        assert!(coarse_timestamp_proof(&persisted, &stable, 10_999_999_999).is_none());
+        assert!(coarse_timestamp_proof(&persisted, &stable, 11_000_000_000).is_some());
+    }
+
+    #[test]
+    fn closed_coarse_bucket_proof_preserves_stat_only_hot_path() {
+        let dir = tempdir_via_env();
+        let mut store = Store::open(&dir.join("graph.db")).unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+
+        let mut entry = make_entry(&dir, "src/proven.rs", "real-body");
+        entry.size = Some(9);
+        entry.mtime_ns = Some(20_000_000_000);
+        entry.ctime_ns = Some(20_000_000_000);
+        entry.file_id = Some(84);
+        let persisted_sha = "proof-skips-content-hash".to_string();
+        store
+            .upsert_file_state(&FileState {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "rust".into(),
+                sha256: persisted_sha.clone(),
+                mtime_ns: 20_000_000_000,
+                size: 9,
+                parser_version: "x".into(),
+                extractor_version: "x".into(),
+                last_indexed_generation: 1,
+            })
+            .unwrap();
+        store
+            .upsert_file_identity(
+                "p",
+                &entry.rel_path,
+                FileIdentity {
+                    ctime_ns: entry.ctime_ns,
+                    file_id: entry.file_id,
+                },
+            )
+            .unwrap();
+        write_coarse_timestamp_proofs(
+            &store,
+            &std::collections::HashMap::from([(
+                coarse_timestamp_proof_key("p", &entry.rel_path),
+                CoarseTimestampProof {
+                    sha256: persisted_sha,
+                    size: 9,
+                    mtime_ns: 20_000_000_000,
+                    ctime_ns: 20_000_000_000,
+                    file_id: 84,
+                    observation_started_ns: 21_000_000_000,
+                },
+            )]),
+        )
+        .unwrap();
+
+        drop(store);
+        let store = Store::open_with(
+            &dir.join("graph.db"),
+            greppy_store::OpenOptions::read_only(),
+        )
+        .unwrap();
+
         assert_eq!(
-            diffs[0],
-            FileDiff::Unchanged,
-            "oversized file with matching stat must be Unchanged, not re-Modified every grep"
+            compute_file_diff(&store, "p", &[entry]).unwrap(),
+            vec![FileDiff::Unchanged]
         );
     }
 
@@ -1017,7 +1364,8 @@ mod tests {
         // stat must resolve to Unchanged WITHOUT reading the body. We
         // prove the body was not hashed by persisting a garbage sha256:
         // if the hash tier ran, the sha mismatch would flag Modified.
-        let mut store = Store::open_memory().unwrap();
+        let dir = tempdir_via_env();
+        let mut store = Store::open(&dir.join("graph.db")).unwrap();
         store
             .upsert_project(&Project {
                 name: "p".into(),
@@ -1026,7 +1374,6 @@ mod tests {
             })
             .unwrap();
 
-        let dir = tempdir_via_env();
         let entry = make_entry(&dir, "src/keep.rs", "stat-tier-body");
         let md = fs::metadata(&entry.abs_path).unwrap();
         store
@@ -1054,6 +1401,26 @@ mod tests {
                 },
             )
             .unwrap();
+
+        if metadata.mtime_ns.unwrap() % COARSE_TIMESTAMP_QUANTUM_NS == 0
+            && metadata.ctime_ns.unwrap() % COARSE_TIMESTAMP_QUANTUM_NS == 0
+        {
+            write_coarse_timestamp_proofs(
+                &store,
+                &std::collections::HashMap::from([(
+                    coarse_timestamp_proof_key("p", "src/keep.rs"),
+                    CoarseTimestampProof {
+                        sha256: "definitely-not-the-real-hash".into(),
+                        size: md.len() as i64,
+                        mtime_ns: metadata.mtime_ns.unwrap(),
+                        ctime_ns: metadata.ctime_ns.unwrap(),
+                        file_id: metadata.file_id.unwrap(),
+                        observation_started_ns: i64::MAX,
+                    },
+                )]),
+            )
+            .unwrap();
+        }
 
         let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
         assert_eq!(
