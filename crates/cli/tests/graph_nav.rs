@@ -414,6 +414,70 @@ fn who_calls_lists_cross_file_caller_with_file_line() {
 }
 
 #[test]
+fn who_calls_resolves_function_items_under_a_src_core_crate_root() {
+    let root = fresh_dir("src-core-crate-root");
+    let repo = root.join("repo");
+    let store = root.join("store");
+    let channels = repo.join("src/core/mission/channels");
+    let business_os = repo.join("src/core/business_os");
+    std::fs::create_dir_all(&channels).unwrap();
+    std::fs::create_dir_all(&business_os).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join("src/core/main.rs"),
+        "mod mission; mod business_os;\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
+    std::fs::write(
+        channels.join("mod.rs"),
+        "pub fn direct_target() {}\npub fn alternate_target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(business_os.join("mod.rs"), "pub mod store;\n").unwrap();
+    std::fs::write(
+        business_os.join("store.rs"),
+        "use crate::mission::channels;\n\
+         pub fn direct_caller() { channels::direct_target(); }\n\
+         pub fn function_item_caller(flag: bool) {\n\
+             let selected = if flag { channels::direct_target } else { channels::alternate_target };\n\
+             selected();\n\
+         }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "direct_target"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls direct_target should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("direct_caller"),
+        "missing direct caller: {out}"
+    );
+    assert!(
+        out.contains("function_item_caller"),
+        "missing function-item caller: {out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "alternate_target"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls alternate_target should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("function_item_caller"),
+        "missing alternate function-item caller: {out}"
+    );
+}
+
+#[test]
 fn who_calls_typescript_factory_callback_reports_module_variable() {
     let root = fresh_dir("typescript-factory-callback");
     let repo = root.join("repo");

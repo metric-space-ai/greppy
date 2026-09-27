@@ -18,7 +18,7 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v1";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v2";
 const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
@@ -719,11 +719,12 @@ pub(crate) fn visibility_for_open_connection(
 /// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
-/// The repair consumes only raw edges physically owned by the Delta and
-/// replaces only its logical overlay edges. Nodes, file state, and vector
-/// embeddings remain untouched. The schema-meta marker makes the operation
-/// one-shot for an otherwise unchanged Delta; a failed resolution leaves the
-/// marker absent so the next query can retry safely.
+/// The repair consumes the composed visible raw-edge view, including raw edges
+/// retained in an immutable Base, and replaces the logical overlay edges with
+/// results from the current resolver. Nodes, file state, and vector embeddings
+/// remain untouched. The schema-meta marker makes the operation one-shot for
+/// an otherwise unchanged Delta; a failed resolution leaves the marker absent
+/// so the next query can retry safely.
 pub(crate) fn repair_persisted_v7_delta(
     delta_path: &Path,
     base_path: &Path,
@@ -772,7 +773,7 @@ pub(crate) fn repair_persisted_v7_delta(
     }
     drop(current);
     let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
-    let raw_edges = overlay.list_delta_raw_edges(project)?;
+    let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
         let existing_edges: i64 = overlay
             .conn()
@@ -784,11 +785,12 @@ pub(crate) fn repair_persisted_v7_delta(
             .map_err(|error| Error::Store(format!("count persisted Delta edges: {error}")))?;
         if existing_edges != 0 {
             return Err(Error::Invalid(
-                "pre-PR138 Delta has resolved edges but no persisted raw edges to repair".into(),
+                "pre-PR138 Store-CoW graph has resolved edges but no persisted raw edges to repair"
+                    .into(),
             ));
         }
     }
-    greppy_indexer::rebuild_overlay_edges(&mut overlay, project)?;
+    greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, project)?;
     overlay
         .conn()
         .execute(
