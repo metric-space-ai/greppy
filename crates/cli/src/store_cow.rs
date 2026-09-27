@@ -1060,7 +1060,15 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
-                None if structural_first_use => None,
+                None if structural_first_use
+                    && !has_verified_previous_indexer_base(
+                        &primary,
+                        &base_commit,
+                        shared_data_root,
+                    )? =>
+                {
+                    None
+                }
                 None => {
                     // Only the first worktree for this immutable Git tree needs a
                     // clean materialization. Every later worktree opens the
@@ -1341,6 +1349,39 @@ fn reuse_verified_base_store(
     prepared_base_with_reader(&layout, manifest, true).map(Some)
 }
 
+/// Return whether a verified v6 Base is available for the current immutable
+/// inputs. Structural first use may skip a cold Base build, but it must still
+/// migrate an existing v6 artifact before publishing a v7 Delta: PR131's Rust
+/// extraction and resolution changes are not safe to hide behind a freshness
+/// proof over the old graph.
+fn has_verified_previous_indexer_base(
+    repo_root: &Path,
+    base_commit: &str,
+    shared_data_root: &Path,
+) -> Result<bool> {
+    let current_identity = base_identity_parts(repo_root, base_commit)?;
+    if current_identity.indexer_version != "greppy-indexer-v7" {
+        return Ok(false);
+    }
+    return has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity);
+}
+
+fn has_verified_previous_indexer_base_for_identity(
+    shared_data_root: &Path,
+    current_identity: &BaseStoreIdentity,
+) -> Result<bool> {
+    if current_identity.indexer_version != "greppy-indexer-v7" {
+        return Ok(false);
+    }
+    let mut previous_identity = current_identity.clone();
+    previous_identity.indexer_version = "greppy-indexer-v6".into();
+    let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+    Ok(layout
+        .read_verified_manifest()
+        .is_ok_and(|manifest| manifest.identity == previous_identity))
+}
+
 impl Drop for TemporaryBaseWorktree {
     fn drop(&mut self) {
         let _ = Command::new("git")
@@ -1596,6 +1637,11 @@ fn prepare_base_store_paths(
         // build to a background process outside the publication lease.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
+        // The outer structural query may defer its Delta embeddings. An
+        // immutable Base must still finish the migrated generation before
+        // publication; inheriting this flag would retain the old completion
+        // marker and make validation reject the new Base forever.
+        .env_remove(crate::ENV_STRUCTURAL_FIRST_USE)
         .env_remove("GREPPY_BACKGROUND_JOB")
         .env_remove("GREPPY_BACKGROUND_CAUSE")
         .env_remove("GREPPY_BACKGROUND_KIND")
@@ -2392,6 +2438,11 @@ mod tests {
 
         let mut current_identity = previous_identity;
         current_identity.indexer_version = "greppy-indexer-v7".into();
+        assert!(
+            has_verified_previous_indexer_base_for_identity(data_root.path(), &current_identity)
+                .unwrap(),
+            "a verified v6 Base must force structural first-use migration"
+        );
         let migrated_root = data_root.path().join("migrated-worktree");
         let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
         let staged_summary = seed_previous_indexer_base(
