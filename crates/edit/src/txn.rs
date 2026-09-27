@@ -563,6 +563,59 @@ mod tests {
         );
     }
 
+    /// Diagnostic only: retain the bundled grammar's exact recovery shape
+    /// before changing the validation adapter again. Run explicitly with
+    /// `--ignored --nocapture`; ordinary suites skip it.
+    #[test]
+    #[ignore = "raw parser diagnostic for the TypeScript import-type false rejection"]
+    fn diagnose_typescript_import_type_recovery_tree() {
+        let language = Language::TypeScript { tsx: false };
+        let source = br#"vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});
+"#;
+        let tree = greppy_parser::parse(language, source).unwrap();
+        eprintln!("ROOT_SEXP={}", tree.root_node().to_sexp());
+
+        let mut cursor = tree.walk();
+        let mut reached_root = false;
+        while !reached_root {
+            let node = cursor.node();
+            if node.is_error() || node.is_missing() {
+                let mut ancestors = Vec::new();
+                let mut parent = node.parent();
+                while let Some(current) = parent {
+                    ancestors.push(current.kind());
+                    parent = current.parent();
+                }
+                eprintln!(
+                    "PARSE_FAILURE kind={} missing={} bytes={}..{} points={:?}..{:?} text={:?} ancestors={:?}",
+                    node.kind(),
+                    node.is_missing(),
+                    node.start_byte(),
+                    node.end_byte(),
+                    node.start_position(),
+                    node.end_position(),
+                    String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]),
+                    ancestors,
+                );
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    reached_root = true;
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn applies_high_to_low_without_shifting() {
         let s = snap(b"aaa bbb ccc");
