@@ -3115,8 +3115,7 @@ impl GraphIndex {
                     .any(|known_file| known_file == module_file)
             });
             if !module_exists {
-                let owner = ref_path.rsplit("::").nth(1).unwrap_or("");
-                return self.resolve_associated_method(src_id, owner, name);
+                return self.resolve_associated_method(src_id, ref_path, name);
             }
             let in_module: Vec<i64> = self
                 .defs_named(&CALLABLE_LABELS, name)
@@ -3174,13 +3173,43 @@ impl GraphIndex {
     /// Resolve `Type::method()` only when `Type` itself resolves in the
     /// referrer's scope. This preserves imported and lowercase Rust type names
     /// without treating a missing qualified module as an unqualified call.
-    fn resolve_associated_method(&self, src_id: i64, owner: &str, name: &str) -> Option<i64> {
+    fn resolve_associated_method(&self, src_id: i64, ref_path: &str, name: &str) -> Option<i64> {
+        let owner = ref_path.rsplit("::").nth(1).unwrap_or("");
         if owner.is_empty() || name.is_empty() {
             return None;
         }
-        let owner_id = self
-            .resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
-            .unique_id()?;
+        let referrer_file = self.file_of(src_id)?;
+        let owner_path = ref_path.strip_suffix(name)?.strip_suffix("::")?;
+        let owner_id = if owner_path == owner {
+            self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
+                .unique_id()?
+        } else {
+            let first_segment = owner_path.split("::").next().unwrap_or("");
+            let module_files = self
+                .rust_namespaces_by_file
+                .get(referrer_file)
+                .and_then(|aliases| aliases.get(first_segment))
+                .map(|alias_files| rust_module_files_below_alias(alias_files, owner_path, owner))
+                .unwrap_or_else(|| rust_module_files_for_path(referrer_file, owner_path, owner));
+            let owners = self
+                .defs_named(&CONSTRUCTABLE_LABELS, owner)
+                .into_iter()
+                .filter(|candidate| {
+                    module_files.iter().any(|file| {
+                        candidate.file_path == *file
+                            || self
+                                .imports_by_file
+                                .get(file)
+                                .is_some_and(|targets| targets.contains(&candidate.id))
+                    })
+                })
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            match owners.as_slice() {
+                [id] => *id,
+                _ => return None,
+            }
+        };
         let owner_file = self.file_of(owner_id)?;
         let suffix = format!("::{owner}::{name}");
         let matches = self
@@ -4696,7 +4725,7 @@ def Widget():
     fn rust_qualified_function_item_resolves_through_grouped_reexport() {
         let repo = setup_multifile_repo(
             "rust-reexport-function-item",
-            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other;\nuse other::imported_worker;\nfn target() {}\nfn root_target() {}\nstruct worker; impl worker { fn run() {} }\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn left_direct_caller() { left::channel::target(); }\nfn local_associated_caller() { worker::run(); }\nfn imported_associated_caller() { imported_worker::run(); }\nfn missing_caller() { let _selected = missing::target; }\nfn missing_direct_caller() { missing::target(); }\n",
+            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other; mod types;\nuse other::imported_worker;\nfn target() {}\nfn root_target() {}\nstruct worker; impl worker { fn run() {} }\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn left_direct_caller() { left::channel::target(); }\nfn local_associated_caller() { worker::run(); }\nfn imported_associated_caller() { imported_worker::run(); }\nfn qualified_associated_caller() { types::worker::run(); }\nfn missing_qualified_associated_caller() { missing::worker::run(); }\nfn missing_caller() { let _selected = missing::target; }\nfn missing_direct_caller() { missing::target(); }\n",
             "// fixture placeholder\n",
         );
         fs::create_dir_all(repo.join("src/channels")).unwrap();
@@ -4718,6 +4747,11 @@ def Widget():
         fs::write(
             repo.join("src/other.rs"),
             "pub fn target() {}\npub struct imported_worker; impl imported_worker { pub fn run() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/types.rs"),
+            "pub struct worker; impl worker { pub fn run() {} }\n",
         )
         .unwrap();
         for side in ["left", "right"] {
@@ -4900,6 +4934,10 @@ def Widget():
                 "src/other.rs::imported_worker::run",
                 "src/lib.rs::Function::imported_associated_caller",
             ),
+            (
+                "src/types.rs::worker::run",
+                "src/lib.rs::Function::qualified_associated_caller",
+            ),
         ] {
             let method = store
                 .get_node_by_qname("test", method_qname)
@@ -4918,6 +4956,25 @@ def Widget():
                 "a real lowercase type owner must preserve its associated call: {method_qname}"
             );
         }
+        let missing_qualified_associated_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/lib.rs::Function::missing_qualified_associated_caller",
+            )
+            .unwrap()
+            .expect("missing qualified associated caller");
+        let local_worker_method = store
+            .get_node_by_qname("test", "src/lib.rs::worker::run")
+            .unwrap()
+            .expect("local lowercase associated method");
+        assert!(
+            store
+                .incoming_edges(local_worker_method.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_qualified_associated_caller.id),
+            "missing::worker::run must not discard its prefix and bind to local worker::run"
+        );
         let namespaced_target = store
             .get_node_by_qname(
                 "test",
