@@ -715,6 +715,43 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn serve_cookie_isolation_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind cookie isolation fixture");
+    let address = listener.local_addr().expect("cookie isolation addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let cookie = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Cookie: ").or_else(|| line.strip_prefix("cookie: ")))
+                .unwrap_or("");
+            let body = format!("<!doctype html><title>cookie</title><body>{cookie}</body>");
+            let set_cookie = if path == "/set" {
+                "Set-Cookie: isolation=A; Path=/; HttpOnly\r\n"
+            } else {
+                ""
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{set_cookie}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}
+
 struct ResetServer {
     url: String,
     stop: std::sync::mpsc::Sender<()>,
@@ -8314,6 +8351,96 @@ fn playwright_stopped_trace_survives_synthetic_cancel_classification() {
 #[test]
 fn locator_strict_mode_rejects_ambiguous_click() {
     run_named_fixture("strict-mode.mjs", "run_strict");
+}
+
+#[test]
+fn ordinary_sessions_isolate_cookie_state() {
+    let fixture = serve_cookie_isolation_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-cookie-isolation-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_cookie_isolation", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_cookie_isolation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("cookie isolation request")
+    };
+    let create = || {
+        let response = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let body = |session: &str, tab: Option<&str>| {
+        let mut payload = json!({"session_id":session,"source":"document.body.innerText"});
+        if let Some(tab) = tab {
+            payload["tab_id"] = json!(tab);
+        }
+        let response = call("web.evaluate", payload);
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.unwrap()["value"].as_str().unwrap().to_owned()
+    };
+
+    let session_a = create();
+    let session_b = create();
+    let set = call(
+        "web.goto",
+        json!({"session_id":session_a,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(set.status, "ok", "{set:?}");
+    let echo_a = call(
+        "web.goto",
+        json!({"session_id":session_a,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_a.status, "ok", "{echo_a:?}");
+    assert_eq!(body(&session_a, None), "isolation=A");
+
+    let new_tab = call("web.tab.new", json!({"session_id":session_a}));
+    assert_eq!(new_tab.status, "ok", "{new_tab:?}");
+    let tab_a = new_tab.result.unwrap()["tab"].as_str().unwrap().to_owned();
+    let tab_echo = call(
+        "web.goto",
+        json!({"session_id":session_a,"tab_id":&tab_a,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(tab_echo.status, "ok", "{tab_echo:?}");
+    assert_eq!(body(&session_a, Some(&tab_a)), "isolation=A");
+
+    let echo_b = call(
+        "web.goto",
+        json!({"session_id":session_b,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_b.status, "ok", "{echo_b:?}");
+    assert_eq!(
+        body(&session_b, None),
+        "",
+        "simultaneous ordinary session B received A's cookie"
+    );
+    let closed_a = call("web.session.close", json!({"session_id":session_a}));
+    assert_eq!(closed_a.status, "ok", "{closed_a:?}");
+
+    let session_c = create();
+    let echo_c = call(
+        "web.goto",
+        json!({"session_id":session_c,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(echo_c.status, "ok", "{echo_c:?}");
+    assert_eq!(
+        body(&session_c, None),
+        "",
+        "new ordinary session C received closed A's cookie"
+    );
+    for session in [session_b, session_c] {
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
 }
 
 #[test]
