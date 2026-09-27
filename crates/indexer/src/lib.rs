@@ -1731,6 +1731,21 @@ fn resolve_and_persist_edges_with_progress(
             .values()
             .flat_map(|aliases| aliases.values().flatten().cloned())
             .collect::<Vec<_>>();
+        pending.extend(
+            index
+                .import_module_files_by_file
+                .values()
+                .flat_map(|files| files.iter().cloned()),
+        );
+        for (source_file, globs) in &index.import_globs_by_file {
+            for glob in globs {
+                pending.extend(
+                    rust_module_files_for_module_path(source_file, glob)
+                        .into_iter()
+                        .filter(|file| index.known_files.contains(file)),
+                );
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         while let Some(module_file) = pending.pop() {
             if !seen.insert(module_file.clone()) {
@@ -1773,6 +1788,13 @@ fn resolve_and_persist_edges_with_progress(
                     .get(&module_file)
                     .into_iter()
                     .flat_map(|aliases| aliases.values().flatten().cloned()),
+            );
+            pending.extend(
+                index
+                    .import_module_files_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|files| files.iter().cloned()),
             );
             if let Some(globs) = index.import_globs_by_file.get(&module_file) {
                 for glob in globs {
@@ -2688,6 +2710,12 @@ struct GraphIndex {
         String,
         std::collections::HashMap<String, std::collections::HashSet<i64>>,
     >,
+    import_alias_sources_by_file: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<(String, String)>>,
+    >,
+    import_module_files_by_file:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
     import_globs_by_file: std::collections::HashMap<String, Vec<String>>,
     /// Rust namespace aliases imported into a file (`channels` in
     /// `use crate::core::mission::channels`). Values are exact candidate
@@ -2881,6 +2909,8 @@ impl GraphIndex {
             by_name,
             imports_by_file: std::collections::HashMap::new(),
             import_aliases_by_file: std::collections::HashMap::new(),
+            import_alias_sources_by_file: std::collections::HashMap::new(),
+            import_module_files_by_file: std::collections::HashMap::new(),
             import_globs_by_file: std::collections::HashMap::new(),
             rust_namespaces_by_file: std::collections::HashMap::new(),
             id_to_file,
@@ -2938,6 +2968,26 @@ impl GraphIndex {
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             let module_files = rust_module_files_for_path(file, path, name);
+            let visible_module_files = module_files
+                .iter()
+                .filter(|module_file| self.known_files.contains(*module_file))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.import_module_files_by_file
+                .entry(file.to_string())
+                .or_default()
+                .extend(visible_module_files);
+            let alias = item
+                .get("imported_name")
+                .and_then(|value| value.as_str())
+                .filter(|alias| !alias.is_empty())
+                .unwrap_or(name);
+            self.import_alias_sources_by_file
+                .entry(file.to_string())
+                .or_default()
+                .entry(alias.to_string())
+                .or_default()
+                .push((path.to_string(), name.to_string()));
             let candidates = self.defs_named(&greppy_resolver::IMPORTABLE_LABELS, name);
             let exact = candidates
                 .iter()
@@ -2946,11 +2996,6 @@ impl GraphIndex {
                 .collect::<Vec<_>>();
             if let [target] = exact.as_slice() {
                 self.record_import(file, *target);
-                let alias = item
-                    .get("imported_name")
-                    .and_then(|value| value.as_str())
-                    .filter(|alias| !alias.is_empty())
-                    .unwrap_or(name);
                 self.import_aliases_by_file
                     .entry(file.to_string())
                     .or_default()
@@ -2958,11 +3003,6 @@ impl GraphIndex {
                     .or_default()
                     .insert(*target);
             }
-            let alias = item
-                .get("imported_name")
-                .and_then(|value| value.as_str())
-                .filter(|alias| !alias.is_empty())
-                .unwrap_or(name);
             let namespace_path = format!("{path}::__namespace__");
             let existing_modules =
                 rust_module_files_for_path(file, &namespace_path, "__namespace__")
@@ -3081,10 +3121,10 @@ impl GraphIndex {
         module_file: &str,
         name: &str,
         labels: &[&str],
-        seen: &mut std::collections::HashSet<String>,
+        seen: &mut std::collections::HashSet<(String, String)>,
         targets: &mut Vec<i64>,
     ) {
-        if !seen.insert(module_file.to_string()) {
+        if !seen.insert((module_file.to_string(), name.to_string())) {
             return;
         }
         targets.extend(
@@ -3103,6 +3143,30 @@ impl GraphIndex {
                     .get(target)
                     .is_some_and(|node| labels.contains(&node.label.as_str()))
             }));
+        }
+        if let Some(sources) = self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            for (path, original_name) in sources {
+                let mut source_files = rust_module_files_for_path(module_file, path, original_name)
+                    .into_iter()
+                    .filter(|file| self.known_files.contains(file))
+                    .collect::<Vec<_>>();
+                if source_files.is_empty() && path == original_name {
+                    source_files.push(module_file.to_string());
+                }
+                for source_file in source_files {
+                    self.rust_module_export_targets_from_file(
+                        &source_file,
+                        original_name,
+                        labels,
+                        seen,
+                        targets,
+                    );
+                }
+            }
         }
         if let Some(globs) = self.import_globs_by_file.get(module_file) {
             for glob in globs {
@@ -3146,6 +3210,17 @@ impl GraphIndex {
                 .copied()
                 .collect::<Vec<_>>();
             if let [target] = matching.as_slice() {
+                return UniqueResolution::Unique(*target);
+            }
+        }
+        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
+            let module_files = globs
+                .iter()
+                .flat_map(|glob| rust_module_files_for_module_path(referrer_file, glob))
+                .filter(|file| self.known_files.contains(file))
+                .collect::<Vec<_>>();
+            let exported = self.rust_module_export_targets(&module_files, name, labels);
+            if let [target] = exported.as_slice() {
                 return UniqueResolution::Unique(*target);
             }
         }
@@ -3199,31 +3274,6 @@ impl GraphIndex {
             if !set.is_empty() {
                 let preferred: Vec<&&NodeLite> =
                     candidates.iter().filter(|n| set.contains(&n.id)).collect();
-                if preferred.len() == 1 {
-                    return UniqueResolution::Unique(preferred[0].id);
-                }
-            }
-        }
-        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
-            for glob in globs {
-                let module_file = (glob == "super").then(|| {
-                    std::path::Path::new(referrer_file)
-                        .parent()
-                        .map(|parent| parent.join("mod.rs"))
-                });
-                let Some(module_file) = module_file
-                    .flatten()
-                    .and_then(|path| path.to_str().map(str::to_owned))
-                else {
-                    continue;
-                };
-                let Some(exports) = self.imports_by_file.get(&module_file) else {
-                    continue;
-                };
-                let preferred: Vec<&&NodeLite> = candidates
-                    .iter()
-                    .filter(|node| exports.contains(&node.id))
-                    .collect();
                 if preferred.len() == 1 {
                     return UniqueResolution::Unique(preferred[0].id);
                 }
@@ -4412,21 +4462,53 @@ mod tests {
     fn overlay_delta_resolves_rust_usage_through_base_reexports() {
         let repo = setup_multifile_repo(
             "overlay-base-reexport",
-            "mod business_os; mod channels; mod glob_channels; mod parent; mod renamed_channels;\n",
+            "mod alias_chain; mod bare_glob; mod business_os; mod channels; mod decoys; mod glob_channels; mod parent; mod renamed_channels; mod super_exports;\n",
             "// fixture placeholder\n",
         );
+        fs::create_dir_all(repo.join("src/alias_chain")).unwrap();
+        fs::create_dir_all(repo.join("src/bare_glob")).unwrap();
         fs::create_dir_all(repo.join("src/business_os")).unwrap();
         fs::create_dir_all(repo.join("src/channels")).unwrap();
         fs::create_dir_all(repo.join("src/glob_channels")).unwrap();
         fs::create_dir_all(repo.join("src/parent/child")).unwrap();
         fs::create_dir_all(repo.join("src/renamed_channels")).unwrap();
-        fs::write(repo.join("src/business_os/mod.rs"), "pub mod store;\n").unwrap();
-        let caller_source = "use crate::{channels, glob_channels, parent::child, renamed_channels};\n\
+        fs::create_dir_all(repo.join("src/super_exports")).unwrap();
+        fs::write(
+            repo.join("src/business_os/mod.rs"),
+            "pub mod store; pub use crate::super_exports::*;\n",
+        )
+        .unwrap();
+        let caller_source = "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
+use crate::bare_glob::*;\n\
+use super::*;\n\
 pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
 pub fn renamed_caller() { let selected = renamed_channels::renamed; selected(); }\n\
 pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n\
-pub fn super_glob_caller() { let selected = child::target; selected(); }\n";
+pub fn super_glob_caller() { let selected = child::target; selected(); }\n\
+pub fn alias_chain_caller() { let selected = alias_chain::outer; selected(); }\n\
+pub fn delta_crate_glob_caller() { let selected = bare_target; selected(); }\n\
+pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n";
         fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
+        fs::write(
+            repo.join("src/alias_chain/mod.rs"),
+            "mod sub; pub use sub::target as middle; pub use middle as outer;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/alias_chain/sub.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/bare_glob/mod.rs"),
+            "mod command; pub use command::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/bare_glob/command.rs"),
+            "pub fn bare_target() {}\n",
+        )
+        .unwrap();
         fs::write(
             repo.join("src/channels/mod.rs"),
             "mod command; pub use command::{first, target};\n",
@@ -4465,6 +4547,16 @@ pub fn super_glob_caller() { let selected = child::target; selected(); }\n";
         fs::write(
             repo.join("src/renamed_channels/command.rs"),
             "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/super_exports/mod.rs"),
+            "pub fn super_target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/decoys.rs"),
+            "pub fn bare_target() {}\npub fn super_target() {}\n",
         )
         .unwrap();
 
@@ -4519,6 +4611,21 @@ pub fn super_glob_caller() { let selected = child::target; selected(); }\n";
                 "src/parent/mod.rs::Function::target",
                 "src/business_os/store.rs::Function::super_glob_caller",
                 "transitive super glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::alias_chain_caller",
+                "explicit alias chain",
+            ),
+            (
+                "src/bare_glob/command.rs::Function::bare_target",
+                "src/business_os/store.rs::Function::delta_crate_glob_caller",
+                "Delta crate glob",
+            ),
+            (
+                "src/super_exports/mod.rs::Function::super_target",
+                "src/business_os/store.rs::Function::delta_super_glob_caller",
+                "Delta super glob",
             ),
         ] {
             let target = overlay
