@@ -260,9 +260,6 @@ pub(crate) fn embedding_config_optional(
 pub(crate) fn embedding_config_for_daemon_probe(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
-    if test_inference_skipped() {
-        return Ok(None);
-    }
     let device = embedding_device_preference(args.device, args.no_gpu)?;
     let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
     Ok(Some(EmbeddingModelConfig {

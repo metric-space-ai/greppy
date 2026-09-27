@@ -907,7 +907,6 @@ fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
     let _restore = EnvRestore::capture(&[
         ENV_DEVICE,
         ENV_NO_GPU,
-        ENV_TEST_SKIP_INFERENCE,
         ENV_EMBED_CUDA_DEVICE,
         ENV_QWEN_CUDA_DEVICE,
     ]);
@@ -916,7 +915,6 @@ fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
     unsafe {
         std::env::set_var(ENV_DEVICE, "auto");
         std::env::remove_var(ENV_NO_GPU);
-        std::env::remove_var(ENV_TEST_SKIP_INFERENCE);
     }
 
     let auto = inference_daemon_status(EmbeddingCliArgs {
