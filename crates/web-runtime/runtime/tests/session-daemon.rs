@@ -3821,16 +3821,20 @@ fn materialized_form_post_body_replays_across_temporary_redirect() {
             "script_source":"inline",
             "bind_session_page":true,
             "script_text":r#"
-const state = await page.evaluate(async () => JSON.stringify(await (async () => {
+const seen = [];
+const handler = message => seen.push(message.text());
+page.on('console', handler);
+await page.evaluate(async () => {
   const request = new Request('/complete', { method: 'POST', body: 'body=once' });
   const before = request.bodyUsed;
   const response = await fetch(request);
   const after = request.bodyUsed;
   let reuseError = '';
   try { await fetch(request); } catch (error) { reuseError = error.name; }
-  return { before, after, reuseError, status: response.status };
-})()));
-console.log(state);
+  console.log('BODY_STATE ' + JSON.stringify({ before, after, reuseError, status: response.status }));
+});
+page.off('console', handler);
+console.log(seen.find(message => message.startsWith('BODY_STATE ')) || 'BODY_STATE missing');
 "#,
         }),
     );
@@ -3840,7 +3844,7 @@ console.log(state);
         .unwrap();
     assert!(
         stdout.contains(
-            r#"{"before":false,"after":true,"reuseError":"TypeError","status":200}"#
+            r#"BODY_STATE {"before":false,"after":true,"reuseError":"TypeError","status":200}"#
         ),
         "{body_state:?}"
     );
