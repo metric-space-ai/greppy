@@ -7475,6 +7475,69 @@ await browser.close();
 }
 
 #[test]
+fn page_evaluate_reports_rejection_and_timeout_then_recovers() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalfail", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+let rejection = "";
+try {
+  await page.evaluate(async () => { throw new Error("evaluate-boom"); });
+} catch (error) {
+  rejection = String(error && error.message ? error.message : error);
+}
+let timeout = "";
+try {
+  await page.evaluate(() => new Promise(() => {}));
+} catch (error) {
+  timeout = String(error && error.message ? error.message : error);
+}
+const recovered = await page.evaluate(async () => "usable-after-timeout");
+console.log(JSON.stringify({ rejection, timeout, recovered }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalfail",
+        source,
+        None,
+        Duration::from_secs(75),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalfail", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalfail");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert!(
+        value["rejection"]
+            .as_str()
+            .unwrap()
+            .contains("page.evaluate Promise rejected: evaluate-boom"),
+        "{value:#}"
+    );
+    assert!(
+        value["timeout"]
+            .as_str()
+            .unwrap()
+            .contains("timeout awaiting page.evaluate Promise"),
+        "{value:#}"
+    );
+    assert_eq!(value["recovered"], "usable-after-timeout", "{value:#}");
+}
+
+#[test]
 fn javascript_compilation_failure_is_actionable_and_session_remains_usable() {
     let fixture = serve_fixture("<!doctype html><html><body>ready</body></html>");
     let socket = std::env::temp_dir().join(format!(

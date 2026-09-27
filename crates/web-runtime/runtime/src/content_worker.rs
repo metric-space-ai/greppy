@@ -1863,6 +1863,19 @@ impl ContentEngine {
         delegate: &Delegate,
         script: &str,
     ) -> io::Result<JSValue> {
+        self.evaluate_awaited_until(webview, delegate, script, ACTION_TIMEOUT)
+    }
+
+    fn evaluate_awaited_until(
+        &self,
+        webview: WebView,
+        delegate: &Delegate,
+        script: &str,
+        timeout: Duration,
+    ) -> io::Result<JSValue> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout"))?;
         let token = alloc_wait_nonce()?;
         let key = Self::wait_slot_key(&token);
         let key_js = serde_json::to_string(&key).map_err(io::Error::other)?;
@@ -1883,11 +1896,23 @@ impl ContentEngine {
 }})({key_js}, {source_js})"#
         );
         let document_generation = delegate.document_generation.get();
-        let first = self.evaluate_until(webview.clone(), &wrapper, ACTION_TIMEOUT)?;
+        let first = match self.evaluate_until(
+            webview.clone(),
+            &wrapper,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.drop_wait_slot(&webview, &token, None);
+                return Err(Self::evaluate_await_error(error));
+            }
+        };
         let JSValue::Array(mut parts) = first else {
+            self.drop_wait_slot(&webview, &token, None);
             return Err(io::Error::other("page.evaluate returned an invalid await envelope"));
         };
         if parts.len() < 2 {
+            self.drop_wait_slot(&webview, &token, None);
             return Err(io::Error::other("page.evaluate returned an incomplete await envelope"));
         }
         let value = parts.remove(1);
@@ -1900,7 +1925,6 @@ impl ContentEngine {
             return Ok(value);
         }
 
-        let deadline = Instant::now() + ACTION_TIMEOUT;
         loop {
             if delegate.document_generation.get() != document_generation {
                 self.drop_wait_slot(&webview, &token, None);
@@ -1908,9 +1932,14 @@ impl ContentEngine {
                     "page.evaluate Promise was interrupted by navigation",
                 ));
             }
-            if let Some((status, value)) =
-                self.take_completed_wait_slot(&webview, &token, Some(deadline))?
-            {
+            let completed = match self.take_completed_evaluate_slot(&webview, &token, deadline) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.drop_wait_slot(&webview, &token, None);
+                    return Err(Self::evaluate_await_error(error));
+                }
+            };
+            if let Some((status, value)) = completed {
                 return match status.as_str() {
                     "ok" => Ok(value),
                     "error" => Err(io::Error::other(match value {
@@ -1934,6 +1963,53 @@ impl ContentEngine {
             if !self.pump_servo(&webview, Duration::from_millis(10), deadline) {
                 self.spin_all_event_loops();
             }
+        }
+    }
+
+    fn evaluate_await_error(error: io::Error) -> io::Error {
+        if error.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout awaiting page.evaluate Promise",
+            )
+        } else {
+            error
+        }
+    }
+
+    fn take_completed_evaluate_slot(
+        &self,
+        webview: &WebView,
+        token: &str,
+        deadline: Instant,
+    ) -> io::Result<Option<(String, JSValue)>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout awaiting page.evaluate Promise",
+            ));
+        }
+        let key_js =
+            serde_json::to_string(&Self::wait_slot_key(token)).map_err(io::Error::other)?;
+        let script = format!(
+            "(function(key) {{ var slot = window[key]; if (!slot || !slot.done) return [0, '', null]; var status = String(slot.status || ''); var value = slot.value; try {{ delete window[key]; }} catch (_e) {{}} return [1, status, value]; }})({key_js})"
+        );
+        match self.evaluate_until(webview.clone(), &script, remaining)? {
+            JSValue::Array(mut items) if items.len() >= 3 => {
+                let value = items.remove(2);
+                let status = match items.remove(1) {
+                    JSValue::String(value) => value,
+                    _ => String::new(),
+                };
+                let done = match items.remove(0) {
+                    JSValue::Number(value) => value != 0.0,
+                    JSValue::Boolean(value) => value,
+                    _ => false,
+                };
+                Ok(done.then_some((status, value)))
+            }
+            _ => Ok(None),
         }
     }
 
