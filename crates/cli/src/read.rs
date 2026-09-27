@@ -280,11 +280,15 @@ fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<grepp
         };
         if node.file_path.is_empty()
             || node.start_line < 1
-            || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
             || !seen.insert((node.file_path.clone(), node.start_line, node.end_line))
         {
             continue;
         }
+        // A persisted module caller is represented by the canonical `__file__`
+        // graph node. `who-calls --json | greppy read -` must be able to carry
+        // that real identity back into the source-reading surface; read-file
+        // already exposes the same source, so accepting the anchor here adds no
+        // new content or resolver interpretation.
         nodes.push(node);
     }
     Ok(nodes)

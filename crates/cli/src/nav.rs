@@ -3531,11 +3531,10 @@ pub(crate) fn dispatch_who_calls(
                     &node.qualified_name,
                 );
                 serde_json::json!({
-                    "qualified_name": if module {
-                        format!("{}::<module>", node.file_path)
-                    } else {
-                        node.qualified_name.clone()
-                    },
+                    // Keep the stored graph identity so JSON piping can
+                    // resolve this row again. `<module>` is presentation,
+                    // never a replacement symbol invented by the renderer.
+                    "qualified_name": node.qualified_name.clone(),
                     "name": if module { "<module>".into() } else { nav_short_name(node) },
                     "file": &node.file_path,
                     "line": site,

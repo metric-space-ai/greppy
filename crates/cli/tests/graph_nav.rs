@@ -506,11 +506,21 @@ Effect.gen(function* () {
     assert_eq!(code, 0, "retained-graph JSON should exit 0: {out}\n{err}");
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     let hit = &value["hits"][0];
-    assert_eq!(hit["qualified_name"], "src/app.ts::<module>", "{value}");
+    assert_eq!(hit["qualified_name"], "src/app.ts::__file__", "{value}");
     assert_eq!(hit["name"], "<module>", "{value}");
     assert_eq!(hit["line"], 4, "{value}");
     assert_eq!(hit["start_line"], 4, "{value}");
     assert_eq!(hit["end_line"], 4, "{value}");
+
+    let (code, read_out, read_err) = run_with_stdin(&["read", "-"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "canonical retained caller must round-trip through read: {read_out}\n{read_err}"
+    );
+    assert!(
+        read_out.contains("src/app.ts:") && read_out.contains("helper(platform)"),
+        "piped module identity must resolve back to its source file: {read_out:?}"
+    );
 }
 
 #[test]
