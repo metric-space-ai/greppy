@@ -867,21 +867,19 @@ fn wait_for_index_publication(
     cause: &str,
 ) -> Result<()> {
     let baseline_generation = published_graph_generation(effective_root);
-    let mut launch =
-        spawn_agent_background_index_after_generation(root, cause, baseline_generation)
-            .ok_or_else(|| {
-                let detail = read_background_job(&background_job_path(effective_root))
-                    .and_then(|job| {
-                        job.get("last_error")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "the index process could not be started".into());
-                Error::Index(format!(
-                    "structural index failed for {}: {detail}",
-                    effective_root.display()
-                ))
-            })?;
+    let mut launch = spawn_background_job_handle(root, cause, "index", None).ok_or_else(|| {
+        let detail = read_background_job(&background_job_path(effective_root))
+            .and_then(|job| {
+                job.get("last_error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "the index process could not be started".into());
+        Error::Index(format!(
+            "structural index failed for {}: {detail}",
+            effective_root.display()
+        ))
+    })?;
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(

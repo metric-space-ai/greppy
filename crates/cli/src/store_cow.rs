@@ -2667,7 +2667,7 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "repaired caller node is missing".to_string())?;
         if !store
-            .incoming_edges(target.id, Some("USAGE"), 10)
+            .incoming_edges(target.id, None, 10)
             .map_err(|error| error.to_string())?
             .iter()
             .any(|edge| edge.source_id == caller.id)
@@ -3034,7 +3034,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(repaired
-            .incoming_edges(target.id, Some("USAGE"), 10)
+            .incoming_edges(target.id, None, 10)
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
