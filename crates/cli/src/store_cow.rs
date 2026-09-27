@@ -2690,16 +2690,38 @@ mod tests {
             ENV_BASE_COMMIT,
         ]);
         let scratch = tempfile::tempdir().unwrap();
-        let root = scratch.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
+        // The freshness proof compares the live workspace with the exact
+        // pinned Git tree, so this regression must use a real repository.
+        let repo = fixture();
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src/alias_chain")).unwrap();
+        std::fs::write(
+            root.join("src/alias_chain/mod.rs"),
+            "pub mod sub;\npub use sub::target as outer;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/caller.rs"),
+            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "alias base"]);
+        let base_commit = git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            root.join("src/caller.rs"),
+            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// dirty Delta\n",
+        )
+        .unwrap();
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
         std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
-        let base_path = scratch.path().join("base.db");
+        let staged_base_path = scratch.path().join("base.db");
         let delta_path = crate::workspace_locator::store_path(&root);
         std::fs::create_dir_all(delta_path.parent().unwrap()).unwrap();
 
         {
-            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            let mut base = greppy_store::Store::open(&staged_base_path).unwrap();
             base.upsert_project(&greppy_store::Project {
                 name: "p".into(),
                 indexed_at: "2026-09-27T00:00:00Z".into(),
@@ -2746,6 +2768,26 @@ mod tests {
             }])
             .unwrap();
         }
+        let base_identity = base_identity_parts(&root, &base_commit).unwrap();
+        let base_layout = BaseStoreLayout::new(scratch.path(), &base_identity).unwrap();
+        let summary_dir = scratch.path().join("base-summary-cache");
+        let summary_path = {
+            let summary = greppy_store::SummaryCache::open(&summary_dir).unwrap();
+            drop(summary);
+            summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
+        };
+        let _base_lease = base_layout.acquire_builder(true).unwrap().unwrap();
+        base_layout
+            .publish_graph_with_summary(base_identity, &staged_base_path, &summary_path)
+            .unwrap();
+        let base_path = base_layout.graph.clone();
+        let caller_rel_path = "src/caller.rs";
+        let caller_metadata = greppy_discover::stable_metadata(
+            &std::fs::symlink_metadata(root.join(caller_rel_path)).unwrap(),
+        );
+        let caller_sha256 = greppy_store::file_state::sha256_hex(
+            &std::fs::read(root.join(caller_rel_path)).unwrap(),
+        );
         {
             let mut delta = greppy_store::Store::open(&delta_path).unwrap();
             delta
@@ -2754,6 +2796,29 @@ mod tests {
                     indexed_at: "2026-09-27T00:00:00Z".into(),
                     root_path: root.to_string_lossy().into_owned(),
                 })
+                .unwrap();
+            delta
+                .upsert_file_state(&greppy_store::FileState {
+                    project: "p".into(),
+                    rel_path: caller_rel_path.into(),
+                    language: "Rust".into(),
+                    sha256: caller_sha256,
+                    mtime_ns: caller_metadata.mtime_ns.unwrap_or_default(),
+                    size: caller_metadata.size as i64,
+                    parser_version: "fixture".into(),
+                    extractor_version: "fixture".into(),
+                    last_indexed_generation: 7,
+                })
+                .unwrap();
+            delta
+                .upsert_file_identity(
+                    "p",
+                    caller_rel_path,
+                    greppy_store::FileIdentity {
+                        ctime_ns: caller_metadata.ctime_ns,
+                        file_id: caller_metadata.file_id,
+                    },
+                )
                 .unwrap();
             delta
                 .upsert_workspace_state(&greppy_store::WorkspaceState {
@@ -2844,11 +2909,11 @@ mod tests {
                 .unwrap();
         {
             let delta = greppy_store::Store::open(&delta_path).unwrap();
-            persist_visibility(&delta, &visibility, "fixture").unwrap();
+            persist_visibility(&delta, &visibility, &base_commit).unwrap();
         }
         std::env::set_var(ENV_MODE, MODE_OVERLAY);
         std::env::set_var(ENV_BASE_PATH, &base_path);
-        std::env::set_var(ENV_BASE_COMMIT, "fixture");
+        std::env::set_var(ENV_BASE_COMMIT, &base_commit);
         let legacy =
             greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         assert_eq!(
