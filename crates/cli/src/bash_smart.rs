@@ -64,7 +64,7 @@ static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 // one compiler warning look like two bash-smart warning blocks.
 static CARGO_WARNING_SUMMARY_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?-u)^[\t ]*warning:[\t ]+`[^`\r\n]+`(?:[\t ]+\([^\r\n)]*\))?[\t ]+generated[\t ]+[0-9]+[\t ]+warnings?(?:[\t ]+\(run[\t ][^\r\n]*\))?[\t ]*$",
+        r"(?-u)^[\t ]*warning:[\t ]+`[^`\r\n]+`(?:[\t ]+\([^\r\n)]*\))?[\t ]+generated[\t ]+([0-9]+)[\t ]+warnings?(?:[\t ]+\(run[\t ][^\r\n]*\))?[\t ]*$",
     )
     .expect("bash-smart Cargo warning summary regex")
 });
@@ -766,17 +766,31 @@ fn detect_blocks(
             });
             index = end;
         }
-        let has_substantive_warning = stream_blocks.iter().any(|block| {
-            block.kind == BlockKind::Warning
-                && !CARGO_WARNING_SUMMARY_RE.is_match(&block.lines[0].bytes)
-        });
-        if has_substantive_warning {
-            stream_blocks.retain(|block| {
-                block.kind != BlockKind::Warning
-                    || !CARGO_WARNING_SUMMARY_RE.is_match(&block.lines[0].bytes)
-            });
+        let mut filtered_blocks = Vec::with_capacity(stream_blocks.len());
+        let mut substantive_warnings = 0usize;
+        for block in stream_blocks {
+            let summary = (block.kind == BlockKind::Warning)
+                .then(|| CARGO_WARNING_SUMMARY_RE.captures(&block.lines[0].bytes))
+                .flatten();
+            if let Some(captures) = summary {
+                let summary_count = std::str::from_utf8(&captures[1])
+                    .ok()
+                    .and_then(|count| count.parse::<usize>().ok());
+                // A recap closes the preceding Cargo diagnostic group. Only
+                // suppress it when the emitted warning-block count proves it
+                // is redundant; otherwise retain the uncertain recap.
+                if summary_count != Some(substantive_warnings) {
+                    filtered_blocks.push(block);
+                }
+                substantive_warnings = 0;
+            } else {
+                if block.kind == BlockKind::Warning {
+                    substantive_warnings += 1;
+                }
+                filtered_blocks.push(block);
+            }
         }
-        blocks.extend(stream_blocks);
+        blocks.extend(filtered_blocks);
     }
     blocks
 }
@@ -2710,6 +2724,31 @@ mod tests {
         assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
         assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
         assert_eq!(blocks[1].lines[0].bytes, b"warning: deprecated API");
+    }
+
+    #[test]
+    fn later_recap_only_crate_is_not_hidden_by_an_earlier_warning_group() {
+        let diagnostics = b"warning: unused variable: `x`\nwarning: `crate-a` (lib) generated 1 warning\nwarning: `crate-b` (lib) generated 1 warning\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `crate-b` (lib) generated 1 warning"
+        );
+    }
+
+    #[test]
+    fn cargo_recap_with_greater_count_than_preceding_warnings_is_retained() {
+        let diagnostics =
+            b"warning: unused variable: `x`\nwarning: `fixture` (lib) generated 2 warnings\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `fixture` (lib) generated 2 warnings"
+        );
     }
 
     #[test]
