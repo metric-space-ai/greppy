@@ -3466,17 +3466,6 @@ fn is_noncode_provider(status: &str, language: &str) -> bool {
         || language == "no file extension"
 }
 
-/// Compact incomplete-provider metadata, excluding non-code snapshot/fixture
-/// providers (see [`is_noncode_provider`]) so the reported
-/// `incomplete_provider_count` / `provider_complete` reflects only real code
-/// callers, not `.stderr` / `.snap` files.
-fn code_incomplete_provider_json(
-    store: &greppy_store::Store,
-    project: &str,
-) -> Result<Vec<serde_json::Value>> {
-    incomplete_provider_json(store, project)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderPolicy {
     Metadata,
@@ -3623,8 +3612,8 @@ fn impact_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    // Only real code providers count toward impact completeness; `.stderr` /
-    // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
+    // Only providers for the relations impact actually reads count toward
+    // completeness; non-code snapshot rows are filtered by the shared helper.
     let incomplete_providers =
         graph_edge_incomplete_provider_json(store, project, meta.edge_types)?;
     // Rule 3: the one-symbol answer has the same shape as a batch of several.

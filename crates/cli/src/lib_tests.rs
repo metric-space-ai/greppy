@@ -2510,16 +2510,6 @@ fn impact_total_excludes_noncode_files() {
     // remain available through doctor/diagnostics.
     assert_eq!(incomplete_provider_json(&store, "p").unwrap().len(), 2);
 
-    // impact's code-only set drops the four non-code providers.
-    let code = code_incomplete_provider_json(&store, "p").unwrap();
-    let langs: Vec<&str> = code
-        .iter()
-        .map(|p| p["language"].as_str().unwrap())
-        .collect();
-    assert_eq!(code.len(), 2, "only java + protobuf remain: {langs:?}");
-    assert!(langs.contains(&"java"));
-    assert!(langs.contains(&"protobuf"));
-
     // Direct predicate coverage.
     assert!(is_noncode_provider("unsupported", "file extension .snap"));
     assert!(is_noncode_provider("accepted", "no file extension"));
