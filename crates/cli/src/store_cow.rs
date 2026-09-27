@@ -1218,6 +1218,9 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         // primary checkout must not force every already-indexed worktree to
         // build a new repository-wide Base on its next Delta refresh.
         let existing_binding = overlay_environment_for_recovery(root)?;
+        let missing_bound_graph = existing_binding
+            .as_ref()
+            .is_some_and(|(path, _)| !path.is_file());
         let base_commit = match existing_binding.as_ref() {
             Some((_, commit)) => commit.clone(),
             None => git_output(&primary, &["rev-parse", "HEAD"])?,
@@ -1226,7 +1229,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
                 None if structural_first_use
-                    && existing_binding.is_none()
+                    && !missing_bound_graph
                     && !has_verified_previous_indexer_base(
                         &primary,
                         &base_commit,
