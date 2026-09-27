@@ -1765,7 +1765,7 @@ fn prepare_base_store_paths(
         .join("graph.db");
     let seeded_summary_cache =
         seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
-    let defer_migrated_embeddings = structural_first_use && seeded_summary_cache.is_some();
+    let defer_base_embeddings = structural_first_use;
     if seeded_summary_cache.is_some() {
         report_base_phase(progress_path, "migrating_base_graph");
     }
@@ -1783,7 +1783,7 @@ fn prepare_base_store_paths(
         command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
     }
     append_embedding_cli_args(&mut command, embedding_args);
-    if defer_migrated_embeddings {
+    if defer_base_embeddings {
         command.env(crate::ENV_STRUCTURAL_FIRST_USE, "1");
     } else {
         command.env_remove(crate::ENV_STRUCTURAL_FIRST_USE);
@@ -1807,10 +1807,10 @@ fn prepare_base_store_paths(
         )
         // A normal Base build completes every candidate before publication;
         // never let the ordinary foreground-index lazy threshold hand it to a
-        // background process outside the publication lease. Structural v6
-        // migration is the bounded exception: it inherits
-        // GREPPY_STRUCTURAL_FIRST_USE, preserves reusable vectors, and records
-        // an exact deferred receipt below for later semantic completion.
+        // background process outside the publication lease. Structural Base
+        // recovery and migration inherit GREPPY_STRUCTURAL_FIRST_USE even
+        // without a reusable seed; they record an exact deferred receipt below
+        // for later semantic completion instead of loading inference models.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
         .env_remove("GREPPY_BACKGROUND_JOB")
@@ -1873,7 +1873,7 @@ fn prepare_base_store_paths(
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
-    if defer_migrated_embeddings {
+    if defer_base_embeddings {
         mark_base_embeddings_deferred(
             &staged_graph,
             &greppy_core::project_identity(worktree_path),

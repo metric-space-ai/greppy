@@ -1167,7 +1167,10 @@ fn normal_query_recovers_missing_persisted_base_without_semantic_rebuild() {
         &store,
         &query,
         None,
-        &[("GREPPY_AUTO_REINDEX", "1")],
+        &[
+            ("GREPPY_AUTO_REINDEX", "1"),
+            ("GREPPY_TEST_FORBID_INDEX_INFERENCE", "1"),
+        ],
     );
     assert_eq!(code, 0, "stdout={out}\nstderr={err}");
     assert!(out.contains("live_caller"), "{out}");
