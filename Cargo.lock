@@ -1051,6 +1051,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "serde_json",
+ "toml_edit 0.22.27",
  "thiserror 1.0.69",
  "tracing",
 ]

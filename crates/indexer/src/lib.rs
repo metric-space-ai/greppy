@@ -2094,31 +2094,52 @@ pub fn rebuild_visible_overlay_edges(store: &mut Store, project: &str) -> Result
             "rebuild_visible_overlay_edges requires an overlay Store".into(),
         ));
     }
-    let delta_files = store
-        .list_delta_raw_edges(project)?
-        .into_iter()
-        .map(|edge| edge.file_path)
-        .collect::<std::collections::HashSet<_>>();
     let raw_edges = store.list_raw_edges(project)?;
     let edges = raw_edges
         .into_iter()
-        .map(|raw| {
-            let mut edge = extracted_edge_from_raw(raw);
-            if !delta_files.contains(&edge.file_path) {
-                if let Some(properties) = edge.properties.as_object_mut() {
-                    properties.insert(
-                        REPAIRED_BASE_EDGE_PROPERTY.into(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
-            edge
-        })
+        .map(extracted_edge_from_raw)
         .collect::<Vec<_>>();
-    resolve_and_persist_edges(store, project, &edges)
+    let resolved = resolve_and_persist_edges(store, project, &edges)?;
+    mark_missing_base_repair_edges(store, project)?;
+    Ok(resolved)
 }
 
 const REPAIRED_BASE_EDGE_PROPERTY: &str = "greppy_base_repair_v2";
+
+fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "UPDATE main.overlay_edges AS d
+             SET properties = json_set(
+                 CASE WHEN json_type(d.properties) = 'object' THEN d.properties ELSE '{}' END,
+                 '$.greppy_base_repair_v2', 1)
+             WHERE d.project = ?1
+               AND EXISTS (
+                   SELECT 1 FROM nodes s
+                   WHERE s.project = d.project
+                     AND s.qualified_name = d.source_qualified_name
+                     AND NOT EXISTS (
+                         SELECT 1 FROM temp.greppy_hidden_paths h
+                         WHERE h.path = s.file_path
+                     )
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM greppy_base.edges e
+                   JOIN greppy_base.nodes bs ON bs.id = e.source_id
+                   JOIN greppy_base.nodes bt ON bt.id = e.target_id
+                   WHERE e.project = d.project
+                     AND bs.qualified_name = d.source_qualified_name
+                     AND bt.qualified_name = d.target_qualified_name
+                     AND e.edge_type = d.edge_type
+               )
+               AND json_extract(d.properties, '$.greppy_base_repair_v2') IS NULL",
+            rusqlite::params![project],
+        )
+        .map_err(sqlite_err)?;
+    Ok(())
+}
 
 fn repaired_base_overlay_edges(store: &Store, project: &str) -> Result<Vec<NewOverlayEdge>> {
     let rows = {
@@ -2971,7 +2992,7 @@ fn rust_crate_roots_for_project(
     known_files: &std::collections::HashSet<String>,
 ) -> Option<std::collections::HashSet<String>> {
     let project = store.get_project(project).ok().flatten()?;
-    let root = std::path::PathBuf::from(project.root_path);
+    let root = std::fs::canonicalize(project.root_path).ok()?;
     let mut roots = std::collections::HashSet::new();
     let mut visited = std::collections::HashSet::new();
     if !rust_crate_roots_from_manifest(
@@ -3105,7 +3126,8 @@ fn rust_crate_roots_from_manifest(
             let direct = !rest.contains('/') && rest.ends_with(".rs");
             let nested = rest.matches('/').count() == 1 && rest.ends_with("/main.rs");
             if direct || nested {
-                add_target(path, roots);
+                let target = format!("src/bin/{rest}");
+                add_target(&target, roots);
             }
         }
     }

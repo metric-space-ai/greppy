@@ -2746,17 +2746,18 @@ mod tests {
                 properties: serde_json::json!({}),
             })
             .unwrap();
-            base.insert_node(&greppy_store::NewNode {
-                project: "p".into(),
-                label: "Function".into(),
-                name: "target".into(),
-                qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
-                file_path: "src/alias_chain/sub.rs".into(),
-                start_line: 1,
-                end_line: 1,
-                properties: serde_json::json!({}),
-            })
-            .unwrap();
+            let target_id = base
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "target".into(),
+                    qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
+                    file_path: "src/alias_chain/sub.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
             base.insert_node(&greppy_store::NewNode {
                 project: "p".into(),
                 label: "Function".into(),
@@ -2766,6 +2767,26 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
                 properties: serde_json::json!({}),
+            })
+            .unwrap();
+            let stable_caller_id = base
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "stable_caller".into(),
+                    qualified_name: "src/stable.rs::Function::stable_caller".into(),
+                    file_path: "src/stable.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            base.insert_edge(&greppy_store::NewEdge {
+                project: "p".into(),
+                source_id: stable_caller_id,
+                target_id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"ref_name": "target"}),
             })
             .unwrap();
             base.insert_raw_edges(&[
@@ -2784,6 +2805,14 @@ mod tests {
                             "glob": false
                         }]
                     }),
+                },
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/stable.rs".into(),
+                    source_qname: "src/stable.rs::Function::stable_caller".into(),
+                    target_qname: "src/alias_chain/sub.rs::Function::target".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({"ref_name": "target"}),
                 },
                 greppy_store::NewRawEdge {
                     project: "p".into(),
@@ -2974,12 +3003,17 @@ mod tests {
             .incoming_edges(legacy_target.id, Some("USAGE"), 10)
             .unwrap()
             .is_empty());
+        let legacy_base_caller = legacy
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
         assert!(
             legacy
                 .incoming_edges(legacy_target.id, Some("CALLS"), 10)
                 .unwrap()
-                .is_empty(),
-            "the Base caller raw edge has no stale logical edge before repair"
+                .iter()
+                .all(|edge| edge.source_id != legacy_base_caller.id),
+            "the missing Base caller has no stale logical edge before repair"
         );
         drop(legacy);
         let vector_before: Vec<u8> =
@@ -3044,6 +3078,45 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == base_caller.id));
+        let stable_caller = repaired
+            .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
+            .unwrap()
+            .unwrap();
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller.id));
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges
+                     WHERE project = 'p'
+                       AND source_qualified_name = 'src/base.rs::Function::base_caller'
+                       AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "only the missing Base relation becomes a repair overlay"
+        );
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges
+                     WHERE project = 'p'
+                       AND source_qualified_name = 'src/stable.rs::Function::stable_caller'
+                       AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "an unchanged Base relation is not copied into the repair set"
+        );
         assert_eq!(
             repaired
                 .get_workspace_state(&root_string)
@@ -3132,6 +3205,15 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == base_caller_after_dirty.id));
+        let stable_caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
+            .unwrap()
+            .unwrap();
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller_after_dirty.id));
         let vector_after_dirty: Vec<u8> = after_dirty
             .conn()
             .query_row(
