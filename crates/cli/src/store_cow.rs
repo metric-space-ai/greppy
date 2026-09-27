@@ -2670,7 +2670,9 @@ mod tests {
             .incoming_edges(target.id, None, 10)
             .map_err(|error| error.to_string())?
             .iter()
-            .any(|edge| edge.source_id == caller.id)
+            .any(|edge| {
+                edge.source_id == caller.id && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")
+            })
         {
             let generation = store
                 .get_workspace_state(effective_root.to_string_lossy().as_ref())
@@ -3037,7 +3039,9 @@ mod tests {
             .incoming_edges(target.id, None, 10)
             .unwrap()
             .iter()
-            .any(|edge| edge.source_id == caller.id));
+            .any(|edge| {
+                edge.source_id == caller.id && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")
+            }));
         assert_eq!(
             repaired
                 .get_workspace_state(&root_string)
