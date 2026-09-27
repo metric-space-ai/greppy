@@ -278,15 +278,31 @@ impl BaseStoreLayout {
             .parent()
             .ok_or_else(|| invalid_data("Base Store layout has no parent"))?;
         fs::create_dir_all(parent)?;
-        let suffix = format!(
-            ".building-{}-{}-{}",
-            expected_hash,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let suffix = if cfg!(windows) {
+            // Keep the staging path below Windows' legacy MAX_PATH limit.
+            // The published manifest still authenticates the complete
+            // identity hash; the prefix only identifies the private build
+            // directory while it is being assembled.
+            format!(
+                ".building-{}-{}-{}",
+                &expected_hash[..16],
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        } else {
+            format!(
+                ".building-{}-{}-{}",
+                expected_hash,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        };
         let building = parent.join(suffix);
         fs::create_dir(&building)?;
         greppy_core::cache::write_agent_base_manifest(

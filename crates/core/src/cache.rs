@@ -503,8 +503,7 @@ pub fn write_agent_base_manifest(
         .unwrap_or_default();
     if !is_hex_id(identity_hash, 64)
         || canonical_repository_identity.trim().is_empty()
-        || (directory_name != identity_hash
-            && !directory_name.starts_with(&format!(".building-{identity_hash}-")))
+        || !agent_base_directory_name_matches(directory_name, identity_hash)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -538,8 +537,7 @@ pub fn read_agent_base_manifest(dir: &Path) -> io::Result<AgentBaseManifest> {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     if manifest.format_version != AGENT_BASE_FORMAT_VERSION
-        || (directory_name != manifest.identity_hash
-            && !directory_name.starts_with(&format!(".building-{}-", manifest.identity_hash)))
+        || !agent_base_directory_name_matches(directory_name, &manifest.identity_hash)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -547,6 +545,14 @@ pub fn read_agent_base_manifest(dir: &Path) -> io::Result<AgentBaseManifest> {
         ));
     }
     Ok(manifest)
+}
+
+fn agent_base_directory_name_matches(directory_name: &str, identity_hash: &str) -> bool {
+    directory_name == identity_hash
+        || directory_name.starts_with(&format!(".building-{identity_hash}-"))
+        || (cfg!(windows)
+            && identity_hash.len() >= 16
+            && directory_name.starts_with(&format!(".building-{}-", &identity_hash[..16])))
 }
 
 pub fn locks_root() -> PathBuf {
