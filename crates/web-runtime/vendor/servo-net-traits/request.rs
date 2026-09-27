@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use content_security_policy::{self as csp};
 use http::header::{AUTHORIZATION, HeaderName};
@@ -340,42 +339,6 @@ pub struct RequestBody {
     source: BodySource,
     /// <https://fetch.spec.whatwg.org/#concept-body-total-bytes>
     total_bytes: Option<usize>,
-    /// Keep a superseded producer alive until both branches created by
-    /// `Request.clone()` have attached their replacement producers.
-    #[serde(skip)]
-    #[ignore_malloc_size_of = "process-local request clone lifetime state"]
-    deferred_detach: Option<Arc<DeferredDetachBranch>>,
-}
-
-#[derive(Debug)]
-struct DeferredDetachGroup {
-    remaining: AtomicUsize,
-    sender: Mutex<Option<IpcSender<BodyChunkRequest>>>,
-}
-
-#[derive(Debug)]
-struct DeferredDetachBranch {
-    released: AtomicBool,
-    group: Arc<DeferredDetachGroup>,
-}
-
-impl DeferredDetachBranch {
-    fn release(&self) {
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.group.remaining.fetch_sub(1, Ordering::AcqRel) == 1 &&
-            let Some(sender) = self.group.sender.lock().take()
-        {
-            let _ = sender.send(BodyChunkRequest::Done);
-        }
-    }
-}
-
-impl Drop for DeferredDetachBranch {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 impl RequestBody {
@@ -389,7 +352,6 @@ impl RequestBody {
             in_memory: None,
             source,
             total_bytes,
-            deferred_detach: None,
         }
     }
 
@@ -403,7 +365,6 @@ impl RequestBody {
             in_memory: Some(in_memory),
             source,
             total_bytes,
-            deferred_detach: None,
         }
     }
 
@@ -458,34 +419,6 @@ impl RequestBody {
         if let Some(sender) = self.body_chunk_request_channel.lock().take() {
             let _ = sender.send(BodyChunkRequest::Done);
         }
-        if let Some(deferred) = self.deferred_detach.as_ref() {
-            deferred.release();
-        }
-    }
-
-    /// Transfer a superseded producer to two replacement branches. The old
-    /// producer roots the tee source, so it can be detached only after both
-    /// branches have attached (or one of their bodies is dropped unused).
-    pub fn defer_stream_detach_pair(
-        first: &mut Self,
-        second: &mut Self,
-        superseded: &Self,
-    ) {
-        let Some(sender) = superseded.body_chunk_request_channel.lock().take() else {
-            return;
-        };
-        let group = Arc::new(DeferredDetachGroup {
-            remaining: AtomicUsize::new(2),
-            sender: Mutex::new(Some(sender)),
-        });
-        first.deferred_detach = Some(Arc::new(DeferredDetachBranch {
-            released: AtomicBool::new(false),
-            group: group.clone(),
-        }));
-        second.deferred_detach = Some(Arc::new(DeferredDetachBranch {
-            released: AtomicBool::new(false),
-            group,
-        }));
     }
 
     pub fn source_is_null(&self) -> bool {

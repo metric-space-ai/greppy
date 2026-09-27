@@ -116,9 +116,9 @@ pub(crate) fn clone_body_stream_for_dom_request(
     else {
         return Ok(None);
     };
-    let mut original_body = rebind(original_stream);
-    let mut cloned_body = rebind(cloned_stream);
-    RequestBody::defer_stream_detach_pair(&mut original_body, &mut cloned_body, source_body);
+    let original_body = rebind(original_stream);
+    let cloned_body = rebind(cloned_stream);
+    source_body.detach_stream();
     Ok(Some((original_body, cloned_body)))
 }
 
