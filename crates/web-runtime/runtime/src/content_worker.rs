@@ -1088,6 +1088,7 @@ impl PageSlot {
 
 struct EngineBundle {
     servo: Servo,
+    rendering_context: Rc<dyn RenderingContext>,
     profile: SharedProfile,
     wake: WakeFlag,
     user_content: Rc<UserContentManager>,
@@ -1276,6 +1277,16 @@ impl ContentEngine {
     }
 
     fn build_bundle(&self, storage_key: &str) -> io::Result<Rc<EngineBundle>> {
+        let rendering_context = Rc::new(
+            SoftwareRenderingContext::new(PhysicalSize {
+                width: 1280,
+                height: 720,
+            })
+            .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
+        );
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         let profile = SharedProfile::new(self.profile.get());
         let proxy = PolicyProxy::spawn(profile.clone())?;
         let preferences = engine_preferences(&proxy.uri());
@@ -1318,6 +1329,7 @@ impl ContentEngine {
         user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
         Ok(Rc::new(EngineBundle {
             servo,
+            rendering_context,
             profile,
             wake,
             user_content,
@@ -1404,6 +1416,15 @@ impl ContentEngine {
     fn spin_until(
         &self,
         timeout: Duration,
+        predicate: impl FnMut() -> bool,
+    ) -> io::Result<bool> {
+        self.spin_until_on(&self.wake, timeout, predicate)
+    }
+
+    fn spin_until_on(
+        &self,
+        wake: &WakeFlag,
+        timeout: Duration,
         mut predicate: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
@@ -1426,7 +1447,7 @@ impl ContentEngine {
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                wake,
                 &mut predicate,
                 remaining.min(Duration::from_millis(10)),
             ) {
@@ -2387,34 +2408,36 @@ impl ContentEngine {
                     .as_deref()
                     .and_then(|context| self.context_bundles.get(context))
                     .cloned();
-                let (servo, profile, wake, user_content) = match bundle.as_ref() {
+                let (servo, rendering_context, profile, wake, user_content) = match bundle.as_ref() {
                     Some(bundle) => (
                         &bundle.servo,
+                        Rc::clone(&bundle.rendering_context),
                         bundle.profile.clone(),
                         bundle.wake.clone(),
                         Rc::clone(&bundle.user_content),
                     ),
                     None => (
                         &self.servo,
+                        Rc::clone(&self.rendering_context),
                         self.profile.clone(),
                         self.wake.clone(),
                         Rc::clone(&self.user_content),
                     ),
                 };
                 let delegate = Rc::new(Delegate::new(
-                    Rc::clone(&self.rendering_context),
+                    Rc::clone(&rendering_context),
                     profile,
-                    wake,
+                    wake.clone(),
                     Rc::clone(&user_content),
                 ));
-                let webview = WebViewBuilder::new(servo, Rc::clone(&self.rendering_context))
+                let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
                     .user_content_manager(user_content)
                     .build();
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until(ACTION_TIMEOUT, move || created.url().is_some())? {
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || created.url().is_some())? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
