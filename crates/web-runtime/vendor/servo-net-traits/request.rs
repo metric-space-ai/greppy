@@ -418,9 +418,24 @@ impl RequestBody {
     pub fn detach_stream(&self) {
         if let Some(sender) = self.body_chunk_request_channel.lock().take() {
             if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
-                eprintln!("greppy-web-body event=detach sender={sender:?}");
+                eprintln!(
+                    "greppy-web-body pid={} event=detach sender={sender:?}",
+                    std::process::id()
+                );
             }
             let _ = sender.send(BodyChunkRequest::Done);
+        }
+    }
+
+    /// Correlate the script-side body chosen for a fetch with the same request in net.
+    /// Enabled only for the opt-in request-body diagnostic mode.
+    pub fn diagnose_fetch_handoff(&self, request_id: &str) {
+        if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+            let sender = self.body_chunk_request_channel.lock();
+            eprintln!(
+                "greppy-web-body pid={} request={request_id} event=fetch-handoff sender={sender:?}",
+                std::process::id()
+            );
         }
     }
 

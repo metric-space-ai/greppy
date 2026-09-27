@@ -62,7 +62,10 @@ static BODY_ROUTE_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
 fn body_route_diagnostic(event: &str, route_id: u64, sender: &IpcSender<BodyChunkRequest>) {
     if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
-        eprintln!("greppy-web-body route={route_id} event={event} sender={sender:?}");
+        eprintln!(
+            "greppy-web-body pid={} route={route_id} event={event} sender={sender:?}",
+            std::process::id()
+        );
     }
 }
 

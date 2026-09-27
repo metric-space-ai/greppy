@@ -946,6 +946,9 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         "GREPPY_WEB_TRACE_PHASE",
         // Bounded, opt-in initialization milestones; no page data or secrets.
         "GREPPY_WEB_TRACE_STARTUP",
+        // Opt-in request-body producer lifecycle diagnostics. Values contain only
+        // process/request/channel identities and never page or body data.
+        "GREPPY_WEB_BODY_DIAGNOSTICS",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))

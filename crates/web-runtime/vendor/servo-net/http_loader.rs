@@ -563,6 +563,7 @@ async fn obtain_response(
             chunk_requester,
             sink,
             fetch_terminated,
+            request_id,
         )?;
 
         let body = match stream {
@@ -716,16 +717,26 @@ fn obtain_response_setup_router_callback(
     chunk_requester: StdArc<Mutex<Option<IpcSender<BodyChunkRequest>>>>,
     sink: BodySink,
     fetch_terminated: UnboundedSender<bool>,
+    request_id: Option<&str>,
 ) -> Result<(), NetworkError> {
     let (body_chan, body_port) = ipc::channel().unwrap();
 
     {
         let mut lock = chunk_requester.lock();
         if let Some(chunk_requester) = lock.as_mut() {
+            if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "greppy-web-body pid={} request={} event=connect-attempt sender={chunk_requester:?}",
+                    std::process::id(),
+                    request_id.unwrap_or("none")
+                );
+            }
             if let Err(error) = chunk_requester.send(BodyChunkRequest::Connect(body_chan)) {
                 if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
                     eprintln!(
-                        "greppy-web-body event=connect-failed sender={chunk_requester:?} error={error}"
+                        "greppy-web-body pid={} request={} event=connect-failed sender={chunk_requester:?} error={error}",
+                        std::process::id(),
+                        request_id.unwrap_or("none")
                     );
                 }
                 log_request_body_stream_closed("connect to the request body stream", Some(&error));

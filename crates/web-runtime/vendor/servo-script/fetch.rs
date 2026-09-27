@@ -234,6 +234,9 @@ pub(crate) fn Fetch(
     // Step 3. Let request be requestObject’s request.
     let request = request_object.get_request();
     let request_id = request.id;
+    if let Some(body) = request.body.as_ref() {
+        body.diagnose_fetch_handoff(&request_id.0.to_string());
+    }
 
     // Step 4. If requestObject’s signal is aborted, then:
     let signal = request_object.Signal();
