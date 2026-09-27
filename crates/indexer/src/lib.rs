@@ -2710,10 +2710,8 @@ struct GraphIndex {
         String,
         std::collections::HashMap<String, std::collections::HashSet<i64>>,
     >,
-    import_alias_sources_by_file: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, Vec<(String, String)>>,
-    >,
+    import_alias_sources_by_file:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, String)>>>,
     import_module_files_by_file:
         std::collections::HashMap<String, std::collections::HashSet<String>>,
     import_globs_by_file: std::collections::HashMap<String, Vec<String>>,
@@ -2854,8 +2852,7 @@ impl GraphIndex {
             std::collections::HashMap::new();
         let mut by_name: std::collections::HashMap<String, Vec<NodeLite>> =
             std::collections::HashMap::new();
-        let mut by_id: std::collections::HashMap<i64, NodeLite> =
-            std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<i64, NodeLite> = std::collections::HashMap::new();
         let mut id_to_file: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut id_to_qname: std::collections::HashMap<i64, String> =
@@ -3213,6 +3210,16 @@ impl GraphIndex {
                 return UniqueResolution::Unique(*target);
             }
         }
+        // A local Rust item shadows a glob import. Do not let Base export
+        // hydration redirect a same-file reference to an imported namesake.
+        let candidates = self.defs_named(labels, name);
+        let local = candidates
+            .iter()
+            .filter(|node| node.file_path == referrer_file)
+            .collect::<Vec<_>>();
+        if let [target] = local.as_slice() {
+            return UniqueResolution::Unique(target.id);
+        }
         if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
             let module_files = globs
                 .iter()
@@ -3224,7 +3231,6 @@ impl GraphIndex {
                 return UniqueResolution::Unique(*target);
             }
         }
-        let candidates = self.defs_named(labels, name);
         if let Some(id) = Self::resolve_unique(&candidates, referrer_file) {
             return UniqueResolution::Unique(id);
         }
@@ -3334,14 +3340,13 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
-            let module_exists = module_files.iter().any(|module_file| {
-                self.known_files.contains(module_file)
-            });
+            let module_exists = module_files
+                .iter()
+                .any(|module_file| self.known_files.contains(module_file));
             if !module_exists {
                 return self.resolve_associated_method(src_id, ref_path, name);
             }
-            let in_module =
-                self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
+            let in_module = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
             match in_module.as_slice() {
                 [id] => return Some(*id),
                 _ => return None,
@@ -4478,7 +4483,8 @@ mod tests {
             "pub mod store; pub use crate::super_exports::*;\n",
         )
         .unwrap();
-        let caller_source = "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
+        let caller_source =
+            "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
 use crate::bare_glob::*;\n\
 use super::*;\n\
 pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
@@ -4487,18 +4493,16 @@ pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n\
 pub fn super_glob_caller() { let selected = child::target; selected(); }\n\
 pub fn alias_chain_caller() { let selected = alias_chain::outer; selected(); }\n\
 pub fn delta_crate_glob_caller() { let selected = bare_target; selected(); }\n\
-pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n";
+pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n\
+pub fn shadow_target() {}\n\
+pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n";
         fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
         fs::write(
             repo.join("src/alias_chain/mod.rs"),
             "mod sub; pub use sub::target as middle; pub use middle as outer;\n",
         )
         .unwrap();
-        fs::write(
-            repo.join("src/alias_chain/sub.rs"),
-            "pub fn target() {}\n",
-        )
-        .unwrap();
+        fs::write(repo.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
         fs::write(
             repo.join("src/bare_glob/mod.rs"),
             "mod command; pub use command::*;\n",
@@ -4506,7 +4510,7 @@ pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n"
         .unwrap();
         fs::write(
             repo.join("src/bare_glob/command.rs"),
-            "pub fn bare_target() {}\n",
+            "pub fn bare_target() {}\npub fn shadow_target() {}\n",
         )
         .unwrap();
         fs::write(
@@ -4534,11 +4538,7 @@ pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n"
             "pub fn target() {}\npub mod child;\n",
         )
         .unwrap();
-        fs::write(
-            repo.join("src/parent/child/mod.rs"),
-            "pub use super::*;\n",
-        )
-        .unwrap();
+        fs::write(repo.join("src/parent/child/mod.rs"), "pub use super::*;\n").unwrap();
         fs::write(
             repo.join("src/renamed_channels/mod.rs"),
             "mod command; pub use command::target as renamed;\n",
@@ -4576,8 +4576,7 @@ pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n"
         .unwrap();
         let dirty_path = "src/business_os/store.rs".to_string();
         let visibility =
-            greppy_store::VisibilityIndex::new([dirty_path.clone()], Vec::<String>::new())
-                .unwrap();
+            greppy_store::VisibilityIndex::new([dirty_path.clone()], Vec::<String>::new()).unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         index_with_options(
             &mut overlay,
@@ -4626,6 +4625,11 @@ pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n"
                 "src/super_exports/mod.rs::Function::super_target",
                 "src/business_os/store.rs::Function::delta_super_glob_caller",
                 "Delta super glob",
+            ),
+            (
+                "src/business_os/store.rs::Function::shadow_target",
+                "src/business_os/store.rs::Function::local_shadow_caller",
+                "local item shadows Base glob",
             ),
         ] {
             let target = overlay
