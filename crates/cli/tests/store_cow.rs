@@ -705,9 +705,14 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         .unwrap();
     let vectors_before: i64 = refreshed_delta
         .conn()
-        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert!(vectors_before > 0, "regression fixture must contain a vector");
+    assert!(
+        vectors_before > 0,
+        "regression fixture must contain a vector"
+    );
     drop(refreshed_delta);
 
     let base_path = PathBuf::from(
@@ -758,9 +763,14 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     );
     let vectors_after: i64 = structural_delta
         .conn()
-        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert_eq!(vectors_after, vectors_before, "refresh must retain Delta vectors");
+    assert_eq!(
+        vectors_after, vectors_before,
+        "refresh must retain Delta vectors"
+    );
     let binding_raw: String = structural_delta
         .conn()
         .query_row(
