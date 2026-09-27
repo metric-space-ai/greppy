@@ -17,6 +17,8 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v1";
+const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -710,6 +712,166 @@ pub(crate) fn visibility_for_open_connection(
 ) -> Result<VisibilityIndex> {
     cached_visibility_from_connection(connection, base_commit)
         .unwrap_or_else(|| visibility_against(root, base_commit))
+}
+
+/// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
+/// whose resolved Rust caller edges were produced by the old resolver.
+///
+/// The repair consumes only raw edges physically owned by the Delta and
+/// replaces only its logical overlay edges. Nodes, file state, and vector
+/// embeddings remain untouched. The schema-meta marker makes the operation
+/// one-shot for an otherwise unchanged Delta; a failed resolution leaves the
+/// marker absent so the next query can retry safely.
+pub(crate) fn repair_persisted_v7_delta(
+    delta_path: &Path,
+    base_path: &Path,
+    visibility: &VisibilityIndex,
+    root: &Path,
+    project: &str,
+) -> Result<bool> {
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    let pending = persisted_v7_delta_needs_repair(&delta, root)?;
+    drop(delta);
+    if !pending {
+        return Ok(false);
+    }
+
+    // A concurrent normal query may have observed the same unmarked Delta.
+    // Poll the existing OS lock rather than serving its stale read-only
+    // snapshot. Once the writer releases the lock, re-read the marker before
+    // electing a repairer; only a missing marker permits resolver work.
+    let deadline = std::time::Instant::now() + crate::NAV_FRESHNESS_BUDGET;
+    let _lock = loop {
+        match greppy_freshness::try_acquire(delta_path) {
+            Ok(lock) => break lock,
+            Err(greppy_freshness::LockError::Held { path }) => {
+                let observed = greppy_store::Store::open_with(
+                    delta_path,
+                    greppy_store::OpenOptions::read_only(),
+                )?;
+                if !persisted_v7_delta_needs_repair(&observed, root)? {
+                    return Ok(false);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Lock(format!(
+                        "timed out waiting for persisted Delta repair publication; lock {}",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let current =
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::query_writer())?;
+    if !persisted_v7_delta_needs_repair(&current, root)? {
+        return Ok(false);
+    }
+    drop(current);
+    let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
+    let raw_edges = overlay.list_delta_raw_edges(project)?;
+    if raw_edges.is_empty() {
+        let existing_edges: i64 = overlay
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.overlay_edges WHERE project = ?1",
+                [project],
+                |row| row.get(0),
+            )
+            .map_err(|error| Error::Store(format!("count persisted Delta edges: {error}")))?;
+        if existing_edges != 0 {
+            return Err(Error::Invalid(
+                "pre-PR138 Delta has resolved edges but no persisted raw edges to repair".into(),
+            ));
+        }
+    }
+    greppy_indexer::rebuild_overlay_edges(&mut overlay, project)?;
+    overlay
+        .conn()
+        .execute(
+            "INSERT INTO main.schema_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                RUST_CALLER_EDGES_REPAIR_META_KEY,
+                RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            ),
+        )
+        .map_err(|error| {
+            Error::Store(format!("persist Rust caller-edge repair marker: {error}"))
+        })?;
+    Ok(true)
+}
+
+pub(crate) fn ensure_persisted_v7_delta_repaired(
+    delta_path: &Path,
+    base_path: &Path,
+    visibility: &VisibilityIndex,
+    root: &Path,
+    project: &str,
+) -> Result<()> {
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    if !persisted_v7_delta_needs_repair(&delta, root)? {
+        return Ok(());
+    }
+    drop(delta);
+    repair_persisted_v7_delta(delta_path, base_path, visibility, root, project)?;
+    let repaired =
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    if persisted_v7_delta_needs_repair(&repaired, root)? {
+        return Err(Error::Lock(
+            "persisted Delta repair did not publish its completion marker".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn persisted_v7_delta_needs_repair(
+    delta: &greppy_store::Store,
+    root: &Path,
+) -> Result<bool> {
+    let marker = match delta.conn().query_row(
+        "SELECT value FROM main.schema_meta WHERE key = ?1",
+        [RUST_CALLER_EDGES_REPAIR_META_KEY],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(value) => Some(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            return Err(Error::Store(format!(
+                "read Rust caller-edge repair marker: {error}"
+            )))
+        }
+    };
+    Ok(delta
+        .list_private_workspace_states()?
+        .into_iter()
+        .any(|state| {
+            let indexer_base = state
+                .indexer_version
+                .split_once(';')
+                .map_or(state.indexer_version.as_str(), |(base, _)| base);
+            paths_resolve_equal(Path::new(&state.root_path), root)
+                && indexer_base == greppy_core::INDEXER_VERSION_BASE
+        })
+        && marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE))
+}
+
+pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "INSERT INTO main.schema_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                RUST_CALLER_EDGES_REPAIR_META_KEY,
+                RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            ),
+        )
+        .map_err(|error| {
+            Error::Store(format!("persist Rust caller-edge repair marker: {error}"))
+        })?;
+    Ok(())
 }
 
 pub(crate) fn persist_visibility(
@@ -2331,6 +2493,7 @@ fn take_field(fields: &[String], index: &mut usize, status: &str) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     struct TmpdirRestore(Option<std::ffi::OsString>);
 
@@ -2377,6 +2540,372 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn assert_persisted_v7_delta_query_is_correct(root: &str) -> std::result::Result<(), String> {
+        let cli = crate::Cli::try_parse_from(["greppy", "--root", root, "who-calls", "target"])
+            .map_err(|error| error.to_string())?;
+        let exit = crate::dispatch(cli).map_err(|error| error.to_string())?;
+        if exit != 0 {
+            return Err(format!("who-calls CLI returned exit code {exit}"));
+        }
+        let effective_root = Path::new(root);
+        let overlay = overlay_spec(effective_root)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "overlay configuration disappeared".to_string())?;
+        let delta_path = crate::workspace_locator::store_path(effective_root);
+        let store =
+            greppy_store::Store::open_overlay(&overlay.base_path, &delta_path, &overlay.visibility)
+                .map_err(|error| error.to_string())?;
+        let target = store
+            .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired target node is missing".to_string())?;
+        let caller = store
+            .get_node_by_qname("p", "src/caller.rs::Function::caller")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired caller node is missing".to_string())?;
+        if !store
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|edge| edge.source_id == caller.id)
+        {
+            return Err("repaired caller edge is missing".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::capture(&[
+            "GREPPY_STORE_DIR",
+            "GREPPY_PROJECT_IDENTITY",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        let base_path = scratch.path().join("base.db");
+        let delta_path = crate::workspace_locator::store_path(&root);
+        std::fs::create_dir_all(delta_path.parent().unwrap()).unwrap();
+
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-09-27T00:00:00Z".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+            base.insert_node(&greppy_store::NewNode {
+                project: "p".into(),
+                label: "Module".into(),
+                name: "mod".into(),
+                qualified_name: "src/alias_chain/mod.rs::__file__".into(),
+                file_path: "src/alias_chain/mod.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+            base.insert_node(&greppy_store::NewNode {
+                project: "p".into(),
+                label: "Function".into(),
+                name: "target".into(),
+                qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
+                file_path: "src/alias_chain/sub.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+            base.insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "p".into(),
+                file_path: "src/alias_chain/mod.rs".into(),
+                source_qname: "src/alias_chain/mod.rs::__file__".into(),
+                target_qname: "src/alias_chain/mod.rs::Import::sub::target".into(),
+                edge_type: "IMPORTS".into(),
+                properties: serde_json::json!({
+                    "imported_name": "target",
+                    "imported_items": [{
+                        "path": "sub::target",
+                        "imported_name": "outer",
+                        "original_name": "target",
+                        "glob": false
+                    }]
+                }),
+            }])
+            .unwrap();
+        }
+        {
+            let mut delta = greppy_store::Store::open(&delta_path).unwrap();
+            delta
+                .upsert_project(&greppy_store::Project {
+                    name: "p".into(),
+                    indexed_at: "2026-09-27T00:00:00Z".into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                })
+                .unwrap();
+            delta
+                .upsert_workspace_state(&greppy_store::WorkspaceState {
+                    root_path: root.to_string_lossy().into_owned(),
+                    git_dir: None,
+                    git_common_dir: None,
+                    head_oid: None,
+                    index_signature: None,
+                    schema_version: delta.schema_version().unwrap(),
+                    indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+                    graph_generation: 7,
+                    updated_at: "2026-09-27T00:00:00Z".into(),
+                })
+                .unwrap();
+            delta
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Module".into(),
+                    name: "caller".into(),
+                    qualified_name: "src/caller.rs::__file__".into(),
+                    file_path: "src/caller.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            delta
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "caller".into(),
+                    qualified_name: "src/caller.rs::Function::caller".into(),
+                    file_path: "src/caller.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            delta
+                .insert_raw_edges(&[
+                    greppy_store::NewRawEdge {
+                        project: "p".into(),
+                        file_path: "src/caller.rs".into(),
+                        source_qname: "src/caller.rs::__file__".into(),
+                        target_qname: "src/caller.rs::Import::crate::alias_chain::outer".into(),
+                        edge_type: "IMPORTS".into(),
+                        properties: serde_json::json!({
+                            "imported_name": "outer",
+                            "imported_items": [{
+                                "path": "crate::alias_chain::outer",
+                                "imported_name": "outer",
+                                "original_name": "outer",
+                                "glob": false
+                            }]
+                        }),
+                    },
+                    greppy_store::NewRawEdge {
+                        project: "p".into(),
+                        file_path: "src/caller.rs".into(),
+                        source_qname: "src/caller.rs::Function::caller".into(),
+                        target_qname: "src/caller.rs::__ref__::outer".into(),
+                        edge_type: "USAGE".into(),
+                        properties: serde_json::json!({"ref_name": "outer"}),
+                    },
+                ])
+                .unwrap();
+            delta
+                .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                    project: "p".into(),
+                    model_id: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                    task: "code".into(),
+                    node_id: None,
+                    chunk_idx: 0,
+                    qualified_name: "src/caller.rs::Function::caller".into(),
+                    file_path: "src/caller.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_sha256: "a".repeat(64),
+                    graph_generation: 7,
+                    vector: vec![1.0, 0.0],
+                })
+                .unwrap();
+        }
+
+        let visibility =
+            greppy_store::VisibilityIndex::new(["src/caller.rs".to_string()], Vec::<String>::new())
+                .unwrap();
+        {
+            let delta = greppy_store::Store::open(&delta_path).unwrap();
+            persist_visibility(&delta, &visibility, "fixture").unwrap();
+        }
+        std::env::set_var(ENV_MODE, MODE_OVERLAY);
+        std::env::set_var(ENV_BASE_PATH, &base_path);
+        std::env::set_var(ENV_BASE_COMMIT, "fixture");
+        let legacy =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert_eq!(
+            legacy
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges WHERE project = 'p'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "the preserved pre-repair Delta starts without the corrected edge"
+        );
+        let legacy_target = legacy
+            .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        assert!(legacy
+            .incoming_edges(legacy_target.id, Some("USAGE"), 10)
+            .unwrap()
+            .is_empty());
+        drop(legacy);
+        let vector_before: Vec<u8> =
+            greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let held = greppy_freshness::try_acquire(&delta_path).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_start = std::sync::Arc::clone(&start);
+        let first_root = root_string.clone();
+        let first = std::thread::spawn(move || {
+            first_start.wait();
+            assert_persisted_v7_delta_query_is_correct(&first_root)
+        });
+        let second_start = std::sync::Arc::clone(&start);
+        let second_root = root_string.clone();
+        let second = std::thread::spawn(move || {
+            second_start.wait();
+            assert_persisted_v7_delta_query_is_correct(&second_root)
+        });
+        start.wait();
+        // Exercise the normal freshness wait budget rather than the old
+        // repair-local cap: a legitimate graph-only repair may exceed two
+        // seconds while still being a live publication.
+        std::thread::sleep(std::time::Duration::from_millis(2_500));
+        drop(held);
+        first
+            .join()
+            .unwrap_or_else(|_| Err("first concurrent query panicked".into()))
+            .unwrap();
+        second
+            .join()
+            .unwrap_or_else(|_| Err("second concurrent query panicked".into()))
+            .unwrap();
+        let repaired = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        let target = repaired
+            .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = repaired
+            .get_node_by_qname("p", "src/caller.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(repaired
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert_eq!(
+            repaired
+                .get_workspace_state(&root_string)
+                .unwrap()
+                .unwrap()
+                .graph_generation,
+            7,
+            "edge repair must not publish a new graph generation"
+        );
+        let vector_after: Vec<u8> = repaired
+            .conn()
+            .query_row(
+                "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_after, vector_before);
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges WHERE project = 'p'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let vector_count = repaired
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.vector_embeddings WHERE project = 'p'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(vector_count, 1);
+        drop(repaired);
+
+        let warm = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        assert_eq!(
+            warm.conn()
+                .query_row(
+                    "SELECT value FROM main.schema_meta WHERE key = ?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            RUST_CALLER_EDGES_REPAIR_COMPLETE
+        );
+        assert_eq!(
+            warm.get_workspace_state(&root_string)
+                .unwrap()
+                .unwrap()
+                .graph_generation,
+            7
+        );
     }
 
     #[test]
