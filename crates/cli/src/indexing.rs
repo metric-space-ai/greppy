@@ -5,6 +5,19 @@
 //! the behaviour changes.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static INDEX_WARM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn index_warm_run_id() -> String {
+    let sequence = INDEX_WARM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("index-warm-{nanos}-{}-{sequence}", std::process::id())
+}
 
 fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
     match phase {
@@ -853,8 +866,8 @@ pub(crate) fn dispatch_index_agent_worktree(
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
     let repo = resolve_root(root.or(path))?;
-    let workspace =
-        greppy_agent::workspace::AgentWorkspace::create(&repo, "index-warm").map_err(|error| {
+    let workspace = greppy_agent::workspace::AgentWorkspace::create(&repo, &index_warm_run_id())
+        .map_err(|error| {
             Error::Invalid(format!("no agent worktree for {}: {error}", repo.display()))
         })?;
     let worktree_path = workspace.worktree_path().to_path_buf();
@@ -1795,7 +1808,12 @@ pub(crate) fn index_embeddings_into_temp_store(
 
 #[cfg(test)]
 mod progress_status_tests {
-    use super::progress_stall_threshold_seconds;
+    use super::{index_warm_run_id, progress_stall_threshold_seconds};
+
+    #[test]
+    fn index_warm_run_ids_are_unique_within_a_process() {
+        assert_ne!(index_warm_run_id(), index_warm_run_id());
+    }
 
     #[test]
     fn cold_model_and_base_preparation_use_phase_specific_stall_thresholds() {
