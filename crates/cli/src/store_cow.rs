@@ -110,9 +110,9 @@ pub(crate) fn overlay_environment(root: &Path) -> Result<Option<(PathBuf, String
 }
 
 /// Read a persisted Delta binding while permitting its Base file to be
-/// absent. This is only for the explicit index recovery path: steady-state
-/// readers must continue to fail closed instead of opening an incomplete
-/// overlay.
+/// absent. Recovery may inspect this binding before rebuilding; query readers
+/// must wait for that publication and then use the strict overlay open, never
+/// attach an incomplete overlay.
 pub(crate) fn overlay_environment_for_recovery(root: &Path) -> Result<Option<(PathBuf, String)>> {
     overlay_environment_inner(root, true)
 }
@@ -1217,14 +1217,16 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         // Keep an existing worktree pinned to its verified Base. Advancing the
         // primary checkout must not force every already-indexed worktree to
         // build a new repository-wide Base on its next Delta refresh.
-        let base_commit = match overlay_environment_for_recovery(root)? {
-            Some((_, commit)) => commit,
+        let existing_binding = overlay_environment_for_recovery(root)?;
+        let base_commit = match existing_binding.as_ref() {
+            Some((_, commit)) => commit.clone(),
             None => git_output(&primary, &["rev-parse", "HEAD"])?,
         };
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
                 None if structural_first_use
+                    && existing_binding.is_none()
                     && !has_verified_previous_indexer_base(
                         &primary,
                         &base_commit,
@@ -1763,7 +1765,7 @@ fn prepare_base_store_paths(
         .join("graph.db");
     let seeded_summary_cache =
         seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
-    let defer_migrated_embeddings = structural_first_use && seeded_summary_cache.is_some();
+    let defer_base_embeddings = structural_first_use;
     if seeded_summary_cache.is_some() {
         report_base_phase(progress_path, "migrating_base_graph");
     }
@@ -1781,7 +1783,7 @@ fn prepare_base_store_paths(
         command.env(crate::ENV_TEST_FORCE_EMBED_COMPLETION, "1");
     }
     append_embedding_cli_args(&mut command, embedding_args);
-    if defer_migrated_embeddings {
+    if defer_base_embeddings {
         command.env(crate::ENV_STRUCTURAL_FIRST_USE, "1");
     } else {
         command.env_remove(crate::ENV_STRUCTURAL_FIRST_USE);
@@ -1805,10 +1807,10 @@ fn prepare_base_store_paths(
         )
         // A normal Base build completes every candidate before publication;
         // never let the ordinary foreground-index lazy threshold hand it to a
-        // background process outside the publication lease. Structural v6
-        // migration is the bounded exception: it inherits
-        // GREPPY_STRUCTURAL_FIRST_USE, preserves reusable vectors, and records
-        // an exact deferred receipt below for later semantic completion.
+        // background process outside the publication lease. Structural Base
+        // recovery and migration inherit GREPPY_STRUCTURAL_FIRST_USE even
+        // without a reusable seed; they record an exact deferred receipt below
+        // for later semantic completion instead of loading inference models.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
         .env_remove("GREPPY_BACKGROUND_JOB")
@@ -1871,7 +1873,7 @@ fn prepare_base_store_paths(
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
-    if defer_migrated_embeddings {
+    if defer_base_embeddings {
         mark_base_embeddings_deferred(
             &staged_graph,
             &greppy_core::project_identity(worktree_path),

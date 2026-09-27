@@ -1091,6 +1091,12 @@ pub(crate) fn dispatch_index(
     let embedding_config = if structural_first_use {
         None
     } else {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("GREPPY_TEST_FORBID_INDEX_INFERENCE").is_some() {
+            return Err(Error::Invalid(
+                "structural recovery attempted inference configuration".into(),
+            ));
+        }
         embedding_config_for_index(embedding_args)?
     };
     let embedding_job =
