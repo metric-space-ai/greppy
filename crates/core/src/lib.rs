@@ -33,7 +33,9 @@
 ///   the contextual identifier `raw`; old extraction trees may be incomplete.
 ///   v5 -> v6: resolve module-qualified Rust calls before same-file twins;
 ///   existing resolved CALLS edges must not survive as a no-op incremental run.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v6";
+///   v6 -> v7: retain grouped Rust reexports and scoped function-item usages;
+///   existing ambiguous caller edges need complete re-extraction/resolution.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v7";
 
 pub mod cache;
 pub mod diag;

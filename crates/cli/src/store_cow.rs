@@ -1548,6 +1548,16 @@ fn prepare_base_store_paths(
     let staging_data = staging.path().join("data");
     std::fs::create_dir_all(&staging_data)
         .map_err(|error| Error::io("create Base build data directory", error))?;
+    let staged_graph = staging_data
+        .join("workspaces")
+        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
+        .join(greppy_core::workspace_hash(worktree_path))
+        .join("graph.db");
+    let seeded_summary_cache =
+        seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
+    if seeded_summary_cache.is_some() {
+        report_base_phase(progress_path, "migrating_base_graph");
+    }
     let binary = std::env::current_exe()
         .map_err(|error| Error::io("resolve current greppy binary for Base build", error))?;
     report_base_phase(progress_path, "building_base_graph");
@@ -1628,11 +1638,6 @@ fn prepare_base_store_paths(
             "immutable Base index build exited {status}"
         )));
     }
-    let staged_graph = staging_data
-        .join("workspaces")
-        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
-        .join(greppy_core::workspace_hash(worktree_path))
-        .join("graph.db");
     if !staged_graph.is_file() {
         return Err(Error::Invalid(format!(
             "Base build succeeded without graph.db at {}",
@@ -1658,8 +1663,12 @@ fn prepare_base_store_paths(
         ));
     }
     report_base_phase(progress_path, "initializing_base_summary_cache");
-    let staged_summary_cache =
-        build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)?;
+    let staged_summary_cache = match seeded_summary_cache {
+        Some(path) => path,
+        None => {
+            build_base_summary_cache(&staged_graph, &identity.summary_model_and_prompt_version)?
+        }
+    };
     validate_base_summary_cache(
         worktree_path,
         &staged_graph,
@@ -1671,6 +1680,83 @@ fn prepare_base_store_paths(
         .map_err(|error| Error::io("publish immutable Base Store", error))?;
     drop(builder_lease);
     prepared_base_with_reader(&layout, manifest, false)
+}
+
+/// Seed a v7 Base build from the verified v6 artifact with the same immutable
+/// inputs. The old published Base remains untouched; the ordinary index
+/// command opens this private copy and performs the scoped raw-edge migration.
+/// Since byte-identical nodes and vectors survive that migration, the child
+/// does not need to re-run model inference.
+fn seed_previous_indexer_base(
+    shared_data_root: &Path,
+    current_identity: &BaseStoreIdentity,
+    worktree_path: &Path,
+    staged_graph: &Path,
+) -> Result<Option<PathBuf>> {
+    if current_identity.indexer_version != "greppy-indexer-v7" {
+        return Ok(None);
+    }
+    let mut previous_identity = current_identity.clone();
+    previous_identity.indexer_version = "greppy-indexer-v6".into();
+    let previous_layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+    let Ok(previous_manifest) = previous_layout.read_verified_manifest() else {
+        return Ok(None);
+    };
+    if previous_manifest.identity != previous_identity {
+        return Ok(None);
+    }
+    let parent = staged_graph
+        .parent()
+        .ok_or_else(|| Error::Invalid("staged Base graph has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| Error::io("create migrated Base graph directory", error))?;
+    let mut previous_graph = std::fs::File::open(&previous_layout.graph)
+        .map_err(|error| Error::io("open previous Base graph for migration", error))?;
+    let mut migrated_graph = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(staged_graph)
+        .map_err(|error| Error::io("create migrated Base graph", error))?;
+    std::io::copy(&mut previous_graph, &mut migrated_graph)
+        .map_err(|error| Error::io("copy previous Base graph for migration", error))?;
+    drop(migrated_graph);
+    let root = worktree_path.to_string_lossy();
+    let store =
+        greppy_store::Store::open_with(staged_graph, greppy_store::OpenOptions::query_writer())?;
+    store
+        .conn()
+        .execute(
+            "UPDATE main.projects SET root_path = ?1",
+            rusqlite::params![root.as_ref()],
+        )
+        .map_err(|error| Error::Store(format!("retarget migrated Base project: {error}")))?;
+    store
+        .conn()
+        .execute(
+            "UPDATE main.workspace_state SET root_path = ?1",
+            rusqlite::params![root.as_ref()],
+        )
+        .map_err(|error| Error::Store(format!("retarget migrated Base workspace: {error}")))?;
+    let staged_summary_cache = parent
+        .join("base-summary-cache")
+        .join(greppy_store::SUMMARY_CACHE_DB_FILE);
+    let summary_parent = staged_summary_cache.parent().ok_or_else(|| {
+        Error::Invalid("staged Base summary cache has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(summary_parent)
+        .map_err(|error| Error::io("create migrated Base summary directory", error))?;
+    let mut previous_summary = std::fs::File::open(&previous_layout.summary_cache)
+        .map_err(|error| Error::io("open previous Base summary cache", error))?;
+    let mut migrated_summary = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged_summary_cache)
+        .map_err(|error| Error::io("create migrated Base summary cache", error))?;
+    std::io::copy(&mut previous_summary, &mut migrated_summary)
+        .map_err(|error| Error::io("copy previous Base summary cache", error))?;
+    drop(migrated_summary);
+    Ok(Some(staged_summary_cache))
 }
 
 fn validate_workspace_inventory(source_path: &Path, worktree_path: &Path) -> Result<usize> {
@@ -2243,6 +2329,100 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn v7_base_seed_copies_verified_v6_graph_and_summary() {
+        let data_root = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
+        let graph = sources.path().join("graph.db");
+        let summary_dir = sources.path().join("summary");
+        let summary = {
+            let cache = greppy_store::SummaryCache::open(&summary_dir).unwrap();
+            drop(cache);
+            summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
+        };
+        let root = "/old/base/root";
+        {
+            let mut store = greppy_store::Store::open(&graph).unwrap();
+            store
+                .upsert_project(&greppy_store::Project {
+                    name: "fixture".into(),
+                    indexed_at: "2026-09-27T00:00:00Z".into(),
+                    root_path: root.into(),
+                })
+                .unwrap();
+            store
+                .upsert_workspace_state(&greppy_store::WorkspaceState {
+                    root_path: root.into(),
+                    git_dir: None,
+                    git_common_dir: None,
+                    head_oid: None,
+                    index_signature: None,
+                    schema_version: store.schema_version().unwrap(),
+                    indexer_version: "greppy-indexer-v6".into(),
+                    graph_generation: 1,
+                    updated_at: "2026-09-27T00:00:00Z".into(),
+                })
+                .unwrap();
+        }
+        let previous_identity = BaseStoreIdentity {
+            format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+            canonical_repository_identity: "fixture-repository".into(),
+            git_object_format: "sha1".into(),
+            base_tree_oid: "1111111111111111111111111111111111111111".into(),
+            store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+            indexer_version: "greppy-indexer-v6".into(),
+            parser_and_extractor_versions: "fixture-parser".into(),
+            summary_model_and_prompt_version: "fixture-summary".into(),
+            embedding_model: "fixture-embedding".into(),
+            embedding_prompt_version: "fixture-prompt".into(),
+            embedding_dimensions: 2,
+            embedding_encoding: "f32+i8-v1".into(),
+        };
+        let previous_layout = BaseStoreLayout::new(data_root.path(), &previous_identity).unwrap();
+        previous_layout
+            .publish_graph_with_summary(previous_identity.clone(), &graph, &summary)
+            .unwrap();
+        let previous_summary_hash = greppy_store::file_state::sha256_hex(
+            &std::fs::read(&previous_layout.summary_cache).unwrap(),
+        );
+
+        let mut current_identity = previous_identity;
+        current_identity.indexer_version = "greppy-indexer-v7".into();
+        let migrated_root = data_root.path().join("migrated-worktree");
+        let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
+        let staged_summary = seed_previous_indexer_base(
+            data_root.path(),
+            &current_identity,
+            &migrated_root,
+            &staged_graph,
+        )
+        .unwrap()
+        .expect("verified v6 Base should seed v7 staging");
+
+        assert_eq!(
+            greppy_store::file_state::sha256_hex(&std::fs::read(&staged_summary).unwrap()),
+            previous_summary_hash
+        );
+        let migrated =
+            greppy_store::Store::open_with(&staged_graph, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        assert_eq!(
+            migrated.list_projects().unwrap()[0].root_path,
+            migrated_root.to_string_lossy()
+        );
+        assert_eq!(
+            migrated.list_workspace_states().unwrap()[0].root_path,
+            migrated_root.to_string_lossy()
+        );
+        assert_eq!(
+            greppy_store::file_state::sha256_hex(
+                &std::fs::read(&previous_layout.summary_cache).unwrap()
+            ),
+            previous_summary_hash,
+            "published v6 summary cache remains immutable"
+        );
     }
 
     #[test]
