@@ -437,11 +437,7 @@ Effect.gen(function* () {
         "a real callback call must not collapse to an empty answer or file anchor: {out:?}"
     );
 
-    let (code, out, err) = run(
-        &["who-calls", "bareHelper", "--code"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["who-calls", "bareHelper", "--code"], &repo, &store);
     assert_eq!(code, 0, "module caller should exit 0: {out}\n{err}");
     assert!(
         out.contains("src/app.ts:8")
@@ -490,7 +486,10 @@ Effect.gen(function* () {
         assert_eq!(usage, 1, "seed an earlier same-anchor USAGE site");
     }
     let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
-    assert_eq!(code, 0, "retained-graph who-calls should exit 0: {out}\n{err}");
+    assert_eq!(
+        code, 0,
+        "retained-graph who-calls should exit 0: {out}\n{err}"
+    );
     assert!(
         out.contains("src/app.ts:4")
             && out.contains("<module>")
@@ -1009,12 +1008,7 @@ fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
-        let (code, out, err) = run_with_env(
-            &args,
-            &repo,
-            &store,
-            &[("GREPPY_AUTO_REINDEX", "0")],
-        );
+        let (code, out, err) = run_with_env(&args, &repo, &store, &[("GREPPY_AUTO_REINDEX", "0")]);
         assert_eq!(
             code, 75,
             "stale {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"

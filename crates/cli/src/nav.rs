@@ -3405,8 +3405,7 @@ pub(crate) fn dispatch_who_calls(
     // Collect each reference-site line persisted in the edge properties. The
     // line locates the statement that `--code` prints for the answer row.
     let mut sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
-    let mut call_sites: std::collections::HashMap<i64, Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut call_sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     for e in &edges {
         if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
             sites.entry(e.source_id).or_default().push(l as u32);
@@ -3463,9 +3462,8 @@ pub(crate) fn dispatch_who_calls(
     let total = nodes.len();
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
-    let preferred_site_lines = |node_id: i64| {
-        sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)))
-    };
+    let preferred_site_lines =
+        |node_id: i64| sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)));
     let repo_root = resolve_root(root)?;
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut evidence: std::collections::HashMap<i64, (u32, (u32, u32))> = Default::default();
@@ -3517,19 +3515,13 @@ pub(crate) fn dispatch_who_calls(
         let hits = nodes[..shown]
             .iter()
             .map(|node| {
-                let (site, span) = evidence
-                    .get(&node.id)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        let start = node.start_line.max(1) as u32;
-                        let end = node.end_line.max(node.start_line).max(1) as u32;
-                        (start, (start, end))
-                    });
-                let module = is_synthetic_file_anchor(
-                    &node.label,
-                    &node.name,
-                    &node.qualified_name,
-                );
+                let (site, span) = evidence.get(&node.id).copied().unwrap_or_else(|| {
+                    let start = node.start_line.max(1) as u32;
+                    let end = node.end_line.max(node.start_line).max(1) as u32;
+                    (start, (start, end))
+                });
+                let module =
+                    is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name);
                 serde_json::json!({
                     // Keep the stored graph identity so JSON piping can
                     // resolve this row again. `<module>` is presentation,
@@ -3563,14 +3555,11 @@ pub(crate) fn dispatch_who_calls(
     // dependency sits". Both fit one line, and nothing else belongs on it.
     let mut rows = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        let (site, span) = evidence
-            .get(&n.id)
-            .copied()
-            .unwrap_or_else(|| {
-                let start = n.start_line.max(1) as u32;
-                let end = n.end_line.max(n.start_line).max(1) as u32;
-                (start, (start, end))
-            });
+        let (site, span) = evidence.get(&n.id).copied().unwrap_or_else(|| {
+            let start = n.start_line.max(1) as u32;
+            let end = n.end_line.max(n.start_line).max(1) as u32;
+            (start, (start, end))
+        });
         let lines = sources.get(&n.file_path).and_then(Option::as_ref);
         rows.push(NavAnswerRow {
             file: n.file_path.clone(),
