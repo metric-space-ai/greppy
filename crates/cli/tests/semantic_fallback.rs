@@ -2,11 +2,13 @@
 //! command `search` (the replacement for the retired `semantic-search`)
 //! and for `brief`, plus the retirement pin for the dead verb.
 //!
-//! 0.3.0 CLI contract (normative; navigation law 1: no justification, no
-//! instruction):
-//! * While the embedding index is still building, `search` prints ONE status
-//!   line with progress and ETA and exits 1 (grep's convention). Never
-//!   partial hits, never `try:` fallback instructions.
+//! Semantic search waits for a real embedding owner to publish a complete
+//! generation. A progress record alone is not a live owner. This fixture
+//! disables inference and must not claim a build is running from a synthetic
+//! record. Live publication and compact progress/ETA formatting are covered by
+//! cli_hardening and lib_tests respectively.
+//!
+//! Missing-asset and retired-command contracts:
 //! * When the embedding assets cannot be resolved, `search` prints ONE line
 //!   naming the unavailable semantic index and exits 1 — a message, not a
 //!   different exit code, distinguishes it from zero hits.
@@ -103,15 +105,16 @@ fn index_graph(repo: &Path, store: &Path) {
 }
 
 #[test]
-fn search_building_status_is_one_line_with_progress_and_eta() {
+fn search_does_not_report_ownerless_metadata_as_live_embedding_progress() {
     let (repo, store, _scratch) = fixture(
         "building",
         "pub fn semantic_progress_marker() -> i32 { 7 }\n",
     );
     index_graph(&repo, &store);
 
-    // Publish a deterministic live embedding job so `search` reports build
-    // progress without spawning a model process during this test.
+    // Metadata with a live PID is not an embedding owner: this process holds
+    // no workspace writer lease. Inference is deliberately disabled by run(),
+    // so the query cannot start a replacement or promise that work is underway.
     let job = graph_db(&store).parent().unwrap().join("index.job");
     std::fs::write(
         &job,
@@ -137,14 +140,22 @@ fn search_building_status_is_one_line_with_progress_and_eta() {
         &[],
     );
     assert_eq!(
-        code, 75,
-        "a building semantic index is a retryable temporary failure; stdout={stdout}\nstderr={stderr}"
+        code, 73,
+        "disabled inference cannot start a real embedding owner; stdout={stdout}\nstderr={stderr}"
     );
-    assert!(stderr.is_empty(), "status belongs on stdout: {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "no answer or fabricated progress: {stdout:?}"
+    );
+    assert!(
+        stderr.starts_with("greppy: index error: semantic embedding failed for ")
+            && stderr.ends_with(": the embedding process could not be started\n"),
+        "the launch failure must be explicit, not a stale PID's progress or retry promise: {stderr:?}"
+    );
     assert_eq!(
-        stdout,
-        "semantic search temporarily unavailable — semantic index building — 3/12 spans, ETA ~9s (backend cuda); retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit 75)\n",
-        "exactly ONE actionable status line with progress, ETA and retry gate — never partial hits; got: {stdout:?}"
+        stderr.lines().count(),
+        1,
+        "one precise diagnostic: {stderr:?}"
     );
 }
 
