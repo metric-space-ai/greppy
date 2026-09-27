@@ -2453,9 +2453,7 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || {
-                    created.url().is_some() && created.load_status() == LoadStatus::Complete
-                })? {
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || created.url().is_some())? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
