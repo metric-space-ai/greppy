@@ -2672,7 +2672,55 @@ mod tests {
             .iter()
             .any(|edge| edge.source_id == caller.id)
         {
-            return Err("repaired caller edge is missing".into());
+            let generation = store
+                .get_workspace_state(effective_root.to_string_lossy().as_ref())
+                .ok()
+                .flatten()
+                .map(|state| state.graph_generation);
+            let marker = store
+                .conn()
+                .query_row(
+                    "SELECT value FROM main.schema_meta WHERE key = ?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let raw_edges = store
+                .conn()
+                .prepare(
+                    "SELECT source_qname || ' -> ' || target_qname || ' [' || edge_type || ']'
+                     FROM main.raw_edges WHERE project = ?1 ORDER BY id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(["p"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_else(|error| vec![format!("<raw edge diagnostic failed: {error}>")]);
+            let resolved_edges = store
+                .conn()
+                .prepare(
+                    "SELECT source_qualified_name || ' -> ' || target_qualified_name || ' [' || edge_type || ']'
+                     FROM main.overlay_edges WHERE project = ?1 ORDER BY id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(["p"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_else(|error| {
+                    vec![format!("<resolved edge diagnostic failed: {error}>")]
+                });
+            let job_path = delta_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("index.job");
+            let job = std::fs::read_to_string(&job_path).ok();
+            return Err(format!(
+                "repaired caller edge is missing; generation={generation:?}; marker={marker:?}; raw_edges={raw_edges:?}; resolved_edges={resolved_edges:?}; index_job={job:?}"
+            ));
         }
         Ok(())
     }
