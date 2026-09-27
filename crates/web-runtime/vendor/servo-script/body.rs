@@ -417,18 +417,9 @@ impl ExtractedBody {
             source,
         } = self;
 
-        // First, setup some infra to be used to transmit body
-        //  from `components::script` to `components::net`.
-        let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();
-
-        let trusted_stream = Trusted::new(&*stream);
-
-        let global = stream.global();
-        let task_manager = global.task_manager();
-        let task_source = task_manager.networking_task_source();
-
-        // In case of the data being in-memory, send everything in one chunk, by-passing SM.
-        // Empty extracted bodies are always representable as an in-memory empty payload.
+        // In-memory bodies cross IPC with the request itself. This keeps navigation POSTs
+        // independent of the outgoing document's producer route and avoids creating a route
+        // that the net process will never consume.
         let in_memory = stream.get_in_memory_bytes(cx).or_else(|| {
             if total_bytes == Some(0) {
                 Some(GenericSharedMemory::from_bytes(&[]))
@@ -442,49 +433,36 @@ impl ExtractedBody {
             _ => NetBodySource::Object,
         };
 
-        let mut body_handler = TransmitBodyConnectHandler::new(
-            trusted_stream,
-            task_source.into(),
-            chunk_request_sender.clone(),
-            in_memory.clone(),
-            source,
-        );
+        let request_body = if let Some(bytes) = in_memory {
+            RequestBody::from_in_memory_bytes(net_source, total_bytes, bytes)
+        } else {
+            // Streaming bodies retain the existing request/response route. Its handler owns the
+            // readable stream until net sends Done/Error and stop_reading breaks the sender cycle.
+            let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();
+            let trusted_stream = Trusted::new(&*stream);
+            let global = stream.global();
+            let task_manager = global.task_manager();
+            let task_source = task_manager.networking_task_source();
+            let mut body_handler = TransmitBodyConnectHandler::new(
+                trusted_stream,
+                task_source.into(),
+                chunk_request_sender.clone(),
+                None,
+                source,
+            );
 
-        ROUTER.add_typed_route(
-            chunk_request_receiver,
-            Box::new(move |message| {
-                match message.unwrap() {
-                    BodyChunkRequest::Connect(sender) => {
-                        body_handler.start_reading(sender);
-                    },
-                    BodyChunkRequest::Extract(receiver) => {
-                        body_handler.re_extract(receiver);
-                    },
+            ROUTER.add_typed_route(
+                chunk_request_receiver,
+                Box::new(move |message| match message.unwrap() {
+                    BodyChunkRequest::Connect(sender) => body_handler.start_reading(sender),
+                    BodyChunkRequest::Extract(receiver) => body_handler.re_extract(receiver),
                     BodyChunkRequest::Chunk => body_handler.transmit_body_chunk(),
-                    // Note: this is actually sent from this process
-                    // by the TransmitBodyPromiseHandler when reading stops.
-                    BodyChunkRequest::Done => {
-                        body_handler.stop_reading(StopReading::Done);
-                    },
-                    // Note: this is actually sent from this process
-                    // by the TransmitBodyPromiseHandler when the stream errors.
-                    BodyChunkRequest::Error => {
-                        body_handler.stop_reading(StopReading::Error);
-                    },
-                }
-            }),
-        );
+                    BodyChunkRequest::Done => body_handler.stop_reading(StopReading::Done),
+                    BodyChunkRequest::Error => body_handler.stop_reading(StopReading::Error),
+                }),
+            );
 
-        // Return `components::net` view into this request body,
-        // which can be used by `net` to transmit it over the network.
-        let request_body = match in_memory {
-            Some(bytes) => RequestBody::new_with_in_memory_bytes(
-                chunk_request_sender,
-                net_source,
-                total_bytes,
-                bytes,
-            ),
-            None => RequestBody::new(chunk_request_sender, net_source, total_bytes),
+            RequestBody::new(chunk_request_sender, net_source, total_bytes)
         };
 
         // Also return the stream for this body, which can be used by script to consume it.

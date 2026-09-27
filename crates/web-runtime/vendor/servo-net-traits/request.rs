@@ -355,14 +355,13 @@ impl RequestBody {
         }
     }
 
-    pub fn new_with_in_memory_bytes(
-        body_chunk_request_channel: IpcSender<BodyChunkRequest>,
+    pub fn from_in_memory_bytes(
         source: BodySource,
         total_bytes: Option<usize>,
         in_memory: GenericSharedMemory,
     ) -> Self {
         RequestBody {
-            body_chunk_request_channel: Arc::new(Mutex::new(Some(body_chunk_request_channel))),
+            body_chunk_request_channel: Arc::new(Mutex::new(None)),
             in_memory: Some(in_memory),
             source,
             total_bytes,
