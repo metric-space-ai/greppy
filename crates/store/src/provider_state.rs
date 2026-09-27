@@ -37,16 +37,19 @@ impl ProviderState {
     /// semantic, …) while fully supporting the call-graph classes an agent
     /// actually queries. A navigation footer for a *specific* edge class must
     /// hedge on THAT class, not on the provider's overall completeness — else a
-    /// fully-supported `who-calls` (CALLS) answer is falsely marked a floor,
-    /// which pushes the agent into a redundant `--all` re-query and grep
-    /// fallback (H2 spiral). `class` matches the lowercase provider-state
-    /// spelling ("calls" / "usages" / "type_refs" / …).
+    /// fully-supported `who-calls` (the CALLS + USAGE union) answer is falsely
+    /// marked a floor, which pushes the agent into a redundant `--all`
+    /// re-query and grep fallback (H2 spiral). `class` matches the lowercase
+    /// provider-state spelling ("calls" / "usages" / "type_refs" / …).
     pub fn supports_edge_class(&self, class: &str) -> bool {
-        // A wholly-unsupported provider emits nothing; otherwise the class is
-        // supported unless it is explicitly listed as unsupported. The indexer
-        // always classifies the call-graph classes (calls/usages/type_refs/…)
-        // into exactly one of the two lists, so this is exact for real data.
-        self.status != "unsupported" && !self.unsupported_edge_classes.iter().any(|c| c == class)
+        // Require an affirmative capability declaration. Old, failed, or
+        // externally-created rows with empty/unknown lists must not silently
+        // become complete merely because they omitted an unsupported entry.
+        matches!(
+            self.status.as_str(),
+            "accepted" | "partial" | "parity_candidate"
+        ) && self.supported_edge_classes.iter().any(|c| c == class)
+            && !self.unsupported_edge_classes.iter().any(|c| c == class)
     }
 }
 
@@ -237,6 +240,29 @@ mod tests {
         let got = s.get_provider_state("p", "rust").unwrap().unwrap();
         assert_eq!(got, state);
         assert!(got.is_incomplete());
+        assert!(got.supports_edge_class("calls"));
+        assert!(
+            !got.supports_edge_class("usages"),
+            "an absent capability declaration is unknown, not complete"
+        );
+        let mut failed = got.clone();
+        failed.status = "failed".into();
+        assert!(
+            !failed.supports_edge_class("calls"),
+            "failed or stale status cannot claim a listed capability"
+        );
+        let mut unknown = got.clone();
+        unknown.status = "unknown_future_status".into();
+        assert!(
+            !unknown.supports_edge_class("calls"),
+            "an unknown status must fail closed"
+        );
+        let mut contradictory = got.clone();
+        contradictory.unsupported_edge_classes.push("calls".into());
+        assert!(
+            !contradictory.supports_edge_class("calls"),
+            "a contradictory row must fail closed"
+        );
         assert_eq!(s.incomplete_provider_states("p").unwrap(), vec![state]);
     }
 

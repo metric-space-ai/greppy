@@ -57,6 +57,29 @@ fn find_graph_db(store_dir: &Path) -> Option<PathBuf> {
     found
 }
 
+fn set_rust_provider_completeness(
+    store_dir: &Path,
+    supported: &[&str],
+    unsupported: &[&str],
+    files_failed: i64,
+) {
+    let db = find_graph_db(store_dir).expect("graph.db after fixture index");
+    let store = greppy_store::Store::open(&db).expect("open provider fixture store");
+    let supported = serde_json::to_string(supported).unwrap();
+    let unsupported = serde_json::to_string(unsupported).unwrap();
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE provider_state
+             SET status = 'partial', supported_edge_classes = ?1,
+                 unsupported_edge_classes = ?2, files_failed = ?3
+             WHERE project = 'repo' AND language = 'rust'",
+            rusqlite::params![supported, unsupported, files_failed],
+        )
+        .expect("update Rust provider fixture");
+    assert_eq!(changed, 1, "fixture must contain one Rust provider row");
+}
+
 /// Build a git-rooted repo whose `src/lib.rs` exercises all three
 /// cross-file reference edges into `src/helper.rs` / `src/types.rs`:
 ///
@@ -1070,6 +1093,12 @@ fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
             v[collection_field].as_array().unwrap().is_empty(),
             "refreshing {command} must not serve rows from the old index: {v:?}"
         );
+        if command == "impact" {
+            assert_eq!(
+                v["provider_complete"], true,
+                "stale impact metadata must use its default incoming reference union, not broad provider completeness: {v:?}"
+            );
+        }
     }
 }
 
@@ -1806,23 +1835,8 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
             "steps",
         ),
         (
-            vec!["who-calls", "do_it", "--json", "--diagnostics"],
-            "who-calls",
-            "hits",
-        ),
-        (
-            vec!["who-calls", "Widget", "--json", "--diagnostics"],
-            "who-calls",
-            "hits",
-        ),
-        (
             vec!["graph-locate", "src/lib.rs:6", "--json", "--diagnostics"],
             "graph-locate",
-            "hits",
-        ),
-        (
-            vec!["impact", "do_it", "--json", "--diagnostics"],
-            "impact",
             "hits",
         ),
         (vec!["fan-in", "--json", "--diagnostics"], "fan-in", "hits"),
@@ -1864,6 +1878,134 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
     assert!(
         out.contains("brief: skipped indexed provider-dependent output"),
         "brief strict skip must be explicit; got: {out:?}"
+    );
+}
+
+#[test]
+fn who_calls_provider_completeness_tracks_its_relation_union_and_file_failures() {
+    let (repo, store) = index_fixture("who-calls-provider-relations");
+
+    // Broad partial status is legitimate metadata, but unrelated omitted
+    // capabilities must not hedge or block a CALLS+USAGE answer.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls", "usages"],
+        &["semantic", "gitdiff"],
+        0,
+    );
+    let (code, out, err) = run_with_env(
+        &["who-calls", "do_it", "--json", "--all"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(
+        code, 0,
+        "relation-complete provider must pass strict policy: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "ok", "{value:#}");
+    assert!(
+        value.get("warning").is_none(),
+        "unrelated partial capabilities must not warn: {value:#}"
+    );
+
+    // who-calls reads the union of incoming CALLS and USAGE. Missing either
+    // relation makes the answer partial even when the observed caller came
+    // from the supported half of that union.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls"],
+        &["usages", "semantic"],
+        0,
+    );
+    let (code, out, err) = run(&["who-calls", "do_it", "--json", "--all"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "metadata policy still serves partial evidence: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["warning"], "1 incomplete provider; answer may be partial",
+        "{value:#}"
+    );
+    let (strict_code, strict_out, strict_err) = run_with_env(
+        &["who-calls", "do_it", "--json", "--all"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(strict_code, 1, "missing requested relation must block strict policy: stderr={strict_err}\nstdout={strict_out}");
+    let strict: serde_json::Value = serde_json::from_str(&strict_out).unwrap();
+    assert_eq!(
+        strict["status"], "skipped_incomplete_provider",
+        "{strict:#}"
+    );
+
+    // The related graph commands have narrower, source-traced relation sets:
+    // callees and path(CALLS) read only calls, as does outgoing impact by
+    // default. They remain complete while incoming default impact's all-
+    // reference union correctly requires usages/type_refs/imports too.
+    for args in [
+        vec!["callees", "caller", "--json", "--all"],
+        vec!["path", "--from", "caller", "--to", "do_it", "--json"],
+        vec!["impact", "caller", "--direction", "outgoing", "--json"],
+    ] {
+        let (code, out, err) = run_with_env(
+            &args,
+            &repo,
+            &store,
+            &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+        );
+        assert_eq!(
+            code, 0,
+            "CALLS-only command {args:?} must pass strict policy: stderr={err}\nstdout={out}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            value.get("warning").is_none(),
+            "compact warning must use the same CALLS-only relation set as the strict gate for {args:?}: {value:#}"
+        );
+    }
+    let (incoming_warn_code, incoming_warn_out, incoming_warn_err) =
+        run(&["impact", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        incoming_warn_code, 0,
+        "metadata policy must serve partial incoming impact: stderr={incoming_warn_err}\nstdout={incoming_warn_out}"
+    );
+    let incoming_warn: serde_json::Value = serde_json::from_str(&incoming_warn_out).unwrap();
+    assert_eq!(
+        incoming_warn["warning"], "1 incomplete provider; answer may be partial",
+        "compact warning must use the same incoming reference union as the strict gate: {incoming_warn:#}"
+    );
+    let (incoming_code, incoming_out, incoming_err) = run_with_env(
+        &["impact", "do_it", "--json"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(
+        incoming_code, 1,
+        "incoming all-reference impact must require its full union: stderr={incoming_err}\nstdout={incoming_out}"
+    );
+
+    // A failed source file can hide edges even when the manifest advertises
+    // every requested relation, so it remains incomplete for every query.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls", "usages"],
+        &["semantic"],
+        1,
+    );
+    let (code, out, err) = run(&["who-calls", "do_it", "--json", "--all"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "metadata policy serves evidence despite failed files: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["warning"], "1 incomplete provider; answer may be partial",
+        "{value:#}"
     );
 }
 

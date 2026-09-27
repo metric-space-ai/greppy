@@ -44,7 +44,25 @@ pub(crate) fn graph_stale_skip_json(
     extra: serde_json::Value,
     empty_collection_field: &str,
 ) -> Result<()> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
+    graph_stale_skip_json_with_incomplete(
+        project,
+        command,
+        freshness,
+        extra,
+        empty_collection_field,
+        incomplete_providers,
+    )
+}
+
+fn graph_stale_skip_json_with_incomplete(
+    project: &str,
+    command: &str,
+    freshness: serde_json::Value,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+    incomplete_providers: Vec<serde_json::Value>,
+) -> Result<()> {
     let mut obj = serde_json::Map::new();
     obj.insert("command".into(), serde_json::json!(command));
     obj.insert("status".into(), serde_json::json!("skipped_stale_index"));
@@ -80,6 +98,39 @@ pub(crate) fn graph_stale_skip_json(
         })?
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn graph_stale_gate_for_edges(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    edge_types: &[&str],
+    json: bool,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+) -> Result<Option<i32>> {
+    match freshness_serve_decision(store, root, project) {
+        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Refuse(freshness) => {
+            if json {
+                let incomplete_providers =
+                    graph_edge_incomplete_provider_json(store, project, edge_types)?;
+                graph_stale_skip_json_with_incomplete(
+                    project,
+                    command,
+                    freshness.clone(),
+                    extra,
+                    empty_collection_field,
+                    incomplete_providers,
+                )?;
+            } else {
+                println!("{}", indexed_stale_skip_message(command, &freshness));
+            }
+            Ok(Some(freshness_refusal_exit(&freshness)))
+        }
+    }
 }
 
 /// Fresh-or-fallback gate for graph navigation. Indexed graph data is only
@@ -124,7 +175,53 @@ pub(crate) fn provider_policy_graph_gate(
     extra: serde_json::Value,
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
+    provider_policy_graph_gate_with_incomplete(
+        store,
+        root,
+        project,
+        command,
+        json,
+        extra,
+        empty_collection_field,
+        incomplete_providers,
+    )
+}
+
+pub(crate) fn provider_policy_graph_gate_for_edges(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    edge_types: &[&str],
+    json: bool,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+) -> Result<Option<i32>> {
+    let incomplete_providers = graph_edge_incomplete_provider_json(store, project, edge_types)?;
+    provider_policy_graph_gate_with_incomplete(
+        store,
+        root,
+        project,
+        command,
+        json,
+        extra,
+        empty_collection_field,
+        incomplete_providers,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_policy_graph_gate_with_incomplete(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    json: bool,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+    incomplete_providers: Vec<serde_json::Value>,
+) -> Result<Option<i32>> {
     if !provider_policy_blocks_query(&incomplete_providers)? {
         return Ok(None);
     }

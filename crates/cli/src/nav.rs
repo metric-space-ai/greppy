@@ -1100,22 +1100,24 @@ pub(crate) fn dispatch_impact(
         "all": false,
     });
     insert_impact_edge_meta(&mut graph_gate_extra, &edge_spec);
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra.clone(),
         "hits",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra,
         "hits",
@@ -4052,22 +4054,24 @@ pub(crate) fn dispatch_path(
         "max_hops": max_hops,
         "hops": serde_json::Value::Null,
     });
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         graph_gate_extra.clone(),
         "steps",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         serde_json::json!({
             "from": from,
