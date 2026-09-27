@@ -730,6 +730,38 @@ fn replace_text_accepts_raw_borrows_and_preserves_syntax_refusal_atomicity() {
 }
 
 #[test]
+fn replace_text_accepts_typescript_import_type_and_preserves_atomicity() {
+    let fixture = Fixture::new("replace-text-typescript-import-type");
+    let source = "import { vi } from \"vitest\";\nconst marker = 1;\n";
+    let replacement = r#"vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});"#;
+    std::fs::write(fixture.repo.join("example.test.ts"), source).unwrap();
+
+    let dry_run = fixture.run(&[
+        "replace-text",
+        "example.test.ts",
+        "const marker = 1;",
+        replacement,
+        "--dry-run",
+    ]);
+    assert!(dry_run.status.success(), "{}", combined(&dry_run));
+    assert_file(&fixture.repo.join("example.test.ts"), source);
+
+    let malformed = replacement.replace("\n});", "\n);");
+    let refused = fixture.run(&[
+        "replace-text",
+        "example.test.ts",
+        "const marker = 1;",
+        &malformed,
+    ]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert!(combined(&refused).contains("nothing written"));
+    assert_file(&fixture.repo.join("example.test.ts"), source);
+}
+
+#[test]
 fn write_accepts_borrow_of_raw_identifier_and_still_rejects_broken_rust() {
     let fixture = Fixture::new("write-rust-raw");
     let source = b"fn main() { let raw = 1; let _ = &raw; }\n";

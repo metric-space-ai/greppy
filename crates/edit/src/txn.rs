@@ -6,6 +6,7 @@
 //! earlier applications never shift later targets. Overlapping ranges are
 //! rejected before anything is applied.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::hash::sha256_hex;
@@ -140,10 +141,69 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
+/// Mask TypeScript import-type queries that the edit syntax gate currently
+/// reports as errors when they appear below an outer `typeof`, for example
+/// `typeof import("node:child_process")`. The replacement preserves byte
+/// length and line positions, so diagnostics and structural ranges still map
+/// to the proposed source. Only a complete string-literal import query is
+/// masked; malformed calls remain visible to the syntax gate.
+fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
+    if language != (Language::TypeScript { tsx: false }) &&
+        language != (Language::TypeScript { tsx: true })
+    {
+        return Cow::Borrowed(content);
+    }
+
+    const PREFIX: &[u8] = b"typeof import(";
+    let mut normalized: Option<Vec<u8>> = None;
+    let mut offset = 0usize;
+    while let Some(relative) = content[offset..]
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    {
+        let start = offset + relative;
+        let quote_at = start + PREFIX.len();
+        let Some(&quote @ (b'\'' | b'"')) = content.get(quote_at) else {
+            offset = quote_at;
+            continue;
+        };
+        let mut cursor = quote_at + 1;
+        let mut escaped = false;
+        while let Some(&byte) = content.get(cursor) {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                break;
+            } else if byte == b'\n' || byte == b'\r' {
+                break;
+            }
+            cursor += 1;
+        }
+        if content.get(cursor) != Some(&quote) || content.get(cursor + 1) != Some(&b')') {
+            offset = quote_at + 1;
+            continue;
+        }
+
+        let import_start = start + b"typeof ".len();
+        let import_end = cursor + 2;
+        let output = normalized.get_or_insert_with(|| content.to_vec());
+        const PLACEHOLDER: &[u8] = b"__greppy_import_type__";
+        let span = &mut output[import_start..import_end];
+        span.fill(b' ');
+        let copied = PLACEHOLDER.len().min(span.len());
+        span[..copied].copy_from_slice(&PLACEHOLDER[..copied]);
+        offset = import_end;
+    }
+    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
-    let tree = greppy_parser::parse(language, content).ok()?;
+    let validation_content = syntax_validation_content(language, content);
+    let tree = greppy_parser::parse(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -188,7 +248,8 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
 /// stays a top-level declaration. When the surrounding context's kind chain
 /// changes, the edit broke the grammar in a way tree-sitter recovered past.
 fn context_kinds(language: Language, content: &[u8], range: (usize, usize)) -> Option<Vec<String>> {
-    let tree = greppy_parser::parse(language, content).ok()?;
+    let validation_content = syntax_validation_content(language, content);
+    let tree = greppy_parser::parse(language, &validation_content).ok()?;
     let leaf = tree
         .root_node()
         .descendant_for_byte_range(range.0, range.1.saturating_sub(1).max(range.0))?;
@@ -226,7 +287,8 @@ pub fn structural_context_preserved(
 /// language is not tree-sitter-supported (postcondition then reports
 /// not-applicable rather than silently passing).
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
-    let tree = greppy_parser::parse(language, content).ok()?;
+    let validation_content = syntax_validation_content(language, content);
+    let tree = greppy_parser::parse(language, &validation_content).ok()?;
     let mut errors = 0usize;
     let mut missing = 0usize;
     let mut cursor = tree.walk();
@@ -314,6 +376,36 @@ mod tests {
             "malformed container body must remain an atomic edit failure"
         );
         assert!(first_syntax_diagnostic(css, malformed_body).is_some());
+    }
+
+    #[test]
+    fn typescript_import_type_query_is_valid_without_weakening_syntax_errors() {
+        let language = Language::TypeScript { tsx: false };
+        let valid = br#"vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});
+"#;
+        assert_eq!(
+            syntax_counts(language, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert_eq!(first_syntax_diagnostic(language, valid), None);
+
+        let malformed = br#"vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+);
+"#;
+        let counts = syntax_counts(language, malformed).unwrap();
+        assert!(
+            counts.errors + counts.missing > 0,
+            "unbalanced TypeScript must remain an atomic edit failure"
+        );
+        assert!(first_syntax_diagnostic(language, malformed).is_some());
     }
 
     #[test]
