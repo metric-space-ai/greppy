@@ -2650,10 +2650,16 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
     let mut parts = module_path.split("::").filter(|part| !part.is_empty());
     let first = parts.next();
     let referrer = Path::new(referrer_file);
-    let mut base = referrer
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_path_buf();
+    let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
+    let is_module_root = referrer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "lib.rs" | "main.rs" | "mod.rs"));
+    let mut base = if is_module_root {
+        parent.to_path_buf()
+    } else {
+        referrer.with_extension("")
+    };
     let mut modules = Vec::new();
     match first {
         Some("crate") => {
@@ -2686,7 +2692,43 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
         .to_string_lossy()
         .replace('\\', "/");
     let nested = base.join("mod.rs").to_string_lossy().replace('\\', "/");
-    vec![flat, nested]
+    let lib = base.join("lib.rs").to_string_lossy().replace('\\', "/");
+    let main = base.join("main.rs").to_string_lossy().replace('\\', "/");
+    vec![flat, nested, lib, main]
+}
+
+fn rust_module_files_below_alias(
+    alias_files: &[String],
+    ref_path: &str,
+    name: &str,
+) -> Vec<String> {
+    let segments = ref_path.split("::").collect::<Vec<_>>();
+    let nested = segments
+        .get(1..segments.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    if segments.last().copied() != Some(name) {
+        return Vec::new();
+    }
+    alias_files
+        .iter()
+        .flat_map(|module_file| {
+            let path = Path::new(module_file);
+            let mut base = if path.file_name().and_then(|part| part.to_str()) == Some("mod.rs") {
+                path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
+            } else {
+                path.with_extension("")
+            };
+            for segment in nested {
+                base.push(segment);
+            }
+            [
+                base.with_extension("rs")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                base.join("mod.rs").to_string_lossy().replace('\\', "/"),
+            ]
+        })
+        .collect()
 }
 
 impl GraphIndex {
@@ -3093,7 +3135,7 @@ impl GraphIndex {
                 .rust_namespaces_by_file
                 .get(referrer_file)
                 .and_then(|aliases| aliases.get(first_segment))
-                .cloned()
+                .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
             let candidates = self.defs_named(&USAGE_LABELS, name);
             let imported: Vec<i64> = candidates
@@ -4570,7 +4612,7 @@ def Widget():
     fn rust_qualified_function_item_resolves_through_grouped_reexport() {
         let repo = setup_multifile_repo(
             "rust-reexport-function-item",
-            "mod business_os; mod channels; mod core; mod left; mod right; mod other;\nfn target() {}\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn missing_caller() { let _selected = missing::target; }\n",
+            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other;\nfn target() {}\nfn root_target() {}\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn missing_caller() { let _selected = missing::target; }\n",
             "// fixture placeholder\n",
         );
         fs::create_dir_all(repo.join("src/channels")).unwrap();
@@ -4625,9 +4667,16 @@ def Widget():
         fs::write(repo.join("src/business_os/mod.rs"), "pub mod store;\n").unwrap();
         fs::write(
             repo.join("src/business_os/store.rs"),
-            "use crate::core::mission::channels;\nfn alias_caller() { let selected = channels::target; selected(); }\n",
+            "use crate::core::mission::channels;\nfn alias_caller() { let selected = channels::target; selected(); }\nfn nested_alias_missing() { let _selected = channels::missing::target; }\n",
         )
         .unwrap();
+        fs::create_dir_all(repo.join("src/flat")).unwrap();
+        fs::write(
+            repo.join("src/flat.rs"),
+            "pub mod child;\nfn self_caller() { let selected = self::child::target; selected(); }\nfn super_caller() { let selected = super::root_target; selected(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/flat/child.rs"), "pub fn target() {}\n").unwrap();
         fs::write(
             repo.join("src/unrelated.py"),
             "def untouched():\n    return 1\n",
@@ -4739,6 +4788,53 @@ def Widget():
                 .any(|edge| edge.source_id == alias_caller.id),
             "a namespace imported with `use crate::...::channels` must resolve channels::target"
         );
+        let nested_alias_missing = store
+            .get_node_by_qname(
+                "test",
+                "src/business_os/store.rs::Function::nested_alias_missing",
+            )
+            .unwrap()
+            .expect("nested namespace negative caller");
+        assert!(
+            store
+                .incoming_edges(namespaced_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != nested_alias_missing.id),
+            "channels::missing::target must not collapse to channels::target"
+        );
+        let flat_child_target = store
+            .get_node_by_qname("test", "src/flat/child.rs::Function::target")
+            .unwrap()
+            .expect("flat module child target");
+        let self_caller = store
+            .get_node_by_qname("test", "src/flat.rs::Function::self_caller")
+            .unwrap()
+            .expect("flat-module self caller");
+        assert!(
+            store
+                .incoming_edges(flat_child_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == self_caller.id),
+            "self::child from flat.rs must resolve beneath the flat module namespace"
+        );
+        let root_target = store
+            .get_node_by_qname("test", "src/lib.rs::Function::root_target")
+            .unwrap()
+            .expect("crate-root target");
+        let super_caller = store
+            .get_node_by_qname("test", "src/flat.rs::Function::super_caller")
+            .unwrap()
+            .expect("flat-module super caller");
+        assert!(
+            store
+                .incoming_edges(root_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == super_caller.id),
+            "super:: from flat.rs must resolve in the parent module"
+        );
 
         let untouched_before = store
             .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
@@ -4810,7 +4906,7 @@ def Widget():
         )
         .unwrap();
         assert_eq!(
-            migration.files_indexed, 18,
+            migration.files_indexed, 20,
             "all retained Rust files re-extract despite sparse scope"
         );
         let untouched_after = store
