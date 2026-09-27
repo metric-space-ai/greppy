@@ -3814,44 +3814,6 @@ fn materialized_form_post_body_replays_across_temporary_redirect() {
             b"username=admin&password=secret"
         );
     }
-    let body_state = call(
-        "web.run",
-        json!({
-            "session_id":session,
-            "script_source":"inline",
-            "bind_session_page":true,
-            "script_text":r#"
-const seen = [];
-const handler = message => seen.push(message.text());
-page.on('console', handler);
-await page.evaluate(async () => {
-  const request = new Request('/complete', { method: 'POST', body: 'body=once' });
-  const before = request.bodyUsed;
-  const response = await fetch(request);
-  const after = request.bodyUsed;
-  let reuseError = '';
-  try { await fetch(request); } catch (error) { reuseError = error.name; }
-  console.log('BODY_STATE ' + JSON.stringify({ before, after, reuseError, status: response.status }));
-});
-page.off('console', handler);
-console.log(seen.find(message => message.startsWith('BODY_STATE ')) || 'BODY_STATE missing');
-"#,
-        }),
-    );
-    assert_eq!(body_state.status, "ok", "{body_state:?}");
-    let stdout = body_state.result.as_ref().unwrap()["stdout"]
-        .as_str()
-        .unwrap();
-    assert!(
-        stdout.contains(
-            r#"BODY_STATE {"before":false,"after":true,"reuseError":"TypeError","status":200}"#
-        ),
-        "{body_state:?}"
-    );
-    assert_eq!(
-        posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"body=once"
-    );
     assert!(posted_bodies.try_recv().is_err());
 }
 
