@@ -1418,6 +1418,7 @@ pub(crate) fn index_overlay_snapshot(
         greppy_indexer::index_with_options(&mut store, target, project, &overlay_options)
     }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
+    crate::store_cow::mark_rust_caller_edges_repaired(&store)?;
     // The persisted Delta binding is authoritative when structural first use
     // deliberately skips Base preparation. In that path the command-scoped
     // environment has no pinned commit even though the existing overlay does.

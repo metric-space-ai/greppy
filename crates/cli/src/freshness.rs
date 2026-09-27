@@ -674,6 +674,20 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
             &base_commit,
             delta.conn(),
         )?;
+        let project = project_for(root)?;
+        let delta = if crate::store_cow::persisted_v7_delta_needs_repair(&delta, &effective_root)? {
+            drop(delta);
+            crate::store_cow::ensure_persisted_v7_delta_repaired(
+                &path,
+                &base_path,
+                &visibility,
+                &effective_root,
+                &project,
+            )?;
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?
+        } else {
+            delta
+        };
         let store = delta.attach_overlay(&base_path, &visibility)?;
         let _ = workspace_locator::ensure_db_mode(&path);
         if let Some(store_dir) = path.parent() {
@@ -939,6 +953,14 @@ fn open_default_store_writer(
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
+        let project = project_for(root)?;
+        crate::store_cow::ensure_persisted_v7_delta_repaired(
+            &path,
+            &overlay.base_path,
+            &overlay.visibility,
+            &effective_root,
+            &project,
+        )?;
         return greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)
             .map_err(Into::into);
     }
