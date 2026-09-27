@@ -1184,6 +1184,7 @@ struct ContentEngine {
     next_id: u64,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
+    renderer_error: RefCell<Option<String>>,
     parent_alive: Arc<AtomicBool>,
     wake: WakeFlag,
     profile: SharedProfile,
@@ -1250,6 +1251,7 @@ impl ContentEngine {
             next_id: 1,
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
+            renderer_error: RefCell::new(None),
             parent_alive,
             wake,
             profile,
@@ -1319,12 +1321,18 @@ impl ContentEngine {
 
     fn spin_all_event_loops(&self) {
         if let Err(error) = self.rendering_context.make_current() {
-            eprintln!("web-runtime: root renderer make_current failed: {error:?}");
+            self.renderer_error
+                .borrow_mut()
+                .get_or_insert_with(|| format!("root renderer make_current failed: {error:?}"));
+            return;
         }
         self.servo.spin_event_loop();
         for bundle in self.context_bundles.values() {
             if let Err(error) = bundle.rendering_context.make_current() {
-                eprintln!("web-runtime: context renderer make_current failed: {error:?}");
+                self.renderer_error.borrow_mut().get_or_insert_with(|| {
+                    format!("context renderer make_current failed: {error:?}")
+                });
+                return;
             }
             bundle.servo.spin_event_loop();
         }
@@ -2313,7 +2321,9 @@ impl ContentEngine {
         };
         self.reject_stale_objects(method, &params)?;
         self.reclaim_pump_tokens();
-        match method {
+        self.renderer_error.borrow_mut().take();
+        let result = (|| -> io::Result<serde_json::Value> {
+            match method {
             "chromium.launch" => {
                 let browser = self.alloc_id("browser");
                 self.browsers.insert(
@@ -2876,7 +2886,7 @@ impl ContentEngine {
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, delegate) = self.page(&page_id)?.clone();
+                let (webview, _) = self.page(&page_id)?.clone();
                 match self.evaluate(webview, &inner_text_script(&selector))? {
                     JSValue::String(text) => Ok(json!({ "text": text })),
                     other => Err(io::Error::other(format!(
@@ -3147,7 +3157,7 @@ impl ContentEngine {
                     .get("selector")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let (webview, delegate) = self.page(&page_id)?.clone();
+                let (webview, _) = self.page(&page_id)?.clone();
                 let script = format!(
                     "(function(selector) {{ {SELECTOR_RUNTIME} return greppyResolveNodes(selector).length; }})({selector})"
                 );
@@ -4271,6 +4281,11 @@ impl ContentEngine {
                 format!("unsupported_playwright_operation: {other}"),
             )),
         }
+        })();
+        if let Some(error) = self.renderer_error.borrow_mut().take() {
+            return Err(io::Error::other(error));
+        }
+        result
     }
 
     /// Make `target` the only visible webview before delivering synthetic

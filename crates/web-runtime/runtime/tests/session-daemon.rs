@@ -8489,6 +8489,34 @@ fn ordinary_sessions_isolate_cookie_state() {
     assert_eq!(stored_b.status, "ok", "{stored_b:?}");
     assert!(stored_b.result.unwrap()["value"].is_null());
 
+    let color_a = call(
+        "web.evaluate",
+        json!({"session_id":session_a,"source":"document.body.style.background='rgb(255, 0, 0)'; document.body.innerHTML='<div style=\"width:320px;height:240px\"></div>'; true"}),
+    );
+    assert_eq!(color_a.status, "ok", "{color_a:?}");
+    let color_b = call(
+        "web.evaluate",
+        json!({"session_id":session_b,"tab_id":&tab_b,"source":"document.body.style.background='rgb(0, 0, 255)'; document.body.innerHTML='<div style=\"width:320px;height:240px\"></div>'; true"}),
+    );
+    assert_eq!(color_b.status, "ok", "{color_b:?}");
+    let shot_a = call("web.screenshot", json!({"session_id":session_a}));
+    assert_eq!(shot_a.status, "ok", "{shot_a:?}");
+    let shot_b = call(
+        "web.screenshot",
+        json!({"session_id":session_b,"tab_id":&tab_b}),
+    );
+    assert_eq!(shot_b.status, "ok", "{shot_b:?}");
+    let digest_a = shot_a.result.as_ref().unwrap()["digest"]
+        .as_str()
+        .expect("session A screenshot digest");
+    let digest_b = shot_b.result.as_ref().unwrap()["digest"]
+        .as_str()
+        .expect("session B screenshot digest");
+    assert_ne!(
+        digest_a, digest_b,
+        "simultaneous sessions rendered through the same owning framebuffer"
+    );
+
     for tab in [&tab_a, &session_a] {
         let target = if tab == &session_a {
             None
