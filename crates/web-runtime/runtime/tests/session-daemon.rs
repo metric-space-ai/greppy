@@ -733,7 +733,9 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
-fn serve_form_post_fixture() -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+fn serve_form_post_fixture(
+    redirect_post: bool,
+) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind form post fixture");
@@ -779,7 +781,9 @@ fn serve_form_post_fixture() -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
                 .next()
                 .unwrap_or("")
                 .to_owned();
-            let response_body = if request_line.starts_with("POST /login ") {
+            let posted = request_line.starts_with("POST /login ") ||
+                request_line.starts_with("POST /complete ");
+            let response_body = if posted {
                 body_sender
                     .send(request[header_end..header_end + content_length].to_vec())
                     .unwrap();
@@ -787,10 +791,14 @@ fn serve_form_post_fixture() -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
             } else {
                 "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
             };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
+            let response = if redirect_post && request_line.starts_with("POST /login ") {
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                )
+            };
             let _ = stream.write_all(response.as_bytes());
         }
     });
@@ -3698,7 +3706,7 @@ console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: rec
 
 #[test]
 fn fresh_sessions_submit_complete_form_post_bodies() {
-    let (fixture, posted_bodies) = serve_form_post_fixture();
+    let (fixture, posted_bodies) = serve_form_post_fixture(false);
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-form-post-{}.sock",
         std::process::id()
@@ -3751,6 +3759,60 @@ fn fresh_sessions_submit_complete_form_post_bodies() {
         );
         let closed = call("web.session.close", json!({"session_id":session}));
         assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
+}
+
+#[test]
+fn materialized_form_post_body_replays_across_temporary_redirect() {
+    let (fixture, posted_bodies) = serve_form_post_fixture(true);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-form-post-redirect-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post_redirect", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post_redirect", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("redirected form post request")
+    };
+
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    for (selector, value) in [("#username", "admin"), ("#password", "secret")] {
+        let filled = call(
+            "web.fill",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":selector},
+                "value":value,
+            }),
+        );
+        assert_eq!(filled.status, "ok", "{filled:?}");
+    }
+    let submitted = call(
+        "web.click",
+        json!({
+            "session_id":session,
+            "selector":{"type":"css","value":"#submit"},
+        }),
+    );
+    assert_eq!(submitted.status, "ok", "{submitted:?}");
+    for _ in 0..2 {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
     }
     assert!(posted_bodies.try_recv().is_err());
 }
