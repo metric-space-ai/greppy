@@ -442,20 +442,6 @@ mod tests {
   .message { display: block; }
 }
 "#;
-        let raw_tree = greppy_parser::parse(language, valid).unwrap();
-        let typeof_start = valid.windows(b"typeof".len()).position(|window| window == b"typeof").unwrap();
-        let mut ancestor = raw_tree
-            .root_node()
-            .descendant_for_byte_range(typeof_start, typeof_start + b"typeof".len());
-        assert!(
-            std::iter::from_fn(|| {
-                let node = ancestor?;
-                ancestor = node.parent();
-                Some(node.kind())
-            })
-            .any(|kind| kind == "type_query"),
-            "the raw recovery tree must retain the TypeScript type-query node"
-        );
         assert_eq!(
             syntax_counts(css, valid),
             Some(SyntaxCounts {
@@ -495,6 +481,23 @@ mod tests {
   return { ...original, spawn: vi.fn(original.spawn) };
 });
 "#;
+        let raw_tree = greppy_parser::parse(language, valid).unwrap();
+        let typeof_start = valid
+            .windows(b"typeof".len())
+            .position(|window| window == b"typeof")
+            .unwrap();
+        let mut ancestor = raw_tree
+            .root_node()
+            .descendant_for_byte_range(typeof_start, typeof_start + b"typeof".len());
+        assert!(
+            std::iter::from_fn(|| {
+                let node = ancestor?;
+                ancestor = node.parent();
+                Some(node.kind())
+            })
+            .any(|kind| kind == "type_query"),
+            "the raw recovery tree must retain the TypeScript type-query node"
+        );
         assert_eq!(
             syntax_counts(language, valid),
             Some(SyntaxCounts {

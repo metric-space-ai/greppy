@@ -749,16 +749,25 @@ fn replace_text_accepts_typescript_import_type_and_preserves_atomicity() {
     assert!(dry_run.status.success(), "{}", combined(&dry_run));
     assert_file(&fixture.repo.join("example.test.ts"), source);
 
-    let malformed = replacement.replace("\n});", "\n);");
-    let refused = fixture.run(&[
+    let written = fixture.run(&[
         "replace-text",
         "example.test.ts",
         "const marker = 1;",
-        &malformed,
+        replacement,
+    ]);
+    assert!(written.status.success(), "{}", combined(&written));
+    let expected = format!("import {{ vi }} from \"vitest\";\n{replacement}\n");
+    assert_file(&fixture.repo.join("example.test.ts"), &expected);
+
+    let refused = fixture.run(&[
+        "replace-text",
+        "example.test.ts",
+        "return { ...original, spawn: vi.fn(original.spawn) };",
+        "return { ...original, spawn: ;",
     ]);
     assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
     assert!(combined(&refused).contains("nothing written"));
-    assert_file(&fixture.repo.join("example.test.ts"), source);
+    assert_file(&fixture.repo.join("example.test.ts"), &expected);
 }
 
 #[test]
