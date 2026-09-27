@@ -4038,7 +4038,8 @@ pub(crate) fn dispatch_path(
         return Err(Error::Invalid("path --edge must not be empty".into()));
     }
 
-    let store = open_default_store(root)?;
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let max_hops = greppy_search::MAX_REACH_HOPS;
     let graph_gate_extra = serde_json::json!({

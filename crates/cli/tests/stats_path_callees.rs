@@ -22,6 +22,35 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+fn mark_call_provider_unavailable(store_dir: &Path) {
+    fn graph_db(dir: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(db) = graph_db(&path) {
+                    return Some(db);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("graph.db") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let db = graph_db(store_dir).expect("fixture graph.db");
+    let store = greppy_store::Store::open(&db).expect("open provider fixture");
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE provider_state SET status = 'partial',
+             supported_edge_classes = '[\"definitions\",\"usages\"]',
+             unsupported_edge_classes = '[\"calls\"]', files_failed = 0
+             WHERE project = 'repo' AND language = 'rust'",
+            [],
+        )
+        .expect("mark requested call relation unavailable");
+    assert_eq!(changed, 1, "fixture must contain one Rust provider row");
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
 }
@@ -340,7 +369,9 @@ fn path_json_reports_shortest_path_counts_and_metadata() {
     assert_eq!(v["path_found"], true);
     assert!(v["reason"].is_null());
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["provider_complete"], true);
+    assert_eq!(v["incomplete_provider_count"], 0);
+    assert_eq!(v["incomplete_providers"], serde_json::json!([]));
     assert_eq!(v["scope"], "shortest_path");
     assert_eq!(v["direction"], "outgoing");
     assert_eq!(v["edge_type"], "CALLS");
@@ -364,6 +395,9 @@ fn path_json_reports_shortest_path_counts_and_metadata() {
 #[test]
 fn provider_policy_require_complete_blocks_path_json() {
     let (repo, store) = index_fixture("provider-policy-path-json");
+    // A normal Rust provider is complete for CALLS. Keep this a real
+    // fail-closed test by withholding the relation that path requests.
+    mark_call_provider_unavailable(&store);
 
     let (code, out, err) = run_with_env(
         &[
@@ -449,9 +483,8 @@ fn path_json_refuses_stale_steps_when_auto_reindex_disabled() {
     );
 }
 
-/// The same small drift with automatic repair enabled is refused for the
-/// triggering request. A subsequent request observes the atomically published
-/// fresh generation and reports that the renamed-away endpoint is gone.
+/// Automatic repair completes inside the triggering query: it observes the
+/// published generation and reports that the renamed-away endpoint is gone.
 #[test]
 fn path_json_auto_reindexes_small_stale_drift() {
     let (repo, store) = index_fixture("path-json-heal");
@@ -460,30 +493,6 @@ fn path_json_auto_reindexes_small_stale_drift() {
         "pub fn renamed_leaf() -> u32 { 8 }\n",
     )
     .unwrap();
-
-    let (first_code, first_out, first_err) = run(
-        &[
-            "path",
-            "--from",
-            "entry",
-            "--to",
-            "leaf",
-            "--json",
-            "--diagnostics",
-        ],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        first_code, 75,
-        "triggering stale request must be refused; stderr={first_err}\nstdout={first_out}"
-    );
-    let first: serde_json::Value = serde_json::from_str(&first_out)
-        .unwrap_or_else(|e| panic!("invalid refresh json: {e}; stdout={first_out:?}"));
-    assert_eq!(first["status"], "skipped_stale_index");
-    assert_eq!(first["fresh"], false);
-    assert_eq!(first["freshness"]["state"], "refreshing");
-    assert!(first["steps"].as_array().unwrap().is_empty());
 
     let (code, out, err) = run(
         &[
@@ -509,6 +518,9 @@ fn path_json_auto_reindexes_small_stale_drift() {
         v["fresh"], true,
         "auto-reindex must yield a fresh answer: {v:?}"
     );
+    assert_eq!(v["freshness"]["state"], "fresh");
+    assert_eq!(v["to_found"], false, "renamed-away endpoint must be absent");
+    assert!(v["steps"].as_array().unwrap().is_empty());
     assert_eq!(v["path_found"], false);
 }
 
