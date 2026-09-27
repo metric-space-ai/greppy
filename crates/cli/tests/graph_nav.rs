@@ -404,12 +404,16 @@ import { helper } from "./helper.ts";
 export const make = Effect.gen(function* () {
     helper(platform);
 }).pipe(Effect.withSpan("make"));
+
+Effect.gen(function* () {
+    bareHelper(platform);
+});
 "#,
     )
     .unwrap();
     std::fs::write(
         src.join("helper.ts"),
-        "export function helper(platform: string): void {}\n",
+        "export function helper(platform: string): void {}\nexport function bareHelper(platform: string): void {}\n",
     )
     .unwrap();
     let store = root.join("store");
@@ -431,6 +435,55 @@ export const make = Effect.gen(function* () {
     assert!(
         !out.contains("no callers") && !out.contains("__file__"),
         "a real callback call must not collapse to an empty answer or file anchor: {out:?}"
+    );
+
+    let (code, out, err) = run(
+        &["who-calls", "bareHelper", "--code"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "module caller should exit 0: {out}\n{err}");
+    assert!(
+        out.contains("src/app.ts:8")
+            && out.contains("<module>")
+            && out.contains("bareHelper(platform)"),
+        "a bare module callback must report its real call site: {out:?}"
+    );
+
+    // Recreate the already-persisted graph from the reported installation:
+    // both raw and resolved CALLS sources point at the synthetic file anchor,
+    // while source files and the workspace fingerprint remain unchanged. A
+    // replacement executable must answer from this retained graph without a
+    // rebuild (and therefore without invalidating reusable embeddings).
+    let db = find_graph_db(&store).unwrap();
+    {
+        let old = greppy_store::Store::open(&db).unwrap();
+        let raw = old
+            .conn()
+            .execute(
+                "UPDATE raw_edges SET source_qname = 'src/app.ts::__file__'
+                 WHERE edge_type = 'CALLS' AND json_extract(properties, '$.callee_name') = 'helper'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(raw, 1, "seed the persisted v6 raw CALLS source");
+        let resolved = old
+            .conn()
+            .execute(
+                "UPDATE edges SET source_id = (SELECT id FROM nodes WHERE qualified_name = 'src/app.ts::__file__')
+                 WHERE edge_type = 'CALLS' AND json_extract(properties, '$.callee_name') = 'helper'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(resolved, 1, "seed the persisted v6 resolved CALLS source");
+    }
+    let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
+    assert_eq!(code, 0, "retained-graph who-calls should exit 0: {out}\n{err}");
+    assert!(
+        out.contains("src/app.ts:4")
+            && out.contains("<module>")
+            && out.contains("helper(platform)"),
+        "the replacement executable must expose the retained call without reindexing: {out:?}"
     );
 }
 

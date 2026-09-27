@@ -3416,11 +3416,20 @@ pub(crate) fn dispatch_who_calls(
             nodes.push(n);
         }
     }
-    // A file anchor emitted on the definition itself (the C++ extractor's
-    // bookkeeping USAGE edge) is not a caller. Filter BEFORE deciding
-    // emptiness — otherwise an uncalled function prints nothing at all
-    // instead of its true answer.
-    nodes.retain(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name));
+    // A file anchor reached only through a bookkeeping USAGE edge (notably the
+    // C++ extractor's definition edge) is not a caller. A CALLS edge sourced
+    // from the anchor is different: it is a real module-scope call and must
+    // remain visible, or we would turn source evidence into a false
+    // authoritative `no callers` answer.
+    let module_callers = edges
+        .iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .map(|edge| edge.source_id)
+        .collect::<std::collections::HashSet<_>>();
+    nodes.retain(|node| {
+        !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            || module_callers.contains(&node.id)
+    });
     nodes.retain(|node| path_filters.matches(&node.file_path));
     if nodes.is_empty() {
         if json {
@@ -3498,11 +3507,6 @@ pub(crate) fn dispatch_who_calls(
     let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut rows = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        // A file anchor is greppy's own bookkeeping, not a symbol. `__file__`
-        // in a result list is a name the agent cannot carry anywhere.
-        if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
-            continue;
-        }
         let site = sorted_site_lines(sites.get(&n.id))
             .first()
             .copied()
@@ -3518,7 +3522,11 @@ pub(crate) fn dispatch_who_calls(
             file: n.file_path.clone(),
             line: site,
             span,
-            name: nav_short_name(n),
+            name: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+                "<module>".into()
+            } else {
+                nav_short_name(n)
+            },
             test: nav_is_test(lines.as_ref(), n),
         });
     }

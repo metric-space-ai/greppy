@@ -1403,8 +1403,9 @@ const JS_TS_KEYWORDS: &[&str] = &[
 ///   * an anonymous inline callback is skipped and the walk continues to the
 ///     nearest NAMED scope, so a callback nested in a named function is still
 ///     attributed to that function;
-///   * if no named enclosing function at all, fall back to
-///     `{file}::__file__`.
+///   * if no named enclosing function exists but the call is nested in a
+///     module-level variable initializer, use that Variable's qname;
+///   * otherwise fall back to `{file}::__file__` for a true module-scope call.
 fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> String {
     let file_qname = format!("{file_path}::__file__");
     let mut module_variable = None;
@@ -1428,7 +1429,9 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // erase the real caller whenever the callback sits inside a named
             // function (`function outer() { arr.map(x => helper(x)) }` would
             // lose `outer -> helper`) — keep walking to the nearest NAMED scope;
-            // module-level callbacks still fall through to `__file__` below.
+            // module-level callbacks keep walking so a surrounding module
+            // Variable can own the call; a truly bare callback falls through
+            // to `__file__` below.
         }
         if module_variable.is_none() && cur.kind() == "variable_declarator" {
             module_variable = js_ts_module_variable_name(cur, source);
