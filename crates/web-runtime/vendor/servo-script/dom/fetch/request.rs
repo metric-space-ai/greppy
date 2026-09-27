@@ -512,18 +512,6 @@ impl Request {
         // There are multiple reassignments to similar values. In the end, all end up as
         // final_body. Therefore, final_body is equivalent to inputOrInitBody
         let init_body_is_non_null = init_body.is_some();
-        if !init_body_is_non_null && input_body.is_some() {
-            if input_body_is_unusable {
-                return Err(Error::Type(c"Input body is unusable".to_owned()));
-            }
-            if let RequestInfo::Request(ref input_request) = input {
-                clone_body_stream_for_dom_body(
-                    cx,
-                    &input_request.body_stream,
-                    &request.body_stream,
-                )?;
-            }
-        }
         let final_body = init_body.or(input_body);
 
         // Step 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:
@@ -549,6 +537,25 @@ impl Request {
             }
             // Step 39.3. Set this’s request’s use-CORS-preflight flag.
             // TODO
+        }
+
+        // Step 41. If initBody is null and inputBody is non-null, then:
+        if !init_body_is_non_null && final_body.is_some() {
+            // Step 41.1. If inputBody is unusable, then throw a TypeError.
+            if input_body_is_unusable {
+                return Err(Error::Type(c"Input body is unusable".to_owned()));
+            }
+            // Step 41.2. Set finalBody to the result of creating a proxy for inputBody.
+            // Tee creates the proxy stream while the source Request retains its original
+            // stream object. Fetching the proxy consumes that source, so make the source's
+            // disturbed state observable through bodyUsed and reject subsequent reuse.
+            if let RequestInfo::Request(ref input_request) = input &&
+                let Some(input_stream) = input_request.body_stream.get()
+            {
+                let branches = input_stream.tee(cx, true)?;
+                request.body_stream.set(Some(&*branches[1]));
+                input_stream.set_is_disturbed(true);
+            }
         }
 
         // Step 42. Set this’s request’s body to finalBody.
