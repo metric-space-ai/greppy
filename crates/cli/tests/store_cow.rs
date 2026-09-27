@@ -734,7 +734,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         "pub fn cold_structural_refresh_symbol() -> i32 { 54 }\n",
     )
     .unwrap();
-    let (cold_code, cold_out, cold_err) = run_cli_with_env(
+    let (cold_code, cold_out, cold_err) = run_with_env(
         &first,
         &store,
         &["index", "."],
@@ -909,11 +909,11 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         previous_layout.graph.to_string_lossy().as_ref(),
         "structural first use must publish a v7 Base"
     );
-    let migrated_base = greppy_store::Store::open(
+    let migrated_base = greppy_store::Store::open(Path::new(
         structural_status["store_cow"]["base_path"]
             .as_str()
             .expect("migrated Base path"),
-    )
+    ))
     .unwrap();
     assert_eq!(
         migrated_base
