@@ -4852,7 +4852,7 @@ def Widget():
                 file_path: "src/unrelated.py".into(),
                 start_line: 1,
                 end_line: 2,
-                content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                content_sha256: "79e7f0faa5c096d71e2144fed19041c227465b02667a95b613c0ecd4648e1a03"
                     .into(),
                 graph_generation: initial.graph_generation,
                 vector: vec![1.0, 0.0],
@@ -4870,7 +4870,7 @@ def Widget():
                 file_path: target.file_path.clone(),
                 start_line: target.start_line,
                 end_line: target.end_line,
-                content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                content_sha256: "0126ac6c598444305c31117e8a38a15cb496335cbd34fb503dfd331926e93fb7"
                     .into(),
                 graph_generation: initial.graph_generation,
                 vector: vec![0.0, 1.0],
@@ -4955,6 +4955,33 @@ def Widget():
             preserved_vectors, 2,
             "Rust and Python vectors are reusable in the v7 generation"
         );
+        for (qualified_name, content_sha256, expected_node_id) in [
+            (
+                "src/unrelated.py::Function::untouched",
+                "79e7f0faa5c096d71e2144fed19041c227465b02667a95b613c0ecd4648e1a03",
+                untouched_before.id,
+            ),
+            (
+                "src/channels/command.rs::Function::target",
+                "0126ac6c598444305c31117e8a38a15cb496335cbd34fb503dfd331926e93fb7",
+                target.id,
+            ),
+        ] {
+            let reusable = store
+                .find_reusable_vector_embedding(&greppy_store::ReusableVectorEmbeddingKey {
+                    project: "test",
+                    model_id: "fixture-model",
+                    prompt_version: "v1",
+                    task: "code",
+                    qualified_name,
+                    chunk_idx: 0,
+                    content_sha256,
+                })
+                .unwrap()
+                .expect("unchanged chunk must remain reusable after migration");
+            assert_eq!(reusable.node_id, Some(expected_node_id));
+            assert_eq!(reusable.graph_generation, migration.graph_generation);
+        }
         let clean = index_with_options(
             &mut store,
             &repo,
