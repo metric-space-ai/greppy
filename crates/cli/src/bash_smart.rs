@@ -78,6 +78,16 @@ static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     )
     .expect("bash-smart source diagnostic regex")
 });
+// Python prefixes warnings with a source and line followed by the warning
+// category (`SyntaxWarning`, `DeprecationWarning`, ...). Treat the complete
+// diagnostic shape as a warning without promoting prose that merely contains
+// a `Warning` class name.
+static PYTHON_WARNING_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(?:[A-Za-z_][A-Za-z0-9_]*)?Warning:(?:[\t ]|$)",
+    )
+    .expect("bash-smart Python warning regex")
+});
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -703,6 +713,8 @@ fn detect_blocks(
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
+                Some(BlockKind::Warning)
+            } else if PYTHON_WARNING_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
             } else {
                 TYPESCRIPT_DIAGNOSTIC_RE
@@ -2610,6 +2622,24 @@ mod tests {
         // mean line 8 of a file named `header.h:x`; use no numeric suffix here.
         let text = split_lines(b"header.h: error: no source line\nheader.h:x:y: error: not a numeric location\nheader.h:41:8: no error: successful\nheader.h:41:8: error_count: 0\nheader.h:41:8: note: informational\nheader.h:41:8: warning_count: 0\n");
         assert!(detect_blocks(&text, &[]).is_empty());
+    }
+
+    #[test]
+    fn python_file_prefixed_warning_categories_count_and_keep_source_detail() {
+        let diagnostics = b"<unknown>:251: SyntaxWarning: invalid escape sequence '\\/'\n  value = r\"~/\\/admin\"\nfixture.py:9: DeprecationWarning: old API\nplain prose mentions SyntaxWarning: but has no source line\nfixture.py:x: RuntimeWarning: non-numeric line\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 2, "{blocks:?}");
+            assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(
+                verdict_line(0, 0, blocks.len(), None),
+                "ok — exit 0, 2 warnings"
+            );
+        }
     }
 
     #[test]
