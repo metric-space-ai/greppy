@@ -5163,7 +5163,7 @@ fn spawn_background_job_handle(
                 .flatten()
                 .map(|state| state.graph_generation)
         });
-        if current_generation != Some(expected_generation) {
+        if current_generation.is_some_and(|generation| generation != expected_generation) {
             // A previous owner published while this caller waited for the
             // spawn lock. Preserve the attached-wait contract so the caller
             // observes that publication instead of launching a duplicate.
