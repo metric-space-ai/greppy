@@ -4634,6 +4634,8 @@ mod tests {
         let data = temp.path().join("provider-data");
         let mount = temp.path().join("provider-mount");
         let _provider_heartbeat = heartbeat_provider(&data, &mount);
+        let canonical_data = fs::canonicalize(&data).unwrap();
+        let canonical_mount = fs::canonicalize(&mount).unwrap();
         let tracker_core = Arc::new(WorkspaceCore::open(data.join("core")).unwrap());
         let tracked_repo = fs::canonicalize(&repo).unwrap();
         tracker_core
@@ -4839,11 +4841,11 @@ mod tests {
         assert!(!workspace.worktree_path().join("commit.txt").exists());
         assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
         let agent_data = workspace.agent_data_root();
-        assert!(agent_data.starts_with(&data));
-        assert!(!agent_data.starts_with(&mount));
+        assert!(agent_data.starts_with(&canonical_data));
+        assert!(!agent_data.starts_with(&canonical_mount));
         let agent_scratch = workspace.agent_scratch_root();
-        assert!(agent_scratch.starts_with(&data));
-        assert!(!agent_scratch.starts_with(&mount));
+        assert!(agent_scratch.starts_with(&canonical_data));
+        assert!(!agent_scratch.starts_with(&canonical_mount));
         fs::create_dir_all(&agent_data).unwrap();
         fs::write(agent_data.join("graph.db"), b"private store").unwrap();
         fs::create_dir_all(&agent_scratch).unwrap();
