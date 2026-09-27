@@ -796,7 +796,11 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
 /// symbols and keeps only unique matches. Non-resolving references (locals,
 /// params with no matching def, etc.) are emitted here but dropped at
 /// resolution.
-fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>, emit: &mut F) {
+fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
+    source: &[u8],
+    node: Node<'t>,
+    emit: &mut F,
+) {
     // Try to emit a usage for THIS node.
     if is_rust_reference_kind(node.kind())
         && !rust_usage_is_suppressed(node)
@@ -805,7 +809,9 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>,
         let name_node = rust_reference_leaf(node);
         let text = node_text(source, name_node);
         if !text.is_empty() && !is_rust_keyword_or_self(text) {
-            emit(name_node, text);
+            let ref_path = matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+                .then(|| node_text(source, node));
+            emit(name_node, text, ref_path);
         }
         if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
             return;
@@ -2721,6 +2727,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         "imported_name": imported_name,
                         "original_name": original_name,
                         "glob": is_glob,
+                        "imported_items": items.iter().map(|item| serde_json::json!({
+                            "path": item.path,
+                            "imported_name": item.imported_name,
+                            "original_name": item.original_name,
+                            "glob": item.is_glob,
+                        })).collect::<Vec<_>>(),
                     }),
                 });
             }
@@ -2838,7 +2850,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     // in a type position is just another reference node) so structs, enums,
     // and traits still get their usage edges.
     {
-        let mut emit = |node: Node<'_>, text: &str| {
+        let mut emit = |node: Node<'_>, text: &str, ref_path: Option<&str>| {
             // The nearest enclosing function's qname, with the same file-node
             // fallback the resolver applies when the reference is not inside
             // any function.
@@ -2854,9 +2866,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 target_qualified_name: format!("{file_path}::__ref__::{text}"),
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
-                properties: serde_json::json!({
-                    "ref_name": text,
-                }),
+                properties: {
+                    let mut properties = serde_json::json!({ "ref_name": text });
+                    if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
+                        object.insert(
+                            "ref_path".into(),
+                            serde_json::Value::String(path.to_string()),
+                        );
+                    }
+                    properties
+                },
             });
         };
         walk_rust_usages(source, tree.root_node(), &mut emit);

@@ -271,13 +271,17 @@ pub fn index_with_options_and_progress(
     // Compatibility must be read before publishing the new version or filtering
     // the inventory. Migrate every retained file in this store layer, even when
     // this invocation would ordinarily refresh only a few Delta paths.
-    let incompatible_index = store
+    let prior_indexer_version = store
         .list_private_workspace_states()?
         .iter()
         .find(|state| state.root_path == abs_root.to_string_lossy())
-        .map_or(!prior_state.is_empty(), |state| {
-            state.indexer_version != indexer_version
-        });
+        .map(|state| state.indexer_version.clone());
+    let rust_reexport_migration = prior_indexer_version.as_deref() == Some("greppy-indexer-v6")
+        && indexer_version == "greppy-indexer-v7";
+    let incompatible_index = prior_indexer_version
+        .as_deref()
+        .map_or(!prior_state.is_empty(), |prior| prior != indexer_version)
+        && !rust_reexport_migration;
     let mut only_paths = options.only_paths.clone();
     if incompatible_index {
         if let Some(paths) = only_paths.as_mut() {
@@ -367,6 +371,16 @@ pub fn index_with_options_and_progress(
     // across the whole run, so we read it once (the old per-file read
     // returned the same number N times).
     let generation = current_gen;
+
+    if rust_reexport_migration {
+        // v7 adds Rust-only raw-edge metadata. Forget only Rust file-state
+        // identities so the ordinary incremental path reparses those files;
+        // all other language graphs, source vectors, embeddings and model
+        // artifacts remain intact and reusable.
+        for state in prior_state.iter().filter(|state| state.language == "rust") {
+            store.delete_file_state(project_name, &state.rel_path)?;
+        }
+    }
 
     let controls = IndexControls::from_env();
     let controlled_entries = apply_large_repo_controls(&all_entries, &controls, &mut report);
@@ -1537,6 +1551,7 @@ fn resolve_and_persist_edges_with_progress(
         };
         let src_id = src.id;
         let src_file = src.file_path.clone();
+        index.record_import_items(edge, &src_file);
         let target_id = match edge
             .properties
             .get("imported_name")
@@ -1593,12 +1608,7 @@ fn resolve_and_persist_edges_with_progress(
             // resolve it to any registered symbol (callable, type, or value)
             // via the symbol registry. No direct target qname exists, so this
             // is name-based only.
-            "USAGE" => match edge.properties.get("ref_name").and_then(|v| v.as_str()) {
-                Some(name) if !name.is_empty() => {
-                    index.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
-                }
-                _ => None,
-            },
+            "USAGE" => index.resolve_usage_target(edge, src_id),
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
 
@@ -2035,17 +2045,9 @@ fn resolve_edges_incremental(
     // Instrumentation: how many raw edges this cheap path actually resolves.
     note_reresolved(all_raw.iter().filter(|e| is_candidate(e)).count());
 
-    // PASS 1 — IMPORTS. Resolve the imports of every file that owns a
-    // candidate reference edge (and every candidate IMPORTS edge itself) so
-    // PASS 2's disambiguation matches the full resolver. Because the def set
-    // is unchanged, these imports resolve exactly as they did before.
-    let mut candidate_owner_files: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
-    for e in &all_raw {
-        if e.edge_type != "IMPORTS" && is_candidate(e) {
-            candidate_owner_files.insert(source_file_of(e));
-        }
-    }
+    // PASS 1 — IMPORTS. Resolve all import signals so grouped reexports and
+    // parent-module globs can disambiguate candidate references exactly as in
+    // the full resolver. Only candidate IMPORTS edges are persisted again.
     let mut resolved: Vec<NewEdge> = Vec::new();
     for edge in all_raw.iter().filter(|e| e.edge_type == "IMPORTS") {
         examined += 1;
@@ -2059,13 +2061,8 @@ fn resolve_edges_incremental(
         };
         let src_id = src.id;
         let src_file = src.file_path.clone();
-        // Only resolve this import if its file owns a candidate reference
-        // edge OR the import edge itself is a candidate (so it lands in the
-        // index for disambiguation and, when itself cascaded, is re-inserted).
         let is_cand_import = is_candidate(edge);
-        if !is_cand_import && !candidate_owner_files.contains(src_file.as_str()) {
-            continue;
-        }
+        index.record_import_items(edge, &src_file);
         let target_id = match edge
             .properties
             .get("imported_name")
@@ -2122,12 +2119,7 @@ fn resolve_edges_incremental(
             // resolve it to any registered symbol (callable, type, or value)
             // via the symbol registry. No direct target qname exists, so this
             // is name-based only.
-            "USAGE" => match edge.properties.get("ref_name").and_then(|v| v.as_str()) {
-                Some(name) if !name.is_empty() => {
-                    index.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
-                }
-                _ => None,
-            },
+            "USAGE" => index.resolve_usage_target(edge, src_id),
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
         let Some(target_id) = target_id else { continue };
@@ -2484,6 +2476,7 @@ struct GraphIndex {
     /// [`record_import`](GraphIndex::record_import) during the IMPORTS
     /// pass; consulted by [`resolve_unique_with_imports`].
     imports_by_file: std::collections::HashMap<String, std::collections::HashSet<i64>>,
+    import_globs_by_file: std::collections::HashMap<String, Vec<String>>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
     id_to_file: std::collections::HashMap<i64, String>,
@@ -2570,6 +2563,7 @@ impl GraphIndex {
             by_qname,
             by_name,
             imports_by_file: std::collections::HashMap::new(),
+            import_globs_by_file: std::collections::HashMap::new(),
             id_to_file,
             id_to_qname,
             files_by_stem,
@@ -2593,6 +2587,38 @@ impl GraphIndex {
             .entry(file.to_string())
             .or_default()
             .insert(target_id);
+    }
+
+    fn record_import_items(&mut self, edge: &ExtractedEdge, file: &str) {
+        let Some(items) = edge.properties.get("imported_items").and_then(|value| value.as_array())
+        else {
+            return;
+        };
+        for item in items {
+            if item.get("glob").and_then(|value| value.as_bool()) == Some(true) {
+                if let Some(path) = item.get("path").and_then(|value| value.as_str()) {
+                    self.import_globs_by_file
+                        .entry(file.to_string())
+                        .or_default()
+                        .push(path.to_string());
+                }
+                continue;
+            }
+            let Some(name) = item.get("original_name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let path = item.get("path").and_then(|value| value.as_str()).unwrap_or("");
+            if let Some(target) = self.unique_def_named_with_path(
+                &greppy_resolver::IMPORTABLE_LABELS,
+                name,
+                path,
+            ) {
+                self.record_import(file, target);
+            }
+        }
     }
 
     /// The set of node `name`s defined in any of `files`. Used by the
@@ -2736,6 +2762,31 @@ impl GraphIndex {
                 }
             }
         }
+        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
+            for glob in globs {
+                let module_file = (glob == "super").then(|| {
+                    std::path::Path::new(referrer_file)
+                        .parent()
+                        .map(|parent| parent.join("mod.rs"))
+                });
+                let Some(module_file) = module_file
+                    .flatten()
+                    .and_then(|path| path.to_str().map(str::to_owned))
+                else {
+                    continue;
+                };
+                let Some(exports) = self.imports_by_file.get(&module_file) else {
+                    continue;
+                };
+                let preferred: Vec<&&NodeLite> = candidates
+                    .iter()
+                    .filter(|node| exports.contains(&node.id))
+                    .collect();
+                if preferred.len() == 1 {
+                    return UniqueResolution::Unique(preferred[0].id);
+                }
+            }
+        }
         UniqueResolution::Ambiguous
     }
 
@@ -2807,6 +2858,36 @@ impl GraphIndex {
             }
             UniqueResolution::Ambiguous => None,
         }
+    }
+
+    fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
+        let name = edge.properties.get("ref_name").and_then(|value| value.as_str())?;
+        if name.is_empty() {
+            return None;
+        }
+        if let Some(module) = edge
+            .properties
+            .get("ref_path")
+            .and_then(|value| value.as_str())
+            .and_then(|path| greppy_resolver::path_module_segment(path, name))
+        {
+            let candidates = self.defs_named(&USAGE_LABELS, name);
+            let imported: Vec<i64> = candidates
+                .iter()
+                .filter(|candidate| {
+                    self.imports_by_file.iter().any(|(file, targets)| {
+                        (file.ends_with(&format!("/{module}.rs"))
+                            || file.ends_with(&format!("/{module}/mod.rs")))
+                            && targets.contains(&candidate.id)
+                    })
+                })
+                .map(|candidate| candidate.id)
+                .collect();
+            if let [id] = imported.as_slice() {
+                return Some(*id);
+            }
+        }
+        self.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
     }
 
     /// Resolve a receiver call only when its statically observed owner and
@@ -4242,6 +4323,112 @@ def Widget():
         fs::write(tmp.join("src/lib.rs"), lib_rs).unwrap();
         fs::write(tmp.join("src/helper.rs"), helper_rs).unwrap();
         tmp
+    }
+
+    #[test]
+    fn rust_qualified_function_item_resolves_through_grouped_reexport() {
+        let repo = setup_multifile_repo(
+            "rust-reexport-function-item",
+            "mod channels; mod other;\nfn caller() { let selected = channels::target; selected(); }\n",
+            "// fixture placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/channels")).unwrap();
+        fs::write(
+            repo.join("src/channels/mod.rs"),
+            "mod command; mod tests; pub use command::{first, target};\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/command.rs"),
+            "pub fn first() {}\npub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/tests.rs"),
+            "use super::*;\nfn direct_test() { target(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/other.rs"), "pub fn target() {}\n").unwrap();
+        fs::write(repo.join("src/unrelated.py"), "def untouched():\n    return 1\n").unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let target = store
+            .get_node_by_qname("test", "src/channels/command.rs::Function::target")
+            .unwrap()
+            .expect("reexported target function");
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::caller")
+            .unwrap()
+            .expect("caller function");
+        let incoming = store.incoming_edges(target.id, Some("USAGE"), 10).unwrap();
+        assert!(
+            incoming.iter().any(|edge| edge.source_id == caller.id),
+            "qualified function item must resolve through the module's grouped reexport: {incoming:?}"
+        );
+        let direct_test = store
+            .get_node_by_qname("test", "src/channels/tests.rs::Function::direct_test")
+            .unwrap()
+            .expect("direct test caller");
+        let calls = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert!(
+            calls.iter().any(|edge| edge.source_id == direct_test.id),
+            "super glob must disambiguate the reexported direct call: {calls:?}"
+        );
+        let homonym = store
+            .get_node_by_qname("test", "src/other.rs::Function::target")
+            .unwrap()
+            .expect("unrelated homonym");
+        assert!(
+            store.incoming_edges(homonym.id, None, 10).unwrap().is_empty(),
+            "module and glob evidence must not create cross-module homonym callers"
+        );
+
+        let untouched_before = store
+            .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
+            .unwrap()
+            .expect("unrelated Python definition");
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "fixture-model".into(),
+                prompt_version: "v1".into(),
+                task: "code".into(),
+                node_id: Some(untouched_before.id),
+                chunk_idx: 0,
+                qualified_name: "src/unrelated.py::Function::untouched".into(),
+                file_path: "src/unrelated.py".into(),
+                start_line: 1,
+                end_line: 2,
+                content_sha256: "fixture-sha".into(),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        let root = greppy_discover::detect_repo_root(&repo).unwrap();
+        let mut state = store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("workspace state");
+        state.indexer_version = "greppy-indexer-v6".into();
+        store.upsert_workspace_state(&state).unwrap();
+
+        let migration = index(&mut store, &repo, "test").unwrap();
+        assert_eq!(migration.files_indexed, 6, "only the six Rust files reparse");
+        let untouched_after = store
+            .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
+            .unwrap()
+            .expect("unrelated Python definition survives migration");
+        assert_eq!(untouched_after.id, untouched_before.id);
+        let preserved_vectors: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vector_embeddings WHERE project='test' AND file_path='src/unrelated.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_vectors, 1, "unrelated source vectors survive v7 migration");
     }
 
     #[test]
