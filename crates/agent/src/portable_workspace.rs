@@ -1483,14 +1483,16 @@ fn apply_from_core(
         });
     }
     let final_index = journal_path.with_extension("final-index");
+    let git_target = git_compatible_path(&canonical_target)?;
+    let git_final_index = git_compatible_path(&final_index)?;
     let read_final = Command::new("git")
         .args([
             "-C",
-            path_text(&canonical_target)?,
+            path_text(&git_target)?,
             "read-tree",
             &proposal.final_tree,
         ])
-        .env("GIT_INDEX_FILE", &final_index)
+        .env("GIT_INDEX_FILE", &git_final_index)
         .output()?;
     if !read_final.status.success() {
         restore_apply_journal(core, &journal_path, &journal)?;
@@ -1500,25 +1502,20 @@ fn apply_from_core(
         ));
     }
     let _ = Command::new("git")
-        .args([
-            "-C",
-            path_text(&canonical_target)?,
-            "update-index",
-            "--refresh",
-        ])
-        .env("GIT_INDEX_FILE", &final_index)
+        .args(["-C", path_text(&git_target)?, "update-index", "--refresh"])
+        .env("GIT_INDEX_FILE", &git_final_index)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
     let final_check = Command::new("git")
         .args([
             "-C",
-            path_text(&canonical_target)?,
+            path_text(&git_target)?,
             "diff-files",
             "--name-status",
             "--",
         ])
-        .env("GIT_INDEX_FILE", &final_index)
+        .env("GIT_INDEX_FILE", &git_final_index)
         .output()?;
     let _ = fs::remove_file(final_index);
     if !final_check.status.success() || !final_check.stdout.is_empty() {
@@ -3197,9 +3194,10 @@ fn initialize_private_git(
         });
     }
     let worktree_git = worktree.join(".git");
+    let linked_git_dir = git_compatible_path(private_git_dir)?;
     fs::write(
         &worktree_git,
-        format!("gitdir: {}\n", private_git_dir.display()),
+        format!("gitdir: {}\n", linked_git_dir.display()),
     )
     .map_err(|error| {
         WorkspaceError::Io(io::Error::new(
@@ -3623,10 +3621,11 @@ fn commit_tree(
     parent: &str,
     message: &str,
 ) -> Result<String, WorkspaceError> {
+    let worktree = git_compatible_path(worktree)?;
     let output = Command::new("git")
         .args([
             "-C",
-            path_text(worktree)?,
+            path_text(&worktree)?,
             "commit-tree",
             tree,
             "-p",
@@ -3643,8 +3642,9 @@ fn commit_tree(
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+    let git_cwd = git_compatible_path(cwd)?;
     let output = Command::new("git")
-        .args(["-C", path_text(cwd)?])
+        .args(["-C", path_text(&git_cwd)?])
         .args(args)
         .output()?;
     output_text(
@@ -3654,10 +3654,12 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
 }
 
 fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+    let git_cwd = git_compatible_path(cwd)?;
+    let git_index = git_compatible_path(index)?;
     let output = Command::new("git")
-        .args(["-C", path_text(cwd)?])
+        .args(["-C", path_text(&git_cwd)?])
         .args(args)
-        .env("GIT_INDEX_FILE", index)
+        .env("GIT_INDEX_FILE", git_index)
         .output()?;
     output_text(
         &format!(
@@ -3682,9 +3684,17 @@ fn filter_ignored_paths(
     if paths.is_empty() {
         return Ok(paths);
     }
+    let git_worktree = git_compatible_path(worktree)?;
+    let git_index = git_compatible_path(index)?;
     let mut child = Command::new("git")
-        .args(["-C", path_text(worktree)?, "check-ignore", "-z", "--stdin"])
-        .env("GIT_INDEX_FILE", index)
+        .args([
+            "-C",
+            path_text(&git_worktree)?,
+            "check-ignore",
+            "-z",
+            "--stdin",
+        ])
+        .env("GIT_INDEX_FILE", git_index)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3756,8 +3766,9 @@ fn filter_agent_owned_ephemeral_paths(
 }
 
 fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
+    let git_cwd = git_compatible_path(cwd)?;
     let output = Command::new("git")
-        .args(["-C", path_text(cwd)?])
+        .args(["-C", path_text(&git_cwd)?])
         .args(args)
         .output()?;
     if output.status.success() {
@@ -4510,6 +4521,39 @@ mod tests {
         assert!(unsupported
             .to_string()
             .contains("unsupported Windows verbatim path for Git"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_git_link_uses_git_compatible_windows_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("workspace");
+        let private_git = temp.path().join("private-git");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(private_git.join("refs/heads")).unwrap();
+        fs::write(private_git.join("index"), b"index").unwrap();
+        fs::write(
+            private_git.join("refs/heads/greppy-baseline"),
+            b"baseline-commit\n",
+        )
+        .unwrap();
+        fs::write(
+            private_git.join("HEAD"),
+            b"ref: refs/heads/greppy-baseline\n",
+        )
+        .unwrap();
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let private_git = fs::canonicalize(private_git).unwrap();
+        assert!(path_text(&worktree).unwrap().starts_with(r"\\?\"));
+        assert!(path_text(&private_git).unwrap().starts_with(r"\\?\"));
+
+        initialize_private_git(&worktree, &private_git, "baseline-tree", "baseline-commit")
+            .unwrap();
+        let expected = format!(
+            "gitdir: {}\n",
+            git_compatible_path(&private_git).unwrap().display()
+        );
+        assert_eq!(fs::read_to_string(worktree.join(".git")).unwrap(), expected);
     }
 
     #[test]
