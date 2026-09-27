@@ -145,11 +145,7 @@ pub(crate) fn inference_registry_status() -> Result<greppy_embed_native::Inferen
     ))
 }
 
-pub(crate) fn inference_model_status() -> serde_json::Value {
-    let embedding_args = EmbeddingCliArgs {
-        device: None,
-        no_gpu: false,
-    };
+pub(crate) fn inference_model_status(embedding_args: EmbeddingCliArgs<'_>) -> serde_json::Value {
     let embedding = match embedding_config_optional(embedding_args) {
         Ok(Some(cfg)) => {
             let EmbeddingModelSource::Gguf { gguf, tokenizer } = cfg.source;
@@ -200,14 +196,10 @@ pub(crate) fn inference_model_status() -> serde_json::Value {
     serde_json::json!({"embedding": embedding, "summary": summary})
 }
 
-pub(crate) fn inference_daemon_status() -> serde_json::Value {
+pub(crate) fn inference_daemon_status(embedding_args: EmbeddingCliArgs<'_>) -> serde_json::Value {
     #[cfg(any(unix, windows))]
     {
-        let embedding_args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        let embedding = match embedding_config_optional(embedding_args) {
+        let embedding = match embedding_config_for_daemon_probe(embedding_args) {
             Ok(Some(cfg)) => {
                 let key = embedding_query_cache_key(&cfg);
                 embed_daemon::status(&cfg, &key)
@@ -268,9 +260,6 @@ pub(crate) fn embedding_config_optional(
 pub(crate) fn embedding_config_for_daemon_probe(
     args: EmbeddingCliArgs<'_>,
 ) -> Result<Option<EmbeddingModelConfig>> {
-    if test_inference_skipped() {
-        return Ok(None);
-    }
     let device = embedding_device_preference(args.device, args.no_gpu)?;
     let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
     Ok(Some(EmbeddingModelConfig {

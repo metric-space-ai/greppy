@@ -2115,7 +2115,7 @@ fn dispatch_subcommand(
                         "index status takes no repository path; use `--root PATH`".into(),
                     ));
                 }
-                dispatch_index_status(json, root)
+                dispatch_index_status(json, root, EmbeddingCliArgs { device, no_gpu })
             } else if path.as_deref() == Some("recover") {
                 if agent_worktree {
                     return Err(Error::Invalid(
@@ -2438,7 +2438,9 @@ fn dispatch_subcommand(
         ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
-        Command::Doctor { json } => dispatch_doctor(json, root),
+        Command::Doctor { json } => {
+            dispatch_doctor(json, root, EmbeddingCliArgs { device, no_gpu })
+        }
         Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
@@ -6125,8 +6127,12 @@ fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
     Ok(if diag.is_healthy() { 0 } else { EXIT_IO as i32 })
 }
 
-fn dispatch_doctor(json: bool, root: Option<&str>) -> Result<i32> {
-    dispatch_index_health("doctor", json, root)
+fn dispatch_doctor(
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    dispatch_index_health("doctor", json, root, embedding_args)
 }
 
 fn combined_inference_gpu_memory() -> u64 {

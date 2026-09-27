@@ -900,6 +900,45 @@ fn cli_device_flags_parse_on_embedding_commands() {
     .is_err());
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[
+        ENV_DEVICE,
+        ENV_NO_GPU,
+        ENV_EMBED_CUDA_DEVICE,
+        ENV_QWEN_CUDA_DEVICE,
+    ]);
+    // Keep the environment backend-neutral so the two explicit arguments are
+    // the only inputs that choose the endpoint identity.
+    unsafe {
+        std::env::set_var(ENV_DEVICE, "auto");
+        std::env::remove_var(ENV_NO_GPU);
+    }
+
+    let auto = inference_daemon_status(EmbeddingCliArgs {
+        device: Some("auto"),
+        no_gpu: false,
+    });
+    let cuda = inference_daemon_status(EmbeddingCliArgs {
+        device: Some("cuda"),
+        no_gpu: false,
+    });
+    let endpoint = |status: &serde_json::Value| {
+        status["embedding"]["endpoint"]
+            .as_str()
+            .expect("daemon probe should report its endpoint")
+            .to_owned()
+    };
+
+    assert_ne!(
+        endpoint(&auto),
+        endpoint(&cuda),
+        "explicit --device must select the matching daemon endpoint"
+    );
+}
+
 #[test]
 fn embedding_device_preference_obeys_cli_and_env() {
     let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
