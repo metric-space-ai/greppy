@@ -807,8 +807,8 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
     );
 }
 
-/// Large drift starts a background refresh and fails closed. No command may
-/// expose rows from the old generation while that refresh is in flight.
+/// Large drift fails closed when automatic healing is explicitly disabled.
+/// No command may expose rows from the old generation.
 fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
     let (repo, store) = index_fixture(tag);
     std::fs::write(
@@ -827,28 +827,28 @@ fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
+fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
     let (repo, store) = large_stale_graph_fixture("graph-stale-gate-brief");
 
     let (code, out, err) = run_with_env(
         &["brief", "do_it"],
         &repo,
         &store,
-        &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
+        &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
         code, 75,
-        "refreshing brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+        "stale brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
         "brief freshness refusal must stay on stdout; stderr={err:?}"
     );
     assert!(
-        out.contains("graph freshness is refreshing")
+        out.contains("graph freshness is drift")
             && out.contains("no stale indexed hits emitted")
             && !out.contains("== do_it"),
-        "refreshing brief must explain the refusal without old evidence; got: {out:?}"
+        "stale brief must explain the refusal without old evidence; got: {out:?}"
     );
 
     let json_cases: Vec<(Vec<&str>, &str, &str)> = vec![
@@ -880,28 +880,28 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
             &args,
             &repo,
             &store,
-            &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
+            &[("GREPPY_AUTO_REINDEX", "0")],
         );
         assert_eq!(
             code, 75,
-            "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+            "stale {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
         );
         assert!(
             err.is_empty(),
             "JSON freshness refusal must stay on stdout; stderr={err:?}"
         );
         let v: serde_json::Value = serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("invalid refreshing {command} json: {e}; stdout={out:?}"));
+            .unwrap_or_else(|e| panic!("invalid stale {command} json: {e}; stdout={out:?}"));
         assert_eq!(v["command"], command);
         assert_eq!(
             v["status"], "skipped_stale_index",
-            "refreshing {command} must be skipped: {v:?}"
+            "stale {command} must be skipped: {v:?}"
         );
         assert_eq!(
             v["fresh"], false,
             "{command} must label the result stale: {v:?}"
         );
-        assert_eq!(v["freshness"]["state"], "refreshing");
+        assert_eq!(v["freshness"]["state"], "drift");
         assert_eq!(
             v["freshness"]["stale_file_count"], 12,
             "{command} must report the drift extent: {v:?}"
