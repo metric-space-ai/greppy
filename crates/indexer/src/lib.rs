@@ -3115,7 +3115,7 @@ impl GraphIndex {
                     .any(|known_file| known_file == module_file)
             });
             if !module_exists {
-                let owner = ref_path.split("::").rev().nth(1).unwrap_or("");
+                let owner = ref_path.rsplit("::").nth(1).unwrap_or("");
                 return self.resolve_associated_method(src_id, owner, name);
             }
             let in_module: Vec<i64> = self
