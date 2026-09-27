@@ -141,15 +141,17 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
-/// Build a validation-only view for an import-type query that the bundled
-/// grammar has already placed inside a `type_query` node but reports an
-/// ERROR/MISSING token at the closing generic delimiter.
+/// Build a validation-only view for the exact import-type recovery shape
+/// emitted by the bundled TypeScript grammar.
 ///
-/// The parse-tree ancestry is the authority for type context. Text that merely
-/// resembles `typeof import("...")` in a comment, string, template, regex, or
-/// value expression cannot qualify. The substituted span preserves length and
-/// retains every newline, so subsequent tree coordinates still name the
-/// proposed source.
+/// For `fn<typeof import("module")>()`, the grammar parses `<` as a binary
+/// operator, retains `typeof import("module")` as a
+/// `binary_expression -> unary_expression -> call_expression(import)` right
+/// operand, then emits one ERROR over the exact `>()` suffix. All of that raw
+/// AST and byte evidence must match before validation substitutes the import
+/// call. Lookalikes in comments, strings, templates, regexes, value
+/// expressions, and unrelated malformed code cannot qualify. The substituted
+/// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if !matches!(language, Language::TypeScript { .. }) {
         return Cow::Borrowed(content);
@@ -158,13 +160,13 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         return Cow::Borrowed(content);
     };
 
-    let mut error_offsets = Vec::new();
+    let mut errors = Vec::new();
     let mut tree_cursor = raw_tree.walk();
     let mut reached_root = false;
     while !reached_root {
         let node = tree_cursor.node();
         if node.is_error() || node.is_missing() {
-            error_offsets.push(node.start_byte());
+            errors.push((node.start_byte(), node.end_byte(), node.is_missing()));
         }
         if tree_cursor.goto_first_child() {
             continue;
@@ -179,7 +181,7 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
             }
         }
     }
-    if error_offsets.is_empty() {
+    if errors.is_empty() {
         return Cow::Borrowed(content);
     }
 
@@ -211,16 +213,22 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         else {
             continue;
         };
-        let mut ancestor = Some(type_node);
-        let mut in_type_query = false;
-        while let Some(node) = ancestor {
-            if node.kind() == "type_query" {
-                in_type_query = true;
-                break;
-            }
-            ancestor = node.parent();
+        let Some(unary_expression) = std::iter::successors(Some(type_node), |node| node.parent())
+            .find(|node| node.kind() == "unary_expression")
+        else {
+            continue;
+        };
+        if !matches!(
+            unary_expression.parent(),
+            Some(node) if node.kind() == "binary_expression"
+        ) {
+            continue;
         }
-        if !in_type_query {
+        let mut before_typeof = start;
+        while before_typeof > 0 && content[before_typeof - 1].is_ascii_whitespace() {
+            before_typeof -= 1;
+        }
+        if before_typeof == 0 || content[before_typeof - 1] != b'<' {
             continue;
         }
 
@@ -276,9 +284,13 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
             continue;
         }
         let import_end = scan + 1;
-        if !error_offsets
-            .iter()
-            .any(|error| *error >= start && *error <= import_end + 1)
+        let suffix_end = import_end + 3;
+        if content.get(import_end..suffix_end) != Some(b">()") ||
+            !errors
+                .iter()
+                .any(|(error_start, error_end, missing)| {
+                    !missing && *error_start == import_end && *error_end == suffix_end
+                })
         {
             continue;
         }
@@ -495,9 +507,21 @@ mod tests {
                 ancestor = node.parent();
                 Some(node.kind())
             })
-            .any(|kind| kind == "type_query"),
-            "the raw recovery tree must retain the TypeScript type-query node"
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|kinds| kinds == ["unary_expression", "binary_expression"]),
+            "the raw recovery tree must retain the observed unary/binary import-type shape"
         );
+        let suffix_start = valid
+            .windows(b">()".len())
+            .position(|window| window == b">()")
+            .unwrap();
+        let error = raw_tree
+            .root_node()
+            .descendant_for_byte_range(suffix_start, suffix_start + b">()".len())
+            .expect("ERROR covering the recovered generic call suffix");
+        assert!(error.is_error());
+        assert_eq!(&valid[error.start_byte()..error.end_byte()], b">()");
         assert_eq!(
             syntax_counts(language, valid),
             Some(SyntaxCounts {
@@ -561,59 +585,6 @@ mod tests {
             escaped_newline,
             "line continuations must not be rewritten because that would move diagnostics"
         );
-    }
-
-    /// Diagnostic only: retain the bundled grammar's exact recovery shape
-    /// before changing the validation adapter again. Run explicitly with
-    /// `--ignored --nocapture`; ordinary suites skip it.
-    #[test]
-    #[ignore = "raw parser diagnostic for the TypeScript import-type false rejection"]
-    fn diagnose_typescript_import_type_recovery_tree() {
-        let language = Language::TypeScript { tsx: false };
-        let source = br#"vi.mock("node:child_process", async (importOriginal) => {
-  const original = await importOriginal<typeof import("node:child_process")>();
-  return { ...original, spawn: vi.fn(original.spawn) };
-});
-"#;
-        let tree = greppy_parser::parse(language, source).unwrap();
-        eprintln!("ROOT_SEXP={}", tree.root_node().to_sexp());
-
-        let mut cursor = tree.walk();
-        let mut reached_root = false;
-        while !reached_root {
-            let node = cursor.node();
-            if node.is_error() || node.is_missing() {
-                let mut ancestors = Vec::new();
-                let mut parent = node.parent();
-                while let Some(current) = parent {
-                    ancestors.push(current.kind());
-                    parent = current.parent();
-                }
-                eprintln!(
-                    "PARSE_FAILURE kind={} missing={} bytes={}..{} points={:?}..{:?} text={:?} ancestors={:?}",
-                    node.kind(),
-                    node.is_missing(),
-                    node.start_byte(),
-                    node.end_byte(),
-                    node.start_position(),
-                    node.end_position(),
-                    String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]),
-                    ancestors,
-                );
-            }
-            if cursor.goto_first_child() {
-                continue;
-            }
-            loop {
-                if cursor.goto_next_sibling() {
-                    break;
-                }
-                if !cursor.goto_parent() {
-                    reached_root = true;
-                    break;
-                }
-            }
-        }
     }
 
     #[test]
