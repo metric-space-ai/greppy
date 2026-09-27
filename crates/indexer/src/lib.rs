@@ -4852,7 +4852,8 @@ def Widget():
                 file_path: "src/unrelated.py".into(),
                 start_line: 1,
                 end_line: 2,
-                content_sha256: "fixture-sha".into(),
+                content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
                 graph_generation: initial.graph_generation,
                 vector: vec![1.0, 0.0],
             })
@@ -4869,7 +4870,8 @@ def Widget():
                 file_path: target.file_path.clone(),
                 start_line: target.start_line,
                 end_line: target.end_line,
-                content_sha256: "rust-fixture-sha".into(),
+                content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
                 graph_generation: initial.graph_generation,
                 vector: vec![0.0, 1.0],
             })
