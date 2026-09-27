@@ -5114,8 +5114,8 @@ def Widget():
         )
         .unwrap();
         assert_eq!(
-            migration.files_indexed, 20,
-            "all retained Rust files re-extract despite sparse scope"
+            migration.files_indexed, 21,
+            "all 21 migration-required fixture files re-extract despite sparse scope"
         );
         let untouched_after = store
             .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
