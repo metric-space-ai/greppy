@@ -3311,7 +3311,7 @@ fn nav_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
     // Rule 3: a one-symbol answer is a batch of one. The caller parses ONE
     // shape — `targets` plus per-hit attribution — however many symbols it
     // named.
@@ -3363,11 +3363,33 @@ fn incomplete_provider_json(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, &[])
+}
+
+/// Provider completeness for a graph answer is scoped to the relations that
+/// answer actually reads. A provider may be broadly partial because it omits
+/// semantic, infrastructure, or history edges while still fully covering a
+/// navigation command's CALLS/USAGE union. File failures remain relevant for
+/// every relation because they can remove otherwise-supported edges.
+fn incomplete_provider_json_for_edges(
+    store: &greppy_store::Store,
+    project: &str,
+    required_edge_classes: &[&str],
+) -> Result<Vec<serde_json::Value>> {
     Ok(store
         .list_provider_states(project)?
         .into_iter()
-        .filter(greppy_store::ProviderState::is_incomplete)
         .filter(|p| !is_noncode_provider(&p.status, &p.language))
+        .filter(|p| {
+            p.files_failed > 0
+                || if required_edge_classes.is_empty() {
+                    p.is_incomplete()
+                } else {
+                    required_edge_classes
+                        .iter()
+                        .any(|class| !p.supports_edge_class(class))
+                }
+        })
         .map(|p| {
             // Agent responses only need to know which language is partial.
             // Per-edge-class and per-file diagnostics belong to doctor and
@@ -3378,6 +3400,25 @@ fn incomplete_provider_json(
             })
         })
         .collect())
+}
+
+const WHO_CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls", "usages"];
+
+fn provider_edge_classes_for_command(command: &str) -> &'static [&'static str] {
+    match command {
+        // dispatch_who_calls and the batched equivalent both read the incoming
+        // union of CALLS and USAGE edges.
+        "who-calls" => WHO_CALLS_PROVIDER_EDGE_CLASSES,
+        _ => &[],
+    }
+}
+
+fn query_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    command: &str,
+) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, provider_edge_classes_for_command(command))
 }
 
 /// A provider row is "non-code noise" when it exists only because the indexer
@@ -6910,7 +6951,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             .get("fresh")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let incomplete_providers = incomplete_provider_json(&store, &project)?;
+        let incomplete_providers = query_incomplete_provider_json(&store, &project, req.command)?;
         let omitted = total.saturating_sub(shown);
         let value = serde_json::json!({
             "command": req.command,

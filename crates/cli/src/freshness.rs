@@ -44,7 +44,7 @@ pub(crate) fn graph_stale_skip_json(
     extra: serde_json::Value,
     empty_collection_field: &str,
 ) -> Result<()> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
     let mut obj = serde_json::Map::new();
     obj.insert("command".into(), serde_json::json!(command));
     obj.insert("status".into(), serde_json::json!("skipped_stale_index"));
@@ -124,7 +124,7 @@ pub(crate) fn provider_policy_graph_gate(
     extra: serde_json::Value,
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
     if !provider_policy_blocks_query(&incomplete_providers)? {
         return Ok(None);
     }
