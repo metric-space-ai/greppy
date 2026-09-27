@@ -37,10 +37,10 @@ impl ProviderState {
     /// semantic, …) while fully supporting the call-graph classes an agent
     /// actually queries. A navigation footer for a *specific* edge class must
     /// hedge on THAT class, not on the provider's overall completeness — else a
-    /// fully-supported `who-calls` (CALLS) answer is falsely marked a floor,
-    /// which pushes the agent into a redundant `--all` re-query and grep
-    /// fallback (H2 spiral). `class` matches the lowercase provider-state
-    /// spelling ("calls" / "usages" / "type_refs" / …).
+    /// fully-supported `who-calls` (the CALLS + USAGE union) answer is falsely
+    /// marked a floor, which pushes the agent into a redundant `--all`
+    /// re-query and grep fallback (H2 spiral). `class` matches the lowercase
+    /// provider-state spelling ("calls" / "usages" / "type_refs" / …).
     pub fn supports_edge_class(&self, class: &str) -> bool {
         // Require an affirmative capability declaration. Old, failed, or
         // externally-created rows with empty/unknown lists must not silently
@@ -49,6 +49,7 @@ impl ProviderState {
             self.status.as_str(),
             "accepted" | "partial" | "parity_candidate"
         ) && self.supported_edge_classes.iter().any(|c| c == class)
+            && !self.unsupported_edge_classes.iter().any(|c| c == class)
     }
 }
 
@@ -249,6 +250,12 @@ mod tests {
         assert!(
             !failed.supports_edge_class("calls"),
             "failed or stale status cannot claim a listed capability"
+        );
+        let mut contradictory = got.clone();
+        contradictory.unsupported_edge_classes.push("calls".into());
+        assert!(
+            !contradictory.supports_edge_class("calls"),
+            "a contradictory row must fail closed"
         );
         assert_eq!(s.incomplete_provider_states("p").unwrap(), vec![state]);
     }

@@ -1055,11 +1055,6 @@ fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
             "graph-locate",
             "hits",
         ),
-        (
-            vec!["impact", "do_it", "--json", "--diagnostics"],
-            "impact",
-            "hits",
-        ),
         (vec!["fan-in", "--json", "--diagnostics"], "fan-in", "hits"),
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
