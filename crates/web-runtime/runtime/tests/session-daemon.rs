@@ -3977,8 +3977,12 @@ const state = await page.evaluate(async () => {{
   const clone = source.clone();
   const first = {} ? clone : source;
   const second = {} ? source : clone;
-  const firstResponse = await fetch(first);
-  const secondResponse = await fetch(second);
+  const stagedFetch = async (stage, request) => {{
+    try {{ return await fetch(request); }}
+    catch (error) {{ throw new Error(`stage=${{stage}}: ${{error.name}}: ${{error.message}}`); }}
+  }};
+  const firstResponse = await stagedFetch('first-fetch', first);
+  const secondResponse = await stagedFetch('second-fetch', second);
   let sourceReuseError = '';
   let cloneReuseError = '';
   try {{ await fetch(source); }} catch (error) {{ sourceReuseError = error.name; }}
