@@ -901,7 +901,10 @@ impl Servo {
         }
         let opts = &instance_opts;
 
-        // Set the preferences globally.
+        // Set the preferences globally. Construction is synchronous on the
+        // embedder thread: resource-thread connectors copy proxy preferences
+        // before this method returns, so a later dependent Servo cannot reroute
+        // an already-live context.
         // TODO: It would be better to make these private to a particular Servo instance.
         let preferences = builder.preferences.map(|opts| *opts);
         servo_config::prefs::set(preferences.unwrap_or_default());

@@ -1178,6 +1178,7 @@ struct ContentEngine {
     browsers: HashMap<String, ObjectLife>,
     contexts: HashMap<String, ObjectLife>,
     context_bundles: HashMap<String, Rc<EngineBundle>>,
+    retired_network_bytes: u64,
     session_contexts: HashMap<String, String>,
     next_id: u64,
     pump_nonce: Cell<u64>,
@@ -1243,6 +1244,7 @@ impl ContentEngine {
             browsers: HashMap::new(),
             contexts: HashMap::new(),
             context_bundles: HashMap::new(),
+            retired_network_bytes: 0,
             session_contexts: HashMap::new(),
             next_id: 1,
             pump_nonce: Cell::new(1),
@@ -1322,6 +1324,61 @@ impl ContentEngine {
                 _ => None,
             })
             .unwrap_or_else(|| self.wake.clone())
+    }
+
+    fn profile_for_page(&self, page_id: &str) -> io::Result<NetworkProfile> {
+        match self.pages.get(page_id) {
+            Some(PageSlot::Live {
+                bundle: Some(bundle),
+                ..
+            }) => Ok(bundle.profile.get()),
+            Some(PageSlot::Live { .. }) => Ok(self.profile.get()),
+            Some(PageSlot::Disposed { generation }) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("object_disposed: Page has been closed (generation {generation})"),
+            )),
+            None => Err(object_disposed("Page")),
+        }
+    }
+
+    fn network_bytes_for(&self, params: &serde_json::Value) -> u64 {
+        if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+            return match self.pages.get(page) {
+                Some(PageSlot::Live {
+                    bundle: Some(bundle),
+                    ..
+                }) => bundle._proxy.bytes_transferred(),
+                Some(PageSlot::Live { .. }) => self._proxy.bytes_transferred(),
+                _ => 0,
+            };
+        }
+        if let Some(session) = params.get("session").and_then(|value| value.as_str()) {
+            if let Some(bundle) = self
+                .session_contexts
+                .get(session)
+                .and_then(|context| self.context_bundles.get(context))
+            {
+                return bundle._proxy.bytes_transferred();
+            }
+            return 0;
+        }
+        // Controller scripts can create several explicit contexts without a
+        // daemon-owned page. Their calls are serialized, so the before/after
+        // delta intentionally covers every context participating in that run.
+        self.context_bundles
+            .values()
+            .map(|bundle| bundle._proxy.bytes_transferred())
+            .sum::<u64>()
+            .saturating_add(self.retired_network_bytes)
+            .saturating_add(self._proxy.bytes_transferred())
+    }
+
+    fn retire_bundle(&mut self, context_id: &str) {
+        if let Some(bundle) = self.context_bundles.remove(context_id) {
+            self.retired_network_bytes = self
+                .retired_network_bytes
+                .saturating_add(bundle._proxy.bytes_transferred());
+        }
     }
 
     fn spin_until(
@@ -2363,15 +2420,15 @@ impl ContentEngine {
                         "profile must be research or project",
                     )
                 })?;
-                // The global value remains the default for controller-created
-                // contexts. Session-owned pages keep their stable copy below.
-                self.profile.set(parsed);
                 if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
                     if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
                         bundle.profile.set(parsed);
                         return Ok(json!({ "profile": bundle.profile.get().as_str() }));
                     }
                 }
+                // Controller scripts set the default before constructing their
+                // explicit contexts. A bundled daemon page never mutates it.
+                self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "session.attachPage" => {
@@ -2454,12 +2511,13 @@ impl ContentEngine {
                 // directions — the metric behind web.run's network_bytes,
                 // which previously reported a fixed 4096-per-navigation
                 // accounting stub.
-                Ok(json!({ "bytes": self._proxy.bytes_transferred() }))
+                Ok(json!({ "bytes": self.network_bytes_for(&params) }))
             }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                let page_profile = self.profile_for_page(&page_id)?;
+                if let UrlDecision::Deny { reason } = decide_url(page_profile, &url) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -2569,7 +2627,7 @@ impl ContentEngine {
                 }
                 if let Some(final_url) = webview.url() {
                     if let UrlDecision::Deny { reason } =
-                        decide_url(self.profile.get(), final_url.as_str())
+                        decide_url(page_profile, final_url.as_str())
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -2881,7 +2939,7 @@ impl ContentEngine {
                     for (id, generation) in owned {
                         self.contexts
                             .insert(id.clone(), ObjectLife::Disposed { generation });
-                        self.context_bundles.remove(&id);
+                        self.retire_bundle(&id);
                         self.session_contexts.retain(|_, context| context != &id);
                     }
                     self.dispose_pages_owned_by_browser(browser_id);
@@ -3527,7 +3585,7 @@ impl ContentEngine {
                             .insert(context_id.to_owned(), ObjectLife::Disposed { generation });
                     }
                     self.dispose_pages_owned_by_context(context_id);
-                    self.context_bundles.remove(context_id);
+                    self.retire_bundle(context_id);
                     self.session_contexts.retain(|_, context| context != context_id);
                 }
                 Ok(json!({}))
@@ -3884,7 +3942,8 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                if let UrlDecision::Deny { reason } =
+                    decide_url(self.profile_for_page(&page_id)?, &url)
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),

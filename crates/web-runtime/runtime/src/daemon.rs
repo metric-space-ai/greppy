@@ -891,13 +891,30 @@ impl Daemon {
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .or_else(|| request.session_id.clone());
+        let network_scope = session_id.as_ref().map(|session_id| {
+            let page = request
+                .payload
+                .get("tab_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    self.sessions
+                        .get(session_id)
+                        .and_then(|session| session.page_id.clone())
+                });
+            json!({ "session": session_id, "page": page })
+        });
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
         // never incremented, which is why a 60 MB page showed 4096 bytes.
         let bytes_before = (touches_page && self.content.is_running())
             .then(|| {
-                self.engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                self.engine_call_timed(
+                    "session.networkBytes",
+                    network_scope.clone().unwrap_or_else(|| json!({})),
+                    Duration::from_secs(2),
+                )
                     .ok()
             })
             .flatten()
@@ -919,7 +936,11 @@ impl Daemon {
             if let Some(before) = bytes_before {
                 if self.content.is_running() {
                     if let Some(after) = self
-                        .engine_call_timed("session.networkBytes", json!({}), Duration::from_secs(2))
+                        .engine_call_timed(
+                            "session.networkBytes",
+                            network_scope.clone().unwrap_or_else(|| json!({})),
+                            Duration::from_secs(2),
+                        )
                         .ok()
                         .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()))
                     {

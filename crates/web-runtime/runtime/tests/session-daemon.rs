@@ -8391,17 +8391,44 @@ fn ordinary_sessions_isolate_cookie_state() {
 
     let session_a = create();
     let session_b = create();
+    let research = call("web.session.create", json!({"profile":"research"}));
+    assert_eq!(research.status, "ok", "{research:?}");
+    let research_id = research.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let early_b = call("web.tab.new", json!({"session_id":session_b}));
     assert_eq!(early_b.status, "ok", "{early_b:?}");
     let tab_b = early_b.result.unwrap()["tab"]
         .as_str()
         .unwrap()
         .to_owned();
+    let research_page = call(
+        "web.evaluate",
+        json!({"session_id":research_id,"source":"document.title"}),
+    );
+    assert_eq!(research_page.status, "ok", "{research_page:?}");
     let set = call(
         "web.goto",
         json!({"session_id":session_a,"url":format!("{fixture}/set")}),
     );
     assert_eq!(set.status, "ok", "{set:?}");
+    assert!(set.metrics.network_bytes > 0, "{set:?}");
+    let research_denied = call(
+        "web.goto",
+        json!({"session_id":research_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(research_denied.status, "error", "{research_denied:?}");
+    assert_eq!(
+        research_denied.error.as_ref().unwrap().code,
+        "policy_denied",
+        "{research_denied:?}"
+    );
+    let research_again = call(
+        "web.evaluate",
+        json!({"session_id":research_id,"source":"document.title"}),
+    );
+    assert_eq!(research_again.status, "ok", "{research_again:?}");
     let echo_a = call(
         "web.goto",
         json!({"session_id":session_a,"url":format!("{fixture}/echo")}),
@@ -8436,6 +8463,7 @@ fn ordinary_sessions_isolate_cookie_state() {
         json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
     );
     assert_eq!(echo_b.status, "ok", "{echo_b:?}");
+    assert!(echo_b.metrics.network_bytes > 0, "{echo_b:?}");
     assert_eq!(
         body(&session_b, Some(&tab_b)),
         "",
@@ -8488,7 +8516,23 @@ fn ordinary_sessions_isolate_cookie_state() {
         "new ordinary session C received closed A's cookie"
     );
 
-    let persistent_name = format!("cookie-isolation-{}", std::process::id());
+    let persistent_name = format!(
+        "cookie-isolation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let persistent_dir = std::env::var("GREPPY_STORE_DIR")
+        .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"))
+        .join("web-runtime")
+        .join("run_cookie_isolation")
+        .join("profiles")
+        .join(&persistent_name);
+    let _ = std::fs::remove_dir_all(&persistent_dir);
     let persistent_first = call(
         "web.session.create",
         json!({"profile":"project","persistent_profile":&persistent_name}),
@@ -8503,6 +8547,12 @@ fn ordinary_sessions_isolate_cookie_state() {
         json!({"session_id":persistent_first_id,"url":format!("{fixture}/set")}),
     );
     assert_eq!(persistent_set.status, "ok", "{persistent_set:?}");
+    let persistent_first_echo = call(
+        "web.goto",
+        json!({"session_id":persistent_first_id,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(persistent_first_echo.status, "ok", "{persistent_first_echo:?}");
+    assert_eq!(body(&persistent_first_id, None), "isolation=A");
     let persistent_closed = call(
         "web.session.close",
         json!({"session_id":persistent_first_id}),
@@ -8528,7 +8578,8 @@ fn ordinary_sessions_isolate_cookie_state() {
         json!({"session_id":persistent_second_id}),
     );
     assert_eq!(persistent_second_closed.status, "ok", "{persistent_second_closed:?}");
-    for session in [session_b, session_c] {
+    let _ = std::fs::remove_dir_all(&persistent_dir);
+    for session in [session_b, session_c, research_id] {
         let closed = call("web.session.close", json!({"session_id":session}));
         assert_eq!(closed.status, "ok", "{closed:?}");
     }
