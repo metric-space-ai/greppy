@@ -3090,29 +3090,71 @@ impl GraphIndex {
                 .and_then(|value| value.as_str())?;
             return self.resolve_receiver_method(&edge.file_path, owner, name);
         }
-        // A module-qualified call names its module explicitly (`store::f()`).
-        // Honour that before the same-file guess: a same-named function in the
-        // caller's own file is not the callee. Only a qualifier that maps onto
-        // a candidate's module file (`store.rs` / `store/mod.rs`) takes part;
-        // `Type::new`, `crate::f`, `self::f` keep the existing path. Several
-        // candidates in files of that module stay unresolved rather than
-        // guessed.
-        if let Some(module) = edge
+        // A module-qualified Rust call names its complete module path. Resolve
+        // it against the referrer's namespace and that module's imports before
+        // any same-file or global-name fallback. This distinguishes paths such
+        // as `left::channel::target` and `right::channel::target` even though
+        // both defining files are named `implementation.rs`.
+        let rust_module_path = edge
             .properties
             .get("callee_path")
             .and_then(|value| value.as_str())
-            .and_then(|path| greppy_resolver::path_module_segment(path, name))
-        {
+            .filter(|path| {
+                edge.file_path.ends_with(".rs")
+                    && path
+                        .split("::")
+                        .next()
+                        .and_then(|segment| segment.chars().next())
+                        .is_some_and(|first| first.is_lowercase())
+            });
+        if let Some(ref_path) = rust_module_path {
+            let referrer_file = self.file_of(src_id)?;
+            let first_segment = ref_path.split("::").next().unwrap_or("");
+            let module_files = self
+                .rust_namespaces_by_file
+                .get(referrer_file)
+                .and_then(|aliases| aliases.get(first_segment))
+                .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
+                .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
             let in_module: Vec<i64> = self
                 .defs_named(&CALLABLE_LABELS, name)
                 .into_iter()
-                .filter(|node| greppy_resolver::file_stem_matches(&node.file_path, module))
+                .filter(|node| {
+                    module_files.iter().any(|file| {
+                        node.file_path == *file
+                            || self
+                                .imports_by_file
+                                .get(file)
+                                .is_some_and(|targets| targets.contains(&node.id))
+                    })
+                })
                 .map(|node| node.id)
                 .collect();
             match in_module.as_slice() {
                 [id] => return Some(*id),
-                [] => {}
                 _ => return None,
+            }
+        }
+        // Preserve the existing basename-based qualified-call behavior for
+        // non-Rust extractors, whose path syntax is language-specific.
+        if rust_module_path.is_none() {
+            if let Some(module) = edge
+                .properties
+                .get("callee_path")
+                .and_then(|value| value.as_str())
+                .and_then(|path| greppy_resolver::path_module_segment(path, name))
+            {
+                let in_module: Vec<i64> = self
+                    .defs_named(&CALLABLE_LABELS, name)
+                    .into_iter()
+                    .filter(|node| greppy_resolver::file_stem_matches(&node.file_path, module))
+                    .map(|node| node.id)
+                    .collect();
+                match in_module.as_slice() {
+                    [id] => return Some(*id),
+                    [] => {}
+                    _ => return None,
+                }
             }
         }
         if let Some(tgt) = self.by_qname(&edge.target_qualified_name) {
@@ -4623,7 +4665,7 @@ def Widget():
     fn rust_qualified_function_item_resolves_through_grouped_reexport() {
         let repo = setup_multifile_repo(
             "rust-reexport-function-item",
-            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other;\nfn target() {}\nfn root_target() {}\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn missing_caller() { let _selected = missing::target; }\n",
+            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other;\nfn target() {}\nfn root_target() {}\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn left_direct_caller() { left::channel::target(); }\nfn missing_caller() { let _selected = missing::target; }\nfn missing_direct_caller() { missing::target(); }\n",
             "// fixture placeholder\n",
         );
         fs::create_dir_all(repo.join("src/channels")).unwrap();
@@ -4764,6 +4806,26 @@ def Widget():
                 .all(|edge| edge.source_id != left_caller.id),
             "a duplicate channel/mod.rs basename must not steal the qualified usage"
         );
+        let left_direct_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::left_direct_caller")
+            .unwrap()
+            .expect("qualified left direct caller");
+        assert!(
+            store
+                .incoming_edges(left_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == left_direct_caller.id),
+            "the complete module path must select the left channel direct-call target"
+        );
+        assert!(
+            store
+                .incoming_edges(right_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != left_direct_caller.id),
+            "the duplicate right channel must not steal the qualified direct call"
+        );
         let local_target = store
             .get_node_by_qname("test", "src/lib.rs::Function::target")
             .unwrap()
@@ -4779,6 +4841,20 @@ def Widget():
                 .iter()
                 .all(|edge| edge.source_id != missing_caller.id),
             "missing::target must not degrade to the same-file target"
+        );
+        let missing_direct_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing_direct_caller")
+            .unwrap()
+            .expect("missing-module direct caller");
+        assert!(
+            [left_target.id, right_target.id, local_target.id]
+                .into_iter()
+                .all(|target_id| store
+                    .incoming_edges(target_id, Some("CALLS"), 10)
+                    .unwrap()
+                    .iter()
+                    .all(|edge| edge.source_id != missing_direct_caller.id)),
+            "missing::target must remain unresolved instead of guessing any homonym"
         );
         let namespaced_target = store
             .get_node_by_qname(
