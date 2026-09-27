@@ -16,6 +16,17 @@ pub struct AsyncRuntimeHolder {
     runtime: Option<Runtime>,
 }
 
+/// A non-owning reference to the process-wide async runtime.
+///
+/// Additional in-process Servo instances share the runtime initialized by the
+/// first instance. Their constellation still expects an `AsyncRuntime` for its
+/// shutdown sequence, but must neither initialize nor shut down that runtime.
+pub struct SharedAsyncRuntimeHolder;
+
+impl AsyncRuntime for SharedAsyncRuntimeHolder {
+    fn shutdown(&mut self) {}
+}
+
 impl AsyncRuntimeHolder {
     pub(crate) fn new(runtime: Runtime) -> Self {
         Self {
@@ -63,6 +74,14 @@ pub fn init_async_runtime() -> Box<dyn AsyncRuntime> {
 
     // Return an async runtime for use in shutdown.
     Box::new(AsyncRuntimeHolder::new(runtime))
+}
+
+pub fn reuse_async_runtime() -> Box<dyn AsyncRuntime> {
+    assert!(
+        async_runtime_initialized(),
+        "Runtime handle should be initialized before it is shared"
+    );
+    Box::new(SharedAsyncRuntimeHolder)
 }
 
 pub fn async_runtime_initialized() -> bool {

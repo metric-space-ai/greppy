@@ -31,7 +31,9 @@ use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
-use net::resource_thread::new_resource_threads;
+use net::resource_thread::{
+    new_resource_threads, new_resource_threads_with_shared_async_runtime,
+};
 use net_traits::{FetchThread, ResourceThreads};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
@@ -985,16 +987,29 @@ impl Servo {
 
         let protocols = Arc::new(protocols);
         let (public_resource_threads, private_resource_threads, async_runtime) =
-            new_resource_threads(
-                devtools_sender.clone(),
-                time_profiler_chan.clone(),
-                mem_profiler_chan.clone(),
-                net_embedder_proxy,
-                opts.config_dir.clone(),
-                opts.certificate_path.clone(),
-                opts.ignore_certificate_errors,
-                protocols.clone(),
-            );
+            if builder.shared_process_state {
+                new_resource_threads_with_shared_async_runtime(
+                    devtools_sender.clone(),
+                    time_profiler_chan.clone(),
+                    mem_profiler_chan.clone(),
+                    net_embedder_proxy,
+                    opts.config_dir.clone(),
+                    opts.certificate_path.clone(),
+                    opts.ignore_certificate_errors,
+                    protocols.clone(),
+                )
+            } else {
+                new_resource_threads(
+                    devtools_sender.clone(),
+                    time_profiler_chan.clone(),
+                    mem_profiler_chan.clone(),
+                    net_embedder_proxy,
+                    opts.config_dir.clone(),
+                    opts.certificate_path.clone(),
+                    opts.ignore_certificate_errors,
+                    protocols.clone(),
+                )
+            };
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
             mem_profiler_chan.clone(),
