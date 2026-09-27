@@ -765,6 +765,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     .expect("decode published Base manifest");
     let mut previous_identity = manifest.identity.clone();
     previous_identity.indexer_version = "greppy-indexer-v6".into();
+    let expected_embedding_model = previous_identity.embedding_model.clone();
     let previous_graph = scratch.path().join("verified-v6-base.db");
     std::fs::copy(&base_path, &previous_graph).expect("copy v6 Base graph");
     // Publication makes the Base immutable. Only the private fixture copy
@@ -793,6 +794,13 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         workspace.indexer_version = "greppy-indexer-v6".into();
         previous_store.upsert_workspace_state(&workspace).unwrap();
     }
+    previous_store
+        .conn()
+        .execute(
+            "DELETE FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{previous_project}")],
+        )
+        .unwrap();
     let base_node = previous_store
         .list_nodes_by_name(&previous_project, "shared_base_symbol", 1)
         .unwrap()
@@ -947,6 +955,36 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         migrated_vectors, v6_vectors,
         "v7 migration must retain vectors"
     );
+    let migrated_generation = migrated_base
+        .list_workspace_states()
+        .unwrap()
+        .into_iter()
+        .map(|workspace| workspace.graph_generation)
+        .max()
+        .expect("migrated Base generation");
+    let expected_embedding_receipt = format!("{migrated_generation}|{expected_embedding_model}");
+    let migrated_completion: Option<String> = migrated_base
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{project}")],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_ne!(
+        migrated_completion.as_deref(),
+        Some(expected_embedding_receipt.as_str()),
+        "structural Base migration must not claim semantic completion"
+    );
+    let deferred_receipt: String = migrated_base
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("store_cow.embedding_deferred.v1:{project}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deferred_receipt, expected_embedding_receipt);
     drop(migrated_base);
     let binding_raw: String = structural_delta
         .conn()
@@ -962,6 +1000,46 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         binding["base_path"],
         structural_status["store_cow"]["base_path"]
     );
+    drop(structural_delta);
+
+    // A later semantic completion reuses the structurally migrated Base and
+    // publishes the normal completion receipt in the writable Delta. The
+    // test provider avoids model work while exercising the production
+    // Base+Delta completion path and generation identity.
+    let (semantic_code, semantic_out, semantic_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        semantic_code, 0,
+        "semantic completion failed\nstdout={semantic_out}\nstderr={semantic_err}"
+    );
+    let completed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let completed_generation = completed_delta
+        .get_workspace_state(first.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("semantically completed Delta workspace")
+        .graph_generation;
+    let completion: String = completed_delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{project}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        completion,
+        format!("{completed_generation}|{expected_embedding_model}")
+    );
+    drop(completed_delta);
 
     // A manually removed or externally cleaned shared Base used to trap the
     // linked worktree in a circular recovery: status and queries told the

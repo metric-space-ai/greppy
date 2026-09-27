@@ -17,6 +17,7 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
+const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
 #[cfg(debug_assertions)]
@@ -1500,6 +1501,7 @@ fn prepare_base_store_paths(
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
+    let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
     let identity = base_identity_parts(repo_root, base_commit)?;
     let identity_hash = identity
         .hash()
@@ -1598,6 +1600,7 @@ fn prepare_base_store_paths(
         .join("graph.db");
     let seeded_summary_cache =
         seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
+    let defer_migrated_embeddings = structural_first_use && seeded_summary_cache.is_some();
     if seeded_summary_cache.is_some() {
         report_base_phase(progress_path, "migrating_base_graph");
     }
@@ -1632,16 +1635,14 @@ fn prepare_base_store_paths(
             greppy_core::cache::ENV_SHARED_INFERENCE_ROOT,
             greppy_core::cache::shared_inference_root(),
         )
-        // A published Base is not valid until every candidate has its vector;
-        // never let the ordinary foreground-index lazy threshold hand this
-        // build to a background process outside the publication lease.
+        // A normal Base build completes every candidate before publication;
+        // never let the ordinary foreground-index lazy threshold hand it to a
+        // background process outside the publication lease. Structural v6
+        // migration is the bounded exception: it inherits
+        // GREPPY_STRUCTURAL_FIRST_USE, preserves reusable vectors, and records
+        // an exact deferred receipt below for later semantic completion.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
-        // The outer structural query may defer its Delta embeddings. An
-        // immutable Base must still finish the migrated generation before
-        // publication; inheriting this flag would retain the old completion
-        // marker and make validation reject the new Base forever.
-        .env_remove(crate::ENV_STRUCTURAL_FIRST_USE)
         .env_remove("GREPPY_BACKGROUND_JOB")
         .env_remove("GREPPY_BACKGROUND_CAUSE")
         .env_remove("GREPPY_BACKGROUND_KIND")
@@ -1702,6 +1703,13 @@ fn prepare_base_store_paths(
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|error| Error::Store(format!("checkpoint Base graph: {error}")))?;
     }
+    if defer_migrated_embeddings {
+        mark_base_embeddings_deferred(
+            &staged_graph,
+            &greppy_core::project_identity(worktree_path),
+            &identity,
+        )?;
+    }
     validate_base_contents(worktree_path, &staged_graph, &identity)?;
     validate_base_file_count(&staged_graph, expected_file_count)?;
     #[cfg(debug_assertions)]
@@ -1728,6 +1736,41 @@ fn prepare_base_store_paths(
         .map_err(|error| Error::io("publish immutable Base Store", error))?;
     drop(builder_lease);
     prepared_base_with_reader(&layout, manifest, false)
+}
+
+fn base_embedding_deferred_key(project: &str) -> String {
+    format!("{BASE_EMBEDDING_DEFERRED_META_PREFIX}{project}")
+}
+
+fn mark_base_embeddings_deferred(
+    graph_path: &Path,
+    project: &str,
+    identity: &BaseStoreIdentity,
+) -> Result<()> {
+    let store =
+        greppy_store::Store::open_with(graph_path, greppy_store::OpenOptions::query_writer())?;
+    let generation = store
+        .list_workspace_states()?
+        .into_iter()
+        .map(|state| state.graph_generation)
+        .max()
+        .ok_or_else(|| Error::Invalid("Base build has no workspace generation".into()))?;
+    store
+        .conn()
+        .execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![
+                base_embedding_deferred_key(project),
+                format!("{generation}|{}", identity.embedding_model)
+            ],
+        )
+        .map_err(|error| Error::Store(format!("record deferred Base embeddings: {error}")))?;
+    store
+        .conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(|error| Error::Store(format!("checkpoint deferred Base receipt: {error}")))?;
+    Ok(())
 }
 
 /// Seed a v7 Base build from the verified v6 artifact with the same immutable
@@ -1926,14 +1969,30 @@ fn validate_base_contents_for_project(
         )
         .ok();
     let expected_completion = format!("{generation}|{}", identity.embedding_model);
+    // A structurally migrated Base is immutable and safe for graph queries
+    // before semantic completion. Accept only the receipt written after that
+    // controlled migration, bound to the same generation and model identity;
+    // an arbitrary missing or stale completion marker still fails closed.
+    let deferred: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [base_embedding_deferred_key(project)],
+            |row| row.get(0),
+        )
+        .ok();
     #[cfg(debug_assertions)]
     let injected_summary_failure = std::env::var_os(ENV_TEST_BASE_SUMMARY_FAIL).is_some();
     #[cfg(not(debug_assertions))]
     let injected_summary_failure = false;
-    if !injected_summary_failure && completion.as_deref() != Some(expected_completion.as_str()) {
+    if !injected_summary_failure
+        && completion.as_deref() != Some(expected_completion.as_str())
+        && deferred.as_deref() != Some(expected_completion.as_str())
+    {
         return Err(Error::Invalid(format!(
-            "Base embedding generation is incomplete: expected `{expected_completion}`, got {}",
-            completion.as_deref().unwrap_or("missing")
+            "Base embedding generation is incomplete: expected completion or deferred receipt `{expected_completion}`, got completion={} deferred={}",
+            completion.as_deref().unwrap_or("missing"),
+            deferred.as_deref().unwrap_or("missing")
         )));
     }
     let provider_failures = store
