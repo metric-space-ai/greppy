@@ -2648,14 +2648,24 @@ mod tests {
         let executable = if executable.parent().and_then(Path::file_name)
             == Some(std::ffi::OsStr::new("deps"))
         {
-            executable
+            let target_dir = executable
                 .parent()
                 .and_then(Path::parent)
-                .map(|target_dir| {
-                    target_dir.join(format!("greppy{}", std::env::consts::EXE_SUFFIX))
-                })
-                .filter(|candidate| candidate.is_file())
-                .unwrap_or(executable)
+                .ok_or_else(|| {
+                    format!(
+                        "persisted-v7 regression cannot locate the Cargo target directory from test executable {}",
+                        executable.display()
+                    )
+                })?;
+            let candidate = target_dir.join(format!("greppy{}", std::env::consts::EXE_SUFFIX));
+            if !candidate.is_file() {
+                return Err(format!(
+                    "persisted-v7 regression requires the built Greppy CLI sibling {}; the current executable is the libtest harness {}",
+                    candidate.display(),
+                    executable.display()
+                ));
+            }
+            candidate
         } else {
             executable
         };
