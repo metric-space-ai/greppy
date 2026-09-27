@@ -39,7 +39,7 @@ impl ProfileLock {
     }
 
     #[cfg(unix)]
-    pub fn acquire_named(root: &Path, name: &str) -> io::Result<Self> {
+    pub fn acquire_named(profile_root: &Path, lock_root: &Path, name: &str) -> io::Result<Self> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
@@ -69,26 +69,38 @@ impl ProfileLock {
             open_dir_at(parent, name)
         }
 
-        std::fs::create_dir_all(root)?;
-        let root_name = component(root.as_os_str().as_bytes())?;
-        let root_fd = unsafe {
+        std::fs::create_dir_all(profile_root)?;
+        std::fs::create_dir_all(lock_root)?;
+        let profile_root_name = component(profile_root.as_os_str().as_bytes())?;
+        let profile_root_fd = unsafe {
             libc::open(
-                root_name.as_ptr(),
+                profile_root_name.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
-        if root_fd < 0 {
+        if profile_root_fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let root_dir = unsafe { File::from_raw_fd(root_fd) };
+        let profile_root_dir = unsafe { File::from_raw_fd(profile_root_fd) };
         let name = component(name.as_bytes())?;
-        let profile_dir = ensure_dir_at(root_dir.as_raw_fd(), &name)?;
+        let profile_dir = ensure_dir_at(profile_root_dir.as_raw_fd(), &name)?;
         let browser = component(b"browser")?;
         let _browser_dir = ensure_dir_at(profile_dir.as_raw_fd(), &browser)?;
-        let lock_name = component(b"profile.lock")?;
+        let lock_root_name = component(lock_root.as_os_str().as_bytes())?;
+        let lock_root_fd = unsafe {
+            libc::open(
+                lock_root_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if lock_root_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let lock_root_dir = unsafe { File::from_raw_fd(lock_root_fd) };
+        let lock_name = component(format!("{}.lock", name.to_string_lossy()).as_bytes())?;
         let lock_fd = unsafe {
             libc::openat(
-                profile_dir.as_raw_fd(),
+                lock_root_dir.as_raw_fd(),
                 lock_name.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
@@ -109,14 +121,15 @@ impl ProfileLock {
         file.flush()?;
         Ok(Self {
             _file: file,
-            _profile_dir: Some(profile_dir),
+            _profile_dir: Some(lock_root_dir),
         })
     }
 
     #[cfg(not(unix))]
-    pub fn acquire_named(root: &Path, name: &str) -> io::Result<Self> {
-        std::fs::create_dir_all(root)?;
-        let profile_dir = root.join(name);
+    pub fn acquire_named(profile_root: &Path, lock_root: &Path, name: &str) -> io::Result<Self> {
+        std::fs::create_dir_all(profile_root)?;
+        std::fs::create_dir_all(lock_root)?;
+        let profile_dir = profile_root.join(name);
         if std::fs::symlink_metadata(&profile_dir).is_ok_and(|metadata| {
             metadata.file_type().is_symlink() || !metadata.is_dir()
         }) {
@@ -134,7 +147,7 @@ impl ProfileLock {
                 ));
             }
         }
-        Self::acquire(&profile_dir)
+        Self::acquire(&lock_root.join(name))
     }
 }
 
@@ -182,11 +195,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("target")).unwrap();
         symlink(root.join("target"), root.join("alias")).unwrap();
-        assert!(ProfileLock::acquire_named(&root, "alias").is_err());
+        let locks = root.with_extension("locks");
+        let _ = std::fs::remove_dir_all(&locks);
+        assert!(ProfileLock::acquire_named(&root, &locks, "alias").is_err());
 
         std::fs::create_dir(root.join("browser-alias")).unwrap();
         symlink(root.join("target"), root.join("browser-alias").join("browser")).unwrap();
-        assert!(ProfileLock::acquire_named(&root, "browser-alias").is_err());
+        assert!(ProfileLock::acquire_named(&root, &locks, "browser-alias").is_err());
+
+        let owner = ProfileLock::acquire_named(&root, &locks, "owned").unwrap();
+        let worker_visible_lock = root.join("owned").join("profile.lock");
+        std::fs::write(&worker_visible_lock, b"replacement").unwrap();
+        std::fs::remove_file(&worker_visible_lock).unwrap();
+        assert!(
+            ProfileLock::acquire_named(&root, &locks, "owned").is_err(),
+            "deleting a worker-visible path must not replace the daemon-owned lock inode"
+        );
+        drop(owner);
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&locks);
     }
 }

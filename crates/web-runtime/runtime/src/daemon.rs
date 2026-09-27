@@ -1329,8 +1329,12 @@ impl Daemon {
                 "persistent_profile must be a short [A-Za-z0-9_-] name under the configured profile store".into(),
             );
         }
-        crate::profile_lock::ProfileLock::acquire_named(&persistent_profiles_root(), name)
-            .map_err(|error| error.to_string())
+        crate::profile_lock::ProfileLock::acquire_named(
+            &persistent_profiles_root(),
+            &persistent_profile_locks_root(),
+            name,
+        )
+        .map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); } }
@@ -4727,6 +4731,12 @@ fn data_root(run_id: &str) -> PathBuf {
 
 fn persistent_profiles_root() -> PathBuf {
     persistent_store_root().join("web-runtime").join("profiles")
+}
+
+fn persistent_profile_locks_root() -> PathBuf {
+    persistent_store_root()
+        .join("web-runtime")
+        .join("profile-locks")
 }
 
 fn persistent_store_root() -> PathBuf {
