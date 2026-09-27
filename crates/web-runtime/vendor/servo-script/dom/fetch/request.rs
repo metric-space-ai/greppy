@@ -437,7 +437,10 @@ impl Request {
 
         // Step 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
         let input_body = if let RequestInfo::Request(ref mut input_request) = input {
-            let input_body = input_request.request.borrow_mut().body.take();
+            if input_body_is_unusable {
+                return Err(Error::Type(c"Input body is unusable".to_owned()));
+            }
+            let input_body = input_request.request.borrow().body.clone();
             clone_body_stream_for_dom_body(
                 cx,
                 &input_request.body_stream,
@@ -543,16 +546,6 @@ impl Request {
             }
             // Step 39.3. Set this’s request’s use-CORS-preflight flag.
             // TODO
-        }
-
-        // Step 41. If initBody is null and inputBody is non-null, then:
-        // Step 41.1. If inputBody is unusable, then throw a TypeError.
-        //
-        // We only perform this check on input_body. However, we already
-        // processed the input body. Therefore, we check it all the way
-        // above and throw the error at the last possible moment
-        if input_body_is_unusable {
-            return Err(Error::Type(c"Input body is unusable".to_owned()));
         }
 
         // Step 42. Set this’s request’s body to finalBody.

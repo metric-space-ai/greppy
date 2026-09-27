@@ -3828,7 +3828,25 @@ const state = await page.evaluate(async () => {
   const after = request.bodyUsed;
   let reuseError = '';
   try { await fetch(request); } catch (error) { reuseError = error.name; }
-  return { before, after, reuseError, status: response.status };
+  const source = new Request('/complete', { method: 'POST', body: 'body=source' });
+  const constructed = new Request(source);
+  const constructedResponse = await fetch(constructed);
+  const locked = new Request('/complete', { method: 'POST', body: 'body=locked' });
+  const reader = locked.body.getReader();
+  let lockedError = '';
+  try { new Request(locked); } catch (error) { lockedError = error.name; }
+  reader.releaseLock();
+  const lockedResponse = await fetch(locked);
+  return {
+    before,
+    after,
+    reuseError,
+    status: response.status,
+    sourceUsed: source.bodyUsed,
+    constructedStatus: constructedResponse.status,
+    lockedError,
+    lockedStatus: lockedResponse.status,
+  };
 });
 console.log(JSON.stringify(state));
 "#,
@@ -3843,10 +3861,16 @@ console.log(JSON.stringify(state));
     assert_eq!(state["after"], true, "{state:#}");
     assert_eq!(state["reuseError"], "TypeError", "{state:#}");
     assert_eq!(state["status"], 200, "{state:#}");
-    assert_eq!(
-        posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"body=once"
-    );
+    assert_eq!(state["sourceUsed"], true, "{state:#}");
+    assert_eq!(state["constructedStatus"], 200, "{state:#}");
+    assert_eq!(state["lockedError"], "TypeError", "{state:#}");
+    assert_eq!(state["lockedStatus"], 200, "{state:#}");
+    for body in [b"body=once", b"body=source", b"body=locked"] {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            body
+        );
+    }
     assert!(posted_bodies.try_recv().is_err());
 }
 
