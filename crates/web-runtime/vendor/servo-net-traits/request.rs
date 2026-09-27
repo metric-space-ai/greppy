@@ -333,7 +333,7 @@ pub struct RequestBody {
     body_chunk_request_channel: Arc<Mutex<Option<IpcSender<BodyChunkRequest>>>>,
     /// Bytes already materialized by script. Navigation requests carry these across IPC so
     /// transmitting them does not depend on the outgoing document's body-producer route.
-    #[conditional_malloc_size_of]
+    #[ignore_malloc_size_of = "GenericSharedMemory is an IPC-owned byte mapping"]
     in_memory: Option<GenericSharedMemory>,
     /// <https://fetch.spec.whatwg.org/#concept-body-source>
     source: BodySource,
