@@ -713,9 +713,9 @@ fn obtain_response_setup_router_callback(
         if let Some(chunk_requester) = lock.as_mut() {
             if let Err(error) = chunk_requester.send(BodyChunkRequest::Connect(body_chan)) {
                 log_request_body_stream_closed("connect to the request body stream", Some(&error));
-                return Err(request_body_stream_closed_error(
-                    "connect to the request body stream",
-                ));
+                return Err(NetworkError::Crash(format!(
+                    "Request body stream disconnected while trying to connect to the request body stream: {error}"
+                )));
             }
 
             // https://fetch.spec.whatwg.org/#concept-request-transmit-body
