@@ -411,6 +411,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     git(&primary, &["config", "user.name", "Linked Store CoW"]);
     git(&primary, &["add", "."]);
     git(&primary, &["commit", "-q", "-m", "base"]);
+    let pinned_base_commit = git(&primary, &["rev-parse", "HEAD"]);
     git(
         &primary,
         &[
@@ -661,6 +662,111 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("first_untracked_symbol"));
+
+    // Reproduce the original failure: a persisted Delta binding is valid, but
+    // structural first use deliberately skips Base preparation, so the
+    // command-scoped GREPPY_AGENT_BASE_COMMIT environment is absent. Keep a
+    // real vector in the active Delta to prove the refresh preserves data
+    // carried across the atomic snapshot publication.
+    let refreshed_delta_path = PathBuf::from(
+        refreshed_status["store_path"]
+            .as_str()
+            .expect("refreshed Delta path"),
+    );
+    let mut refreshed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let project = greppy_core::project_identity(&first);
+    let generation = refreshed_delta
+        .get_workspace_state(first.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("refreshed workspace state")
+        .graph_generation;
+    refreshed_delta
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: project.clone(),
+            model_id: "regression-model".into(),
+            prompt_version: "regression-prompt".into(),
+            task: "retrieval_document".into(),
+            node_id: None,
+            chunk_idx: 0,
+            qualified_name: "shared_base_symbol".into(),
+            file_path: "src/base.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            content_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+                .into(),
+            graph_generation: generation,
+            vector: vec![1.0, 0.0],
+        })
+        .unwrap();
+    let vectors_before: i64 = refreshed_delta
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| row.get(0))
+        .unwrap();
+    assert!(vectors_before > 0, "regression fixture must contain a vector");
+    drop(refreshed_delta);
+
+    let base_path = PathBuf::from(
+        refreshed_status["store_cow"]["base_path"]
+            .as_str()
+            .expect("persisted Base path"),
+    );
+    let summary_cache = base_path
+        .parent()
+        .expect("Base graph parent")
+        .join(greppy_store::BASE_SUMMARY_CACHE_FILE);
+    std::fs::remove_file(&summary_cache).expect("force Base reuse miss");
+    std::fs::write(
+        first.join("src/structural_refresh.rs"),
+        "pub fn structural_refresh_symbol() -> i32 { 55 }\n",
+    )
+    .unwrap();
+    let (structural_code, structural_out, structural_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_STRUCTURAL_FIRST_USE", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        structural_code, 0,
+        "persisted overlay structural refresh failed\nstdout={structural_out}\nstderr={structural_err}"
+    );
+    let structural_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    assert_eq!(
+        structural_delta
+            .list_nodes_by_name(&project, "structural_refresh_symbol", 10)
+            .unwrap()
+            .len(),
+        1,
+        "structural refresh must publish the new node"
+    );
+    assert_eq!(
+        structural_delta
+            .list_nodes_by_name(&project, "first_untracked_symbol", 10)
+            .unwrap()
+            .len(),
+        1,
+        "structural refresh must retain existing Delta nodes"
+    );
+    let vectors_after: i64 = structural_delta
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(vectors_after, vectors_before, "refresh must retain Delta vectors");
+    let binding_raw: String = structural_delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'store_cow.binding.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding: serde_json::Value = serde_json::from_str(&binding_raw).unwrap();
+    assert_eq!(binding["base_commit"], pinned_base_commit);
+    assert_eq!(binding["base_path"], base_path.to_string_lossy().as_ref());
 
     // A manually removed or externally cleaned shared Base used to trap the
     // linked worktree in a circular recovery: status and queries told the
