@@ -1061,19 +1061,30 @@ fn refresh_unchanged_rust_raw_edges(
     progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<std::collections::HashSet<String>> {
     let diffs = greppy_freshness::compute_file_diff(store, project_name, entries)?;
+    // `compute_file_diff` sorts its result by path, while discovery order is
+    // independently deterministic and need not be the same. `Unchanged`
+    // intentionally carries no path, so zipping the two sequences can assign
+    // another file's classification. Build the explicit changed-path set and
+    // classify inventory entries by exclusion instead.
+    let changed_paths = diffs
+        .iter()
+        .filter_map(|diff| match diff {
+            greppy_freshness::FileDiff::Added(entry)
+            | greppy_freshness::FileDiff::Modified { entry, .. } => Some(entry.rel_path.as_str()),
+            greppy_freshness::FileDiff::Deleted(rel) => Some(rel.as_str()),
+            greppy_freshness::FileDiff::Unchanged => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
     let validated_unchanged = entries
         .iter()
-        .zip(diffs.iter())
-        .filter_map(|(entry, diff)| {
-            matches!(diff, greppy_freshness::FileDiff::Unchanged).then_some(entry.rel_path.clone())
-        })
+        .filter(|entry| !changed_paths.contains(entry.rel_path.as_str()))
+        .map(|entry| entry.rel_path.clone())
         .collect::<std::collections::HashSet<_>>();
     let unchanged_rust = entries
         .iter()
-        .zip(diffs.iter())
         .enumerate()
-        .filter_map(|(idx, (entry, diff))| {
-            (matches!(diff, greppy_freshness::FileDiff::Unchanged)
+        .filter_map(|(idx, entry)| {
+            (!changed_paths.contains(entry.rel_path.as_str())
                 && greppy_parser::language_for_path(&entry.abs_path) == Language::Rust)
                 .then_some((idx, entry, Language::Rust))
         })
