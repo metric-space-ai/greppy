@@ -141,12 +141,15 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
-/// Mask TypeScript import-type queries that the edit syntax gate currently
-/// reports as errors when they appear below an outer `typeof`, for example
-/// `typeof import("node:child_process")`. The replacement preserves byte
-/// length and line positions, so diagnostics and structural ranges still map
-/// to the proposed source. Only a complete string-literal import query is
-/// masked; malformed calls remain visible to the syntax gate.
+/// Build a validation-only view for TypeScript import-type queries that the
+/// bundled grammar reports as errors below an outer `typeof`.
+///
+/// Candidates are recognized by a small lexical scanner, only in normal code
+/// (never comments, strings, or templates), and only when the raw parse has an
+/// ERROR/MISSING node at that candidate. Horizontal whitespace is accepted,
+/// while newlines and line continuations are deliberately left untouched.
+/// Replacing only the `import("literal")` portion with a one-byte identifier
+/// plus spaces preserves every byte and line coordinate.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if language != (Language::TypeScript { tsx: false }) &&
         language != (Language::TypeScript { tsx: true })
@@ -154,23 +157,125 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         return Cow::Borrowed(content);
     }
 
-    const PREFIX: &[u8] = b"typeof import(";
+    let Ok(raw_tree) = greppy_parser::parse(language, content) else {
+        return Cow::Borrowed(content);
+    };
+    let mut error_offsets = Vec::new();
+    let mut tree_cursor = raw_tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = tree_cursor.node();
+        if node.is_error() || node.is_missing() {
+            error_offsets.push(node.start_byte());
+        }
+        if tree_cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if tree_cursor.goto_next_sibling() {
+                break;
+            }
+            if !tree_cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    if error_offsets.is_empty() {
+        return Cow::Borrowed(content);
+    }
+
+    fn identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+    }
+    fn horizontal_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | 0x0c)
+    }
+    fn skip_quoted(content: &[u8], start: usize, quote: u8) -> usize {
+        let mut cursor = start + 1;
+        while let Some(&byte) = content.get(cursor) {
+            if byte == b'\\' {
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+            if byte == quote || byte == b'\n' || byte == b'\r' {
+                break;
+            }
+        }
+        cursor
+    }
+
     let mut normalized: Option<Vec<u8>> = None;
-    let mut offset = 0usize;
-    while let Some(relative) = content[offset..]
-        .windows(PREFIX.len())
-        .position(|window| window == PREFIX)
-    {
-        let start = offset + relative;
-        let quote_at = start + PREFIX.len();
+    let mut cursor = 0usize;
+    while cursor < content.len() {
+        match (content.get(cursor), content.get(cursor + 1)) {
+            (Some(b'/'), Some(b'/')) => {
+                cursor += 2;
+                while !matches!(content.get(cursor), None | Some(b'\n' | b'\r')) {
+                    cursor += 1;
+                }
+                continue;
+            },
+            (Some(b'/'), Some(b'*')) => {
+                cursor += 2;
+                while cursor + 1 < content.len() &&
+                    !matches!((content[cursor], content[cursor + 1]), (b'*', b'/'))
+                {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(content.len());
+                continue;
+            },
+            (Some(&quote @ (b'\'' | b'"' | b'`')), _) => {
+                cursor = skip_quoted(content, cursor, quote);
+                continue;
+            },
+            _ => {},
+        }
+
+        const TYPEOF: &[u8] = b"typeof";
+        if !content[cursor..].starts_with(TYPEOF) ||
+            cursor.checked_sub(1).and_then(|at| content.get(at)).is_some_and(|b| identifier_byte(*b)) ||
+            content.get(cursor + TYPEOF.len()).is_some_and(|b| identifier_byte(*b))
+        {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        cursor += TYPEOF.len();
+        let whitespace_start = cursor;
+        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
+            cursor += 1;
+        }
+        if cursor == whitespace_start || !content[cursor..].starts_with(b"import") ||
+            content.get(cursor + b"import".len()).is_some_and(|b| identifier_byte(*b))
+        {
+            continue;
+        }
+        let import_start = cursor;
+        cursor += b"import".len();
+        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
+            cursor += 1;
+        }
+        if content.get(cursor) != Some(&b'(') {
+            continue;
+        }
+        cursor += 1;
+        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
+            cursor += 1;
+        }
+        let quote_at = cursor;
         let Some(&quote @ (b'\'' | b'"')) = content.get(quote_at) else {
-            offset = quote_at;
             continue;
         };
-        let mut cursor = quote_at + 1;
+        cursor = quote_at + 1;
         let mut escaped = false;
         while let Some(&byte) = content.get(cursor) {
             if escaped {
+                if byte == b'\n' || byte == b'\r' {
+                    break;
+                }
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
@@ -181,20 +286,29 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
             }
             cursor += 1;
         }
-        if content.get(cursor) != Some(&quote) || content.get(cursor + 1) != Some(&b')') {
-            offset = quote_at + 1;
+        if content.get(cursor) != Some(&quote) {
             continue;
         }
-
-        let import_start = start + b"typeof ".len();
-        let import_end = cursor + 2;
+        cursor += 1;
+        while content.get(cursor).is_some_and(|b| horizontal_space(*b)) {
+            cursor += 1;
+        }
+        if content.get(cursor) != Some(&b')') {
+            continue;
+        }
+        let import_end = cursor + 1;
+        if !error_offsets
+            .iter()
+            .any(|error| *error >= start && *error <= import_end + 1)
+        {
+            cursor = import_end;
+            continue;
+        }
         let output = normalized.get_or_insert_with(|| content.to_vec());
-        const PLACEHOLDER: &[u8] = b"__greppy_import_type__";
         let span = &mut output[import_start..import_end];
         span.fill(b' ');
-        let copied = PLACEHOLDER.len().min(span.len());
-        span[..copied].copy_from_slice(&PLACEHOLDER[..copied]);
-        offset = import_end;
+        span[0] = b'T';
+        cursor = import_end;
     }
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
@@ -395,6 +509,21 @@ mod tests {
         );
         assert_eq!(first_syntax_diagnostic(language, valid), None);
 
+        for valid_whitespace in [
+            br#"type ChildProcess = typeof  import ("node:child_process");"#.as_slice(),
+            b"type ChildProcess = typeof\timport\t(\t'node:child_process'\t);".as_slice(),
+        ] {
+            assert_eq!(
+                syntax_counts(language, valid_whitespace),
+                Some(SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }),
+                "{}",
+                String::from_utf8_lossy(valid_whitespace)
+            );
+        }
+
         let malformed = br#"vi.mock("node:child_process", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:child_process")>();
   return { ...original, spawn: vi.fn(original.spawn) };
@@ -406,6 +535,31 @@ mod tests {
             "unbalanced TypeScript must remain an atomic edit failure"
         );
         assert!(first_syntax_diagnostic(language, malformed).is_some());
+
+        for lexically_invalid in [
+            br#"/* typeof import("*/") */"#.as_slice(),
+            br#"const value = "typeof import(\"node:child_process\")"#.as_slice(),
+        ] {
+            assert!(
+                syntax_counts(language, lexically_invalid)
+                    .is_some_and(|counts| counts.errors + counts.missing > 0),
+                "malformed comment/string must not be hidden: {}",
+                String::from_utf8_lossy(lexically_invalid)
+            );
+            assert_eq!(
+                syntax_validation_content(language, lexically_invalid).as_ref(),
+                lexically_invalid,
+                "comment/string contents must never be rewritten"
+            );
+        }
+
+        let escaped_newline =
+            b"type ChildProcess = typeof import(\"node:\\\nchild_process\");";
+        assert_eq!(
+            syntax_validation_content(language, escaped_newline).as_ref(),
+            escaped_newline,
+            "line continuations must not be rewritten because that would move diagnostics"
+        );
     }
 
     #[test]
