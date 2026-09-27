@@ -427,6 +427,20 @@ impl TransmitBodyConnectHandler {
     }
 }
 
+impl Drop for TransmitBodyConnectHandler {
+    fn drop(&mut self) {
+        if let Some(control_sender) = self.control_sender.as_ref() {
+            body_route_diagnostic("handler-drop-open", self.route_id, control_sender);
+        } else if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "greppy-web-body pid={} route={} event=handler-drop-closed",
+                std::process::id(),
+                self.route_id
+            );
+        }
+    }
+}
+
 /// The handler of read promises of body streams used in
 /// <https://fetch.spec.whatwg.org/#concept-request-transmit-body>.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -572,6 +586,7 @@ impl ExtractedBody {
                 None,
                 source,
             );
+            let route_id = body_handler.route_id;
 
             ROUTER.add_typed_route(
                 chunk_request_receiver,
@@ -583,6 +598,7 @@ impl ExtractedBody {
                     BodyChunkRequest::Error => body_handler.stop_reading(StopReading::Error),
                 }),
             );
+            body_route_diagnostic("registration-enqueued", route_id, &chunk_request_sender);
 
             RequestBody::new(chunk_request_sender, net_source, total_bytes)
         };
