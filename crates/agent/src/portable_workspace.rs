@@ -440,13 +440,14 @@ impl AgentWorkspace {
                 &self.baseline_view_commit,
             ],
         )?;
+        let private_git_source = git_compatible_path(&self.private_git_dir)?;
         git_ok(
             &self.repo_root,
             &[
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
-                path_text(&self.private_git_dir)?,
+                path_text(&private_git_source)?,
                 export_ref,
                 baseline_export_ref,
             ],
@@ -1299,9 +1300,10 @@ fn read_optional_commit_ref(
     ref_name: &str,
 ) -> Result<Option<String>, WorkspaceError> {
     let expression = format!("{ref_name}^{{commit}}");
+    let git_repository = git_compatible_path(repository)?;
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", &expression])
-        .current_dir(repository)
+        .current_dir(git_repository)
         .output()?;
     if output.status.success() {
         return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().into()));
@@ -1536,10 +1538,11 @@ fn validate_proposal_git_binding(
     repository: &Path,
     proposal: &ProposalRecord,
 ) -> Result<(), WorkspaceError> {
+    let git_repository = git_compatible_path(repository)?;
     let read_git = |args: &[&str], subject: &str| -> Result<String, WorkspaceError> {
         let output = Command::new("git")
             .args(args)
-            .current_dir(repository)
+            .current_dir(&git_repository)
             .output()?;
         if !output.status.success() {
             return Err(WorkspaceError::Tampered {
@@ -1642,9 +1645,10 @@ fn validate_commit_hardlink_binding(
     proposal_commit: &str,
     hardlink_groups: &[Vec<String>],
 ) -> Result<(), WorkspaceError> {
+    let git_repository = git_compatible_path(repository)?;
     let output = Command::new("git")
         .args(["show", "-s", "--format=%B", proposal_commit])
-        .current_dir(repository)
+        .current_dir(git_repository)
         .output()?;
     if !output.status.success() {
         return Err(git_failed("git show proposal hardlink binding", &output));
@@ -3002,14 +3006,7 @@ fn ensure_git_control_template(
                 .parent()
                 .ok_or_else(|| io::Error::other("invalid template alternates path"))?,
         )?;
-        fs::write(
-            &alternates,
-            format!(
-                "{}\n{}\n",
-                layer.objects.display(),
-                source_objects.display()
-            ),
-        )?;
+        write_git_alternates(&alternates, &[&layer.objects, source_objects])?;
         fs::copy(&layer.index, payload.join("index"))?;
         let shared_name = layer
             .shared_index
@@ -3267,7 +3264,7 @@ fn ensure_shared_git_layer(
                 .parent()
                 .ok_or_else(|| io::Error::other("invalid shared alternates path"))?,
         )?;
-        fs::write(&alternates, format!("{}\n", source_objects.display()))?;
+        write_git_alternates(&alternates, &[source_objects])?;
         let indexes = temporary.join("indexes");
         fs::create_dir(&indexes)?;
         let seed_index = indexes.join("seed.index");
@@ -3440,6 +3437,17 @@ fn init_bare(path: &Path, object_format: &str) -> Result<(), WorkspaceError> {
         ])
         .output()?;
     output_text("git init --bare private workspace repository", output)?;
+    Ok(())
+}
+
+fn write_git_alternates(path: &Path, object_directories: &[&Path]) -> Result<(), WorkspaceError> {
+    let mut contents = String::new();
+    for object_directory in object_directories {
+        let object_directory = git_compatible_path(object_directory)?;
+        contents.push_str(path_text(&object_directory)?);
+        contents.push('\n');
+    }
+    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -4521,6 +4529,27 @@ mod tests {
         assert!(unsupported
             .to_string()
             .contains("unsupported Windows verbatim path for Git"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_alternates_remove_supported_windows_verbatim_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let alternates = temp.path().join("alternates");
+
+        write_git_alternates(
+            &alternates,
+            &[
+                Path::new(r"\\?\C:\provider-data\objects"),
+                Path::new(r"\\?\UNC\server\share\objects"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(alternates).unwrap(),
+            "C:\\provider-data\\objects\n\\\\server\\share\\objects\n"
+        );
     }
 
     #[cfg(windows)]
