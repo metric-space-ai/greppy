@@ -6,7 +6,6 @@
 //! earlier applications never shift later targets. Overlapping ranges are
 //! rejected before anything is applied.
 
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::hash::sha256_hex;
@@ -141,164 +140,10 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
-/// Build a validation-only view for an import-type query that the bundled
-/// grammar has already placed inside a `type_arguments` node but reports an
-/// ERROR/MISSING token at the closing generic delimiter.
-///
-/// The parse-tree ancestry is the authority for type context. Text that merely
-/// resembles `typeof import("...")` in a comment, string, template, regex, or
-/// value expression cannot qualify. The substituted span preserves length and
-/// retains every newline, so subsequent tree coordinates still name the
-/// proposed source.
-fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
-    if !matches!(language, Language::TypeScript { .. }) {
-        return Cow::Borrowed(content);
-    }
-    let Ok(raw_tree) = greppy_parser::parse(language, content) else {
-        return Cow::Borrowed(content);
-    };
-
-    let mut error_offsets = Vec::new();
-    let mut tree_cursor = raw_tree.walk();
-    let mut reached_root = false;
-    while !reached_root {
-        let node = tree_cursor.node();
-        if node.is_error() || node.is_missing() {
-            error_offsets.push(node.start_byte());
-        }
-        if tree_cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if tree_cursor.goto_next_sibling() {
-                break;
-            }
-            if !tree_cursor.goto_parent() {
-                reached_root = true;
-                break;
-            }
-        }
-    }
-    if error_offsets.is_empty() {
-        return Cow::Borrowed(content);
-    }
-
-    fn identifier_byte(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
-    }
-    let mut normalized: Option<Vec<u8>> = None;
-    let mut scan = 0usize;
-    while scan + b"typeof".len() <= content.len() {
-        let Some(relative) = content[scan..]
-            .windows(b"typeof".len())
-            .position(|window| window == b"typeof")
-        else {
-            break;
-        };
-        let start = scan + relative;
-        scan = start + b"typeof".len();
-        if start
-            .checked_sub(1)
-            .and_then(|at| content.get(at))
-            .is_some_and(|byte| identifier_byte(*byte)) ||
-            content.get(scan).is_some_and(|byte| identifier_byte(*byte))
-        {
-            continue;
-        }
-        let Some(type_node) = raw_tree
-            .root_node()
-            .descendant_for_byte_range(start, scan)
-        else {
-            continue;
-        };
-        let mut ancestor = Some(type_node);
-        let mut in_type_arguments = false;
-        while let Some(node) = ancestor {
-            if node.kind() == "type_arguments" {
-                in_type_arguments = true;
-                break;
-            }
-            ancestor = node.parent();
-        }
-        if !in_type_arguments {
-            continue;
-        }
-
-        let whitespace_start = scan;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
-            scan += 1;
-        }
-        if scan == whitespace_start || !content[scan..].starts_with(b"import") {
-            continue;
-        }
-        let import_start = scan;
-        scan += b"import".len();
-        if content.get(scan).is_some_and(|byte| identifier_byte(*byte)) {
-            continue;
-        }
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
-            scan += 1;
-        }
-        if content.get(scan) != Some(&b'(') {
-            continue;
-        }
-        scan += 1;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
-            scan += 1;
-        }
-        let Some(&quote @ (b'\'' | b'"')) = content.get(scan) else {
-            continue;
-        };
-        scan += 1;
-        let mut escaped = false;
-        let mut line_continuation = false;
-        while let Some(&byte) = content.get(scan) {
-            if escaped {
-                line_continuation |= matches!(byte, b'\n' | b'\r');
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == quote {
-                break;
-            } else if matches!(byte, b'\n' | b'\r') {
-                break;
-            }
-            scan += 1;
-        }
-        if line_continuation || content.get(scan) != Some(&quote) {
-            continue;
-        }
-        scan += 1;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
-            scan += 1;
-        }
-        if content.get(scan) != Some(&b')') {
-            continue;
-        }
-        let import_end = scan + 1;
-        if !error_offsets
-            .iter()
-            .any(|error| *error >= start && *error <= import_end + 1)
-        {
-            continue;
-        }
-
-        let output = normalized.get_or_insert_with(|| content.to_vec());
-        for (offset, byte) in output[import_start..import_end].iter_mut().enumerate() {
-            if !matches!(*byte, b'\n' | b'\r') {
-                *byte = if offset == 0 { b'T' } else { b' ' };
-            }
-        }
-        scan = import_end;
-    }
-    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
-}
-
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse(language, content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -343,8 +188,7 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
 /// stays a top-level declaration. When the surrounding context's kind chain
 /// changes, the edit broke the grammar in a way tree-sitter recovered past.
 fn context_kinds(language: Language, content: &[u8], range: (usize, usize)) -> Option<Vec<String>> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse(language, content).ok()?;
     let leaf = tree
         .root_node()
         .descendant_for_byte_range(range.0, range.1.saturating_sub(1).max(range.0))?;
@@ -382,8 +226,7 @@ pub fn structural_context_preserved(
 /// language is not tree-sitter-supported (postcondition then reports
 /// not-applicable rather than silently passing).
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse(language, content).ok()?;
     let mut errors = 0usize;
     let mut missing = 0usize;
     let mut cursor = tree.walk();
@@ -471,79 +314,6 @@ mod tests {
             "malformed container body must remain an atomic edit failure"
         );
         assert!(first_syntax_diagnostic(css, malformed_body).is_some());
-    }
-
-    #[test]
-    fn typescript_import_type_query_is_valid_without_weakening_syntax_errors() {
-        let language = Language::TypeScript { tsx: false };
-        let valid = br#"vi.mock("node:child_process", async (importOriginal) => {
-  const original = await importOriginal<typeof import("node:child_process")>();
-  return { ...original, spawn: vi.fn(original.spawn) };
-});
-"#;
-        assert_eq!(
-            syntax_counts(language, valid),
-            Some(SyntaxCounts {
-                errors: 0,
-                missing: 0
-            })
-        );
-        assert_eq!(first_syntax_diagnostic(language, valid), None);
-
-        for valid_whitespace in [
-            br#"type ChildProcess = typeof  import ("node:child_process");"#.as_slice(),
-            b"type ChildProcess = typeof\timport\t(\t'node:child_process'\t);".as_slice(),
-            b"const value = call<typeof\n  import(\n    \"node:child_process\"\n  )>();".as_slice(),
-        ] {
-            assert_eq!(
-                syntax_counts(language, valid_whitespace),
-                Some(SyntaxCounts {
-                    errors: 0,
-                    missing: 0
-                }),
-                "{}",
-                String::from_utf8_lossy(valid_whitespace)
-            );
-        }
-
-        let malformed = br#"vi.mock("node:child_process", async (importOriginal) => {
-  const original = await importOriginal<typeof import("node:child_process")>();
-  return { ...original, spawn: vi.fn(original.spawn) };
-);
-"#;
-        let counts = syntax_counts(language, malformed).unwrap();
-        assert!(
-            counts.errors + counts.missing > 0,
-            "unbalanced TypeScript must remain an atomic edit failure"
-        );
-        assert!(first_syntax_diagnostic(language, malformed).is_some());
-
-        for lexically_invalid in [
-            br#"/* typeof import("*/") */"#.as_slice(),
-            br#"const value = "typeof import(\"node:child_process\")"#.as_slice(),
-            br#"const value = `typeof import("node:child_process")` + ;"#.as_slice(),
-            br#"const r = /typeof import("/")/;"#.as_slice(),
-        ] {
-            assert!(
-                syntax_counts(language, lexically_invalid)
-                    .is_some_and(|counts| counts.errors + counts.missing > 0),
-                "malformed comment/string/template/regex must not be hidden: {}",
-                String::from_utf8_lossy(lexically_invalid)
-            );
-            assert_eq!(
-                syntax_validation_content(language, lexically_invalid).as_ref(),
-                lexically_invalid,
-                "comment/string/template/regex contents must never be rewritten"
-            );
-        }
-
-        let escaped_newline =
-            b"type ChildProcess = typeof import(\"node:\\\nchild_process\");";
-        assert_eq!(
-            syntax_validation_content(language, escaped_newline).as_ref(),
-            escaped_newline,
-            "line continuations must not be rewritten because that would move diagnostics"
-        );
     }
 
     #[test]
