@@ -1740,10 +1740,10 @@ fn resolve_and_persist_edges_with_progress(
         for (source_file, globs) in &index.import_globs_by_file {
             for glob in globs {
                 pending.extend(
-                    rust_module_files_for_module_path_with_known_files(
+                    rust_module_files_for_module_path_with_crate_roots(
                         source_file,
                         glob,
-                        Some(&index.known_files),
+                        index.rust_crate_roots.as_ref(),
                     )
                     .into_iter()
                     .filter(|file| index.known_files.contains(file)),
@@ -1803,10 +1803,10 @@ fn resolve_and_persist_edges_with_progress(
             if let Some(globs) = index.import_globs_by_file.get(&module_file) {
                 for glob in globs {
                     pending.extend(
-                        rust_module_files_for_module_path_with_known_files(
+                        rust_module_files_for_module_path_with_crate_roots(
                             &module_file,
                             glob,
-                            Some(&index.known_files),
+                            index.rust_crate_roots.as_ref(),
                         )
                         .into_iter()
                         .filter(|file| index.known_files.contains(file)),
@@ -2747,6 +2747,10 @@ struct GraphIndex {
     /// module files, never global basename matches.
     rust_namespaces_by_file:
         std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    /// Declared Cargo target files for this project. `None` means no readable
+    /// Cargo manifest was available, so the legacy source-layout fallback is
+    /// retained; `Some` is authoritative, including an empty set.
+    rust_crate_roots: Option<std::collections::HashSet<String>>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
     id_to_file: std::collections::HashMap<i64, String>,
@@ -2777,11 +2781,11 @@ impl UniqueResolution {
     }
 }
 
-fn rust_module_files_for_path_with_known_files(
+fn rust_module_files_for_path_with_crate_roots(
     referrer_file: &str,
     ref_path: &str,
     name: &str,
-    known_files: Option<&std::collections::HashSet<String>>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
 ) -> Vec<String> {
     let Some(module_path) = ref_path
         .strip_suffix(name)
@@ -2789,19 +2793,19 @@ fn rust_module_files_for_path_with_known_files(
     else {
         return Vec::new();
     };
-    rust_module_files_for_module_path_with_known_files(referrer_file, module_path, known_files)
+    rust_module_files_for_module_path_with_crate_roots(referrer_file, module_path, crate_roots)
 }
 
-fn rust_module_files_for_module_path_with_known_files(
+fn rust_module_files_for_module_path_with_crate_roots(
     referrer_file: &str,
     module_path: &str,
-    known_files: Option<&std::collections::HashSet<String>>,
+    crate_roots: Option<&std::collections::HashSet<String>>,
 ) -> Vec<String> {
     // Cargo permits a binary/library target outside the conventional
-    // `src/{main,lib}.rs` location. When the graph already knows the file
-    // inventory, choose the nearest ancestor containing `main.rs`/`lib.rs`
-    // for `crate::` paths; this keeps module resolution lexical and avoids
-    // guessing from unrelated same-named files elsewhere in the repository.
+    // `src/{main,lib}.rs` location. When Cargo target metadata is available,
+    // choose the nearest ancestor of one of those declared target files for
+    // `crate::` paths. This keeps module resolution lexical without treating
+    // an arbitrary nested `main.rs`/`lib.rs` as a crate root.
     let referrer = Path::new(referrer_file);
     let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
     let is_module_root = referrer
@@ -2820,21 +2824,21 @@ fn rust_module_files_for_module_path_with_known_files(
     {
         match module {
             "crate" if position == 0 => {
-                base = known_files
-                    .and_then(|files| rust_crate_root_for_file(referrer_file, files))
-                    .or_else(|| {
-                        let root_end = referrer_file
-                            .rfind("/src/")
-                            .map(|offset| offset + "/src".len())
-                            .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
-                        root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
-                    })
-                    .unwrap_or_else(|| {
-                        referrer
-                            .parent()
-                            .unwrap_or_else(|| Path::new(""))
-                            .to_path_buf()
-                    });
+                base = if let Some(roots) = crate_roots {
+                    rust_crate_root_for_file(referrer_file, roots)
+                } else {
+                    let root_end = referrer_file
+                        .rfind("/src/")
+                        .map(|offset| offset + "/src".len())
+                        .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                    root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                }
+                .unwrap_or_else(|| {
+                    referrer
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_path_buf()
+                });
             }
             "self" if position == 0 => {}
             "super" => {
@@ -2855,23 +2859,74 @@ fn rust_module_files_for_module_path_with_known_files(
 
 fn rust_crate_root_for_file(
     referrer_file: &str,
-    known_files: &std::collections::HashSet<String>,
+    crate_roots: &std::collections::HashSet<String>,
 ) -> Option<std::path::PathBuf> {
     let mut directory = Path::new(referrer_file).parent()?.to_path_buf();
     loop {
-        for root_name in ["lib.rs", "main.rs"] {
-            let root = directory
-                .join(root_name)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if known_files.contains(&root) {
-                return Some(directory);
-            }
+        if crate_roots
+            .iter()
+            .any(|root| Path::new(root).parent() == Some(directory.as_path()))
+        {
+            return Some(directory);
         }
         if !directory.pop() {
             return None;
         }
     }
+}
+
+fn rust_crate_roots_for_project(
+    store: &Store,
+    project: &str,
+    known_files: &std::collections::HashSet<String>,
+) -> Option<std::collections::HashSet<String>> {
+    let project = store.get_project(project).ok().flatten()?;
+    let root = std::path::PathBuf::from(project.root_path);
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let mut roots = std::collections::HashSet::new();
+    let mut section = "";
+    let mut has_lib_path = false;
+    let mut has_bin_path = false;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line;
+            continue;
+        }
+        if !matches!(section, "[lib]" | "[[bin]]") || !line.starts_with("path") {
+            continue;
+        }
+        let Some((_, value)) = line.split_once('=') else {
+            continue;
+        };
+        let path = value.trim().trim_matches('"').trim_matches('\'');
+        if path.is_empty() {
+            continue;
+        }
+        if section == "[lib]" {
+            has_lib_path = true;
+        } else {
+            has_bin_path = true;
+        }
+        roots.insert(path.replace('\\', "/"));
+    }
+    // Cargo's implicit targets are authoritative when their conventional
+    // files are present. Explicit target paths above cover arbitrary layouts.
+    if !has_lib_path && known_files.contains("src/lib.rs") {
+        roots.insert("src/lib.rs".to_string());
+    }
+    if !has_bin_path {
+        if known_files.contains("src/main.rs") {
+            roots.insert("src/main.rs".to_string());
+        }
+        roots.extend(
+            known_files
+                .iter()
+                .filter(|path| path.starts_with("src/bin/") && path.ends_with(".rs"))
+                .cloned(),
+        );
+    }
+    Some(roots)
 }
 
 fn rust_module_files_below_alias(
@@ -2965,6 +3020,7 @@ impl GraphIndex {
                 by_qname.insert(qname, node);
             }
         }
+        let rust_crate_roots = rust_crate_roots_for_project(store, project, &known_files);
         Ok(GraphIndex {
             by_qname,
             by_id,
@@ -2975,6 +3031,7 @@ impl GraphIndex {
             import_module_files_by_file: std::collections::HashMap::new(),
             import_globs_by_file: std::collections::HashMap::new(),
             rust_namespaces_by_file: std::collections::HashMap::new(),
+            rust_crate_roots,
             id_to_file,
             id_to_qname,
             files_by_stem,
@@ -3029,11 +3086,11 @@ impl GraphIndex {
                 .get("path")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let module_files = rust_module_files_for_path_with_known_files(
+            let module_files = rust_module_files_for_path_with_crate_roots(
                 file,
                 path,
                 name,
-                Some(&self.known_files),
+                self.rust_crate_roots.as_ref(),
             );
             let visible_module_files = module_files
                 .iter()
@@ -3071,11 +3128,11 @@ impl GraphIndex {
                     .insert(*target);
             }
             let namespace_path = format!("{path}::__namespace__");
-            let existing_modules = rust_module_files_for_path_with_known_files(
+            let existing_modules = rust_module_files_for_path_with_crate_roots(
                 file,
                 &namespace_path,
                 "__namespace__",
-                Some(&self.known_files),
+                self.rust_crate_roots.as_ref(),
             )
             .into_iter()
             .filter(|module_file| self.known_files.contains(module_file))
@@ -3225,11 +3282,11 @@ impl GraphIndex {
             .and_then(|aliases| aliases.get(name))
         {
             for (path, original_name) in sources {
-                let mut source_files = rust_module_files_for_path_with_known_files(
+                let mut source_files = rust_module_files_for_path_with_crate_roots(
                     module_file,
                     path,
                     original_name,
-                    Some(&self.known_files),
+                    self.rust_crate_roots.as_ref(),
                 )
                 .into_iter()
                 .filter(|file| self.known_files.contains(file))
@@ -3259,10 +3316,10 @@ impl GraphIndex {
         }
         if let Some(globs) = self.import_globs_by_file.get(module_file) {
             for glob in globs {
-                for exported_file in rust_module_files_for_module_path_with_known_files(
+                for exported_file in rust_module_files_for_module_path_with_crate_roots(
                     module_file,
                     glob,
-                    Some(&self.known_files),
+                    self.rust_crate_roots.as_ref(),
                 ) {
                     if self.known_files.contains(&exported_file) {
                         self.rust_module_export_targets_from_file(
@@ -3336,10 +3393,10 @@ impl GraphIndex {
             let module_files = globs
                 .iter()
                 .flat_map(|glob| {
-                    rust_module_files_for_module_path_with_known_files(
+                    rust_module_files_for_module_path_with_crate_roots(
                         referrer_file,
                         glob,
-                        Some(&self.known_files),
+                        self.rust_crate_roots.as_ref(),
                     )
                 })
                 .filter(|file| self.known_files.contains(file))
@@ -3458,11 +3515,11 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| {
-                    rust_module_files_for_path_with_known_files(
+                    rust_module_files_for_path_with_crate_roots(
                         referrer_file,
                         ref_path,
                         name,
-                        Some(&self.known_files),
+                        self.rust_crate_roots.as_ref(),
                     )
                 });
             let module_exists = module_files
@@ -3532,11 +3589,11 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, owner_path, owner))
                 .unwrap_or_else(|| {
-                    rust_module_files_for_path_with_known_files(
+                    rust_module_files_for_path_with_crate_roots(
                         referrer_file,
                         owner_path,
                         owner,
-                        Some(&self.known_files),
+                        self.rust_crate_roots.as_ref(),
                     )
                 });
             let owners = self
@@ -3598,11 +3655,11 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| {
-                    rust_module_files_for_path_with_known_files(
+                    rust_module_files_for_path_with_crate_roots(
                         referrer_file,
                         ref_path,
                         name,
-                        Some(&self.known_files),
+                        self.rust_crate_roots.as_ref(),
                     )
                 });
             let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
@@ -5749,6 +5806,11 @@ def Widget():
             "// ordinary source root remains in the fixture\n",
             "// ordinary source root remains in the fixture\n",
         );
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"src-core-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"fixture\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(repo.join("src/core/mission/channels")).unwrap();
         fs::create_dir_all(repo.join("src/core/business_os")).unwrap();
         fs::write(

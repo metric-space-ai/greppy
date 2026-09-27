@@ -2757,22 +2757,43 @@ mod tests {
                 properties: serde_json::json!({}),
             })
             .unwrap();
-            base.insert_raw_edges(&[greppy_store::NewRawEdge {
+            base.insert_node(&greppy_store::NewNode {
                 project: "p".into(),
-                file_path: "src/alias_chain/mod.rs".into(),
-                source_qname: "src/alias_chain/mod.rs::__file__".into(),
-                target_qname: "src/alias_chain/mod.rs::Import::sub::target".into(),
-                edge_type: "IMPORTS".into(),
-                properties: serde_json::json!({
-                    "imported_name": "target",
-                    "imported_items": [{
-                        "path": "sub::target",
-                        "imported_name": "outer",
-                        "original_name": "target",
-                        "glob": false
-                    }]
-                }),
-            }])
+                label: "Function".into(),
+                name: "base_caller".into(),
+                qualified_name: "src/base.rs::Function::base_caller".into(),
+                file_path: "src/base.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+            base.insert_raw_edges(&[
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/alias_chain/mod.rs".into(),
+                    source_qname: "src/alias_chain/mod.rs::__file__".into(),
+                    target_qname: "src/alias_chain/mod.rs::Import::sub::target".into(),
+                    edge_type: "IMPORTS".into(),
+                    properties: serde_json::json!({
+                        "imported_name": "target",
+                        "imported_items": [{
+                            "path": "sub::target",
+                            "imported_name": "outer",
+                            "original_name": "target",
+                            "glob": false
+                        }]
+                    }),
+                },
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/base.rs".into(),
+                    source_qname: "src/base.rs::Function::base_caller".into(),
+                    target_qname: "src/alias_chain/sub.rs::Function::target".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({"ref_name": "target"}),
+                },
+            ])
             .unwrap();
         }
         let base_identity = base_identity_parts(&root, &base_commit).unwrap();
@@ -2839,6 +2860,16 @@ mod tests {
                     graph_generation: 7,
                     updated_at: "2026-09-27T00:00:00Z".into(),
                 })
+                .unwrap();
+            delta
+                .conn()
+                .execute(
+                    "INSERT OR REPLACE INTO main.schema_meta (key, value) VALUES (?1, ?2)",
+                    [
+                        "greppy.rust_caller_edges_repair.v1",
+                        RUST_CALLER_EDGES_REPAIR_COMPLETE,
+                    ],
+                )
                 .unwrap();
             delta
                 .insert_node(&greppy_store::NewNode {
@@ -2943,6 +2974,13 @@ mod tests {
             .incoming_edges(legacy_target.id, Some("USAGE"), 10)
             .unwrap()
             .is_empty());
+        assert!(
+            legacy
+                .incoming_edges(legacy_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .is_empty(),
+            "the Base caller raw edge has no stale logical edge before repair"
+        );
         drop(legacy);
         let vector_before: Vec<u8> =
             greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
@@ -2997,6 +3035,15 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
+        let base_caller = repaired
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller.id));
         assert_eq!(
             repaired
                 .get_workspace_state(&root_string)
@@ -3055,6 +3102,45 @@ mod tests {
                 .graph_generation,
             7
         );
+        drop(warm);
+
+        // A later ordinary dirty-file publication rebuilds Delta-owned raw
+        // edges. The repaired Base-derived overlay edge must remain visible;
+        // it cannot depend on rescanning Base raw edges on every query.
+        std::fs::write(
+            root.join(caller_rel_path),
+            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// second dirty Delta\n",
+        )
+        .unwrap();
+        let code = crate::dispatch(
+            crate::Cli::try_parse_from(["greppy", "--root", &root_string, "who-calls", "target"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(code, 0, "dirty publication should succeed");
+        let after_dirty = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        let target_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let base_caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller_after_dirty.id));
+        let vector_after_dirty: Vec<u8> = after_dirty
+            .conn()
+            .query_row(
+                "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_after_dirty, vector_before);
     }
 
     #[test]

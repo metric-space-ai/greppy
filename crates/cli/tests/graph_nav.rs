@@ -419,13 +419,19 @@ fn who_calls_resolves_function_items_under_a_src_core_crate_root() {
     let repo = root.join("repo");
     let store = root.join("store");
     let channels = repo.join("src/core/mission/channels");
-    let business_os = repo.join("src/core/business_os");
+    let business_os = repo.join("src/core/decoy/business_os");
     std::fs::create_dir_all(&channels).unwrap();
     std::fs::create_dir_all(&business_os).unwrap();
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::write(
-        repo.join("src/core/main.rs"),
-        "mod mission; mod business_os;\n",
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"src-core-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"fixture\"\npath = \"src/core/main.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/core/main.rs"), "mod mission; mod decoy;\n").unwrap();
+    std::fs::write(
+        repo.join("src/core/decoy/main.rs"),
+        "pub fn unrelated_decoy_root() {}\n",
     )
     .unwrap();
     std::fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
