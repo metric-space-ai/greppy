@@ -5163,11 +5163,12 @@ fn spawn_background_job_handle(
     })
     .unwrap_or(0)
     .saturating_add(1);
-    let Ok(mut exe) = std::env::current_exe() else {
+    let Ok(exe) = std::env::current_exe() else {
         return None;
     };
     #[cfg(test)]
-    {
+    let exe = {
+        let mut exe = exe;
         // Unit tests run inside Cargo's libtest harness, whose current
         // executable accepts test filters rather than Greppy CLI arguments.
         // The Windows CI job builds the real binary before running these
@@ -5180,7 +5181,8 @@ fn spawn_background_job_handle(
                 }
             }
         }
-    }
+        exe
+    };
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
