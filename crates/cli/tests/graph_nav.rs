@@ -521,6 +521,38 @@ Effect.gen(function* () {
         read_out.contains("src/app.ts:") && read_out.contains("helper(platform)"),
         "piped module identity must resolve back to its source file: {read_out:?}"
     );
+
+    let (code, head_out, head_err) =
+        run_with_stdin(&["read", "-", "--head", "2"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "module head read should succeed: {head_out}\n{head_err}"
+    );
+    assert!(
+        head_out.contains("import { helper }") && !head_out.contains("helper(platform)"),
+        "--head must slice the current file span rather than the old 1:1 anchor: {head_out:?}"
+    );
+
+    let (code, tail_out, tail_err) =
+        run_with_stdin(&["read", "-", "--tail", "3"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "module tail read should succeed: {tail_out}\n{tail_err}"
+    );
+    assert!(
+        tail_out.contains("bareHelper(platform)"),
+        "--tail must address the end of the current file span: {tail_out:?}"
+    );
+
+    let (code, smart_out, smart_err) = run_with_stdin(&["read-smart", "-"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "canonical module caller must round-trip through read-smart: {smart_out}\n{smart_err}"
+    );
+    assert!(
+        smart_out.contains("helper(platform)") && smart_out.contains("bareHelper(platform)"),
+        "read-smart must expose the verified module source without a fabricated callable: {smart_out:?}"
+    );
 }
 
 #[test]

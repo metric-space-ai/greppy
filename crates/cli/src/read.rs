@@ -252,6 +252,21 @@ fn read_definition(
         )));
     }
     let line_count = read_line_count(&content);
+    if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+        // A canonical `__file__` node identifies the current indexed file, not
+        // a one-line callable definition. Older graphs persist its bookkeeping
+        // span as 1:1, but JSON caller pipelines legitimately carry this node
+        // into `read` / `read-smart`. Derive the readable span from the
+        // SHA-verified, confined file bytes above so the canonical identity
+        // yields real source without inventing a callable owner. Text
+        // --head/--tail then slice this full-file DefinitionRead normally.
+        return Ok(Some(DefinitionRead {
+            node,
+            content,
+            start_line: 1,
+            end_line: line_count.max(1),
+        }));
+    }
     let node_start = usize::try_from(node.start_line.max(1)).unwrap_or(1);
     if node_start > line_count.max(1) {
         return Ok(None);
