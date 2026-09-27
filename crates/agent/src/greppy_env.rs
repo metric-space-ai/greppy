@@ -297,14 +297,9 @@ pub fn agent_help_invocation(args: &[String]) -> bool {
     let command = |value: &str| !value.is_empty() && !value.starts_with('-');
     match args {
         [agent, flag] => agent == "agent" && help(flag),
-        [agent, subcommand, flag] => {
-            agent == "agent" && command(subcommand) && help(flag)
-        }
+        [agent, subcommand, flag] => agent == "agent" && command(subcommand) && help(flag),
         [agent, sessions, subcommand, flag] => {
-            agent == "agent"
-                && sessions == "sessions"
-                && command(subcommand)
-                && help(flag)
+            agent == "agent" && sessions == "sessions" && command(subcommand) && help(flag)
         }
         _ => false,
     }
@@ -705,7 +700,10 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
                     .is_some_and(|doctor| {
                         doctor.get("healthy").and_then(Value::as_bool) == Some(true)
                             && doctor.get("project_present").and_then(Value::as_bool) == Some(true)
-                            && doctor.get("graph_generation").and_then(Value::as_u64).is_some()
+                            && doctor
+                                .get("graph_generation")
+                                .and_then(Value::as_u64)
+                                .is_some()
                             && doctor.pointer("/stats/files").and_then(Value::as_u64) == Some(0)
                             && doctor
                                 .get("root_path")

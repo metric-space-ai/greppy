@@ -913,8 +913,8 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    let agent_help_in_agent_run = std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some()
-        && agent_help_invocation(&argv);
+    let agent_help_in_agent_run =
+        std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() && agent_help_invocation(&argv);
     if agent::is_agent_tui_invocation(&argv)
         && !is_agent_admin_invocation(&argv)
         && !agent_help_in_agent_run
@@ -8390,8 +8390,14 @@ mod embeddinggemma_assets {
     pub fn identity_paths() -> (String, String) {
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         (
-            root.join(GGUF_SHA).join(GGUF_NAME).to_string_lossy().into_owned(),
-            root.join(TOK_SHA).join(TOK_NAME).to_string_lossy().into_owned(),
+            root.join(GGUF_SHA)
+                .join(GGUF_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            root.join(TOK_SHA)
+                .join(TOK_NAME)
+                .to_string_lossy()
+                .into_owned(),
         )
     }
 

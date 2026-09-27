@@ -81,7 +81,11 @@ fn agent_run_allows_help_without_agent_lifecycle_side_effects() {
             0,
             "Usage: greppy agent sessions list",
         ),
-        (&["agent", "list", "--help"][..], 64, "unrecognized subcommand"),
+        (
+            &["agent", "list", "--help"][..],
+            64,
+            "unrecognized subcommand",
+        ),
     ] {
         let output = Command::new(binary_path())
             .args(args)
@@ -114,7 +118,10 @@ fn agent_run_allows_help_without_agent_lifecycle_side_effects() {
         .output()
         .unwrap()
         .stdout;
-    assert_eq!(refs_after, refs_before, "help must not create proposal refs");
+    assert_eq!(
+        refs_after, refs_before,
+        "help must not create proposal refs"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

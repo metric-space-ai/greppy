@@ -1095,11 +1095,9 @@ mod tests {
 
         let connection = Connection::open(metadata_path).unwrap();
         let base_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM cow_repository_bases",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM cow_repository_bases", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(base_count, 1);
         let mut statement = connection
@@ -1111,16 +1109,18 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .into_iter()
-            .map(|value| serde_json::from_slice::<Vec<ChunkId>>(&value).unwrap().len() as i64)
+            .map(|value| {
+                serde_json::from_slice::<Vec<ChunkId>>(&value)
+                    .unwrap()
+                    .len() as i64
+            })
             .sum::<i64>();
         assert!(entry_chunks > 0);
         let chunk_connection = Connection::open(chunk_root.join("chunks.sqlite3")).unwrap();
         let retained_refs: i64 = chunk_connection
-            .query_row(
-                "SELECT COALESCE(SUM(refs), 0) FROM cow_chunks",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COALESCE(SUM(refs), 0) FROM cow_chunks", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(retained_refs, entry_chunks);
     }

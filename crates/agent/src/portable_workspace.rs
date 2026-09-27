@@ -188,8 +188,7 @@ impl AgentWorkspace {
         // app-owned path here, before deriving any tool-writable children. The
         // generic sandbox still receives physical, symlink-free roots and keeps
         // rejecting arbitrary symlink components supplied from elsewhere.
-        let data_root =
-            canonicalize_trusted_provider_path("data root", provider.data_root())?;
+        let data_root = canonicalize_trusted_provider_path("data root", provider.data_root())?;
         #[cfg(target_os = "macos")]
         {
             greppy_workspace_core::spawn_repository_tracker_for(
@@ -400,11 +399,8 @@ impl AgentWorkspace {
             &self.baseline_tree,
             self.core.changed_paths(&self.handle)?,
         )?;
-        let changed_paths = filter_ignored_paths(
-            &self.worktree,
-            &self.private_index,
-            changed_paths,
-        )?;
+        let changed_paths =
+            filter_ignored_paths(&self.worktree, &self.private_index, changed_paths)?;
         let hardlink_groups = self.core.hardlink_groups(&self.handle, &changed_paths)?;
         if !changed_paths.is_empty() {
             let mut arguments = vec!["add", "-A", "--"];
@@ -2917,10 +2913,7 @@ pub fn workspace_data_root() -> Result<PathBuf, WorkspaceError> {
 /// first verify the provider manifest, mounted identity, and live I/O. The
 /// sandbox can therefore retain its stronger rule that every root it receives
 /// is already free of symlink components.
-fn canonicalize_trusted_provider_path(
-    kind: &str,
-    path: &Path,
-) -> Result<PathBuf, WorkspaceError> {
+fn canonicalize_trusted_provider_path(kind: &str, path: &Path) -> Result<PathBuf, WorkspaceError> {
     fs::canonicalize(path).map_err(|error| {
         WorkspaceError::AdapterUnavailable(format!(
             "cannot resolve provider {kind} {}: {error}",
@@ -3944,11 +3937,9 @@ mod tests {
             &configured_mount.join("workspaces/run-git"),
         )
         .unwrap();
-        let prepared = crate::sandbox::prepare_writable_roots(&[
-            worktree.clone(),
-            private_git.clone(),
-        ])
-        .unwrap();
+        let prepared =
+            crate::sandbox::prepare_writable_roots(&[worktree.clone(), private_git.clone()])
+                .unwrap();
 
         assert_eq!(
             prepared,
@@ -4008,7 +3999,10 @@ mod tests {
         git(root.path(), &["init", "-q"]);
         git(root.path(), &["config", "user.email", "test@example.test"]);
         git(root.path(), &["config", "user.name", "Test"]);
-        git(root.path(), &["commit", "--allow-empty", "-q", "-m", "empty"]);
+        git(
+            root.path(),
+            &["commit", "--allow-empty", "-q", "-m", "empty"],
+        );
         let empty_tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
         let changed = vec![
             ".greppy".to_string(),
@@ -5029,13 +5023,11 @@ mod tests {
         assert!(patch.contains("+agent"));
         assert!(!patch.lines().any(|line| line == "-base"));
         assert!(git(&repo, &["ls-tree", "-r", &commit, "--", "cache"]).is_empty());
-        assert!(
-            git(
-                &repo,
-                &["ls-tree", "-r", &commit, "--", WEB_CURRENT_SCOPE_PATH]
-            )
-            .is_empty()
-        );
+        assert!(git(
+            &repo,
+            &["ls-tree", "-r", &commit, "--", WEB_CURRENT_SCOPE_PATH]
+        )
+        .is_empty());
         assert!(!patch.contains(WEB_CURRENT_SCOPE_PATH));
 
         let index = git_path(&repo, "index").unwrap();
