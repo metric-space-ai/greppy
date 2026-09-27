@@ -3944,6 +3944,7 @@ impl ContentEngine {
                 let url = required_str(&params, "url")?;
                 if let UrlDecision::Deny { reason } =
                     decide_url(self.profile_for_page(&page_id)?, &url)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
