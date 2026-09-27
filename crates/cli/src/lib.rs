@@ -5108,6 +5108,7 @@ fn spawn_background_job_handle(
     cause: &str,
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
+    expected_generation: Option<u64>,
 ) -> Option<BackgroundJobLaunch> {
     // Integration tests use short-lived stores and explicitly opt out of
     // inference. A detached child can outlive the fixture guard, recreate the
@@ -5148,6 +5149,30 @@ fn spawn_background_job_handle(
             root,
             _demand: Some(demand),
         });
+    }
+    if let Some(expected_generation) = expected_generation {
+        let current_generation = greppy_store::Store::open_with(
+            &workspace_locator::store_path(&root),
+            greppy_store::OpenOptions::read_only(),
+        )
+        .ok()
+        .and_then(|store| {
+            store
+                .get_workspace_state(root.to_string_lossy().as_ref())
+                .ok()
+                .flatten()
+                .map(|state| state.graph_generation)
+        });
+        if current_generation != Some(expected_generation) {
+            // A previous owner published while this caller waited for the
+            // spawn lock. Preserve the attached-wait contract so the caller
+            // observes that publication instead of launching a duplicate.
+            return Some(BackgroundJobLaunch::Attached {
+                path: job_path,
+                root,
+                _demand: Some(demand),
+            });
+        }
     }
     let target_generation = greppy_store::Store::open_with(
         &workspace_locator::store_path(&root),
@@ -5372,7 +5397,7 @@ fn spawn_background_job(
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
 ) -> bool {
-    let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
+    let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg, None) else {
         return false;
     };
     if let BackgroundJobLaunch::Owned {
@@ -5398,7 +5423,15 @@ pub(crate) fn spawn_agent_background_index(
     root: Option<&str>,
     cause: &str,
 ) -> Option<BackgroundJobLaunch> {
-    spawn_background_job_handle(root, cause, "index", None)
+    spawn_background_job_handle(root, cause, "index", None, None)
+}
+
+pub(crate) fn spawn_agent_background_index_after_generation(
+    root: Option<&str>,
+    cause: &str,
+    expected_generation: Option<u64>,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, cause, "index", None, expected_generation)
 }
 
 /// Kick off the complete atomic graph + embedding snapshot as a detached
@@ -5412,7 +5445,7 @@ pub(crate) fn spawn_background_embed_handle(
     root: Option<&str>,
     cfg: &EmbeddingModelConfig,
 ) -> Option<BackgroundJobLaunch> {
-    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg))
+    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg), None)
 }
 
 fn format_embedding_eta(seconds: u64) -> String {
