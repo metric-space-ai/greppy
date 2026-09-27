@@ -3821,7 +3821,7 @@ fn materialized_form_post_body_replays_across_temporary_redirect() {
             "script_source":"inline",
             "bind_session_page":true,
             "script_text":r#"
-const state = await page.evaluate(async () => {
+const state = await page.evaluate(async () => JSON.stringify(await (async () => {
   const request = new Request('/complete', { method: 'POST', body: 'body=once' });
   const before = request.bodyUsed;
   const response = await fetch(request);
@@ -3829,8 +3829,8 @@ const state = await page.evaluate(async () => {
   let reuseError = '';
   try { await fetch(request); } catch (error) { reuseError = error.name; }
   return { before, after, reuseError, status: response.status };
-});
-console.log(JSON.stringify(state));
+})()));
+console.log(state);
 "#,
         }),
     );
