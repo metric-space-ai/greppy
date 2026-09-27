@@ -2104,8 +2104,6 @@ pub fn rebuild_visible_overlay_edges(store: &mut Store, project: &str) -> Result
     Ok(resolved)
 }
 
-const REPAIRED_BASE_EDGE_PROPERTY: &str = "greppy_base_repair_v2";
-
 fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()> {
     store
         .conn()
@@ -2126,12 +2124,16 @@ fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()
                )
                AND NOT EXISTS (
                    SELECT 1
-                   FROM greppy_base.edges e
-                   JOIN greppy_base.nodes bs ON bs.id = e.source_id
-                   JOIN greppy_base.nodes bt ON bt.id = e.target_id
-                   WHERE e.project = d.project
+                   FROM greppy_base.nodes bs
+                   JOIN greppy_base.edges e
+                     ON e.project = bs.project AND e.source_id = bs.id
+                   JOIN greppy_base.nodes bt
+                     ON bt.project = e.project AND bt.id = e.target_id
+                   WHERE bs.project = d.project
                      AND bs.qualified_name = d.source_qualified_name
+                     AND bt.project = d.project
                      AND bt.qualified_name = d.target_qualified_name
+                     AND e.project = d.project
                      AND e.edge_type = d.edge_type
                )
                AND json_extract(d.properties, '$.greppy_base_repair_v2') IS NULL",
@@ -3138,6 +3140,10 @@ fn workspace_member_manifests(
     workspace_root: &std::path::Path,
     member: &str,
 ) -> Vec<std::path::PathBuf> {
+    // This is deliberately a narrow manifest reader: explicit members and a
+    // single standalone `*` component are enough for the source layouts that
+    // need crate-root resolution here. Cargo's full glob semantics and
+    // `workspace.exclude` are not reproduced by this helper.
     let pattern = std::path::Path::new(member);
     let Some((wildcard_index, _)) = pattern
         .components()
