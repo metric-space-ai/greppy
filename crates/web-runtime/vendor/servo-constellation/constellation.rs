@@ -2966,8 +2966,13 @@ where
             warn!("Exit private web storage thread failed ({:?})", e);
         }
 
-        debug!("Shutting-down IPC router thread in constellation.");
-        ROUTER.shutdown();
+        // Borrowing constellations share the process-global router with the
+        // owning Servo and other sessions. Closing one session must not stop
+        // request-body channels for surviving or subsequently opened sessions.
+        if self.owns_process_state {
+            debug!("Shutting-down IPC router thread in constellation.");
+            ROUTER.shutdown();
+        }
 
         debug!("Shutting-down the async runtime in constellation.");
         self.async_runtime.shutdown();

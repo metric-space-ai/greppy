@@ -2253,6 +2253,9 @@ class Page {
       page: this._id,
       generation: this._generation || 1,
       source,
+      // The content worker owns a 30s Promise deadline. Leave time for its
+      // cleanup/error response before the controller transport gives up.
+      timeout: 31_000,
     });
     await this._flushPopups();
     await this._dispatchConsole();

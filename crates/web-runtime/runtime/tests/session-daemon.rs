@@ -733,6 +733,110 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn decode_chunked_body(mut encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded.windows(2).position(|part| part == b"\r\n")?;
+        let size_text = std::str::from_utf8(&encoded[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            return Some(decoded);
+        }
+        if encoded.len() < size + 2 || &encoded[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[size + 2..];
+    }
+}
+
+fn serve_form_post_fixture(
+    redirect_post: bool,
+) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind form post fixture");
+    let address = listener.local_addr().expect("form post addr");
+    let (body_sender, body_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let (header_end, content_length, chunked) = loop {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break (request.len(), 0, false);
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let header_end = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let chunked = headers.lines().any(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("transfer-encoding:")
+                            .is_some_and(|value| value.trim() == "chunked")
+                    });
+                    break (header_end, content_length, chunked);
+                }
+            };
+            while if chunked {
+                decode_chunked_body(&request[header_end..]).is_none()
+            } else {
+                request.len() < header_end + content_length
+            } {
+                let size = stream.read(&mut chunk).unwrap_or(0);
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let request_line = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let posted = request_line.starts_with("POST /login ") ||
+                request_line.starts_with("POST /complete ");
+            let response_body = if posted {
+                let body = if chunked {
+                    decode_chunked_body(&request[header_end..]).unwrap()
+                } else {
+                    request[header_end..header_end + content_length].to_vec()
+                };
+                body_sender
+                    .send(body)
+                    .unwrap();
+                "<!doctype html><title>submitted</title><body>submitted</body>"
+            } else {
+                "<!doctype html><title>login</title><form method='post' action='/login'><input id='username' name='username'><input id='password' name='password'><button id='submit' type='submit'>Login</button></form>"
+            };
+            let response = if redirect_post && request_line.starts_with("POST /login ") {
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /complete\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{address}/"), body_receiver)
+}
+
 fn serve_cookie_isolation_fixture() -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3630,6 +3734,282 @@ console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: rec
     assert!(stdout.contains("kind=no_document"), "{controller:?}");
     assert!(stdout.contains("\"missing\":404"), "{controller:?}");
     assert!(stdout.contains("\"recovered\":200"), "{controller:?}");
+}
+
+#[test]
+fn fresh_sessions_submit_complete_form_post_bodies() {
+    let (fixture, posted_bodies) = serve_form_post_fixture(false);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-form-post-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("form post request")
+    };
+
+    for _ in 0..3 {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        for (selector, value) in [
+            ("#username", "admin"),
+            ("#password", "secret"),
+        ] {
+            let filled = call(
+                "web.fill",
+                json!({
+                    "session_id":session,
+                    "selector":{"type":"css","value":selector},
+                    "value":value,
+                }),
+            );
+            assert_eq!(filled.status, "ok", "{filled:?}");
+        }
+        let submitted = call(
+            "web.click",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":"#submit"},
+            }),
+        );
+        assert_eq!(submitted.status, "ok", "{submitted:?}");
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
+}
+
+#[test]
+fn materialized_form_post_body_replays_across_temporary_redirect() {
+    let (fixture, posted_bodies) = serve_form_post_fixture(true);
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-form-post-redirect-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_form_post_redirect", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_form_post_redirect", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("redirected form post request")
+    };
+
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    for (selector, value) in [("#username", "admin"), ("#password", "secret")] {
+        let filled = call(
+            "web.fill",
+            json!({
+                "session_id":session,
+                "selector":{"type":"css","value":selector},
+                "value":value,
+            }),
+        );
+        assert_eq!(filled.status, "ok", "{filled:?}");
+    }
+    let submitted = call(
+        "web.click",
+        json!({
+            "session_id":session,
+            "selector":{"type":"css","value":"#submit"},
+        }),
+    );
+    assert_eq!(submitted.status, "ok", "{submitted:?}");
+    for _ in 0..2 {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"username=admin&password=secret"
+        );
+    }
+    let body_state = call(
+        "web.run",
+        json!({
+            "session_id":session,
+            "script_source":"inline",
+            "bind_session_page":true,
+            "script_text":r#"
+const state = await page.evaluate(async () => {
+  const request = new Request('/complete', { method: 'POST', body: 'body=once' });
+  const rawBody = request.body;
+  const before = request.bodyUsed;
+  const response = await fetch(request);
+  const after = request.bodyUsed;
+  const rawRead = await rawBody.getReader().read();
+  let reuseError = '';
+  try { await fetch(request); } catch (error) { reuseError = error.name; }
+  const source = new Request('/complete', { method: 'POST', body: 'body=source' });
+  const constructed = new Request(source);
+  const constructedResponse = await fetch(constructed);
+  const locked = new Request('/complete', { method: 'POST', body: 'body=locked' });
+  const reader = locked.body.getReader();
+  let lockedError = '';
+  try { new Request(locked); } catch (error) { lockedError = error.name; }
+  reader.releaseLock();
+  const lockedResponse = await fetch(locked);
+  const consumed = new Request('/complete', { method: 'POST', body: 'body=old' });
+  await consumed.text();
+  const replacement = new Request(consumed, { body: 'body=replacement' });
+  const replacementResponse = await fetch(replacement);
+  const streamed = new Request('/complete', {
+    method: 'POST',
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('body=streamed'));
+        controller.close();
+      },
+    }),
+    duplex: 'half',
+  });
+  const streamedResponse = await fetch(streamed);
+  const cloneSource = new Request('/complete', { method: 'POST', body: 'body=cloned' });
+  const cloned = cloneSource.clone();
+  const cloneSourceResponse = await fetch(cloneSource);
+  const clonedResponse = await fetch(cloned);
+  return {
+    before,
+    after,
+    reuseError,
+    status: response.status,
+    rawBodyDone: rawRead.done,
+    sourceUsed: source.bodyUsed,
+    constructedStatus: constructedResponse.status,
+    lockedError,
+    lockedStatus: lockedResponse.status,
+    consumedUsed: consumed.bodyUsed,
+    replacementStatus: replacementResponse.status,
+    streamedUsed: streamed.bodyUsed,
+    streamedStatus: streamedResponse.status,
+    cloneSourceUsed: cloneSource.bodyUsed,
+    clonedUsed: cloned.bodyUsed,
+    cloneSourceStatus: cloneSourceResponse.status,
+    clonedStatus: clonedResponse.status,
+  };
+});
+console.log(JSON.stringify(state));
+"#,
+        }),
+    );
+    assert_eq!(body_state.status, "ok", "{body_state:?}");
+    let stdout = body_state.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(state["before"], false, "{state:#}");
+    assert_eq!(state["after"], true, "{state:#}");
+    assert_eq!(state["reuseError"], "TypeError", "{state:#}");
+    assert_eq!(state["status"], 200, "{state:#}");
+    assert_eq!(state["rawBodyDone"], true, "{state:#}");
+    assert_eq!(state["sourceUsed"], true, "{state:#}");
+    assert_eq!(state["constructedStatus"], 200, "{state:#}");
+    assert_eq!(state["lockedError"], "TypeError", "{state:#}");
+    assert_eq!(state["lockedStatus"], 200, "{state:#}");
+    assert_eq!(state["consumedUsed"], true, "{state:#}");
+    assert_eq!(state["replacementStatus"], 200, "{state:#}");
+    assert_eq!(state["streamedUsed"], true, "{state:#}");
+    assert_eq!(state["streamedStatus"], 200, "{state:#}");
+    assert_eq!(state["cloneSourceUsed"], true, "{state:#}");
+    assert_eq!(state["clonedUsed"], true, "{state:#}");
+    assert_eq!(state["cloneSourceStatus"], 200, "{state:#}");
+    assert_eq!(state["clonedStatus"], 200, "{state:#}");
+    for body in [
+        b"body=once".as_slice(),
+        b"body=source".as_slice(),
+        b"body=locked".as_slice(),
+        b"body=replacement".as_slice(),
+        b"body=streamed".as_slice(),
+        b"body=cloned".as_slice(),
+        b"body=cloned".as_slice(),
+    ] {
+        assert_eq!(
+            posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            body
+        );
+    }
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+
+    for clone_first in [false, true] {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let clone_session = created.result.as_ref().unwrap()["session_id"]
+            .as_str().unwrap();
+        let opened = call("web.goto", json!({"session_id":clone_session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        let clone_state = call("web.run", json!({
+            "session_id":clone_session,
+            "script_source":"inline",
+            "bind_session_page":true,
+            "script_text":format!(r#"
+const state = await page.evaluate(async () => {{
+  const source = new Request('/complete', {{
+    method:'POST',
+    body:new ReadableStream({{start(controller) {{
+      controller.enqueue(new TextEncoder().encode('body=cloned'));
+      controller.close();
+    }}}}),
+    duplex:'half',
+  }});
+  const clone = source.clone();
+  const first = {} ? clone : source;
+  const second = {} ? source : clone;
+  const stagedFetch = async (stage, request) => {{
+    try {{ return await fetch(request); }}
+    catch (error) {{ throw new Error(`stage=${{stage}}: ${{error.name}}: ${{error.message}}`); }}
+  }};
+  const firstResponse = await stagedFetch('first-fetch', first);
+  const secondResponse = await stagedFetch('second-fetch', second);
+  let sourceReuseError = '';
+  let cloneReuseError = '';
+  try {{ await fetch(source); }} catch (error) {{ sourceReuseError = error.name; }}
+  try {{ await fetch(clone); }} catch (error) {{ cloneReuseError = error.name; }}
+  return {{sourceUsed:source.bodyUsed, cloneUsed:clone.bodyUsed,
+    firstStatus:firstResponse.status, secondStatus:secondResponse.status,
+    sourceReuseError, cloneReuseError}};
+}});
+console.log(JSON.stringify(state));
+"#, clone_first, clone_first),
+        }));
+        assert_eq!(clone_state.status, "ok", "clone_first={clone_first}: {clone_state:?}");
+        let stdout = clone_state.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        let state: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        assert_eq!(state["sourceUsed"], true, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["cloneUsed"], true, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["firstStatus"], 200, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["secondStatus"], 200, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["sourceReuseError"], "TypeError", "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["cloneReuseError"], "TypeError", "clone_first={clone_first}: {state:#}");
+        for _ in 0..2 {
+            assert_eq!(posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(), b"body=cloned", "clone_first={clone_first}");
+        }
+        let closed = call("web.session.close", json!({"session_id":clone_session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+    }
+    assert!(posted_bodies.try_recv().is_err());
 }
 
 #[test]
@@ -7427,6 +7807,121 @@ fn keyboard_down_and_up_are_separate_events() {
 #[test]
 fn evaluate_serializes_special_values_not_json_null() {
     run_named_fixture("evaluate-arg.mjs", "run_evalarg");
+}
+
+#[test]
+fn page_evaluate_awaits_primitive_object_and_async_object_results() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-await-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalawait", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const primitive = await page.evaluate(() => 42);
+const object = await page.evaluate(() => ({ before: false, after: true }));
+const asyncPrimitive = await page.evaluate(async () => 7);
+const asyncString = await page.evaluate(async () => "resolved");
+const state = await page.evaluate(async () => {
+  await Promise.resolve();
+  return { before: false, after: true, reuseError: "TypeError", status: 200 };
+});
+console.log(JSON.stringify({ primitive, object, asyncPrimitive, asyncString, state }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalawait",
+        source,
+        None,
+        Duration::from_secs(60),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalawait", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalawait");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(value["primitive"], 42, "{value:#}");
+    assert_eq!(value["object"], json!({"before": false, "after": true}), "{value:#}");
+    assert_eq!(value["asyncPrimitive"], 7, "{value:#}");
+    assert_eq!(value["asyncString"], "resolved", "{value:#}");
+    assert_eq!(
+        value["state"],
+        json!({"before": false, "after": true, "reuseError": "TypeError", "status": 200}),
+        "{value:#}"
+    );
+}
+
+#[test]
+fn page_evaluate_reports_rejection_and_timeout_then_recovers() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-evaluate-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let guard = Supervisor::spawn(&socket, "run_evalfail", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let source = r#"
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+let rejection = "";
+try {
+  await page.evaluate(async () => { throw new Error("evaluate-boom"); });
+} catch (error) {
+  rejection = String(error && error.message ? error.message : error);
+}
+let timeout = "";
+try {
+  await page.evaluate(() => new Promise(() => {}));
+} catch (error) {
+  timeout = String(error && error.message ? error.message : error);
+}
+const recovered = await page.evaluate(async () => "usable-after-timeout");
+console.log(JSON.stringify({ rejection, timeout, recovered }));
+await browser.close();
+"#;
+    let ran = run_playwright_source(
+        &socket,
+        "run_evalfail",
+        source,
+        None,
+        Duration::from_secs(75),
+    );
+    let _ = unix_request(
+        &socket,
+        &Request::new("run_evalfail", "web.shutdown", json!({})),
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    assert_no_leftover_web_runtime_processes("run_evalfail");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    let stdout = ran.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert!(
+        value["rejection"]
+            .as_str()
+            .unwrap()
+            .contains("page.evaluate Promise rejected: evaluate-boom"),
+        "{value:#}"
+    );
+    assert!(
+        value["timeout"]
+            .as_str()
+            .unwrap()
+            .contains("timeout awaiting page.evaluate Promise"),
+        "{value:#}"
+    );
+    assert_eq!(value["recovered"], "usable-after-timeout", "{value:#}");
 }
 
 #[test]
