@@ -188,6 +188,7 @@ pub(crate) fn provider_policy_graph_gate(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn provider_policy_graph_gate_for_edges(
     store: &greppy_store::Store,
     root: Option<&str>,
