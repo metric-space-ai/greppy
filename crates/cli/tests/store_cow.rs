@@ -720,7 +720,38 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             .as_str()
             .expect("persisted Base path"),
     );
+    // A genuinely cold structural refresh must still avoid materializing a
+    // temporary Base checkout. Retain this regression independently of the
+    // verified-v6 migration below.
+    let summary_cache = base_path
+        .parent()
+        .expect("Base graph parent")
+        .join(greppy_store::BASE_SUMMARY_CACHE_FILE);
+    let saved_summary_cache = std::fs::read(&summary_cache).unwrap();
+    std::fs::remove_file(&summary_cache).expect("force Base reuse miss");
+    std::fs::write(
+        first.join("src/cold_structural_refresh.rs"),
+        "pub fn cold_structural_refresh_symbol() -> i32 { 54 }\n",
+    )
+    .unwrap();
+    let (cold_code, cold_out, cold_err) = run_cli_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_STRUCTURAL_FIRST_USE", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        cold_code, 0,
+        "cold structural refresh failed: {cold_out}\n{cold_err}"
+    );
+    std::fs::write(&summary_cache, saved_summary_cache).unwrap();
+
     // Downgrade the published fixture to a verified v6 Base and remove the
+
     // current v7 generation. Structural first use must migrate this graph
     // before publishing a v7 Base; treating v6 as fresh would answer against
     // the pre-v7 extraction and resolution contract.
