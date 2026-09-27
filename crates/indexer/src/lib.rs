@@ -1719,6 +1719,95 @@ fn resolve_and_persist_edges_with_progress(
         resolved.push(new_edge(project, src_id, target_id, edge));
     }
 
+    // A Store-CoW Delta resolves only its own raw edges, but a qualified Rust
+    // reference can depend on reexports in the immutable Base. Hydrate import
+    // context only for module files reached from the Delta's imports. This
+    // preserves the O(Delta + reached modules) bound instead of scanning every
+    // Base raw edge, while allowing `channels::target` to follow a Base
+    // `pub use command::{..., target}`.
+    if store.is_overlay() {
+        let mut pending = index
+            .rust_namespaces_by_file
+            .values()
+            .flat_map(|aliases| aliases.values().flatten().cloned())
+            .collect::<Vec<_>>();
+        pending.extend(
+            index
+                .import_module_files_by_file
+                .values()
+                .flat_map(|files| files.iter().cloned()),
+        );
+        for (source_file, globs) in &index.import_globs_by_file {
+            for glob in globs {
+                pending.extend(
+                    rust_module_files_for_module_path(source_file, glob)
+                        .into_iter()
+                        .filter(|file| index.known_files.contains(file)),
+                );
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(module_file) = pending.pop() {
+            if !seen.insert(module_file.clone()) {
+                continue;
+            }
+            for raw in store.list_raw_edges_for_file(project, &module_file)? {
+                let edge = extracted_edge_from_raw(raw);
+                if edge.edge_type != "IMPORTS" {
+                    continue;
+                }
+                let Some(src) = index.by_qname(&edge.source_qualified_name) else {
+                    continue;
+                };
+                let src_id = src.id;
+                let src_file = src.file_path.clone();
+                index.record_import_items(&edge, &src_file);
+                let Some(name) = edge
+                    .properties
+                    .get("imported_name")
+                    .and_then(|value| value.as_str())
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let path = edge
+                    .properties
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if let Some(target_id) = index
+                    .unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+                    .filter(|target_id| *target_id != src_id)
+                {
+                    index.record_import(&src_file, target_id);
+                }
+            }
+            pending.extend(
+                index
+                    .rust_namespaces_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|aliases| aliases.values().flatten().cloned()),
+            );
+            pending.extend(
+                index
+                    .import_module_files_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|files| files.iter().cloned()),
+            );
+            if let Some(globs) = index.import_globs_by_file.get(&module_file) {
+                for glob in globs {
+                    pending.extend(
+                        rust_module_files_for_module_path(&module_file, glob)
+                            .into_iter()
+                            .filter(|file| index.known_files.contains(file)),
+                    );
+                }
+            }
+        }
+    }
+
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
     for edge in edges.iter().filter(|e| e.edge_type != "IMPORTS") {
         examined += 1;
@@ -2607,6 +2696,7 @@ fn navigation_label_rank(label: &str) -> u8 {
 ///   `Store::outgoing_edges`).
 struct GraphIndex {
     by_qname: std::collections::HashMap<String, NodeLite>,
+    by_id: std::collections::HashMap<i64, NodeLite>,
     /// `name → nodes sharing that name`, each inner vec sorted by
     /// `qualified_name` so the candidate order matches the old
     /// `list_nodes_by_name` ordering (resolution depends only on the
@@ -2616,6 +2706,14 @@ struct GraphIndex {
     /// [`record_import`](GraphIndex::record_import) during the IMPORTS
     /// pass; consulted by [`resolve_unique_with_imports`].
     imports_by_file: std::collections::HashMap<String, std::collections::HashSet<i64>>,
+    import_aliases_by_file: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, std::collections::HashSet<i64>>,
+    >,
+    import_alias_sources_by_file:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, String)>>>,
+    import_module_files_by_file:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
     import_globs_by_file: std::collections::HashMap<String, Vec<String>>,
     /// Rust namespace aliases imported into a file (`channels` in
     /// `use crate::core::mission::channels`). Values are exact candidate
@@ -2633,6 +2731,7 @@ struct GraphIndex {
     /// Erlang/Zig/Dart module imports). Populated at load; only usable AFTER
     /// the structural pass has created the File nodes.
     files_by_stem: std::collections::HashMap<String, Vec<i64>>,
+    known_files: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2658,8 +2757,10 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
     else {
         return Vec::new();
     };
-    let mut parts = module_path.split("::").filter(|part| !part.is_empty());
-    let first = parts.next();
+    rust_module_files_for_module_path(referrer_file, module_path)
+}
+
+fn rust_module_files_for_module_path(referrer_file: &str, module_path: &str) -> Vec<String> {
     let referrer = Path::new(referrer_file);
     let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
     let is_module_root = referrer
@@ -2671,32 +2772,32 @@ fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -
     } else {
         referrer.with_extension("")
     };
-    let mut modules = Vec::new();
-    match first {
-        Some("crate") => {
-            let root_end = referrer_file
-                .rfind("/src/")
-                .map(|offset| offset + "/src".len())
-                .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
-            base = root_end
-                .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
-                .unwrap_or_else(|| {
-                    referrer
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .to_path_buf()
-                });
+    for (position, module) in module_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        match module {
+            "crate" if position == 0 => {
+                let root_end = referrer_file
+                    .rfind("/src/")
+                    .map(|offset| offset + "/src".len())
+                    .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                base = root_end
+                    .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                    .unwrap_or_else(|| {
+                        referrer
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .to_path_buf()
+                    });
+            }
+            "self" if position == 0 => {}
+            "super" => {
+                base.pop();
+            }
+            part => base.push(part),
         }
-        Some("self") => {}
-        Some("super") => {
-            base.pop();
-        }
-        Some(part) => modules.push(part),
-        None => return Vec::new(),
-    }
-    modules.extend(parts);
-    for module in modules {
-        base.push(module);
     }
     let flat = base
         .with_extension("rs")
@@ -2751,12 +2852,14 @@ impl GraphIndex {
             std::collections::HashMap::new();
         let mut by_name: std::collections::HashMap<String, Vec<NodeLite>> =
             std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<i64, NodeLite> = std::collections::HashMap::new();
         let mut id_to_file: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut id_to_qname: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
+        let mut known_files = std::collections::HashSet::new();
         {
             let conn = store.conn();
             let mut stmt = conn
@@ -2789,21 +2892,28 @@ impl GraphIndex {
                     label,
                     file_path: file_path.clone(),
                 };
+                known_files.insert(file_path.clone());
                 id_to_file.insert(id, file_path);
                 id_to_qname.insert(id, qname.clone());
                 by_name.entry(name).or_default().push(node.clone());
+                by_id.insert(id, node.clone());
                 by_qname.insert(qname, node);
             }
         }
         Ok(GraphIndex {
             by_qname,
+            by_id,
             by_name,
             imports_by_file: std::collections::HashMap::new(),
+            import_aliases_by_file: std::collections::HashMap::new(),
+            import_alias_sources_by_file: std::collections::HashMap::new(),
+            import_module_files_by_file: std::collections::HashMap::new(),
             import_globs_by_file: std::collections::HashMap::new(),
             rust_namespaces_by_file: std::collections::HashMap::new(),
             id_to_file,
             id_to_qname,
             files_by_stem,
+            known_files,
         })
     }
 
@@ -2855,6 +2965,26 @@ impl GraphIndex {
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             let module_files = rust_module_files_for_path(file, path, name);
+            let visible_module_files = module_files
+                .iter()
+                .filter(|module_file| self.known_files.contains(*module_file))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.import_module_files_by_file
+                .entry(file.to_string())
+                .or_default()
+                .extend(visible_module_files);
+            let alias = item
+                .get("imported_name")
+                .and_then(|value| value.as_str())
+                .filter(|alias| !alias.is_empty())
+                .unwrap_or(name);
+            self.import_alias_sources_by_file
+                .entry(file.to_string())
+                .or_default()
+                .entry(alias.to_string())
+                .or_default()
+                .push((path.to_string(), name.to_string()));
             let candidates = self.defs_named(&greppy_resolver::IMPORTABLE_LABELS, name);
             let exact = candidates
                 .iter()
@@ -2863,21 +2993,18 @@ impl GraphIndex {
                 .collect::<Vec<_>>();
             if let [target] = exact.as_slice() {
                 self.record_import(file, *target);
+                self.import_aliases_by_file
+                    .entry(file.to_string())
+                    .or_default()
+                    .entry(alias.to_string())
+                    .or_default()
+                    .insert(*target);
             }
-            let alias = item
-                .get("imported_name")
-                .and_then(|value| value.as_str())
-                .filter(|alias| !alias.is_empty())
-                .unwrap_or(name);
             let namespace_path = format!("{path}::__namespace__");
             let existing_modules =
                 rust_module_files_for_path(file, &namespace_path, "__namespace__")
                     .into_iter()
-                    .filter(|module_file| {
-                        self.id_to_file
-                            .values()
-                            .any(|known_file| known_file == module_file)
-                    })
+                    .filter(|module_file| self.known_files.contains(module_file))
                     .collect::<Vec<_>>();
             if !existing_modules.is_empty() {
                 self.rust_namespaces_by_file
@@ -2964,6 +3091,110 @@ impl GraphIndex {
             .unique_id()
     }
 
+    fn rust_module_export_targets(
+        &self,
+        module_files: &[String],
+        name: &str,
+        labels: &[&str],
+    ) -> Vec<i64> {
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for module_file in module_files {
+            self.rust_module_export_targets_from_file(
+                module_file,
+                name,
+                labels,
+                &mut seen,
+                &mut targets,
+            );
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn rust_module_export_targets_from_file(
+        &self,
+        module_file: &str,
+        name: &str,
+        labels: &[&str],
+        seen: &mut std::collections::HashSet<(String, String)>,
+        targets: &mut Vec<i64>,
+    ) {
+        if !seen.insert((module_file.to_string(), name.to_string())) {
+            return;
+        }
+        let initial_count = targets.len();
+        targets.extend(
+            self.defs_named(labels, name)
+                .into_iter()
+                .filter(|node| node.file_path == module_file)
+                .map(|node| node.id),
+        );
+        if targets.len() > initial_count {
+            return;
+        }
+        if let Some(aliases) = self
+            .import_aliases_by_file
+            .get(module_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            targets.extend(aliases.iter().copied().filter(|target| {
+                self.by_id
+                    .get(target)
+                    .is_some_and(|node| labels.contains(&node.label.as_str()))
+            }));
+        }
+        if let Some(sources) = self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            for (path, original_name) in sources {
+                let mut source_files = rust_module_files_for_path(module_file, path, original_name)
+                    .into_iter()
+                    .filter(|file| self.known_files.contains(file))
+                    .collect::<Vec<_>>();
+                if source_files.is_empty() && path == original_name {
+                    source_files.push(module_file.to_string());
+                }
+                for source_file in source_files {
+                    self.rust_module_export_targets_from_file(
+                        &source_file,
+                        original_name,
+                        labels,
+                        seen,
+                        targets,
+                    );
+                }
+            }
+        }
+        // An explicit binding shadows glob imports even when its target is
+        // unresolved; do not invent a different binding through a glob.
+        if self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return;
+        }
+        if let Some(globs) = self.import_globs_by_file.get(module_file) {
+            for glob in globs {
+                for exported_file in rust_module_files_for_module_path(module_file, glob) {
+                    if self.known_files.contains(&exported_file) {
+                        self.rust_module_export_targets_from_file(
+                            &exported_file,
+                            name,
+                            labels,
+                            seen,
+                            targets,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_unique_status_with_imports(
         &self,
         labels: &[&str],
@@ -2974,7 +3205,61 @@ impl GraphIndex {
         let Some(referrer_file) = self.file_of(referrer_id) else {
             return UniqueResolution::Unresolved;
         };
+        if let Some(alias_targets) = self
+            .import_aliases_by_file
+            .get(referrer_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            let matching = alias_targets
+                .iter()
+                .filter(|target| {
+                    self.by_id
+                        .get(target)
+                        .is_some_and(|node| labels.contains(&node.label.as_str()))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if let [target] = matching.as_slice() {
+                return UniqueResolution::Unique(*target);
+            }
+        }
+        // A local Rust item shadows a glob import. Do not let Base export
+        // hydration redirect a same-file reference to an imported namesake.
         let candidates = self.defs_named(labels, name);
+        let local = candidates
+            .iter()
+            .filter(|node| node.file_path == referrer_file)
+            .collect::<Vec<_>>();
+        if let Some(target) = local
+            .iter()
+            .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+        {
+            return UniqueResolution::Unique(target.id);
+        }
+        if self
+            .import_alias_sources_by_file
+            .get(referrer_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            let exported =
+                self.rust_module_export_targets(&[referrer_file.to_string()], name, labels);
+            return match exported.as_slice() {
+                [target] => UniqueResolution::Unique(*target),
+                [] => UniqueResolution::Unresolved,
+                _ => UniqueResolution::Ambiguous,
+            };
+        }
+        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
+            let module_files = globs
+                .iter()
+                .flat_map(|glob| rust_module_files_for_module_path(referrer_file, glob))
+                .filter(|file| self.known_files.contains(file))
+                .collect::<Vec<_>>();
+            let exported = self.rust_module_export_targets(&module_files, name, labels);
+            if let [target] = exported.as_slice() {
+                return UniqueResolution::Unique(*target);
+            }
+        }
         if let Some(id) = Self::resolve_unique(&candidates, referrer_file) {
             return UniqueResolution::Unique(id);
         }
@@ -3024,31 +3309,6 @@ impl GraphIndex {
             if !set.is_empty() {
                 let preferred: Vec<&&NodeLite> =
                     candidates.iter().filter(|n| set.contains(&n.id)).collect();
-                if preferred.len() == 1 {
-                    return UniqueResolution::Unique(preferred[0].id);
-                }
-            }
-        }
-        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
-            for glob in globs {
-                let module_file = (glob == "super").then(|| {
-                    std::path::Path::new(referrer_file)
-                        .parent()
-                        .map(|parent| parent.join("mod.rs"))
-                });
-                let Some(module_file) = module_file
-                    .flatten()
-                    .and_then(|path| path.to_str().map(str::to_owned))
-                else {
-                    continue;
-                };
-                let Some(exports) = self.imports_by_file.get(&module_file) else {
-                    continue;
-                };
-                let preferred: Vec<&&NodeLite> = candidates
-                    .iter()
-                    .filter(|node| exports.contains(&node.id))
-                    .collect();
                 if preferred.len() == 1 {
                     return UniqueResolution::Unique(preferred[0].id);
                 }
@@ -3109,28 +3369,13 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
-            let module_exists = module_files.iter().any(|module_file| {
-                self.id_to_file
-                    .values()
-                    .any(|known_file| known_file == module_file)
-            });
+            let module_exists = module_files
+                .iter()
+                .any(|module_file| self.known_files.contains(module_file));
             if !module_exists {
                 return self.resolve_associated_method(src_id, ref_path, name);
             }
-            let in_module: Vec<i64> = self
-                .defs_named(&CALLABLE_LABELS, name)
-                .into_iter()
-                .filter(|node| {
-                    module_files.iter().any(|file| {
-                        node.file_path == *file
-                            || self
-                                .imports_by_file
-                                .get(file)
-                                .is_some_and(|targets| targets.contains(&node.id))
-                    })
-                })
-                .map(|node| node.id)
-                .collect();
+            let in_module = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
             match in_module.as_slice() {
                 [id] => return Some(*id),
                 _ => return None,
@@ -3250,20 +3495,7 @@ impl GraphIndex {
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
                 .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
-            let candidates = self.defs_named(&USAGE_LABELS, name);
-            let imported: Vec<i64> = candidates
-                .iter()
-                .filter(|candidate| {
-                    module_files.iter().any(|file| {
-                        candidate.file_path == *file
-                            || self
-                                .imports_by_file
-                                .get(file)
-                                .is_some_and(|targets| targets.contains(&candidate.id))
-                    })
-                })
-                .map(|candidate| candidate.id)
-                .collect();
+            let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
             if let [id] = imported.as_slice() {
                 return Some(*id);
             }
@@ -4255,6 +4487,205 @@ mod tests {
             "missing Delta metadata requires migration"
         );
         assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        drop(overlay);
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(stores);
+    }
+
+    #[test]
+    fn overlay_delta_resolves_rust_usage_through_base_reexports() {
+        let repo = setup_multifile_repo(
+            "overlay-base-reexport",
+            "mod alias_chain; mod bare_glob; mod business_os; mod channels; mod decoys; mod glob_channels; mod parent; mod renamed_channels; mod super_exports;\n",
+            "// fixture placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/alias_chain")).unwrap();
+        fs::create_dir_all(repo.join("src/bare_glob")).unwrap();
+        fs::create_dir_all(repo.join("src/business_os")).unwrap();
+        fs::create_dir_all(repo.join("src/channels")).unwrap();
+        fs::create_dir_all(repo.join("src/glob_channels")).unwrap();
+        fs::create_dir_all(repo.join("src/parent/child")).unwrap();
+        fs::create_dir_all(repo.join("src/renamed_channels")).unwrap();
+        fs::create_dir_all(repo.join("src/super_exports")).unwrap();
+        fs::write(
+            repo.join("src/business_os/mod.rs"),
+            "pub mod store; pub use crate::super_exports::*;\n",
+        )
+        .unwrap();
+        let caller_source =
+            "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
+use crate::bare_glob::*;\n\
+use crate::alias_chain::outer;\n\
+use super::*;\n\
+pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
+pub fn renamed_caller() { let selected = renamed_channels::renamed; selected(); }\n\
+pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n\
+pub fn super_glob_caller() { let selected = child::target; selected(); }\n\
+pub fn alias_chain_caller() { let selected = alias_chain::outer; selected(); }\n\
+pub fn delta_crate_glob_caller() { let selected = bare_target; selected(); }\n\
+pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n\
+pub fn shadow_target() {}\n\
+pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n\
+pub struct Shadow; impl Shadow { pub fn shadow_target() {} }\n\
+pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
+        fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
+        fs::write(
+            repo.join("src/alias_chain/mod.rs"),
+            "mod sub; pub use sub::target as middle; pub use middle as outer;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
+        fs::write(
+            repo.join("src/bare_glob/mod.rs"),
+            "mod command; pub use command::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/bare_glob/command.rs"),
+            "pub fn bare_target() {}\npub fn shadow_target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/mod.rs"),
+            "mod command; pub use command::{first, target};\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/command.rs"),
+            "pub fn first() {}\npub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/glob_channels/mod.rs"),
+            "mod command; pub use command::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/glob_channels/command.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/parent/mod.rs"),
+            "pub fn target() {}\npub mod child;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/parent/child/mod.rs"), "pub use super::*;\n").unwrap();
+        fs::write(
+            repo.join("src/renamed_channels/mod.rs"),
+            "mod command; pub use command::target as renamed;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/renamed_channels/command.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/super_exports/mod.rs"),
+            "pub fn super_target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/decoys.rs"),
+            "pub fn bare_target() {}\npub fn super_target() {}\n",
+        )
+        .unwrap();
+
+        let stores = repo.with_extension("overlay-base-reexport-stores");
+        fs::create_dir_all(&stores).unwrap();
+        let base_path = stores.join("base.db");
+        let delta_path = stores.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+        }
+
+        fs::write(
+            repo.join("src/business_os/store.rs"),
+            format!("{caller_source}// dirty worktree comment\n"),
+        )
+        .unwrap();
+        let dirty_path = "src/business_os/store.rs".to_string();
+        let visibility =
+            greppy_store::VisibilityIndex::new([dirty_path.clone()], Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        index_with_options(
+            &mut overlay,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(std::collections::BTreeSet::from([dirty_path])),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        rebuild_overlay_edges(&mut overlay, "test").unwrap();
+
+        for (target_qname, caller_qname, reexport_kind) in [
+            (
+                "src/channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::grouped_caller",
+                "grouped",
+            ),
+            (
+                "src/renamed_channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::renamed_caller",
+                "renamed",
+            ),
+            (
+                "src/glob_channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::glob_caller",
+                "glob",
+            ),
+            (
+                "src/parent/mod.rs::Function::target",
+                "src/business_os/store.rs::Function::super_glob_caller",
+                "transitive super glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::alias_chain_caller",
+                "explicit alias chain",
+            ),
+            (
+                "src/bare_glob/command.rs::Function::bare_target",
+                "src/business_os/store.rs::Function::delta_crate_glob_caller",
+                "Delta crate glob",
+            ),
+            (
+                "src/super_exports/mod.rs::Function::super_target",
+                "src/business_os/store.rs::Function::delta_super_glob_caller",
+                "Delta super glob",
+            ),
+            (
+                "src/business_os/store.rs::Function::shadow_target",
+                "src/business_os/store.rs::Function::local_shadow_caller",
+                "local item shadows Base glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::imported_alias_caller",
+                "explicit import of chained reexport",
+            ),
+        ] {
+            let target = overlay
+                .get_node_by_qname("test", target_qname)
+                .unwrap()
+                .expect("Base target remains visible");
+            let caller = overlay
+                .get_node_by_qname("test", caller_qname)
+                .unwrap()
+                .expect("dirty Delta caller");
+            let incoming = overlay
+                .incoming_edges(target.id, Some("USAGE"), 10)
+                .unwrap();
+            assert!(
+                incoming.iter().any(|edge| edge.source_id == caller.id),
+                "dirty Delta usage must resolve through the Base {reexport_kind} reexport: {incoming:?}"
+            );
+        }
+
         drop(overlay);
         let _ = fs::remove_dir_all(repo);
         let _ = fs::remove_dir_all(stores);
