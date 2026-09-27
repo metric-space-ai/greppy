@@ -1032,6 +1032,7 @@ impl Servo {
             async_runtime,
             public_storage_threads.clone(),
             private_storage_threads.clone(),
+            !builder.shared_process_state,
         );
 
         net::connector::prewarm_tls();
@@ -1239,6 +1240,7 @@ fn create_constellation(
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
+    owns_process_state: bool,
 ) {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
@@ -1280,6 +1282,7 @@ fn create_constellation(
         #[cfg(feature = "webgpu")]
         wgpu_image_map: paint.webgpu_image_map(),
         async_runtime,
+        owns_process_state,
         privileged_urls,
         wake_lock_provider: Box::new(DefaultWakeLockDelegate),
     };

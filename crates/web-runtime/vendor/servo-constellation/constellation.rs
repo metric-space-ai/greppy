@@ -497,6 +497,9 @@ pub struct Constellation<STF, SWF> {
     /// The async runtime.
     async_runtime: Box<dyn AsyncRuntime>,
 
+    /// Whether this constellation owns process-global single-process services.
+    owns_process_state: bool,
+
     /// A vector of [`JoinHandle`]s used to ensure full termination of threaded [`EventLoop`]s
     /// which are runnning in the same process.
     event_loop_join_handles: Vec<JoinHandle<()>>,
@@ -583,6 +586,9 @@ pub struct InitialConstellationState {
 
     /// The async runtime.
     pub async_runtime: Box<dyn AsyncRuntime>,
+
+    /// Whether this constellation owns process-global single-process services.
+    pub owns_process_state: bool,
 
     /// The wake lock provider for acquiring and releasing OS-level screen wake locks.
     pub wake_lock_provider: Box<dyn WakeLockDelegate>,
@@ -734,6 +740,7 @@ where
                     broken_image_icon_data: broken_image_icon_data.clone(),
                     process_manager: ProcessManager::new(state.mem_profiler_chan),
                     async_runtime: state.async_runtime,
+                    owns_process_state: state.owns_process_state,
                     event_loop_join_handles: Default::default(),
                     privileged_urls: state.privileged_urls,
                     image_cache_factory: Arc::new(ImageCacheFactoryImpl::new(
@@ -782,12 +789,17 @@ where
         }
         self.handle_shutdown();
 
-        if !opts::get().multiprocess {
-            StyleThreadPool::shutdown();
-        }
+        // Additional in-process Servo instances borrow these process-global
+        // services from the owning Servo. Closing an isolated context must not
+        // stop them while the owner and later contexts are still running.
+        if self.owns_process_state {
+            if !opts::get().multiprocess {
+                StyleThreadPool::shutdown();
+            }
 
-        // Shut down the `FetchThread` if it has been started at any time.
-        FetchThread::exit();
+            // Shut down the `FetchThread` if it has been started at any time.
+            FetchThread::exit();
+        }
 
         // Note: the last thing the constellation does, is asking the embedder to
         // shut down. This helps ensure we've shut down all our internal threads before

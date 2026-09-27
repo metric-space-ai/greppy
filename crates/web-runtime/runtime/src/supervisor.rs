@@ -940,6 +940,10 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        // Worker protocol and engine-call milestones. The supervisor reads
+        // this flag too, so scrubbing it from child workers produces a
+        // misleading supervisor-only trace exactly when a content call hangs.
+        "GREPPY_WEB_TRACE_PHASE",
         // Bounded, opt-in initialization milestones; no page data or secrets.
         "GREPPY_WEB_TRACE_STARTUP",
     ];
