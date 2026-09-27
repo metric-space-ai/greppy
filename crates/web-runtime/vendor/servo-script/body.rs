@@ -97,7 +97,10 @@ pub(crate) fn proxy_body_stream_for_dom_request(
             global,
             bytes.to_vec(),
         )?;
-        source_stream.set_is_disturbed(true);
+        rooted!(&in(cx) let reason = UndefinedValue());
+        source_stream
+            .cancel(cx, global, reason.handle())
+            .set_promise_is_handled(cx);
         return Ok((source_body.clone(), proxy));
     }
 
@@ -127,6 +130,7 @@ pub(crate) fn proxy_body_stream_for_dom_request(
         content_type: None,
     };
     let (proxy_body, _) = extracted.into_net_request_body(cx);
+    source_body.detach_stream();
     Ok((proxy_body, proxy))
 }
 
@@ -283,17 +287,15 @@ impl TransmitBodyConnectHandler {
     /// Otherwise, the following cycle will happen: The control sender is owned by us which keeps the control receiver
     /// alive in the router which keeps us alive.
     fn stop_reading(&mut self, reason: StopReading) {
-        let bytes_sender = self
-            .bytes_sender
-            .take()
-            .expect("Stop reading called multiple times on TransmitBodyConnectHandler.");
-        match reason {
-            StopReading::Error => {
-                let _ = bytes_sender.send(BodyChunkResponse::Error);
-            },
-            StopReading::Done => {
-                let _ = bytes_sender.send(BodyChunkResponse::Done);
-            },
+        if let Some(bytes_sender) = self.bytes_sender.take() {
+            match reason {
+                StopReading::Error => {
+                    let _ = bytes_sender.send(BodyChunkResponse::Error);
+                },
+                StopReading::Done => {
+                    let _ = bytes_sender.send(BodyChunkResponse::Done);
+                },
+            }
         }
         let _ = self.control_sender.take();
     }

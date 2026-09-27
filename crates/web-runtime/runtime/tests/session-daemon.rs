@@ -3823,9 +3823,11 @@ fn materialized_form_post_body_replays_across_temporary_redirect() {
             "script_text":r#"
 const state = await page.evaluate(async () => {
   const request = new Request('/complete', { method: 'POST', body: 'body=once' });
+  const rawBody = request.body;
   const before = request.bodyUsed;
   const response = await fetch(request);
   const after = request.bodyUsed;
+  const rawRead = await rawBody.getReader().read();
   let reuseError = '';
   try { await fetch(request); } catch (error) { reuseError = error.name; }
   const source = new Request('/complete', { method: 'POST', body: 'body=source' });
@@ -3861,6 +3863,7 @@ const state = await page.evaluate(async () => {
     after,
     reuseError,
     status: response.status,
+    rawBodyDone: rawRead.done,
     sourceUsed: source.bodyUsed,
     constructedStatus: constructedResponse.status,
     lockedError,
@@ -3888,6 +3891,7 @@ console.log(JSON.stringify(state));
     assert_eq!(state["after"], true, "{state:#}");
     assert_eq!(state["reuseError"], "TypeError", "{state:#}");
     assert_eq!(state["status"], 200, "{state:#}");
+    assert_eq!(state["rawBodyDone"], true, "{state:#}");
     assert_eq!(state["sourceUsed"], true, "{state:#}");
     assert_eq!(state["constructedStatus"], 200, "{state:#}");
     assert_eq!(state["lockedError"], "TypeError", "{state:#}");

@@ -412,6 +412,15 @@ impl RequestBody {
         self.body_chunk_request_channel.lock().take();
     }
 
+    /// Detach a script-side producer that was superseded by a proxied body.
+    /// The terminal message lets its route drop the sender/receiver ownership cycle even when
+    /// net never connected to that producer.
+    pub fn detach_stream(&self) {
+        if let Some(sender) = self.body_chunk_request_channel.lock().take() {
+            let _ = sender.send(BodyChunkRequest::Done);
+        }
+    }
+
     pub fn source_is_null(&self) -> bool {
         self.source == BodySource::Null
     }
