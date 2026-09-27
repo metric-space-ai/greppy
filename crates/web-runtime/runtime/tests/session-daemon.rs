@@ -8364,12 +8364,25 @@ fn ordinary_sessions_isolate_cookie_state() {
     let _guard = Supervisor::spawn(&socket, "run_cookie_isolation", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     let call = |method: &str, payload| {
-        unix_request(
+        let started = Instant::now();
+        eprintln!("cookie-isolation stage begin method={method}");
+        let response = unix_request(
             &socket,
             &Request::new("run_cookie_isolation", method, payload),
             Duration::from_secs(30),
         )
-        .expect("cookie isolation request")
+        .unwrap_or_else(|error| {
+            panic!(
+                "cookie isolation request failed method={method} elapsed={:?}: {error}",
+                started.elapsed()
+            )
+        });
+        eprintln!(
+            "cookie-isolation stage end method={method} elapsed={:?} status={}",
+            started.elapsed(),
+            response.status
+        );
+        response
     };
     let create = || {
         let response = call("web.session.create", json!({"profile":"project"}));
