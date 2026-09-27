@@ -1652,7 +1652,7 @@ fn resolve_and_persist_edges(
     project: &str,
     edges: &[ExtractedEdge],
 ) -> Result<usize> {
-    resolve_and_persist_edges_with_progress(store, project, edges, &mut |_| {})
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, &mut |_| {}, &[])
 }
 
 fn resolve_and_persist_edges_with_progress(
@@ -1660,6 +1660,16 @@ fn resolve_and_persist_edges_with_progress(
     project: &str,
     edges: &[ExtractedEdge],
     progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<usize> {
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, progress, &[])
+}
+
+fn resolve_and_persist_edges_with_progress_and_preserved(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+    preserved_overlay_edges: &[NewOverlayEdge],
 ) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
@@ -1867,7 +1877,7 @@ fn resolve_and_persist_edges_with_progress(
     // the same IMPORTS-then-references order resolved above.
     progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     if store.is_overlay() {
-        let logical = resolved
+        let resolved_logical = resolved
             .iter()
             .map(|edge| {
                 let source_qualified_name =
@@ -1893,6 +1903,8 @@ fn resolve_and_persist_edges_with_progress(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut logical = preserved_overlay_edges.to_vec();
+        logical.extend(resolved_logical);
         store.replace_overlay_edges(project, &logical)?;
     } else {
         insert_edges_batched(store, &resolved)?;
@@ -2051,7 +2063,9 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
 /// Store-CoW Delta. This is intentionally O(Delta raw edges), never O(Base):
 /// it closes no-op/prune generations where the incremental parser correctly
 /// skips unchanged dirty files but publication still needs a self-contained
-/// next Delta snapshot.
+/// next Delta snapshot. A small set of compatibility edges published by the
+/// one-shot Base repair is carried forward from existing overlay rows; it is
+/// filtered by current visibility and does not rescan Base raw edges.
 pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
     if !store.is_overlay() {
         return Err(greppy_core::Error::Invalid(
@@ -2059,7 +2073,14 @@ pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> 
         ));
     }
     let raw_edges = load_all_raw_edges(store, project)?;
-    resolve_and_persist_edges(store, project, &raw_edges)
+    let preserved = repaired_base_overlay_edges(store, project)?;
+    resolve_and_persist_edges_with_progress_and_preserved(
+        store,
+        project,
+        &raw_edges,
+        &mut |_| {},
+        &preserved,
+    )
 }
 
 /// Rebuild every visible logical edge in a private Store-CoW Delta from the
@@ -2073,12 +2094,81 @@ pub fn rebuild_visible_overlay_edges(store: &mut Store, project: &str) -> Result
             "rebuild_visible_overlay_edges requires an overlay Store".into(),
         ));
     }
+    let delta_files = store
+        .list_delta_raw_edges(project)?
+        .into_iter()
+        .map(|edge| edge.file_path)
+        .collect::<std::collections::HashSet<_>>();
     let raw_edges = store.list_raw_edges(project)?;
     let edges = raw_edges
         .into_iter()
-        .map(extracted_edge_from_raw)
+        .map(|raw| {
+            let mut edge = extracted_edge_from_raw(raw);
+            if !delta_files.contains(&edge.file_path) {
+                if let Some(properties) = edge.properties.as_object_mut() {
+                    properties.insert(
+                        REPAIRED_BASE_EDGE_PROPERTY.into(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
+            edge
+        })
         .collect::<Vec<_>>();
     resolve_and_persist_edges(store, project, &edges)
+}
+
+const REPAIRED_BASE_EDGE_PROPERTY: &str = "greppy_base_repair_v2";
+
+fn repaired_base_overlay_edges(store: &Store, project: &str) -> Result<Vec<NewOverlayEdge>> {
+    let rows = {
+        let mut stmt = store
+            .conn()
+            .prepare_cached(
+                "SELECT source_qualified_name, target_qualified_name, edge_type, properties
+                 FROM main.overlay_edges
+                 WHERE project = ?1
+                   AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+            )
+            .map_err(sqlite_err)?;
+        stmt.query_map(rusqlite::params![project], |row| {
+            let properties: String = row.get(3)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                properties,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut preserved = Vec::with_capacity(rows.len());
+    for (source, target, edge_type, properties) in rows {
+        let Some(source_node) = store.get_node_by_qname(project, &source)? else {
+            continue;
+        };
+        let source_hidden: i64 = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.greppy_hidden_paths WHERE path = ?1)",
+                rusqlite::params![source_node.file_path],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if source_hidden != 0 || store.get_node_by_qname(project, &target)?.is_none() {
+            continue;
+        }
+        preserved.push(NewOverlayEdge {
+            project: project.to_string(),
+            source_qualified_name: source,
+            target_qualified_name: target,
+            edge_type,
+            properties: serde_json::from_str(&properties).map_err(|error| {
+                greppy_core::Error::Store(format!("overlay edge JSON: {error}"))
+            })?,
+        });
+    }
+    Ok(preserved)
 }
 
 // Test-only instrumentation: the number of raw edges PHASE B actually fed
@@ -2882,51 +2972,181 @@ fn rust_crate_roots_for_project(
 ) -> Option<std::collections::HashSet<String>> {
     let project = store.get_project(project).ok().flatten()?;
     let root = std::path::PathBuf::from(project.root_path);
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let mut roots = std::collections::HashSet::new();
-    let mut section = "";
-    let mut has_lib_path = false;
-    let mut has_bin_path = false;
-    for line in manifest.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line;
-            continue;
-        }
-        if !matches!(section, "[lib]" | "[[bin]]") || !line.starts_with("path") {
-            continue;
-        }
-        let Some((_, value)) = line.split_once('=') else {
-            continue;
-        };
-        let path = value.trim().trim_matches('"').trim_matches('\'');
-        if path.is_empty() {
-            continue;
-        }
-        if section == "[lib]" {
-            has_lib_path = true;
-        } else {
-            has_bin_path = true;
-        }
-        roots.insert(path.replace('\\', "/"));
-    }
-    // Cargo's implicit targets are authoritative when their conventional
-    // files are present. Explicit target paths above cover arbitrary layouts.
-    if !has_lib_path && known_files.contains("src/lib.rs") {
-        roots.insert("src/lib.rs".to_string());
-    }
-    if !has_bin_path {
-        if known_files.contains("src/main.rs") {
-            roots.insert("src/main.rs".to_string());
-        }
-        roots.extend(
-            known_files
-                .iter()
-                .filter(|path| path.starts_with("src/bin/") && path.ends_with(".rs"))
-                .cloned(),
-        );
+    let mut visited = std::collections::HashSet::new();
+    if !rust_crate_roots_from_manifest(
+        &root.join("Cargo.toml"),
+        &root,
+        known_files,
+        &mut roots,
+        &mut visited,
+    ) {
+        return None;
     }
     Some(roots)
+}
+
+fn rust_crate_roots_from_manifest(
+    manifest_path: &std::path::Path,
+    repository_root: &std::path::Path,
+    known_files: &std::collections::HashSet<String>,
+    roots: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> bool {
+    let manifest_path = std::fs::canonicalize(manifest_path)
+        .ok()
+        .unwrap_or_else(|| manifest_path.to_path_buf());
+    if !visited.insert(manifest_path.clone()) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let manifest_root = manifest_path.parent().unwrap_or(repository_root);
+    if let Some(members) = document
+        .get("workspace")
+        .and_then(|item| item.as_table())
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_array())
+    {
+        for member in members.iter().filter_map(|value| value.as_str()) {
+            for member_manifest in workspace_member_manifests(manifest_root, member) {
+                let _ = rust_crate_roots_from_manifest(
+                    &member_manifest,
+                    repository_root,
+                    known_files,
+                    roots,
+                    visited,
+                );
+            }
+        }
+    }
+    let Some(package) = document.get("package").and_then(|item| item.as_table()) else {
+        return true;
+    };
+
+    let relative_path = |path: &std::path::Path| -> Option<String> {
+        let relative = path.strip_prefix(repository_root).ok()?;
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    };
+    let add_target = |target: &str, roots: &mut std::collections::HashSet<String>| {
+        let path = manifest_root.join(target);
+        if let Some(relative) = relative_path(&path) {
+            roots.insert(relative);
+        }
+    };
+    let known_target = |target: &str| {
+        relative_path(&manifest_root.join(target))
+            .is_some_and(|relative| known_files.contains(&relative))
+    };
+    let autolib = package
+        .get("autolib")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+    let autobins = package
+        .get("autobins")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+
+    let lib = document.get("lib").and_then(|item| item.as_table());
+    if let Some(path) = lib
+        .and_then(|table| table.get("path"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_str())
+    {
+        add_target(path, roots);
+    } else if autolib && known_target("src/lib.rs") {
+        add_target("src/lib.rs", roots);
+    }
+
+    if let Some(bins) = document
+        .get("bin")
+        .and_then(|item| item.as_array_of_tables())
+    {
+        for bin in bins {
+            if let Some(path) = bin
+                .get("path")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                add_target(path, roots);
+            } else if let Some(name) = bin
+                .get("name")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                let inferred = format!("src/bin/{name}.rs");
+                if known_target(&inferred) {
+                    add_target(&inferred, roots);
+                }
+            }
+        }
+    }
+    if autobins {
+        if known_target("src/main.rs") {
+            add_target("src/main.rs", roots);
+        }
+        let manifest_prefix = relative_path(manifest_root).unwrap_or_default();
+        let bin_prefix = if manifest_prefix.is_empty() {
+            "src/bin/".to_string()
+        } else {
+            format!("{manifest_prefix}/src/bin/")
+        };
+        for path in known_files {
+            let Some(rest) = path.strip_prefix(&bin_prefix) else {
+                continue;
+            };
+            let direct = !rest.contains('/') && rest.ends_with(".rs");
+            let nested = rest.matches('/').count() == 1 && rest.ends_with("/main.rs");
+            if direct || nested {
+                add_target(path, roots);
+            }
+        }
+    }
+    true
+}
+
+fn workspace_member_manifests(
+    workspace_root: &std::path::Path,
+    member: &str,
+) -> Vec<std::path::PathBuf> {
+    let pattern = std::path::Path::new(member);
+    let Some((wildcard_index, _)) = pattern
+        .components()
+        .enumerate()
+        .find(|(_, component)| component.as_os_str().to_string_lossy() == "*")
+    else {
+        return vec![workspace_root.join(pattern).join("Cargo.toml")];
+    };
+    let components = pattern.components().collect::<Vec<_>>();
+    let mut prefix = std::path::PathBuf::new();
+    for component in &components[..wildcard_index] {
+        prefix.push(component.as_os_str());
+    }
+    let mut suffix = std::path::PathBuf::new();
+    for component in &components[wildcard_index + 1..] {
+        suffix.push(component.as_os_str());
+    }
+    let Ok(entries) = std::fs::read_dir(workspace_root.join(prefix)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .map(|path| path.join(&suffix).join("Cargo.toml"))
+        .collect()
 }
 
 fn rust_module_files_below_alias(
@@ -5887,6 +6107,66 @@ def Widget():
                 target.qualified_name
             );
         }
+    }
+
+    #[test]
+    fn cargo_manifest_targets_cover_workspace_custom_and_implicit_bins() {
+        let repo = tempfile::tempdir().unwrap();
+        let custom = repo.path().join("custom");
+        let implicit = repo.path().join("implicit");
+        fs::create_dir_all(custom.join("src/core")).unwrap();
+        fs::create_dir_all(custom.join("src/core/decoy")).unwrap();
+        fs::create_dir_all(implicit.join("src/bin/nested")).unwrap();
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            custom.join("Cargo.toml"),
+            "[package]\nname = \"custom\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"custom\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            implicit.join("Cargo.toml"),
+            "[package]\nname = \"implicit\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        for path in [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ] {
+            fs::write(repo.path().join(path), "fn item() {}\n").unwrap();
+        }
+        let known_files = [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut roots = std::collections::HashSet::new();
+        assert!(rust_crate_roots_from_manifest(
+            &repo.path().join("Cargo.toml"),
+            repo.path(),
+            &known_files,
+            &mut roots,
+            &mut std::collections::HashSet::new(),
+        ));
+        assert!(roots.contains("custom/src/core/main.rs"));
+        assert!(!roots.contains("custom/src/core/decoy/main.rs"));
+        assert!(roots.contains("implicit/src/main.rs"));
+        assert!(roots.contains("implicit/src/bin/tool.rs"));
+        assert!(roots.contains("implicit/src/bin/nested/main.rs"));
+        assert!(!roots.contains("implicit/src/bin/nested/helper.rs"));
     }
 
     #[test]
