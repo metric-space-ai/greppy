@@ -640,7 +640,7 @@ pub(crate) fn freshness_json_is_fresh(freshness: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-fn recover_missing_query_base(root: Option<&str>, effective_root: &Path) -> Result<()> {
+fn recover_missing_query_base(root: Option<&str>, effective_root: &std::path::Path) -> Result<()> {
     if !auto_reindex_enabled() {
         return Ok(());
     }
