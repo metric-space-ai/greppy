@@ -3962,6 +3962,8 @@ console.log(JSON.stringify(state));
         assert_eq!(opened.status, "ok", "{opened:?}");
         let clone_state = call("web.run", json!({
             "session_id":clone_session,
+            "script_source":"inline",
+            "bind_session_page":true,
             "script_text":format!(r#"
 const state = await page.evaluate(async () => {{
   const source = new Request('/complete', {{
