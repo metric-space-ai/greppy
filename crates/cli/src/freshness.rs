@@ -125,6 +125,52 @@ pub(crate) fn provider_policy_graph_gate(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
+    provider_policy_graph_gate_with_incomplete(
+        store,
+        root,
+        project,
+        command,
+        json,
+        extra,
+        empty_collection_field,
+        incomplete_providers,
+    )
+}
+
+pub(crate) fn provider_policy_graph_gate_for_edges(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    edge_types: &[&str],
+    json: bool,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+) -> Result<Option<i32>> {
+    let incomplete_providers = graph_edge_incomplete_provider_json(store, project, edge_types)?;
+    provider_policy_graph_gate_with_incomplete(
+        store,
+        root,
+        project,
+        command,
+        json,
+        extra,
+        empty_collection_field,
+        incomplete_providers,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_policy_graph_gate_with_incomplete(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    command: &str,
+    json: bool,
+    extra: serde_json::Value,
+    empty_collection_field: &str,
+    incomplete_providers: Vec<serde_json::Value>,
+) -> Result<Option<i32>> {
     if !provider_policy_blocks_query(&incomplete_providers)? {
         return Ok(None);
     }

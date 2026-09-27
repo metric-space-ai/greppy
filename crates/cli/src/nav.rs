@@ -1111,11 +1111,12 @@ pub(crate) fn dispatch_impact(
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra,
         "hits",
@@ -4063,11 +4064,12 @@ pub(crate) fn dispatch_path(
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         serde_json::json!({
             "from": from,

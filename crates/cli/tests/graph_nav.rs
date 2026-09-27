@@ -1941,6 +1941,37 @@ fn who_calls_provider_completeness_tracks_its_relation_union_and_file_failures()
         "{strict:#}"
     );
 
+    // The related graph commands have narrower, source-traced relation sets:
+    // callees and path(CALLS) read only calls, as does outgoing impact by
+    // default. They remain complete while incoming default impact's all-
+    // reference union correctly requires usages/type_refs/imports too.
+    for args in [
+        vec!["callees", "caller", "--json", "--all"],
+        vec!["path", "--from", "caller", "--to", "do_it", "--json"],
+        vec!["impact", "caller", "--direction", "outgoing", "--json"],
+    ] {
+        let (code, out, err) = run_with_env(
+            &args,
+            &repo,
+            &store,
+            &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+        );
+        assert_eq!(
+            code, 0,
+            "CALLS-only command {args:?} must pass strict policy: stderr={err}\nstdout={out}"
+        );
+    }
+    let (incoming_code, incoming_out, incoming_err) = run_with_env(
+        &["impact", "do_it", "--json"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(
+        incoming_code, 1,
+        "incoming all-reference impact must require its full union: stderr={incoming_err}\nstdout={incoming_out}"
+    );
+
     // A failed source file can hide edges even when the manifest advertises
     // every requested relation, so it remains incomplete for every query.
     set_rust_provider_completeness(

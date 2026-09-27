@@ -3403,14 +3403,35 @@ fn incomplete_provider_json_for_edges(
 }
 
 const WHO_CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls", "usages"];
+const CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls"];
 
 fn provider_edge_classes_for_command(command: &str) -> &'static [&'static str] {
     match command {
         // dispatch_who_calls and the batched equivalent both read the incoming
         // union of CALLS and USAGE edges.
         "who-calls" => WHO_CALLS_PROVIDER_EDGE_CLASSES,
+        "callees" => CALLS_PROVIDER_EDGE_CLASSES,
         _ => &[],
     }
+}
+
+fn provider_edge_classes_for_graph_edges(edge_types: &[&str]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    for edge_type in edge_types {
+        let class = match *edge_type {
+            "CALLS" => "calls",
+            "USAGE" | "USES" => "usages",
+            "TYPE_REF" => "type_refs",
+            "IMPORTS" => "imports",
+            // Unknown/custom graph relations have no trustworthy provider
+            // capability mapping, so retain broad completeness semantics.
+            _ => return Vec::new(),
+        };
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
 }
 
 fn query_incomplete_provider_json(
@@ -3419,6 +3440,15 @@ fn query_incomplete_provider_json(
     command: &str,
 ) -> Result<Vec<serde_json::Value>> {
     incomplete_provider_json_for_edges(store, project, provider_edge_classes_for_command(command))
+}
+
+fn graph_edge_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    edge_types: &[&str],
+) -> Result<Vec<serde_json::Value>> {
+    let required = provider_edge_classes_for_graph_edges(edge_types);
+    incomplete_provider_json_for_edges(store, project, &required)
 }
 
 /// A provider row is "non-code noise" when it exists only because the indexer
@@ -3595,7 +3625,8 @@ fn impact_counts_json_with_expand(
         .unwrap_or(false);
     // Only real code providers count toward impact completeness; `.stderr` /
     // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
-    let incomplete_providers = code_incomplete_provider_json(store, project)?;
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, meta.edge_types)?;
     // Rule 3: the one-symbol answer has the same shape as a batch of several.
     let mut hits = hits;
     for hit in &mut hits {
@@ -3870,7 +3901,8 @@ fn path_counts_json(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, &[meta.edge_type])?;
     let steps: Vec<_> = path
         .map(|p| p.rows.iter().map(graph_row_json).collect())
         .unwrap_or_default();
