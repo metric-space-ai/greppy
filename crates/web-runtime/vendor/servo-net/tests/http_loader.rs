@@ -25,6 +25,7 @@ use headers::{
 use http::header::{self, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use http::uri::Authority;
 use http::{HeaderName, Method, StatusCode};
+use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
@@ -999,6 +1000,49 @@ fn test_load_sets_content_length_to_length_of_request_body() {
             .code()
             .is_success()
     );
+}
+
+#[test]
+fn test_repeated_fresh_form_posts_keep_their_body_streams() {
+    const ATTEMPTS: usize = 3;
+    let content = "username=admin&password=secret";
+    let content_len = content.len() as u64;
+    let (body_sender, body_receiver) = unbounded();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              _response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            assert_eq!(request.method(), Method::POST);
+            assert_eq!(
+                request.headers().typed_get::<ContentLength>(),
+                Some(ContentLength(content_len))
+            );
+            body_sender.send(request.into_body()).unwrap();
+        };
+    let (server, url) = make_server(handler);
+
+    for _ in 0..ATTEMPTS {
+        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .method(Method::POST)
+            .body(Some(create_request_body_with_content(content.to_owned())))
+            .destination(Destination::Document)
+            .origin(mock_origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build();
+
+        let response = fetch(request, None);
+        assert!(response.actual_response().status.code().is_success());
+    }
+
+    for _ in 0..ATTEMPTS {
+        let body = body_receiver.recv().unwrap();
+        let actual = spawn_blocking_task::<_, Vec<u8>>(async move {
+            body.collect().await.unwrap().to_bytes().to_vec()
+        });
+        assert_eq!(actual, content.as_bytes());
+    }
+    assert!(body_receiver.try_recv().is_err());
+    let _ = server.close();
 }
 
 #[test]

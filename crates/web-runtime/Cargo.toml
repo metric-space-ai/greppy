@@ -16,3 +16,5 @@ servo-embedder-traits = { path = "vendor/servo-embedder-traits" }
 # ancestors instead. See vendor/servo-layout/flow/inline/inline_box.rs.
 servo-layout = { path = "vendor/servo-layout" }
 servo-net = { path = "vendor/servo-net" }
+servo-net-traits = { path = "vendor/servo-net-traits" }
+servo-script = { path = "vendor/servo-script" }
