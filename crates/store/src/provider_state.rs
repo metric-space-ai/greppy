@@ -251,6 +251,12 @@ mod tests {
             !failed.supports_edge_class("calls"),
             "failed or stale status cannot claim a listed capability"
         );
+        let mut unknown = got.clone();
+        unknown.status = "unknown_future_status".into();
+        assert!(
+            !unknown.supports_edge_class("calls"),
+            "an unknown status must fail closed"
+        );
         let mut contradictory = got.clone();
         contradictory.unsupported_edge_classes.push("calls".into());
         assert!(
