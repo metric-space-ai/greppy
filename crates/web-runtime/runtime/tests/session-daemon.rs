@@ -3886,10 +3886,6 @@ const state = await page.evaluate(async () => {
     duplex: 'half',
   });
   const streamedResponse = await fetch(streamed);
-  const cloneSource = new Request('/complete', { method: 'POST', body: 'body=cloned' });
-  const cloned = cloneSource.clone();
-  const cloneSourceResponse = await fetch(cloneSource);
-  const clonedResponse = await fetch(cloned);
   return {
     before,
     after,
@@ -3904,10 +3900,6 @@ const state = await page.evaluate(async () => {
     replacementStatus: replacementResponse.status,
     streamedUsed: streamed.bodyUsed,
     streamedStatus: streamedResponse.status,
-    cloneSourceUsed: cloneSource.bodyUsed,
-    clonedUsed: cloned.bodyUsed,
-    cloneSourceStatus: cloneSourceResponse.status,
-    clonedStatus: clonedResponse.status,
   };
 });
 console.log(JSON.stringify(state));
@@ -3932,23 +3924,70 @@ console.log(JSON.stringify(state));
     assert_eq!(state["replacementStatus"], 200, "{state:#}");
     assert_eq!(state["streamedUsed"], true, "{state:#}");
     assert_eq!(state["streamedStatus"], 200, "{state:#}");
-    assert_eq!(state["cloneSourceUsed"], true, "{state:#}");
-    assert_eq!(state["clonedUsed"], true, "{state:#}");
-    assert_eq!(state["cloneSourceStatus"], 200, "{state:#}");
-    assert_eq!(state["clonedStatus"], 200, "{state:#}");
     for body in [
         b"body=once".as_slice(),
         b"body=source".as_slice(),
         b"body=locked".as_slice(),
         b"body=replacement".as_slice(),
         b"body=streamed".as_slice(),
-        b"body=cloned".as_slice(),
-        b"body=cloned".as_slice(),
     ] {
         assert_eq!(
             posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),
             body
         );
+    }
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+
+    for clone_first in [false, true] {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        assert_eq!(created.status, "ok", "{created:?}");
+        let clone_session = created.result.as_ref().unwrap()["session_id"]
+            .as_str().unwrap();
+        let opened = call("web.goto", json!({"session_id":clone_session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "{opened:?}");
+        let clone_state = call("web.run", json!({
+            "session_id":clone_session,
+            "script":format!(r#"
+const state = await page.evaluate(async () => {{
+  const source = new Request('/complete', {{
+    method:'POST',
+    body:new ReadableStream({{start(controller) {{
+      controller.enqueue(new TextEncoder().encode('body=cloned'));
+      controller.close();
+    }}}}),
+    duplex:'half',
+  }});
+  const clone = source.clone();
+  const first = {} ? clone : source;
+  const second = {} ? source : clone;
+  const firstResponse = await fetch(first);
+  const secondResponse = await fetch(second);
+  let sourceReuseError = '';
+  let cloneReuseError = '';
+  try {{ await fetch(source); }} catch (error) {{ sourceReuseError = error.name; }}
+  try {{ await fetch(clone); }} catch (error) {{ cloneReuseError = error.name; }}
+  return {{sourceUsed:source.bodyUsed, cloneUsed:clone.bodyUsed,
+    firstStatus:firstResponse.status, secondStatus:secondResponse.status,
+    sourceReuseError, cloneReuseError}};
+}});
+console.log(JSON.stringify(state));
+"#, clone_first, clone_first),
+        }));
+        assert_eq!(clone_state.status, "ok", "clone_first={clone_first}: {clone_state:?}");
+        let stdout = clone_state.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        let state: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        assert_eq!(state["sourceUsed"], true, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["cloneUsed"], true, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["firstStatus"], 200, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["secondStatus"], 200, "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["sourceReuseError"], "TypeError", "clone_first={clone_first}: {state:#}");
+        assert_eq!(state["cloneReuseError"], "TypeError", "clone_first={clone_first}: {state:#}");
+        for _ in 0..2 {
+            assert_eq!(posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(), b"body=cloned", "clone_first={clone_first}");
+        }
+        let closed = call("web.session.close", json!({"session_id":clone_session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
     }
     assert!(posted_bodies.try_recv().is_err());
 }

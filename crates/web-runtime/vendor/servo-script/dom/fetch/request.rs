@@ -25,7 +25,7 @@ use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_url::ServoUrl;
 
 use crate::body::{
-    BodyMixin, BodyType, Extractable, body_text_stream, clone_body_stream_for_dom_body,
+    BodyMixin, BodyType, Extractable, body_text_stream, clone_body_stream_for_dom_request,
     consume_body, proxy_body_stream_for_dom_request,
 };
 use crate::conversions::Convert;
@@ -576,20 +576,31 @@ impl Request {
         // Step 1. Let newRequest be a copy of request, except for its body.
         let mut new_req_inner = req.clone();
         let body = new_req_inner.body.take();
+        drop(req);
 
         let r_clone = Request::new(cx, &r.global(), None, url);
         *r_clone.request.borrow_mut() = new_req_inner;
 
         // Step 2. If request’s body is non-null, set newRequest’s body
         // to the result of cloning request’s body.
-        if let Some(body) = body {
-            r_clone.request.borrow_mut().body = Some(body);
+        if let Some(body) = body.as_ref() {
+            r_clone.request.borrow_mut().body = Some(body.clone());
         }
 
         r_clone.Headers(cx).copy_from_headers(&r.Headers(cx))?;
         r_clone.Headers(cx).set_guard(headers_guard);
 
-        clone_body_stream_for_dom_body(cx, &r.body_stream, &r_clone.body_stream)?;
+        if let Some(body) = body.as_ref() {
+            if let Some((original_body, cloned_body)) = clone_body_stream_for_dom_request(
+                cx,
+                &r.body_stream,
+                &r_clone.body_stream,
+                body,
+            )? {
+                r.request.borrow_mut().body = Some(original_body);
+                r_clone.request.borrow_mut().body = Some(cloned_body);
+            }
+        }
 
         // Step 3. Return newRequest.
         Ok(r_clone)

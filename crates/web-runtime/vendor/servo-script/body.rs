@@ -82,6 +82,46 @@ pub(crate) fn clone_body_stream_for_dom_body(
     Ok(())
 }
 
+/// Clone a request body and give each streamed branch its own network producer.
+/// Materialized bodies already carry their bytes inline and can keep cloning the
+/// existing `RequestBody` value.
+pub(crate) fn clone_body_stream_for_dom_request(
+    cx: &mut JSContext,
+    original_body_stream: &MutNullableDom<ReadableStream>,
+    cloned_body_stream: &MutNullableDom<ReadableStream>,
+    source_body: &RequestBody,
+) -> Fallible<Option<(RequestBody, RequestBody)>> {
+    clone_body_stream_for_dom_body(cx, original_body_stream, cloned_body_stream)?;
+    if source_body.in_memory_bytes().is_some() {
+        return Ok(None);
+    }
+
+    let source = if source_body.source_is_null() {
+        BodySource::Null
+    } else {
+        BodySource::Object
+    };
+    let mut rebind = |stream: DomRoot<ReadableStream>| {
+        ExtractedBody {
+            stream,
+            source: source.clone(),
+            total_bytes: source_body.len(),
+            content_type: None,
+        }
+        .into_net_request_body(cx)
+        .0
+    };
+    let (Some(original_stream), Some(cloned_stream)) =
+        (original_body_stream.get(), cloned_body_stream.get())
+    else {
+        return Ok(None);
+    };
+    let original_body = rebind(original_stream);
+    let cloned_body = rebind(cloned_stream);
+    source_body.detach_stream();
+    Ok(Some((original_body, cloned_body)))
+}
+
 /// Create the identity proxy required when a `Request` is constructed from another request.
 /// Materialized bodies retain their inline network payload; streamed bodies get a new producer
 /// bound to the readable side of an identity transform.
