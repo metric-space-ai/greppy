@@ -1057,12 +1057,18 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
             Some((_, commit)) => commit,
             None => git_output(&primary, &["rev-parse", "HEAD"])?,
         };
-        let legacy_base_migration_required = structural_first_use
-            && has_verified_previous_indexer_base(&primary, &base_commit, shared_data_root)?;
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
-                None if structural_first_use && !legacy_base_migration_required => None,
+                None if structural_first_use
+                    && !has_verified_previous_indexer_base(
+                        &primary,
+                        &base_commit,
+                        shared_data_root,
+                    )? =>
+                {
+                    None
+                }
                 None => {
                     // Only the first worktree for this immutable Git tree needs a
                     // clean materialization. Every later worktree opens the
