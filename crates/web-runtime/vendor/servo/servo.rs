@@ -31,7 +31,9 @@ use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
-use net::resource_thread::new_resource_threads;
+use net::resource_thread::{
+    new_resource_threads, new_resource_threads_with_shared_async_runtime,
+};
 use net_traits::{FetchThread, ResourceThreads};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
@@ -890,16 +892,21 @@ impl Servo {
     #[servo_tracing::instrument(name = "Servo::new", skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
-        let mut opts = builder.opts.map(|opts| *opts).unwrap_or_default();
+        let mut instance_opts = builder.opts.map(|opts| *opts).unwrap_or_default();
         if cfg!(debug_assertions)
             && std::env::var("GREPPY_WEB_TEST_IGNORE_CERTS").ok().as_deref() == Some("1")
         {
-            opts.ignore_certificate_errors = true;
+            instance_opts.ignore_certificate_errors = true;
         }
-        opts::initialize_options(opts);
-        let opts = opts::get();
+        if !builder.shared_process_state {
+            opts::initialize_options(instance_opts.clone());
+        }
+        let opts = &instance_opts;
 
-        // Set the preferences globally.
+        // Set the preferences globally. Construction is synchronous on the
+        // embedder thread: resource-thread connectors copy proxy preferences
+        // before this method returns, so a later dependent Servo cannot reroute
+        // an already-live context.
         // TODO: It would be better to make these private to a particular Servo instance.
         let preferences = builder.preferences.map(|opts| *opts);
         servo_config::prefs::set(preferences.unwrap_or_default());
@@ -916,12 +923,14 @@ impl Servo {
             Ordering::Relaxed,
         );
 
-        if !opts.multiprocess {
+        if !opts.multiprocess && !builder.shared_process_state {
             media_platform::init();
         }
 
         // Reserving a namespace to create WebViewId.
-        PipelineNamespace::install(EMBEDDER_PIPELINE_NAMESPACE_ID);
+        if !builder.shared_process_state {
+            PipelineNamespace::install(EMBEDDER_PIPELINE_NAMESPACE_ID);
+        }
 
         // Get both endpoints of a special channel for communication between
         // the client window and `Paint`. This channel is unique because
@@ -952,7 +961,7 @@ impl Servo {
 
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
-        let js_engine_setup = if !opts.multiprocess {
+        let js_engine_setup = if !opts.multiprocess && !builder.shared_process_state {
             Some(script::init())
         } else {
             None
@@ -978,16 +987,29 @@ impl Servo {
 
         let protocols = Arc::new(protocols);
         let (public_resource_threads, private_resource_threads, async_runtime) =
-            new_resource_threads(
-                devtools_sender.clone(),
-                time_profiler_chan.clone(),
-                mem_profiler_chan.clone(),
-                net_embedder_proxy,
-                opts.config_dir.clone(),
-                opts.certificate_path.clone(),
-                opts.ignore_certificate_errors,
-                protocols.clone(),
-            );
+            if builder.shared_process_state {
+                new_resource_threads_with_shared_async_runtime(
+                    devtools_sender.clone(),
+                    time_profiler_chan.clone(),
+                    mem_profiler_chan.clone(),
+                    net_embedder_proxy,
+                    opts.config_dir.clone(),
+                    opts.certificate_path.clone(),
+                    opts.ignore_certificate_errors,
+                    protocols.clone(),
+                )
+            } else {
+                new_resource_threads(
+                    devtools_sender.clone(),
+                    time_profiler_chan.clone(),
+                    mem_profiler_chan.clone(),
+                    net_embedder_proxy,
+                    opts.config_dir.clone(),
+                    opts.certificate_path.clone(),
+                    opts.ignore_certificate_errors,
+                    protocols.clone(),
+                )
+            };
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
             mem_profiler_chan.clone(),
@@ -1010,6 +1032,7 @@ impl Servo {
             async_runtime,
             public_storage_threads.clone(),
             private_storage_threads.clone(),
+            !builder.shared_process_state,
         );
 
         net::connector::prewarm_tls();
@@ -1217,6 +1240,7 @@ fn create_constellation(
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
+    owns_process_state: bool,
 ) {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
@@ -1258,6 +1282,7 @@ fn create_constellation(
         #[cfg(feature = "webgpu")]
         wgpu_image_map: paint.webgpu_image_map(),
         async_runtime,
+        owns_process_state,
         privileged_urls,
         wake_lock_provider: Box::new(DefaultWakeLockDelegate),
     };
@@ -1425,6 +1450,7 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    shared_process_state: bool,
 }
 
 impl Default for ServoBuilder {
@@ -1434,12 +1460,26 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            shared_process_state: false,
         }
     }
 }
 
 impl ServoBuilder {
     pub fn build(self) -> Servo {
+        Servo::new(self)
+    }
+
+    /// Build another in-process Servo while an existing Servo owns the
+    /// process-global JavaScript engine and embedder pipeline namespace.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep the owning Servo alive until this Servo and every
+    /// WebView created from it have been dropped. Both Servos must run on the
+    /// same embedder thread so the installed pipeline namespace remains valid.
+    pub unsafe fn build_with_shared_process_state(mut self) -> Servo {
+        self.shared_process_state = true;
         Servo::new(self)
     }
 

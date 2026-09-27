@@ -20,7 +20,7 @@ fn workflow_supervisor(socket: &Path, run_id: &str, fixture: &str) -> Supervisor
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .process_group(0);
-    Supervisor::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+    Supervisor::finish_spawn(socket, run_id, command, TEST_DEADLINE, true)
 }
 
 const PAGE: &str = r#"<!doctype html><html><body>

@@ -31,6 +31,7 @@ use url::Url;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
+const PERSISTENT_PROFILE_ROOT_ENV: &str = "GREPPY_WEB_PERSISTENT_PROFILE_ROOT";
 const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
@@ -1057,6 +1058,7 @@ impl ObjectLife {
 enum PageSlot {
     Live {
         pair: (WebView, Rc<Delegate>),
+        bundle: Option<Rc<EngineBundle>>,
         generation: u64,
         context_id: Option<String>,
         browser_id: Option<String>,
@@ -1070,16 +1072,27 @@ impl PageSlot {
     fn live(
         webview: WebView,
         delegate: Rc<Delegate>,
+        bundle: Option<Rc<EngineBundle>>,
         context_id: Option<String>,
         browser_id: Option<String>,
     ) -> Self {
         Self::Live {
             pair: (webview, delegate),
+            bundle,
             generation: 1,
             context_id,
             browser_id,
         }
     }
+}
+
+struct EngineBundle {
+    servo: Servo,
+    rendering_context: Rc<dyn RenderingContext>,
+    profile: SharedProfile,
+    wake: WakeFlag,
+    user_content: Rc<UserContentManager>,
+    _proxy: PolicyProxy,
 }
 
 fn object_disposed(kind: &str) -> io::Error {
@@ -1166,9 +1179,13 @@ struct ContentEngine {
     pages: HashMap<String, PageSlot>,
     browsers: HashMap<String, ObjectLife>,
     contexts: HashMap<String, ObjectLife>,
+    context_bundles: HashMap<String, Rc<EngineBundle>>,
+    retired_network_bytes: u64,
+    session_contexts: HashMap<String, String>,
     next_id: u64,
     pump_nonce: Cell<u64>,
     pump_pending: RefCell<Vec<String>>,
+    renderer_error: RefCell<Option<String>>,
     parent_alive: Arc<AtomicBool>,
     wake: WakeFlag,
     profile: SharedProfile,
@@ -1176,6 +1193,16 @@ struct ContentEngine {
     /// frames and popups too, not just the tab the agent drove.
     user_content: Rc<UserContentManager>,
     _proxy: PolicyProxy,
+}
+
+impl Drop for ContentEngine {
+    fn drop(&mut self) {
+        // Additional Servo instances borrow the process-global JS engine and
+        // embedder namespace owned by `self.servo`; drop every dependent page
+        // and bundle before Rust reaches the owner's field drop.
+        self.pages.clear();
+        self.context_bundles.clear();
+    }
 }
 
 impl ContentEngine {
@@ -1219,9 +1246,13 @@ impl ContentEngine {
             pages: HashMap::new(),
             browsers: HashMap::new(),
             contexts: HashMap::new(),
+            context_bundles: HashMap::new(),
+            retired_network_bytes: 0,
+            session_contexts: HashMap::new(),
             next_id: 1,
             pump_nonce: Cell::new(1),
             pump_pending: RefCell::new(Vec::new()),
+            renderer_error: RefCell::new(None),
             parent_alive,
             wake,
             profile,
@@ -1247,8 +1278,166 @@ impl ContentEngine {
         id
     }
 
+    fn build_bundle(&self, storage_key: &str) -> io::Result<Rc<EngineBundle>> {
+        let rendering_context = Rc::new(
+            SoftwareRenderingContext::new(PhysicalSize {
+                width: 1280,
+                height: 720,
+            })
+            .map_err(|error| io::Error::other(format!("software renderer failed: {error:?}")))?,
+        );
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
+        let profile = SharedProfile::new(self.profile.get());
+        let proxy = PolicyProxy::spawn(profile.clone())?;
+        let preferences = engine_preferences(&proxy.uri());
+        let wake = WakeFlag::new();
+        let mut opts = Opts::default();
+        let persistent_name = storage_key.strip_prefix("persistent-");
+        if persistent_name.is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid persistent profile storage key",
+            ));
+        }
+        let config_root = persistent_name
+            .and_then(|_| std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV))
+            .or_else(|| std::env::var_os(CONTENT_CONFIG_DIR_ENV));
+        if let Some(path) = config_root {
+            let path = match persistent_name {
+                Some(name) => PathBuf::from(path).join(name).join("browser"),
+                None => PathBuf::from(path).join(storage_key),
+            };
+            std::fs::create_dir_all(&path)?;
+            opts.config_dir = Some(path);
+        }
+        // `self.servo` owns Servo's process-global SpiderMonkey setup and the
+        // embedder thread's pipeline namespace for the lifetime of this engine.
+        let servo = unsafe {
+            ServoBuilder::default()
+                .opts(opts)
+                .preferences(preferences)
+                .event_loop_waker(Box::new(wake.clone()))
+                .build_with_shared_process_state()
+        };
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_script(Rc::new(UserScript::new(shim_source().to_owned(), None)));
+        Ok(Rc::new(EngineBundle {
+            servo,
+            rendering_context,
+            profile,
+            wake,
+            user_content,
+            _proxy: proxy,
+        }))
+    }
+
+    fn spin_all_event_loops(&self) {
+        if let Err(error) = self.rendering_context.make_current() {
+            self.renderer_error
+                .borrow_mut()
+                .get_or_insert_with(|| format!("root renderer make_current failed: {error:?}"));
+            return;
+        }
+        self.servo.spin_event_loop();
+        for bundle in self.context_bundles.values() {
+            if let Err(error) = bundle.rendering_context.make_current() {
+                self.renderer_error.borrow_mut().get_or_insert_with(|| {
+                    format!("context renderer make_current failed: {error:?}")
+                });
+                return;
+            }
+            bundle.servo.spin_event_loop();
+        }
+    }
+
+    fn wake_for_webview(&self, webview: &WebView) -> WakeFlag {
+        self.pages
+            .values()
+            .find_map(|slot| match slot {
+                PageSlot::Live {
+                    pair: (candidate, _),
+                    bundle: Some(bundle),
+                    ..
+                } if candidate == webview => Some(bundle.wake.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.wake.clone())
+    }
+
+    fn profile_for_page(&self, page_id: &str) -> io::Result<NetworkProfile> {
+        match self.pages.get(page_id) {
+            Some(PageSlot::Live {
+                bundle: Some(bundle),
+                ..
+            }) => Ok(bundle.profile.get()),
+            Some(PageSlot::Live { .. }) => Ok(self.profile.get()),
+            Some(PageSlot::Disposed { generation }) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("object_disposed: Page has been closed (generation {generation})"),
+            )),
+            None => Err(object_disposed("Page")),
+        }
+    }
+
+    fn network_bytes_for(&self, params: &serde_json::Value) -> u64 {
+        if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+            return match self.pages.get(page) {
+                Some(PageSlot::Live {
+                    bundle: Some(bundle),
+                    ..
+                }) => bundle._proxy.bytes_transferred(),
+                Some(PageSlot::Live { .. }) => self._proxy.bytes_transferred(),
+                _ => 0,
+            };
+        }
+        if let Some(session) = params.get("session").and_then(|value| value.as_str()) {
+            if let Some(bundle) = self
+                .session_contexts
+                .get(session)
+                .and_then(|context| self.context_bundles.get(context))
+            {
+                return bundle._proxy.bytes_transferred();
+            }
+            return 0;
+        }
+        // Controller scripts can create several explicit contexts without a
+        // daemon-owned page. Their calls are serialized, so the before/after
+        // delta intentionally covers every context participating in that run.
+        self.context_bundles
+            .values()
+            .map(|bundle| bundle._proxy.bytes_transferred())
+            .sum::<u64>()
+            .saturating_add(self.retired_network_bytes)
+            .saturating_add(self._proxy.bytes_transferred())
+    }
+
+    fn retire_bundle(&mut self, context_id: &str) {
+        if let Some(bundle) = self.context_bundles.remove(context_id) {
+            self.retired_network_bytes = self
+                .retired_network_bytes
+                .saturating_add(bundle._proxy.bytes_transferred());
+        }
+    }
+
     fn spin_until(
         &self,
+        timeout: Duration,
+        predicate: impl FnMut() -> bool,
+    ) -> io::Result<bool> {
+        self.spin_until_on(&self.wake, timeout, predicate)
+    }
+
+    fn spin_until_on(
+        &self,
+        wake: &WakeFlag,
         timeout: Duration,
         mut predicate: impl FnMut() -> bool,
     ) -> io::Result<bool> {
@@ -1263,7 +1452,7 @@ impl ContentEngine {
             // Load-status and WebResourceRequested are event-loop messages.
             // Continue-with-headers waits on that same loop; a missed waker
             // must not sit on the Condvar until ACTION_TIMEOUT with status=Started.
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
             if predicate() {
                 return Ok(true);
             }
@@ -1272,7 +1461,7 @@ impl ContentEngine {
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                wake,
                 &mut predicate,
                 remaining.min(Duration::from_millis(10)),
             ) {
@@ -1283,7 +1472,7 @@ impl ContentEngine {
                     }
                 }
                 WakePoll::NeedSpin { .. } => {
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -1341,6 +1530,7 @@ impl ContentEngine {
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
+        let wake = self.wake_for_webview(webview);
         let mut last_js = Instant::now() - Duration::from_millis(200);
         let mut trace = NavTrace::begin();
         loop {
@@ -1356,7 +1546,7 @@ impl ContentEngine {
                 trace.finish(webview);
                 return Ok(true);
             }
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
             if terminal_failure() {
                 trace.finish(webview);
                 return Ok(true);
@@ -1372,7 +1562,7 @@ impl ContentEngine {
                 return Ok(false);
             }
             match poll_wake_step(
-                &self.wake,
+                &wake,
                 &mut || false,
                 remaining.min(Duration::from_millis(10)),
             ) {
@@ -1383,7 +1573,7 @@ impl ContentEngine {
                     }
                 }
                 WakePoll::NeedSpin { .. } => {
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -1514,7 +1704,7 @@ impl ContentEngine {
                 break;
             }
             webview.paint();
-            self.servo.spin_event_loop();
+            self.spin_all_event_loops();
             if Instant::now() >= next_poll {
                 let poll_budget = deadline
                     .saturating_duration_since(Instant::now())
@@ -1711,8 +1901,9 @@ impl ContentEngine {
         ready: impl FnMut() -> bool,
         take: impl FnMut() -> Option<T>,
     ) -> io::Result<T> {
+        let wake = self.wake_for_webview(webview);
         wait_for_recorded_loop(
-            &self.wake,
+            &wake,
             timeout,
             timeout_label,
             || {
@@ -1726,17 +1917,15 @@ impl ContentEngine {
                 if !webview.animating() {
                     return false;
                 }
-                let observed = self.wake.generation();
-                let _ = self
-                    .wake
-                    .wait_for_generation(observed, animation_frame_budget(remaining));
+                let observed = wake.generation();
+                let _ = wake.wait_for_generation(observed, animation_frame_budget(remaining));
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 true
             },
             || {
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
             },
             ready,
             take,
@@ -1767,6 +1956,7 @@ impl ContentEngine {
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
         let io_deadline = strict_boolean.then_some(deadline);
+        let wake = self.wake_for_webview(&webview);
         let mut token = alloc_wait_nonce()?;
         let mut document_generation = delegate.document_generation.get();
         delegate.clear_wait_notice(&token);
@@ -1887,16 +2077,14 @@ impl ContentEngine {
             // callbacks are pending (`WebView::animating`). That is the rAF clock,
             // not a Rust predicate sample.
             if webview.animating() {
-                let observed = self.wake.generation();
-                let _ = self
-                    .wake
-                    .wait_for_generation(observed, animation_frame_budget(remaining));
+                let observed = wake.generation();
+                let _ = wake.wait_for_generation(observed, animation_frame_budget(remaining));
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 continue;
             }
             match poll_wake_step(
-                &self.wake,
+                &wake,
                 || {
                     delegate.wait_notice(&token).is_some()
                         || delegate.document_generation.get() != document_generation
@@ -1918,7 +2106,7 @@ impl ContentEngine {
                 }
                 WakePoll::NeedSpin { .. } => {
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
             }
         }
@@ -2153,7 +2341,9 @@ impl ContentEngine {
         };
         self.reject_stale_objects(method, &params)?;
         self.reclaim_pump_tokens();
-        match method {
+        self.renderer_error.borrow_mut().take();
+        let result = (|| -> io::Result<serde_json::Value> {
+            match method {
             "chromium.launch" => {
                 let browser = self.alloc_id("browser");
                 self.browsers.insert(
@@ -2184,13 +2374,39 @@ impl ContentEngine {
                         parent: browser_id,
                     },
                 );
+                let bundle = self.build_bundle(&context)?;
+                self.context_bundles.insert(context.clone(), bundle);
                 Ok(json!({ "context": context, "generation": 1 }))
             }
-            "context.newPage" => {
-                let context_id = params
+            "context.newPage" | "session.ensurePage" => {
+                let mut context_id = params
                     .get("context")
                     .and_then(|value| value.as_str())
                     .map(str::to_owned);
+                if method == "session.ensurePage" {
+                    let session = required_str(&params, "session")?;
+                    context_id = match self.session_contexts.get(&session) {
+                        Some(context) => Some(context.clone()),
+                        None => {
+                            let context = self.alloc_id("session-context");
+                            let storage_key = params
+                                .get("storage_key")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(&context);
+                            let bundle = self.build_bundle(storage_key)?;
+                            self.contexts.insert(
+                                context.clone(),
+                                ObjectLife::Live {
+                                    generation: 1,
+                                    parent: None,
+                                },
+                            );
+                            self.context_bundles.insert(context.clone(), bundle);
+                            self.session_contexts.insert(session, context.clone());
+                            Some(context)
+                        }
+                    };
+                }
                 let browser_id = context_id
                     .as_deref()
                     .and_then(|id| match self.contexts.get(id) {
@@ -2204,20 +2420,40 @@ impl ContentEngine {
                     }
                 }
                 let page = self.alloc_id("page");
+                let bundle = context_id
+                    .as_deref()
+                    .and_then(|context| self.context_bundles.get(context))
+                    .cloned();
+                let (servo, rendering_context, profile, wake, user_content) = match bundle.as_ref() {
+                    Some(bundle) => (
+                        &bundle.servo,
+                        Rc::clone(&bundle.rendering_context),
+                        bundle.profile.clone(),
+                        bundle.wake.clone(),
+                        Rc::clone(&bundle.user_content),
+                    ),
+                    None => (
+                        &self.servo,
+                        Rc::clone(&self.rendering_context),
+                        self.profile.clone(),
+                        self.wake.clone(),
+                        Rc::clone(&self.user_content),
+                    ),
+                };
                 let delegate = Rc::new(Delegate::new(
-                    Rc::clone(&self.rendering_context),
-                    self.profile.clone(),
-                    self.wake.clone(),
-                    Rc::clone(&self.user_content),
+                    Rc::clone(&rendering_context),
+                    profile,
+                    wake.clone(),
+                    Rc::clone(&user_content),
                 ));
-                let webview = WebViewBuilder::new(&self.servo, Rc::clone(&self.rendering_context))
+                let webview = WebViewBuilder::new(servo, rendering_context)
                     .delegate(delegate.clone())
-                    .user_content_manager(Rc::clone(&self.user_content))
+                    .user_content_manager(user_content)
                     .build();
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until(ACTION_TIMEOUT, move || created.url().is_some())? {
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || created.url().is_some())? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
@@ -2225,9 +2461,15 @@ impl ContentEngine {
                 }
                 self.pages.insert(
                     page.clone(),
-                    PageSlot::live(webview, delegate, context_id, browser_id),
+                    PageSlot::live(
+                        webview,
+                        delegate,
+                        bundle,
+                        context_id.clone(),
+                        browser_id,
+                    ),
                 );
-                Ok(json!({ "page": page, "generation": 1 }))
+                Ok(json!({ "page": page, "context": context_id, "generation": 1 }))
             }
             "session.setProfile" => {
                 let name = required_str(&params, "profile")?;
@@ -2237,6 +2479,14 @@ impl ContentEngine {
                         "profile must be research or project",
                     )
                 })?;
+                if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
+                    if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
+                        bundle.profile.set(parsed);
+                        return Ok(json!({ "profile": bundle.profile.get().as_str() }));
+                    }
+                }
+                // Controller scripts set the default before constructing their
+                // explicit contexts. A bundled daemon page never mutates it.
                 self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
@@ -2249,6 +2499,7 @@ impl ContentEngine {
                             generation,
                             context_id,
                             browser_id,
+                            ..
                         }) => (
                             *generation,
                             context_id.clone(),
@@ -2319,12 +2570,13 @@ impl ContentEngine {
                 // directions — the metric behind web.run's network_bytes,
                 // which previously reported a fixed 4096-per-navigation
                 // accounting stub.
-                Ok(json!({ "bytes": self._proxy.bytes_transferred() }))
+                Ok(json!({ "bytes": self.network_bytes_for(&params) }))
             }
             "page.goto" => {
                 let page_id = required_str(&params, "page")?;
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                let page_profile = self.profile_for_page(&page_id)?;
+                if let UrlDecision::Deny { reason } = decide_url(page_profile, &url) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -2434,7 +2686,7 @@ impl ContentEngine {
                 }
                 if let Some(final_url) = webview.url() {
                     if let UrlDecision::Deny { reason } =
-                        decide_url(self.profile.get(), final_url.as_str())
+                        decide_url(page_profile, final_url.as_str())
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -2455,12 +2707,12 @@ impl ContentEngine {
                 webview.focus();
                 let loaded_ms = goto_started.map(|t| t.elapsed().as_millis());
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 // Complete is the load signal. Subresource scripts are waited
                 // by waitForFunction / init scripts on the event loop; a
                 // wall-clock sleep after every goto burned the 60s script
                 // budget without observing script start.
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let painted_ms = goto_started.map(|t| t.elapsed().as_millis());
                 self.run_init_scripts(&page_id)?;
                 if let (Some(started), Some(loaded), Some(painted)) =
@@ -2577,9 +2829,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "page.touch.tap" => {
@@ -2588,9 +2840,9 @@ impl ContentEngine {
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 tap_at(&webview, &delegate, x, y, 0.0, 0.0, || {
-                    self.servo.spin_event_loop()
+                    self.spin_all_event_loops()
                 })?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "locator.dblclick" => {
@@ -2605,9 +2857,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 click_at(
                     &webview,
                     &delegate,
@@ -2615,9 +2867,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let _ = self.locator_eval(
                     &params,
                     "nodes[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true",
@@ -2637,9 +2889,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    || self.servo.spin_event_loop(),
+                    || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 let selector = params
                     .get("selector")
                     .cloned()
@@ -2745,7 +2997,9 @@ impl ContentEngine {
                         .collect();
                     for (id, generation) in owned {
                         self.contexts
-                            .insert(id, ObjectLife::Disposed { generation });
+                            .insert(id.clone(), ObjectLife::Disposed { generation });
+                        self.retire_bundle(&id);
+                        self.session_contexts.retain(|_, context| context != &id);
                     }
                     self.dispose_pages_owned_by_browser(browser_id);
                 } else {
@@ -2760,61 +3014,7 @@ impl ContentEngine {
             }
             "session.closePage" => {
                 let page_id = required_str(&params, "page")?;
-                let (context_id, browser_id) = match self.pages.get(&page_id) {
-                    Some(PageSlot::Live {
-                        context_id,
-                        browser_id,
-                        ..
-                    }) => (context_id.clone(), browser_id.clone()),
-                    _ => (None, None),
-                };
                 self.dispose_page(&page_id);
-                if let Some(context_id) = context_id {
-                    let still_used = self.pages.values().any(|slot| {
-                        matches!(
-                            slot,
-                            PageSlot::Live {
-                                context_id: Some(owner),
-                                ..
-                            } if owner == &context_id
-                        )
-                    });
-                    if !still_used {
-                        let generation = match self.contexts.get(&context_id) {
-                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
-                            _ => None,
-                        };
-                        if let Some(generation) = generation {
-                            self.contexts.insert(
-                                context_id,
-                                ObjectLife::Disposed { generation },
-                            );
-                        }
-                    }
-                }
-                if let Some(browser_id) = browser_id {
-                    let still_used = self.pages.values().any(|slot| {
-                        matches!(
-                            slot,
-                            PageSlot::Live {
-                                browser_id: Some(owner),
-                                ..
-                            } if owner == &browser_id
-                        )
-                    });
-                    if !still_used {
-                        let generation = match self.browsers.get(&browser_id) {
-                            Some(ObjectLife::Live { generation, .. }) => Some(*generation),
-                            _ => None,
-                        };
-                        if let Some(generation) = generation {
-                            self.browsers.insert(
-                                browser_id,
-                                ObjectLife::Disposed { generation },
-                            );
-                        }
-                    }
-                }
                 Ok(json!({}))
             }
             "page.isClosed" => {
@@ -2822,7 +3022,6 @@ impl ContentEngine {
                 let closed = !matches!(self.pages.get(&page_id), Some(PageSlot::Live { .. }));
                 Ok(json!({ "closed": closed }))
             }
-            "session.ensurePage" => self.handle("context.newPage", params),
             "page.url" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
@@ -2908,7 +3107,7 @@ impl ContentEngine {
             }
             "page.screenshot" => {
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = params.get("clip").and_then(|value| {
                     if !value.is_object() {
                         return None;
@@ -2944,9 +3143,14 @@ impl ContentEngine {
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false)
                 {
-                    self.screenshot_png_render_complete(&webview, clip)?
+                    self.screenshot_png_render_complete(
+                        &webview,
+                        &delegate.rendering_context,
+                        &delegate.wake,
+                        clip,
+                    )?
                 } else {
-                    self.screenshot_png(&webview, clip)?
+                    self.screenshot_png(&webview, &delegate.rendering_context, clip)?
                 };
                 screenshot_engine_result(&png)
             }
@@ -3017,9 +3221,9 @@ impl ContentEngine {
                     resolved.y,
                     resolved.width,
                     resolved.height,
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "locator.check" | "locator.uncheck" => {
@@ -3127,14 +3331,14 @@ impl ContentEngine {
             "locator.screenshot" => {
                 let resolved = self.resolve_actionable(&params)?;
                 let page_id = required_str(&params, "page")?;
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 let clip = Some((
                     resolved.x.max(0.0) as u32,
                     resolved.y.max(0.0) as u32,
                     resolved.width.max(1.0) as u32,
                     resolved.height.max(1.0) as u32,
                 ));
-                let png = self.screenshot_png(&webview, clip)?;
+                let png = self.screenshot_png(&webview, &delegate.rendering_context, clip)?;
                 screenshot_engine_result(&png)
             }
             "locator.allTextContents" => {
@@ -3265,7 +3469,7 @@ impl ContentEngine {
                 );
                 self.evaluate(webview.clone(), &source)?;
                 webview.paint();
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 self.run_init_scripts(&page_id)?;
                 Ok(json!({}))
             }
@@ -3445,6 +3649,8 @@ impl ContentEngine {
                             .insert(context_id.to_owned(), ObjectLife::Disposed { generation });
                     }
                     self.dispose_pages_owned_by_context(context_id);
+                    self.retire_bundle(context_id);
+                    self.session_contexts.retain(|_, context| context != context_id);
                 }
                 Ok(json!({}))
             }
@@ -3715,32 +3921,54 @@ impl ContentEngine {
                             _ => None,
                         })
                         .unwrap_or_else(|| page_id.clone());
-                    let (context_id, browser_id) = match self.pages.get(&opener) {
+                    let (context_id, browser_id, bundle) = match self.pages.get(&opener) {
                         Some(PageSlot::Live {
                             context_id,
                             browser_id,
+                            bundle,
                             ..
-                        }) => (context_id.clone(), browser_id.clone()),
+                        }) => (context_id.clone(), browser_id.clone(), bundle.clone()),
                         _ => match self.pages.get(&page_id) {
                             Some(PageSlot::Live {
                                 context_id,
                                 browser_id,
+                                bundle,
                                 ..
-                            }) => (context_id.clone(), browser_id.clone()),
-                            _ => (None, None),
+                            }) => (context_id.clone(), browser_id.clone(), bundle.clone()),
+                            _ => (None, None, None),
                         },
                     };
                     let id = self.alloc_id("page");
+                    let (rendering_context, profile, wake, user_content) = match bundle.as_ref() {
+                        Some(bundle) => (
+                            Rc::clone(&bundle.rendering_context),
+                            bundle.profile.clone(),
+                            bundle.wake.clone(),
+                            Rc::clone(&bundle.user_content),
+                        ),
+                        None => (
+                            Rc::clone(&self.rendering_context),
+                            self.profile.clone(),
+                            self.wake.clone(),
+                            Rc::clone(&self.user_content),
+                        ),
+                    };
                     let delegate = Rc::new(Delegate::new(
-                        Rc::clone(&self.rendering_context),
-                        self.profile.clone(),
-                        self.wake.clone(),
-                        Rc::clone(&self.user_content),
+                        rendering_context,
+                        profile,
+                        wake,
+                        user_content,
                     ));
+                    if let Some(bundle) = bundle.as_ref() {
+                        debug_assert!(Rc::ptr_eq(
+                            &delegate.rendering_context,
+                            &bundle.rendering_context
+                        ));
+                    }
                     delegate.opener_id.replace(Some(opener.clone()));
                     self.pages.insert(
                         id.clone(),
-                        PageSlot::live(webview, delegate, context_id, browser_id),
+                        PageSlot::live(webview, delegate, bundle, context_id, browser_id),
                     );
                     pages.push(json!({ "page": id, "opener": opener, "generation": 1 }));
                 }
@@ -3786,7 +4014,9 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let index = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let url = required_str(&params, "url")?;
-                if let UrlDecision::Deny { reason } = decide_url(self.profile.get(), &url) {
+                if let UrlDecision::Deny { reason } =
+                    decide_url(self.profile_for_page(&page_id)?, &url)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
@@ -3825,7 +4055,7 @@ impl ContentEngine {
                             "timed out waiting for frame navigation",
                         ));
                     }
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                     thread::sleep(Duration::from_millis(1));
                 }
                 Ok(json!({ "url": assigned }))
@@ -3850,7 +4080,7 @@ impl ContentEngine {
                     let loading = webview.clone();
                     let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
                 Ok(json!({
                     "ok": ok,
@@ -3866,7 +4096,7 @@ impl ContentEngine {
                     let loading = webview.clone();
                     let _ = self.spin_until_loaded(&loading, call_timeout(&params), || true)?;
                     webview.paint();
-                    self.servo.spin_event_loop();
+                    self.spin_all_event_loops();
                 }
                 Ok(json!({
                     "ok": ok,
@@ -3940,7 +4170,7 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 webview.resize(PhysicalSize { width, height });
                 *delegate.viewport.borrow_mut() = (width, height);
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({ "width": width, "height": height }))
             }
             "page.viewportSize" => {
@@ -3955,9 +4185,9 @@ impl ContentEngine {
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 click_at(&webview, &delegate, x, y, 0.0, 0.0, || {
-                    self.servo.spin_event_loop()
+                    self.spin_all_event_loops()
                 })?;
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
                 Ok(json!({}))
             }
             "page.mouse.move" => {
@@ -3971,7 +4201,7 @@ impl ContentEngine {
                     &webview,
                     &delegate,
                     || InputEvent::MouseMove(MouseMoveEvent::new(point)),
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -3992,7 +4222,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -4031,7 +4261,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 let dispatch = match self.evaluate(
                     webview,
@@ -4062,7 +4292,7 @@ impl ContentEngine {
                             point,
                         ))
                     },
-                    &mut || self.servo.spin_event_loop(),
+                    &mut || self.spin_all_event_loops(),
                 )?;
                 Ok(json!({}))
             }
@@ -4071,6 +4301,11 @@ impl ContentEngine {
                 format!("unsupported_playwright_operation: {other}"),
             )),
         }
+        })();
+        if let Some(error) = self.renderer_error.borrow_mut().take() {
+            return Err(io::Error::other(error));
+        }
+        result
     }
 
     /// Make `target` the only visible webview before delivering synthetic
@@ -4091,7 +4326,7 @@ impl ContentEngine {
         // hide/show travel through the constellation asynchronously; without
         // a spin the hit test can still see the old visibility and route the
         // very next input into a hidden webview (2 of 12 clicks still died).
-        self.servo.spin_event_loop();
+        self.spin_all_event_loops();
     }
 
     fn dispatch_locator_click(
@@ -4125,9 +4360,9 @@ impl ContentEngine {
             resolved.y,
             resolved.width,
             resolved.height,
-            || self.servo.spin_event_loop(),
+            || self.spin_all_event_loops(),
         )?;
-        self.servo.spin_event_loop();
+        self.spin_all_event_loops();
         let dispatch = match self.locator_eval(
             params,
             &format!(
@@ -4353,17 +4588,22 @@ impl ContentEngine {
     fn screenshot_png_render_complete(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
+        wake: &WakeFlag,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        self.rendering_context.present();
+        rendering_context.present();
         let saved = Rc::new(RefCell::new(None));
         let callback = Rc::clone(&saved);
         webview.take_screenshot(None, move |result| {
             *callback.borrow_mut() = Some(result);
         });
         let pending = Rc::clone(&saved);
-        if !self.spin_until(ACTION_TIMEOUT, move || pending.borrow().is_some())? {
+        if !self.spin_until_on(wake, ACTION_TIMEOUT, move || pending.borrow().is_some())? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out waiting for complete rendering; retry without renderComplete for an instant screenshot",
@@ -4380,6 +4620,7 @@ impl ContentEngine {
     fn screenshot_png(
         &self,
         webview: &WebView,
+        rendering_context: &Rc<dyn RenderingContext>,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
         // An agent's screenshot means "what does the page look like NOW".
@@ -4395,8 +4636,11 @@ impl ContentEngine {
         // holds the freshly painted frame until present swaps it away. The
         // present afterwards keeps the swap chain producing frames so
         // locator actionability never sees `stable` (event_loop_stalled).
+        rendering_context.make_current().map_err(|error| {
+            io::Error::other(format!("renderer make_current failed: {error:?}"))
+        })?;
         webview.paint();
-        let size = self.rendering_context.size2d();
+        let size = rendering_context.size2d();
         let rect = servo::DeviceIntRect::from_size(servo::DeviceIntSize::new(
             size.width as i32,
             size.height as i32,
@@ -4404,15 +4648,18 @@ impl ContentEngine {
         // `read_to_image` returns None only when nothing has rendered yet
         // (a page that has not produced its first frame). Give that first
         // frame a short window instead of the old 30s readiness wait.
-        let mut image = self.rendering_context.read_to_image(rect);
-        self.rendering_context.present();
+        let mut image = rendering_context.read_to_image(rect);
+        rendering_context.present();
         if image.is_none() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while image.is_none() && Instant::now() < deadline {
-                self.servo.spin_event_loop();
+                self.spin_all_event_loops();
+                rendering_context.make_current().map_err(|error| {
+                    io::Error::other(format!("renderer make_current failed: {error:?}"))
+                })?;
                 webview.paint();
-                image = self.rendering_context.read_to_image(rect);
-                self.rendering_context.present();
+                image = rendering_context.read_to_image(rect);
+                rendering_context.present();
             }
         }
         let image = image.ok_or_else(|| {
@@ -6019,6 +6266,9 @@ pub fn run() -> io::Result<()> {
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
+        std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV)
+            .as_deref()
+            .map(std::path::Path::new),
     )?;
     trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
