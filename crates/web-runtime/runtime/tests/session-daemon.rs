@@ -3841,6 +3841,21 @@ const state = await page.evaluate(async () => {
   await consumed.text();
   const replacement = new Request(consumed, { body: 'body=replacement' });
   const replacementResponse = await fetch(replacement);
+  const streamed = new Request('/complete', {
+    method: 'POST',
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('body=streamed'));
+        controller.close();
+      },
+    }),
+    duplex: 'half',
+  });
+  const streamedResponse = await fetch(streamed);
+  const cloneSource = new Request('/complete', { method: 'POST', body: 'body=cloned' });
+  const cloned = cloneSource.clone();
+  const cloneSourceResponse = await fetch(cloneSource);
+  const clonedResponse = await fetch(cloned);
   return {
     before,
     after,
@@ -3852,6 +3867,12 @@ const state = await page.evaluate(async () => {
     lockedStatus: lockedResponse.status,
     consumedUsed: consumed.bodyUsed,
     replacementStatus: replacementResponse.status,
+    streamedUsed: streamed.bodyUsed,
+    streamedStatus: streamedResponse.status,
+    cloneSourceUsed: cloneSource.bodyUsed,
+    clonedUsed: cloned.bodyUsed,
+    cloneSourceStatus: cloneSourceResponse.status,
+    clonedStatus: clonedResponse.status,
   };
 });
 console.log(JSON.stringify(state));
@@ -3873,11 +3894,20 @@ console.log(JSON.stringify(state));
     assert_eq!(state["lockedStatus"], 200, "{state:#}");
     assert_eq!(state["consumedUsed"], true, "{state:#}");
     assert_eq!(state["replacementStatus"], 200, "{state:#}");
+    assert_eq!(state["streamedUsed"], true, "{state:#}");
+    assert_eq!(state["streamedStatus"], 200, "{state:#}");
+    assert_eq!(state["cloneSourceUsed"], true, "{state:#}");
+    assert_eq!(state["clonedUsed"], true, "{state:#}");
+    assert_eq!(state["cloneSourceStatus"], 200, "{state:#}");
+    assert_eq!(state["clonedStatus"], 200, "{state:#}");
     for body in [
         b"body=once".as_slice(),
         b"body=source".as_slice(),
         b"body=locked".as_slice(),
         b"body=replacement".as_slice(),
+        b"body=streamed".as_slice(),
+        b"body=cloned".as_slice(),
+        b"body=cloned".as_slice(),
     ] {
         assert_eq!(
             posted_bodies.recv_timeout(Duration::from_secs(5)).unwrap(),

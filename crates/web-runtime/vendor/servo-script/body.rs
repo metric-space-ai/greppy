@@ -30,6 +30,8 @@ use url::form_urlencoded;
 use crate::dom::bindings::buffer_source::{create_buffer_source, get_buffer_source_copy};
 use crate::dom::bindings::codegen::Bindings::BlobBinding::Blob_Binding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::FormDataBinding::FormDataMethods;
+use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
+use crate::dom::bindings::codegen::Bindings::TransformStreamBinding::TransformStreamMethods;
 use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::BodyInit;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -50,6 +52,7 @@ use crate::dom::readablestream::{
     ReadableStream, get_read_promise_bytes, get_read_promise_done, pipe_through,
 };
 use crate::dom::urlsearchparams::URLSearchParams;
+use crate::dom::types::TransformStream;
 use crate::mime_multipart::{Node, read_multipart_body};
 use crate::realms::enter_auto_realm;
 use crate::task_source::SendableTaskSource;
@@ -77,6 +80,54 @@ pub(crate) fn clone_body_stream_for_dom_body(
     cloned_body_stream.set(Some(out2));
 
     Ok(())
+}
+
+/// Create the identity proxy required when a `Request` is constructed from another request.
+/// Materialized bodies retain their inline network payload; streamed bodies get a new producer
+/// bound to the readable side of an identity transform.
+pub(crate) fn proxy_body_stream_for_dom_request(
+    cx: &mut JSContext,
+    global: &GlobalScope,
+    source_stream: &ReadableStream,
+    source_body: &RequestBody,
+) -> Fallible<(RequestBody, DomRoot<ReadableStream>)> {
+    if let Some(bytes) = source_body.in_memory_bytes() {
+        let proxy = ReadableStream::new_from_bytes_with_byte_reading_support(
+            cx,
+            global,
+            bytes.to_vec(),
+        )?;
+        source_stream.set_is_disturbed(true);
+        return Ok((source_body.clone(), proxy));
+    }
+
+    let strategy = QueuingStrategy::empty();
+    let transform = TransformStream::Constructor(cx, global, None, None, &strategy, &strategy)?;
+    let proxy = transform.Readable();
+    let mut realm = CurrentRealm::assert(cx);
+    source_stream
+        .pipe_to(
+            &mut realm,
+            global,
+            &transform.Writable(),
+            false,
+            false,
+            false,
+            None,
+        )
+        .set_promise_is_handled(cx);
+    let extracted = ExtractedBody {
+        stream: proxy.clone(),
+        source: if source_body.source_is_null() {
+            BodySource::Null
+        } else {
+            BodySource::Object
+        },
+        total_bytes: source_body.len(),
+        content_type: None,
+    };
+    let (proxy_body, _) = extracted.into_net_request_body(cx);
+    Ok((proxy_body, proxy))
 }
 
 /// The Dom object, or ReadableStream, that is the source of a body.

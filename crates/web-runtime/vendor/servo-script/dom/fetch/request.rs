@@ -26,7 +26,7 @@ use servo_url::ServoUrl;
 
 use crate::body::{
     BodyMixin, BodyType, Extractable, body_text_stream, clone_body_stream_for_dom_body,
-    consume_body,
+    consume_body, proxy_body_stream_for_dom_request,
 };
 use crate::conversions::Convert;
 use crate::dom::abortsignal::AbortSignal;
@@ -512,7 +512,7 @@ impl Request {
         // There are multiple reassignments to similar values. In the end, all end up as
         // final_body. Therefore, final_body is equivalent to inputOrInitBody
         let init_body_is_non_null = init_body.is_some();
-        let final_body = init_body.or(input_body);
+        let mut final_body = init_body.or(input_body);
 
         // Step 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:
         if final_body
@@ -546,15 +546,18 @@ impl Request {
                 return Err(Error::Type(c"Input body is unusable".to_owned()));
             }
             // Step 41.2. Set finalBody to the result of creating a proxy for inputBody.
-            // Tee creates the proxy stream while the source Request retains its original
-            // stream object. Fetching the proxy consumes that source, so make the source's
-            // disturbed state observable through bodyUsed and reject subsequent reuse.
             if let RequestInfo::Request(ref input_request) = input &&
-                let Some(input_stream) = input_request.body_stream.get()
+                let Some(input_stream) = input_request.body_stream.get() &&
+                let Some(input_body) = final_body.as_ref()
             {
-                let branches = input_stream.tee(cx, true)?;
-                request.body_stream.set(Some(&*branches[1]));
-                input_stream.set_is_disturbed(true);
+                let (proxy_body, proxy_stream) = proxy_body_stream_for_dom_request(
+                    cx,
+                    global,
+                    &input_stream,
+                    input_body,
+                )?;
+                final_body = Some(proxy_body);
+                request.body_stream.set(Some(&proxy_stream));
             }
         }
 
