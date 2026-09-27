@@ -479,7 +479,8 @@ Effect.gen(function* () {
                  SELECT source.project, source.id, target.id, 'USAGE', '{\"line\":2}'
                  FROM nodes source, nodes target
                  WHERE source.qualified_name = 'src/app.ts::__file__'
-                   AND target.name = 'helper'",
+                   AND target.qualified_name = 'src/helper.ts::Function::helper'
+                   AND target.project = source.project",
                 [],
             )
             .unwrap();
@@ -1491,6 +1492,7 @@ fn search_symbol_heals_single_file_edits_in_band() {
 /// Start an indexer for a one-file edit that pauses at the publication
 /// failpoint, holding the writer lock. It publishes as soon as the returned
 /// release path exists; HOLD_MS only bounds a test that never releases.
+#[cfg(debug_assertions)]
 fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process::Child, PathBuf) {
     let ready = repo.parent().unwrap().join(format!("{tag}-ready"));
     let release = repo.parent().unwrap().join(format!("{tag}-release"));
@@ -1522,6 +1524,7 @@ fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process
 
 /// Keep the actual query alive while publication is held. Its result is
 /// checked after releasing the writer, without coupling to progress wording.
+#[cfg(debug_assertions)]
 fn spawn_read_during_refresh(repo: &Path, store: &Path) -> std::process::Child {
     Command::new(bin())
         .args(["read", "do_it", "--json", "--diagnostics"])
@@ -1534,6 +1537,7 @@ fn spawn_read_during_refresh(repo: &Path, store: &Path) -> std::process::Child {
         .expect("spawn read")
 }
 
+#[cfg(debug_assertions)]
 fn edit_helper_to_84(repo: &Path) {
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -1544,6 +1548,10 @@ fn edit_helper_to_84(repo: &Path) {
 
 /// Ordinary queries join a healthy refresh and return the current definition.
 /// They do not ask the agent to retry just because a former 2s budget elapsed.
+/// The publication hold is a debug-only product hook, so this synchronization
+/// test remains in the debug suite rather than pretending to exercise it in a
+/// production binary where the hook is deliberately compiled out.
+#[cfg(debug_assertions)]
 #[test]
 fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
     let (repo, store) = index_fixture("read-waits-for-edit-refresh");
@@ -1579,6 +1587,7 @@ fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
 }
 
 /// Explicitly declining automatic healing still must not expose stale spans.
+#[cfg(debug_assertions)]
 #[test]
 fn read_with_auto_refresh_disabled_refuses_stale_spans_while_writer_is_held() {
     let (repo, store) = index_fixture("read-refuses-held-refresh");
@@ -1629,6 +1638,10 @@ fn read_with_auto_refresh_disabled_refuses_stale_spans_while_writer_is_held() {
     );
 }
 
+/// Existing-vector publication timing depends on the same debug-only hold
+/// hook. Keep the complete oracle in debug builds; release coverage must not
+/// infer a timing failure from an environment variable the binary ignores.
+#[cfg(debug_assertions)]
 #[test]
 fn structural_query_with_existing_vectors_joins_refresh_and_returns_callers() {
     let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");
@@ -2574,7 +2587,13 @@ fn recurse(n: u32) -> u32 {
         "brief must report a recursive self-call as a caller, got: {out}"
     );
     assert!(
-        out.contains("  recurse\n"),
+        out.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|field| field.parse::<u32>().is_ok())
+                && fields.next() == Some("recurse")
+        }),
         "brief's sketch must name the recursive call, got: {out}"
     );
 }
