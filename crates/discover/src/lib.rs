@@ -739,11 +739,17 @@ mod tests {
         let root = tmp.join("repo");
         let store = root.join("cache");
         write(&root.join("src/lib.rs"), "fn keep() {}");
-        write(&store.join("workspaces/v7/project/graph.db"), "changing cache");
+        write(
+            &store.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
         unsafe { std::env::set_var("GREPPY_STORE_DIR", &store) };
 
         let entries = walk(&root).unwrap();
-        let rels: Vec<&str> = entries.iter().map(|entry| entry.rel_path.as_str()).collect();
+        let rels: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect();
         assert_eq!(rels, ["src/lib.rs"]);
     }
 
@@ -755,7 +761,10 @@ mod tests {
         let root = tmp.join("repo");
         let store = root.join(".git/greppy-store");
         write(&root.join("src/lib.rs"), "fn keep() {}");
-        write(&store.join("workspaces/v7/project/graph.db"), "changing cache");
+        write(
+            &store.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
         unsafe { std::env::set_var("GREPPY_STORE_DIR", &store) };
 
         let entries = walk(&root).unwrap();
@@ -775,7 +784,10 @@ mod tests {
         let inside = root.join("cache");
         let outside = tmp.join("outside-store");
         write(&root.join("src/lib.rs"), "fn keep() {}");
-        write(&inside.join("workspaces/v7/project/graph.db"), "changing cache");
+        write(
+            &inside.join("workspaces/v7/project/graph.db"),
+            "changing cache",
+        );
         fs::create_dir_all(&outside).unwrap();
 
         let outside_link = tmp.join("store-link");
@@ -797,11 +809,9 @@ mod tests {
             2,
             "in-workspace spelling of an external target is valid"
         );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.rel_path == "cache/workspaces/v7/project/graph.db")
-        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry.rel_path == "cache/workspaces/v7/project/graph.db"));
     }
 
     #[test]
