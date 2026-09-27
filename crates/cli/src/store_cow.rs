@@ -1637,6 +1637,11 @@ fn prepare_base_store_paths(
         // build to a background process outside the publication lease.
         .env("GREPPY_LAZY_EMBED_MIN_SPANS", usize::MAX.to_string())
         .env(ENV_DISABLE_AUTO_LINKED_WORKTREE, "1")
+        // The outer structural query may defer its Delta embeddings. An
+        // immutable Base must still finish the migrated generation before
+        // publication; inheriting this flag would retain the old completion
+        // marker and make validation reject the new Base forever.
+        .env_remove(crate::ENV_STRUCTURAL_FIRST_USE)
         .env_remove("GREPPY_BACKGROUND_JOB")
         .env_remove("GREPPY_BACKGROUND_CAUSE")
         .env_remove("GREPPY_BACKGROUND_KIND")
