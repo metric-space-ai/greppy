@@ -749,6 +749,9 @@ impl Daemon {
         // before bind, leaving in-flight process-group leaders reparented to PID 1.
         let controller_token = random_token()?;
         let content_token = random_token()?;
+        let data_root = data_root(&config.run_id);
+        let persistent_profiles = persistent_profiles_root();
+        std::fs::create_dir_all(&persistent_profiles)?;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); } }
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
@@ -764,7 +767,11 @@ impl Daemon {
         let content_thread = thread::Builder::new()
             .name("web-spawn-content".into())
             .spawn(move || {
-                let mut worker = WorkerProcess::spawn(WorkerKind::Content, content_token)?;
+                let mut worker = WorkerProcess::spawn_with_persistent_profiles(
+                    WorkerKind::Content,
+                    content_token,
+                    Some(persistent_profiles),
+                )?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
                 worker.handshake()?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
@@ -778,7 +785,6 @@ impl Daemon {
             .join()
             .map_err(|_| io::Error::other("content spawn thread panicked"))??;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); } }
-        let data_root = data_root(&config.run_id);
         run_control
             .controller_pid
             .store(controller.pid(), Ordering::Relaxed);
@@ -1320,21 +1326,25 @@ impl Daemon {
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         {
             return Err(
-                "persistent_profile must be a short [A-Za-z0-9_-] name under the run store".into(),
+                "persistent_profile must be a short [A-Za-z0-9_-] name under the configured profile store".into(),
             );
         }
-        let dir = self.store.root().join("profiles").join(name);
-        crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
+        crate::profile_lock::ProfileLock::acquire_named(
+            &persistent_profiles_root(),
+            &persistent_profile_locks_root(),
+            name,
+        )
+        .map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-begin"); } }
         self.exiting = true;
         self.sessions.clear();
-        self.profile_locks.clear();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-controller-eof"); } }
         self.controller.shutdown_or_kill();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-content-reap"); } }
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase shutdown-accept-break"); } }
         self.journal(
             "runtime",
@@ -1422,8 +1432,9 @@ impl Daemon {
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
                 let ephemeral = session.persistent_profile.is_none();
-                let _ = self.profile_locks.remove(&session_id);
+                let profile_lock = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
+                let mut close_failed = false;
                 if self.content.is_running() {
                     let mut pages = session.tabs.clone();
                     if let Some(page) = session.page_id.take() {
@@ -1432,11 +1443,18 @@ impl Daemon {
                         }
                     }
                     for page in pages {
-                        let _ = self.engine_call("session.closePage", json!({ "page": page }));
+                        close_failed |= self
+                            .engine_call("session.closePage", json!({ "page": page }))
+                            .is_err();
                     }
                     if let Some(context) = session.engine_context_id.take() {
-                        let _ = self.engine_call("context.close", json!({ "context": context }));
+                        close_failed |= self
+                            .engine_call("context.close", json!({ "context": context }))
+                            .is_err();
                     }
+                }
+                if close_failed {
+                    self.content.shutdown_or_kill();
                 }
                 let _ = session.transition(SessionState::Closed);
                 self.run_control
@@ -1450,6 +1468,7 @@ impl Daemon {
                 if ephemeral {
                     self.remove_ephemeral_session_dir(&session_id);
                 }
+                drop(profile_lock);
                 Response::ok(
                     request,
                     serde_json::json!({ "session_id": session_id, "state": "closed" }),
@@ -4495,7 +4514,11 @@ impl Daemon {
                 return Err(error.to_string());
             }
         };
-        let mut content = match WorkerProcess::spawn(WorkerKind::Content, token) {
+        let mut content = match WorkerProcess::spawn_with_persistent_profiles(
+            WorkerKind::Content,
+            token,
+            Some(persistent_profiles_root()),
+        ) {
             Ok(content) => content,
             Err(error) => {
                 self.record_crash("content", reason, false);
@@ -4633,9 +4656,9 @@ impl Daemon {
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase idle-exit"); } }
         self.exiting = true;
         self.sessions.clear();
-        self.profile_locks.clear();
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
         let _ = std::fs::remove_file(&self.socket);
         self.journal(
             "runtime",
@@ -4659,13 +4682,31 @@ impl Daemon {
         for session_id in stale {
             if let Some(mut session) = self.sessions.remove(&session_id) {
                 let ephemeral = session.persistent_profile.is_none();
-                let _ = self.profile_locks.remove(&session_id);
+                let profile_lock = self.profile_locks.remove(&session_id);
+                let mut close_failed = false;
+                let mut pages = session.tabs.clone();
                 if let Some(page) = session.page_id.take() {
-                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                    if !pages.contains(&page) {
+                        pages.push(page);
+                    }
+                }
+                for page in pages {
+                    close_failed |= self
+                        .engine_call("session.closePage", json!({ "page": page }))
+                        .is_err();
+                }
+                if let Some(context) = session.engine_context_id.take() {
+                    close_failed |= self
+                        .engine_call("context.close", json!({ "context": context }))
+                        .is_err();
+                }
+                if close_failed {
+                    self.content.shutdown_or_kill();
                 }
                 if ephemeral {
                     self.remove_ephemeral_session_dir(&session_id);
                 }
+                drop(profile_lock);
             }
         }
     }
@@ -4680,15 +4721,29 @@ impl Drop for Daemon {
         self.exiting = true;
         self.controller.shutdown_or_kill();
         self.content.shutdown_or_kill();
+        self.profile_locks.clear();
     }
 }
 
 fn data_root(run_id: &str) -> PathBuf {
-    let base = std::env::var("GREPPY_STORE_DIR")
+    persistent_store_root().join("web-runtime").join(run_id)
+}
+
+fn persistent_profiles_root() -> PathBuf {
+    persistent_store_root().join("web-runtime").join("profiles")
+}
+
+fn persistent_profile_locks_root() -> PathBuf {
+    persistent_store_root()
+        .join("web-runtime")
+        .join("profile-locks")
+}
+
+fn persistent_store_root() -> PathBuf {
+    std::env::var("GREPPY_STORE_DIR")
         .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"));
-    base.join("web-runtime").join(run_id)
+        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"))
 }
 
 fn urlencoding(value: &str) -> String {

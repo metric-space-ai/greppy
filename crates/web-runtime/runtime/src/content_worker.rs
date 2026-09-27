@@ -31,6 +31,7 @@ use url::Url;
 
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_CONFIG_DIR_ENV: &str = "GREPPY_WEB_CONTENT_CONFIG_DIR";
+const PERSISTENT_PROFILE_ROOT_ENV: &str = "GREPPY_WEB_PERSISTENT_PROFILE_ROOT";
 const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
@@ -1293,8 +1294,27 @@ impl ContentEngine {
         let preferences = engine_preferences(&proxy.uri());
         let wake = WakeFlag::new();
         let mut opts = Opts::default();
-        if let Some(path) = std::env::var_os(CONTENT_CONFIG_DIR_ENV) {
-            let path = PathBuf::from(path).join(storage_key);
+        let persistent_name = storage_key.strip_prefix("persistent-");
+        if persistent_name.is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid persistent profile storage key",
+            ));
+        }
+        let config_root = persistent_name
+            .and_then(|_| std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV))
+            .or_else(|| std::env::var_os(CONTENT_CONFIG_DIR_ENV));
+        if let Some(path) = config_root {
+            let path = match persistent_name {
+                Some(name) => PathBuf::from(path).join(name).join("browser"),
+                None => PathBuf::from(path).join(storage_key),
+            };
             std::fs::create_dir_all(&path)?;
             opts.config_dir = Some(path);
         }
@@ -6246,6 +6266,9 @@ pub fn run() -> io::Result<()> {
     crate::supervisor::apply_worker_sandbox(
         &std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         &std::env::temp_dir(),
+        std::env::var_os(PERSISTENT_PROFILE_ROOT_ENV)
+            .as_deref()
+            .map(std::path::Path::new),
     )?;
     trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;

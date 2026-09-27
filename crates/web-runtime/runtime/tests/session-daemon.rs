@@ -363,7 +363,7 @@ struct Supervisor {
     run_id: String,
     _deadline: Deadline,
     kill_group: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl Drop for Supervisor {
@@ -415,7 +415,22 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
-        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, true)
+    }
+
+    fn spawn_parallel(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_web-runtime"));
+        command
+            .arg("--socket")
+            .arg(socket)
+            .arg("--run-id")
+            .arg(run_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        extra(&mut command);
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, false)
     }
 
     fn spawn_leak(socket: &Path, run_id: &str, extra: impl FnOnce(&mut Command)) -> Self {
@@ -430,7 +445,7 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .process_group(0);
         extra(&mut command);
-        Self::finish_spawn(socket, run_id, command, LEAK_TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, LEAK_TEST_DEADLINE, true)
     }
 
     fn spawn_from_dist(socket: &Path, run_id: &str, dist: &Path) -> Self {
@@ -446,7 +461,7 @@ impl Supervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .process_group(0);
-        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE)
+        Self::finish_spawn(socket, run_id, command, TEST_DEADLINE, true)
     }
 
     fn finish_spawn(
@@ -454,11 +469,14 @@ impl Supervisor {
         run_id: &str,
         mut command: Command,
         deadline: Duration,
+        serialize: bool,
     ) -> Self {
         reap_orphaned_greppy_web_temps();
-        let lock = supervisor_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let lock = serialize.then(|| {
+            supervisor_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        });
         let mut bytes = [0_u8; 16];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut file| {
@@ -8545,6 +8563,17 @@ fn ordinary_sessions_isolate_cookie_state() {
     let closed_a = call("web.session.close", json!({"session_id":session_a}));
     assert_eq!(closed_a.status, "ok", "{closed_a:?}");
 
+    let surviving_b = call(
+        "web.goto",
+        json!({"session_id":session_b,"tab_id":&tab_b,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(surviving_b.status, "ok", "{surviving_b:?}");
+    assert_eq!(
+        body(&session_b, Some(&tab_b)),
+        "",
+        "surviving ordinary session B received closed A's cookie"
+    );
+
     let session_c = create();
     let echo_c = call(
         "web.goto",
@@ -8570,7 +8599,6 @@ fn ordinary_sessions_isolate_cookie_state() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"))
         .join("web-runtime")
-        .join("run_cookie_isolation")
         .join("profiles")
         .join(&persistent_name);
     let _ = std::fs::remove_dir_all(&persistent_dir);
@@ -8685,6 +8713,256 @@ fn persistent_profile_lock_is_exclusive_until_owner_closes() {
     )
     .expect("reacquire");
     assert_eq!(third.status, "ok", "{third:?}");
+}
+
+#[test]
+fn persistent_profile_survives_content_runtime_restart() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-restart-{nonce}"));
+    let profile = format!("restart{nonce}");
+
+    let run_once = |run_id: &str, socket: &std::path::Path, verify: bool| {
+        let store_for_spawn = store.clone();
+        let guard = Supervisor::spawn(socket, run_id, move |command| {
+            command.env("GREPPY_STORE_DIR", &store_for_spawn);
+        });
+        wait_for_socket(socket, Duration::from_secs(30));
+        let call = |method: &str, payload| {
+            unix_request(
+                socket,
+                &Request::new(run_id, method, payload),
+                Duration::from_secs(30),
+            )
+            .expect("persistent profile restart request")
+        };
+        let created = call(
+            "web.session.create",
+            json!({"profile":"project","persistent_profile":&profile}),
+        );
+        assert_eq!(created.status, "ok", "{created:?}");
+        let session = created.result.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let navigated = call(
+            "web.goto",
+            json!({"session_id":&session,"url":format!("{fixture}/echo")}),
+        );
+        assert_eq!(navigated.status, "ok", "{navigated:?}");
+        if verify {
+            let state = call(
+                "web.evaluate",
+                json!({"session_id":&session,"source":"JSON.stringify({cookie: document.body.innerText, local: localStorage.getItem('restart')})"}),
+            );
+            assert_eq!(state.status, "ok", "{state:?}");
+            assert_eq!(
+                state.result.unwrap()["value"],
+                json!("{\"cookie\":\"isolation=A\",\"local\":\"preserved\"}")
+            );
+        } else {
+            let set_cookie = call(
+                "web.goto",
+                json!({"session_id":&session,"url":format!("{fixture}/set")}),
+            );
+            assert_eq!(set_cookie.status, "ok", "{set_cookie:?}");
+            let set_local = call(
+                "web.evaluate",
+                json!({"session_id":&session,"source":"localStorage.setItem('restart', 'preserved')"}),
+            );
+            assert_eq!(set_local.status, "ok", "{set_local:?}");
+        }
+        let closed = call("web.session.close", json!({"session_id":session}));
+        assert_eq!(closed.status, "ok", "{closed:?}");
+        drop(guard);
+        let _ = std::fs::remove_file(socket);
+    };
+
+    let socket_a = std::env::temp_dir().join(format!("greppy-web-profile-a-{nonce}.sock"));
+    let socket_b = std::env::temp_dir().join(format!("greppy-web-profile-b-{nonce}.sock"));
+    run_once("run_profile_restart_a", &socket_a, false);
+    run_once("run_profile_restart_b", &socket_b, true);
+
+    let profile_dir = store
+        .join("web-runtime")
+        .join("profiles")
+        .join(&profile);
+    assert!(profile_dir.join("browser").is_dir(), "{profile_dir:?}");
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+#[test]
+fn persistent_profile_survives_content_worker_recovery() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!("{}-recovery", std::process::id());
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
+    let socket = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}.sock"));
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket);
+    let store_for_spawn = store.clone();
+    let supervisor = Supervisor::spawn(&socket, "run_profile_recovery", move |command| {
+        command.env("GREPPY_STORE_DIR", &store_for_spawn);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_profile_recovery", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("persistent profile recovery request")
+    };
+    let created = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&nonce}),
+    );
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let set_cookie = call(
+        "web.goto",
+        json!({"session_id":&session,"url":format!("{fixture}/set")}),
+    );
+    assert_eq!(set_cookie.status, "ok", "{set_cookie:?}");
+    let set_local = call(
+        "web.evaluate",
+        json!({"session_id":&session,"source":"localStorage.setItem('restart', 'recovered')"}),
+    );
+    assert_eq!(set_local.status, "ok", "{set_local:?}");
+    let committed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(committed.status, "ok", "{committed:?}");
+
+    let content = content_worker_pid(supervisor.child.id()).expect("content worker pid");
+    assert!(Command::new("kill")
+        .args(["-KILL", &content.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let recovered_session = call(
+        "web.session.create",
+        json!({"profile":"project","persistent_profile":&nonce}),
+    );
+    assert_eq!(recovered_session.status, "ok", "{recovered_session:?}");
+    let recovered_session = recovered_session.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reopened = call(
+        "web.goto",
+        json!({"session_id":&recovered_session,"url":format!("{fixture}/echo")}),
+    );
+    assert_eq!(reopened.status, "ok", "{reopened:?}");
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":&recovered_session,"source":"JSON.stringify({cookie: document.body.innerText, local: localStorage.getItem('restart')})"}),
+    );
+    assert_eq!(state.status, "ok", "{state:?}");
+    assert_eq!(
+        state.result.unwrap()["value"],
+        json!("{\"cookie\":\"isolation=A\",\"local\":\"recovered\"}")
+    );
+    let closed = call(
+        "web.session.close",
+        json!({"session_id":recovered_session}),
+    );
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    drop(supervisor);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
+fn persistent_profile_lock_contends_across_supervisors_until_close_flushes() {
+    let fixture = serve_cookie_isolation_fixture();
+    let nonce = format!("{}-lock", std::process::id());
+    let store = std::env::temp_dir().join(format!("greppy-web-profile-{nonce}"));
+    let socket_a = std::env::temp_dir().join(format!("greppy-web-profile-a-{nonce}.sock"));
+    let socket_b = std::env::temp_dir().join(format!("greppy-web-profile-b-{nonce}.sock"));
+    let _ = std::fs::remove_dir_all(&store);
+    let store_a = store.clone();
+    let supervisor_a = Supervisor::spawn(&socket_a, "run_profile_lock_a", move |command| {
+        command.env("GREPPY_STORE_DIR", &store_a);
+    });
+    let store_b = store.clone();
+    let supervisor_b = Supervisor::spawn_parallel(&socket_b, "run_profile_lock_b", move |command| {
+        command.env("GREPPY_STORE_DIR", &store_b);
+    });
+    wait_for_socket(&socket_a, Duration::from_secs(30));
+    wait_for_socket(&socket_b, Duration::from_secs(30));
+    let create = |socket: &std::path::Path, run: &str| {
+        unix_request(
+            socket,
+            &Request::new(
+                run,
+                "web.session.create",
+                json!({"profile":"project","persistent_profile":&nonce}),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("cross-supervisor profile create")
+    };
+    let first = create(&socket_a, "run_profile_lock_a");
+    assert_eq!(first.status, "ok", "{first:?}");
+    let blocked = create(&socket_b, "run_profile_lock_b");
+    assert_eq!(blocked.status, "error", "{blocked:?}");
+    assert_eq!(
+        blocked.error.as_ref().map(|error| error.code.as_str()),
+        Some("profile_in_use"),
+        "{blocked:?}"
+    );
+    let first_id = first.result.unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.goto",
+            json!({"session_id":&first_id,"url":format!("{fixture}/echo")}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("open persistent page before close");
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    let written = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.evaluate",
+            json!({"session_id":&first_id,"source":"localStorage.setItem('flush', 'x'.repeat(1000000))"}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("write persistent state before close");
+    assert_eq!(written.status, "ok", "{written:?}");
+    let closed = unix_request(
+        &socket_a,
+        &Request::new(
+            "run_profile_lock_a",
+            "web.session.close",
+            json!({"session_id":first_id}),
+        ),
+        Duration::from_secs(30),
+    )
+    .expect("close and flush profile owner");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    let acquired = create(&socket_b, "run_profile_lock_b");
+    assert_eq!(acquired.status, "ok", "{acquired:?}");
+    drop(supervisor_a);
+    drop(supervisor_b);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&socket_a);
+    let _ = std::fs::remove_file(&socket_b);
 }
 
 #[test]
