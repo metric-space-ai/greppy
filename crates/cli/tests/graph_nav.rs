@@ -1093,6 +1093,12 @@ fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
             v[collection_field].as_array().unwrap().is_empty(),
             "refreshing {command} must not serve rows from the old index: {v:?}"
         );
+        if command == "impact" {
+            assert_eq!(
+                v["provider_complete"], true,
+                "stale impact metadata must use its default incoming reference union, not broad provider completeness: {v:?}"
+            );
+        }
     }
 }
 
@@ -1955,7 +1961,23 @@ fn who_calls_provider_completeness_tracks_its_relation_union_and_file_failures()
             code, 0,
             "CALLS-only command {args:?} must pass strict policy: stderr={err}\nstdout={out}"
         );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            value.get("warning").is_none(),
+            "compact warning must use the same CALLS-only relation set as the strict gate for {args:?}: {value:#}"
+        );
     }
+    let (incoming_warn_code, incoming_warn_out, incoming_warn_err) =
+        run(&["impact", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        incoming_warn_code, 0,
+        "metadata policy must serve partial incoming impact: stderr={incoming_warn_err}\nstdout={incoming_warn_out}"
+    );
+    let incoming_warn: serde_json::Value = serde_json::from_str(&incoming_warn_out).unwrap();
+    assert_eq!(
+        incoming_warn["warning"], "1 incomplete provider; answer may be partial",
+        "compact warning must use the same incoming reference union as the strict gate: {incoming_warn:#}"
+    );
     let (incoming_code, incoming_out, incoming_err) = run_with_env(
         &["impact", "do_it", "--json"],
         &repo,
