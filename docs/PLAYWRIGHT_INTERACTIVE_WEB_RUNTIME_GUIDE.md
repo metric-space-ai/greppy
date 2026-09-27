@@ -880,6 +880,16 @@ Each research session uses a fresh context by default. Persistent profiles are
 opt-in, path-scoped, and locked against concurrent writers. Profile locks MUST
 be recovered safely after a crash without deleting a live owner lock.
 
+An explicitly named profile owns browser state at
+`<GREPPY_STORE_DIR|GREPPY_RUNTIME_DIR>/web-runtime/profiles/<name>/browser` and
+its single-writer lock at the sibling `profile.lock`. The daemon owns lock
+acquisition and release. The sandboxed content worker receives read/write
+access only to the configured profiles root and its disposable temporary tree.
+Closing a session releases the lock without deleting browser state, so a later
+content-worker or runtime process can reopen the named profile. Unnamed session
+contexts remain isolated in the disposable content-worker tree and are removed
+with that worker.
+
 ## 17. Resource governance
 
 Every session MUST have typed limits:

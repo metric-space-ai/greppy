@@ -749,6 +749,9 @@ impl Daemon {
         // before bind, leaving in-flight process-group leaders reparented to PID 1.
         let controller_token = random_token()?;
         let content_token = random_token()?;
+        let data_root = data_root(&config.run_id);
+        let persistent_profiles = persistent_profiles_root();
+        std::fs::create_dir_all(&persistent_profiles)?;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase spawn-controller"); } }
         let controller_thread = thread::Builder::new()
             .name("web-spawn-controller".into())
@@ -764,7 +767,11 @@ impl Daemon {
         let content_thread = thread::Builder::new()
             .name("web-spawn-content".into())
             .spawn(move || {
-                let mut worker = WorkerProcess::spawn(WorkerKind::Content, content_token)?;
+                let mut worker = WorkerProcess::spawn_with_persistent_profiles(
+                    WorkerKind::Content,
+                    content_token,
+                    Some(persistent_profiles),
+                )?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase handshake-content"); } }
                 worker.handshake()?;
                 if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-ready"); } }
@@ -778,7 +785,6 @@ impl Daemon {
             .join()
             .map_err(|_| io::Error::other("content spawn thread panicked"))??;
         if crate::supervisor::phase_trace_enabled() { if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase workers-ready"); } }
-        let data_root = data_root(&config.run_id);
         run_control
             .controller_pid
             .store(controller.pid(), Ordering::Relaxed);
@@ -1320,10 +1326,18 @@ impl Daemon {
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         {
             return Err(
-                "persistent_profile must be a short [A-Za-z0-9_-] name under the run store".into(),
+                "persistent_profile must be a short [A-Za-z0-9_-] name under the configured profile store".into(),
             );
         }
-        let dir = self.store.root().join("profiles").join(name);
+        let root = persistent_profiles_root();
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let root = root.canonicalize().map_err(|error| error.to_string())?;
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let resolved = dir.canonicalize().map_err(|error| error.to_string())?;
+        if resolved.parent() != Some(root.as_path()) {
+            return Err("persistent_profile resolves outside the configured profile store".into());
+        }
         crate::profile_lock::ProfileLock::acquire(&dir).map_err(|error| error.to_string())
     }
     fn shutdown(&mut self, request: &Request) -> Response {
@@ -4495,7 +4509,11 @@ impl Daemon {
                 return Err(error.to_string());
             }
         };
-        let mut content = match WorkerProcess::spawn(WorkerKind::Content, token) {
+        let mut content = match WorkerProcess::spawn_with_persistent_profiles(
+            WorkerKind::Content,
+            token,
+            Some(persistent_profiles_root()),
+        ) {
             Ok(content) => content,
             Err(error) => {
                 self.record_crash("content", reason, false);
@@ -4684,11 +4702,18 @@ impl Drop for Daemon {
 }
 
 fn data_root(run_id: &str) -> PathBuf {
-    let base = std::env::var("GREPPY_STORE_DIR")
+    persistent_store_root().join("web-runtime").join(run_id)
+}
+
+fn persistent_profiles_root() -> PathBuf {
+    persistent_store_root().join("web-runtime").join("profiles")
+}
+
+fn persistent_store_root() -> PathBuf {
+    std::env::var("GREPPY_STORE_DIR")
         .or_else(|_| std::env::var("GREPPY_RUNTIME_DIR"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"));
-    base.join("web-runtime").join(run_id)
+        .unwrap_or_else(|_| std::env::temp_dir().join("greppy-web-runtime"))
 }
 
 fn urlencoding(value: &str) -> String {
