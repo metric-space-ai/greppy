@@ -1499,7 +1499,14 @@ impl Daemon {
                             return limit_error(request, message);
                         }
                     }
-                    match self.engine_call("session.ensurePage", json!({})) {
+                    let storage_key = self.sessions.get(&session_id)
+                        .and_then(|session| session.persistent_profile.as_ref())
+                        .map(|name| format!("persistent-{name}"))
+                        .unwrap_or_else(|| format!("ephemeral-{session_id}"));
+                    match self.engine_call(
+                        "session.ensurePage",
+                        json!({ "session": session_id, "storage_key": storage_key }),
+                    ) {
                         Ok(result) => {
                             let Some(page) = result
                                 .get("page")
@@ -1510,6 +1517,10 @@ impl Daemon {
                             };
                             if let Some(session) = self.sessions.get_mut(&session_id) {
                                 session.page_id = Some(page.clone());
+                                session.engine_context_id = result
+                                    .get("context")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned);
                                 session.pages = 1;
                             }
                             Some(page)
@@ -2908,7 +2919,10 @@ impl Daemon {
                     }
                 }
                 let result = match action {
-                    "new" => match self.engine_call("context.newPage", json!({})) {
+                    "new" => {
+                        let context = self.sessions.get(&session_id)
+                            .and_then(|session| session.engine_context_id.clone());
+                        match self.engine_call("context.newPage", json!({ "context": context })) {
                         Ok(value) => match value.get("page").and_then(|v| v.as_str()) {
                             Some(page) => {
                                 let page = page.to_owned();
@@ -2922,6 +2936,7 @@ impl Daemon {
                             None => Err("engine returned no page id".to_owned()),
                         },
                         Err(error) => Err(error),
+                    }
                     },
                     "switch" => match target {
                         None => Err("web.tab switch requires a tab id".to_owned()),
@@ -3883,7 +3898,14 @@ impl Daemon {
                     self.finish_session(&session_id);
                     return Err(protocol_error(request, "web.wait requires an existing page; open or select a tab first"));
                 }
-                match self.engine_call("session.ensurePage", json!({})) {
+                let storage_key = self.sessions.get(&session_id)
+                    .and_then(|session| session.persistent_profile.as_ref())
+                    .map(|name| format!("persistent-{name}"))
+                    .unwrap_or_else(|| format!("ephemeral-{session_id}"));
+                match self.engine_call(
+                    "session.ensurePage",
+                    json!({ "session": session_id, "storage_key": storage_key }),
+                ) {
                     Ok(result) => {
                         let page = result
                             .get("page")
@@ -3895,6 +3917,10 @@ impl Daemon {
                         };
                         if let Some(session) = self.sessions.get_mut(&session_id) {
                             session.page_id = Some(page.clone());
+                            session.engine_context_id = result
+                                .get("context")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned);
                             session.pages = 1;
                         }
                         page
@@ -3919,10 +3945,10 @@ impl Daemon {
             if remaining < Duration::from_millis(1) {
                 Err("timeout: no remaining wait setup budget".into())
             } else {
-                self.engine_call_timed_with_recovery("session.setProfile", json!({"profile":profile.as_str()}), remaining, false)
+                self.engine_call_timed_with_recovery("session.setProfile", json!({"page":page,"profile":profile.as_str()}), remaining, false)
             }
         } else {
-            self.engine_call("session.setProfile", json!({ "profile": profile.as_str() }))
+            self.engine_call("session.setProfile", json!({ "page": page, "profile": profile.as_str() }))
         };
         if let Err(error) = profile_result {
             self.finish_session(&session_id);
