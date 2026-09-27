@@ -2644,11 +2644,35 @@ mod tests {
     }
 
     fn assert_persisted_v7_delta_query_is_correct(root: &str) -> std::result::Result<(), String> {
-        let cli = crate::Cli::try_parse_from(["greppy", "--root", root, "who-calls", "target"])
-            .map_err(|error| error.to_string())?;
-        let exit = crate::dispatch(cli).map_err(|error| error.to_string())?;
-        if exit != 0 {
-            return Err(format!("who-calls CLI returned exit code {exit}"));
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let executable = if executable.parent().and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("deps"))
+        {
+            executable
+                .parent()
+                .and_then(Path::parent)
+                .map(|target_dir| {
+                    target_dir.join(format!("greppy{}", std::env::consts::EXE_SUFFIX))
+                })
+                .filter(|candidate| candidate.is_file())
+                .unwrap_or(executable)
+        } else {
+            executable
+        };
+        let output = Command::new(executable)
+            .arg("--root")
+            .arg(root)
+            .arg("who-calls")
+            .arg("target")
+            .output()
+            .map_err(|error| format!("spawn who-calls CLI: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "who-calls CLI returned {}; stdout={:?}; stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
         let effective_root = Path::new(root);
         let overlay = overlay_spec(effective_root)
