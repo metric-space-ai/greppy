@@ -5163,9 +5163,24 @@ fn spawn_background_job_handle(
     })
     .unwrap_or(0)
     .saturating_add(1);
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(mut exe) = std::env::current_exe() else {
         return None;
     };
+    #[cfg(test)]
+    {
+        // Unit tests run inside Cargo's libtest harness, whose current
+        // executable accepts test filters rather than Greppy CLI arguments.
+        // The Windows CI job builds the real binary before running these
+        // tests; route detached children to that sibling binary instead.
+        if exe.parent().and_then(std::path::Path::file_name) == Some(std::ffi::OsStr::new("deps")) {
+            if let Some(target_dir) = exe.parent().and_then(std::path::Path::parent) {
+                let candidate = target_dir.join(format!("greppy{}", std::env::consts::EXE_SUFFIX));
+                if candidate.is_file() {
+                    exe = candidate;
+                }
+            }
+        }
+    }
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
@@ -5262,16 +5277,20 @@ fn spawn_background_job_handle(
             return None;
         }
     };
-    let mut stderr_reader = child.stderr.take().map(|mut stderr| {
+    let stderr_capture = child.stderr.take().map(|mut stderr| {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
         std::thread::spawn(move || {
             use std::io::Read as _;
 
-            let mut captured = Vec::new();
             let mut chunk = [0_u8; 4096];
             loop {
                 match stderr.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
+                        let Ok(mut captured) = sink.lock() else {
+                            break;
+                        };
                         let remaining = BACKGROUND_STDERR_LIMIT.saturating_sub(captured.len());
                         if remaining > 0 {
                             captured.extend_from_slice(&chunk[..read.min(remaining)]);
@@ -5279,8 +5298,8 @@ fn spawn_background_job_handle(
                     }
                 }
             }
-            captured
-        })
+        });
+        captured
     });
     value["pid"] = serde_json::json!(child.id());
     value["state"] = serde_json::json!(if kind == "embedding" {
@@ -5306,9 +5325,9 @@ fn spawn_background_job_handle(
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Ok(Some(status)) => {
                 if !status.success() {
-                    let stderr = stderr_reader
-                        .take()
-                        .and_then(|reader| reader.join().ok())
+                    let stderr = stderr_capture
+                        .as_ref()
+                        .and_then(|captured| captured.lock().ok())
                         .filter(|bytes| !bytes.is_empty())
                         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
                         .filter(|text| !text.is_empty());
