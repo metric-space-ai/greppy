@@ -487,10 +487,40 @@ fn path_json_refuses_stale_steps_when_auto_reindex_disabled() {
 /// published generation and reports that the renamed-away endpoint is gone.
 #[test]
 fn path_json_auto_reindexes_small_stale_drift() {
-    let (repo, store) = index_fixture("path-json-heal");
+    let (repo, store) = make_chain_repo("path-json-heal");
+    // `leaf` also names the file's Module node, which legitimately survives
+    // renaming its function. Give the endpoint a distinct name so absence
+    // proves function removal rather than making an incorrect module claim.
     std::fs::write(
         repo.join("src/leaf.rs"),
-        "pub fn renamed_leaf() -> u32 { 8 }\n",
+        "pub fn endpoint_before() -> u32 { 7 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/mid.rs"),
+        "pub fn middle() { crate::leaf::endpoint_before(); }\n",
+    )
+    .unwrap();
+    let (index_code, index_out, index_err) = run(&["index", "."], &repo, &store);
+    assert_eq!(index_code, 0, "{index_out}\n{index_err}");
+    let (before_code, before_out, before_err) = run(
+        &[
+            "path",
+            "--from",
+            "entry",
+            "--to",
+            "endpoint_before",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(before_code, 0, "{before_out}\n{before_err}");
+    let before: serde_json::Value = serde_json::from_str(&before_out).unwrap();
+    assert_eq!(before["path_found"], true, "{before}");
+    std::fs::write(
+        repo.join("src/leaf.rs"),
+        "pub fn endpoint_after() -> u32 { 8 }\n",
     )
     .unwrap();
 
@@ -500,7 +530,7 @@ fn path_json_auto_reindexes_small_stale_drift() {
             "--from",
             "entry",
             "--to",
-            "leaf",
+            "endpoint_before",
             "--json",
             "--diagnostics",
         ],
@@ -509,7 +539,7 @@ fn path_json_auto_reindexes_small_stale_drift() {
     );
     assert_eq!(
         code, 1,
-        "healed path: `leaf` no longer exists, so no path; stderr={err}\nstdout={out}"
+        "healed path: `endpoint_before` no longer exists, so no path; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid healed path json: {e}; stdout={out:?}"));
