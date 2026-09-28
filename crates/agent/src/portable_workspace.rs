@@ -6777,6 +6777,80 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_cleanup_restart_recovers_journal_after_core_rolls_back_pair() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+
+        let workspace = AgentWorkspace::create(&repo, "cleanup-before-restart").unwrap();
+        let root = ordinary_workspace_root(&data);
+        let worktree = workspace.worktree_path().to_path_buf();
+        let private_git = workspace.linked_git_dir().to_path_buf();
+        let identity = ordinary_identity_path(&root, workspace.run_id());
+        let journal = ordinary_cleanup_journal_path(&root, workspace.run_id());
+        let agent_data = workspace.agent_data_root();
+        let scratch = workspace.agent_scratch_root();
+        fs::create_dir_all(&agent_data).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(agent_data.join("graph.db"), b"data").unwrap();
+        fs::write(scratch.join("tool.tmp"), b"scratch").unwrap();
+        let foreign = root.join("restart-foreign-collision");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep.txt"), b"foreign\n").unwrap();
+
+        *CLEANUP_TEST_HOOK.lock().unwrap() = Some(Box::new(|_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected persistent deletion failure",
+            ))
+        }));
+        assert!(workspace.cleanup().is_err());
+        *CLEANUP_TEST_HOOK.lock().unwrap() = None;
+        for abandoned in [
+            &worktree,
+            &private_git,
+            &identity,
+            &journal,
+            &agent_data,
+            &scratch,
+        ] {
+            assert!(abandoned.exists());
+        }
+
+        let restarted_core = WorkspaceCore::open(data.join("core")).unwrap();
+        assert!(restarted_core.list_workspaces().unwrap().is_empty());
+        drop(restarted_core);
+        let next = AgentWorkspace::create(&repo, "cleanup-after-restart").unwrap();
+        for recovered in [
+            &worktree,
+            &private_git,
+            &identity,
+            &journal,
+            &agent_data,
+            &scratch,
+        ] {
+            assert!(!recovered.exists());
+        }
+        assert_eq!(fs::read(foreign.join("keep.txt")).unwrap(), b"foreign\n");
+        next.cleanup().unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
     fn ordinary_cleanup_recovery_skips_live_owner_and_rejects_renamed_journal() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
