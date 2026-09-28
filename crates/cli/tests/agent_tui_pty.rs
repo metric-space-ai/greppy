@@ -14,7 +14,9 @@ mod portable_provider;
 use portable_provider::{spawn_fake_provider, FakeProvider};
 
 fn binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
+    std::env::var_os("GREPPY_ACCEPTANCE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_greppy")))
 }
 
 fn unique_temp(tag: &str) -> PathBuf {
@@ -448,6 +450,7 @@ mod pty {
             bytes.extend_from_slice(&pty.read_until(b"hi from stub", Duration::from_secs(20)));
             pty.write_all(b"/exit\r");
         }
+        let provider_created = pty.workspace_root.join("provider.json").exists();
         let (status, tail) = pty.wait(Duration::from_secs(20));
         bytes.extend_from_slice(&tail);
         stop.store(true, Ordering::SeqCst);
@@ -463,7 +466,7 @@ mod pty {
             text.contains("\x1b[?1049l"),
             "terminal not restored: {text:?}"
         );
-        assert!(!pty.workspace_root.join("provider.json").exists());
+        assert!(!provider_created);
         assert_eq!(std::fs::read(repo.join("hello.txt")).unwrap(), b"local\n");
         assert_eq!(
             std::fs::read(repo.join("untracked.txt")).unwrap(),
@@ -473,7 +476,6 @@ mod pty {
             std::fs::read(repo.join(".git/index")).unwrap(),
             index_before
         );
-        drop(pty);
         std::fs::remove_dir_all(repo).unwrap();
     }
 

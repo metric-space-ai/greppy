@@ -17,7 +17,9 @@ mod portable_provider;
 use portable_provider::{spawn_fake_provider, spawn_fake_provider_with_edits};
 
 fn binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
+    std::env::var_os("GREPPY_ACCEPTANCE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_greppy")))
 }
 
 fn unique_temp(tag: &str) -> PathBuf {
