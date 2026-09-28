@@ -193,6 +193,15 @@ fn edit_gateway_response() -> &'static str {
 
 #[test]
 fn greppy_p_without_provider_preserves_dirty_source_and_publishes_proposal() {
+    assert_provider_optional_proposal(false);
+}
+
+#[test]
+fn greppy_p_with_inactive_provider_preserves_dirty_source_and_publishes_proposal() {
+    assert_provider_optional_proposal(true);
+}
+
+fn assert_provider_optional_proposal(installed_inactive: bool) {
     let root = unique_temp("no-provider-agent");
     let repo = root.join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -203,6 +212,20 @@ fn greppy_p_without_provider_preserves_dirty_source_and_publishes_proposal() {
     std::fs::write(repo.join("untracked.txt"), "keep me\n").unwrap();
     let index_before = std::fs::read(repo.join(".git/index")).unwrap();
     let no_provider = root.join("workspace-without-provider");
+    let manifest_bytes = installed_inactive.then(|| {
+        std::fs::create_dir(&no_provider).unwrap();
+        let manifest = serde_json::json!({
+            "protocol_version": 1, "adapter_version": "0.4.1", "adapter_kind": "fskit",
+            "state": "ready", "instance_id": "installed-inactive",
+            "data_root": no_provider, "mount_root": root.join("unmounted"),
+            "heartbeat_unix_ms": 1,
+            "capabilities": {"hard_links":true,"symbolic_links":true,"byte_range_locks":true,
+                "memory_maps":true,"atomic_rename":true,"case_preserving":true}
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(no_provider.join("provider.json"), &bytes).unwrap();
+        bytes
+    });
     let (endpoint, stop, handle) =
         spawn_gateway_sequence(vec![edit_gateway_response(), stub_gateway_response()]);
     let output = Command::new(binary_path())
@@ -255,9 +278,16 @@ fn greppy_p_without_provider_preserves_dirty_source_and_publishes_proposal() {
         std::fs::read(repo.join(".git/index")).unwrap(),
         index_before
     );
+    match manifest_bytes {
+        Some(bytes) => assert_eq!(
+            std::fs::read(no_provider.join("provider.json")).unwrap(),
+            bytes
+        ),
+        None => assert!(!no_provider.join("provider.json").exists()),
+    }
     assert!(
-        !no_provider.join("provider.json").exists(),
-        "must not install or mount a provider"
+        !root.join("unmounted").exists(),
+        "must not activate a provider"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
