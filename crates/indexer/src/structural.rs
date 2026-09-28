@@ -62,6 +62,9 @@ use greppy_store::{NewEdge, NewNode, Store};
 /// File/Folder/Project spine is not.
 const NON_DEF_LABELS: [&str; 3] = ["File", "Folder", "Project"];
 
+/// Folder/File nodes inserted per transaction in the structural pass.
+const STRUCTURAL_NODE_BATCH: usize = 1024;
+
 /// Normalize backslashes to `/` and return an owned copy. rel_paths from
 /// the discover walk are already `/`-separated on every platform, but we
 /// normalize defensively for exactness.
@@ -205,19 +208,25 @@ pub(crate) fn build_structural(
     // Insert Folder nodes; remember their ids by rel_dir for edge wiring.
     let mut folder_id: HashMap<String, i64> = HashMap::new();
     progress("building_folders", 0, dirs.len());
-    for (index, dir) in dirs.iter().enumerate() {
-        let id = store.insert_node(&NewNode {
-            project: project.to_string(),
-            label: "Folder".into(),
-            name: basename(dir).to_string(),
-            qualified_name: folder_qn(project, dir),
-            file_path: dir.clone(),
-            start_line: 0,
-            end_line: 0,
-            properties: serde_json::json!({}),
-        })?;
-        folder_id.insert(dir.clone(), id);
-        progress("building_folders", index + 1, dirs.len());
+    let dirs_vec: Vec<&String> = dirs.iter().collect();
+    for chunk in dirs_vec.chunks(STRUCTURAL_NODE_BATCH) {
+        let nodes: Vec<NewNode> = chunk
+            .iter()
+            .map(|dir| NewNode {
+                project: project.to_string(),
+                label: "Folder".into(),
+                name: basename(dir).to_string(),
+                qualified_name: folder_qn(project, dir),
+                file_path: (*dir).clone(),
+                start_line: 0,
+                end_line: 0,
+                properties: serde_json::json!({}),
+            })
+            .collect();
+        for (dir, id) in chunk.iter().zip(store.insert_nodes(&nodes)?) {
+            folder_id.insert((*dir).clone(), id);
+        }
+        progress("building_folders", folder_id.len(), dirs.len());
     }
 
     // CONTAINS_FOLDER: parent(dir) → dir. The parent is the enclosing
@@ -246,55 +255,64 @@ pub(crate) fn build_structural(
     // drop structural nodes left behind by a now-deleted file/folder.
     let mut valid_files: BTreeSet<String> = BTreeSet::new();
     progress("building_files", 0, entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        let rel = norm(&entry.rel_path);
-        let qn = file_qn(project, &rel);
-        valid_files.insert(qn.clone());
-        let file_id = store.insert_node(&NewNode {
-            project: project.to_string(),
-            label: "File".into(),
-            name: basename(&rel).to_string(),
-            qualified_name: qn,
-            file_path: rel.clone(),
-            start_line: 0,
-            end_line: 0,
-            properties: serde_json::json!({ "extension": extension(&rel) }),
-        })?;
+    let mut done = 0;
+    // Insert File nodes a chunk per transaction: one commit per file made
+    // this phase fsync-bound on large repositories.
+    for chunk in entries.chunks(STRUCTURAL_NODE_BATCH) {
+        let rels: Vec<String> = chunk.iter().map(|entry| norm(&entry.rel_path)).collect();
+        let nodes: Vec<NewNode> = rels
+            .iter()
+            .map(|rel| NewNode {
+                project: project.to_string(),
+                label: "File".into(),
+                name: basename(rel).to_string(),
+                qualified_name: file_qn(project, rel),
+                file_path: rel.clone(),
+                start_line: 0,
+                end_line: 0,
+                properties: serde_json::json!({ "extension": extension(rel) }),
+            })
+            .collect();
+        let file_ids = store.insert_nodes(&nodes)?;
+        for ((rel, node), file_id) in rels.iter().zip(nodes).zip(file_ids) {
+            valid_files.insert(node.qualified_name);
 
-        // CONTAINS_FILE: parent(dir) → file (Project when at repo root).
-        let parent_rel = parent_dir(&rel);
-        let parent = if parent_rel.is_empty() {
-            project_id
-        } else {
-            folder_id[parent_rel]
-        };
-        edges.push(NewEdge {
-            project: project.to_string(),
-            source_id: parent,
-            target_id: file_id,
-            edge_type: "CONTAINS_FILE".into(),
-            properties: serde_json::json!({}),
-        });
-
-        // DEFINES: File → every definition extracted from this file. A
-        // File→DEFINES edge is inserted for every def; here the
-        // defs are the already-persisted nodes for this file that are NOT
-        // part of the structural spine or the synthetic Module node. We
-        // list every label in this file (empty label filter) and skip the
-        // structural/synthetic labels.
-        for def in store.list_nodes(project, "", &rel, 0, usize::MAX)? {
-            if NON_DEF_LABELS.contains(&def.label.as_str()) {
-                continue;
-            }
+            // CONTAINS_FILE: parent(dir) → file (Project when at repo root).
+            let parent_rel = parent_dir(rel);
+            let parent = if parent_rel.is_empty() {
+                project_id
+            } else {
+                folder_id[parent_rel]
+            };
             edges.push(NewEdge {
                 project: project.to_string(),
-                source_id: file_id,
-                target_id: def.id,
-                edge_type: "DEFINES".into(),
+                source_id: parent,
+                target_id: file_id,
+                edge_type: "CONTAINS_FILE".into(),
                 properties: serde_json::json!({}),
             });
+
+            // DEFINES: File → every definition extracted from this file. A
+            // File→DEFINES edge is inserted for every def; here the
+            // defs are the already-persisted nodes for this file that are NOT
+            // part of the structural spine or the synthetic Module node. We
+            // list every label in this file (empty label filter) and skip the
+            // structural/synthetic labels.
+            for def in store.list_nodes(project, "", rel, 0, usize::MAX)? {
+                if NON_DEF_LABELS.contains(&def.label.as_str()) {
+                    continue;
+                }
+                edges.push(NewEdge {
+                    project: project.to_string(),
+                    source_id: file_id,
+                    target_id: def.id,
+                    edge_type: "DEFINES".into(),
+                    properties: serde_json::json!({}),
+                });
+            }
+            done += 1;
+            progress("building_files", done, entries.len());
         }
-        progress("building_files", index + 1, entries.len());
     }
 
     // Persist the structural edges in one transaction. Besides being

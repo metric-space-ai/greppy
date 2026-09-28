@@ -70,9 +70,7 @@ fn build_cuda() {
         println!("cargo:warning=greppy-embed-native: no CUDA backend — `{nvcc}` not found on PATH");
         return;
     };
-    let nvcc_path = resolved
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&nvcc));
+    let nvcc_path = canonical(&resolved).unwrap_or_else(|| PathBuf::from(&nvcc));
     let arch_list = cuda_arch_list();
     let ext = if target_os == "windows" { "dll" } else { "so" };
     let lib = out_dir.join(format!("greppy_embed_native_cuda.{ext}"));
@@ -80,10 +78,7 @@ fn build_cuda() {
         .ok()
         .map(PathBuf::from)
         .or_else(|| {
-            nvcc_path
-                .canonicalize()
-                .ok()
-                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+            canonical(&nvcc_path).and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
         })
         .unwrap_or_else(|| {
             if target_os == "windows" {
@@ -111,14 +106,30 @@ fn build_cuda() {
     println!("cargo:rustc-cfg=embed_native_has_cuda_dylib");
 }
 
+/// `canonicalize` on Windows yields verbatim `\\?\C:\...` paths. nvcc locates
+/// its toolkit files (`bin\crt\link.stub`) relative to argv[0], and cl.exe
+/// cannot open verbatim paths, so hand both the plain drive-letter form.
+fn canonical(path: &Path) -> Option<PathBuf> {
+    let resolved = path.canonicalize().ok()?;
+    match resolved.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if !plain.starts_with(r"UNC\") => Some(PathBuf::from(plain)),
+        _ => Some(resolved),
+    }
+}
+
 fn resolve_executable(name: &str) -> Option<PathBuf> {
     let candidate = PathBuf::from(name);
     if candidate.components().count() > 1 {
         return candidate.is_file().then_some(candidate);
     }
-    env::split_paths(&env::var_os("PATH")?)
-        .map(|dir| dir.join(name))
-        .find(|path| path.is_file())
+    // `nvcc` runs on the build host, so the host's executable suffix applies:
+    // on Windows the file on PATH is `nvcc.exe`, never a bare `nvcc`.
+    let with_suffix = format!("{name}{}", env::consts::EXE_SUFFIX);
+    env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
+        [dir.join(name), dir.join(&with_suffix)]
+            .into_iter()
+            .find(|path| path.is_file())
+    })
 }
 
 fn cuda_arch_list() -> Vec<String> {
@@ -155,10 +166,7 @@ fn compile_cuda_dylib(
     cuda_dir: &Path,
 ) {
     let mut cmd = Command::new(nvcc);
-    if let Some(toolkit_bin) = nvcc
-        .canonicalize()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+    if let Some(toolkit_bin) = canonical(nvcc).and_then(|path| path.parent().map(Path::to_path_buf))
     {
         let mut search_path = vec![toolkit_bin, cuda_home.join("nvvm").join("bin")];
         if let Some(current) = env::var_os("PATH") {

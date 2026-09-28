@@ -729,6 +729,37 @@ fn cli_device_flags_parse_on_embedding_commands() {
 }
 
 #[test]
+fn default_device_is_cuda_on_cuda_builds_unless_the_user_chose() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[ENV_DEVICE, ENV_NO_GPU]);
+    let cuda_build = greppy_embed_native::HAS_GPU_BACKEND
+        && cfg!(any(target_os = "linux", target_os = "windows"));
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
+    unsafe {
+        std::env::remove_var(ENV_DEVICE);
+        std::env::remove_var(ENV_NO_GPU);
+    }
+    default_device_to_cuda().unwrap();
+    assert_eq!(
+        env_nonempty(ENV_DEVICE).as_deref(),
+        cuda_build.then_some("cuda")
+    );
+
+    // SAFETY: as above.
+    unsafe { std::env::set_var(ENV_DEVICE, "cpu") };
+    default_device_to_cuda().unwrap();
+    assert_eq!(env_nonempty(ENV_DEVICE).as_deref(), Some("cpu"));
+
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var(ENV_DEVICE);
+        std::env::set_var(ENV_NO_GPU, "1");
+    }
+    default_device_to_cuda().unwrap();
+    assert_eq!(env_nonempty(ENV_DEVICE), None, "--no-gpu intent wins");
+}
+
+#[test]
 fn embedding_device_preference_obeys_cli_and_env() {
     let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&[

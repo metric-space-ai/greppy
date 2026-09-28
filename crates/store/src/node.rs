@@ -365,19 +365,30 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Node>> {
-        // A single parameterised statement that treats an empty filter as
-        // "match all" via `(?n = '' OR col = ?n)`. Keeping one SQL shape
-        // (rather than branching) means the prepared-statement cache reuses
-        // it for every filter combination and the plan stays deterministic.
-        let mut stmt = self.conn().prepare_cached(
+        // Treat an empty filter as "match all" via `(?n = '' OR col = ?n)`.
+        // A file filter gets its own statement: the generic shape lets the
+        // planner walk the `(project, qualified_name)` unique index to skip
+        // the sort, scanning every node in the project for each call, while
+        // `idx_nodes_file` finds one file's rows directly. The unary `+`
+        // stops the planner from preferring the ordering index again.
+        let sql = if file.is_empty() {
             "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
              FROM nodes
              WHERE project = ?1
                AND (?2 = '' OR label = ?2)
                AND (?3 = '' OR file_path = ?3)
              ORDER BY qualified_name, id
-             LIMIT ?4 OFFSET ?5",
-        )?;
+             LIMIT ?4 OFFSET ?5"
+        } else {
+            "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+             FROM nodes
+             WHERE project = ?1
+               AND file_path = ?3
+               AND (?2 = '' OR label = ?2)
+             ORDER BY +qualified_name, id
+             LIMIT ?4 OFFSET ?5"
+        };
+        let mut stmt = self.conn().prepare_cached(sql)?;
         let rows = stmt
             .query_map(
                 params![project, label, file, limit as i64, offset as i64],

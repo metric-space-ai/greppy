@@ -660,15 +660,13 @@ fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()
     startup.StartupInfo.hStdError = stdout.raw();
     startup.lpAttributeList = attributes.ptr;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // Hidden console, not `DETACHED_PROCESS`: Windows ignores `CREATE_NO_WINDOW`
+    // alongside it, and a console-less daemon's console children flash windows.
     let flags = {
         use windows_sys::Win32::System::Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
-            EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT,
         };
-        CREATE_NEW_PROCESS_GROUP
-            | CREATE_NO_WINDOW
-            | DETACHED_PROCESS
-            | EXTENDED_STARTUPINFO_PRESENT
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT
     };
     let created = unsafe {
         CreateProcessW(
@@ -1316,6 +1314,11 @@ impl Write for LimitedFrame {
     }
 }
 
+/// Largest single write offered to a named pipe: the smaller of the two pipe
+/// buffers created by `create_named_pipe`.
+#[cfg(windows)]
+const PIPE_WRITE_CHUNK: usize = 64 * 1024;
+
 fn write_frame(
     stream: &mut TransportStream,
     bytes: &[u8],
@@ -1333,7 +1336,18 @@ fn write_frame(
         }
         #[cfg(unix)]
         stream.bound_write_timeout(remaining)?;
-        match stream.write(&bytes[written..]) {
+        // A PIPE_NOWAIT byte pipe writes nothing when a write exceeds the
+        // free buffer space, so a frame larger than the pipe buffer would
+        // never progress. Offer at most one buffer's worth per write, and
+        // retry a zero-byte write while the peer drains the pipe.
+        #[cfg(windows)]
+        let chunk = &bytes[written..bytes.len().min(written + PIPE_WRITE_CHUNK)];
+        #[cfg(not(windows))]
+        let chunk = &bytes[written..];
+        match stream.write(chunk) {
+            #[cfg(windows)]
+            Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+            #[cfg(not(windows))]
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -2545,6 +2559,51 @@ mod tests {
             RequestOutcome::Response(ref value) if value["state"] == "ready"
         ));
         server.join().unwrap();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(endpoint.address());
+    }
+
+    /// Embedding batch responses are megabytes, far above the pipe buffer:
+    /// the whole frame must still reach the client intact.
+    #[test]
+    fn local_transport_round_trip_carries_frames_larger_than_the_pipe_buffer() {
+        let endpoint = Endpoint::for_identity(
+            "transport-large-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let payload = "x".repeat(3 << 20);
+        let frame = format!("{{\"payload\":\"{payload}\"}}\n");
+        let listener = TransportListener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok(mut stream) => {
+                    read_frame(&mut stream, 4096, Duration::from_secs(5)).unwrap();
+                    write_frame(&mut stream, frame.as_bytes(), Duration::from_secs(5)).unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("transport accept failed: {error}"),
+            }
+        });
+        let response = request(
+            &endpoint,
+            serde_json::json!({"op": "status"}),
+            Duration::from_secs(10),
+            4096,
+            4 << 20,
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(
+                &response,
+                RequestOutcome::Response(value)
+                    if value["payload"].as_str().map(str::len) == Some(3 << 20)
+            ),
+            "large frame must arrive whole"
+        );
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
     }

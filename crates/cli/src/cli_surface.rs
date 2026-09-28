@@ -32,7 +32,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub root: Option<String>,
 
-    /// Native inference backend for both embedded models.
+    /// Native inference backend for both embedded models. Builds with a CUDA
+    /// backend default to `cuda` (no silent CPU fallback); pass `auto` or
+    /// `cpu` to choose otherwise.
     #[arg(long, global = true, value_name = "auto|cpu|metal|cuda[:INDEX]")]
     pub device: Option<String>,
 
@@ -79,9 +81,10 @@ pub enum Command {
         after_help = "Storage location:\n  Set GREPPY_STORE_DIR to an absolute directory on the intended volume before\n  indexing; use the same value for status, queries and later edits. The store\n  lives under GREPPY_STORE_DIR/workspaces/. This selects a different store; it\n  does not move or delete an existing one.\n\n  TMPDIR controls temporary files, not the normal persistent index location.\n  XDG_CACHE_HOME does not select the Greppy index location.\n\n  Models and inference caches use GREPPY_SHARED_INFERENCE_ROOT when explicitly\n  set; otherwise they follow GREPPY_STORE_DIR. Use one shared inference root on\n  the intended volume to retain model/cache reuse across isolated stores.\n\n  Example (Unix):\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index .\n    GREPPY_STORE_DIR=/absolute/volume/greppy-store greppy index status --json"
     )]
     Index {
-        /// Path to the repository root (default: cwd), or `status`/`recover`.
+        /// Path to the repository root (default: cwd), or `status`/`recover`/`rebuild`.
+        /// `rebuild` deletes the workspace's index and builds it from scratch.
         path: Option<String>,
-        /// Repository path used by `index recover` (default: cwd).
+        /// Repository path used by `index recover` / `index rebuild` (default: cwd).
         recovery_path: Option<String>,
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]

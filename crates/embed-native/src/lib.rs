@@ -174,6 +174,8 @@ enum EmbeddingBackend {
 pub struct EmbeddingGemma {
     tokenizer: PromptTokenizer,
     backend: EmbeddingBackend,
+    /// Why `auto` settled on CPU although a GPU backend was compiled in.
+    gpu_fallback: Option<String>,
 }
 
 impl EmbeddingGemma {
@@ -208,8 +210,12 @@ impl EmbeddingGemma {
             tokenizer_config.max_length = max_length.max(1).min(tokenizer_config.max_length.max(1));
         }
         let tokenizer = PromptTokenizer::from_file(tokenizer_json_path, tokenizer_config)?;
-        let backend = load_backend(&gguf, &options.device)?;
-        Ok(Self { tokenizer, backend })
+        let (backend, gpu_fallback) = load_backend(&gguf, &options.device)?;
+        Ok(Self {
+            tokenizer,
+            backend,
+            gpu_fallback,
+        })
     }
 
     pub fn embed_one(&self, task: EmbedTask, content: &str) -> Result<Vec<f32>> {
@@ -402,12 +408,20 @@ impl EmbeddingGemma {
             EmbeddingBackend::Cuda(_) => "cuda",
         }
     }
+
+    /// The GPU load error `auto` fell back from, if it fell back to CPU.
+    pub fn gpu_fallback(&self) -> Option<&str> {
+        self.gpu_fallback.as_deref()
+    }
 }
 
-fn load_backend(model: &GgufModel, preference: &DevicePreference) -> Result<EmbeddingBackend> {
-    match preference {
+fn load_backend(
+    model: &GgufModel,
+    preference: &DevicePreference,
+) -> Result<(EmbeddingBackend, Option<String>)> {
+    let backend = match preference {
         DevicePreference::Cpu => CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu),
-        DevicePreference::Auto => load_auto_backend(model),
+        DevicePreference::Auto => return load_auto_backend(model),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         DevicePreference::Metal => {
             MetalEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Metal)
@@ -422,45 +436,48 @@ fn load_backend(model: &GgufModel, preference: &DevicePreference) -> Result<Embe
         DevicePreference::Cuda => Err(Error::InvalidGguf(
             "CUDA was explicitly requested but is unavailable in this build/platform".into(),
         )),
-    }
+    };
+    backend.map(|backend| (backend, None))
 }
 
-fn load_auto_backend(model: &GgufModel) -> Result<EmbeddingBackend> {
+fn load_auto_backend(model: &GgufModel) -> Result<(EmbeddingBackend, Option<String>)> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        return load_metal_with_cpu_fallback(model);
+        return with_cpu_fallback(model, "Metal", || {
+            MetalEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Metal)
+        });
     }
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
     {
-        return load_cuda_with_cpu_fallback(model);
+        return with_cpu_fallback(model, "CUDA", || {
+            CudaEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cuda)
+        });
     }
     #[cfg(not(any(
         all(feature = "metal", target_os = "macos"),
         all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
     )))]
     {
-        CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
+        CpuEmbeddingModel::from_gguf(model).map(|backend| (EmbeddingBackend::Cpu(backend), None))
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn load_metal_with_cpu_fallback(model: &GgufModel) -> Result<EmbeddingBackend> {
-    match MetalEmbeddingModel::from_gguf(model) {
-        Ok(model) => Ok(EmbeddingBackend::Metal(model)),
+#[cfg(any(
+    all(feature = "metal", target_os = "macos"),
+    all(feature = "cuda", any(target_os = "linux", target_os = "windows"))
+))]
+fn with_cpu_fallback(
+    model: &GgufModel,
+    gpu: &str,
+    load_gpu: impl FnOnce() -> Result<EmbeddingBackend>,
+) -> Result<(EmbeddingBackend, Option<String>)> {
+    match load_gpu() {
+        Ok(backend) => Ok((backend, None)),
         Err(err) => {
-            eprintln!("greppy_embed_native: Metal unavailable, falling back to CPU: {err}");
-            CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
-        }
-    }
-}
-
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-fn load_cuda_with_cpu_fallback(model: &GgufModel) -> Result<EmbeddingBackend> {
-    match CudaEmbeddingModel::from_gguf(model) {
-        Ok(model) => Ok(EmbeddingBackend::Cuda(model)),
-        Err(err) => {
-            eprintln!("greppy_embed_native: CUDA unavailable, falling back to CPU: {err}");
-            CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
+            let reason = format!("{gpu} unavailable, fell back to CPU: {err}");
+            eprintln!("greppy_embed_native: {reason}");
+            CpuEmbeddingModel::from_gguf(model)
+                .map(|backend| (EmbeddingBackend::Cpu(backend), Some(reason)))
         }
     }
 }

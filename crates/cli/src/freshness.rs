@@ -183,6 +183,10 @@ pub(crate) fn maybe_reindex_stale(
     }
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
+        // Close this query's handle on the old snapshot first: on Windows an
+        // open handle keeps the refresh from replacing graph.db, so the
+        // refresh and this query would each wait for the other.
+        *store = greppy_store::Store::open_memory()?;
         let rebuilt = try_auto_reindex_inline(root);
         if !rebuilt {
             let writer_active = workspace_writer_active(root);
@@ -195,6 +199,8 @@ pub(crate) fn maybe_reindex_stale(
                 wait_for_active_index_refresh(root);
             }
         }
+        // Best-effort: if the reopen fails, the empty placeholder reads as
+        // unindexed and the stale gate refuses instead of the query erroring.
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
         }
@@ -610,7 +616,7 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
             false,
             None,
         )
-        .map(|snapshot| snapshot.index.is_clean())
+        .map(|snapshot| snapshot.index.is_clean() && snapshot.changed_during_index.is_none())
         .unwrap_or(false)
     }
 }

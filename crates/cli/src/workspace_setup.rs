@@ -943,7 +943,7 @@ fn parse_hdiutil_device(output: &str) -> Option<PathBuf> {
 fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate the greppy executable: {error}"))?;
@@ -957,7 +957,7 @@ fn start_platform_adapter(data_root: &Path, mount_root: &Path) -> Result<(), Str
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", adapter.display()))?;
     publish_pid(data_root, child.id())?;
