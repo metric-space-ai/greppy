@@ -82,6 +82,12 @@ pub struct ProviderInstallation {
     manifest: ProviderManifest,
 }
 
+#[derive(Debug, Clone)]
+pub enum OptionalProvider {
+    Ready(ProviderInstallation),
+    Inactive,
+}
+
 /// Read-only evidence, not permission to use a provider or a successful I/O smoke.
 #[derive(Debug, Serialize)]
 pub struct ProviderDiagnostics {
@@ -119,6 +125,78 @@ impl ProviderDiagnosticCheck {
 }
 
 impl ProviderInstallation {
+    /// Select the mounted acceleration backend without making activation a
+    /// prerequisite for ordinary workspaces. Missing, stopped, stale, or
+    /// unmounted providers are inactive. Static identity/capability corruption
+    /// and mismatched mounted identities remain hard errors.
+    pub fn optional(data_root: impl AsRef<Path>) -> Result<OptionalProvider> {
+        Self::optional_at(data_root, SystemTime::now())
+    }
+
+    fn optional_at(data_root: impl AsRef<Path>, now: SystemTime) -> Result<OptionalProvider> {
+        let data_root = absolute_clean(data_root.as_ref())?;
+        let control_path = data_root.join("provider.json");
+        match fs::symlink_metadata(&control_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(Error::AdapterUnhealthy(
+                    "provider control manifest is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OptionalProvider::Inactive);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let control_bytes = match fs::read(&control_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OptionalProvider::Inactive);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let manifest: ProviderManifest = serde_json::from_slice(&control_bytes)?;
+        validate_manifest_static_identity(&manifest, &data_root)?;
+        manifest.capabilities.validate()?;
+        if manifest.state != ProviderState::Ready
+            || provider_heartbeat_age(&manifest, now)? > MAX_HEARTBEAT_AGE
+        {
+            return Ok(OptionalProvider::Inactive);
+        }
+
+        let marker_path = manifest.mount_root.join(".greppy-provider.json");
+        match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(Error::AdapterUnhealthy(
+                    "mounted provider identity is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OptionalProvider::Inactive);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let marker_bytes = match read_mount_marker(&marker_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OptionalProvider::Inactive);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let marker: ProviderManifest = serde_json::from_slice(&marker_bytes)?;
+        validate_manifest_static_identity(&marker, &data_root)?;
+        if !same_provider_identity(&marker, &manifest) {
+            return Err(Error::AdapterUnhealthy(
+                "control manifest and mounted provider identity differ".into(),
+            ));
+        }
+        Ok(OptionalProvider::Ready(Self {
+            data_root,
+            manifest,
+        }))
+    }
+
     /// Keep diagnosis available when liveness fails. This never creates a core,
     /// starts an adapter, writes through the mount, or relaxes require_healthy.
     pub fn diagnose(data_root: impl AsRef<Path>) -> ProviderDiagnostics {
@@ -360,16 +438,24 @@ fn validate_manifest_identity(
     manifest: &ProviderManifest,
     expected_data_root: &Path,
 ) -> Result<()> {
-    if manifest.protocol_version != PROVIDER_PROTOCOL_VERSION {
-        return Err(Error::AdapterUnhealthy(format!(
-            "provider protocol {} is incompatible with required protocol {}",
-            manifest.protocol_version, PROVIDER_PROTOCOL_VERSION
-        )));
-    }
+    validate_manifest_static_identity(manifest, expected_data_root)?;
     if manifest.state != ProviderState::Ready {
         return Err(Error::AdapterUnhealthy(format!(
             "provider state is {:?}",
             manifest.state
+        )));
+    }
+    Ok(())
+}
+
+fn validate_manifest_static_identity(
+    manifest: &ProviderManifest,
+    expected_data_root: &Path,
+) -> Result<()> {
+    if manifest.protocol_version != PROVIDER_PROTOCOL_VERSION {
+        return Err(Error::AdapterUnhealthy(format!(
+            "provider protocol {} is incompatible with required protocol {}",
+            manifest.protocol_version, PROVIDER_PROTOCOL_VERSION
         )));
     }
     if manifest.data_root != expected_data_root {
@@ -394,6 +480,17 @@ fn validate_manifest_identity(
 }
 
 fn validate_manifest_heartbeat(manifest: &ProviderManifest, now: SystemTime) -> Result<()> {
+    let age = provider_heartbeat_age(manifest, now)?;
+    if age > MAX_HEARTBEAT_AGE {
+        return Err(Error::AdapterUnhealthy(format!(
+            "provider heartbeat is stale by {} seconds",
+            age.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn provider_heartbeat_age(manifest: &ProviderManifest, now: SystemTime) -> Result<Duration> {
     let heartbeat = UNIX_EPOCH
         .checked_add(Duration::from_millis(manifest.heartbeat_unix_ms))
         .ok_or_else(|| Error::AdapterUnhealthy("provider heartbeat overflowed".into()))?;
@@ -406,13 +503,7 @@ fn validate_manifest_heartbeat(manifest: &ProviderManifest, now: SystemTime) -> 
             ));
         }
     };
-    if age > MAX_HEARTBEAT_AGE {
-        return Err(Error::AdapterUnhealthy(format!(
-            "provider heartbeat is stale by {} seconds",
-            age.as_secs()
-        )));
-    }
-    Ok(())
+    Ok(age)
 }
 
 fn absolute_clean(path: &Path) -> Result<PathBuf> {
@@ -492,6 +583,61 @@ mod tests {
         .unwrap();
         assert!(matches!(
             ProviderInstallation::require_healthy_at(&data, now),
+            Err(Error::AdapterUnhealthy(_))
+        ));
+    }
+
+    #[test]
+    fn optional_provider_treats_stale_or_unmounted_installation_as_inactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let stale = manifest(
+            &data,
+            &mount,
+            now - MAX_HEARTBEAT_AGE - Duration::from_secs(1),
+        );
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ProviderInstallation::optional_at(&data, now).unwrap(),
+            OptionalProvider::Inactive
+        ));
+
+        let live = manifest(&data, &mount, now);
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&live).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ProviderInstallation::optional_at(&data, now).unwrap(),
+            OptionalProvider::Inactive
+        ));
+    }
+
+    #[test]
+    fn optional_provider_rejects_mounted_identity_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mount = temp.path().join("mount");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let value = manifest(&data, &mount, now);
+        publish(&value);
+        let mut other = value;
+        other.instance_id = "different-instance".into();
+        fs::write(
+            mount.join(".greppy-provider.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ProviderInstallation::optional_at(&data, now),
             Err(Error::AdapterUnhealthy(_))
         ));
     }

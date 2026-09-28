@@ -22,17 +22,18 @@ pub use namespace::{
     WorkspaceHandle, WorkspaceOperationLease, WorkspacePairLease, WorkspaceStatus,
 };
 pub use provider::{
-    AdapterKind, ProviderCapabilities, ProviderDiagnosticCheck, ProviderDiagnostics,
-    ProviderInstallation, ProviderManifest, ProviderState, PROVIDER_PROTOCOL_VERSION,
+    AdapterKind, OptionalProvider, ProviderCapabilities, ProviderDiagnosticCheck,
+    ProviderDiagnostics, ProviderInstallation, ProviderManifest, ProviderState,
+    PROVIDER_PROTOCOL_VERSION,
 };
 pub use repository_tracker::{
     RepositoryChangeBatch, RepositoryTrackerState, RepositoryTrackerStatus,
 };
 pub use repository_tracker_service::{spawn_repository_tracker, spawn_repository_tracker_for};
 pub use snapshot::{
-    capture_overlay_directory, capture_repository, capture_repository_incremental,
-    capture_repository_with_observer, BaselineDirectory, BaselineEntry, BaselineSnapshot,
-    EntryKind,
+    capture_hardlink_groups, capture_overlay_directory, capture_repository,
+    capture_repository_incremental, capture_repository_with_observer, path_hardlink_identity,
+    BaselineDirectory, BaselineEntry, BaselineSnapshot, EntryKind, HardlinkIdentity,
 };
 
 pub(crate) fn verify_sqlite_integrity(

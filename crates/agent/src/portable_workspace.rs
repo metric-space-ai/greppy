@@ -1,13 +1,14 @@
-//! Portable, provider-mounted CoW workspace lifecycle.
+//! Portable workspace lifecycle with an optional provider-mounted CoW fast path.
 //!
-//! No native checkout or filesystem snapshot fallback exists here. Creation
-//! verifies the installed adapter and its mounted identity before capturing the
-//! repository and before any model request can be made.
+//! A healthy mounted provider supplies CoW namespaces. When no healthy provider
+//! is available, the same pinned snapshots are materialized into ordinary,
+//! private directories under Greppy's data root.
 
 use greppy_workspace_core::{
     capture_overlay_directory, capture_repository, capture_repository_incremental,
-    capture_repository_with_observer, BaselineEntry, BaselineSnapshot, ChunkStore, EntryKind,
-    ProposalRecord, ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
+    capture_repository_with_observer, path_hardlink_identity, BaselineEntry, BaselineSnapshot,
+    ChunkStore, EntryKind, HardlinkIdentity, OptionalProvider, ProposalRecord,
+    ProviderInstallation, RepositoryTrackerState, WorkspaceCore, WorkspaceHandle,
     WorkspacePairLease,
 };
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -35,12 +36,23 @@ pub struct AgentWorkspace {
     baseline_hash: String,
     baseline_tree: String,
     baseline_view_commit: String,
-    provider_instance: String,
-    provider_data_root: PathBuf,
+    backend: WorkspaceBackend,
     data_root: PathBuf,
     core: WorkspaceCore,
     handle: WorkspaceHandle,
     pair_lease: WorkspacePairLease,
+}
+
+#[derive(Debug)]
+enum WorkspaceBackend {
+    Provider {
+        instance: String,
+        configured_data_root: PathBuf,
+    },
+    Ordinary {
+        root: PathBuf,
+        identity: String,
+    },
 }
 
 impl fmt::Debug for AgentWorkspace {
@@ -53,7 +65,7 @@ impl fmt::Debug for AgentWorkspace {
             .field("run_id", &self.run_id)
             .field("base_commit", &self.base_commit)
             .field("baseline_hash", &self.baseline_hash)
-            .field("provider_instance", &self.provider_instance)
+            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
@@ -179,32 +191,45 @@ impl AgentWorkspace {
         let started = Instant::now();
         trace_workspace_phase(run_id, "start", started);
         let configured_data_root = workspace_data_root()?;
-        let provider = ProviderInstallation::require_healthy(&configured_data_root)?;
-        trace_workspace_phase(run_id, "provider-healthy", started);
-        provider.doctor_io(&format!("startup-{run_id}"))?;
-        trace_workspace_phase(run_id, "provider-io-verified", started);
-        // The provider configuration is trusted only after its control manifest
-        // and mounted marker agree and a live I/O probe succeeds. Resolve that
-        // app-owned path here, before deriving any tool-writable children. The
-        // generic sandbox still receives physical, symlink-free roots and keeps
-        // rejecting arbitrary symlink components supplied from elsewhere.
-        let data_root = canonicalize_trusted_provider_path("data root", provider.data_root())?;
+        let provider = match ProviderInstallation::optional(&configured_data_root)? {
+            OptionalProvider::Ready(provider) => {
+                if provider.doctor_io(&format!("startup-{run_id}")).is_ok() {
+                    Some(provider)
+                } else {
+                    None
+                }
+            }
+            OptionalProvider::Inactive => None,
+        };
+        let data_root = if let Some(provider) = provider.as_ref() {
+            trace_workspace_phase(run_id, "provider-healthy", started);
+            canonicalize_trusted_provider_path("data root", provider.data_root())?
+        } else {
+            prepare_ordinary_data_root(&configured_data_root)?
+        };
         #[cfg(target_os = "macos")]
-        {
+        if provider.is_some() {
             greppy_workspace_core::spawn_repository_tracker_for(
                 data_root.clone(),
                 repo_root.to_path_buf(),
             )?;
             trace_workspace_phase(run_id, "repository-tracker-started", started);
         }
-        let provider_instance = provider.manifest().instance_id.clone();
         let core = WorkspaceCore::open(data_root.join("core"))?;
         trace_workspace_phase(run_id, "core-open", started);
         recover_proposal_publish_journals(&core)?;
         recover_apply_journals(&core)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
-        let (baseline, captured_snapshot_owns_chunks) =
-            capture_tracked_repository(repo_root, &core, run_id, started)?;
+        let (baseline, captured_snapshot_owns_chunks) = if provider.is_some() {
+            capture_tracked_repository(repo_root, &core, run_id, started)?
+        } else {
+            (
+                capture_repository_with_observer(repo_root, core.chunks(), |phase| {
+                    trace_workspace_phase(run_id, phase, started)
+                })?,
+                true,
+            )
+        };
         trace_workspace_phase(run_id, "snapshot-captured", started);
         let repo_root = baseline.repository.clone();
         let base_commit = baseline.base_commit.clone();
@@ -226,27 +251,21 @@ impl AgentWorkspace {
             }
         };
         trace_workspace_phase(run_id, "content-namespace-created", started);
-        let worktree = match provider.workspace_path(run_id) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = core.abort_workspace_pair(run_id, &git_run_id);
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = wait_for_workspace_snapshot(&worktree, &baseline_for_git.entries) {
-            let _ = core.abort_workspace_pair(run_id, &git_run_id);
-            return Err(error);
-        }
-        // This mounted path is provider-authenticated above and now exists.
-        // Resolve configured storage symlinks before it crosses the sandbox's
-        // no-symlink writable-root boundary.
-        let worktree = match canonicalize_trusted_provider_path("workspace", &worktree) {
+        let worktree = match materialize_content_workspace(
+            provider.as_ref(),
+            &data_root,
+            run_id,
+            &repo_root,
+            &baseline_for_git,
+            core.chunks(),
+        ) {
             Ok(path) => path,
             Err(error) => {
                 let _ = core.abort_workspace_pair(run_id, &git_run_id);
                 return Err(error);
             }
         };
+        let ordinary_content_owned = provider.is_none();
         trace_workspace_phase(run_id, "content-visible", started);
         let (git_baseline, git_baseline_owns_chunks, baseline_tree, baseline_view_commit) =
             match prepare_git_control_baseline(
@@ -259,12 +278,19 @@ impl AgentWorkspace {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                    cleanup_failed_ordinary_paths(
+                        &data_root,
+                        run_id,
+                        ordinary_content_owned,
+                        &git_run_id,
+                        false,
+                    );
                     return Err(error);
                 }
             };
         trace_workspace_phase(run_id, "git-baseline-prepared", started);
         let git_handle = if git_baseline_owns_chunks {
-            core.create_overlay_workspace(&git_run_id, git_baseline)
+            core.create_overlay_workspace(&git_run_id, git_baseline.clone())
         } else {
             core.create_overlay_workspace_from_shared_baseline(&git_run_id, &git_baseline)
         };
@@ -272,29 +298,38 @@ impl AgentWorkspace {
             Ok(handle) => handle,
             Err(error) => {
                 let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                cleanup_failed_ordinary_paths(
+                    &data_root,
+                    run_id,
+                    ordinary_content_owned,
+                    &git_run_id,
+                    false,
+                );
                 return Err(error.into());
             }
         };
         trace_workspace_phase(run_id, "git-namespace-created", started);
-        let private_git_dir = match provider.workspace_path(&git_run_id) {
+        let private_git_dir = match materialize_overlay_workspace(
+            provider.as_ref(),
+            &data_root,
+            &git_run_id,
+            &git_baseline,
+            core.chunks(),
+        ) {
             Ok(path) => path,
             Err(error) => {
                 let _ = core.abort_workspace_pair(run_id, &git_run_id);
-                return Err(error.into());
+                cleanup_failed_ordinary_paths(
+                    &data_root,
+                    run_id,
+                    ordinary_content_owned,
+                    &git_run_id,
+                    false,
+                );
+                return Err(error);
             }
         };
-        if let Err(error) = wait_for_workspace(&private_git_dir) {
-            let _ = core.abort_workspace_pair(run_id, &git_run_id);
-            return Err(error);
-        }
-        let private_git_dir =
-            match canonicalize_trusted_provider_path("private Git workspace", &private_git_dir) {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = core.abort_workspace_pair(run_id, &git_run_id);
-                    return Err(error);
-                }
-            };
+        let ordinary_git_owned = provider.is_none();
         trace_workspace_phase(run_id, "git-namespace-visible", started);
         let initialized = initialize_private_git(
             &worktree,
@@ -306,15 +341,62 @@ impl AgentWorkspace {
             Ok(result) => result,
             Err(error) => {
                 let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                cleanup_failed_ordinary_paths(
+                    &data_root,
+                    run_id,
+                    ordinary_content_owned,
+                    &git_run_id,
+                    ordinary_git_owned,
+                );
                 return Err(error);
             }
         };
         trace_workspace_phase(run_id, "git-initialized", started);
+        let ordinary_identity = if provider.is_none() {
+            let root = ordinary_workspace_root(&data_root);
+            let identity = ordinary_workspace_identity(run_id, &baseline_hash);
+            if let Err(error) = write_ordinary_identity(&root, run_id, &git_run_id, &identity) {
+                let _ = core.abort_workspace_pair(run_id, &git_run_id);
+                cleanup_failed_ordinary_paths(
+                    &data_root,
+                    run_id,
+                    ordinary_content_owned,
+                    &git_run_id,
+                    ordinary_git_owned,
+                );
+                return Err(error);
+            }
+            Some(identity)
+        } else {
+            None
+        };
         if let Err(error) = core.complete_workspace_pair(&handle, &git_handle) {
             let _ = core.abort_workspace_pair(run_id, &git_run_id);
+            cleanup_failed_ordinary_paths(
+                &data_root,
+                run_id,
+                ordinary_content_owned,
+                &git_run_id,
+                ordinary_git_owned,
+            );
+            if provider.is_none() {
+                let _ = remove_ordinary_identity(&ordinary_workspace_root(&data_root), run_id);
+            }
             return Err(error.into());
         }
         trace_workspace_phase(run_id, "pair-committed", started);
+        let backend = match provider {
+            Some(provider) => WorkspaceBackend::Provider {
+                instance: provider.manifest().instance_id.clone(),
+                configured_data_root,
+            },
+            None => {
+                let root = ordinary_workspace_root(&data_root);
+                let identity = ordinary_identity
+                    .expect("ordinary workspace identity is prepared before pair commit");
+                WorkspaceBackend::Ordinary { root, identity }
+            }
+        };
         Ok(Self {
             repo_root,
             worktree,
@@ -326,8 +408,7 @@ impl AgentWorkspace {
             baseline_hash,
             baseline_tree,
             baseline_view_commit,
-            provider_instance,
-            provider_data_root: configured_data_root,
+            backend,
             data_root,
             core,
             handle,
@@ -394,14 +475,29 @@ impl AgentWorkspace {
 
     pub fn finish(&self, message: &str) -> Result<RunOutcome, WorkspaceError> {
         self.verify_identity()?;
+        let backend_changed_paths = match &self.backend {
+            WorkspaceBackend::Provider { .. } => self.core.changed_paths(&self.handle)?,
+            WorkspaceBackend::Ordinary { .. } => {
+                ordinary_changed_paths(&self.worktree, &self.private_index, &self.baseline_tree)?
+            }
+        };
         let changed_paths = filter_agent_owned_ephemeral_paths(
             &self.worktree,
             &self.baseline_tree,
-            self.core.changed_paths(&self.handle)?,
+            backend_changed_paths,
         )?;
         let changed_paths =
             filter_ignored_paths(&self.worktree, &self.private_index, changed_paths)?;
-        let hardlink_groups = self.core.hardlink_groups(&self.handle, &changed_paths)?;
+        let hardlink_groups = match &self.backend {
+            WorkspaceBackend::Provider { .. } => {
+                self.core.hardlink_groups(&self.handle, &changed_paths)?
+            }
+            WorkspaceBackend::Ordinary { .. } => ordinary_changed_hardlink_groups(
+                &self.worktree,
+                &self.private_index,
+                &changed_paths,
+            )?,
+        };
         if !changed_paths.is_empty() {
             let mut arguments = vec!["add", "-A", "--"];
             arguments.extend(changed_paths.iter().map(String::as_str));
@@ -413,6 +509,7 @@ impl AgentWorkspace {
             &self.worktree,
             &self.private_index,
             &hardlink_groups,
+            matches!(&self.backend, WorkspaceBackend::Provider { .. }),
         )?;
         let final_tree = git_with_index(&self.worktree, &self.private_index, &["write-tree"])?;
         if final_tree == self.baseline_tree {
@@ -499,26 +596,47 @@ impl AgentWorkspace {
         }
         self.core
             .remove_workspace_pair(self.handle, self.git_handle)?;
+        if let WorkspaceBackend::Ordinary { root, .. } = &self.backend {
+            remove_owned_ordinary_workspace(&self.worktree)?;
+            remove_owned_ordinary_workspace(&self.private_git_dir)?;
+            remove_ordinary_identity(root, &self.run_id)?;
+        }
         drop(self.pair_lease);
         Ok(())
     }
 
     fn verify_identity(&self) -> Result<(), WorkspaceError> {
-        let provider = ProviderInstallation::require_healthy(&self.provider_data_root)?;
-        if provider.manifest().instance_id != self.provider_instance {
-            return Err(WorkspaceError::Tampered {
-                path: self.worktree.clone(),
-                detail: "provider instance changed during the agent run".into(),
-            });
-        }
-        let expected_worktree = canonicalize_trusted_provider_path(
-            "workspace",
-            &provider.workspace_path(&self.run_id)?,
-        )?;
-        let expected_private_git = canonicalize_trusted_provider_path(
-            "private Git workspace",
-            &provider.workspace_path(self.git_handle.id())?,
-        )?;
+        let (expected_worktree, expected_private_git) = match &self.backend {
+            WorkspaceBackend::Provider {
+                instance,
+                configured_data_root,
+            } => {
+                let provider = ProviderInstallation::require_healthy(configured_data_root)?;
+                if provider.manifest().instance_id != *instance {
+                    return Err(WorkspaceError::Tampered {
+                        path: self.worktree.clone(),
+                        detail: "provider instance changed during the agent run".into(),
+                    });
+                }
+                (
+                    canonicalize_trusted_provider_path(
+                        "workspace",
+                        &provider.workspace_path(&self.run_id)?,
+                    )?,
+                    canonicalize_trusted_provider_path(
+                        "private Git workspace",
+                        &provider.workspace_path(self.git_handle.id())?,
+                    )?,
+                )
+            }
+            WorkspaceBackend::Ordinary { root, identity } => {
+                verify_ordinary_identity(root, &self.run_id, self.git_handle.id(), identity)?;
+                (
+                    canonicalize_owned_ordinary_workspace(root, &self.run_id)?,
+                    canonicalize_owned_ordinary_workspace(root, self.git_handle.id())?,
+                )
+            }
+        };
         if expected_worktree != self.worktree
             || expected_private_git != self.private_git_dir
             || !self.private_git_dir.is_dir()
@@ -1702,6 +1820,7 @@ fn stage_hardlink_groups(
     worktree: &Path,
     index: &Path,
     hardlink_groups: &[Vec<String>],
+    use_core_metadata: bool,
 ) -> Result<(), WorkspaceError> {
     for group in hardlink_groups {
         let Some(canonical) = group.first() else {
@@ -1710,13 +1829,17 @@ fn stage_hardlink_groups(
                 detail: "proposal contains an empty hardlink group".into(),
             });
         };
-        let metadata =
+        let mode = if use_core_metadata {
             core.metadata(workspace, canonical)?
                 .ok_or_else(|| WorkspaceError::Tampered {
                     path: worktree.join(canonical),
                     detail: "hardlink group canonical path disappeared before staging".into(),
-                })?;
-        let mode = if metadata.mode & 0o111 != 0 {
+                })?
+                .mode
+        } else {
+            ordinary_file_mode(&worktree.join(canonical))?
+        };
+        let mode = if mode & 0o111 != 0 {
             "100755"
         } else {
             "100644"
@@ -1736,6 +1859,31 @@ fn stage_hardlink_groups(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn ordinary_file_mode(path: &Path) -> Result<u32, WorkspaceError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: path.into(),
+            detail: "hardlink group canonical path is not a regular file".into(),
+        });
+    }
+    Ok(metadata.permissions().mode())
+}
+
+#[cfg(windows)]
+fn ordinary_file_mode(path: &Path) -> Result<u32, WorkspaceError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(WorkspaceError::Tampered {
+            path: path.into(),
+            detail: "hardlink group canonical path is not a regular file".into(),
+        });
+    }
+    Ok(0o644)
 }
 
 fn apply_affected_paths(
@@ -2922,6 +3070,339 @@ fn canonicalize_trusted_provider_path(kind: &str, path: &Path) -> Result<PathBuf
     })
 }
 
+fn prepare_ordinary_data_root(configured: &Path) -> Result<PathBuf, WorkspaceError> {
+    fs::create_dir_all(configured)?;
+    let root = fs::canonicalize(configured)?;
+    let workspaces = ordinary_workspace_root(&root);
+    ensure_owned_ordinary_root(&root, &workspaces)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&workspaces, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(root)
+}
+
+fn ordinary_workspace_root(data_root: &Path) -> PathBuf {
+    data_root.join("ordinary-workspaces-v1")
+}
+
+fn ensure_owned_ordinary_root(data_root: &Path, root: &Path) -> Result<(), WorkspaceError> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(WorkspaceError::Tampered {
+                path: root.into(),
+                detail: "ordinary workspace root is not an owned physical directory".into(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(root)?,
+        Err(error) => return Err(error.into()),
+    }
+    let canonical_data = fs::canonicalize(data_root)?;
+    let canonical_root = fs::canonicalize(root)?;
+    if canonical_root.parent() != Some(canonical_data.as_path()) {
+        return Err(WorkspaceError::Tampered {
+            path: root.into(),
+            detail: "ordinary workspace root escaped the Greppy data root".into(),
+        });
+    }
+    Ok(())
+}
+
+fn materialize_content_workspace(
+    provider: Option<&ProviderInstallation>,
+    data_root: &Path,
+    id: &str,
+    repository: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+) -> Result<PathBuf, WorkspaceError> {
+    if let Some(provider) = provider {
+        let path = provider.workspace_path(id)?;
+        wait_for_workspace_snapshot(&path, &baseline.entries)?;
+        return canonicalize_trusted_provider_path("workspace", &path);
+    }
+    let root = ordinary_workspace_root(data_root);
+    publish_ordinary_directory(&root, id, |staging| {
+        materialize_repository_baseline(repository, staging, baseline, chunks)
+    })
+}
+
+fn materialize_overlay_workspace(
+    provider: Option<&ProviderInstallation>,
+    data_root: &Path,
+    id: &str,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+) -> Result<PathBuf, WorkspaceError> {
+    if let Some(provider) = provider {
+        let path = provider.workspace_path(id)?;
+        wait_for_workspace(&path)?;
+        return canonicalize_trusted_provider_path("private Git workspace", &path);
+    }
+    let root = ordinary_workspace_root(data_root);
+    publish_ordinary_directory(&root, id, |staging| {
+        materialize_overlay_baseline(staging, baseline, chunks)
+    })
+}
+
+fn publish_ordinary_directory(
+    root: &Path,
+    id: &str,
+    build: impl FnOnce(&Path) -> Result<(), WorkspaceError>,
+) -> Result<PathBuf, WorkspaceError> {
+    let data_root = root
+        .parent()
+        .ok_or_else(|| io::Error::other("ordinary workspace root has no parent"))?;
+    ensure_owned_ordinary_root(data_root, root)?;
+    let destination = root.join(id);
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(WorkspaceError::Tampered {
+            path: destination,
+            detail: "ordinary workspace destination already exists".into(),
+        });
+    }
+    let staging = root.join(format!(
+        ".{id}.publishing-{:x}-{:x}",
+        std::process::id(),
+        now_unix_ns()
+    ));
+    fs::create_dir(&staging)?;
+    let result = build(&staging).and_then(|()| {
+        fs::rename(&staging, &destination)?;
+        fs::canonicalize(&destination).map_err(WorkspaceError::from)
+    });
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn materialize_repository_baseline(
+    repository: &Path,
+    destination: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+) -> Result<(), WorkspaceError> {
+    let git_dir = PathBuf::from(git_ok(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?);
+    let index = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("ordinary workspace has no parent"))?
+        .join(format!(".{}.index", now_unix_ns()));
+    let checkout = (|| -> Result<(), WorkspaceError> {
+        git_private(
+            &git_dir,
+            destination,
+            Some(&index),
+            &["read-tree", &baseline.base_commit],
+        )?;
+        git_private(
+            &git_dir,
+            destination,
+            Some(&index),
+            &["checkout-index", "--all", "--force"],
+        )?;
+        materialize_snapshot_entries(destination, baseline, chunks)
+    })();
+    let _ = fs::remove_file(index);
+    checkout
+}
+
+fn materialize_overlay_baseline(
+    destination: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+) -> Result<(), WorkspaceError> {
+    for directory in &baseline.directories {
+        ensure_materialization_ancestors(destination, &directory.path)?;
+        let path = destination.join(&directory.path);
+        fs::create_dir_all(&path)?;
+        set_restored_mode(&path, directory.mode)?;
+    }
+    materialize_snapshot_entries(destination, baseline, chunks)
+}
+
+fn materialize_snapshot_entries(
+    destination: &Path,
+    baseline: &BaselineSnapshot,
+    chunks: &ChunkStore,
+) -> Result<(), WorkspaceError> {
+    for entry in &baseline.entries {
+        ensure_materialization_ancestors(destination, &entry.path)?;
+        let path = destination.join(&entry.path);
+        match entry.kind {
+            EntryKind::Tombstone => remove_visible_path(&path)?,
+            EntryKind::File => {
+                remove_visible_path(&path)?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, baseline_bytes(chunks, entry)?)?;
+                set_restored_mode(&path, entry.mode)?;
+            }
+            EntryKind::Symlink => {
+                remove_visible_path(&path)?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                create_restored_symlink(&baseline_bytes(chunks, entry)?, &path)?;
+            }
+        }
+    }
+    for group in &baseline.hardlink_groups {
+        let Some(source) = group.first() else {
+            continue;
+        };
+        let source = destination.join(source);
+        for relative in group.iter().skip(1) {
+            ensure_materialization_ancestors(destination, relative)?;
+            let target = destination.join(relative);
+            remove_visible_path(&target)?;
+            fs::hard_link(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_materialization_ancestors(root: &Path, relative: &str) -> Result<(), WorkspaceError> {
+    validate_apply_path(relative)?;
+    let mut ancestor = root.to_path_buf();
+    let Some(parent) = Path::new(relative).parent() else {
+        return Ok(());
+    };
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        ancestor.push(component);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(WorkspaceError::Tampered {
+                    path: ancestor,
+                    detail: format!(
+                        "ordinary workspace has a non-directory ancestor for {relative}"
+                    ),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ordinary_workspace_identity(run_id: &str, baseline_hash: &str) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"greppy-ordinary-workspace-v1\0");
+    digest.update(run_id.as_bytes());
+    digest.update(baseline_hash.as_bytes());
+    digest.update(&std::process::id().to_le_bytes());
+    digest.update(&now_unix_ns().to_le_bytes());
+    digest.finalize().to_hex().to_string()
+}
+
+fn ordinary_identity_path(root: &Path, run_id: &str) -> PathBuf {
+    root.join(format!(".{run_id}.identity"))
+}
+
+fn write_ordinary_identity(
+    root: &Path,
+    run_id: &str,
+    git_id: &str,
+    identity: &str,
+) -> Result<(), WorkspaceError> {
+    let data_root = root
+        .parent()
+        .ok_or_else(|| io::Error::other("ordinary workspace root has no parent"))?;
+    ensure_owned_ordinary_root(data_root, root)?;
+    let payload = serde_json::to_vec(&("greppy.ordinary-workspace.v1", run_id, git_id, identity))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let path = ordinary_identity_path(root, run_id);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn verify_ordinary_identity(
+    root: &Path,
+    run_id: &str,
+    git_id: &str,
+    identity: &str,
+) -> Result<(), WorkspaceError> {
+    let data_root = root
+        .parent()
+        .ok_or_else(|| io::Error::other("ordinary workspace root has no parent"))?;
+    ensure_owned_ordinary_root(data_root, root)?;
+    let path = ordinary_identity_path(root, run_id);
+    let expected = serde_json::to_vec(&("greppy.ordinary-workspace.v1", run_id, git_id, identity))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let is_regular = fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+    if !is_regular || fs::read(&path).ok().as_deref() != Some(expected.as_slice()) {
+        return Err(WorkspaceError::Tampered {
+            path,
+            detail: "ordinary workspace identity changed during the agent run".into(),
+        });
+    }
+    Ok(())
+}
+
+fn canonicalize_owned_ordinary_workspace(root: &Path, id: &str) -> Result<PathBuf, WorkspaceError> {
+    let canonical_root = fs::canonicalize(root)?;
+    let path = fs::canonicalize(root.join(id))?;
+    if path.parent() != Some(canonical_root.as_path()) || !path.is_dir() {
+        return Err(WorkspaceError::Tampered {
+            path,
+            detail: "ordinary workspace escaped its owned root".into(),
+        });
+    }
+    Ok(path)
+}
+
+fn remove_owned_ordinary_workspace(path: &Path) -> Result<(), WorkspaceError> {
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn cleanup_failed_ordinary_paths(
+    data_root: &Path,
+    content_id: &str,
+    content_owned: bool,
+    git_id: &str,
+    git_owned: bool,
+) {
+    let root = ordinary_workspace_root(data_root);
+    for (id, owned) in [(content_id, content_owned), (git_id, git_owned)] {
+        if !owned {
+            continue;
+        }
+        let path = root.join(id);
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn remove_ordinary_identity(root: &Path, run_id: &str) -> Result<(), WorkspaceError> {
+    fs::remove_file(ordinary_identity_path(root, run_id))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn home_dir() -> Result<PathBuf, WorkspaceError> {
     std::env::var_os("HOME")
@@ -3671,6 +4152,179 @@ fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, Wor
         ),
         output,
     )
+}
+
+fn ordinary_changed_paths(
+    worktree: &Path,
+    index: &Path,
+    baseline_tree: &str,
+) -> Result<Vec<String>, WorkspaceError> {
+    let mut paths = git_nul_paths(
+        worktree,
+        index,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            baseline_tree,
+            "--",
+        ],
+        "ordinary baseline diff",
+    )?;
+    paths.extend(git_nul_paths(
+        worktree,
+        index,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        "ordinary untracked inventory",
+    )?);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn ordinary_changed_hardlink_groups(
+    worktree: &Path,
+    index: &Path,
+    changed_paths: &[String],
+) -> Result<Vec<Vec<String>>, WorkspaceError> {
+    if changed_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut target_identities = BTreeSet::<HardlinkIdentity>::new();
+    for path in changed_paths {
+        if let Some(identity) = path_hardlink_identity(&worktree.join(path))? {
+            target_identities.insert(identity);
+        }
+    }
+    if target_identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut groups = BTreeMap::<HardlinkIdentity, BTreeSet<String>>::new();
+    run_git_nul_stream(
+        worktree,
+        index,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+        "ordinary hardlink inventory",
+        |path| {
+            if let Some(identity) = path_hardlink_identity(&worktree.join(path))? {
+                if target_identities.contains(&identity) {
+                    groups.entry(identity).or_default().insert(path.into());
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|group| group.into_iter().collect())
+        .collect())
+}
+
+fn git_nul_paths(
+    worktree: &Path,
+    index: &Path,
+    args: &[&str],
+    subject: &str,
+) -> Result<Vec<String>, WorkspaceError> {
+    let mut paths = Vec::new();
+    run_git_nul_stream(worktree, index, args, subject, |path| {
+        paths.push(path.into());
+        Ok(())
+    })?;
+    Ok(paths)
+}
+
+fn run_git_nul_stream(
+    worktree: &Path,
+    index: &Path,
+    args: &[&str],
+    subject: &str,
+    mut visit: impl FnMut(&str) -> Result<(), WorkspaceError>,
+) -> Result<(), WorkspaceError> {
+    let worktree = git_compatible_path(worktree)?;
+    let index = git_compatible_path(index)?;
+    let mut child = Command::new("git")
+        .args(["-C", path_text(&worktree)?])
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Git inventory stdout is unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Git inventory stderr is unavailable"))?;
+    const STDERR_LIMIT: u64 = 1024 * 1024;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(STDERR_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let streamed = stream_nul_paths(BufReader::new(stdout), &mut visit);
+    if streamed.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("Git inventory stderr reader panicked"))??;
+    streamed?;
+    if !status.success() {
+        let stderr = if stderr.len() > STDERR_LIMIT as usize {
+            b"Git stderr exceeded 1 MiB and was truncated\n".to_vec()
+        } else {
+            stderr
+        };
+        return Err(git_failed(
+            subject,
+            &Output {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn stream_nul_paths(
+    mut reader: impl BufRead,
+    mut visit: impl FnMut(&str) -> Result<(), WorkspaceError>,
+) -> Result<(), WorkspaceError> {
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let count = reader.read_until(0, &mut record)?;
+        if count == 0 {
+            return Ok(());
+        }
+        if record.last() == Some(&0) {
+            record.pop();
+        }
+        if record.is_empty() {
+            continue;
+        }
+        let path = std::str::from_utf8(&record).map_err(|_| {
+            WorkspaceError::Unsupported("ordinary workspace contains a non-UTF-8 path".into())
+        })?;
+        validate_apply_path(path)?;
+        visit(path)?;
+    }
 }
 
 fn filter_ignored_paths(
@@ -5439,16 +6093,334 @@ mod tests {
     }
 
     #[test]
-    fn missing_provider_fails_closed() {
+    fn missing_provider_uses_isolated_dirty_baseline_and_preserves_source_index() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        fs::write(repo.join("tracked.txt"), b"staged\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        fs::write(repo.join("tracked.txt"), b"unstaged\n").unwrap();
+        fs::write(repo.join("untracked.txt"), b"untracked\n").unwrap();
+        let index = repo.join(".git/index");
+        let index_before = fs::read(&index).unwrap();
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
-        std::env::set_var("GREPPY_WORKSPACE_DIR", temp.path());
-        let error = AgentWorkspace::create(temp.path(), "missing-provider").unwrap_err();
-        assert!(matches!(error, WorkspaceError::AdapterUnavailable(_)));
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "missing-provider").unwrap();
+        assert_eq!(
+            fs::read(workspace.worktree_path().join("tracked.txt")).unwrap(),
+            b"unstaged\n"
+        );
+        assert_eq!(
+            fs::read(workspace.worktree_path().join("untracked.txt")).unwrap(),
+            b"untracked\n"
+        );
+        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+        fs::write(workspace.worktree_path().join("tracked.txt"), b"agent\n").unwrap();
+        let (commit, ref_name) = match workspace.finish("ordinary proposal").unwrap() {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("expected proposal"),
+        };
+        assert_eq!(workspace.ref_name(), ref_name);
+        workspace.apply_to(&repo, &commit).unwrap();
+        assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"agent\n");
+        assert_eq!(
+            fs::read(repo.join("untracked.txt")).unwrap(),
+            b"untracked\n"
+        );
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        let worktree = workspace.worktree_path().to_path_buf();
+        let private_git = workspace.linked_git_dir().to_path_buf();
+        workspace.cleanup().unwrap();
+        assert!(!worktree.exists());
+        assert!(!private_git.exists());
         match previous {
             Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
             None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
         }
+    }
+
+    #[test]
+    fn ordinary_workspace_rejects_concurrent_identity_and_keep_retains_paths() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "ordinary-keep").unwrap();
+        assert!(AgentWorkspace::create(&repo, "ordinary-keep").is_err());
+        let worktree = workspace.worktree_path().to_path_buf();
+        let private_git = workspace.linked_git_dir().to_path_buf();
+        workspace.keep().unwrap();
+        assert!(worktree.is_dir());
+        assert!(private_git.is_dir());
+        assert_eq!(
+            workspace.core.status(&workspace.handle).unwrap().state,
+            "kept"
+        );
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn present_invalid_provider_does_not_silently_fall_back() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("provider.json"), b"not a provider manifest").unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        assert!(AgentWorkspace::create(temp.path(), "invalid-provider").is_err());
+        assert!(!ordinary_workspace_root(&data).exists());
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn installed_but_unmounted_provider_uses_ordinary_workspace() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        let mount = temp.path().join("inactive-mount");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&data).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let manifest = ProviderManifest {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            adapter_version: "0.4.1-installed".into(),
+            adapter_kind: AdapterKind::FsKit,
+            state: ProviderState::Ready,
+            instance_id: "installed-not-mounted".into(),
+            data_root: data.clone(),
+            mount_root: mount,
+            heartbeat_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            capabilities: ProviderCapabilities {
+                hard_links: true,
+                symbolic_links: true,
+                byte_range_locks: true,
+                memory_maps: true,
+                atomic_rename: true,
+                case_preserving: true,
+            },
+        };
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "installed-inactive").unwrap();
+        assert!(matches!(
+            workspace.backend,
+            WorkspaceBackend::Ordinary { .. }
+        ));
+        workspace.cleanup().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn ordinary_git_collision_survives_failed_creation() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&data).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let root = ordinary_workspace_root(&data);
+        fs::create_dir(&root).unwrap();
+        let collision = root.join(git_workspace_id("collision"));
+        fs::create_dir(&collision).unwrap();
+        fs::write(collision.join("foreign.txt"), b"preserve\n").unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        assert!(AgentWorkspace::create(&repo, "collision").is_err());
+        assert_eq!(
+            fs::read(collision.join("foreign.txt")).unwrap(),
+            b"preserve\n"
+        );
+        assert!(!root.join("collision").exists());
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_materialization_refuses_symlink_ancestors_and_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ordinary_workspace_root(&data)).unwrap();
+        assert!(prepare_ordinary_data_root(&data).is_err());
+
+        fs::remove_file(ordinary_workspace_root(&data)).unwrap();
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("link")).unwrap();
+        let chunks_root = tempfile::tempdir().unwrap();
+        let chunks = ChunkStore::open(chunks_root.path()).unwrap();
+        let bytes = b"escape";
+        let chunk = chunks.put(bytes).unwrap();
+        let snapshot = BaselineSnapshot {
+            repository: destination.clone(),
+            base_commit: "virtual-empty:test".into(),
+            baseline_hash: "test".into(),
+            index_hash: String::new(),
+            index_chunks: Vec::new(),
+            directories: Vec::new(),
+            entries: vec![BaselineEntry {
+                path: "link/escape.txt".into(),
+                kind: EntryKind::File,
+                mode: 0o644,
+                size: bytes.len() as u64,
+                modified_unix_ns: 0,
+                content_hash: blake3::hash(bytes).to_hex().to_string(),
+                chunks: vec![chunk],
+            }],
+            hardlink_groups: Vec::new(),
+            tracker_epoch: None,
+            tracker_generation: None,
+        };
+        assert!(materialize_snapshot_entries(&destination, &snapshot, &chunks).is_err());
+        assert!(!outside.join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_identity_refuses_symlink_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = ordinary_workspace_root(&data);
+        fs::create_dir_all(&root).unwrap();
+        write_ordinary_identity(&root, "run", "git-run", "nonce").unwrap();
+        let path = ordinary_identity_path(&root, "run");
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&replacement, &path).unwrap();
+        assert!(verify_ordinary_identity(&root, "run", "git-run", "nonce").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_finish_preserves_new_link_to_unchanged_source_after_agent_commit() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"unchanged\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let index = repo.join(".git/index");
+        let index_before = fs::read(&index).unwrap();
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+
+        let workspace = AgentWorkspace::create(&repo, "ordinary-hardlink-commit").unwrap();
+        fs::hard_link(
+            workspace.worktree_path().join("tracked.txt"),
+            workspace.worktree_path().join("new.txt"),
+        )
+        .unwrap();
+        git(workspace.worktree_path(), &["config", "user.name", "Agent"]);
+        git(
+            workspace.worktree_path(),
+            &["config", "user.email", "agent@example.com"],
+        );
+        git(workspace.worktree_path(), &["add", "new.txt"]);
+        git(
+            workspace.worktree_path(),
+            &["commit", "-qm", "add linked file"],
+        );
+        assert!(git(workspace.worktree_path(), &["status", "--porcelain"]).is_empty());
+
+        let (commit, ref_name) = match workspace.finish("hardlink proposal").unwrap() {
+            RunOutcome::Proposal {
+                commit, ref_name, ..
+            } => (commit, ref_name),
+            RunOutcome::Clean => panic!("committed workspace delta must remain a proposal"),
+        };
+        let proposal = workspace.core.proposal(&ref_name).unwrap();
+        assert_eq!(
+            proposal.hardlink_groups,
+            vec![vec!["new.txt".into(), "tracked.txt".into()]]
+        );
+        workspace.apply_to(&repo, &commit).unwrap();
+        let source = fs::metadata(repo.join("tracked.txt")).unwrap();
+        let linked = fs::metadata(repo.join("new.txt")).unwrap();
+        assert_eq!(source.ino(), linked.ino());
+        assert_eq!(source.nlink(), 2);
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        workspace.cleanup().unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn ordinary_nul_stream_accepts_more_than_two_hundred_thousand_records() {
+        let mut input = Vec::with_capacity(400_002);
+        for _ in 0..200_001 {
+            input.extend_from_slice(b"p\0");
+        }
+        let mut count = 0usize;
+        stream_nul_paths(std::io::Cursor::new(input), |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 200_001);
     }
 }
