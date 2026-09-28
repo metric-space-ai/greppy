@@ -3578,14 +3578,22 @@ fn recover_ordinary_cleanup_journals(
                 path: path.clone(),
                 detail: format!("ordinary cleanup journal is invalid: {error}"),
             })?;
-        if journal.schema != 1 || git_workspace_id(&journal.run_id) != journal.git_id {
+        validate_run_id(&journal.run_id)?;
+        validate_run_id(&journal.git_id)?;
+        if journal.schema != 1
+            || git_workspace_id(&journal.run_id) != journal.git_id
+            || ordinary_cleanup_journal_path(&root, &journal.run_id) != path
+        {
             return Err(WorkspaceError::Tampered {
                 path,
                 detail: "ordinary cleanup journal identity is invalid".into(),
             });
         }
+        let Some(_recovery_lease) = core.try_workspace_pair_lease(&journal.run_id)? else {
+            continue;
+        };
+        verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
         if !journal.core_removed {
-            verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
             let paths = [
                 (
                     "agent-data",
@@ -6693,6 +6701,21 @@ mod tests {
 
         let core = WorkspaceCore::open(data.join("core")).unwrap();
         assert_eq!(core.list_workspaces().unwrap().len(), 2);
+        let identity_bytes = fs::read(&identity).unwrap();
+        let mut forged_phase: OrdinaryCleanupJournal =
+            serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        forged_phase.core_removed = true;
+        replace_ordinary_cleanup_journal(&journal, &forged_phase).unwrap();
+        fs::write(&identity, b"tampered identity\n").unwrap();
+        assert!(matches!(
+            recover_ordinary_cleanup_journals(&data, &core),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        assert!(private_git.exists());
+        assert!(journal.exists());
+        fs::write(&identity, identity_bytes).unwrap();
+        forged_phase.core_removed = false;
+        replace_ordinary_cleanup_journal(&journal, &forged_phase).unwrap();
         recover_ordinary_cleanup_journals(&data, &core).unwrap();
         assert!(core.list_workspaces().unwrap().is_empty());
         assert!(!worktree.exists());
@@ -6702,6 +6725,70 @@ mod tests {
         assert!(!agent_data.exists());
         assert!(!scratch.exists());
         assert_eq!(fs::read(foreign.join("keep.txt")).unwrap(), b"foreign\n");
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn ordinary_cleanup_recovery_skips_live_owner_and_rejects_renamed_journal() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+
+        let workspace = AgentWorkspace::create(&repo, "cleanup-live-owner").unwrap();
+        let root = ordinary_workspace_root(&data);
+        let run_id = workspace.run_id().to_string();
+        let git_id = workspace.git_handle.id().to_string();
+        let identity = match &workspace.backend {
+            WorkspaceBackend::Ordinary { identity, .. } => identity.clone(),
+            WorkspaceBackend::Provider { .. } => panic!("expected ordinary workspace"),
+        };
+        let worktree = workspace.worktree_path().to_path_buf();
+        let private_git = workspace.linked_git_dir().to_path_buf();
+        let identity_path = ordinary_identity_path(&root, &run_id);
+        let journal_path = persist_ordinary_cleanup_journal(
+            &root,
+            &OrdinaryCleanupJournal {
+                schema: 1,
+                run_id: run_id.clone(),
+                git_id,
+                identity,
+                core_removed: false,
+            },
+        )
+        .unwrap();
+
+        recover_ordinary_cleanup_journals(&data, &workspace.core).unwrap();
+        assert!(worktree.exists());
+        assert!(private_git.exists());
+        assert!(identity_path.exists());
+        assert!(journal_path.exists());
+        assert_eq!(workspace.core.list_workspaces().unwrap().len(), 2);
+
+        let renamed_journal = root.join(".cleanup-wrong.json");
+        fs::rename(&journal_path, &renamed_journal).unwrap();
+        assert!(matches!(
+            recover_ordinary_cleanup_journals(&data, &workspace.core),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        assert!(worktree.exists());
+        assert!(private_git.exists());
+        assert!(identity_path.exists());
+        fs::rename(&renamed_journal, &journal_path).unwrap();
+        workspace.cleanup().unwrap();
 
         match previous {
             Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
