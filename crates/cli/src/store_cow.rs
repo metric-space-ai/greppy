@@ -2695,6 +2695,7 @@ mod tests {
             ENV_MODE,
             ENV_BASE_PATH,
             ENV_BASE_COMMIT,
+            crate::ENV_STRUCTURAL_FIRST_USE,
         ]);
         let scratch = tempfile::tempdir().unwrap();
         // The freshness proof compares the live workspace with the exact
@@ -3218,6 +3219,20 @@ mod tests {
             "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// second dirty Delta\n",
         )
         .unwrap();
+        // A production drift query launches `<current greppy> index ...` with
+        // structural-first-use set. This unit test runs inside the libtest
+        // executable, so spawning current_exe would feed CLI arguments to the
+        // test harness. Dispatch the same structural index path in-process;
+        // embeddings remain deferred and the vector-preservation assertion
+        // below continues to cover the one-shot repair contract.
+        std::env::set_var(crate::ENV_STRUCTURAL_FIRST_USE, "1");
+        let index_code = crate::dispatch(
+            crate::Cli::try_parse_from(["greppy", "index", &root_string, "--root", &root_string])
+                .unwrap(),
+        )
+        .unwrap();
+        std::env::remove_var(crate::ENV_STRUCTURAL_FIRST_USE);
+        assert_eq!(index_code, 0, "dirty structural publication should succeed");
         let code = crate::dispatch(
             crate::Cli::try_parse_from(["greppy", "--root", &root_string, "who-calls", "target"])
                 .unwrap(),
