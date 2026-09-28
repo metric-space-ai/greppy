@@ -302,7 +302,7 @@ fn read_refuses_same_file_field_function_collision_until_exactly_qualified() {
     index(&repo, &store);
 
     let simplified = "src/i960_timed.rs::cycles";
-    let field = "src/i960_timed.rs::InstructionTiming::cycles";
+    let field = "src/i960_timed.rs::Class::InstructionTiming::cycles";
     let function = "src/i960_timed.rs::Function::cycles";
 
     for command in ["read", "read-smart"] {
