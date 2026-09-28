@@ -2367,8 +2367,20 @@ fn resolve_edges_incremental(
     // copied into the Delta merely because a definition changed.
     if store.is_overlay() {
         let raw_edges = load_all_raw_edges(store, project)?;
+        // A persisted Delta may also contain the bounded Base-edge repairs
+        // published by `rebuild_visible_overlay_edges`. Replacing the
+        // Delta's resolved edges from its own raw rows must carry those
+        // explicitly marked rows forward; otherwise the structural index
+        // pass erases them before the caller can rebuild the composed view.
+        let repaired_base_edges = repaired_base_overlay_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
+        return resolve_and_persist_edges_with_progress_and_preserved(
+            store,
+            project,
+            &raw_edges,
+            &repaired_base_edges,
+            progress,
+        );
     }
 
     // Did a changed file alter the resolvable definition set? If so, an
