@@ -2055,13 +2055,13 @@ struct AgentWorkspaceStatus {
     provider_ready: bool,
     backend: &'static str,
     provider: Option<greppy_workspace_core::ProviderManifest>,
-    data_root: PathBuf,
+    data_root: std::path::PathBuf,
     workspaces: Vec<greppy_workspace_core::WorkspaceStatus>,
     chunks: greppy_workspace_core::ChunkStoreStats,
 }
 
 fn agent_workspace_status(
-    data_root: &Path,
+    data_root: &std::path::Path,
 ) -> std::result::Result<AgentWorkspaceStatus, greppy_workspace_core::Error> {
     let (provider_ready, backend, provider) =
         match greppy_workspace_core::ProviderInstallation::optional(data_root)? {
@@ -2099,6 +2099,7 @@ fn agent_workspace_status(
 #[cfg(test)]
 mod optional_workspace_status_tests {
     use super::*;
+    use std::fs;
     use greppy_workspace_core::{
         AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
         PROVIDER_PROTOCOL_VERSION,
