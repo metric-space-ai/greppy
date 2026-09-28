@@ -3135,17 +3135,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vector_after, vector_before);
-        assert_eq!(
-            repaired
+        let overlay_relations = |store: &greppy_store::Store| {
+            let mut statement = store
                 .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM main.overlay_edges WHERE project = 'p'",
-                    [],
-                    |row| row.get::<_, i64>(0),
+                .prepare(
+                    "SELECT source_qualified_name, target_qualified_name, edge_type,
+                            COALESCE(json_extract(properties, '$.greppy_base_repair_v2'), 0)
+                     FROM main.overlay_edges WHERE project = 'p'
+                     ORDER BY source_qualified_name, target_qualified_name, edge_type",
                 )
-                .unwrap(),
-            1
-        );
+                .unwrap();
+            let relations = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            relations
+        };
+        // The one-shot composed rebuild shadows an existing Base relation too.
+        // Store visibility suppresses the matching Base row, so this is one
+        // visible relation, not two. Only missing Base edges carry repair markers.
+        let expected_relations = [
+            ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
+            ("src/base.rs::Function::base_caller", "CALLS", 1),
+            ("src/caller.rs::Function::caller", "USAGE", 0),
+            ("src/stable.rs::Function::stable_caller", "CALLS", 0),
+        ]
+        .into_iter()
+        .map(|(source, kind, repaired)| {
+            (
+                source.to_string(),
+                "src/alias_chain/sub.rs::Function::target".to_string(),
+                kind.to_string(),
+                repaired,
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(overlay_relations(&repaired), expected_relations);
         let vector_count = repaired
             .conn()
             .query_row(
@@ -3214,6 +3247,37 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == stable_caller_after_dirty.id));
+        let later_relations = overlay_relations(&after_dirty);
+        assert!(
+            later_relations
+                .iter()
+                .all(|row| row.0 != "src/stable.rs::Function::stable_caller"),
+            "ordinary bounded publication must prune the temporary Base shadow"
+        );
+        assert_eq!(
+            later_relations
+                .iter()
+                .filter(|row| row.3 == 1)
+                .collect::<Vec<_>>(),
+            expected_relations
+                .iter()
+                .filter(|row| row.3 == 1)
+                .collect::<Vec<_>>(),
+            "both missing Base relations must survive ordinary Delta publication"
+        );
+        let caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/caller.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_dirty
+                .incoming_edges(target_after_dirty.id, None, 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller_after_dirty.id
+                    && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")),
+            "the real parser must republish the dirty caller relation"
+        );
         let vector_after_dirty: Vec<u8> = after_dirty
             .conn()
             .query_row(
