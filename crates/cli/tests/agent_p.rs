@@ -63,6 +63,13 @@ fn init_repo(root: &std::path::Path) {
 /// Minimal Anthropic Messages gateway: GET /v1/models → 200; POST /v1/messages
 /// → canned SSE text-only end_turn stream.
 fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_sequence(vec![sse])
+}
+
+fn spawn_gateway_sequence(
+    responses: Vec<&'static str>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    assert!(!responses.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
         .set_nonblocking(true)
@@ -72,6 +79,7 @@ fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHan
     let stop_flag = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
+        let mut message_index: usize = 0;
         while !stop_flag.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -90,6 +98,8 @@ fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHan
                         );
                         let _ = stream.write_all(resp.as_bytes());
                     } else if first_line.starts_with("POST /v1/messages") {
+                        let sse = responses[message_index.min(responses.len() - 1)];
+                        message_index += 1;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             sse.len(),
@@ -128,7 +138,11 @@ fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHan
 }
 
 fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
-    spawn_gateway(concat!(
+    spawn_gateway(stub_gateway_response())
+}
+
+fn stub_gateway_response() -> &'static str {
+    concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
         "\n",
@@ -147,11 +161,15 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n",
         "\n",
-    ))
+    )
 }
 
 fn spawn_edit_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
-    spawn_gateway(concat!(
+    spawn_gateway(edit_gateway_response())
+}
+
+fn edit_gateway_response() -> &'static str {
+    concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_edit\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
         "\n",
@@ -170,7 +188,78 @@ fn spawn_edit_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n",
         "\n",
-    ))
+    )
+}
+
+#[test]
+fn greppy_p_without_provider_preserves_dirty_source_and_publishes_proposal() {
+    let root = unique_temp("no-provider-agent");
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::write(repo.join("hello.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "hello.txt"]);
+    std::fs::write(repo.join("hello.txt"), "local\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "keep me\n").unwrap();
+    let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+    let no_provider = root.join("workspace-without-provider");
+    let (endpoint, stop, handle) =
+        spawn_gateway_sequence(vec![edit_gateway_response(), stub_gateway_response()]);
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", root.join("store"))
+        .env("GREPPY_WORKSPACE_DIR", &no_provider)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "change hello.txt",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--private-store",
+            "--skip-selfcheck",
+            "--json",
+        ])
+        .output()
+        .expect("spawn no-provider agent");
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "result")
+        .expect("completed agent result");
+    assert_eq!(result["turns"], 2, "{result}");
+    assert_eq!(result["applied"], false, "{result}");
+    let proposal = result["proposal_ref"].as_str().expect("proposal ref");
+    assert!(proposal.starts_with("refs/greppy/agent/"), "{proposal}");
+    let shown = Command::new("git")
+        .current_dir(&repo)
+        .args(["show", &format!("{proposal}:hello.txt")])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert_eq!(shown.stdout, b"partial\n");
+    assert_eq!(std::fs::read(repo.join("hello.txt")).unwrap(), b"local\n");
+    assert_eq!(
+        std::fs::read(repo.join("untracked.txt")).unwrap(),
+        b"keep me\n"
+    );
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).unwrap(),
+        index_before
+    );
+    assert!(
+        !no_provider.join("provider.json").exists(),
+        "must not install or mount a provider"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
