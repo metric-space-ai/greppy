@@ -6393,7 +6393,7 @@ mod tests {
         let proposal = workspace.core.proposal(&ref_name).unwrap();
         assert_eq!(
             proposal.hardlink_groups,
-            vec![vec!["new.txt".into(), "tracked.txt".into()]]
+            vec![vec!["new.txt".to_string(), "tracked.txt".to_string()]]
         );
         workspace.apply_to(&repo, &commit).unwrap();
         let source = fs::metadata(repo.join("tracked.txt")).unwrap();
