@@ -3413,11 +3413,6 @@ fn canonicalize_owned_ordinary_workspace(root: &Path, id: &str) -> Result<PathBu
     Ok(path)
 }
 
-fn remove_owned_ordinary_workspace(path: &Path) -> Result<(), WorkspaceError> {
-    fs::remove_dir_all(path)?;
-    Ok(())
-}
-
 fn cleanup_failed_ordinary_paths(
     data_root: &Path,
     content_id: &str,
@@ -6725,6 +6720,12 @@ mod tests {
         let foreign = root.join("foreign-collision");
         fs::create_dir(&foreign).unwrap();
         fs::write(foreign.join("keep.txt"), b"foreign\n").unwrap();
+        // Open the recovery observer while the Agent still holds its pair
+        // lease. Startup recovery must preserve this live pair, allowing the
+        // test to distinguish a forged terminal journal from ordinary core
+        // startup rollback after the lease is released.
+        let core = WorkspaceCore::open(data.join("core")).unwrap();
+        assert_eq!(core.list_workspaces().unwrap().len(), 2);
 
         let mut failed = false;
         *CLEANUP_TEST_HOOK.lock().unwrap() = Some(Box::new(move |kind, _| {
@@ -6744,7 +6745,6 @@ mod tests {
         assert!(identity.exists());
         assert!(journal.exists());
 
-        let core = WorkspaceCore::open(data.join("core")).unwrap();
         assert_eq!(core.list_workspaces().unwrap().len(), 2);
         let mut forged_phase: OrdinaryCleanupJournal =
             serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
