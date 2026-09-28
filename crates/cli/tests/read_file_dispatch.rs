@@ -291,6 +291,56 @@ fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
 }
 
 #[test]
+fn read_refuses_same_file_field_function_collision_until_exactly_qualified() {
+    let (repo, store) = fresh_workspace("same-file-field-function");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/i960_timed.rs"),
+        "struct InstructionTiming {\n    cycles: u32,\n}\n\nfn cycles(mnemonic: &str) -> Result<u32, ()> {\n    Ok(mnemonic.len() as u32)\n}\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+
+    let simplified = "src/i960_timed.rs::cycles";
+    let field = "src/i960_timed.rs::InstructionTiming::cycles";
+    let function = "src/i960_timed.rs::Function::cycles";
+
+    for command in ["read", "read-smart"] {
+        let (code, stdout, stderr) = run(&repo, &store, &[command, simplified]);
+        assert_ne!(
+            code, 0,
+            "command={command}\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(stdout.contains("is 2 definitions"), "{stdout}");
+        assert!(stdout.contains(field), "{stdout}");
+        assert!(stdout.contains(function), "{stdout}");
+        assert!(
+            stdout.contains(&format!("greppy read {field}"))
+                && stdout.contains(&format!("greppy read {function}")),
+            "{stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", simplified, "--json"]);
+    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["status"], "ambiguous", "{value}");
+    let selectors = value["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|candidate| candidate["selector"].as_str())
+        .collect::<Vec<_>>();
+    assert!(selectors.contains(&field), "{value}");
+    assert!(selectors.contains(&function), "{value}");
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read", function]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("fn cycles(mnemonic: &str)"), "{stdout}");
+    assert!(!stdout.contains("cycles: u32"), "{stdout}");
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)
