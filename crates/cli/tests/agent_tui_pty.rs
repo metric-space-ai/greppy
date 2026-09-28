@@ -447,11 +447,12 @@ mod pty {
         let index_before = std::fs::read(repo.join(".git/index")).unwrap();
         let (endpoint, stop, handle) = super::spawn_stub_gateway(0);
         let mut pty = Pty::spawn_with_provider(&repo, &endpoint, &[], false, false);
-        let mut bytes = pty.read_until(b"prompt", Duration::from_secs(60));
-        let ready = bytes.windows(6).any(|window| window == b"prompt");
+        let mut bytes = pty.read_until(b"ready", Duration::from_secs(60));
+        let ready = bytes.windows(5).any(|window| window == b"ready");
         if ready {
             pty.write_all(b"say hello\r");
-            bytes.extend_from_slice(&pty.read_until(b"hi from stub", Duration::from_secs(20)));
+            // The renderer positions words separately with ANSI CSI sequences.
+            bytes.extend_from_slice(&pty.read_until(b"stub", Duration::from_secs(20)));
             pty.write_all(b"/exit\r");
         }
         let provider_created = pty.workspace_root.join("provider.json").exists();
@@ -462,7 +463,7 @@ mod pty {
         let text = String::from_utf8_lossy(&bytes);
         assert!(ready, "agent never reached its prompt: {text:?}");
         assert!(
-            text.contains("hi from stub"),
+            text.contains("stub") && text.contains("over 1 turns"),
             "turn did not complete: {text:?}"
         );
         assert!(status.success(), "status={status:?} output={text:?}");
