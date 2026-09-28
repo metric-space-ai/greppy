@@ -503,8 +503,7 @@ pub fn write_agent_base_manifest(
         .unwrap_or_default();
     if !is_hex_id(identity_hash, 64)
         || canonical_repository_identity.trim().is_empty()
-        || (directory_name != identity_hash
-            && !directory_name.starts_with(&format!(".building-{identity_hash}-")))
+        || !agent_base_directory_name_matches(directory_name, identity_hash)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -538,8 +537,7 @@ pub fn read_agent_base_manifest(dir: &Path) -> io::Result<AgentBaseManifest> {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     if manifest.format_version != AGENT_BASE_FORMAT_VERSION
-        || (directory_name != manifest.identity_hash
-            && !directory_name.starts_with(&format!(".building-{}-", manifest.identity_hash)))
+        || !agent_base_directory_name_matches(directory_name, &manifest.identity_hash)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -547,6 +545,14 @@ pub fn read_agent_base_manifest(dir: &Path) -> io::Result<AgentBaseManifest> {
         ));
     }
     Ok(manifest)
+}
+
+fn agent_base_directory_name_matches(directory_name: &str, identity_hash: &str) -> bool {
+    directory_name == identity_hash
+        || directory_name.starts_with(&format!(".building-{identity_hash}-"))
+        || (cfg!(windows)
+            && identity_hash.len() >= 16
+            && directory_name.starts_with(&format!(".building-{}-", &identity_hash[..16])))
 }
 
 pub fn locks_root() -> PathBuf {
@@ -1899,6 +1905,35 @@ mod tests {
         assert!(root.join("locks").is_dir());
         assert_eq!(lock.path(), root.join("locks/startup"));
         drop(lock);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn agent_base_staging_manifest_name_matches_platform_contract() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("agent-base-staging-name");
+        let _restore = StoreDirRestore::set(&base.join("data"));
+        let identity_hash = "a".repeat(64);
+        let repository_hash = "b".repeat(64);
+        let short_name = format!(".building-{}-1-2", &identity_hash[..16]);
+        let directory = agent_base_stores_root()
+            .join(repository_hash)
+            .join(&short_name);
+        fs::create_dir_all(&directory).unwrap();
+
+        #[cfg(windows)]
+        {
+            write_agent_base_manifest(&directory, &identity_hash, "repo").unwrap();
+            let manifest = read_agent_base_manifest(&directory).unwrap();
+            assert_eq!(manifest.identity_hash, identity_hash);
+            assert!(write_agent_base_manifest(&directory, &"c".repeat(64), "repo").is_err());
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(write_agent_base_manifest(&directory, &identity_hash, "repo").is_err());
+        }
+
         let _ = fs::remove_dir_all(base);
     }
 

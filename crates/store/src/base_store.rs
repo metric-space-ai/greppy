@@ -278,9 +278,16 @@ impl BaseStoreLayout {
             .parent()
             .ok_or_else(|| invalid_data("Base Store layout has no parent"))?;
         fs::create_dir_all(parent)?;
+        // Windows filesystem/security calls are sensitive to the length of
+        // this private staging path. Keep the published manifest's complete
+        // identity hash, while shortening only the temporary directory name.
+        let staging_identity: &str = if cfg!(windows) {
+            &expected_hash[..16]
+        } else {
+            expected_hash.as_str()
+        };
         let suffix = format!(
-            ".building-{}-{}-{}",
-            expected_hash,
+            ".building-{staging_identity}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

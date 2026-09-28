@@ -2649,11 +2649,45 @@ mod tests {
     }
 
     fn assert_persisted_v7_delta_query_is_correct(root: &str) -> std::result::Result<(), String> {
-        let cli = crate::Cli::try_parse_from(["greppy", "--root", root, "who-calls", "target"])
-            .map_err(|error| error.to_string())?;
-        let exit = crate::dispatch(cli).map_err(|error| error.to_string())?;
-        if exit != 0 {
-            return Err(format!("who-calls CLI returned exit code {exit}"));
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let executable = if executable.parent().and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("deps"))
+        {
+            let target_dir = executable
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    format!(
+                        "persisted-v7 regression cannot locate the Cargo target directory from test executable {}",
+                        executable.display()
+                    )
+                })?;
+            let candidate = target_dir.join(format!("greppy{}", std::env::consts::EXE_SUFFIX));
+            if !candidate.is_file() {
+                return Err(format!(
+                    "persisted-v7 regression requires the built Greppy CLI sibling {}; the current executable is the libtest harness {}",
+                    candidate.display(),
+                    executable.display()
+                ));
+            }
+            candidate
+        } else {
+            executable
+        };
+        let output = Command::new(executable)
+            .arg("--root")
+            .arg(root)
+            .arg("who-calls")
+            .arg("target")
+            .output()
+            .map_err(|error| format!("spawn who-calls CLI: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "who-calls CLI returned {}; stdout={:?}; stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
         let effective_root = Path::new(root);
         let overlay = overlay_spec(effective_root)
@@ -2672,12 +2706,62 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "repaired caller node is missing".to_string())?;
         if !store
-            .incoming_edges(target.id, Some("USAGE"), 10)
+            .incoming_edges(target.id, None, 10)
             .map_err(|error| error.to_string())?
             .iter()
-            .any(|edge| edge.source_id == caller.id)
+            .any(|edge| {
+                edge.source_id == caller.id && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")
+            })
         {
-            return Err("repaired caller edge is missing".into());
+            let generation = store
+                .get_workspace_state(effective_root.to_string_lossy().as_ref())
+                .ok()
+                .flatten()
+                .map(|state| state.graph_generation);
+            let marker = store
+                .conn()
+                .query_row(
+                    "SELECT value FROM main.schema_meta WHERE key = ?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let raw_edges = store
+                .conn()
+                .prepare(
+                    "SELECT source_qname || ' -> ' || target_qname || ' [' || edge_type || ']'
+                     FROM main.raw_edges WHERE project = ?1 ORDER BY id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(["p"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_else(|error| vec![format!("<raw edge diagnostic failed: {error}>")]);
+            let resolved_edges = store
+                .conn()
+                .prepare(
+                    "SELECT source_qualified_name || ' -> ' || target_qualified_name || ' [' || edge_type || ']'
+                     FROM main.overlay_edges WHERE project = ?1 ORDER BY id",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(["p"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_else(|error| {
+                    vec![format!("<resolved edge diagnostic failed: {error}>")]
+                });
+            let job_path = delta_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("index.job");
+            let job = std::fs::read_to_string(&job_path).ok();
+            return Err(format!(
+                "repaired caller edge is missing; generation={generation:?}; marker={marker:?}; raw_edges={raw_edges:?}; resolved_edges={resolved_edges:?}; index_job={job:?}"
+            ));
         }
         Ok(())
     }
@@ -2816,6 +2900,19 @@ mod tests {
                 })
                 .unwrap();
             delta
+                .upsert_file_state(&greppy_store::FileState {
+                    project: "p".into(),
+                    rel_path: "src/deleted.rs".into(),
+                    language: "Rust".into(),
+                    sha256: "deleted".into(),
+                    mtime_ns: 0,
+                    size: 0,
+                    parser_version: "fixture".into(),
+                    extractor_version: "fixture".into(),
+                    last_indexed_generation: 7,
+                })
+                .unwrap();
+            delta
                 .upsert_file_identity(
                     "p",
                     caller_rel_path,
@@ -2898,8 +2995,8 @@ mod tests {
                     task: "code".into(),
                     node_id: None,
                     chunk_idx: 0,
-                    qualified_name: "src/caller.rs::Function::caller".into(),
-                    file_path: "src/caller.rs".into(),
+                    qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
+                    file_path: "src/alias_chain/sub.rs".into(),
                     start_line: 1,
                     end_line: 1,
                     content_sha256: "a".repeat(64),
@@ -2907,11 +3004,47 @@ mod tests {
                     vector: vec![1.0, 0.0],
                 })
                 .unwrap();
+            delta
+                .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                    project: "p".into(),
+                    model_id: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                    task: "code".into(),
+                    node_id: None,
+                    chunk_idx: 0,
+                    qualified_name: "src/caller.rs::Function::caller".into(),
+                    file_path: "src/caller.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_sha256: "b".repeat(64),
+                    graph_generation: 7,
+                    vector: vec![0.0, 1.0],
+                })
+                .unwrap();
+            delta
+                .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                    project: "p".into(),
+                    model_id: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                    task: "code".into(),
+                    node_id: None,
+                    chunk_idx: 0,
+                    qualified_name: "src/deleted.rs::Function::deleted".into(),
+                    file_path: "src/deleted.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    content_sha256: "c".repeat(64),
+                    graph_generation: 7,
+                    vector: vec![0.5, 0.5],
+                })
+                .unwrap();
         }
 
-        let visibility =
-            greppy_store::VisibilityIndex::new(["src/caller.rs".to_string()], Vec::<String>::new())
-                .unwrap();
+        let visibility = greppy_store::VisibilityIndex::new(
+            ["src/caller.rs".to_string()],
+            ["src/deleted.rs".to_string()],
+        )
+        .unwrap();
         {
             let delta = greppy_store::Store::open(&delta_path).unwrap();
             persist_visibility(&delta, &visibility, &base_commit).unwrap();
@@ -2947,7 +3080,8 @@ mod tests {
                 .unwrap()
                 .conn()
                 .query_row(
-                    "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                    "SELECT vector FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/alias_chain/sub.rs'",
                     [],
                     |row| row.get(0),
                 )
@@ -2991,10 +3125,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(repaired
-            .incoming_edges(target.id, Some("USAGE"), 10)
+            .incoming_edges(target.id, None, 10)
             .unwrap()
             .iter()
-            .any(|edge| edge.source_id == caller.id));
+            .any(|edge| {
+                edge.source_id == caller.id && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")
+            }));
         assert_eq!(
             repaired
                 .get_workspace_state(&root_string)
@@ -3007,12 +3143,39 @@ mod tests {
         let vector_after: Vec<u8> = repaired
             .conn()
             .query_row(
-                "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                "SELECT vector FROM main.vector_embeddings
+                 WHERE project = 'p' AND file_path = 'src/alias_chain/sub.rs'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(vector_after, vector_before);
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/caller.rs'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "edited caller vectors are invalidated during graph refresh"
+        );
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings
+                     WHERE project = 'p' AND file_path = 'src/deleted.rs'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "deleted file vectors are invalidated during graph refresh"
+        );
         assert_eq!(
             repaired
                 .conn()
