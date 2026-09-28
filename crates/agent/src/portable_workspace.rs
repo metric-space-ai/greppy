@@ -626,7 +626,9 @@ impl AgentWorkspace {
             journal.core_removed = true;
             replace_ordinary_cleanup_journal(&journal_path, &journal)?;
             remove_ordinary_identity(root, &self.run_id)?;
-            fs::remove_file(journal_path)?;
+            sync_directory(root)?;
+            remove_ordinary_cleanup_journal(&journal_path)?;
+            sync_directory(root)?;
         } else {
             for private_root in [self.agent_data_root(), self.agent_scratch_root()] {
                 remove_ordinary_cleanup_path("provider-private", &private_root)?;
@@ -3446,6 +3448,15 @@ fn remove_ordinary_identity(root: &Path, run_id: &str) -> Result<(), WorkspaceEr
     Ok(())
 }
 
+fn remove_ordinary_cleanup_journal(path: &Path) -> Result<(), WorkspaceError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 fn ordinary_cleanup_journal_path(root: &Path, run_id: &str) -> PathBuf {
     root.join(format!(".cleanup-{run_id}.json"))
 }
@@ -3592,22 +3603,22 @@ fn recover_ordinary_cleanup_journals(
         let Some(_recovery_lease) = core.try_workspace_pair_lease(&journal.run_id)? else {
             continue;
         };
-        verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
+        let paths = [
+            (
+                "agent-data",
+                data_root.join("agent-data").join(&journal.run_id),
+            ),
+            (
+                "agent-scratch",
+                data_root.join("agent-scratch").join(&journal.run_id),
+            ),
+            ("content", root.join(&journal.run_id)),
+            ("private-git", root.join(&journal.git_id)),
+        ];
         if !journal.core_removed {
-            let paths = [
-                (
-                    "agent-data",
-                    data_root.join("agent-data").join(&journal.run_id),
-                ),
-                (
-                    "agent-scratch",
-                    data_root.join("agent-scratch").join(&journal.run_id),
-                ),
-                ("content", root.join(&journal.run_id)),
-                ("private-git", root.join(&journal.git_id)),
-            ];
+            verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
             let mut first_error = None;
-            for (kind, owned_path) in paths {
+            for (kind, owned_path) in &paths {
                 if let Err(error) = remove_ordinary_cleanup_path(kind, &owned_path) {
                     first_error.get_or_insert(error);
                 }
@@ -3621,9 +3632,43 @@ fn recover_ordinary_cleanup_journals(
             }
             journal.core_removed = true;
             replace_ordinary_cleanup_journal(&path, &journal)?;
+        } else {
+            if !core.workspace_pair_records_absent(&journal.run_id, &journal.git_id)? {
+                return Err(WorkspaceError::Tampered {
+                    path,
+                    detail: "terminal ordinary cleanup journal still has core workspace records"
+                        .into(),
+                });
+            }
+            for (_, owned_path) in &paths {
+                match fs::symlink_metadata(owned_path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(WorkspaceError::Tampered {
+                            path,
+                            detail: format!(
+                                "terminal ordinary cleanup journal still has owned path {}",
+                                owned_path.display()
+                            ),
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match fs::symlink_metadata(ordinary_identity_path(&root, &journal.run_id)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => verify_ordinary_identity(
+                    &root,
+                    &journal.run_id,
+                    &journal.git_id,
+                    &journal.identity,
+                )?,
+                Err(error) => return Err(error.into()),
+            }
         }
         remove_ordinary_identity(&root, &journal.run_id)?;
-        fs::remove_file(&path)?;
+        sync_directory(&root)?;
+        remove_ordinary_cleanup_journal(&path)?;
         sync_directory(&root)?;
     }
     Ok(())
@@ -6701,19 +6746,18 @@ mod tests {
 
         let core = WorkspaceCore::open(data.join("core")).unwrap();
         assert_eq!(core.list_workspaces().unwrap().len(), 2);
-        let identity_bytes = fs::read(&identity).unwrap();
         let mut forged_phase: OrdinaryCleanupJournal =
             serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
         forged_phase.core_removed = true;
         replace_ordinary_cleanup_journal(&journal, &forged_phase).unwrap();
-        fs::write(&identity, b"tampered identity\n").unwrap();
         assert!(matches!(
             recover_ordinary_cleanup_journals(&data, &core),
             Err(WorkspaceError::Tampered { .. })
         ));
         assert!(private_git.exists());
+        assert!(identity.exists());
         assert!(journal.exists());
-        fs::write(&identity, identity_bytes).unwrap();
+        assert_eq!(core.list_workspaces().unwrap().len(), 2);
         forged_phase.core_removed = false;
         replace_ordinary_cleanup_journal(&journal, &forged_phase).unwrap();
         recover_ordinary_cleanup_journals(&data, &core).unwrap();
@@ -6789,6 +6833,72 @@ mod tests {
         assert!(identity_path.exists());
         fs::rename(&renamed_journal, &journal_path).unwrap();
         workspace.cleanup().unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn ordinary_cleanup_recovers_terminal_journal_after_identity_unlink() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+
+        let workspace = AgentWorkspace::create(&repo, "cleanup-terminal-crash").unwrap();
+        let root = ordinary_workspace_root(&data);
+        let run_id = workspace.run_id().to_string();
+        let git_id = workspace.git_handle.id().to_string();
+        let identity = match &workspace.backend {
+            WorkspaceBackend::Ordinary { identity, .. } => identity.clone(),
+            WorkspaceBackend::Provider { .. } => panic!("expected ordinary workspace"),
+        };
+        let identity_path = ordinary_identity_path(&root, &run_id);
+        let mut cleanup = OrdinaryCleanupJournal {
+            schema: 1,
+            run_id: run_id.clone(),
+            git_id: git_id.clone(),
+            identity,
+            core_removed: false,
+        };
+        let journal_path = persist_ordinary_cleanup_journal(&root, &cleanup).unwrap();
+        for owned_path in [
+            workspace.agent_data_root(),
+            workspace.agent_scratch_root(),
+            workspace.worktree_path().to_path_buf(),
+            workspace.linked_git_dir().to_path_buf(),
+        ] {
+            remove_ordinary_cleanup_path("terminal-test", &owned_path).unwrap();
+        }
+        workspace
+            .core
+            .abort_workspace_pair(&run_id, &git_id)
+            .unwrap();
+        cleanup.core_removed = true;
+        replace_ordinary_cleanup_journal(&journal_path, &cleanup).unwrap();
+        remove_ordinary_identity(&root, &run_id).unwrap();
+        sync_directory(&root).unwrap();
+        drop(workspace);
+
+        let core = WorkspaceCore::open(data.join("core")).unwrap();
+        recover_ordinary_cleanup_journals(&data, &core).unwrap();
+        assert!(!identity_path.exists());
+        assert!(!journal_path.exists());
+        assert!(core.list_workspaces().unwrap().is_empty());
+        recover_ordinary_cleanup_journals(&data, &core).unwrap();
+        remove_ordinary_identity(&root, &run_id).unwrap();
+        remove_ordinary_cleanup_journal(&journal_path).unwrap();
 
         match previous {
             Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),

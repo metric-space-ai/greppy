@@ -529,6 +529,26 @@ impl WorkspaceCore {
         }))
     }
 
+    /// Report whether both workspace records and any pair record involving
+    /// either ID are absent. Callers performing recovery must hold the pair
+    /// lease for `content_id` while checking this terminal-state invariant.
+    pub fn workspace_pair_records_absent(&self, content_id: &str, git_id: &str) -> Result<bool> {
+        validate_workspace_id(content_id)?;
+        validate_workspace_id(git_id)?;
+        let connection = self.lock_metadata()?;
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM cow_workspaces WHERE id IN (?1, ?2)
+                 UNION ALL
+                 SELECT 1 FROM cow_workspace_pairs
+                 WHERE content_id IN (?1, ?2) OR git_id IN (?1, ?2)
+             )",
+            params![content_id, git_id],
+            |row| row.get(0),
+        )?;
+        Ok(!present)
+    }
+
     pub fn try_repository_operation_lease(
         &self,
         repository: &Path,
