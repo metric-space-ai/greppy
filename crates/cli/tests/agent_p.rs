@@ -231,7 +231,8 @@ fn assert_provider_optional_proposal(installed_inactive: bool) {
     });
     let (endpoint, stop, handle) =
         spawn_gateway_sequence(vec![edit_gateway_response(), stub_gateway_response()]);
-    let output = Command::new(binary_path())
+    let mut command = Command::new(binary_path());
+    command
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", root.join("store"))
         .env("GREPPY_WORKSPACE_DIR", &no_provider)
@@ -248,9 +249,13 @@ fn assert_provider_optional_proposal(installed_inactive: bool) {
             "--private-store",
             "--skip-selfcheck",
             "--json",
-        ])
-        .output()
-        .expect("spawn no-provider agent");
+        ]);
+    if std::env::var_os("GREPPY_ACCEPTANCE_BINARY").is_some() {
+        command
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .env_remove("CI");
+    }
+    let output = command.output().expect("spawn no-provider agent");
     stop.store(true, Ordering::SeqCst);
     handle.join().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -250,6 +250,10 @@ mod pty {
                     .env("TERM", "xterm")
                     .env_remove("GREPPY_MODEL")
                     .env("GREPPY_ENDPOINT", endpoint);
+                if std::env::var_os("GREPPY_ACCEPTANCE_BINARY").is_some() {
+                    cmd.env_remove("GREPPY_TEST_SKIP_INFERENCE")
+                        .env_remove("CI");
+                }
                 if plain {
                     cmd.arg("agent");
                 } else {
