@@ -215,7 +215,8 @@ fn assert_provider_optional_proposal(installed_inactive: bool) {
     let manifest_bytes = installed_inactive.then(|| {
         std::fs::create_dir(&no_provider).unwrap();
         let manifest = serde_json::json!({
-            "protocol_version": 1, "adapter_version": "0.4.1", "adapter_kind": "fskit",
+            "protocol_version": greppy_workspace_core::PROVIDER_PROTOCOL_VERSION,
+            "adapter_version": "0.4.1", "adapter_kind": greppy_workspace_core::AdapterKind::FsKit,
             "state": "ready", "instance_id": "installed-inactive",
             "data_root": no_provider, "mount_root": root.join("unmounted"),
             "heartbeat_unix_ms": 1,
