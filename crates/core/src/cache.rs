@@ -1633,7 +1633,12 @@ fn secure_windows_path(path: &Path) -> io::Result<()> {
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
+    // Rust accepts long paths, but the raw Win32 ACL API needs the extended
+    // absolute form. Resolve before allocating the descriptor so failures do
+    // not leak it; every caller secures a file or directory that already exists.
+    let path = fs::canonicalize(path)?;
     let descriptor_text = wide(std::ffi::OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)"));
+
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -1853,6 +1858,32 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn private_acl_and_atomic_write_accept_long_existing_paths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let base = tempdir("long-private-acl");
+        let mut directory = base.clone();
+        for _ in 0..5 {
+            directory.push("identity-preserving-cache-component-0123456789abcdef0123456789abcdef");
+        }
+        assert!(directory.as_os_str().encode_wide().count() > 260);
+        fs::create_dir_all(&directory).unwrap();
+        secure_private_directory(&directory).unwrap();
+        let file = directory.join("manifest.json");
+        atomic_write(&file, b"{\"complete\":true}").unwrap();
+        secure_private_file(&file).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"{\"complete\":true}");
+        assert_eq!(
+            secure_private_file(&directory.join("missing.json"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     struct StoreDirRestore(Option<std::ffi::OsString>);
 
