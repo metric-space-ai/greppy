@@ -510,6 +510,25 @@ impl WorkspaceCore {
         }))
     }
 
+    /// Try to fence recovery or cleanup of an existing workspace pair without
+    /// creating or changing its metadata. `None` means a live holder still
+    /// owns the pair and recovery must leave it untouched.
+    pub fn try_workspace_pair_lease(&self, content_id: &str) -> Result<Option<WorkspacePairLease>> {
+        validate_workspace_id(content_id)?;
+        let path = self
+            .root
+            .join("pair-leases")
+            .join(format!("{content_id}.lease"));
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        if !lock_pair_lease(&file, true)? {
+            return Ok(None);
+        }
+        Ok(Some(WorkspacePairLease {
+            file,
+            content_id: content_id.to_string(),
+        }))
+    }
+
     pub fn try_repository_operation_lease(
         &self,
         repository: &Path,

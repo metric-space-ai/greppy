@@ -1994,8 +1994,24 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Status { json } => {
-            let status = agent_workspace_status(&data_root)
-                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let status = match agent_workspace_status(&data_root) {
+                Ok(status) => status,
+                Err(error) if json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ready": false,
+                            "agent_workspace_ready": false,
+                            "provider_ready": false,
+                            "error": error.to_string(),
+                            "data_root": data_root
+                        }))
+                        .map_err(|error| Error::Invalid(error.to_string()))?
+                    );
+                    return Ok(EXIT_IO as i32);
+                }
+                Err(error) => return Err(Error::Invalid(error.to_string())),
+            };
             if json {
                 println!(
                     "{}",
@@ -2008,8 +2024,8 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
                     status.backend,
                     if status.provider_ready { "ready" } else { "inactive" },
                     status.workspaces.len(),
-                    status.chunk_count,
-                    status.segment_bytes
+                    status.chunks.chunk_count,
+                    status.chunks.segment_bytes
                 );
             }
             Ok(0)
@@ -2041,8 +2057,7 @@ struct AgentWorkspaceStatus {
     provider: Option<greppy_workspace_core::ProviderManifest>,
     data_root: PathBuf,
     workspaces: Vec<greppy_workspace_core::WorkspaceStatus>,
-    chunk_count: u64,
-    segment_bytes: u64,
+    chunks: greppy_workspace_core::ChunkStoreStats,
 }
 
 fn agent_workspace_status(
@@ -2077,8 +2092,7 @@ fn agent_workspace_status(
         provider,
         data_root: data_root.into(),
         workspaces,
-        chunk_count: stats.chunk_count,
-        segment_bytes: stats.segment_bytes,
+        chunks: stats,
     })
 }
 
@@ -2099,6 +2113,11 @@ mod optional_workspace_status_tests {
         assert!(status.agent_workspace_ready);
         assert!(!status.provider_ready);
         assert_eq!(status.backend, "ordinary");
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["chunks"].is_object());
+        assert!(json["provider"].is_null());
+        assert!(json["workspaces"].is_array());
+        assert!(json.get("chunk_count").is_none());
     }
 
     #[test]
