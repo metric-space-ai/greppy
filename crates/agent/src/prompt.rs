@@ -103,13 +103,22 @@ mod tests {
 
     #[test]
     fn preparation_guidance_matches_the_owner_approved_public_prompt() {
-        fn preparation_block(text: &str) -> &str {
+        fn preparation_block(text: &str) -> String {
             let start = text
                 .find("Indexing and embedding preparation")
                 .expect("preparation guidance must be present");
-            text[start..].split("\n\n").next().unwrap()
+            text[start..]
+                .lines()
+                .take_while(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
         }
         let public = include_str!("../../../AGENTS.md");
+        let windows_public = public.lines().collect::<Vec<_>>().join("\r\n");
+        assert_eq!(
+            preparation_block(SYSTEM_PROMPT),
+            preparation_block(&windows_public)
+        );
         assert_eq!(
             preparation_block(SYSTEM_PROMPT),
             preparation_block(public),

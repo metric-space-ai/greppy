@@ -266,9 +266,7 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
-            } else if byte == quote {
-                break;
-            } else if matches!(byte, b'\n' | b'\r') {
+            } else if byte == quote || matches!(byte, b'\n' | b'\r') {
                 break;
             }
             scan += 1;
