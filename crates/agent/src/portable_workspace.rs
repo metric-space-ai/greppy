@@ -55,6 +55,15 @@ enum WorkspaceBackend {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct OrdinaryCleanupJournal {
+    schema: u32,
+    run_id: String,
+    git_id: String,
+    identity: String,
+    core_removed: bool,
+}
+
 impl fmt::Debug for AgentWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentWorkspace")
@@ -217,6 +226,7 @@ impl AgentWorkspace {
         }
         let core = WorkspaceCore::open(data_root.join("core"))?;
         trace_workspace_phase(run_id, "core-open", started);
+        recover_ordinary_cleanup_journals(&data_root, &core)?;
         recover_proposal_publish_journals(&core)?;
         recover_apply_journals(&core)?;
         trace_workspace_phase(run_id, "recovery-complete", started);
@@ -587,19 +597,42 @@ impl AgentWorkspace {
 
     pub fn cleanup(self) -> Result<(), WorkspaceError> {
         self.verify_identity()?;
-        for private_root in [self.agent_data_root(), self.agent_scratch_root()] {
-            match fs::remove_dir_all(&private_root) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        if let WorkspaceBackend::Ordinary { root, identity } = &self.backend {
+            let mut journal = OrdinaryCleanupJournal {
+                schema: 1,
+                run_id: self.run_id.clone(),
+                git_id: self.git_handle.id().into(),
+                identity: identity.clone(),
+                core_removed: false,
+            };
+            let journal_path = persist_ordinary_cleanup_journal(root, &journal)?;
+            let paths = [
+                ("agent-data", self.agent_data_root()),
+                ("agent-scratch", self.agent_scratch_root()),
+                ("content", self.worktree.clone()),
+                ("private-git", self.private_git_dir.clone()),
+            ];
+            let mut first_error = None;
+            for (kind, path) in paths {
+                if let Err(error) = remove_ordinary_cleanup_path(kind, &path) {
+                    first_error.get_or_insert(error);
+                }
             }
-        }
-        self.core
-            .remove_workspace_pair(self.handle, self.git_handle)?;
-        if let WorkspaceBackend::Ordinary { root, .. } = &self.backend {
-            remove_owned_ordinary_workspace(&self.worktree)?;
-            remove_owned_ordinary_workspace(&self.private_git_dir)?;
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            self.core
+                .remove_workspace_pair(self.handle, self.git_handle)?;
+            journal.core_removed = true;
+            replace_ordinary_cleanup_journal(&journal_path, &journal)?;
             remove_ordinary_identity(root, &self.run_id)?;
+            fs::remove_file(journal_path)?;
+        } else {
+            for private_root in [self.agent_data_root(), self.agent_scratch_root()] {
+                remove_ordinary_cleanup_path("provider-private", &private_root)?;
+            }
+            self.core
+                .remove_workspace_pair(self.handle, self.git_handle)?;
         }
         drop(self.pair_lease);
         Ok(())
@@ -3083,6 +3116,12 @@ fn prepare_ordinary_data_root(configured: &Path) -> Result<PathBuf, WorkspaceErr
     Ok(root)
 }
 
+/// Prove that the ordinary agent-workspace backend can create and authenticate
+/// its private root without requiring a mounted provider.
+pub fn ensure_ordinary_workspace_available(configured: &Path) -> Result<(), WorkspaceError> {
+    prepare_ordinary_data_root(configured).map(|_| ())
+}
+
 fn ordinary_workspace_root(data_root: &Path) -> PathBuf {
     data_root.join("ordinary-workspaces-v1")
 }
@@ -3399,7 +3438,186 @@ fn cleanup_failed_ordinary_paths(
 }
 
 fn remove_ordinary_identity(root: &Path, run_id: &str) -> Result<(), WorkspaceError> {
-    fs::remove_file(ordinary_identity_path(root, run_id))?;
+    match fs::remove_file(ordinary_identity_path(root, run_id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ordinary_cleanup_journal_path(root: &Path, run_id: &str) -> PathBuf {
+    root.join(format!(".cleanup-{run_id}.json"))
+}
+
+fn persist_ordinary_cleanup_journal(
+    root: &Path,
+    journal: &OrdinaryCleanupJournal,
+) -> Result<PathBuf, WorkspaceError> {
+    let path = ordinary_cleanup_journal_path(root, &journal.run_id);
+    let bytes = serde_json::to_vec(journal).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            sync_directory(root)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing: OrdinaryCleanupJournal = serde_json::from_slice(&fs::read(&path)?)
+                .map_err(|error| WorkspaceError::Tampered {
+                    path: path.clone(),
+                    detail: format!("ordinary cleanup journal is invalid: {error}"),
+                })?;
+            if existing.schema != journal.schema
+                || existing.run_id != journal.run_id
+                || existing.git_id != journal.git_id
+                || existing.identity != journal.identity
+            {
+                return Err(WorkspaceError::Tampered {
+                    path,
+                    detail: "ordinary cleanup journal does not match the workspace".into(),
+                });
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(path)
+}
+
+fn replace_ordinary_cleanup_journal(
+    path: &Path,
+    journal: &OrdinaryCleanupJournal,
+) -> Result<(), WorkspaceError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("cleanup journal has no parent"))?;
+    let temporary = parent.join(format!(
+        ".cleanup-update-{:x}-{:x}",
+        std::process::id(),
+        now_unix_ns()
+    ));
+    let bytes = serde_json::to_vec(journal).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn remove_ordinary_cleanup_path(kind: &str, path: &Path) -> Result<(), WorkspaceError> {
+    cleanup_test_hook(kind, path)?;
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+type CleanupTestHook = Box<dyn FnMut(&str, &Path) -> io::Result<()> + Send>;
+
+#[cfg(test)]
+static CLEANUP_TEST_HOOK: std::sync::Mutex<Option<CleanupTestHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn cleanup_test_hook(kind: &str, path: &Path) -> io::Result<()> {
+    if let Some(hook) = CLEANUP_TEST_HOOK.lock().unwrap().as_mut() {
+        hook(kind, path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn cleanup_test_hook(_kind: &str, _path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn recover_ordinary_cleanup_journals(
+    data_root: &Path,
+    core: &WorkspaceCore,
+) -> Result<(), WorkspaceError> {
+    let root = ordinary_workspace_root(data_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut journals = entries
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".cleanup-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    journals.sort();
+    for path in journals {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Tampered {
+                path,
+                detail: "ordinary cleanup journal is not a regular file".into(),
+            });
+        }
+        let mut journal: OrdinaryCleanupJournal = serde_json::from_slice(&fs::read(&path)?)
+            .map_err(|error| WorkspaceError::Tampered {
+                path: path.clone(),
+                detail: format!("ordinary cleanup journal is invalid: {error}"),
+            })?;
+        if journal.schema != 1 || git_workspace_id(&journal.run_id) != journal.git_id {
+            return Err(WorkspaceError::Tampered {
+                path,
+                detail: "ordinary cleanup journal identity is invalid".into(),
+            });
+        }
+        if !journal.core_removed {
+            verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
+            let paths = [
+                (
+                    "agent-data",
+                    data_root.join("agent-data").join(&journal.run_id),
+                ),
+                (
+                    "agent-scratch",
+                    data_root.join("agent-scratch").join(&journal.run_id),
+                ),
+                ("content", root.join(&journal.run_id)),
+                ("private-git", root.join(&journal.git_id)),
+            ];
+            let mut first_error = None;
+            for (kind, owned_path) in paths {
+                if let Err(error) = remove_ordinary_cleanup_path(kind, &owned_path) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            match core.abort_workspace_pair(&journal.run_id, &journal.git_id) {
+                Ok(()) | Err(greppy_workspace_core::Error::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            journal.core_removed = true;
+            replace_ordinary_cleanup_journal(&path, &journal)?;
+        }
+        remove_ordinary_identity(&root, &journal.run_id)?;
+        fs::remove_file(&path)?;
+        sync_directory(&root)?;
+    }
     Ok(())
 }
 
@@ -6422,5 +6640,72 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 200_001);
+    }
+
+    #[test]
+    fn ordinary_cleanup_failure_is_recovered_without_touching_foreign_collision() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "cleanup-recovery").unwrap();
+        let root = ordinary_workspace_root(&data);
+        let worktree = workspace.worktree_path().to_path_buf();
+        let private_git = workspace.linked_git_dir().to_path_buf();
+        let identity = ordinary_identity_path(&root, workspace.run_id());
+        let journal = ordinary_cleanup_journal_path(&root, workspace.run_id());
+        let agent_data = workspace.agent_data_root();
+        let scratch = workspace.agent_scratch_root();
+        fs::create_dir_all(&agent_data).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(agent_data.join("graph.db"), b"data").unwrap();
+        fs::write(scratch.join("tool.tmp"), b"scratch").unwrap();
+        let foreign = root.join("foreign-collision");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep.txt"), b"foreign\n").unwrap();
+
+        let mut failed = false;
+        *CLEANUP_TEST_HOOK.lock().unwrap() = Some(Box::new(move |kind, _| {
+            if kind == "private-git" && !failed {
+                failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected transient deletion failure",
+                ));
+            }
+            Ok(())
+        }));
+        assert!(workspace.cleanup().is_err());
+        *CLEANUP_TEST_HOOK.lock().unwrap() = None;
+        assert!(!worktree.exists());
+        assert!(private_git.exists());
+        assert!(identity.exists());
+        assert!(journal.exists());
+
+        let core = WorkspaceCore::open(data.join("core")).unwrap();
+        assert_eq!(core.list_workspaces().unwrap().len(), 2);
+        recover_ordinary_cleanup_journals(&data, &core).unwrap();
+        assert!(core.list_workspaces().unwrap().is_empty());
+        assert!(!worktree.exists());
+        assert!(!private_git.exists());
+        assert!(!identity.exists());
+        assert!(!journal.exists());
+        assert!(!agent_data.exists());
+        assert!(!scratch.exists());
+        assert_eq!(fs::read(foreign.join("keep.txt")).unwrap(), b"foreign\n");
+
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
     }
 }

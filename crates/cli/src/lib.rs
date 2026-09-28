@@ -1994,49 +1994,22 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Status { json } => {
-            let provider =
-                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
-                    Ok(provider) => provider,
-                    Err(error) if json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "ready": false,
-                                "error": error.to_string(),
-                                "data_root": data_root
-                            }))
-                            .map_err(|error| Error::Invalid(error.to_string()))?
-                        );
-                        return Ok(EXIT_IO as i32);
-                    }
-                    Err(error) => return Err(Error::Invalid(error.to_string())),
-                };
-            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let workspaces = core
-                .list_workspaces()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let stats = core
-                .chunks()
-                .stats()
+            let status = agent_workspace_status(&data_root)
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "provider": provider.manifest(),
-                        "workspaces": workspaces,
-                        "chunks": stats
-                    }))
-                    .map_err(|error| Error::Invalid(error.to_string()))?
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|error| Error::Invalid(error.to_string()))?
                 );
             } else {
                 println!(
-                    "provider {:?} ready; {} workspace(s), {} chunks, {} physical bytes",
-                    provider.manifest().adapter_kind,
-                    workspaces.len(),
-                    stats.chunk_count,
-                    stats.segment_bytes
+                    "agent workspace ready ({} backend; provider {}); {} workspace(s), {} chunks, {} physical bytes",
+                    status.backend,
+                    if status.provider_ready { "ready" } else { "inactive" },
+                    status.workspaces.len(),
+                    status.chunk_count,
+                    status.segment_bytes
                 );
             }
             Ok(0)
@@ -2056,6 +2029,120 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             );
             Ok(0)
         }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AgentWorkspaceStatus {
+    ready: bool,
+    agent_workspace_ready: bool,
+    provider_ready: bool,
+    backend: &'static str,
+    provider: Option<greppy_workspace_core::ProviderManifest>,
+    data_root: PathBuf,
+    workspaces: Vec<greppy_workspace_core::WorkspaceStatus>,
+    chunk_count: u64,
+    segment_bytes: u64,
+}
+
+fn agent_workspace_status(
+    data_root: &Path,
+) -> std::result::Result<AgentWorkspaceStatus, greppy_workspace_core::Error> {
+    let (provider_ready, backend, provider) =
+        match greppy_workspace_core::ProviderInstallation::optional(data_root)? {
+            greppy_workspace_core::OptionalProvider::Ready(provider) => {
+                if provider
+                    .doctor_io(&format!("status-{}", std::process::id()))
+                    .is_ok()
+                {
+                    (true, "provider", Some(provider.manifest().clone()))
+                } else {
+                    (false, "ordinary", Some(provider.manifest().clone()))
+                }
+            }
+            greppy_workspace_core::OptionalProvider::Inactive => (false, "ordinary", None),
+        };
+    if !provider_ready {
+        greppy_agent::ensure_ordinary_workspace_available(data_root)
+            .map_err(|error| greppy_workspace_core::Error::AdapterUnavailable(error.to_string()))?;
+    }
+    let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))?;
+    let workspaces = core.list_workspaces()?;
+    let stats = core.chunks().stats()?;
+    Ok(AgentWorkspaceStatus {
+        ready: true,
+        agent_workspace_ready: true,
+        provider_ready,
+        backend,
+        provider,
+        data_root: data_root.into(),
+        workspaces,
+        chunk_count: stats.chunk_count,
+        segment_bytes: stats.segment_bytes,
+    })
+}
+
+#[cfg(test)]
+mod optional_workspace_status_tests {
+    use super::*;
+    use greppy_workspace_core::{
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
+        PROVIDER_PROTOCOL_VERSION,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_without_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = agent_workspace_status(temp.path()).unwrap();
+        assert!(status.ready);
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+    }
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_with_unmounted_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let manifest = ProviderManifest {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            adapter_version: "0.4.1-installed".into(),
+            adapter_kind: AdapterKind::FsKit,
+            state: ProviderState::Ready,
+            instance_id: "installed-not-mounted".into(),
+            data_root: data.clone(),
+            mount_root: temp.path().join("inactive-mount"),
+            heartbeat_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            capabilities: ProviderCapabilities {
+                hard_links: true,
+                symbolic_links: true,
+                byte_range_locks: true,
+                memory_maps: true,
+                atomic_rename: true,
+                case_preserving: true,
+            },
+        };
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let status = agent_workspace_status(&data).unwrap();
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+    }
+
+    #[test]
+    fn status_rejects_malformed_present_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("provider.json"), b"not valid json").unwrap();
+        assert!(agent_workspace_status(temp.path()).is_err());
     }
 }
 
