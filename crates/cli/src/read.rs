@@ -295,7 +295,13 @@ fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<grepp
         };
         if node.file_path.is_empty()
             || node.start_line < 1
-            || !seen.insert((node.file_path.clone(), node.start_line, node.end_line))
+            || !seen.insert((
+                node.file_path.clone(),
+                node.start_line,
+                node.end_line,
+                node.qualified_name.clone(),
+                node.label.clone(),
+            ))
         {
             continue;
         }
@@ -309,15 +315,21 @@ fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<grepp
     Ok(nodes)
 }
 
-fn read_is_ambiguous(target: &str, nodes: &[greppy_store::Node]) -> bool {
-    if split_path_qualified(target).is_some() {
-        return false;
+fn read_is_ambiguous(nodes: &[greppy_store::Node]) -> bool {
+    nodes.len() > 1
+}
+
+fn read_report_ambiguous(target: &str, nodes: &[greppy_store::Node]) {
+    println!("`{target}` is {} definitions", nodes.len());
+    for node in nodes {
+        println!(
+            "{}:{}  {} — greppy read {}",
+            node.file_path,
+            node.start_line.max(1),
+            node.qualified_name,
+            node.qualified_name
+        );
     }
-    let sites = nodes
-        .iter()
-        .map(|node| node.file_path.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    sites.len() > 1
 }
 
 fn read_begin_group(printed: &mut bool, previous_ended_with_newline: &mut bool) {
@@ -793,12 +805,13 @@ pub(crate) fn dispatch_read_symbols(
             );
             return Ok(1);
         }
-        if read_is_ambiguous(query, &nodes) {
+        if read_is_ambiguous(&nodes) {
             let candidates = nodes
                 .iter()
                 .map(|node| {
                     serde_json::json!({
-                        "qualified_name": node.qualified_name,
+                        "qualified_name": node.qualified_name.clone(),
+                        "selector": node.qualified_name.clone(),
                         "path": node.file_path,
                         "line": node.start_line,
                     })
@@ -881,12 +894,13 @@ pub(crate) fn dispatch_read_symbols(
                 ids.push(id);
             }
         }
-        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+        let nodes = read_real_nodes(&store, &ids)?;
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let nodes = read_real_nodes(&store, &ids)?;
         let Some(node) = nodes.first().cloned() else {
             nav_report_missing(&store, &project, query);
             previous_ended_with_newline = true;
@@ -1175,8 +1189,8 @@ pub(crate) fn dispatch_read_smart(
         let ids = resolve_symbol_nodes(&store, Some(query))?;
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
-        let filtered_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
-        if nav_refuse_ambiguous(&store, query, &filtered_ids)?.is_some() {
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
