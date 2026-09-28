@@ -5,6 +5,7 @@
 use super::common::*;
 use clap::Subcommand;
 use greppy_core::error::Result;
+use greppy_web_client::record_query::{matches, parse as parse_query};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -283,199 +284,6 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
     }
 }
 
-/// One predicate of a query.
-#[derive(Debug)]
-struct Predicate {
-    path: Vec<String>,
-    op: Op,
-}
-
-#[derive(Debug)]
-enum Op {
-    Eq(String),
-    Ne(String),
-    Re(Regex),
-    Cmp(Ordering, f64),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Ordering {
-    Gt,
-    Ge,
-    Lt,
-    Le,
-}
-
-/// Split on spaces, but keep spaces inside `/regex/` and `"quoted"` runs.
-fn split_terms(query: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut cur = String::new();
-    let mut in_re = false;
-    let mut in_quote = false;
-    let mut prev_was_tilde = false;
-    for ch in query.chars() {
-        match ch {
-            '"' => {
-                in_quote = !in_quote;
-                cur.push(ch);
-            }
-            '/' if !in_quote => {
-                // A slash opens a regex only right after `~`; the next
-                // unescaped slash closes it.
-                if in_re {
-                    in_re = false;
-                } else if prev_was_tilde {
-                    in_re = true;
-                }
-                cur.push(ch);
-            }
-            ' ' if !in_re && !in_quote => {
-                if !cur.is_empty() {
-                    terms.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(ch),
-        }
-        prev_was_tilde = ch == '~';
-    }
-    if !cur.is_empty() {
-        terms.push(cur);
-    }
-    terms
-}
-
-fn parse_query(query: &str) -> std::result::Result<Vec<Predicate>, String> {
-    let mut out = Vec::new();
-    for term in split_terms(query) {
-        out.push(parse_term(&term)?);
-    }
-    if out.is_empty() {
-        return Err("empty query".into());
-    }
-    Ok(out)
-}
-
-fn parse_term(term: &str) -> std::result::Result<Predicate, String> {
-    // Longest operators first so `>=` is not read as `>`.
-    for (marker, make) in [
-        ("!=", 0u8),
-        (">=", 1),
-        ("<=", 2),
-        ("~", 3),
-        ("=", 4),
-        (">", 5),
-        ("<", 6),
-    ] {
-        if let Some(at) = term.find(marker) {
-            if at == 0 {
-                continue;
-            }
-            let (field, rest) = term.split_at(at);
-            let rest = &rest[marker.len()..];
-            let path: Vec<String> = field.split('.').map(str::to_owned).collect();
-            let op = match make {
-                0 => Op::Ne(unquote(rest)),
-                1 => Op::Cmp(Ordering::Ge, number(rest)?),
-                2 => Op::Cmp(Ordering::Le, number(rest)?),
-                3 => Op::Re(regex(rest)?),
-                4 => Op::Eq(unquote(rest)),
-                5 => Op::Cmp(Ordering::Gt, number(rest)?),
-                _ => Op::Cmp(Ordering::Lt, number(rest)?),
-            };
-            return Ok(Predicate { path, op });
-        }
-    }
-    Err(format!("term `{term}` has no operator"))
-}
-
-fn unquote(value: &str) -> String {
-    let trimmed = value.trim();
-    trimmed
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or(trimmed)
-        .to_owned()
-}
-
-fn number(value: &str) -> std::result::Result<f64, String> {
-    value
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| format!("`{value}` is not a number"))
-}
-
-/// `~/pattern/flags` — Rust `regex` syntax. No lookaround, no backreferences.
-fn regex(value: &str) -> std::result::Result<Regex, String> {
-    let value = value.trim();
-    let body = value.strip_prefix('/').ok_or("regex must start with /")?;
-    let close = body.rfind('/').ok_or("regex must end with /")?;
-    let (pattern, flags) = body.split_at(close);
-    let flags = &flags[1..];
-    let mut prefix = String::new();
-    for flag in flags.chars() {
-        match flag {
-            'i' | 'm' | 's' | 'x' | 'u' => prefix.push(flag),
-            other => return Err(format!("unsupported regex flag `{other}`")),
-        }
-    }
-    let full = if prefix.is_empty() {
-        pattern.to_owned()
-    } else {
-        format!("(?{prefix}){pattern}")
-    };
-    Regex::new(&full).map_err(|error| format!("invalid regex: {error}"))
-}
-
-fn lookup<'a>(record: &'a Value, path: &[String]) -> Option<&'a Value> {
-    let mut cur = record;
-    for key in path {
-        cur = cur.get(key)?;
-    }
-    Some(cur)
-}
-
-/// Scalar rendering used for `=`, `!=` and regex comparisons. Strings compare
-/// as themselves so `role=button` does not need quotes around `button`.
-fn as_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn as_number(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.trim().parse::<f64>().ok(),
-        Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
-        _ => None,
-    }
-}
-
-fn matches(record: &Value, predicates: &[Predicate]) -> bool {
-    predicates.iter().all(|predicate| {
-        let Some(value) = lookup(record, &predicate.path) else {
-            // An absent field never satisfies a predicate. Absence is not
-            // equality with the empty string.
-            return false;
-        };
-        match &predicate.op {
-            Op::Eq(want) => as_text(value) == *want,
-            Op::Ne(want) => as_text(value) != *want,
-            Op::Re(re) => re.is_match(&as_text(value)),
-            Op::Cmp(ordering, want) => match as_number(value) {
-                Some(got) => match ordering {
-                    Ordering::Gt => got > *want,
-                    Ordering::Ge => got >= *want,
-                    Ordering::Lt => got < *want,
-                    Ordering::Le => got <= *want,
-                },
-                None => false,
-            },
-        }
-    })
-}
-
 fn run_match(query: &str, count_only: bool, json_out: bool) -> Result<i32> {
     let predicates = match parse_query(query) {
         Ok(predicates) => predicates,
@@ -621,6 +429,43 @@ mod tests {
     }
 
     #[test]
+    fn wait_url_dialects_are_usage_errors_not_page_javascript() {
+        for query in [
+            "url_not=http://localhost:8023/users/sign_in",
+            "url!~sign_in",
+            "url=http://localhost:7770/catalogsearch/",
+            "URL_NOT=http://example.test/",
+            "url~product_list_order=name",
+        ] {
+            let error = validate_query(query).expect_err(query);
+            assert!(error.contains("--url"), "{query}: {error}");
+            assert!(
+                error.contains("must not be sent to the page"),
+                "{query}: {error}"
+            );
+            assert!(!error.contains("unknown query kind"), "{query}: {error}");
+        }
+        let title = validate_query("title=One Stop Market").expect_err("title");
+        assert!(title.contains("--title"), "{title}");
+        for css_sibling in [
+            "div~span",
+            "div ~ span",
+            "title~meta",
+            "url~meta",
+            "url~product[data-order=name]",
+            "input[class~=quantity]",
+            "css=div~span",
+        ] {
+            assert!(validate_query(css_sibling).is_ok(), "{css_sibling}");
+            assert!(
+                validate_condition_query(css_sibling).is_ok(),
+                "{css_sibling}"
+            );
+        }
+        assert!(validate_condition_query("title~meta").is_ok());
+    }
+
+    #[test]
     fn node_queries_reject_unknown_conditions_and_malformed_regexes() {
         for query in [
             "time=500ms",
@@ -680,10 +525,54 @@ pub(super) fn validate_condition_query(query: &str) -> std::result::Result<(), S
     validate_query_impl(query, false)
 }
 
+fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
+    let lower = query.trim().to_ascii_lowercase();
+    // `name~selector` is also valid bare CSS general-sibling syntax (including
+    // `title~meta`), so the ambiguous tilde-only forms must remain node
+    // queries. The explicit equals/negative forms cannot be CSS selectors and
+    // are safe to diagnose as mistaken --url/--title conditions.
+    let malformed_url_tilde = lower
+        .strip_prefix("url~")
+        .and_then(|rest| rest.split_once('='))
+        .is_some_and(|(name, value)| {
+            !name.is_empty()
+                && !value.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-/.?&%".contains(&byte))
+                && value
+                    .bytes()
+                    .all(|byte| !byte.is_ascii_whitespace() && !b"[]#:.>+~*'\"".contains(&byte))
+        });
+    let url_like = lower.starts_with("url=")
+        || lower.starts_with("url!~")
+        || lower.starts_with("url!=")
+        || lower.starts_with("url_not=")
+        || lower.starts_with("url_not~")
+        || malformed_url_tilde;
+    let title_like = lower.starts_with("title=") || lower.starts_with("title!~");
+    if url_like {
+        Some(
+            "URL conditions use --url EXACT or --url '~/REGEX/flags', optionally with --absent; they are not node queries and must not be sent to the page"
+                .into(),
+        )
+    } else if title_like {
+        Some(
+            "title conditions use --title EXACT or --title '~/REGEX/flags', optionally with --absent; they are not node queries and must not be sent to the page"
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
 fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result<(), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("empty query; expected css=, xpath=, text=, role=, id= or tag=".into());
+    }
+    if let Some(message) = wait_condition_used_as_node_query(trimmed) {
+        return Err(message);
     }
     const KINDS: [&str; 6] = ["css", "xpath", "text", "role", "id", "tag"];
     let Some(split) = trimmed.find(['=', '~']) else {

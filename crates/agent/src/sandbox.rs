@@ -1785,31 +1785,21 @@ mod tests {
     }
 
     /// U1: `/var/...`-style system-alias roots still resolve via the fixed
-    /// allowlist (macOS). On other platforms this is a no-op of the temp-dir
-    /// acceptance already covered elsewhere.
+    /// allowlist, independently of the caller's TMPDIR.
     #[cfg(target_os = "macos")]
     #[test]
     fn prepare_expands_macos_var_system_alias() {
-        // temp_dir() on macOS is under /var/folders/… which must expand through
-        // the fixed /var → /private/var allowlist entry.
-        let tmp = std::env::temp_dir();
-        assert!(
-            tmp.starts_with("/var") || tmp.starts_with("/private/var"),
-            "expected macOS temp_dir under /var, got {}",
-            tmp.display()
+        // Both directories already exist on macOS: this checks resolution
+        // without creating test artifacts outside the configured temp volume.
+        let alias = PathBuf::from("/var/folders");
+        let canonical = PathBuf::from("/private/var/folders");
+        assert!(alias.is_dir());
+        let roots = prepare_writable_roots(std::slice::from_ref(&alias)).unwrap();
+        assert_eq!(roots, vec![canonical.clone()]);
+        assert_eq!(
+            prepare_writable_roots(std::slice::from_ref(&canonical)).unwrap(),
+            roots
         );
-        let roots = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert!(
-            roots[0].starts_with("/private/var"),
-            "canonical root must live under /private/var, got {}",
-            roots[0].display()
-        );
-        // Direct /var/folders request (pre-expansion form) must also work.
-        if tmp.starts_with("/var") {
-            let via_var = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
-            assert_eq!(via_var[0], roots[0]);
-        }
     }
 
     /// U1 unit: expand_system_alias_prefixes rewrites only allowlisted heads.

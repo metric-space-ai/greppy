@@ -44,6 +44,31 @@ fn index(repo: &Path, store: &Path) {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 }
 
+fn only_graph_db_below(root: &Path) -> PathBuf {
+    fn visit(path: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                visit(&child, found);
+            } else if child.file_name().is_some_and(|name| name == "graph.db") {
+                found.push(child);
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    visit(root, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one graph.db below {root:?}: {found:?}"
+    );
+    found.pop().unwrap()
+}
+
 #[test]
 fn symbol_reads_never_mix_stale_spans_with_shifted_source() {
     let (repo, store) = fresh_workspace("shifted-source");
@@ -227,6 +252,45 @@ fn read_applies_path_filters_before_ambiguity_resolution() {
 }
 
 #[test]
+fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
+    let (repo, store) = fresh_workspace("path-variable");
+    std::fs::create_dir_all(repo.join("src/core")).unwrap();
+    std::fs::write(
+        repo.join("src/core/gateway.rs"),
+        "pub const EMAIL_RUNTIME_ENV_KEYS: &[&str] = &[\n    \"CTO_EMAIL_PASSWORD\",\n    \"CTO_EMAIL_USERNAME\",\n];\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+
+    for symbol in [
+        "src/core/gateway.rs::Variable::EMAIL_RUNTIME_ENV_KEYS",
+        "src/core/gateway.rs::EMAIL_RUNTIME_ENV_KEYS",
+    ] {
+        let (code, stdout, stderr) = run(&repo, &store, &["read", symbol]);
+        assert_eq!(code, 0, "symbol={symbol}\nstdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.starts_with("src/core/gateway.rs:1-4  EMAIL_RUNTIME_ENV_KEYS\n"),
+            "symbol={symbol}\n{stdout}"
+        );
+        assert!(
+            stdout.contains("CTO_EMAIL_PASSWORD"),
+            "symbol={symbol}\n{stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read", "missing/gateway.rs::EMAIL_RUNTIME_ENV_KEYS"],
+    );
+    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
+        "a missing path must not fall back to the real declaration: {stdout}"
+    );
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)
@@ -260,6 +324,96 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
         "{expanded}"
     );
     assert!(expanded.ends_with(" continues at 801\n"), "{expanded}");
+}
+
+#[test]
+fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
+    let (repo, store) = fresh_workspace("missing-linked-base");
+    let content = (1..=805)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("long.txt"), &content).unwrap();
+
+    // Initialize only the small continuation store. No graph index is built.
+    let (init_code, init_out, init_err) = run(
+        &repo,
+        &store,
+        &["read-file", "long.txt", "--lines", "1:1", "--handle"],
+    );
+    assert_eq!(init_code, 0, "{init_out}\n{init_err}");
+    assert!(init_out.contains("handle: geh2:"), "{init_out}");
+
+    let graph_db = only_graph_db_below(&store);
+    let missing_base = store.join("cleaned-base").join("graph.db");
+    let binding = serde_json::json!({
+        "version": 1,
+        "base_path": missing_base,
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "project": "missing-linked-base",
+    });
+    rusqlite::Connection::open(&graph_db)
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_meta(key, value) VALUES(?1, ?2)\n             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("store_cow.binding.v1", binding.to_string()),
+        )
+        .unwrap();
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.starts_with("long.txt:1-400\nline 1\n"), "{stdout}");
+    assert!(stdout.contains("line 400\nhandle: geh2:"), "{stdout}");
+    assert!(!stdout.contains("line 401\n"), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("continuation id");
+
+    let (expand_code, expanded, expand_err) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "{expanded}\n{expand_err}");
+    assert!(
+        expanded.starts_with("long.txt:401-800\nline 401\n"),
+        "{expanded}"
+    );
+    assert!(!expanded.contains("line 400\n"), "{expanded}");
+    assert!(!expanded.contains("line 801\n"), "{expanded}");
+
+    let (range_code, range_out, range_err) = run(
+        &repo,
+        &store,
+        &["read-file", "long.txt", "--lines", "800:805", "--handle"],
+    );
+    assert_eq!(range_code, 0, "{range_out}\n{range_err}");
+    assert!(
+        range_out.starts_with("long.txt:800-805\nline 800\n"),
+        "{range_out}"
+    );
+    assert!(range_out.contains("line 805\nhandle: geh2:"), "{range_out}");
+    let handle = range_out
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .expect("compact read-file handle");
+    let (edit_code, edit_out, edit_err) = run(
+        &repo,
+        &store,
+        &[
+            "replace-span",
+            handle,
+            "replacement remains dry-run only\n",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(edit_code, 0, "{edit_out}\n{edit_err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("long.txt")).unwrap(),
+        content,
+        "compact handle resolution must not publish a dry-run replacement"
+    );
+    assert!(
+        !graph_db.parent().unwrap().join("index.job").exists(),
+        "read-file metadata operations must not launch an index job"
+    );
 }
 
 #[test]
@@ -344,6 +498,26 @@ fn read_file_accepts_explicit_absolute_path_outside_repo_only() {
     assert_eq!(escape_out, "no such file: ../diagnostic.json\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn read_file_follows_relative_symlink_to_external_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let (repo, store) = fresh_workspace("relative-external-symlink");
+    let dependency = repo.parent().unwrap().join("dependency-store");
+    std::fs::create_dir_all(dependency.join(".bin")).unwrap();
+    std::fs::write(dependency.join(".bin/vp"), "#!/bin/sh\necho linked\n").unwrap();
+    symlink(&dependency, repo.join("node_modules")).unwrap();
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "node_modules/.bin/vp", "--all"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(stdout, "node_modules/.bin/vp:1-2\n#!/bin/sh\necho linked\n");
+}
+
 #[test]
 fn read_handle_is_compact_and_existing_json_shape_survives() {
     let (repo, store) = fresh_workspace("handle");
@@ -390,4 +564,197 @@ fn compact_read_handle_still_drives_replace_span() {
         original,
         "dry-run must not publish the replacement"
     );
+}
+
+fn run_from(cwd: &Path, store: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .output()
+        .expect("run greppy");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn nested_read_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (repo, store) = fresh_workspace(tag);
+    let cwd = repo.parent().unwrap().to_path_buf();
+    std::fs::write(cwd.join("probe.conf"), "CWD_SENTINEL\n").unwrap();
+    std::fs::write(repo.join("probe.conf"), "REPO_SENTINEL\n").unwrap();
+    let nested = repo.join("etc");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("probe.conf"), "SUBDIR_SENTINEL\n").unwrap();
+    (cwd, repo, store, nested)
+}
+
+#[test]
+fn nested_root_reads_select_the_subdir_not_cwd_or_repo_sentinels() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-read");
+    std::fs::create_dir(repo.join("other")).unwrap();
+    let absolute = nested.to_str().unwrap();
+    let trailing = format!("{absolute}/");
+    let mut roots = vec![absolute.to_string(), "repo/etc".to_string(), trailing];
+    #[cfg(unix)]
+    {
+        let link = cwd.join("etc-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        roots.push("etc-link".to_string());
+    }
+    for root in &roots {
+        for args in [
+            vec!["--root", root.as_str(), "read-file", "probe.conf", "--all"],
+            vec![
+                "--root",
+                root.as_str(),
+                "read-file",
+                "probe.conf",
+                "--path",
+                "etc",
+            ],
+            vec!["--root", root.as_str(), "read", "probe.conf"],
+        ] {
+            let (code, stdout, stderr) = run_from(&cwd, &store, &args);
+            assert_eq!(code, 0, "{args:?}: {stdout}\n{stderr}");
+            assert!(stdout.contains("etc/probe.conf"), "{args:?}: {stdout}");
+            assert!(stdout.contains("SUBDIR_SENTINEL"), "{args:?}: {stdout}");
+            assert!(!stdout.contains("CWD_SENTINEL"), "{args:?}: {stdout}");
+            assert!(!stdout.contains("REPO_SENTINEL"), "{args:?}: {stdout}");
+        }
+        let (code, stdout, stderr) = run_from(
+            &cwd,
+            &store,
+            &[
+                "--root",
+                root.as_str(),
+                "read-file",
+                "probe.conf",
+                "--path",
+                "other",
+            ],
+        );
+        assert_ne!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains("outside path filter"), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+    }
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "probe.conf", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("probe.conf"), "{stdout}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("etc/probe.conf"), "{stdout}");
+
+    let (code, stdout, stderr) = run_from(&repo, &store, &["read-file", "probe.conf", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("etc/probe.conf"), "{stdout}");
+
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_missing_file_does_not_select_the_ancestor_sentinel() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-missing");
+    std::fs::remove_file(nested.join("probe.conf")).unwrap();
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "probe.conf",
+            "--all",
+        ],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert_eq!(stdout, "no such file: probe.conf\n");
+    assert!(!stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("CWD_SENTINEL"), "{stdout}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_read_file_continuation_stays_on_the_subdir_file() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-page");
+    let mut long = String::new();
+    for line in 1..=805 {
+        long.push_str(&format!("subdir line {line}\n"));
+    }
+    std::fs::write(nested.join("long.txt"), &long).unwrap();
+    let mut repo_long = String::new();
+    for line in 1..=805 {
+        repo_long.push_str(&format!("repo line {line}\n"));
+    }
+    std::fs::write(repo.join("long.txt"), &repo_long).unwrap();
+
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &["--root", nested.to_str().unwrap(), "read-file", "long.txt"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.starts_with("etc/long.txt:1-400\nsubdir line 1\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("subdir line 400\n"), "{stdout}");
+    assert!(!stdout.contains("repo line"), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("continuation id");
+
+    let (expand_code, expanded, expand_stderr) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "{expanded}\n{expand_stderr}");
+    assert!(
+        expanded.starts_with("etc/long.txt:401-800\nsubdir line 401\n"),
+        "{expanded}"
+    );
+    assert!(!expanded.contains("repo line"), "{expanded}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn nested_root_relative_escape_is_still_refused() {
+    let (cwd, repo, store, nested) = nested_read_fixture("nested-root-escape");
+    let (code, stdout, stderr) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "../probe.conf",
+            "--all",
+        ],
+    );
+    // ../probe.conf from etc lands on the repo sentinel, which is still inside
+    // the workspace, so the relative operand is allowed and names the repo file.
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("probe.conf"), "{stdout}");
+    assert!(stdout.contains("REPO_SENTINEL"), "{stdout}");
+    assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
+
+    let (escape_code, escape_out, escape_err) = run_from(
+        &cwd,
+        &store,
+        &[
+            "--root",
+            nested.to_str().unwrap(),
+            "read-file",
+            "../../probe.conf",
+            "--all",
+        ],
+    );
+    assert_eq!(escape_code, 1, "{escape_out}\n{escape_err}");
+    assert_eq!(escape_out, "no such file: ../../probe.conf\n");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }

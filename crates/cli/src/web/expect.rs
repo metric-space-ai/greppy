@@ -76,6 +76,33 @@ mod response_tests {
     }
 
     #[test]
+    fn malformed_positional_url_wait_is_rejected_before_runtime_evaluation() {
+        use clap::Parser;
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "wait",
+            "url~product_list_order=name",
+            "--session",
+            "wrs_fixture",
+        ])
+        .unwrap();
+        let ExpectCommand::Wait { condition, .. } = parsed.command else {
+            panic!("wait")
+        };
+        let error = condition_expression(&condition).expect_err("malformed URL shorthand");
+        assert!(error.contains("--url"), "{error}");
+        assert!(error.contains("must not be sent to the page"), "{error}");
+
+        for valid_css in ["url~meta", "url~product[data-order=name]", "div~span"] {
+            let parsed = TestCli::try_parse_from(["test", "wait", valid_css]).unwrap();
+            let ExpectCommand::Wait { condition, .. } = parsed.command else {
+                panic!("wait")
+            };
+            assert!(condition_expression(&condition).is_ok(), "{valid_css}");
+        }
+    }
+
+    #[test]
     fn native_wait_preserves_result_evidence_and_never_accepts_missing_confirmation() {
         let state = json!({"status":"available", "snapshot":{"title":"Saved"}});
         let result = normalize_native_wait_response(

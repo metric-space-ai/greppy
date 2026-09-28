@@ -135,12 +135,14 @@ fn query_json_raw(
     let mut argv = args.to_vec();
     argv.push("--json");
     let (code, stdout, stderr) = run(repo, store, &argv, overlay);
-    assert_eq!(
-        code, 0,
-        "query {args:?} failed\nstdout={stdout}\nstderr={stderr}"
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("invalid JSON for {args:?}: {error}; stdout={stdout:?}"));
+    let expected_no_match = code == 1 && value["status"] == "no_matches";
+    assert!(
+        code == 0 || expected_no_match,
+        "query {args:?} failed with exit {code}\nstdout={stdout}\nstderr={stderr}"
     );
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("invalid JSON for {args:?}: {error}; stdout={stdout:?}"))
+    value
 }
 
 fn query_text(repo: &Path, store: &Path, args: &[&str], overlay: Option<(&Path, &str)>) -> String {
@@ -388,6 +390,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     let primary = scratch.path().join("primary");
     let first = scratch.path().join("feature-one");
     let second = scratch.path().join("feature-two");
+    let third = scratch.path().join("feature-three");
     let store = scratch.path().join("store");
     std::fs::create_dir_all(primary.join("src")).unwrap();
     std::fs::write(
@@ -408,6 +411,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     git(&primary, &["config", "user.name", "Linked Store CoW"]);
     git(&primary, &["add", "."]);
     git(&primary, &["commit", "-q", "-m", "base"]);
+    let pinned_base_commit = git(&primary, &["rev-parse", "HEAD"]);
     git(
         &primary,
         &[
@@ -516,6 +520,99 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     )
     .contains("feature_two_symbol"));
 
+    // A cold structural query in a later linked worktree must reuse the
+    // already verified immutable Base and publish only its branch/dirty Delta.
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-three",
+            third.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        third.join("src/change.rs"),
+        "pub fn feature_three_symbol() -> i32 { 33 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        third.join("src/dirty.rs"),
+        "pub fn dirty_three_symbol() -> i32 { 34 }\n",
+    )
+    .unwrap();
+    let (third_code, third_out, third_err) = run_with_env(
+        &third,
+        &store,
+        &["search-symbol", "feature_three_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(third_code, 0, "stdout={third_out}\nstderr={third_err}");
+    assert!(third_out.contains("feature_three_symbol"), "{third_out}");
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "dirty_three_symbol"],
+        None,
+    )
+    .contains("dirty_three_symbol"));
+    let third_status = query_json_raw(&third, &store, &["index", "status"], None);
+    assert_eq!(third_status["store_cow"]["mode"], "overlay");
+    assert_eq!(third_status["store_cow"]["base_identity"], shared_identity);
+    let third_delta = PathBuf::from(
+        third_status["store_path"]
+            .as_str()
+            .expect("third Delta path"),
+    );
+    let third_graph = greppy_store::Store::open(&third_delta).unwrap();
+    let third_generation = third_graph
+        .get_workspace_state(third.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("third workspace state")
+        .graph_generation;
+    drop(third_graph);
+    // This fixture verifies Base lifecycle, composite visibility, and graph
+    // generation preservation. Real vector creation is covered by the native
+    // inference acceptance suite; test assets intentionally skip inference.
+    let (embed_code, embed_out, embed_err) = run_with_env(
+        &third,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(embed_code, 0, "stdout={embed_out}\nstderr={embed_err}");
+    let embedded_delta = greppy_store::Store::open(&third_delta).unwrap();
+    assert_eq!(
+        embedded_delta
+            .get_workspace_state(third.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("embedded third workspace state")
+            .graph_generation,
+        third_generation,
+        "embedding an existing Base+Delta must not rebuild its graph"
+    );
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "shared_base_symbol"],
+        None,
+    )
+    .contains("shared_base_symbol"));
+    assert!(query_text(
+        &third,
+        &store,
+        &["search-symbol", "dirty_three_symbol"],
+        None,
+    )
+    .contains("dirty_three_symbol"));
     // The first process's environment is gone. A fresh query still composes
     // its Base+Delta from the binding persisted in its private graph.
     assert!(query_text(
@@ -566,6 +663,388 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     )
     .contains("first_untracked_symbol"));
 
+    // Reproduce the original failure: a persisted Delta binding is valid, but
+    // structural first use deliberately skips Base preparation, so the
+    // command-scoped GREPPY_AGENT_BASE_COMMIT environment is absent. Keep a
+    // real vector in the active Delta to prove the refresh preserves data
+    // carried across the atomic snapshot publication.
+    let refreshed_delta_path = PathBuf::from(
+        refreshed_status["store_path"]
+            .as_str()
+            .expect("refreshed Delta path"),
+    );
+    let mut refreshed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let project = greppy_core::project_identity(&first);
+    let generation = refreshed_delta
+        .get_workspace_state(first.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("refreshed workspace state")
+        .graph_generation;
+    let vector_node = refreshed_delta
+        .list_nodes_by_name(&project, "first_untracked_symbol", 1)
+        .unwrap()
+        .pop()
+        .expect("existing Delta vector node");
+    let vector_content = std::fs::read(first.join("src/untracked.rs")).unwrap();
+    refreshed_delta
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: project.clone(),
+            model_id: "test-code-embedder".into(),
+            prompt_version: "test-prompt-v1".into(),
+            task: "retrieval_document".into(),
+            node_id: Some(vector_node.id),
+            chunk_idx: 0,
+            qualified_name: vector_node.qualified_name,
+            file_path: vector_node.file_path,
+            start_line: vector_node.start_line,
+            end_line: vector_node.end_line,
+            content_sha256: greppy_store::file_state::sha256_hex(&vector_content),
+            graph_generation: generation,
+            vector: vec![1.0, 0.0],
+        })
+        .unwrap();
+    let vectors_before: i64 = refreshed_delta
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        vectors_before > 0,
+        "regression fixture must contain a vector"
+    );
+    drop(refreshed_delta);
+
+    let base_path = PathBuf::from(
+        refreshed_status["store_cow"]["base_path"]
+            .as_str()
+            .expect("persisted Base path"),
+    );
+    // A genuinely cold structural refresh must still avoid materializing a
+    // temporary Base checkout. Retain this regression independently of the
+    // verified-v6 migration below.
+    let summary_cache = base_path
+        .parent()
+        .expect("Base graph parent")
+        .join(greppy_store::BASE_SUMMARY_CACHE_FILE);
+    let saved_summary_cache = std::fs::read(&summary_cache).unwrap();
+    std::fs::remove_file(&summary_cache).expect("force Base reuse miss");
+    std::fs::write(
+        first.join("src/cold_structural_refresh.rs"),
+        "pub fn cold_structural_refresh_symbol() -> i32 { 54 }\n",
+    )
+    .unwrap();
+    let (cold_code, cold_out, cold_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_STRUCTURAL_FIRST_USE", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        cold_code, 0,
+        "cold structural refresh failed: {cold_out}\n{cold_err}"
+    );
+    std::fs::write(&summary_cache, saved_summary_cache).unwrap();
+
+    // Downgrade the published fixture to a verified v6 Base and remove the
+
+    // current v7 generation. Structural first use must migrate this graph
+    // before publishing a v7 Base; treating v6 as fresh would answer against
+    // the pre-v7 extraction and resolution contract.
+    let manifest_path = base_path
+        .parent()
+        .expect("Base graph parent")
+        .join(greppy_store::BASE_STORE_MANIFEST_FILE);
+    let manifest: greppy_store::BaseStoreManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read published Base manifest"),
+    )
+    .expect("decode published Base manifest");
+    let mut previous_identity = manifest.identity.clone();
+    previous_identity.indexer_version = "greppy-indexer-v6".into();
+    let expected_embedding_model = previous_identity.embedding_model.clone();
+    let previous_graph = scratch.path().join("verified-v6-base.db");
+    std::fs::copy(&base_path, &previous_graph).expect("copy v6 Base graph");
+    // Publication makes the Base immutable. Only the private fixture copy
+    // may be edited to represent a previous indexer generation.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&previous_graph, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = std::fs::metadata(&previous_graph).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&previous_graph, permissions).unwrap();
+    }
+
+    let mut previous_store = greppy_store::Store::open(&previous_graph).unwrap();
+    let previous_project = previous_store
+        .list_projects()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("v6 Base project")
+        .name;
+    for mut workspace in previous_store.list_workspace_states().unwrap() {
+        workspace.indexer_version = "greppy-indexer-v6".into();
+        previous_store.upsert_workspace_state(&workspace).unwrap();
+    }
+    previous_store
+        .conn()
+        .execute(
+            "DELETE FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{previous_project}")],
+        )
+        .unwrap();
+    let base_node = previous_store
+        .list_nodes_by_name(&previous_project, "shared_base_symbol", 1)
+        .unwrap()
+        .pop()
+        .expect("v6 Base symbol");
+    let base_generation = previous_store
+        .list_workspace_states()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("v6 Base workspace")
+        .graph_generation;
+    previous_store
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: previous_project.clone(),
+            model_id: "test-code-embedder".into(),
+            prompt_version: "test-prompt-v1".into(),
+            task: "retrieval_document".into(),
+            node_id: Some(base_node.id),
+            chunk_idx: 0,
+            qualified_name: base_node.qualified_name,
+            file_path: base_node.file_path,
+            start_line: base_node.start_line,
+            end_line: base_node.end_line,
+            content_sha256: greppy_store::file_state::sha256_hex(
+                &std::fs::read(primary.join("src/base.rs")).unwrap(),
+            ),
+            graph_generation: base_generation,
+            vector: vec![0.0, 1.0],
+        })
+        .unwrap();
+    let v6_vectors: i64 = previous_store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(v6_vectors, 1, "v6 fixture must contain one valid vector");
+    drop(previous_store);
+
+    let previous_layout = greppy_store::BaseStoreLayout::new(&store, &previous_identity).unwrap();
+    {
+        let _builder = previous_layout.acquire_builder(false).unwrap().unwrap();
+        previous_layout
+            .publish_graph_with_summary(
+                previous_identity,
+                &previous_graph,
+                &base_path
+                    .parent()
+                    .expect("Base graph parent")
+                    .join(greppy_store::BASE_SUMMARY_CACHE_FILE),
+            )
+            .unwrap();
+    }
+    std::fs::remove_dir_all(base_path.parent().expect("Base graph parent"))
+        .expect("remove current v7 Base generation");
+    let bound_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let binding_raw: String = bound_delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'store_cow.binding.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut binding: serde_json::Value = serde_json::from_str(&binding_raw).unwrap();
+    binding["base_path"] =
+        serde_json::Value::String(previous_layout.graph.to_string_lossy().into_owned());
+    bound_delta
+        .conn()
+        .execute(
+            "UPDATE schema_meta SET value = ?1 WHERE key = 'store_cow.binding.v1'",
+            [serde_json::to_string(&binding).unwrap()],
+        )
+        .unwrap();
+    drop(bound_delta);
+    std::fs::write(
+        first.join("src/structural_refresh.rs"),
+        "pub fn structural_refresh_symbol() -> i32 { 55 }\n",
+    )
+    .unwrap();
+    let (structural_code, structural_out, structural_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[("GREPPY_STRUCTURAL_FIRST_USE", "1")],
+    );
+    assert_eq!(
+        structural_code, 0,
+        "persisted overlay structural refresh failed\nstdout={structural_out}\nstderr={structural_err}"
+    );
+    let structural_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    assert_eq!(
+        structural_delta
+            .list_nodes_by_name(&project, "structural_refresh_symbol", 10)
+            .unwrap()
+            .len(),
+        1,
+        "structural refresh must publish the new node"
+    );
+    assert_eq!(
+        structural_delta
+            .list_nodes_by_name(&project, "first_untracked_symbol", 10)
+            .unwrap()
+            .len(),
+        1,
+        "structural refresh must retain existing Delta nodes"
+    );
+    let vectors_after: i64 = structural_delta
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        vectors_after, vectors_before,
+        "refresh must retain Delta vectors"
+    );
+    let structural_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(structural_status["fresh"], true, "{structural_status:#}");
+    assert_eq!(
+        structural_status["embedding_complete"], false,
+        "structurally valid Base must not report semantic completion: {structural_status:#}"
+    );
+    assert_eq!(
+        structural_status["freshness"]["source"], "verified_store_cow_overlay",
+        "structural v6 migration must publish a freshness proof: {structural_status:#}"
+    );
+    assert_ne!(
+        structural_status["store_cow"]["base_path"],
+        previous_layout.graph.to_string_lossy().as_ref(),
+        "structural first use must publish a v7 Base"
+    );
+    let migrated_base = greppy_store::Store::open(Path::new(
+        structural_status["store_cow"]["base_path"]
+            .as_str()
+            .expect("migrated Base path"),
+    ))
+    .unwrap();
+    assert_eq!(
+        migrated_base
+            .list_nodes_by_name(&project, "shared_base_symbol", 10)
+            .unwrap()
+            .len(),
+        1,
+        "v7 migration must retain the v6 Base node"
+    );
+    let migrated_vectors: i64 = migrated_base
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        migrated_vectors, v6_vectors,
+        "v7 migration must retain vectors"
+    );
+    let migrated_generation = migrated_base
+        .list_workspace_states()
+        .unwrap()
+        .into_iter()
+        .map(|workspace| workspace.graph_generation)
+        .max()
+        .expect("migrated Base generation");
+    let expected_embedding_receipt = format!("{migrated_generation}|{expected_embedding_model}");
+    let migrated_completion: Option<String> = migrated_base
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{project}")],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_ne!(
+        migrated_completion.as_deref(),
+        Some(expected_embedding_receipt.as_str()),
+        "structural Base migration must not claim semantic completion"
+    );
+    let deferred_receipt: String = migrated_base
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("store_cow.embedding_deferred.v1:{project}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deferred_receipt, expected_embedding_receipt);
+    drop(migrated_base);
+    let binding_raw: String = structural_delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'store_cow.binding.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding: serde_json::Value = serde_json::from_str(&binding_raw).unwrap();
+    assert_eq!(binding["base_commit"], pinned_base_commit);
+    assert_eq!(
+        binding["base_path"],
+        structural_status["store_cow"]["base_path"]
+    );
+    drop(structural_delta);
+
+    // A later semantic completion reuses the structurally migrated Base and
+    // publishes the normal completion receipt in the writable Delta. The
+    // test provider avoids model work while exercising the production
+    // Base+Delta completion path and generation identity.
+    let (semantic_code, semantic_out, semantic_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        semantic_code, 0,
+        "semantic completion failed\nstdout={semantic_out}\nstderr={semantic_err}"
+    );
+    let completed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+    let completed_generation = completed_delta
+        .get_workspace_state(first.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("semantically completed Delta workspace")
+        .graph_generation;
+    let completion: String = completed_delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [format!("embedding_complete:{project}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        completion,
+        format!("{completed_generation}|{expected_embedding_model}")
+    );
+    drop(completed_delta);
+
     // A manually removed or externally cleaned shared Base used to trap the
     // linked worktree in a circular recovery: status and queries told the
     // user to run `greppy index`, but that command opened the same missing
@@ -575,7 +1054,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     // branch has advanced above, so this also proves recovery preserves the
     // worktree's original Base commit.
     let missing_base = PathBuf::from(
-        refreshed_status["store_cow"]["base_path"]
+        structural_status["store_cow"]["base_path"]
             .as_str()
             .expect("persisted Base path"),
     );
@@ -621,6 +1100,199 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("first_untracked_symbol"));
+}
+
+#[test]
+fn normal_query_recovers_missing_persisted_base_without_semantic_rebuild() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let linked = scratch.path().join("linked");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/lib.rs"),
+        "pub fn target() -> i32 { 1 }\npub fn old_caller() -> i32 { target() }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(&primary, &["config", "user.email", "recovery@test.invalid"]);
+    git(&primary, &["config", "user.name", "Base Recovery"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    let pinned_commit = git(&primary, &["rev-parse", "HEAD"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    index(&linked, &store, None);
+    let before = query_json_raw(&linked, &store, &["index", "status"], None);
+    let missing_base = PathBuf::from(before["store_cow"]["base_path"].as_str().unwrap());
+    let delta_path = PathBuf::from(before["store_path"].as_str().unwrap());
+    std::fs::write(primary.join("src/later.rs"), "pub fn later_primary() {}\n").unwrap();
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "advance primary"]);
+    std::fs::write(
+        linked.join("src/lib.rs"),
+        "pub fn target() -> i32 { 1 }\npub fn live_caller() -> i32 { target() }\n",
+    )
+    .unwrap();
+    std::fs::remove_file(&missing_base).unwrap();
+
+    let query = ["who-calls", "target", "--json", "--all"];
+    let (disabled_code, _, disabled_err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    assert_eq!(disabled_code, 64, "{disabled_err}");
+    assert!(
+        disabled_err.contains("Base Store is missing"),
+        "{disabled_err}"
+    );
+    assert!(!missing_base.exists(), "explicit opt-out must not rebuild");
+
+    // No explicit index command or retry: the first normal query must join
+    // structural publication and answer from the recovered Base plus dirty Delta.
+    let (code, out, err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[
+            ("GREPPY_AUTO_REINDEX", "1"),
+            ("GREPPY_TEST_FORBID_INDEX_INFERENCE", "1"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("live_caller"), "{out}");
+    assert!(!out.contains("old_caller"), "{out}");
+    assert!(missing_base.is_file());
+    let delta = greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+        .unwrap();
+    let binding: String = delta
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'store_cow.binding.v1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+    assert_eq!(binding["base_commit"], pinned_commit);
+    let base =
+        greppy_store::Store::open_with(&missing_base, greppy_store::OpenOptions::read_only())
+            .unwrap();
+    let deferred: i64 = base
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM schema_meta WHERE key LIKE 'store_cow.embedding_deferred.v1:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(deferred > 0, "query recovery must defer semantic inference");
+    drop(base);
+    drop(delta);
+    let (warm_code, warm_out, warm_err) = run_with_env(
+        &linked,
+        &store,
+        &query,
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(warm_code, 0, "{warm_out}\n{warm_err}");
+    assert!(warm_out.contains("live_caller"), "{warm_out}");
+}
+
+#[test]
+fn cold_linked_structural_query_uses_complete_private_graph_without_building_a_base() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let linked = scratch.path().join("linked");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn cold_base_symbol() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(&primary, &["config", "user.email", "cold-cow@test.invalid"]);
+    git(&primary, &["config", "user.name", "Cold Store CoW"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-q", "-m", "base"]);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cold-linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        linked.join("src/base.rs"),
+        "pub fn cold_branch_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        linked.join("src/dirty.rs"),
+        "pub fn cold_dirty_symbol() -> i32 { 3 }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run_with_env(
+        &linked,
+        &store,
+        &["search-symbol", "cold_branch_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("cold_branch_symbol"), "{out}");
+    assert!(query_text(
+        &linked,
+        &store,
+        &["search-symbol", "cold_dirty_symbol"],
+        None,
+    )
+    .contains("cold_dirty_symbol"));
+
+    std::fs::write(
+        linked.join("src/base.rs"),
+        "pub fn cold_after_edit_symbol() -> i32 { 4 }\n",
+    )
+    .unwrap();
+    let (refresh_code, refresh_out, refresh_err) = run_with_env(
+        &linked,
+        &store,
+        &["search-symbol", "cold_after_edit_symbol"],
+        None,
+        &[("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1")],
+    );
+    assert_eq!(
+        refresh_code, 0,
+        "stale structural refresh must publish without a Base/model build: {refresh_out} {refresh_err}"
+    );
+    assert!(
+        refresh_out.contains("cold_after_edit_symbol"),
+        "{refresh_out}"
+    );
+
+    let status = query_json_raw(&linked, &store, &["index", "status"], None);
+    assert_eq!(status["store_cow"]["mode"], "single", "{status:#}");
+    assert_eq!(status["fresh"], true, "{status:#}");
 }
 
 #[test]

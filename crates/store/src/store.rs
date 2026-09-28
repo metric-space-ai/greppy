@@ -85,10 +85,7 @@ impl Store {
 
     /// Open with explicit options.
     pub fn open_with(path: &Path, opts: OpenOptions) -> Result<Self> {
-        let lifecycle = workspace_lifecycle_for_path(path).map_err(|e| Error::Io {
-            context: format!("acquire lifecycle lease for {}", path.display()),
-            source: e,
-        })?;
+        let lifecycle = workspace_lifecycle_for_path(path, opts.read_only)?;
         let conn = if opts.read_only {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
                 |e| Error::Io {
@@ -478,24 +475,30 @@ WHERE NOT EXISTS (
 
 fn workspace_lifecycle_for_path(
     path: &Path,
-) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    nonblocking: bool,
+) -> Result<Option<greppy_core::cache::FileLock>> {
     let Some(parent) = path.parent() else {
         return Ok(None);
     };
     let Ok(manifest) = greppy_core::cache::read_store_manifest(parent) else {
         return Ok(None);
     };
-    greppy_core::cache::acquire_workspace_lifecycle(
+    let lease = greppy_core::cache::acquire_workspace_lifecycle(
         &manifest.canonical_root,
         greppy_core::cache::LockMode::Shared,
-        false,
+        nonblocking,
     )
-    .inspect(|lease| {
-        debug_assert!(
-            lease.is_some(),
-            "blocking lifecycle lock must return a guard"
-        );
-    })
+    .map_err(|source| Error::Io {
+        context: format!("acquire lifecycle lease for {}", path.display()),
+        source,
+    })?;
+    if lease.is_none() {
+        return Err(Error::Lock(format!(
+            "workspace index lifecycle is busy for {}; retry this query after the active maintenance operation finishes",
+            manifest.canonical_root.display()
+        )));
+    }
+    Ok(lease)
 }
 
 /// A write transaction. Use `Store::transaction()` to acquire.
@@ -521,6 +524,28 @@ impl<'a> Transaction<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_open_refuses_held_lifecycle_and_recovers_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = greppy_core::cache::ensure_workspace_store(root.path()).unwrap();
+        let path = store_dir.join("graph.db");
+        drop(Store::open(&path).unwrap());
+        let exclusive = greppy_core::cache::acquire_workspace_lifecycle(
+            root.path(),
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let error = Store::open_with(&path, OpenOptions::read_only()).unwrap_err();
+        assert!(matches!(&error, Error::Lock(message) if message.contains("retry this query")));
+        let core_error: greppy_core::Error = error.into();
+        assert!(matches!(core_error, greppy_core::Error::Lock(_)));
+        drop(exclusive);
+        drop(Store::open_with(&path, OpenOptions::read_only()).unwrap());
+        std::fs::remove_dir_all(store_dir).unwrap();
+    }
 
     #[test]
     fn open_memory_creates_db_with_schema() {

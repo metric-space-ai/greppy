@@ -995,11 +995,11 @@ fn load_auto_backend(
 ) -> Result<Backend> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        load_metal_with_cpu_fallback(model, inventory, eos_token_id)
+        load_metal_backend(model, inventory, eos_token_id)
     }
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        load_cuda_with_cpu_fallback(model, inventory, eos_token_id)
+        load_cuda_backend(model, inventory, eos_token_id)
     }
     #[cfg(not(any(
         all(feature = "metal", target_os = "macos"),
@@ -1007,36 +1007,6 @@ fn load_auto_backend(
     )))]
     {
         load_cpu_backend(model, inventory, eos_token_id)
-    }
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn load_metal_with_cpu_fallback(
-    model: &greppy_embed_native::GgufModel,
-    inventory: Qwen35Inventory,
-    eos_token_id: u32,
-) -> Result<Backend> {
-    match load_metal_backend(model, inventory.clone(), eos_token_id) {
-        Ok(backend) => Ok(backend),
-        Err(err) => {
-            eprintln!("greppy_qwen35_native: Metal unavailable, falling back to CPU: {err}");
-            load_cpu_backend(model, inventory, eos_token_id)
-        }
-    }
-}
-
-#[cfg(all(feature = "cuda", target_os = "linux"))]
-fn load_cuda_with_cpu_fallback(
-    model: &greppy_embed_native::GgufModel,
-    inventory: Qwen35Inventory,
-    eos_token_id: u32,
-) -> Result<Backend> {
-    match load_cuda_backend(model, inventory.clone(), eos_token_id) {
-        Ok(backend) => Ok(backend),
-        Err(err) => {
-            eprintln!("greppy_qwen35_native: CUDA unavailable, falling back to CPU: {err}");
-            load_cpu_backend(model, inventory, eos_token_id)
-        }
     }
 }
 

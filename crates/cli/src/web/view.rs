@@ -73,6 +73,57 @@ fn string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Envelope fields only: a held wait/assert/workflow expectation. Never infer
+/// an application task from dispatch, `ok: true`, or a post-action snapshot.
+fn stated_condition_held(payload: &Value) -> bool {
+    if payload.get("status").and_then(Value::as_str) != Some("ok") {
+        return false;
+    }
+    if payload.get("error").is_some_and(|error| error.is_object()) {
+        return false;
+    }
+    let operation = payload
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let receipt = payload
+        .get("result")
+        .filter(|value| !value.is_null())
+        .unwrap_or(payload);
+    match operation {
+        "web.wait" | "web.assert" => receipt.get("held") == Some(&Value::Bool(true)),
+        "web.workflow" => workflow_expectations_held(receipt),
+        _ => false,
+    }
+}
+
+fn workflow_expectations_held(result: &Value) -> bool {
+    if result.get("workflow_version").and_then(Value::as_u64) != Some(1) {
+        return false;
+    }
+    let Some(steps) = result.get("steps").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut any = false;
+    for step in steps {
+        let Some(expectation) = step.get("expectation") else {
+            continue;
+        };
+        any = true;
+        if expectation.get("status").and_then(Value::as_str) != Some("ok") {
+            return false;
+        }
+        if expectation
+            .get("result")
+            .and_then(|result| result.get("held"))
+            != Some(&Value::Bool(true))
+        {
+            return false;
+        }
+    }
+    any
+}
+
 // These known v2 defaults have a compact presentation. In particular,
 // checked/selected/expanded=false and unknown fields must remain visible.
 fn v2_presentation_default(key: &str, value: &Value) -> bool {
@@ -184,6 +235,7 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
         .and_then(Value::as_str)
         .unwrap_or("web");
     let error = payload.get("error").filter(|v| v.is_object());
+    let held = stated_condition_held(payload);
     let mut header = if let Some(e) = error {
         format!(
             "FAILED — {} (exit {})\n",
@@ -194,8 +246,12 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
         )
     } else if payload.get("status").and_then(Value::as_str) == Some("error") {
         "FAILED — runtime reported an error\n".into()
+    } else if held && observed.is_some() {
+        "returned; expectation held; page observed\n".into()
+    } else if held {
+        "returned; expectation held\n".into()
     } else if observed.is_some() {
-        "returned; page observed\n".into()
+        "returned; page observed — snapshot, not a verified task outcome\n".into()
     } else if page_state
         .is_some_and(|state| state.get("status").and_then(Value::as_str) == Some("unavailable"))
     {
@@ -224,11 +280,16 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
         if let Some(workflow) = workflow {
             body.push_str(workflow);
         } else if let Some(obj) = receipt.as_object() {
-            let fields: serde_json::Map<String, Value> = obj
+            let mut fields: serde_json::Map<String, Value> = obj
                 .iter()
                 .filter(|(key, _)| key.as_str() != "page_state")
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
+            // `ok: true` restates status=ok. Leaving it in the receipt made
+            // unverified dispatch look like a verified page change.
+            if error.is_none() && fields.get("ok") == Some(&Value::Bool(true)) {
+                fields.remove("ok");
+            }
             let label = if error.is_some() {
                 "partial_result"
             } else {
@@ -280,6 +341,9 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
         if observed.is_some() {
             body.push_str("Current page state — observation, not proof of the intended outcome:\n");
         }
+    }
+    if error.is_none() && observed.is_some() && !held {
+        body.push_str("Current page state — observation, not proof of the intended outcome:\n");
     }
     // Errors with a valid follow-up snapshot use exactly the same state view
     // as successful actions. Keep the typed failure above; never replay an
@@ -665,6 +729,8 @@ mod tests {
         let payload = workflow_receipt();
         let before = payload.clone();
         let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+        assert!(out.starts_with("returned; expectation held; page observed\n"));
+        assert!(!out.contains("not a verified task outcome"));
         assert!(out.contains("workflow:"));
         assert!(out.contains("step 1: action=\"web.click\" status=\"ok\""));
         assert!(out.contains("\"held\":true"));
@@ -830,10 +896,19 @@ mod tests {
                 "snapshot":observed("Dialog opened")["result"], "revision":42}
         }});
         let out = render(&payload, Scope::default(), tmp.path()).unwrap();
-        assert!(out.starts_with("returned; page observed\n"));
+        assert!(
+            out.starts_with("returned; page observed — snapshot, not a verified task outcome\n")
+        );
+        assert!(out.contains("not proof of the intended outcome"));
+        assert!(!out.starts_with("FAILED"));
+        assert!(!out.contains("expectation held"));
         assert!(out.contains("\"@1\" \"checkbox\""));
         assert!(out.contains("checked=false"));
         assert!(out.contains("receipt: {\"dispatch\":\"native\""));
+        assert!(
+            !out.contains("\"ok\":true"),
+            "dispatch ok must not look like a verified effect: {out}"
+        );
         assert!(out.contains("session=\"session-a\""));
         assert!(out.contains("page_state \"revision\": 42"));
         assert!(
@@ -1060,6 +1135,107 @@ mod tests {
         .unwrap();
         assert!(out.starts_with("returned — task outcome not verified"));
     }
+
+    #[test]
+    fn dispatch_without_expect_is_not_a_verified_effect_and_same_url_is_not_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = json!({
+            "title":"One Stop Market", "url":"http://localhost:7770/",
+            "text":"Search", "actionables":[], "actionable_schema":"greppy.web.actionable.v2",
+            "ref_count":0, "refs_truncated":false
+        });
+        for (operation, extra) in [
+            ("web.click", json!({"dispatch":"native"})),
+            ("web.fill", json!({})),
+            ("web.press", json!({})),
+        ] {
+            let mut result = json!({
+                "ok":true, "session_id":"session-a",
+                "page_state":{"schema":"greppy.web.page-state.v1", "status":"available",
+                    "snapshot":snapshot}
+            });
+            if let Some(object) = extra.as_object() {
+                result.as_object_mut().unwrap().extend(object.clone());
+            }
+            let payload = json!({"operation":operation, "status":"ok", "result":result});
+            let before = payload.clone();
+            let out = render(&payload, Scope::default(), tmp.path()).unwrap();
+            assert!(
+                out.starts_with(
+                    "returned; page observed — snapshot, not a verified task outcome\n"
+                ),
+                "{operation}: {out}"
+            );
+            assert!(
+                out.contains("not proof of the intended outcome"),
+                "{operation}: {out}"
+            );
+            assert!(out.contains("http://localhost:7770/"), "{operation}: {out}");
+            assert!(out.contains("One Stop Market"), "{operation}: {out}");
+            assert!(
+                !out.starts_with("FAILED"),
+                "{operation}: no-navigation dispatch must remain a returned action: {out}"
+            );
+            assert!(!out.contains("expectation held"), "{operation}: {out}");
+            assert_eq!(
+                payload, before,
+                "{operation}: machine data must remain untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn held_wait_is_not_described_as_unverified_and_failed_expect_stays_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = json!({"operation":"web.wait", "status":"ok", "result":{
+            "held":true, "waited_ms":7, "detail":{"matched":1}
+        }});
+        let out = render(&held, Scope::default(), tmp.path()).unwrap();
+        assert!(out.starts_with("returned; expectation held\n"), "{out}");
+        assert!(!out.contains("not a verified task outcome"), "{out}");
+        assert!(!out.starts_with("FAILED"), "{out}");
+
+        let native = json!({"operation":"web.wait", "status":"ok", "result":{
+            "held":true, "waited_ms":7, "session_id":"session-a", "tab_id":"tab-a",
+            "page_state":{"schema":"greppy.web.page-state.v1", "status":"available",
+                "snapshot":{"title":"Results", "url":"http://localhost:7770/catalogsearch/",
+                    "actionables":[]}}
+        }});
+        let out = render(&native, Scope::default(), tmp.path()).unwrap();
+        assert!(
+            out.starts_with("returned; expectation held; page observed\n"),
+            "{out}"
+        );
+        assert!(out.contains("catalogsearch"), "{out}");
+
+        let failed = json!({"operation":"web.workflow", "status":"error",
+        "error":{"code":"TIMEOUT","exit_code":34,"message":"expectation did not hold",
+            "next_action":"inspect; do not replay"},
+        "result":{"workflow_version":1, "session_id":"workflow-s", "tab_id":"workflow-p",
+            "completed_steps":0, "total_steps":1, "actions_attempted":1, "rolled_back":false,
+            "failed_step":1, "phase":"expectation",
+            "steps":[{"step":1,
+                "action":{"operation":"web.click", "status":"ok", "receipt":{"ok":true,"dispatch":"native"}},
+                "expectation":{"status":"error", "result":{"held":false}},
+                "failed_phase":"expectation"}],
+            "page_state":{"schema":"greppy.web.page-state.v1","status":"available",
+                "snapshot":{"title":"One Stop Market","url":"http://localhost:7770/","actionables":[]}}
+        }});
+        let out = render(&failed, Scope::default(), tmp.path()).unwrap();
+        assert!(out.starts_with("FAILED"), "{out}");
+        assert!(out.contains("TIMEOUT"), "{out}");
+        assert!(out.contains("expectation status=\"error\""), "{out}");
+        assert!(
+            out.contains("failed_phase=\"expectation\"")
+                || out.contains("failed_phase=expectation")
+                || out.contains("\"failed_phase\":\"expectation\"")
+                || out.contains("failed_phase="),
+            "{out}"
+        );
+        assert!(!out.contains("expectation held"), "{out}");
+        assert!(!out.contains("\"held\":true"), "{out}");
+    }
+
     #[test]
     fn errors_preserve_recovery_and_partial_execution() {
         let tmp = tempfile::tempdir().unwrap();

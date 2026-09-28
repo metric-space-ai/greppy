@@ -36,6 +36,8 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_AGENT: u8 = 3;
 /// Exit: `--apply` cherry-pick conflict.
 pub const EXIT_CONFLICT: u8 = 4;
+/// Exit: the agent stopped before completing its response; proposals remain available.
+pub const EXIT_INCOMPLETE: u8 = 5;
 /// Exit: user cancelled interactive startup.
 pub const EXIT_CANCELLED: u8 = 130;
 
@@ -121,6 +123,7 @@ Exit codes:
   2  no gateway / bad usage / missing model / unsupported repository
   3  agent or loop error (worktree kept for debugging)
   4  --apply refused (dirty target) or cherry-pick conflict (ref still available)
+  5  incomplete (turn/token/deadline limit or repeated tool failures; proposal saved)
 ";
 
 /// Parsed `greppy -p` arguments (everything after the leading `-p` token).
@@ -569,6 +572,8 @@ fn run_agent(
         }
     };
     let shared_data_root = greppy_core::cache::data_root();
+    let deadline_total = args.deadline_secs.map(Duration::from_secs);
+    let deadline = deadline_total.map(|total| Instant::now() + total);
 
     // Stable and disposable agent worktrees have cache/run-id basenames that
     // are unrelated to the source repository. Pin one logical project name so
@@ -787,6 +792,8 @@ fn run_agent(
                 device: None,
                 no_gpu: false,
             },
+            deadline,
+            None,
         ) {
             Ok(prepared) => {
                 if !interactive {
@@ -803,9 +810,22 @@ fn run_agent(
                 Some(prepared)
             }
             Err(error) => {
-                let message = format!(
-                    "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
-                );
+                let deadline_reached = deadline.is_some_and(|limit| Instant::now() >= limit);
+                let (exit, message) = if deadline_reached {
+                    (
+                        EXIT_INCOMPLETE,
+                        format!(
+                            "greppy -p: deadline reached while waiting for shared Base ({error})"
+                        ),
+                    )
+                } else {
+                    (
+                        EXIT_AGENT,
+                        format!(
+                            "greppy -p: shared Base unavailable ({error}) — agent start aborted before the first model call"
+                        ),
+                    )
+                };
                 eprintln!("{message}");
                 if args.keep_worktree {
                     keep_worktree_on_error(&workspace);
@@ -817,7 +837,7 @@ fn run_agent(
                 return crate::agent_json::emit_error_result_opt(
                     json.as_mut(),
                     &json_session,
-                    EXIT_AGENT,
+                    exit,
                     &message,
                 );
             }
@@ -923,7 +943,9 @@ fn run_agent(
     if !interactive && !args.skip_selfcheck {
         match env.startup_self_check() {
             Ok(ok) => {
-                if ok.unrecognized_census_shape {
+                if ok.legitimate_empty_index {
+                    eprintln!("self-check ok — healthy empty index, worktree writable");
+                } else if ok.unrecognized_census_shape {
                     eprintln!(
                         "self-check ok — index answers (census shape unrecognized), worktree writable"
                     );
@@ -944,18 +966,6 @@ fn run_agent(
             }
         }
     }
-
-    // Wall-clock Instant is computed AFTER the self-check (and after
-    // prewarm/index) so setup does not eat the budget — only the model loop
-    // does. `deadline_total` mirrors the original N so the low-time advisory
-    // can fire at 20% remaining.
-    let (deadline, deadline_total) = match args.deadline_secs {
-        Some(secs) => {
-            let total = Duration::from_secs(secs);
-            (Some(Instant::now() + total), Some(total))
-        }
-        None => (None, None),
-    };
 
     let mut config = AgentConfig {
         max_turns: args.max_turns,
@@ -1224,7 +1234,9 @@ fn run_agent(
         }
     }
 
-    let mut exit = EXIT_OK;
+    let mut cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    let (mut exit, _) =
+        result_exit_and_status(cancelled, session.last_stop.as_ref(), EXIT_OK, "clean");
     let mut result_status = "clean";
     let mut proposal_ref = None;
     let mut commit_id = None;
@@ -1279,7 +1291,9 @@ fn run_agent(
                 }
             }
 
-            if args.apply && !run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref())
+            if args.apply
+                && exit == EXIT_OK
+                && !run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref())
             {
                 match workspace.apply_to(workspace.repo_root(), &commit) {
                     Ok(()) => {
@@ -1325,6 +1339,8 @@ fn run_agent(
         }
     }
 
+    cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    (exit, _) = result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
     if exit == EXIT_OK && !args.keep_worktree {
         let wt_path = workspace.worktree_path().to_path_buf();
         if let Err(e) = workspace.cleanup() {
@@ -1365,8 +1381,9 @@ fn run_agent(
 
     drop(stdout);
     drop(stderr);
-    let cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
-    let (exit, status) = result_exit_and_status(cancelled, exit, result_status);
+    cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    let (exit, status) =
+        result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
     if let Some(emitter) = json.as_mut() {
         emitter.session(&json_session);
         emitter.result(&crate::agent_json::JsonResult {
@@ -1489,13 +1506,23 @@ fn run_was_cancelled(stop: Option<&LoopStop>, cancel: Option<&Arc<AtomicBool>>) 
 
 fn result_exit_and_status(
     cancelled: bool,
+    stop: Option<&LoopStop>,
     exit: u8,
     ok_status: &'static str,
 ) -> (u8, &'static str) {
     if cancelled || exit == EXIT_CANCELLED {
         (EXIT_CANCELLED, "cancelled")
     } else if exit == EXIT_OK {
-        (exit, ok_status)
+        if matches!(
+            stop,
+            Some(LoopStop::MaxTurns | LoopStop::MaxTokens | LoopStop::Deadline | LoopStop::Stuck)
+        ) {
+            (EXIT_INCOMPLETE, "incomplete")
+        } else {
+            (exit, ok_status)
+        }
+    } else if exit == EXIT_INCOMPLETE {
+        (EXIT_INCOMPLETE, "incomplete")
     } else {
         (exit, "error")
     }
@@ -1507,6 +1534,10 @@ fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Session entry point carries separate borrowed runtime and persistence state"
+)]
 fn run_headless_session(
     client: &mut Client,
     env: &mut GreppyEnv,
@@ -2130,9 +2161,9 @@ fn run_interactive_session(
         thread::Builder::new()
             .name("greppy-agent-index-monitor".to_string())
             .spawn(move || {
-                let ready = if let Some(mut job) = start_semantic_index(&startup_worktree) {
+                let ready = if let Some(job) = start_semantic_index(&startup_worktree) {
                     match monitor_index_startup(
-                        &mut job,
+                        job,
                         &startup_worktree,
                         &monitor_bridge,
                         &monitor_cancel,
@@ -2794,7 +2825,7 @@ fn client_for_endpoint(endpoint: &str, model: &str, api_key: Option<&str>) -> Cl
 }
 
 fn monitor_index_startup(
-    launch: &mut crate::BackgroundJobLaunch,
+    mut launch: crate::BackgroundJobLaunch,
     worktree_path: &Path,
     bridge: &crate::agent_tui::EventBridge,
     cancel: &AtomicBool,
@@ -2802,11 +2833,11 @@ fn monitor_index_startup(
     let mut missing_ticks = 0usize;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let owned = matches!(launch, crate::BackgroundJobLaunch::Owned { .. });
+            let owned = matches!(&launch, crate::BackgroundJobLaunch::Owned { .. });
             cancel_background_job(launch);
             bridge.send_discrete(SessionEvent::Warning(
                 if owned {
-                    "Indexing cancelled."
+                    "Index monitoring cancelled; automatic indexing stops when no other waiter remains."
                 } else {
                     "Startup monitoring stopped; the shared index job continues."
                 }
@@ -2827,7 +2858,7 @@ fn monitor_index_startup(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown error");
                 bridge.send_discrete(SessionEvent::Warning(format!("Indexing failed: {detail}")));
-                reap_owned_background_job(launch);
+                reap_owned_background_job(&mut launch);
                 return Ok(false);
             }
             let completed = job
@@ -2888,10 +2919,10 @@ fn monitor_index_startup(
                 eta_seconds,
             });
         } else if doctor_reports_embedding_complete(worktree_path) {
-            reap_owned_background_job(launch);
+            reap_owned_background_job(&mut launch);
             return Ok(true);
         } else {
-            if !owned_background_job_is_running(launch) {
+            if !owned_background_job_is_running(&mut launch) {
                 missing_ticks = missing_ticks.saturating_add(1);
             }
             if missing_ticks >= 20 {
@@ -2900,7 +2931,7 @@ fn monitor_index_startup(
                         "The index job ended before embeddings were complete.".into(),
                     ));
                 }
-                reap_owned_background_job(launch);
+                reap_owned_background_job(&mut launch);
                 return Ok(false);
             }
         }
@@ -2908,11 +2939,25 @@ fn monitor_index_startup(
     }
 }
 
-fn cancel_background_job(launch: &mut crate::BackgroundJobLaunch) {
-    if let crate::BackgroundJobLaunch::Owned { child, path } = launch {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(path);
+fn cancel_background_job(launch: crate::BackgroundJobLaunch) {
+    if let crate::BackgroundJobLaunch::Owned {
+        mut child,
+        path,
+        demand,
+    } = launch
+    {
+        if demand.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        drop(demand);
+        let _ = std::thread::Builder::new()
+            .name("greppy-agent-index-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
 }
 
@@ -3279,18 +3324,49 @@ mod tests {
     #[test]
     fn cancelled_loop_maps_to_exit_130() {
         assert_eq!(
-            result_exit_and_status(true, EXIT_OK, "clean"),
+            result_exit_and_status(true, None, EXIT_OK, "clean"),
             (EXIT_CANCELLED, "cancelled")
         );
         assert_eq!(
-            result_exit_and_status(false, EXIT_CANCELLED, "clean"),
+            result_exit_and_status(false, None, EXIT_CANCELLED, "clean"),
             (EXIT_CANCELLED, "cancelled")
         );
         assert_eq!(
-            result_exit_and_status(false, EXIT_OK, "proposal"),
+            result_exit_and_status(false, Some(&LoopStop::EndTurn), EXIT_OK, "proposal"),
             (EXIT_OK, "proposal")
         );
-        let flag = Arc::new(AtomicBool::new(true));
+        for stop in [
+            LoopStop::MaxTurns,
+            LoopStop::MaxTokens,
+            LoopStop::Deadline,
+            LoopStop::Stuck,
+        ] {
+            assert_eq!(
+                result_exit_and_status(false, Some(&stop), EXIT_OK, "proposal"),
+                (EXIT_INCOMPLETE, "incomplete"),
+                "{stop:?}"
+            );
+        }
+        assert_eq!(
+            result_exit_and_status(false, Some(&LoopStop::MaxTurns), EXIT_AGENT, "proposal"),
+            (EXIT_AGENT, "error")
+        );
+        assert_eq!(
+            result_exit_and_status(
+                false,
+                Some(&LoopStop::MaxTurns),
+                EXIT_INCOMPLETE,
+                "proposal"
+            ),
+            (EXIT_INCOMPLETE, "incomplete")
+        );
+        assert_eq!(
+            result_exit_and_status(true, Some(&LoopStop::MaxTurns), EXIT_INCOMPLETE, "proposal"),
+            (EXIT_CANCELLED, "cancelled")
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!run_was_cancelled(Some(&LoopStop::EndTurn), Some(&flag)));
+        flag.store(true, Ordering::SeqCst);
         assert!(run_was_cancelled(Some(&LoopStop::EndTurn), Some(&flag)));
         assert!(run_was_cancelled(Some(&LoopStop::Cancelled), None));
         assert!(!run_was_cancelled(Some(&LoopStop::EndTurn), None));
@@ -3806,9 +3882,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("foreign-index-job.json");
         fs::write(&path, "{}\n").expect("write job marker");
-        let mut launch = crate::BackgroundJobLaunch::Attached { path: path.clone() };
+        let launch = crate::BackgroundJobLaunch::Attached {
+            path: path.clone(),
+            root: dir.path().to_path_buf(),
+            _demand: None,
+        };
 
-        cancel_background_job(&mut launch);
+        cancel_background_job(launch);
 
         assert!(path.exists(), "attached job belongs to another process");
     }
@@ -3822,18 +3902,15 @@ mod tests {
             .args(["-c", "sleep 30"])
             .spawn()
             .expect("spawn child");
-        let mut launch = crate::BackgroundJobLaunch::Owned {
+        let launch = crate::BackgroundJobLaunch::Owned {
             child,
             path: path.clone(),
+            demand: None,
         };
 
-        cancel_background_job(&mut launch);
+        cancel_background_job(launch);
 
         assert!(!path.exists());
-        let crate::BackgroundJobLaunch::Owned { child, .. } = &mut launch else {
-            panic!("expected owned launch");
-        };
-        assert!(child.try_wait().expect("query child").is_some());
     }
 
     #[test]

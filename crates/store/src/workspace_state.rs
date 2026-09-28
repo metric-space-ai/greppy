@@ -70,6 +70,20 @@ impl Store {
         Ok(row)
     }
 
+    /// List workspace compatibility metadata owned by this writable layer.
+    /// An attached Base must not mask missing or old Delta metadata.
+    pub fn list_private_workspace_states(&self) -> Result<Vec<WorkspaceState>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT root_path, git_dir, git_common_dir, head_oid, index_signature,
+                    schema_version, indexer_version, graph_generation, updated_at
+             FROM main.workspace_state ORDER BY root_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok(row_to_workspace_state(row)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// List every indexed workspace state, ordered by root path.
     pub fn list_workspace_states(&self) -> Result<Vec<WorkspaceState>> {
         let mut stmt = self.conn().prepare(

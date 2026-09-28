@@ -145,11 +145,7 @@ pub(crate) fn inference_registry_status() -> Result<greppy_embed_native::Inferen
     ))
 }
 
-pub(crate) fn inference_model_status() -> serde_json::Value {
-    let embedding_args = EmbeddingCliArgs {
-        device: None,
-        no_gpu: false,
-    };
+pub(crate) fn inference_model_status(embedding_args: EmbeddingCliArgs<'_>) -> serde_json::Value {
     let embedding = match embedding_config_optional(embedding_args) {
         Ok(Some(cfg)) => {
             let EmbeddingModelSource::Gguf { gguf, tokenizer } = cfg.source;
@@ -200,14 +196,10 @@ pub(crate) fn inference_model_status() -> serde_json::Value {
     serde_json::json!({"embedding": embedding, "summary": summary})
 }
 
-pub(crate) fn inference_daemon_status() -> serde_json::Value {
+pub(crate) fn inference_daemon_status(embedding_args: EmbeddingCliArgs<'_>) -> serde_json::Value {
     #[cfg(any(unix, windows))]
     {
-        let embedding_args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        let embedding = match embedding_config_optional(embedding_args) {
+        let embedding = match embedding_config_for_daemon_probe(embedding_args) {
             Ok(Some(cfg)) => {
                 let key = embedding_query_cache_key(&cfg);
                 embed_daemon::status(&cfg, &key)
@@ -264,6 +256,23 @@ pub(crate) fn embedding_config_optional(
     embedding_config_required(args).map(Some)
 }
 
+/// Resolve the daemon identity without materializing embedded assets.
+pub(crate) fn embedding_config_for_daemon_probe(
+    args: EmbeddingCliArgs<'_>,
+) -> Result<Option<EmbeddingModelConfig>> {
+    let device = embedding_device_preference(args.device, args.no_gpu)?;
+    let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
+    Ok(Some(EmbeddingModelConfig {
+        model_id: embedded_embedding_model_id(),
+        source: EmbeddingModelSource::Gguf {
+            gguf: gguf.into(),
+            tokenizer: tokenizer.into(),
+        },
+        max_length: None,
+        device,
+    }))
+}
+
 pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>> {
     if test_inference_skipped() {
         return Ok(None);
@@ -282,13 +291,15 @@ pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>
 pub(crate) fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
     let cli = cli_inference_override();
     if cli.no_gpu || env_bool(ENV_NO_GPU)? {
-        return Ok(greppy_qwen35_native::DevicePreference::Cpu);
+        return enforce_product_gpu(greppy_qwen35_native::DevicePreference::Cpu);
     }
     let raw = cli
         .device
         .or_else(|| env_nonempty(ENV_DEVICE))
         .unwrap_or_else(|| "auto".to_string());
-    greppy_qwen35_native::DevicePreference::parse(&raw).map_err(|e| Error::Invalid(e.to_string()))
+    let preference = greppy_qwen35_native::DevicePreference::parse(&raw)
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    enforce_product_gpu(preference)
 }
 
 pub(crate) fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
@@ -333,7 +344,7 @@ pub(crate) fn embedding_config_required(
         None => {
             return Err(Error::Config(
                 "embedded EmbeddingGemma assets are unavailable".into(),
-            ))
+            ));
         }
     };
     let source_digest = embedding_source_content_digest(&source)?;
@@ -387,7 +398,7 @@ pub(crate) fn embedding_device_preference(
     cli_no_gpu: bool,
 ) -> Result<greppy_embed_native::DevicePreference> {
     if cli_no_gpu || env_bool(ENV_NO_GPU)? {
-        return Ok(greppy_embed_native::DevicePreference::Cpu);
+        return enforce_product_gpu(greppy_embed_native::DevicePreference::Cpu);
     }
     let raw = cli_device
         .map(str::trim)
@@ -395,8 +406,27 @@ pub(crate) fn embedding_device_preference(
         .map(ToOwned::to_owned)
         .or_else(|| env_nonempty(ENV_DEVICE))
         .unwrap_or_else(|| "auto".to_string());
-    raw.parse::<greppy_embed_native::DevicePreference>()
-        .map_err(|e| Error::Invalid(e.to_string()))
+    let preference = raw
+        .parse::<greppy_embed_native::DevicePreference>()
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    enforce_product_gpu(preference)
+}
+
+fn enforce_product_gpu(
+    preference: greppy_embed_native::DevicePreference,
+) -> Result<greppy_embed_native::DevicePreference> {
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    ))]
+    if preference == greppy_embed_native::DevicePreference::Cpu {
+        return Err(Error::Invalid(
+            "CPU inference is disabled in product builds; use the platform GPU by removing \
+             --device cpu or --no-gpu and unsetting GREPPY_DEVICE=cpu or GREPPY_NO_GPU"
+                .into(),
+        ));
+    }
+    Ok(preference)
 }
 
 /// Cache key for query embeddings: logical model id + prompt/task contract +

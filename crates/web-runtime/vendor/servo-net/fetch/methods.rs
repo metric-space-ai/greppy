@@ -12,6 +12,7 @@ use content_security_policy as csp;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::resources::{self, Resource};
+use embedder_traits::{WebResourceLoadId, WebResourceResponseCompleted};
 use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
 use http::header::{self, HeaderMap, HeaderName, RANGE};
 use http::{HeaderValue, Method, StatusCode};
@@ -29,7 +30,7 @@ use net_traits::request::{
     Request, RequestBody, RequestId, RequestMode, ResponseTainting, is_cors_safelisted_method,
     is_cors_safelisted_request_header,
 };
-use net_traits::response::{Response, ResponseBody, ResponseType, TerminationReason};
+use net_traits::response::{CacheState, Response, ResponseBody, ResponseType, TerminationReason};
 use net_traits::{
     FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
     ResourceFetchTimingContainer, ResourceTimeValue, ResourceTimingType, WebSocketDomAction,
@@ -57,6 +58,7 @@ use crate::filemanager_thread::FileManager;
 use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
 use crate::request_interceptor::RequestInterceptor;
+use crate::embedder::NetToEmbedderMsg;
 use crate::subresource_integrity::is_response_integrity_valid;
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
@@ -874,6 +876,61 @@ pub async fn main_fetch(
 
     // Step 24.
     target.process_response_eof(request, &response);
+    let should_emit_terminal_completion = response.is_network_error() ||
+        !matches!(current_scheme, "http" | "https") ||
+        matches!(
+            response.actual_response().cache_state,
+            CacheState::Local | CacheState::Validated
+        );
+    if should_emit_terminal_completion {
+    let (status_code, status_message, headers, body_bytes, from_cache, failure) =
+        if let Some(error) = response.get_network_error() {
+            (
+                None,
+                Vec::new(),
+                HeaderMap::new(),
+                0,
+                false,
+                Some(format!("{error:?}")),
+            )
+        } else {
+            let actual = response.actual_response();
+            let body_bytes = match &*actual.body.lock() {
+                ResponseBody::Done(body) => body.len() as u64,
+                ResponseBody::Empty => 0,
+                ResponseBody::Receiving(body) => body.len() as u64,
+            };
+            (
+                actual.status.try_code().map(|status| status.as_u16()),
+                actual.status.message().to_vec(),
+                actual.headers.clone(),
+                body_bytes,
+                matches!(actual.cache_state, CacheState::Local | CacheState::Validated),
+                None,
+            )
+        };
+    context
+        .request_interceptor
+        .lock()
+        .await
+        .embedder_proxy()
+        .send(NetToEmbedderMsg::WebResourceResponseCompleted(
+            request.target_webview_id,
+            WebResourceResponseCompleted {
+                id: WebResourceLoadId {
+                    fetch_id: request.id.0.to_string(),
+                    redirect_count: request.redirect_count,
+                },
+                url: request.current_url().into_url(),
+                headers,
+                status_code,
+                status_message,
+                body_bytes,
+                from_cache,
+                failure,
+            },
+        ));
+    }
     // Send Response to Devtools
     // This is done after process_response_eof to ensure that the body is fully
     // processed before sending the response to Devtools.

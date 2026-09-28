@@ -152,6 +152,16 @@ INDEX:
                                     automatically on first use). --agent-worktree indexes the
                                     agent worktree belonging to PATH instead
 
+Indexing and embedding preparation are one-time work for the current source
+state, not evidence that Greppy is unavailable. If Greppy reports preparation in
+progress, keep the task pending and use its estimated remaining time for one
+bounded sleep before retrying the original command. Reuse the existing job; do
+not start duplicate indexing. Once preparation completes, resume the full Greppy
+functionality and choose the best command for the task—do not retain a temporary
+fallback to basic text tools. If preparation fails or exceeds its estimate,
+inspect and report the concrete issue instead of silently abandoning the
+function.
+
 AGENT:
   -p "TASK" [--model M]   a built-in coding agent carries out TASK on this
                           repository and delivers the outcome as one commit on
