@@ -361,6 +361,27 @@ fn the_header_leads_with_the_product() {
     );
 }
 
+#[test]
+fn preparation_wait_preserves_the_original_task_and_full_tool_use() {
+    let text = prompt().split_whitespace().collect::<Vec<_>>().join(" ");
+    for requirement in [
+        "one-time work for the current source state",
+        "If Greppy reports preparation in progress",
+        "keep the task pending",
+        "use its estimated remaining time for one bounded sleep",
+        "before retrying the original command",
+        "Reuse the existing job; do not start duplicate indexing",
+        "Once preparation completes, resume the full Greppy functionality",
+        "do not retain a temporary fallback to basic text tools",
+        "If preparation fails or exceeds its estimate, inspect and report the concrete issue",
+    ] {
+        assert!(
+            text.contains(requirement),
+            "missing preparation policy: {requirement}"
+        );
+    }
+}
+
 /// The eleven assertions above hold CONCEPTS: they catch a return to a retired
 /// idea, not an edit that stays inside the ideas. That is how a CHAIN example
 /// was silently changed while every guard stayed green. This one holds the
@@ -409,8 +430,10 @@ fn the_prompt_is_frozen_byte_for_byte() {
     // the built-in agent includes the byte-identical canonical asset.
     // 04.09.2026: owner-approved release plan corrects unsupported nested
     // browser commands and action-result guidance to match the shipped CLI.
+    // 28.09.2026: owner approved bounded preparation waits, reuse of the
+    // existing job, and resumption of full Greppy functionality afterward.
     const APPROVED_SHA256: &str =
-        "bfa1d5486861c176b3f9da64ffa788b4721880d130f1c830808da3234e7e21a3";
+        "a3b4e024e7169e40b2ea27cf5c9d851ee1d6f10fd2d40d3cefa976cb7123ccf8";
 
     let text = prompt();
     let digest = {
