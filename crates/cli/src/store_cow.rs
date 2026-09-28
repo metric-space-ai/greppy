@@ -2812,7 +2812,7 @@ mod tests {
                     source_qname: "src/stable.rs::Function::stable_caller".into(),
                     target_qname: "src/alias_chain/sub.rs::Function::target".into(),
                     edge_type: "CALLS".into(),
-                    properties: serde_json::json!({"ref_name": "target"}),
+                    properties: serde_json::json!({"callee_name": "target"}),
                 },
                 greppy_store::NewRawEdge {
                     project: "p".into(),
@@ -2820,7 +2820,7 @@ mod tests {
                     source_qname: "src/base.rs::Function::base_caller".into(),
                     target_qname: "src/alias_chain/sub.rs::Function::target".into(),
                     edge_type: "CALLS".into(),
-                    properties: serde_json::json!({"ref_name": "target"}),
+                    properties: serde_json::json!({"callee_name": "target"}),
                 },
             ])
             .unwrap();
