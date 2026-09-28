@@ -7,7 +7,13 @@ must implement reflinks, snapshots, or block cloning.
 
 ## Setup and health
 
-Install the platform package, then run:
+Filesystem acceleration is optional. Without an installed or activated
+provider, `greppy -p` and the TUI use ordinary isolated directories. They keep
+the same captured dirty baseline, proposal publication and apply safeguards;
+copying the files can make preparation slower. No FSKit activation is required
+for this workflow.
+
+To enable acceleration, install the platform package, then run:
 
 ```text
 greppy workspace setup
@@ -18,9 +24,11 @@ greppy workspace status --json
 `setup` installs or activates the packaged adapter. `doctor` verifies the live
 control manifest against the marker read through the mount, checks recovery and
 CAS integrity, and performs mounted create/read/partial-write/rename/delete
-operations. `greppy -p` repeats the mechanical health preflight and makes no
-model request if the provider is unavailable, stale, recovering, or has a
-different identity.
+operations. These commands diagnose the optional provider. The agent selects
+ordinary directories when acceleration is absent or inactive; it verifies
+provider identity and live I/O before using an active mounted workspace.
+Identity corruption is an error, and an active run never silently switches
+its existing workspace to a different backend.
 
 Setup also records the provider for the next login using the platform's
 per-user lifecycle mechanism. Linux installs and enables a restartable systemd
@@ -32,7 +40,7 @@ followed. The Windows MSI installs an uninstall-safe machine Run entry that
 replays setup at login; Greppy validates that it points to the current package
 before starting the adjacent private provider and driver.
 
-There is one persistent user mount with workspaces below `workspaces/<id>`.
+When acceleration is active, there is one persistent user mount with workspaces below `workspaces/<id>`.
 Creating an agent workspace updates namespace metadata; it does not create a
 second mount or traverse and copy the repository.
 

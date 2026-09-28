@@ -144,6 +144,7 @@ fn greppy_agent_help_documents_commands() {
     assert!(stdout.contains("/model"), "{stdout}");
     assert!(stdout.contains("--continue"), "{stdout}");
     assert!(stdout.contains("Ctrl+C"), "{stdout}");
+    assert!(stdout.contains("FSKit activation is optional"), "{stdout}");
 }
 
 #[test]
@@ -191,11 +192,22 @@ mod pty {
         master: File,
         child: Child,
         terminal_query_tail: Vec<u8>,
-        _provider: FakeProvider,
+        _provider: Option<FakeProvider>,
+        workspace_root: PathBuf,
     }
 
     impl Pty {
         fn spawn(repo: &std::path::Path, endpoint: &str, extra: &[&str], plain: bool) -> Self {
+            Self::spawn_with_provider(repo, endpoint, extra, plain, true)
+        }
+
+        fn spawn_with_provider(
+            repo: &std::path::Path,
+            endpoint: &str,
+            extra: &[&str],
+            plain: bool,
+            use_provider: bool,
+        ) -> Self {
             unsafe {
                 let mut master = 0;
                 let mut slave = 0;
@@ -221,12 +233,16 @@ mod pty {
                 libc::close(slave);
                 let store = super::unique_temp("pty-store");
                 let provider_root = super::unique_temp("pty-provider");
-                let provider = spawn_fake_provider(&provider_root, repo);
+                let provider = use_provider.then(|| spawn_fake_provider(&provider_root, repo));
+                let workspace_root = provider
+                    .as_ref()
+                    .map(|provider| provider.data.clone())
+                    .unwrap_or_else(|| provider_root.join("ordinary"));
                 let mut cmd = Command::new(super::binary_path());
                 cmd.current_dir(repo)
                     .env("GREPPY_STORE_DIR", &store)
                     .env("GREPPY_CONFIG_DIR", store.join("config"))
-                    .env("GREPPY_WORKSPACE_DIR", &provider.data)
+                    .env("GREPPY_WORKSPACE_DIR", &workspace_root)
                     .env("GREPPY_TEST_SKIP_INFERENCE", "1")
                     .env("GREPPY_ASCII", "1")
                     .env("TERM", "xterm")
@@ -260,6 +276,7 @@ mod pty {
                     child,
                     terminal_query_tail: Vec::new(),
                     _provider: provider,
+                    workspace_root,
                 }
             }
         }
@@ -403,7 +420,61 @@ mod pty {
     impl Drop for Pty {
         fn drop(&mut self) {
             let _ = self.child.kill();
+            let _ = self.child.wait();
+            if self._provider.is_none() {
+                let _ = std::fs::remove_dir_all(&self.workspace_root);
+            }
         }
+    }
+
+    #[test]
+    fn pty_without_provider_completes_turn_and_preserves_dirty_checkout() {
+        let _serial = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = super::unique_temp("pty-no-provider");
+        super::init_repo(&repo);
+        std::fs::write(repo.join("hello.txt"), b"staged\n").unwrap();
+        super::git(&repo, &["add", "hello.txt"]);
+        std::fs::write(repo.join("hello.txt"), b"local\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), b"keep\n").unwrap();
+        let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+        let (endpoint, stop, handle) = super::spawn_stub_gateway(0);
+        let mut pty = Pty::spawn_with_provider(&repo, &endpoint, &[], false, false);
+        let mut bytes = pty.read_until(b"prompt", Duration::from_secs(60));
+        let ready = bytes.windows(6).any(|window| window == b"prompt");
+        if ready {
+            pty.write_all(b"say hello\r");
+            bytes.extend_from_slice(&pty.read_until(b"hi from stub", Duration::from_secs(20)));
+            pty.write_all(b"/exit\r");
+        }
+        let (status, tail) = pty.wait(Duration::from_secs(20));
+        bytes.extend_from_slice(&tail);
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(ready, "agent never reached its prompt: {text:?}");
+        assert!(
+            text.contains("hi from stub"),
+            "turn did not complete: {text:?}"
+        );
+        assert!(status.success(), "status={status:?} output={text:?}");
+        assert!(
+            text.contains("\x1b[?1049l"),
+            "terminal not restored: {text:?}"
+        );
+        assert!(!pty.workspace_root.join("provider.json").exists());
+        assert_eq!(std::fs::read(repo.join("hello.txt")).unwrap(), b"local\n");
+        assert_eq!(
+            std::fs::read(repo.join("untracked.txt")).unwrap(),
+            b"keep\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.join(".git/index")).unwrap(),
+            index_before
+        );
+        drop(pty);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

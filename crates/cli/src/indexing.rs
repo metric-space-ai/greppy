@@ -860,10 +860,10 @@ pub(crate) fn dispatch_index_health(
 /// Run the indexer against `path` (default: current directory).
 /// Warm the worktree `greppy -p` will use, instead of this checkout.
 ///
-/// The built-in agent works in a portable provider namespace. This command
-/// exercises and warms that exact filesystem path without registering a native
-/// Git worktree; the shared immutable index Base remains reusable by later
-/// agent runs while this temporary namespace is removed afterwards.
+/// The built-in agent uses an isolated workspace, accelerated by a healthy
+/// provider when available. This command warms that same backend without
+/// registering a native Git worktree; the shared immutable index Base remains
+/// reusable by later runs while this temporary workspace is removed afterwards.
 pub(crate) fn dispatch_index_agent_worktree(
     path: Option<&str>,
     root: Option<&str>,

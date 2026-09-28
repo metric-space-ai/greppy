@@ -46,9 +46,10 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const TOOL_LINE_MAX: usize = 120;
 
 const LONG_HELP: &str = "\
-Coding agent with interactive and one-shot modes. Uses the installed portable
-Chunk-CoW provider and fails before the first model request when its adapter
-or persistent mount is not healthy. The immutable baseline includes the pinned
+Coding agent with interactive and one-shot modes. Uses an isolated workspace;
+a healthy portable Chunk-CoW provider accelerates it when available. Without
+an activated provider, ordinary private directories provide the same agent
+workflow. FSKit activation is optional. The immutable baseline includes the pinned
 commit plus visible staged, unstaged and untracked state;
 ignored files are excluded. It delivers a baseline-bound proposal ref
 (refs/greppy/agent/<run_id>); inspect it with `git show` or apply it with
@@ -93,7 +94,7 @@ Flags:
   --apply             Apply only the Agent delta to the exact captured baseline;
                       the existing Git index remains byte-identical
   --diff              Print the full proposal patch after the stat
-  --keep-worktree     Preserve the portable namespace and private delta
+  --keep-worktree     Preserve the isolated workspace and private delta
   --no-sandbox        Disable write-confinement (env GREPPY_NO_SANDBOX=1)
   --skip-selfcheck    Skip the startup capability self-check (env GREPPY_SKIP_SELFCHECK=1)
   --json              Stream newline-delimited JSON events on stdout (`greppy -p` only)
@@ -655,9 +656,8 @@ fn run_agent(
             );
         }
         Err(WorkspaceError::AdapterUnavailable(reason)) => {
-            let message = format!("greppy -p: portable CoW adapter is unavailable: {reason}");
+            let message = format!("greppy -p: cannot prepare an isolated workspace: {reason}");
             eprintln!("{message}");
-            eprintln!("run `greppy workspace setup`, then `greppy workspace doctor --json`");
             return crate::agent_json::emit_error_result_opt(
                 json.as_mut(),
                 &json_session,

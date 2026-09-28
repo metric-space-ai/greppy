@@ -242,9 +242,10 @@ display folds long output and previews oversized individual lines with an
 explicit raw-log recovery path. Short output may also appear after the verdict
 and diagnostics. See the [display contract](contracts/bash-smart-display-v1.md).
 
-The integrated agent allocates its portable Chunk-CoW workspace before the
-first model request. After installing the platform package, activate and verify
-the persistent per-user adapter once:
+The integrated agent creates an isolated workspace before the first model
+request. FSKit is optional acceleration on macOS: without activation, the
+agent uses ordinary private directories with the same proposal workflow.
+To enable the packaged filesystem acceleration, activate and verify it once:
 
 ```bash
 greppy workspace setup
@@ -257,22 +258,15 @@ prompts and shows streaming replies, tool activity, and token usage. `/exit` or
 Ctrl+C finishes the current turn and publishes the session's reviewable
 proposal. `greppy -p "TASK"` remains the headless one-shot mode for scripts.
 
-The agent defaults to `--workspace-backend auto`: use an exact native
-Filesystem-CoW snapshot only when capability probing guarantees no full-tree
-metadata traversal, otherwise retain the 0.3.2 Git-worktree behavior. Use
-`native` to force the 0.3.2 backend or `cow` to require exact CoW, including a
-per-file reflink tree, and receive an explicit error when it is unavailable:
+Both interactive and headless modes select the workspace backend automatically:
 
 ```bash
 greppy agent --model MODEL
 greppy agent "TASK" --model MODEL
-greppy -p "TASK" --model MODEL --workspace-backend auto
-greppy -p "TASK" --model MODEL --workspace-backend native
-greppy -p "TASK" --model MODEL --workspace-backend cow
+greppy -p "TASK" --model MODEL
 ```
 
-There is no filesystem/backend selector and no hidden native fallback. An
-unavailable or unhealthy adapter stops before model inference. Each workspace
+An absent or inactive filesystem provider does not prevent agent work. Each workspace
 has private Git control state: it reads the pinned base commit's objects
 read-only, while its index, refs, new objects, and agent-created commits remain
 private. Only the final verified proposal is imported into
@@ -599,18 +593,22 @@ summaries, and embeddings. They have the same confidentiality requirements as
 the repository itself. Agent sandboxes can read a published Base but cannot
 write it; writable Delta state remains isolated per run.
 
-The 0.4.0 portable agent workspace is a separate layer from the Base/Delta
-index store. `greppy -p` has one workspace contract and no backend
-selector or native fallback: it starts only after the bundled portable adapter
-is mounted and healthy. Run `greppy workspace setup` after installation, then
-use `greppy workspace doctor --json` to verify provider identity, recovery, CAS
-integrity, and mounted read/write/rename/delete behavior. On macOS, replacing or
-updating the app can make macOS require approval of `Greppy Workspace FS` again.
-Setup detects that state before attempting a mount and opens the File System
-Extensions pane; enable that named switch and rerun setup. A failed doctor
-prevents the first model call.
+The agent workspace is a separate layer from the Base/Delta index store.
+`greppy -p` and the TUI use the same isolated workspace contract. A healthy
+mounted provider accelerates workspace creation and writes; an absent or
+inactive provider uses ordinary private directories. The captured dirty
+baseline, proposal refs, apply safeguards and original Git-index preservation
+apply to both backends. Ordinary directories require copying the captured
+files, so preparation can take longer.
 
-Workspace data uses fixed 1 MiB BLAKE3-addressed chunks in append-only segments
+`greppy workspace setup` enables the optional provider. Its `doctor --json`
+checks provider identity, recovery, CAS integrity and mounted I/O; it is a
+provider diagnostic, not a prerequisite for ordinary agent work. macOS can
+require approval of `Greppy Workspace FS` again after an app update. Enable
+that switch and rerun setup when you want the acceleration. Greppy does not
+change macOS extension settings automatically.
+
+The accelerated workspace uses fixed 1 MiB BLAKE3-addressed chunks in append-only segments
 and SQLite-WAL manifests. Each workspace overlays an immutable Git-commit base
 and an immutable dirty snapshot with a private namespace of changed chunks,
 tombstones, redirects, links, metadata, and private Git state. A one-byte write

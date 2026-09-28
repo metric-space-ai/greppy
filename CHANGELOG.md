@@ -16,8 +16,12 @@ and its subsequent repairs. Version metadata is preparation, not release accepta
   retain the task, reuse the running index job, use a reported estimate for one
   bounded wait, and resume full Greppy functionality afterward. This prompt
   change does not itself implement a runtime ETA.
+- FSKit is optional acceleration. The ordinary workspace backend must provide
+  the same agent/TUI proposal and apply behavior without extension activation;
+  its implementation and acceptance are in progress.
 - Release acceptance remains open for persisted-index/caller repair, native web
-  regressions, FSKit upgrade/mount, and real agent/TUI/benchmark workflows.
+  regressions and real agent/TUI/benchmark workflows. Optional FSKit has separate
+  provider regression and performance checks; activation is not a core prerequisite.
   Production inference must use Metal on macOS and CUDA on Linux.
 
 ## [0.4.0] — Unreleased development history (superseded by 0.4.1)
