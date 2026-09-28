@@ -4263,7 +4263,7 @@ fn run_git_nul_stream(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("Git inventory stdout is unavailable"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("Git inventory stderr is unavailable"))?;
