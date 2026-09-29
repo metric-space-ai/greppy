@@ -1132,12 +1132,44 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
         eprintln!("skipping artifact recovery CLI proof: optional web-runtime binary is not built");
         return;
     };
+    struct Cleanup<'a> {
+        workspace: std::path::PathBuf,
+        runtime: &'a std::path::Path,
+        run_id: String,
+        session: Option<String>,
+        server: Option<std::thread::JoinHandle<()>>,
+        address: std::net::SocketAddr,
+    }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(session) = &self.session {
+                let _ = run_scoped(
+                    &self.workspace,
+                    self.runtime,
+                    &self.run_id,
+                    &["web", "session", "close", session, "--json"],
+                );
+            }
+            let _ = run_scoped(
+                &self.workspace,
+                self.runtime,
+                &self.run_id,
+                &["web", "runtime", "stop", "--json"],
+            );
+            let _ = std::net::TcpStream::connect(self.address);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
     let server_reads = Arc::clone(&reads);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
             let Ok(mut stream) = stream else { continue };
             let mut request = [0_u8; 2048];
             let length = stream.read(&mut request).unwrap_or(0);
@@ -1149,7 +1181,7 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
                     "artifact body ".repeat(10_000)
                 )
             } else {
-                "<html><body>session bootstrap</body></html>".to_owned()
+                break;
             };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1163,21 +1195,34 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
     let workspace = std::env::temp_dir().join(&run_id);
     let _ = std::fs::remove_dir_all(&workspace);
     std::fs::create_dir_all(&workspace).unwrap();
-    let bootstrap = format!("http://{address}/bootstrap");
+    let mut cleanup = Cleanup {
+        workspace: workspace.clone(),
+        runtime: &runtime,
+        run_id: run_id.clone(),
+        session: None,
+        server: Some(server),
+        address,
+    };
     let large = format!("http://{address}/large");
-    let (code, _, stderr) = run_scoped(
+    let (code, stdout, stderr) = run_scoped(
         &workspace,
         &runtime,
         &run_id,
-        &["web", "open", &bootstrap, "--json"],
+        &["web", "session", "create", "--profile", "project", "--json"],
     );
-    assert_eq!(code, 0, "bootstrap failed: {stderr}");
+    assert_eq!(code, 0, "session create failed: {stdout} {stderr}");
+    let session_receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let session = session_receipt["result"]["session_id"]
+        .as_str()
+        .expect("created project session")
+        .to_owned();
+    cleanup.session = Some(session.clone());
 
     let (code, output, stderr) = run_scoped(
         &workspace,
         &runtime,
         &run_id,
-        &["web", "read", "--url", &large],
+        &["web", "read", "--url", &large, "--session", &session],
     );
     assert_eq!(code, 0, "read failed: {stderr}");
     let digest = output
@@ -1185,11 +1230,15 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
         .and_then(|(_, tail)| tail.split_once('\''))
         .map(|(value, _)| value)
         .expect("exact artifact export guidance");
-    let session = output
+    let guided_session = output
         .split_once(" --session '")
         .and_then(|(_, tail)| tail.split_once('\''))
         .map(|(value, _)| value)
         .expect("guidance session");
+    assert_eq!(
+        guided_session, &session,
+        "guidance must retain the owning session"
+    );
     assert!(
         output.contains("saved locally; no repeat request"),
         "{output}"
@@ -1206,16 +1255,10 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
             "export",
             digest,
             "--session",
-            session,
+            guided_session,
             "--to",
             exported.to_str().unwrap(),
         ],
-    );
-    let _ = run_scoped(
-        &workspace,
-        &runtime,
-        &run_id,
-        &["web", "runtime", "stop", "--json"],
     );
     assert_eq!(code, 0, "export failed stdout={stdout} stderr={stderr}");
     let bytes = std::fs::read(&exported).unwrap();
@@ -1225,5 +1268,4 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
         1,
         "export repeated the HTTP read"
     );
-    let _ = std::fs::remove_dir_all(&workspace);
 }
