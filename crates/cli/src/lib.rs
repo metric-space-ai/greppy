@@ -2099,11 +2099,11 @@ fn agent_workspace_status(
 #[cfg(test)]
 mod optional_workspace_status_tests {
     use super::*;
-    use std::fs;
     use greppy_workspace_core::{
         AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
         PROVIDER_PROTOCOL_VERSION,
     };
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -4633,6 +4633,20 @@ fn background_job_spawn_active(root: &std::path::Path) -> bool {
 }
 
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, false)
+}
+
+// Only a launcher holding the spawn lease or an explicit index holding the
+// workspace writer lease may replace another job's identity.
+fn start_background_job_record(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, true)
+}
+
+fn write_background_job_record(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    new_owner: bool,
+) -> Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -4640,6 +4654,40 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
         .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| Error::io(format!("create {}", parent.display()), error))?;
+    // The index thread, its cancellation monitor and a delegated Base child
+    // can publish concurrently. Atomic rename alone permits late progress to
+    // overwrite the terminal cancellation record. Serialize the read/replace
+    // across processes and retain cancellation for this exact job identity.
+    let _publication = greppy_core::cache::acquire_named_lock_in(
+        parent,
+        "background-job-publication",
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .map_err(|error| Error::io("lock background job publication", error))?
+    .ok_or_else(|| Error::Invalid("background job publication lock unavailable".into()))?;
+    if !new_owner {
+        if let Some(current) = read_background_job(path) {
+            let same_epoch = ["target_generation", "started_at_unix_secs"]
+                .iter()
+                .all(|key| {
+                    current
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some()
+                        && current.get(key) == value.get(key)
+                });
+            // Only the launcher may install the PID into a pid=null record;
+            // otherwise an old writer can hijack an immediate same-second retry.
+            let same_owner = current.get("pid") == value.get("pid");
+            if !same_epoch
+                || !same_owner
+                || current.get("state").and_then(serde_json::Value::as_str) == Some("cancelled")
+            {
+                return Ok(());
+            }
+        }
+    }
     let temp = parent.join(format!(
         ".background.job.{}.{}.tmp",
         std::process::id(),
@@ -4766,9 +4814,17 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
-        let target_generation = std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let inherited = if delegated { published.as_ref() } else { None };
+        let target_generation = inherited
+            .and_then(|job| {
+                job.get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
             .unwrap_or(0);
         if detached {
             if let Some(path) = &path {
@@ -4785,12 +4841,26 @@ impl BackgroundJobGuard {
             detached,
             delegated,
             owner_pid,
-            cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
-                .unwrap_or_else(|_| "background-refresh".into()),
-            kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
-            started_at_unix_secs: std::env::var("GREPPY_BACKGROUND_STARTED_AT")
-                .ok()
-                .and_then(|value| value.parse().ok())
+            cause: inherited
+                .and_then(|job| job.get("cause").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_CAUSE").ok())
+                .unwrap_or_else(|| "background-refresh".into()),
+            kind: inherited
+                .and_then(|job| job.get("kind").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_KIND").ok())
+                .unwrap_or_else(|| "index".into()),
+            started_at_unix_secs: inherited
+                .and_then(|job| {
+                    job.get("started_at_unix_secs")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .or_else(|| {
+                    std::env::var("GREPPY_BACKGROUND_STARTED_AT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
                 .unwrap_or_else(unix_now_secs_cli),
             target_generation,
             backend: published
@@ -4994,7 +5064,11 @@ impl BackgroundJobGuard {
             "current_detail": self.current_detail,
             "last_error": last_error,
         });
-        let _ = write_background_job(path, &value);
+        if state == "starting" && self.is_foreground_owner() {
+            let _ = start_background_job_record(path, &value);
+        } else {
+            let _ = write_background_job(path, &value);
+        }
     }
 
     fn complete(&mut self) {
@@ -5099,6 +5173,68 @@ mod background_progress_tests {
             Some(now),
             now
         ));
+    }
+}
+
+#[cfg(test)]
+mod background_job_status_tests {
+    use super::{read_background_job, start_background_job_record, write_background_job};
+    use serde_json::json;
+
+    #[test]
+    fn cancelled_job_cannot_be_resurrected_by_late_progress_or_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let cancelled = json!({
+            "pid": 42,
+            "target_generation": 2,
+            "started_at_unix_secs": 123,
+            "state": "cancelled",
+            "last_error": "automatic index stopped after its last query waiter exited"
+        });
+        write_background_job(&path, &cancelled).unwrap();
+        let mut late = cancelled.clone();
+        for phase in [
+            "preparing_base_checkout",
+            "base_graph_ready",
+            "embedding",
+            "failed",
+        ] {
+            late["state"] = json!(phase);
+            late["last_error"] = json!(null);
+            write_background_job(&path, &late).unwrap();
+            assert_eq!(read_background_job(&path).unwrap(), cancelled);
+        }
+    }
+
+    #[test]
+    fn cancelled_job_allows_a_fresh_launch_and_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let mut job = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "cancelled"
+        });
+        write_background_job(&path, &job).unwrap();
+        let mut stale = job.clone();
+        stale["state"] = json!("base_graph_ready");
+        job["pid"] = json!(null);
+        job["state"] = json!("launching");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["pid"] = json!(43);
+        job["state"] = json!("starting");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        stale["target_generation"] = json!(0);
+        stale["started_at_unix_secs"] = json!(124);
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["state"] = json!("embedding");
+        write_background_job(&path, &job).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
     }
 }
 
@@ -5306,7 +5442,7 @@ fn spawn_background_job_handle(
         "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         return None;
     }
     let mut command = std::process::Command::new(exe);
@@ -5372,7 +5508,7 @@ fn spawn_background_job_handle(
     } else {
         "refreshing"
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return None;
