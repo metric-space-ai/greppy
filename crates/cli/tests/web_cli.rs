@@ -1245,7 +1245,7 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
         "{output}"
     );
 
-    let exported = workspace.join("full-response.html");
+    let exported = workspace.canonicalize().unwrap().join("full-response.txt");
     let (code, stdout, stderr) = run_scoped(
         &workspace,
         &runtime,
