@@ -2686,6 +2686,17 @@ mod tests {
 
     #[test]
     fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors() {
+        let test = std::thread::Builder::new()
+            .name("persisted-v7-delta-repair".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(persisted_v7_delta_repair_is_one_shot_and_preserves_vectors_body)
+            .expect("spawn persisted repair test on CLI-sized stack");
+        if let Err(panic) = test.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors_body() {
         let _env_lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3027,6 +3038,11 @@ mod tests {
                 .iter()
                 .all(|edge| edge.source_id != legacy_base_caller.id),
             "the missing Base caller has no stale logical edge before repair"
+        );
+        let freshness_proof = overlay_freshness_proof(&root, &legacy, "p").unwrap();
+        assert!(
+            matches!(freshness_proof, Some(OverlayFreshnessProof::Fresh { .. })),
+            "persisted repair fixture must satisfy the real Store-CoW freshness gate before the query; otherwise the unit-test executable would be selected as a background CLI: {freshness_proof:?}"
         );
         drop(legacy);
         let vector_before: Vec<u8> =
