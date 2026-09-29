@@ -2846,6 +2846,12 @@ mod tests {
         let caller_sha256 = greppy_store::file_state::sha256_hex(
             &std::fs::read(root.join(caller_rel_path)).unwrap(),
         );
+        // Match a real publication's repository fingerprint. Leaving these
+        // fields empty makes the first query classify this synthetic Delta as
+        // stale and try to launch the CLI through the libtest executable.
+        // The dirty file state remains generation 7, so the query still has
+        // to exercise the bounded persisted repair below.
+        let fixture_fingerprint = greppy_core::GitFingerprint::capture(root);
         {
             let mut delta = greppy_store::Store::open(&delta_path).unwrap();
             delta
@@ -2881,10 +2887,16 @@ mod tests {
             delta
                 .upsert_workspace_state(&greppy_store::WorkspaceState {
                     root_path: root.to_string_lossy().into_owned(),
-                    git_dir: None,
-                    git_common_dir: None,
-                    head_oid: None,
-                    index_signature: None,
+                    git_dir: fixture_fingerprint
+                        .git_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    git_common_dir: fixture_fingerprint
+                        .git_common_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    head_oid: fixture_fingerprint.head_oid.clone(),
+                    index_signature: fixture_fingerprint.index_signature.clone(),
                     schema_version: delta.schema_version().unwrap(),
                     indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
                     graph_generation: 7,
