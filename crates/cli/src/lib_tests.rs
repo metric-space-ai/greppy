@@ -1969,6 +1969,45 @@ fn dispatch_to_code_maps_errors() {
 }
 
 #[test]
+fn automatic_index_worker_cap_preserves_only_lower_valid_override() {
+    use std::ffi::OsStr;
+
+    assert_eq!(automatic_index_worker_count(None), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("1"))), 1);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("2"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("8"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("0"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("invalid"))), 2);
+}
+
+#[test]
+fn automatic_index_child_command_receives_effective_worker_cap() {
+    use std::ffi::{OsStr, OsString};
+
+    let mut command = std::process::Command::new("greppy");
+    assert_eq!(
+        configure_automatic_index_workers(&mut command, Some(OsStr::new("8"))),
+        2
+    );
+    let worker_env = command
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("GREPPY_WORKERS"))
+        .and_then(|(_, value)| value.map(OsString::from));
+    assert_eq!(worker_env.as_deref(), Some(OsStr::new("2")));
+
+    let mut embedding = std::process::Command::new("greppy");
+    assert_eq!(
+        configure_automatic_index_workers(&mut embedding, Some(OsStr::new("8"))),
+        2
+    );
+    let embedding_worker_env = embedding
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("GREPPY_WORKERS"))
+        .and_then(|(_, value)| value.map(OsString::from));
+    assert_eq!(embedding_worker_env.as_deref(), Some(OsStr::new("2")));
+}
+
+#[test]
 fn delegated_base_index_progress_preserves_outer_job_owner() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
