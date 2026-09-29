@@ -2490,6 +2490,28 @@ fn require_rename_edge_identity(
     }
 }
 
+fn select_rename_reference_site(
+    symbol: &str,
+    short_name: &str,
+    file_path: &str,
+    sites: &[(usize, usize)],
+) -> EditResult<Option<(usize, usize)>> {
+    match sites {
+        // A structurally valid source span with no live old identifier is a
+        // stale graph candidate, not an unresolved source reference.
+        [] => Ok(None),
+        [site] => Ok(Some(*site)),
+        _ => Err(EditRefusal::new(
+            "ambiguous_reference",
+            format!(
+                "graph reference scope {file_path} contains {} live `{short_name}` identifiers for `{symbol}`; select a narrower symbol or refresh the index — nothing written",
+                sites.len()
+            ),
+            12,
+        )),
+    }
+}
+
 pub(crate) fn run_trained_rename(
     root_path: &std::path::Path,
     root: Option<&str>,
@@ -2658,26 +2680,13 @@ pub(crate) fn run_trained_rename(
                     12,
                 )));
             };
-            match sites.as_slice() {
-                // The graph can retain a stale edge after its old identifier
-                // disappeared. With no live AST identifier there is nothing
-                // left to rename, so this candidate is safely irrelevant.
-                [] => continue,
-                [site] => scopes
+            match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
+                Ok(None) => continue,
+                Ok(Some(site)) => scopes
                     .entry(source.file_path.clone())
                     .or_default()
-                    .push(*site),
-                _ => {
-                    return Ok(Err(EditRefusal::new(
-                        "ambiguous_reference",
-                        format!(
-                            "graph reference scope {} contains {} live `{short_name}` identifiers; select a narrower symbol or refresh the index — nothing written",
-                            source.file_path,
-                            sites.len()
-                        ),
-                        12,
-                    )))
-                }
+                    .push(site),
+                Err(refusal) => return Ok(Err(refusal)),
             }
         }
     }
@@ -3145,6 +3154,42 @@ mod patch_rollback_tests {
         .unwrap_err();
         assert_eq!(refusal.code, "unresolved_reference_identity");
         assert!(refusal.message.contains("source node 42"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected_path = dir.path().join("selected.rs");
+        let caller_path = dir.path().join("caller.rs");
+        std::fs::write(&selected_path, b"impl Scheduler { fn next(&self) {} }\n").unwrap();
+        std::fs::write(&caller_path, b"fn call(s: &Scheduler) { s.next(); }\n").unwrap();
+        let before_selected = std::fs::read(&selected_path).unwrap();
+        let before_caller = std::fs::read(&caller_path).unwrap();
+        assert!(require_rename_edge_identity(
+            "CALLS",
+            &misleading,
+            Some("Scheduler"),
+            "next",
+            "Scheduler::next",
+            42,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&selected_path).unwrap(), before_selected);
+        assert_eq!(std::fs::read(&caller_path).unwrap(), before_caller);
+
+        assert_eq!(
+            select_rename_reference_site("Scheduler::next", "next", "stale.rs", &[]).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_rename_reference_site("Scheduler::next", "next", "caller.rs", &[(30, 34)])
+                .unwrap(),
+            Some((30, 34))
+        );
+        assert!(select_rename_reference_site(
+            "Scheduler::next",
+            "next",
+            "ambiguous.rs",
+            &[(10, 14), (30, 34)]
+        )
+        .is_err());
     }
 
     #[test]
