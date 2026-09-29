@@ -2636,15 +2636,7 @@ fn rust_free_function_reference_inventory(
                             item.get("glob").and_then(serde_json::Value::as_bool) == Some(true)
                         })
                     }));
-            if import_has_glob
-                && rust_glob_import_may_bind_name(
-                    root_path,
-                    &rel,
-                    &content,
-                    &edge.properties,
-                    short_name,
-                )
-            {
+            if import_has_glob {
                 return Err(EditRefusal::new(
                     "unresolved_reference_identity",
                     format!("live Rust glob import in {rel}:{} may bind `{short_name}` while renaming `{symbol}` — replace it with an exact import or refresh identity evidence; nothing written", edge.line),
@@ -2727,119 +2719,6 @@ fn rust_free_function_reference_inventory(
         }
     }
     Ok(())
-}
-
-fn rust_glob_import_may_bind_name(
-    root_path: &std::path::Path,
-    rel: &str,
-    content: &[u8],
-    properties: &serde_json::Value,
-    short_name: &str,
-) -> bool {
-    let Some(raw_path) = properties.get("path").and_then(serde_json::Value::as_str) else {
-        return true;
-    };
-    let base = raw_path
-        .trim()
-        .strip_suffix("::*")
-        .unwrap_or(raw_path.trim());
-    let segments = base.split("::").collect::<Vec<_>>();
-    let Some(last) = segments.last().copied().filter(|value| !value.is_empty()) else {
-        return true;
-    };
-
-    // Type globs import enum variants/associated names. A live local type is
-    // positive evidence: inspect only that declaration, not every same-name
-    // identifier in the file.
-    if last.chars().next().is_some_and(char::is_uppercase) {
-        let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
-            return true;
-        };
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            if matches!(node.kind(), "enum_item" | "struct_item" | "union_item")
-                && node
-                    .child_by_field_name("name")
-                    .and_then(|name| content.get(name.byte_range()))
-                    == Some(last.as_bytes())
-            {
-                let bytes = content.get(node.byte_range()).unwrap_or_default();
-                return greppy_edit::verbs::rename_identifier_sites(
-                    std::path::Path::new(rel),
-                    bytes,
-                    &[(0, bytes.len())],
-                    short_name,
-                )
-                .is_none_or(|sites| !sites.is_empty());
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        return true;
-    }
-
-    let rel_path = std::path::Path::new(rel);
-    let rel_dir = rel_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
-    let source_root = rel_path
-        .components()
-        .position(|part| part.as_os_str() == "src")
-        .map(|index| {
-            rel_path
-                .components()
-                .take(index + 1)
-                .collect::<std::path::PathBuf>()
-        })
-        .unwrap_or_default();
-    let mut module = std::path::PathBuf::new();
-    let mut iter = segments.into_iter();
-    match iter.next() {
-        Some("crate") => module.push(source_root),
-        Some("self") => module.push(rel_dir),
-        Some("super") => module.push(rel_dir.parent().unwrap_or(rel_dir)),
-        Some(first) => {
-            module.push(rel_dir);
-            module.push(first);
-        }
-        None => return true,
-    }
-    module.extend(iter);
-    let candidates = [
-        root_path.join(&module).with_extension("rs"),
-        root_path.join(&module).join("mod.rs"),
-    ];
-    let Some(module_path) = candidates.into_iter().find(|path| path.is_file()) else {
-        return true;
-    };
-    let Ok(module_content) = std::fs::read(&module_path) else {
-        return true;
-    };
-    let module_rel = module_path
-        .strip_prefix(root_path)
-        .unwrap_or(&module_path)
-        .to_string_lossy();
-    let Ok(extraction) =
-        greppy_parser::extract(greppy_parser::Language::Rust, &module_content, &module_rel)
-    else {
-        return true;
-    };
-    if extraction.nodes.iter().any(|node| node.name == short_name) {
-        return true;
-    }
-    extraction.edges.iter().any(|candidate| {
-        candidate.edge_type == "IMPORTS"
-            && (candidate
-                .properties
-                .get("glob")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-                || candidate
-                    .properties
-                    .get("imported_name")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(short_name))
-    })
 }
 
 fn rust_local_free_function_owns_site(
@@ -4032,55 +3911,6 @@ mod patch_rollback_tests {
             source,
             "get_lit_str",
             sites[1]
-        ));
-    }
-
-    #[test]
-    fn glob_import_identity_distinguishes_unrelated_selected_and_unknown_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src/internals")).unwrap();
-        std::fs::write(
-            dir.path().join("src/internals/symbol.rs"),
-            b"pub const OTHER: usize = 1;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/selected.rs"),
-            b"pub fn get_lit_str() {}\n",
-        )
-        .unwrap();
-        let source = b"enum RenameRule { One, Two }\nuse self::RenameRule::*;\nuse crate::internals::symbol::*;\n";
-        let local_type = serde_json::json!({"path": "self::RenameRule::*"});
-        let unrelated_module = serde_json::json!({"path": "crate::internals::symbol::*"});
-        let selected_module = serde_json::json!({"path": "crate::selected::*"});
-        let unknown_module = serde_json::json!({"path": "crate::missing::*"});
-        assert!(!rust_glob_import_may_bind_name(
-            dir.path(),
-            "src/attr.rs",
-            source,
-            &local_type,
-            "get_lit_str",
-        ));
-        assert!(!rust_glob_import_may_bind_name(
-            dir.path(),
-            "src/attr.rs",
-            source,
-            &unrelated_module,
-            "get_lit_str",
-        ));
-        assert!(rust_glob_import_may_bind_name(
-            dir.path(),
-            "src/attr.rs",
-            source,
-            &selected_module,
-            "get_lit_str",
-        ));
-        assert!(rust_glob_import_may_bind_name(
-            dir.path(),
-            "src/attr.rs",
-            source,
-            &unknown_module,
-            "get_lit_str",
         ));
     }
 
