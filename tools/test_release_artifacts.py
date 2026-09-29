@@ -465,7 +465,9 @@ class ReleaseArtifactTests(unittest.TestCase):
             any(asset.get("optional_group") for asset in contract["assets"] if asset not in windows)
         )
 
-    def test_release_publish_skips_absent_windows_and_unrun_cow_performance(self) -> None:
+    def test_release_publish_excludes_cpu_only_windows_and_unrun_cow_performance(
+        self,
+    ) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
@@ -485,15 +487,32 @@ class ReleaseArtifactTests(unittest.TestCase):
             matrix_emit.signing_enabled({name: "set" for name in matrix_emit.SECRET_ENV})
         )
         without = matrix_emit.filtered_includes(False)
-        with_windows = matrix_emit.filtered_includes(True)
+        with_signing = matrix_emit.filtered_includes(True)
         for key in ("build", "verify"):
-            self.assertNotIn("windows-x86_64", [row["name"] for row in without[key]])
-            self.assertIn("windows-x86_64", [row["name"] for row in with_windows[key]])
-            self.assertIn("macos-arm64", [row["name"] for row in without[key]])
-        windows_build = next(
-            row for row in with_windows["build"] if row["name"] == "windows-x86_64"
+            self.assertEqual(
+                [row["name"] for row in with_signing[key]],
+                [row["name"] for row in without[key]],
+            )
+            self.assertNotIn(
+                "windows-x86_64", [row["name"] for row in with_signing[key]]
+            )
+        self.assertEqual(
+            [row["features"] for row in with_signing["build"]], ["metal", "cuda"]
         )
-        self.assertEqual(windows_build["features"], "cpu-only")
+        output = self.root / "release-matrix-output"
+        matrix_emit.write_github_output(
+            output, {name: "set" for name in matrix_emit.SECRET_ENV}
+        )
+        emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        self.assertEqual(emitted["enabled"], "true")
+        self.assertEqual(
+            [row["name"] for row in json.loads(emitted["build_include"])],
+            ["macos-arm64", "linux-x86_64"],
+        )
+        self.assertEqual(
+            [row["name"] for row in json.loads(emitted["verify_include"])],
+            ["macos-arm64", "linux-x86_64-no-toolkit"],
+        )
         self.assertIn("cow_performance_ok", workflow)
         self.assertIn("cow_performance_failed", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
