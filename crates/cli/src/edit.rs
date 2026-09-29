@@ -2625,24 +2625,6 @@ fn rust_free_function_reference_inventory(
                 .properties
                 .get("imported_items")
                 .and_then(serde_json::Value::as_array);
-            let import_has_glob = edge.edge_type == "IMPORTS"
-                && (edge
-                    .properties
-                    .get("glob")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    || import_items.is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("glob").and_then(serde_json::Value::as_bool) == Some(true)
-                        })
-                    }));
-            if import_has_glob {
-                return Err(EditRefusal::new(
-                    "unresolved_reference_identity",
-                    format!("live Rust glob import in {rel}:{} may bind `{short_name}` while renaming `{symbol}` — replace it with an exact import or refresh identity evidence; nothing written", edge.line),
-                    12,
-                ));
-            }
             let (name_property, path_property) = match edge.edge_type.as_str() {
                 "CALLS" => ("callee_name", "callee_path"),
                 "USAGE" | "USES" => ("ref_name", "ref_path"),
@@ -3912,6 +3894,52 @@ mod patch_rollback_tests {
             "get_lit_str",
             sites[1]
         ));
+    }
+
+    #[test]
+    fn glob_without_old_name_needs_no_edit_but_live_glob_call_must_be_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = b"pub fn get_lit_str() {}\n";
+        std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
+        std::fs::write(
+            dir.path().join("glob_only.rs"),
+            b"pub use crate::selected::*;\n",
+        )
+        .unwrap();
+        let selected_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("selected.rs"),
+            selected,
+            &[(0, selected.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        let scopes =
+            std::collections::BTreeMap::from([("selected.rs".to_string(), selected_sites)]);
+        let selected_files = std::collections::BTreeSet::from(["selected.rs".to_string()]);
+        rust_free_function_reference_inventory(
+            dir.path(),
+            &scopes,
+            &selected_files,
+            "get_lit_str",
+            "selected.rs::get_lit_str",
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("glob_call.rs"),
+            b"use crate::selected::*;\nfn caller() { get_lit_str(); }\n",
+        )
+        .unwrap();
+        let refusal = rust_free_function_reference_inventory(
+            dir.path(),
+            &scopes,
+            &selected_files,
+            "get_lit_str",
+            "selected.rs::get_lit_str",
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "unresolved_reference_identity");
+        assert!(refusal.message.contains("glob_call.rs"));
     }
 
     #[test]
