@@ -1121,6 +1121,7 @@ fn web_goto_without_scope_is_no_session() {
 #[cfg(unix)]
 #[test]
 fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{
@@ -1262,7 +1263,10 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
     );
     assert_eq!(code, 0, "export failed stdout={stdout} stderr={stderr}");
     let bytes = std::fs::read(&exported).unwrap();
-    assert!(bytes.ends_with(b"IMMUTABLE_TAIL</body></html>"));
+    let expected = format!("{}IMMUTABLE_TAIL", "artifact body ".repeat(10_000));
+    assert_eq!(bytes, expected.as_bytes(), "artifact is rendered page text");
+    assert!(bytes.ends_with(b"IMMUTABLE_TAIL"));
+    assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));
     assert_eq!(
         reads.load(Ordering::SeqCst),
         1,
