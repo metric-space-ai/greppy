@@ -364,6 +364,40 @@ const RG_LONG_WITH_VALUE: &[&str] = &[
 const RG_SHORT_NO_VALUE: &str = "ivwxlcoqnHaIFPSL0NsupUz";
 const RG_SHORT_WITH_VALUE: &str = "efgtTABCMjmrdE";
 
+#[derive(Clone, Copy)]
+pub(crate) enum PassthroughFlavor {
+    Grep,
+    Ripgrep,
+}
+
+/// Whether `argument` consumes the following argv token as an opaque option
+/// value. Greppy globals embedded in such values must never be interpreted.
+pub(crate) fn passthrough_option_consumes_next(
+    argument: &OsStr,
+    flavor: PassthroughFlavor,
+) -> bool {
+    let Some(text) = argument.to_str() else {
+        return false;
+    };
+    let (long_with_value, short_with_value) = match flavor {
+        PassthroughFlavor::Grep => (GREP_LONG_WITH_VALUE, GREP_SHORT_WITH_VALUE),
+        PassthroughFlavor::Ripgrep => (RG_LONG_WITH_VALUE, RG_SHORT_WITH_VALUE),
+    };
+    if text.starts_with("--") {
+        return !text.contains('=') && long_with_value.contains(&text);
+    }
+    if !text.starts_with('-') || text == "-" {
+        return false;
+    }
+    let mut flags = text[1..].char_indices().peekable();
+    while let Some((_, flag)) = flags.next() {
+        if short_with_value.contains(flag) {
+            return flags.peek().is_none();
+        }
+    }
+    false
+}
+
 pub(crate) fn rg_stdin_demand(args: &[OsString]) -> StdinDemand<'_> {
     let mut positionals: Vec<&OsStr> = Vec::new();
     let mut explicit_pattern = false;
