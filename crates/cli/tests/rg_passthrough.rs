@@ -473,7 +473,7 @@ for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
 #[test]
 fn non_utf8_root_preserves_cwd_and_option_values_in_both_positions() {
     use std::ffi::OsString;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
     let caller = unique_tempdir("nonutf8-root").canonicalize().unwrap();
@@ -482,6 +482,15 @@ fn non_utf8_root_preserves_cwd_and_option_values_in_both_positions() {
     let shim = caller.join("rg-shim.sh");
     std::fs::write(&shim, b"#!/bin/sh\npwd -P\nprintf '<%s>\\n' \"$@\"\n").unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // macOS may expose an invalid-UTF8 directory name as percent-escaped
+    // bytes from getcwd. Compare with the same native child, not a spelling
+    // reconstructed from the path originally passed to create_dir.
+    let native = Command::new(&shim)
+        .args(["-g", "--root", "--files", "docs/user"])
+        .current_dir(&repository)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0));
     let mut equals_root = OsString::from("--root=");
     equals_root.push(&repository);
     for root in [
@@ -507,9 +516,7 @@ fn non_utf8_root_preserves_cwd_and_option_values_in_both_positions() {
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(0), "{output:?}");
-            let mut expected = repository.as_os_str().as_bytes().to_vec();
-            expected.extend_from_slice(b"\n<-g>\n<--root>\n<--files>\n<docs/user>\n");
-            assert_eq!(output.stdout, expected, "args={args:?}");
+            assert_eq!(output.stdout, native.stdout, "args={args:?}");
         }
     }
     std::fs::remove_dir_all(caller).unwrap();
