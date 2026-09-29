@@ -478,7 +478,14 @@ fn non_utf8_root_preserves_cwd_and_option_values_in_both_positions() {
 
     let caller = unique_tempdir("nonutf8-root").canonicalize().unwrap();
     let repository = caller.join(OsString::from_vec(b"repo-\xff".to_vec()));
-    std::fs::create_dir(&repository).unwrap();
+    if let Err(error) = std::fs::create_dir(&repository) {
+        if error.raw_os_error() == Some(libc::EILSEQ) {
+            eprintln!("non-UTF8 root fixture unsupported by this filesystem: {error}");
+            std::fs::remove_dir_all(caller).unwrap();
+            return;
+        }
+        panic!("create non-UTF8 root fixture: {error}");
+    }
     let shim = caller.join("rg-shim.sh");
     std::fs::write(&shim, b"#!/bin/sh\npwd -P\nprintf '<%s>\\n' \"$@\"\n").unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -548,7 +555,7 @@ fn root_is_shared_by_translated_rg_and_bare_grep() {
         .output()
         .expect("spawn rooted grep");
     let native = Command::new(real_grep)
-        .args(["-R", "Alpha", "."])
+        .args(["-R", "Alpha"])
         .current_dir(&repository)
         .stdin(Stdio::null())
         .output()
