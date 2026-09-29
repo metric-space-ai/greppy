@@ -305,6 +305,41 @@ for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
         format!("{}\n<--files>\n", repository.display())
     );
 
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("needle"),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!("{}\n<needle>\n<.>\n", repository.display())
+    );
+
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("-e"),
+        std::ffi::OsStr::new("--root"),
+        std::ffi::OsStr::new("-g"),
+        std::ffi::OsStr::new("--device"),
+        std::ffi::OsStr::new("--glob"),
+        std::ffi::OsStr::new("--root"),
+        std::ffi::OsStr::new("-f"),
+        std::ffi::OsStr::new("--device"),
+        std::ffi::OsStr::new("docs/user/guide.md"),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!(
+            "{}\n<-e>\n<--root>\n<-g>\n<--device>\n<--glob>\n<--root>\n<-f>\n<--device>\n<docs/user/guide.md>\n",
+            repository.display()
+        )
+    );
+
     let absolute = repository.join("docs/user");
     let output = run(&[
         std::ffi::OsStr::new("rg"),
@@ -384,15 +419,12 @@ fn root_is_shared_by_translated_rg_and_bare_grep() {
     std::fs::write(repository.join("docs/user/guide.md"), "Alpha rooted\n").unwrap();
     let root = repository.to_string_lossy().into_owned();
 
-    let translated = run_translated(
-        &["rg", "-S", "alpha", "docs/user/guide.md", "--root", &root],
-        &caller,
-    );
+    let translated = run_translated(&["rg", "-S", "alpha", "--root", &root], &caller);
     assert_eq!(translated.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&translated.stdout).contains("Alpha rooted"));
 
     let bare = Command::new(binary_path())
-        .args(["grep", "Alpha", "docs/user/guide.md", "--root", &root])
+        .args(["grep", "-R", "Alpha", "--root", &root])
         .current_dir(&caller)
         .env("GREPPY_STORE_DIR", unique_tempdir("root-bare-store"))
         .stdin(Stdio::null())

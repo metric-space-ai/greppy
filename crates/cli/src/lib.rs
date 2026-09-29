@@ -9072,12 +9072,28 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobal
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     let mut root: Option<std::ffi::OsString> = None;
     let mut removed = false;
+    let mut flavor = PassthroughFlavor::Grep;
     let mut index = 0;
     while index < args.len() {
         let text = args[index].to_str().unwrap_or_default();
         if text == "--" {
             out.extend_from_slice(&args[index..]);
             break;
+        }
+        if passthrough_option_consumes_next(&args[index], flavor) {
+            out.push(args[index].clone());
+            if let Some(value) = args.get(index + 1) {
+                out.push(value.clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(text, "rg" | "ripgrep") {
+            flavor = PassthroughFlavor::Ripgrep;
+        } else if matches!(text, "grep" | "egrep" | "fgrep" | "rgrep") {
+            flavor = PassthroughFlavor::Grep;
         }
         if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
             if let Some(value) = args.get(index + 1) {
@@ -9140,6 +9156,21 @@ fn grep_working_dir(root: Option<&std::ffi::OsStr>) -> Result<Option<std::path::
         )));
     }
     Ok(Some(canonical))
+}
+
+fn add_root_default_path(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+    demand: StdinDemand<'_>,
+) -> Option<Vec<std::ffi::OsString>> {
+    if working_dir.is_some() && matches!(demand, StdinDemand::WhenNonTerminal(_)) {
+        let mut rooted = Vec::with_capacity(args.len() + 1);
+        rooted.extend_from_slice(args);
+        rooted.push(std::ffi::OsString::from("."));
+        Some(rooted)
+    } else {
+        None
+    }
 }
 
 /// Greppy-only flags, with the subcommand that owns each one.
@@ -9226,7 +9257,12 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // particular, a directory operand without `-r` must keep real grep's
     // diagnostic and exit code rather than silently acquiring recursion.
     let _ = named_grep;
-    let grep_args = stripped;
+    let rooted = add_root_default_path(
+        stripped,
+        working_dir.as_deref(),
+        grep_stdin_demand(stripped),
+    );
+    let grep_args = rooted.as_deref().unwrap_or(stripped);
     if let Some((flag, owner)) = greppy_only_flag(grep_args) {
         let guidance = if owner.is_empty() {
             "it belongs to greppy's navigation commands. Drop it, or name the command it goes with"
@@ -9263,6 +9299,8 @@ fn dispatch_rg_os(
     args: &[std::ffi::OsString],
     working_dir: Option<&std::path::Path>,
 ) -> Result<i32> {
+    let rooted = add_root_default_path(args, working_dir, rg_stdin_demand(args));
+    let args = rooted.as_deref().unwrap_or(args);
     if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
         return Err(Error::Invalid(message));
     }
