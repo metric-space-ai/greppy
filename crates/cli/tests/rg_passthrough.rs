@@ -245,6 +245,163 @@ exit 0
     assert_eq!(std::fs::read(&receipt).unwrap(), b"--json\nabsent\na.txt\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn root_selects_child_cwd_without_changing_rg_operands() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repository = unique_tempdir("root-repository").canonicalize().unwrap();
+    let caller = unique_tempdir("root-caller").canonicalize().unwrap();
+    std::fs::create_dir_all(repository.join("docs/user")).unwrap();
+    std::fs::write(repository.join("docs/user/guide.md"), "root scoped\n").unwrap();
+    let receipt = repository.join("rg-root-receipt.txt");
+    let shim = repository.join("rg-root-shim.sh");
+    std::fs::write(
+        &shim,
+        r#"#!/bin/sh
+pwd -P > "$RG_ROOT_RECEIPT"
+for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(binary_path())
+            .args(args)
+            .current_dir(&caller)
+            .env("GREPPY_REAL_RG", &shim)
+            .env("RG_ROOT_RECEIPT", &receipt)
+            .env("GREPPY_STORE_DIR", unique_tempdir("root-store"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn rooted rg")
+    };
+    let root_flag = std::ffi::OsString::from(format!("--root={}", repository.display()));
+
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--files"),
+        std::ffi::OsStr::new("docs/user"),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!("{}\n<--files>\n<docs/user>\n", repository.display())
+    );
+
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--files"),
+        root_flag.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!("{}\n<--files>\n", repository.display())
+    );
+
+    let absolute = repository.join("docs/user");
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--glob"),
+        std::ffi::OsStr::new("*.md"),
+        std::ffi::OsStr::new("--files"),
+        absolute.as_os_str(),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+        std::ffi::OsStr::new("--"),
+        std::ffi::OsStr::new("--root"),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!(
+            "{}\n<--glob>\n<*.md>\n<--files>\n<{}>\n<-->\n<--root>\n",
+            repository.display(),
+            absolute.display()
+        )
+    );
+
+    let missing = caller.join("missing-root");
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--files"),
+        std::ffi::OsStr::new("--root"),
+        missing.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(64));
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("invalid --root"), "{diagnostic}");
+
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--files"),
+        std::ffi::OsStr::new("--root"),
+    ]);
+    assert_eq!(output.status.code(), Some(64));
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("--root needs a directory"),
+        "{diagnostic}"
+    );
+
+    let file_root = caller.join("not-a-directory");
+    std::fs::write(&file_root, b"file").unwrap();
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("--files"),
+        std::ffi::OsStr::new("--root"),
+        file_root.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(64));
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("not a directory"), "{diagnostic}");
+}
+
+#[cfg(unix)]
+#[test]
+fn root_is_shared_by_translated_rg_and_bare_grep() {
+    let repository = unique_tempdir("root-translated");
+    let caller = unique_tempdir("root-translated-caller");
+    std::fs::create_dir_all(repository.join("docs/user")).unwrap();
+    std::fs::write(repository.join("docs/user/guide.md"), "Alpha rooted\n").unwrap();
+    let root = repository.to_string_lossy().into_owned();
+
+    let translated = run_translated(
+        &["rg", "-S", "alpha", "docs/user/guide.md", "--root", &root],
+        &caller,
+    );
+    assert_eq!(translated.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&translated.stdout).contains("Alpha rooted"));
+
+    let bare = Command::new(binary_path())
+        .args(["grep", "Alpha", "docs/user/guide.md", "--root", &root])
+        .current_dir(&caller)
+        .env("GREPPY_STORE_DIR", unique_tempdir("root-bare-store"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn rooted grep");
+    assert_eq!(bare.status.code(), Some(0));
+    assert_eq!(bare.stdout, b"Alpha rooted\n");
+}
+
 #[test]
 fn explicit_rg_json_matches_native_match_records_and_no_match_exit() {
     let real_rg = std::env::var_os("PATH").and_then(|paths| {

@@ -9059,9 +9059,14 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// tells agents to pass `--root .` on every command. Forwarding them made real
 /// grep answer `unrecognized option '--root'`, which cost the agent a turn every
 /// time it searched — measured at 2.3 wasted turns per task, and zero in an arm
-/// that just calls grep directly. `--root DIR` also carries intent: when no path
-/// operand is present we append DIR so the search still covers what was asked.
-fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+/// that just calls grep directly. `--root DIR` selects the child search process's
+/// working directory; it must never become an additional grep path operand.
+struct GrepGlobals {
+    args: Vec<std::ffi::OsString>,
+    root: Option<std::ffi::OsString>,
+}
+
+fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobals>> {
     const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
     const BARE_FLAGS: [&str; 2] = ["--no-gpu", "--diagnostics"];
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
@@ -9070,14 +9075,24 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
     let mut index = 0;
     while index < args.len() {
         let text = args[index].to_str().unwrap_or_default();
+        if text == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
         if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
             if let Some(value) = args.get(index + 1) {
                 if *flag == "--root" {
+                    if value.is_empty() {
+                        return Err(Error::Invalid("--root needs a directory".into()));
+                    }
                     root = Some(value.clone());
                 }
                 index += 2;
                 removed = true;
                 continue;
+            }
+            if *flag == "--root" {
+                return Err(Error::Invalid("--root needs a directory".into()));
             }
             index += 1;
             removed = true;
@@ -9088,7 +9103,11 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
             .find(|flag| text.starts_with(&format!("{flag}=")))
         {
             if *flag == "--root" {
-                root = Some(std::ffi::OsString::from(&text[flag.len() + 1..]));
+                let value = &text[flag.len() + 1..];
+                if value.is_empty() {
+                    return Err(Error::Invalid("--root needs a directory".into()));
+                }
+                root = Some(std::ffi::OsString::from(value));
             }
             index += 1;
             removed = true;
@@ -9103,23 +9122,24 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
         index += 1;
     }
     if !removed {
-        return None;
+        return Ok(None);
     }
-    // A bare `--root DIR` with no path operand still means "search DIR". The
-    // first non-flag argument is the PATTERN, so a path operand only exists from
-    // the second one on — counting the pattern as a path silently searched the
-    // wrong place.
-    if let Some(root) = root {
-        let non_flags = out
-            .iter()
-            .skip(1)
-            .filter(|arg| !arg.to_str().unwrap_or_default().starts_with('-'))
-            .count();
-        if non_flags <= 1 {
-            out.push(root);
-        }
+    Ok(Some(GrepGlobals { args: out, root }))
+}
+
+fn grep_working_dir(root: Option<&std::ffi::OsStr>) -> Result<Option<std::path::PathBuf>> {
+    let Some(root) = root else { return Ok(None) };
+    let supplied = std::path::PathBuf::from(root);
+    let canonical = supplied.canonicalize().map_err(|error| {
+        Error::Invalid(format!("invalid --root `{}`: {error}", supplied.display()))
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::Invalid(format!(
+            "invalid --root `{}`: not a directory",
+            supplied.display()
+        )));
     }
-    Some(out)
+    Ok(Some(canonical))
 }
 
 /// Greppy-only flags, with the subcommand that owns each one.
@@ -9177,8 +9197,13 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // grep-family (or rg-family) placeholder in full[1] if present so
     // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
     // all agree.
-    let cleaned = strip_greppy_globals(&full[1..]);
-    let args: &[std::ffi::OsString] = cleaned.as_deref().unwrap_or(&full[1..]);
+    let cleaned = strip_greppy_globals(&full[1..])?;
+    let args: &[std::ffi::OsString] = cleaned
+        .as_ref()
+        .map(|cleaned| cleaned.args.as_slice())
+        .unwrap_or(&full[1..]);
+    let working_dir =
+        grep_working_dir(cleaned.as_ref().and_then(|cleaned| cleaned.root.as_deref()))?;
     let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) = match args
         .first()
         .and_then(|s| s.to_str())
@@ -9194,7 +9219,7 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // Blindly forwarding them to real grep would be a usage error at
     // best and a silently different search at worst.
     if named_rg || greppy_passthrough::is_rg_style(stripped) {
-        return dispatch_rg_os(stripped);
+        return dispatch_rg_os(stripped, working_dir.as_deref());
     }
 
     // Ordinary grep invocations are a byte-exact delegation contract. In
@@ -9226,7 +9251,7 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.extend_from_slice(grep_args);
 
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir.as_deref())
 }
 
 /// Route a ripgrep-style invocation: byte-exact delegation to real
@@ -9234,7 +9259,10 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
 /// real-grep call, otherwise fail loudly naming the flag and the closest
 /// alternative. Absence of ripgrep must never silently change search
 /// semantics.
-fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
+fn dispatch_rg_os(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+) -> Result<i32> {
     if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
         return Err(Error::Invalid(message));
     }
@@ -9242,7 +9270,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
         let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
         rebuilt.push(std::ffi::OsString::from("rg"));
         rebuilt.extend_from_slice(args);
-        return greppy_passthrough::run_grep_os(&real_rg, &rebuilt);
+        return greppy_passthrough::run_grep_os_in_dir(&real_rg, &rebuilt, working_dir);
     }
     use std::io::IsTerminal;
     let stdin_piped = !std::io::stdin().is_terminal();
@@ -9252,7 +9280,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend(grep_args);
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir)
 }
 
 fn retire_verified_legacy_store(root: &std::path::Path) {
