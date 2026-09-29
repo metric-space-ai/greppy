@@ -2639,16 +2639,15 @@ impl ContentEngine {
                         "profile must be research or project",
                     )
                 })?;
-                // Controller scripts can create explicit contexts after a
-                // daemon-owned page has already been bound. Keep the default
-                // and that page's isolated policy bundle on the same immutable
-                // session profile before the script starts.
-                self.profile.set(parsed);
                 if let Some(page) = params.get("page").and_then(|value| value.as_str()) {
                     if let Some(PageSlot::Live { bundle: Some(bundle), .. }) = self.pages.get(page) {
                         bundle.profile.set(parsed);
+                        return Ok(json!({ "profile": bundle.profile.get().as_str() }));
                     }
                 }
+                // Controller scripts set the default before constructing their
+                // explicit contexts. A bundled daemon page never mutates it.
+                self.profile.set(parsed);
                 Ok(json!({ "profile": self.profile.get().as_str() }))
             }
             "session.attachPage" => {

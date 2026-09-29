@@ -1528,6 +1528,37 @@ impl Daemon {
                 return engine_error(request, error, 33);
             }
         }
+        let profile = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.profile)
+            .unwrap_or(NetworkProfile::Research);
+        let started = Instant::now();
+        let run_budget = Duration::from_millis(request.deadline_ms.max(1_000));
+        let run_deadline = started + run_budget;
+        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
+            session_id,
+            run_budget.as_millis()
+        ); }
+        if let Err(error) = self.engine_call_timed(
+            "session.setProfile",
+            json!({ "profile": profile.as_str() }),
+            run_deadline.saturating_duration_since(Instant::now()),
+        ) {
+            self.finish_session(&session_id);
+            if error.contains("timed out") {
+                let mut object = ErrorObject::new(
+                    "timeout",
+                    redact_secrets(&error),
+                    request.request_id.clone(),
+                    35,
+                    "retry with a longer deadline or a smaller script",
+                );
+                object.session_id = Some(session_id);
+                return Response::error(request, object);
+            }
+            return engine_error(request, error, 34);
+        }
         let bind_session_page = request
             .payload
             .get("bind_session_page")
@@ -1581,6 +1612,27 @@ impl Daemon {
         } else {
             None
         };
+        if let Some(page) = bound_page.as_deref() {
+            if let Err(error) = self.engine_call_timed(
+                "session.setProfile",
+                json!({ "page": page, "profile": profile.as_str() }),
+                run_deadline.saturating_duration_since(Instant::now()),
+            ) {
+                self.finish_session(&session_id);
+                if error.contains("timed out") {
+                    let mut object = ErrorObject::new(
+                        "timeout",
+                        redact_secrets(&error),
+                        request.request_id.clone(),
+                        35,
+                        "retry with a longer deadline or a smaller script",
+                    );
+                    object.session_id = Some(session_id);
+                    return Response::error(request, object);
+                }
+                return engine_error(request, error, 34);
+            }
+        }
         if let Some(session) = self.sessions.get_mut(&session_id) {
             if let Err(message) = session
                 .limits
@@ -1701,7 +1753,7 @@ impl Daemon {
                 );
             }
         };
-        if let Some(page) = bound_page {
+        if let Some(page) = bound_page.as_deref() {
             let page = serde_json::to_string(&page)
                 .expect("a runtime page id is always JSON serializable");
             source = format!(
@@ -1724,41 +1776,6 @@ impl Daemon {
                 self.finish_session(&session_id);
                 return engine_error(request, error, 33);
             }
-        }
-        let profile = self
-            .sessions
-            .get(&session_id)
-            .map(|session| session.profile)
-            .unwrap_or(NetworkProfile::Research);
-        let started = Instant::now();
-        let run_budget = Duration::from_millis(request.deadline_ms.max(1_000));
-        let run_deadline = started + run_budget;
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase run-wait point=set-profile worker=content session={} deadline_ms={}",
-            session_id,
-            run_budget.as_millis()
-        ); }
-        let mut profile_params = json!({ "profile": profile.as_str() });
-        if let Some(page) = bound_page.as_deref() {
-            profile_params["page"] = json!(page);
-        }
-        if let Err(error) = self.engine_call_timed(
-            "session.setProfile",
-            profile_params,
-            run_deadline.saturating_duration_since(Instant::now()),
-        ) {
-            self.finish_session(&session_id);
-            if error.contains("timed out") {
-                let mut object = ErrorObject::new(
-                    "timeout",
-                    redact_secrets(&error),
-                    request.request_id.clone(),
-                    35,
-                    "retry with a longer deadline or a smaller script",
-                );
-                object.session_id = Some(session_id);
-                return Response::error(request, object);
-            }
-            return engine_error(request, error, 34);
         }
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();

@@ -3215,6 +3215,69 @@ fn route_fulfill_overrides_http_body() {
 }
 
 #[test]
+fn bound_page_uses_immutable_session_network_profile() {
+    let origin = serve_fixture("bound profile");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-bound-profile-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_bound_profile", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let create = |profile: &str| {
+        let response = unix_request(
+            &socket,
+            &Request::new(
+                "run_bound_profile",
+                "web.session.create",
+                json!({ "profile": profile }),
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("create profile session");
+        assert_eq!(response.status, "ok", "{response:?}");
+        response.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let run = |session_id: &str| {
+        let mut request = Request::new(
+            "run_bound_profile",
+            "web.run",
+            json!({
+                "session_id": session_id,
+                "script_source": "inline",
+                "script_text": format!("await page.goto({origin:?}); console.log(page.url());"),
+                "bind_session_page": true,
+            }),
+        );
+        request.deadline_ms = 60_000;
+        unix_request(&socket, &request, Duration::from_secs(60)).expect("bound web.run")
+    };
+
+    let project = create("project");
+    for phase in ["fresh project page", "reused project page"] {
+        let response = run(&project);
+        assert_eq!(response.status, "ok", "{phase}: {response:?}");
+    }
+
+    let research = create("research");
+    let denied = run(&research);
+    assert_eq!(denied.status, "error", "{denied:?}");
+    assert!(
+        denied.error.as_ref().is_some_and(|error| error
+            .message
+            .contains("research profile denies loopback")),
+        "{denied:?}"
+    );
+
+    let restored = run(&project);
+    assert_eq!(restored.status, "ok", "project after research: {restored:?}");
+}
+
+#[test]
 fn network_query_filters_enriched_response_records() {
     let origin = serve_fixture("unused");
     let socket = std::env::temp_dir().join(format!(
