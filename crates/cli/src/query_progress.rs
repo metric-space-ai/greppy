@@ -29,6 +29,7 @@ impl LocalQueryProgress {
             started_at_unix_secs: None,
             rate_milli_spans_per_second: 0,
             eta_unix_secs: None,
+            worker_count: None,
         }));
         let observed = Arc::clone(&progress);
         let mut reporter = ProgressReporter::default();
@@ -97,6 +98,7 @@ struct JobProgress {
     started_at_unix_secs: Option<u64>,
     rate_milli_spans_per_second: u64,
     eta_unix_secs: Option<u64>,
+    worker_count: Option<u64>,
 }
 
 impl JobProgress {
@@ -133,6 +135,9 @@ impl JobProgress {
                 .unwrap_or(0),
             eta_unix_secs: value
                 .get("eta_unix_secs")
+                .and_then(serde_json::Value::as_u64),
+            worker_count: value
+                .get("worker_count")
                 .and_then(serde_json::Value::as_u64),
         })
     }
@@ -340,8 +345,12 @@ impl ProgressReporter {
             .pid
             .map(|pid| format!("; pid {pid}"))
             .unwrap_or_default();
+        let workers = job
+            .worker_count
+            .map(|workers| format!("; workers {workers}; details: greppy index status --json"))
+            .unwrap_or_default();
         Some(format!(
-            "greppy: {command} — {}: {progress}; {prognosis}{pid}",
+            "greppy: {command} — {}: {progress}; {prognosis}{pid}{workers}",
             job.state
         ))
     }
@@ -431,6 +440,7 @@ mod tests {
             started_at_unix_secs: Some(1_000),
             rate_milli_spans_per_second: 0,
             eta_unix_secs: None,
+            worker_count: None,
         }
     }
 
@@ -463,6 +473,22 @@ mod tests {
             )
             .unwrap();
         assert!(new_phase.contains("measuring phase ETA"), "{new_phase}");
+    }
+
+    #[test]
+    fn automatic_index_readiness_reports_workers_without_poll_spam() {
+        let mut reporter = ProgressReporter::default();
+        let mut active = job("extracting_files", 160, 7170);
+        active.worker_count = Some(2);
+        let initial = reporter
+            .observe("who-calls", Some(active.clone()), Duration::from_secs(2))
+            .unwrap();
+        assert!(initial.contains("160/7170 spans"), "{initial}");
+        assert!(initial.contains("workers 2"), "{initial}");
+        assert!(initial.contains("greppy index status --json"), "{initial}");
+        assert!(reporter
+            .observe("who-calls", Some(active), Duration::from_secs(4))
+            .is_none());
     }
 
     #[test]

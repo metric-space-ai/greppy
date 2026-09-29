@@ -186,6 +186,7 @@ const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
 const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
+const AUTOMATIC_INDEX_MAX_WORKERS: usize = 2;
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
 /// Bound the source sent to the summary daemon. Cache keys continue to use the
@@ -4797,6 +4798,7 @@ struct BackgroundJobGuard {
     kind: String,
     started_at_unix_secs: u64,
     target_generation: u64,
+    worker_count: Option<usize>,
     backend: Option<String>,
     device: Option<String>,
     completed_documents: usize,
@@ -4896,6 +4898,9 @@ impl BackgroundJobGuard {
                 })
                 .unwrap_or_else(unix_now_secs_cli),
             target_generation,
+            worker_count: inherited
+                .and_then(|job| job.get("worker_count").and_then(serde_json::Value::as_u64))
+                .and_then(|workers| usize::try_from(workers).ok()),
             backend: published
                 .as_ref()
                 .and_then(|job| job.get("backend"))
@@ -5080,6 +5085,7 @@ impl BackgroundJobGuard {
             "updated_at_unix_secs": now,
             "cause": self.cause,
             "target_generation": self.target_generation,
+            "worker_count": self.worker_count,
             "state": state,
             "backend": self.backend,
             "device": self.device,
@@ -5472,6 +5478,9 @@ fn spawn_background_job_handle(
     };
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    let inherited_workers = std::env::var_os("GREPPY_WORKERS");
+    let worker_count =
+        (kind == "index").then(|| automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
     // call can observe the child-owned writer lock while background_job is
     // still null and provide no useful progress or recovery information.
@@ -5483,6 +5492,7 @@ fn spawn_background_job_handle(
         "updated_at_unix_secs": started_at,
         "cause": cause,
         "target_generation": target_generation,
+        "worker_count": worker_count,
         "state": "launching",
         "backend": backend,
         "device": device,
@@ -5516,6 +5526,7 @@ fn spawn_background_job_handle(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    configure_automatic_index_workers(&mut command, kind, inherited_workers.as_deref());
     if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
@@ -5606,6 +5617,28 @@ fn spawn_background_job_handle(
         path: job_path,
         demand: Some(demand),
     })
+}
+
+fn automatic_index_worker_count(inherited: Option<&std::ffi::OsStr>) -> usize {
+    inherited
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| (1..=256).contains(workers))
+        .unwrap_or(AUTOMATIC_INDEX_MAX_WORKERS)
+        .min(AUTOMATIC_INDEX_MAX_WORKERS)
+}
+
+fn configure_automatic_index_workers(
+    command: &mut std::process::Command,
+    kind: &str,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Option<usize> {
+    if kind != "index" {
+        return None;
+    }
+    let workers = automatic_index_worker_count(inherited);
+    command.env("GREPPY_WORKERS", workers.to_string());
+    Some(workers)
 }
 
 fn spawn_background_job(

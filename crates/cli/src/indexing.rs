@@ -438,7 +438,7 @@ pub(crate) fn dispatch_index_health(
             println!("store: {}", store_path.display());
             if let Some(job) = status.get("background_job").filter(|job| !job.is_null()) {
                 println!(
-                    "progress: phase={} completed={}/{} eta_seconds={}",
+                    "progress: phase={} completed={}/{} eta_seconds={} workers={}",
                     job.get("state")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("starting"),
@@ -449,6 +449,10 @@ pub(crate) fn dispatch_index_health(
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
                     job.get("eta_seconds")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    job.get("worker_count")
                         .and_then(serde_json::Value::as_u64)
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "unknown".into()),
