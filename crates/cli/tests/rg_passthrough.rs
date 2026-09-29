@@ -471,7 +471,7 @@ fn root_is_shared_by_translated_rg_and_bare_grep() {
         .output()
         .expect("spawn rooted grep");
     let native = Command::new(real_grep)
-        .args(["-R", "Alpha"])
+        .args(["-R", "Alpha", "."])
         .current_dir(&repository)
         .stdin(Stdio::null())
         .output()
