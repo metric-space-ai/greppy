@@ -2378,8 +2378,8 @@ fn resolve_edges_incremental(
             store,
             project,
             &raw_edges,
-            &repaired_base_edges,
             progress,
+            &repaired_base_edges,
         );
     }
 
