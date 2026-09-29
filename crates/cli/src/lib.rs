@@ -4667,25 +4667,31 @@ fn write_background_job_record(
     .map_err(|error| Error::io("lock background job publication", error))?
     .ok_or_else(|| Error::Invalid("background job publication lock unavailable".into()))?;
     if !new_owner {
-        if let Some(current) = read_background_job(path) {
-            let same_epoch = ["target_generation", "started_at_unix_secs"]
-                .iter()
-                .all(|key| {
-                    current
-                        .get(key)
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some()
-                        && current.get(key) == value.get(key)
-                });
-            // Only the launcher may install the PID into a pid=null record;
-            // otherwise an old writer can hijack an immediate same-second retry.
-            let same_owner = current.get("pid") == value.get("pid");
-            if !same_epoch
-                || !same_owner
-                || current.get("state").and_then(serde_json::Value::as_str) == Some("cancelled")
-            {
-                return Ok(());
-            }
+        // Completed owners remove their journal. Late progress must not
+        // recreate it; only an authorized new launcher establishes records.
+        let Some(current) = read_background_job(path) else {
+            return Ok(());
+        };
+        let same_epoch = ["target_generation", "started_at_unix_secs"]
+            .iter()
+            .all(|key| {
+                current
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                    && current.get(key) == value.get(key)
+            });
+        // Only the launcher may install the PID into a pid=null record;
+        // otherwise an old writer can hijack an immediate same-second retry.
+        let same_owner = current.get("pid") == value.get("pid");
+        if !same_epoch
+            || !same_owner
+            || matches!(
+                current.get("state").and_then(serde_json::Value::as_str),
+                Some("cancelled" | "failed")
+            )
+        {
+            return Ok(());
         }
     }
     let temp = parent.join(format!(
@@ -4814,7 +4820,7 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
-        let inherited = if delegated { published.as_ref() } else { None };
+        let inherited = published.as_ref();
         let target_generation = inherited
             .and_then(|job| {
                 job.get("target_generation")
@@ -5192,7 +5198,7 @@ mod background_job_status_tests {
             "state": "cancelled",
             "last_error": "automatic index stopped after its last query waiter exited"
         });
-        write_background_job(&path, &cancelled).unwrap();
+        start_background_job_record(&path, &cancelled).unwrap();
         let mut late = cancelled.clone();
         for phase in [
             "preparing_base_checkout",
@@ -5215,7 +5221,7 @@ mod background_job_status_tests {
             "pid": 42, "target_generation": 2,
             "started_at_unix_secs": 123, "state": "cancelled"
         });
-        write_background_job(&path, &job).unwrap();
+        start_background_job_record(&path, &job).unwrap();
         let mut stale = job.clone();
         stale["state"] = json!("base_graph_ready");
         job["pid"] = json!(null);
@@ -5235,6 +5241,26 @@ mod background_job_status_tests {
         job["state"] = json!("embedding");
         write_background_job(&path, &job).unwrap();
         assert_eq!(read_background_job(&path).unwrap(), job);
+    }
+
+    #[test]
+    fn failed_or_removed_job_cannot_be_revived_by_a_late_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let failed = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "failed",
+            "last_error": "demand monitor failed"
+        });
+        start_background_job_record(&path, &failed).unwrap();
+        let mut late = failed.clone();
+        late["state"] = json!("preparing_base_checkout");
+        late["last_error"] = json!(null);
+        write_background_job(&path, &late).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), failed);
+        std::fs::remove_file(&path).unwrap();
+        write_background_job(&path, &late).unwrap();
+        assert!(!path.exists());
     }
 }
 

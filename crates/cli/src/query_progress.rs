@@ -761,7 +761,7 @@ mod tests {
             })
         };
 
-        crate::write_background_job(&path, &value(std::process::id())).unwrap();
+        crate::start_background_job_record(&path, &value(std::process::id())).unwrap();
         assert!(JobProgress::read(&path).is_some());
 
         // u32::MAX is outside the process-id range supported by our target

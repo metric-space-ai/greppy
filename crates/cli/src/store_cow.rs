@@ -3577,12 +3577,13 @@ mod tests {
         let layout = BaseStoreLayout::new(data_root.path(), &identity).unwrap();
         let held = layout.acquire_builder(true).unwrap().unwrap();
         let progress_path = data_root.path().join("index.job");
-        crate::write_background_job(
+        crate::start_background_job_record(
             &progress_path,
             &serde_json::json!({
                 "schema_version": crate::BACKGROUND_JOB_SCHEMA_VERSION,
                 "kind": "index",
                 "pid": std::process::id(),
+                "target_generation": 1,
                 "started_at_unix_secs": 1,
                 "updated_at_unix_secs": 1,
                 "state": "preparing_base_checkout"

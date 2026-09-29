@@ -1637,7 +1637,7 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
     let root = test_tempdir("delegated-base-progress");
     let job_path = root.join("index.job");
     let outer_pid = 424_242u32;
-    write_background_job(
+    start_background_job_record(
         &job_path,
         &serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
@@ -1673,6 +1673,10 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
 
     let job = read_background_job(&job_path).expect("delegated job remains for outer indexer");
     assert_eq!(job["pid"], outer_pid);
+    assert_eq!(job["target_generation"], 1);
+    assert_eq!(job["started_at_unix_secs"], 1);
+    assert_eq!(job["cause"], "foreground-index");
+    assert_eq!(job["kind"], "index");
     assert_eq!(job["state"], "base_graph_ready");
     assert_eq!(job["completed_spans"], 4);
     assert_eq!(job["total_spans"], 10);
@@ -1689,7 +1693,7 @@ fn graph_index_progress_publishes_real_phase_and_file_counts() {
     let root = test_tempdir("graph-index-progress");
     let job_path = root.join("index.job");
     let pid = std::process::id();
-    write_background_job(
+    start_background_job_record(
         &job_path,
         &serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
@@ -1737,6 +1741,16 @@ fn degraded_overlay_retains_exact_background_failure() {
     let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
     let root = test_tempdir("overlay-embedding-degraded");
     let job_path = root.join("index.job");
+    start_background_job_record(
+        &job_path,
+        &serde_json::json!({
+            "pid": std::process::id(),
+            "target_generation": 1,
+            "started_at_unix_secs": 1,
+            "state": "embedding"
+        }),
+    )
+    .unwrap();
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var("GREPPY_BACKGROUND_JOB", &job_path);
