@@ -452,7 +452,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                         json,
                     ) {
                         Ok(text) => {
-                            println!("{text}");
+                            // View pages already include their terminating newline. Printing one
+                            // more byte can exceed the renderer's exact 8 KiB output contract.
+                            print!("{text}");
                             Ok(0)
                         }
                         Err(message) => emit_error(json, invalid(&message)),
