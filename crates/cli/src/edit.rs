@@ -2619,20 +2619,56 @@ fn rust_free_function_reference_inventory(
                     format!("cannot parse {rel} while inventorying `{symbol}`: {error} — nothing written"),
                     12,
                 )
-            })?;
+        })?;
         for edge in extraction.edges {
+            let import_items = edge
+                .properties
+                .get("imported_items")
+                .and_then(serde_json::Value::as_array);
+            let import_has_glob = edge.edge_type == "IMPORTS"
+                && (edge
+                    .properties
+                    .get("glob")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    || import_items.is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("glob").and_then(serde_json::Value::as_bool) == Some(true)
+                        })
+                    }));
+            if import_has_glob {
+                return Err(EditRefusal::new(
+                    "unresolved_reference_identity",
+                    format!("live Rust glob import in {rel}:{} may bind `{short_name}` while renaming `{symbol}` — replace it with an exact import or refresh identity evidence; nothing written", edge.line),
+                    12,
+                ));
+            }
             let (name_property, path_property) = match edge.edge_type.as_str() {
                 "CALLS" => ("callee_name", "callee_path"),
                 "USAGE" | "USES" => ("ref_name", "ref_path"),
+                "IMPORTS" => ("imported_name", "path"),
                 _ => continue,
             };
-            if edge
+            let named_reference = edge
                 .properties
                 .get(name_property)
                 .and_then(|value| value.as_str())
                 .and_then(|value| value.rsplit("::").next())
-                != Some(short_name)
-            {
+                == Some(short_name);
+            let grouped_import_reference = edge.edge_type == "IMPORTS"
+                && import_items.is_some_and(|items| {
+                    items.iter().any(|item| {
+                        ["imported_name", "original_name"]
+                            .into_iter()
+                            .any(|property| {
+                                item.get(property)
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| value.rsplit("::").next())
+                                    == Some(short_name)
+                            })
+                    })
+                });
+            if !named_reference && !grouped_import_reference {
                 continue;
             }
             let line_range = line_range_to_bytes(&content, edge.line as usize, edge.line as usize);
@@ -3031,8 +3067,23 @@ pub(crate) fn run_trained_rename(
                     12,
                 )));
             };
-            let range =
-                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize);
+            let range = if rust_free_function_inventory_eligible {
+                edge.properties
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok())
+                    .filter(|line| *line >= 1)
+                    .map(|line| line_range_to_bytes(&content, line, line))
+                    .unwrap_or_else(|| {
+                        line_range_to_bytes(
+                            &content,
+                            source.start_line as usize,
+                            span.end_line as usize,
+                        )
+                    })
+            } else {
+                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize)
+            };
             let Some(sites) = greppy_edit::verbs::rename_identifier_sites(
                 std::path::Path::new(&source.file_path),
                 &content,
@@ -3795,6 +3846,24 @@ mod patch_rollback_tests {
         let source = b"struct Helper;\nimpl Helper { fn get_lit_str() {} }\nuse crate::selected::get_lit_str;\nfn caller() { get_lit_str(); }\n";
         let sites = greppy_edit::verbs::rename_identifier_sites(
             std::path::Path::new("method.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 3);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[2]
+        ));
+    }
+
+    #[test]
+    fn associated_method_alone_does_not_own_free_function_call() {
+        let source = b"struct Helper;\nimpl Helper { fn get_lit_str() {} }\nfn caller() { get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("method-only.rs"),
             source,
             &[(0, source.len())],
             "get_lit_str",

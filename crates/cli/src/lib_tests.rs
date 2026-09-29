@@ -463,12 +463,101 @@ fn rename_identity_planner_subprocess_helper() {
         "struct Gadget;\nfn consume(value: Gadget) { let _ = value; }\n"
     );
 
+    // A resolved free-function caller may contain several calls in one indexed
+    // function span. Each edge's persisted source line identifies its exact
+    // call without sweeping the unrelated copy of the same function name.
+    let free_root = test_tempdir("rename-identity-free-multiple");
+    std::fs::create_dir(free_root.join(".git")).unwrap();
+    std::fs::write(
+        free_root.join("selected_free.rs"),
+        "pub fn get_lit_str() {}\npub fn selected_caller() {\n    get_lit_str();\n    get_lit_str();\n    get_lit_str();\n}\n",
+    )
+    .unwrap();
+    let unrelated_free = "pub fn get_lit_str() {}\npub fn unrelated_caller() { get_lit_str(); }\n";
+    std::fs::write(free_root.join("unrelated_free.rs"), unrelated_free).unwrap();
+    let free_store_path = workspace_locator::store_path(&free_root);
+    std::fs::create_dir_all(free_store_path.parent().unwrap()).unwrap();
+    let mut free_store = greppy_store::Store::open(&free_store_path).unwrap();
+    let free_project = workspace_locator::project_identity(&free_root);
+    let free_report = greppy_indexer::index(&mut free_store, &free_root, &free_project).unwrap();
+    assert!(
+        free_report.is_clean(),
+        "free rename fixture: {free_report:?}"
+    );
+    drop(free_store);
+    let free_outcome = run_trained_rename(
+        &free_root,
+        free_root.to_str(),
+        "selected_free.rs::get_lit_str",
+        "get_str_literal",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(free_outcome.published);
+    assert_eq!(
+        std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
+        "pub fn get_str_literal() {}\npub fn selected_caller() {\n    get_str_literal();\n    get_str_literal();\n    get_str_literal();\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(free_root.join("unrelated_free.rs")).unwrap(),
+        unrelated_free
+    );
+
+    // Removing an exact IMPORTS edge must be caught by the live Rust
+    // inventory before either the definition or import is published.
+    let import_root = test_tempdir("rename-identity-free-missing-import");
+    std::fs::create_dir(import_root.join(".git")).unwrap();
+    let import_selected = "pub fn get_lit_str() {}\n";
+    let import_user = "pub use crate::selected_free::get_lit_str;\n";
+    std::fs::write(import_root.join("selected_free.rs"), import_selected).unwrap();
+    std::fs::write(import_root.join("import_user.rs"), import_user).unwrap();
+    let import_store_path = workspace_locator::store_path(&import_root);
+    std::fs::create_dir_all(import_store_path.parent().unwrap()).unwrap();
+    let mut import_store = greppy_store::Store::open(&import_store_path).unwrap();
+    let import_project = workspace_locator::project_identity(&import_root);
+    let import_report =
+        greppy_indexer::index(&mut import_store, &import_root, &import_project).unwrap();
+    assert!(
+        import_report.is_clean(),
+        "import rename fixture: {import_report:?}"
+    );
+    let import_target =
+        resolve_symbol_nodes(&import_store, Some("selected_free.rs::get_lit_str")).unwrap()[0];
+    import_store
+        .conn()
+        .execute(
+            "DELETE FROM edges WHERE target_id = ?1 AND edge_type = 'IMPORTS'",
+            [import_target],
+        )
+        .unwrap();
+    drop(import_store);
+    let import_before = ["selected_free.rs", "import_user.rs"]
+        .map(|path| (path, std::fs::read(import_root.join(path)).unwrap()));
+    let import_refusal = run_trained_rename(
+        &import_root,
+        import_root.to_str(),
+        "selected_free.rs::get_lit_str",
+        "get_str_literal",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(import_refusal.code, "unresolved_reference_identity");
+    for (path, expected) in import_before {
+        assert_eq!(std::fs::read(import_root.join(path)).unwrap(), expected);
+    }
+
     std::fs::remove_dir_all(success_root).unwrap();
     #[cfg(unix)]
     std::fs::remove_dir_all(external_root).unwrap();
     std::fs::remove_dir_all(omitted_root).unwrap();
     std::fs::remove_dir_all(refusal_root).unwrap();
     std::fs::remove_dir_all(type_root).unwrap();
+    std::fs::remove_dir_all(free_root).unwrap();
+    std::fs::remove_dir_all(import_root).unwrap();
 }
 
 #[test]
