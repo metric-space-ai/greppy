@@ -347,8 +347,7 @@ fn coarse_timestamp_proof(
     if !stat_identity_matches(persisted, &current) {
         return None;
     }
-    if !coarse_bucket_end_ns(persisted)
-        .is_some_and(|bucket_end| observation_started_ns >= bucket_end)
+    if coarse_bucket_end_ns(persisted).is_none_or(|bucket_end| observation_started_ns < bucket_end)
     {
         return None;
     }
@@ -423,7 +422,7 @@ fn write_coarse_timestamp_proofs(
     };
     std::fs::create_dir_all(parent)?;
     let mut entries: Vec<_> = proofs.iter().collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(key, _)| *key);
     let mut body = String::from("v1\n");
     for (key, proof) in entries {
         use std::fmt::Write;
