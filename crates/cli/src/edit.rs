@@ -2489,46 +2489,33 @@ fn rust_rename_reference_inventory(
     short_name: &str,
     symbol: &str,
 ) -> EditResult<()> {
-    fn visit(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                if !matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some(".git" | "target" | ".greppy")
-                ) {
-                    visit(&path, files)?;
-                }
-            } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
-                files.push(path);
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = Vec::new();
-    visit(root_path, &mut files).map_err(|error| {
+    let files = greppy_discover::walk(root_path).map_err(|error| {
         EditRefusal::new(
             "unresolved_reference",
             format!("cannot inventory Rust references for `{symbol}`: {error} — nothing written"),
             12,
         )
     })?;
-    for path in files {
-        let Ok(rel) = path.strip_prefix(root_path) else {
+    for entry in files {
+        if std::path::Path::new(&entry.rel_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("rs")
+        {
             continue;
-        };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        let content = std::fs::read(&path).map_err(|error| {
-            EditRefusal::new(
-                "unresolved_reference",
-                format!(
-                    "cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"
-                ),
-                12,
-            )
-        })?;
+        }
+        let rel = entry.rel_path;
+        let content = greppy_discover::read_stable_file(&entry.abs_path)
+            .map(|(content, _)| content)
+            .map_err(|error| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"
+                    ),
+                    12,
+                )
+            })?;
         let extraction = greppy_parser::extract(greppy_parser::Language::Rust, &content, &rel)
             .map_err(|error| {
                 EditRefusal::new(
@@ -2673,18 +2660,50 @@ pub(crate) fn run_trained_rename(
     let short_name = def_nodes[0].name.clone();
     use std::collections::BTreeMap;
     let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-    let mut rust_method_owner: Option<String> = None;
-    let mut rust_inventory_eligible = true;
+    let first_owner = def_nodes[0].qualified_name.rsplit("::").nth(1);
+    let rust_inventory_eligible = first_owner != Some("Function")
+        && first_owner.is_some()
+        && def_nodes.iter().all(|def| {
+            def.file_path.ends_with(".rs") && def.qualified_name.rsplit("::").nth(1) == first_owner
+        });
+    let rust_method_owner = rust_inventory_eligible.then(|| first_owner.unwrap().to_owned());
     for def in &def_nodes {
         let owner = def.qualified_name.rsplit("::").nth(1);
-        if def.file_path.ends_with(".rs") && owner != Some("Function") {
-            match &rust_method_owner {
-                None => rust_method_owner = owner.map(str::to_owned),
-                Some(existing) if Some(existing.as_str()) == owner => {}
-                Some(_) => rust_inventory_eligible = false,
+        if !rust_inventory_eligible {
+            scopes
+                .entry(def.file_path.clone())
+                .or_default()
+                .push((0, usize::MAX));
+            for edge in store.incoming_edges(def.id, None, 100_000)? {
+                let Some(source) = store.get_node(edge.source_id)? else {
+                    continue;
+                };
+                if source.file_path.is_empty() || source.start_line < 1 {
+                    continue;
+                }
+                let Ok(content) = std::fs::read(root_path.join(&source.file_path)) else {
+                    continue;
+                };
+                let Some(span) = read_span_with_meta(
+                    root_path,
+                    &source.file_path,
+                    source.start_line,
+                    source.end_line,
+                    usize::MAX,
+                    false,
+                ) else {
+                    continue;
+                };
+                scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .push(line_range_to_bytes(
+                        &content,
+                        source.start_line as usize,
+                        span.end_line as usize,
+                    ));
             }
-        } else {
-            rust_inventory_eligible = false;
+            continue;
         }
         let content = std::fs::read(root_path.join(&def.file_path))
             .map_err(|error| Error::io(format!("read {} for rename", def.file_path), error))?;
@@ -2710,7 +2729,7 @@ pub(crate) fn run_trained_rename(
             definition_range,
             &short_name,
         );
-        let Some([definition_site]) = definition_sites.as_deref() else {
+        let Some([definition_scope]) = definition_sites.as_deref() else {
             return Ok(Err(EditRefusal::new(
                 "ambiguous_symbol",
                 format!(
@@ -2722,7 +2741,7 @@ pub(crate) fn run_trained_rename(
         scopes
             .entry(def.file_path.clone())
             .or_default()
-            .push(*definition_site);
+            .push(*definition_scope);
         for edge in store.incoming_edges(def.id, None, 100_000)? {
             let property = match edge.edge_type.as_str() {
                 "CALLS" => "callee_name",

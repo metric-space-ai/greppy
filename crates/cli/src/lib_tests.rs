@@ -288,6 +288,19 @@ fn rename_identity_planner_subprocess_helper() {
 
     let success_root = test_tempdir("rename-identity-success");
     let (project, store_path) = index_rename_fixture(&success_root);
+    #[cfg(unix)]
+    let external_root = {
+        use std::os::unix::fs::symlink;
+        let external = test_tempdir("rename-identity-external");
+        std::fs::write(
+            external.join("outside.rs"),
+            "fn outside(value: UnknownOwner) { value.next(); }\n",
+        )
+        .unwrap();
+        symlink(&external, success_root.join("external-link")).unwrap();
+        symlink(&success_root, success_root.join("ancestor-loop")).unwrap();
+        external
+    };
     {
         let mut store = greppy_store::Store::open(&store_path).unwrap();
         let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
@@ -415,6 +428,8 @@ fn rename_identity_planner_subprocess_helper() {
     }
 
     std::fs::remove_dir_all(success_root).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_dir_all(external_root).unwrap();
     std::fs::remove_dir_all(omitted_root).unwrap();
     std::fs::remove_dir_all(refusal_root).unwrap();
 }
