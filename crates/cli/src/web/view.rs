@@ -1,4 +1,4 @@
-//! Opt-in human web view. No model inference, page execution, or graph store.
+//! Default human web view. No model inference, page execution, or graph store.
 //! Continuations read immutable local snapshots; they never repeat an action.
 
 #[path = "view_scope.rs"]
@@ -37,7 +37,10 @@ struct Snapshot {
 }
 
 pub(super) fn enabled() -> bool {
-    std::env::var("GREPPY_WEB_VIEW").as_deref() == Ok("compact")
+    !matches!(
+        std::env::var("GREPPY_WEB_VIEW").as_deref(),
+        Ok("" | "0" | "off" | "raw" | "legacy")
+    )
 }
 
 fn now() -> u64 {
