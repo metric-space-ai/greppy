@@ -1737,9 +1737,13 @@ impl Daemon {
             session_id,
             run_budget.as_millis()
         ); }
+        let mut profile_params = json!({ "profile": profile.as_str() });
+        if let Some(page) = bound_page.as_deref() {
+            profile_params["page"] = json!(page);
+        }
         if let Err(error) = self.engine_call_timed(
             "session.setProfile",
-            json!({ "profile": profile.as_str() }),
+            profile_params,
             run_deadline.saturating_duration_since(Instant::now()),
         ) {
             self.finish_session(&session_id);
