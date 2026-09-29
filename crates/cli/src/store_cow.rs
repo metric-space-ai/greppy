@@ -18,7 +18,7 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v1";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v2";
 const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
@@ -719,11 +719,12 @@ pub(crate) fn visibility_for_open_connection(
 /// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
-/// The repair consumes only raw edges physically owned by the Delta and
-/// replaces only its logical overlay edges. Nodes, file state, and vector
-/// embeddings remain untouched. The schema-meta marker makes the operation
-/// one-shot for an otherwise unchanged Delta; a failed resolution leaves the
-/// marker absent so the next query can retry safely.
+/// The repair consumes the composed visible raw-edge view, including raw edges
+/// retained in an immutable Base, and replaces the logical overlay edges with
+/// results from the current resolver. Nodes, file state, and vector embeddings
+/// remain untouched. The schema-meta marker makes the operation one-shot for
+/// an otherwise unchanged Delta; a failed resolution leaves the marker absent
+/// so the next query can retry safely.
 pub(crate) fn repair_persisted_v7_delta(
     delta_path: &Path,
     base_path: &Path,
@@ -772,7 +773,7 @@ pub(crate) fn repair_persisted_v7_delta(
     }
     drop(current);
     let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
-    let raw_edges = overlay.list_delta_raw_edges(project)?;
+    let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
         let existing_edges: i64 = overlay
             .conn()
@@ -784,11 +785,12 @@ pub(crate) fn repair_persisted_v7_delta(
             .map_err(|error| Error::Store(format!("count persisted Delta edges: {error}")))?;
         if existing_edges != 0 {
             return Err(Error::Invalid(
-                "pre-PR138 Delta has resolved edges but no persisted raw edges to repair".into(),
+                "pre-PR138 Store-CoW graph has resolved edges but no persisted raw edges to repair"
+                    .into(),
             ));
         }
     }
-    greppy_indexer::rebuild_overlay_edges(&mut overlay, project)?;
+    greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, project)?;
     overlay
         .conn()
         .execute(
@@ -2693,6 +2695,7 @@ mod tests {
             ENV_MODE,
             ENV_BASE_PATH,
             ENV_BASE_COMMIT,
+            crate::ENV_STRUCTURAL_FIRST_USE,
         ]);
         let scratch = tempfile::tempdir().unwrap();
         // The freshness proof compares the live workspace with the exact
@@ -2744,33 +2747,83 @@ mod tests {
                 properties: serde_json::json!({}),
             })
             .unwrap();
+            let target_id = base
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "target".into(),
+                    qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
+                    file_path: "src/alias_chain/sub.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
             base.insert_node(&greppy_store::NewNode {
                 project: "p".into(),
                 label: "Function".into(),
-                name: "target".into(),
-                qualified_name: "src/alias_chain/sub.rs::Function::target".into(),
-                file_path: "src/alias_chain/sub.rs".into(),
+                name: "base_caller".into(),
+                qualified_name: "src/base.rs::Function::base_caller".into(),
+                file_path: "src/base.rs".into(),
                 start_line: 1,
                 end_line: 1,
                 properties: serde_json::json!({}),
             })
             .unwrap();
-            base.insert_raw_edges(&[greppy_store::NewRawEdge {
+            let stable_caller_id = base
+                .insert_node(&greppy_store::NewNode {
+                    project: "p".into(),
+                    label: "Function".into(),
+                    name: "stable_caller".into(),
+                    qualified_name: "src/stable.rs::Function::stable_caller".into(),
+                    file_path: "src/stable.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties: serde_json::json!({}),
+                })
+                .unwrap();
+            base.insert_edge(&greppy_store::NewEdge {
                 project: "p".into(),
-                file_path: "src/alias_chain/mod.rs".into(),
-                source_qname: "src/alias_chain/mod.rs::__file__".into(),
-                target_qname: "src/alias_chain/mod.rs::Import::sub::target".into(),
-                edge_type: "IMPORTS".into(),
-                properties: serde_json::json!({
-                    "imported_name": "target",
-                    "imported_items": [{
-                        "path": "sub::target",
-                        "imported_name": "outer",
-                        "original_name": "target",
-                        "glob": false
-                    }]
-                }),
-            }])
+                source_id: stable_caller_id,
+                target_id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"ref_name": "target"}),
+            })
+            .unwrap();
+            base.insert_raw_edges(&[
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/alias_chain/mod.rs".into(),
+                    source_qname: "src/alias_chain/mod.rs::__file__".into(),
+                    target_qname: "src/alias_chain/mod.rs::Import::sub::target".into(),
+                    edge_type: "IMPORTS".into(),
+                    properties: serde_json::json!({
+                        "imported_name": "target",
+                        "imported_items": [{
+                            "path": "sub::target",
+                            "imported_name": "outer",
+                            "original_name": "target",
+                            "glob": false
+                        }]
+                    }),
+                },
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/stable.rs".into(),
+                    source_qname: "src/stable.rs::Function::stable_caller".into(),
+                    target_qname: "src/alias_chain/sub.rs::Function::target".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({"callee_name": "target"}),
+                },
+                greppy_store::NewRawEdge {
+                    project: "p".into(),
+                    file_path: "src/base.rs".into(),
+                    source_qname: "src/base.rs::Function::base_caller".into(),
+                    target_qname: "src/alias_chain/sub.rs::Function::target".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({"callee_name": "target"}),
+                },
+            ])
             .unwrap();
         }
         let base_identity = base_identity_parts(&root, &base_commit).unwrap();
@@ -2837,6 +2890,16 @@ mod tests {
                     graph_generation: 7,
                     updated_at: "2026-09-27T00:00:00Z".into(),
                 })
+                .unwrap();
+            delta
+                .conn()
+                .execute(
+                    "INSERT OR REPLACE INTO main.schema_meta (key, value) VALUES (?1, ?2)",
+                    [
+                        "greppy.rust_caller_edges_repair.v1",
+                        RUST_CALLER_EDGES_REPAIR_COMPLETE,
+                    ],
+                )
                 .unwrap();
             delta
                 .insert_node(&greppy_store::NewNode {
@@ -2941,6 +3004,18 @@ mod tests {
             .incoming_edges(legacy_target.id, Some("USAGE"), 10)
             .unwrap()
             .is_empty());
+        let legacy_base_caller = legacy
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
+        assert!(
+            legacy
+                .incoming_edges(legacy_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != legacy_base_caller.id),
+            "the missing Base caller has no stale logical edge before repair"
+        );
         drop(legacy);
         let vector_before: Vec<u8> =
             greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
@@ -2995,6 +3070,54 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
+        let base_caller = repaired
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller.id));
+        let stable_caller = repaired
+            .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
+            .unwrap()
+            .unwrap();
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller.id));
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges
+                     WHERE project = 'p'
+                       AND source_qualified_name = 'src/base.rs::Function::base_caller'
+                       AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "only the missing Base relation becomes a repair overlay"
+        );
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.overlay_edges
+                     WHERE project = 'p'
+                       AND source_qualified_name = 'src/stable.rs::Function::stable_caller'
+                       AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "an unchanged Base relation is not copied into the repair set"
+        );
         assert_eq!(
             repaired
                 .get_workspace_state(&root_string)
@@ -3013,17 +3136,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vector_after, vector_before);
-        assert_eq!(
-            repaired
+        let overlay_relations = |store: &greppy_store::Store| {
+            let mut statement = store
                 .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM main.overlay_edges WHERE project = 'p'",
-                    [],
-                    |row| row.get::<_, i64>(0),
+                .prepare(
+                    "SELECT source_qualified_name, target_qualified_name, edge_type,
+                            COALESCE(json_extract(properties, '$.greppy_base_repair_v2'), 0)
+                     FROM main.overlay_edges WHERE project = 'p'
+                     ORDER BY source_qualified_name, target_qualified_name, edge_type",
                 )
-                .unwrap(),
-            1
-        );
+                .unwrap();
+            let relations = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            relations
+        };
+        // The one-shot composed rebuild shadows an existing Base relation too.
+        // Store visibility suppresses the matching Base row, so this is one
+        // visible relation, not two. Only missing Base edges carry repair markers.
+        let expected_relations = [
+            ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
+            ("src/base.rs::Function::base_caller", "CALLS", 1),
+            ("src/caller.rs::Function::caller", "USAGE", 0),
+            ("src/stable.rs::Function::stable_caller", "CALLS", 0),
+        ]
+        .into_iter()
+        .map(|(source, kind, repaired)| {
+            (
+                source.to_string(),
+                "src/alias_chain/sub.rs::Function::target".to_string(),
+                kind.to_string(),
+                repaired,
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(overlay_relations(&repaired), expected_relations);
         let vector_count = repaired
             .conn()
             .query_row(
@@ -3053,6 +3209,102 @@ mod tests {
                 .graph_generation,
             7
         );
+        drop(warm);
+
+        // A later ordinary dirty-file publication rebuilds Delta-owned raw
+        // edges. The repaired Base-derived overlay edge must remain visible;
+        // it cannot depend on rescanning Base raw edges on every query.
+        std::fs::write(
+            root.join(caller_rel_path),
+            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// second dirty Delta\n",
+        )
+        .unwrap();
+        // A production drift query launches `<current greppy> index ...` with
+        // structural-first-use set. This unit test runs inside the libtest
+        // executable, so spawning current_exe would feed CLI arguments to the
+        // test harness. Dispatch the same structural index path in-process;
+        // embeddings remain deferred and the vector-preservation assertion
+        // below continues to cover the one-shot repair contract.
+        std::env::set_var(crate::ENV_STRUCTURAL_FIRST_USE, "1");
+        let index_code = crate::dispatch(
+            crate::Cli::try_parse_from(["greppy", "index", &root_string, "--root", &root_string])
+                .unwrap(),
+        )
+        .unwrap();
+        std::env::remove_var(crate::ENV_STRUCTURAL_FIRST_USE);
+        assert_eq!(index_code, 0, "dirty structural publication should succeed");
+        let code = crate::dispatch(
+            crate::Cli::try_parse_from(["greppy", "--root", &root_string, "who-calls", "target"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(code, 0, "dirty publication should succeed");
+        let after_dirty = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        let target_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let base_caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/base.rs::Function::base_caller")
+            .unwrap()
+            .unwrap();
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller_after_dirty.id));
+        let stable_caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
+            .unwrap()
+            .unwrap();
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller_after_dirty.id));
+        let later_relations = overlay_relations(&after_dirty);
+        assert!(
+            later_relations
+                .iter()
+                .all(|row| row.0 != "src/stable.rs::Function::stable_caller"),
+            "ordinary bounded publication must prune the temporary Base shadow"
+        );
+        assert_eq!(
+            later_relations
+                .iter()
+                .filter(|row| row.3 == 1)
+                .collect::<Vec<_>>(),
+            expected_relations
+                .iter()
+                .filter(|row| row.3 == 1)
+                .collect::<Vec<_>>(),
+            "both missing Base relations must survive ordinary Delta publication"
+        );
+        let caller_after_dirty = after_dirty
+            .get_node_by_qname("p", "src/caller.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_dirty
+                .incoming_edges(target_after_dirty.id, None, 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller_after_dirty.id
+                    && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")),
+            "the real parser must republish the dirty caller relation"
+        );
+        // The edge-only compatibility repair above must preserve vectors.
+        // This later phase actually changes caller.rs, so its stale embedding
+        // must be invalidated by ordinary file reindexing, not carried forward.
+        let stale_caller_vectors: i64 = after_dirty
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.vector_embeddings WHERE project = 'p' AND file_path = 'src/caller.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_caller_vectors, 0);
     }
 
     #[test]

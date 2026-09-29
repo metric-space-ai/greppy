@@ -1652,7 +1652,7 @@ fn resolve_and_persist_edges(
     project: &str,
     edges: &[ExtractedEdge],
 ) -> Result<usize> {
-    resolve_and_persist_edges_with_progress(store, project, edges, &mut |_| {})
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, &mut |_| {}, &[])
 }
 
 fn resolve_and_persist_edges_with_progress(
@@ -1660,6 +1660,16 @@ fn resolve_and_persist_edges_with_progress(
     project: &str,
     edges: &[ExtractedEdge],
     progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<usize> {
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, progress, &[])
+}
+
+fn resolve_and_persist_edges_with_progress_and_preserved(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+    preserved_overlay_edges: &[NewOverlayEdge],
 ) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
@@ -1740,9 +1750,13 @@ fn resolve_and_persist_edges_with_progress(
         for (source_file, globs) in &index.import_globs_by_file {
             for glob in globs {
                 pending.extend(
-                    rust_module_files_for_module_path(source_file, glob)
-                        .into_iter()
-                        .filter(|file| index.known_files.contains(file)),
+                    rust_module_files_for_module_path_with_crate_roots(
+                        source_file,
+                        glob,
+                        index.rust_crate_roots.as_ref(),
+                    )
+                    .into_iter()
+                    .filter(|file| index.known_files.contains(file)),
                 );
             }
         }
@@ -1799,9 +1813,13 @@ fn resolve_and_persist_edges_with_progress(
             if let Some(globs) = index.import_globs_by_file.get(&module_file) {
                 for glob in globs {
                     pending.extend(
-                        rust_module_files_for_module_path(&module_file, glob)
-                            .into_iter()
-                            .filter(|file| index.known_files.contains(file)),
+                        rust_module_files_for_module_path_with_crate_roots(
+                            &module_file,
+                            glob,
+                            index.rust_crate_roots.as_ref(),
+                        )
+                        .into_iter()
+                        .filter(|file| index.known_files.contains(file)),
                     );
                 }
             }
@@ -1859,7 +1877,7 @@ fn resolve_and_persist_edges_with_progress(
     // the same IMPORTS-then-references order resolved above.
     progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     if store.is_overlay() {
-        let logical = resolved
+        let resolved_logical = resolved
             .iter()
             .map(|edge| {
                 let source_qualified_name =
@@ -1885,6 +1903,8 @@ fn resolve_and_persist_edges_with_progress(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut logical = preserved_overlay_edges.to_vec();
+        logical.extend(resolved_logical);
         store.replace_overlay_edges(project, &logical)?;
     } else {
         insert_edges_batched(store, &resolved)?;
@@ -2043,7 +2063,9 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
 /// Store-CoW Delta. This is intentionally O(Delta raw edges), never O(Base):
 /// it closes no-op/prune generations where the incremental parser correctly
 /// skips unchanged dirty files but publication still needs a self-contained
-/// next Delta snapshot.
+/// next Delta snapshot. A small set of compatibility edges published by the
+/// one-shot Base repair is carried forward from existing overlay rows; it is
+/// filtered by current visibility and does not rescan Base raw edges.
 pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
     if !store.is_overlay() {
         return Err(greppy_core::Error::Invalid(
@@ -2051,7 +2073,129 @@ pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> 
         ));
     }
     let raw_edges = load_all_raw_edges(store, project)?;
-    resolve_and_persist_edges(store, project, &raw_edges)
+    let preserved = repaired_base_overlay_edges(store, project)?;
+    resolve_and_persist_edges_with_progress_and_preserved(
+        store,
+        project,
+        &raw_edges,
+        &mut |_| {},
+        &preserved,
+    )
+}
+
+/// Rebuild every visible logical edge in a private Store-CoW Delta from the
+/// composed raw-edge view. This is reserved for one-shot compatibility repair
+/// of an immutable Base whose raw edges were extracted by an older resolver;
+/// ordinary Delta indexing must keep using [`rebuild_overlay_edges`] so its
+/// work remains bounded by Delta-owned files.
+pub fn rebuild_visible_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
+    if !store.is_overlay() {
+        return Err(greppy_core::Error::Invalid(
+            "rebuild_visible_overlay_edges requires an overlay Store".into(),
+        ));
+    }
+    let raw_edges = store.list_raw_edges(project)?;
+    let edges = raw_edges
+        .into_iter()
+        .map(extracted_edge_from_raw)
+        .collect::<Vec<_>>();
+    let resolved = resolve_and_persist_edges(store, project, &edges)?;
+    mark_missing_base_repair_edges(store, project)?;
+    Ok(resolved)
+}
+
+fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "UPDATE main.overlay_edges AS d
+             SET properties = json_set(
+                 CASE WHEN json_type(d.properties) = 'object' THEN d.properties ELSE '{}' END,
+                 '$.greppy_base_repair_v2', 1)
+             WHERE d.project = ?1
+               AND EXISTS (
+                   SELECT 1 FROM nodes s
+                   WHERE s.project = d.project
+                     AND s.qualified_name = d.source_qualified_name
+                     AND NOT EXISTS (
+                         SELECT 1 FROM temp.greppy_hidden_paths h
+                         WHERE h.path = s.file_path
+                     )
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM greppy_base.nodes bs
+                   JOIN greppy_base.edges e
+                     ON e.project = bs.project AND e.source_id = bs.id
+                   JOIN greppy_base.nodes bt
+                     ON bt.project = e.project AND bt.id = e.target_id
+                   WHERE bs.project = d.project
+                     AND bs.qualified_name = d.source_qualified_name
+                     AND bt.project = d.project
+                     AND bt.qualified_name = d.target_qualified_name
+                     AND e.project = d.project
+                     AND e.edge_type = d.edge_type
+               )
+               AND json_extract(d.properties, '$.greppy_base_repair_v2') IS NULL",
+            rusqlite::params![project],
+        )
+        .map_err(sqlite_err)?;
+    Ok(())
+}
+
+fn repaired_base_overlay_edges(store: &Store, project: &str) -> Result<Vec<NewOverlayEdge>> {
+    let rows = {
+        let mut stmt = store
+            .conn()
+            .prepare_cached(
+                "SELECT source_qualified_name, target_qualified_name, edge_type, properties
+                 FROM main.overlay_edges
+                 WHERE project = ?1
+                   AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+            )
+            .map_err(sqlite_err)?;
+        let collected = stmt
+            .query_map(rusqlite::params![project], |row| {
+                let properties: String = row.get(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    properties,
+                ))
+            })
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        collected
+    };
+    let mut preserved = Vec::with_capacity(rows.len());
+    for (source, target, edge_type, properties) in rows {
+        let Some(source_node) = store.get_node_by_qname(project, &source)? else {
+            continue;
+        };
+        let source_hidden: i64 = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.greppy_hidden_paths WHERE path = ?1)",
+                rusqlite::params![source_node.file_path],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if source_hidden != 0 || store.get_node_by_qname(project, &target)?.is_none() {
+            continue;
+        }
+        preserved.push(NewOverlayEdge {
+            project: project.to_string(),
+            source_qualified_name: source,
+            target_qualified_name: target,
+            edge_type,
+            properties: serde_json::from_str(&properties).map_err(|error| {
+                greppy_core::Error::Store(format!("overlay edge JSON: {error}"))
+            })?,
+        });
+    }
+    Ok(preserved)
 }
 
 // Test-only instrumentation: the number of raw edges PHASE B actually fed
@@ -2223,8 +2367,20 @@ fn resolve_edges_incremental(
     // copied into the Delta merely because a definition changed.
     if store.is_overlay() {
         let raw_edges = load_all_raw_edges(store, project)?;
+        // A persisted Delta may also contain the bounded Base-edge repairs
+        // published by `rebuild_visible_overlay_edges`. Replacing the
+        // Delta's resolved edges from its own raw rows must carry those
+        // explicitly marked rows forward; otherwise the structural index
+        // pass erases them before the caller can rebuild the composed view.
+        let repaired_base_edges = repaired_base_overlay_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
+        return resolve_and_persist_edges_with_progress_and_preserved(
+            store,
+            project,
+            &raw_edges,
+            progress,
+            &repaired_base_edges,
+        );
     }
 
     // Did a changed file alter the resolvable definition set? If so, an
@@ -2720,6 +2876,10 @@ struct GraphIndex {
     /// module files, never global basename matches.
     rust_namespaces_by_file:
         std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    /// Declared Cargo target files for this project. `None` means no readable
+    /// Cargo manifest was available. Uncovered files retain the conventional
+    /// source-layout fallback because target discovery is intentionally bounded.
+    rust_crate_roots: Option<std::collections::HashSet<String>>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
     id_to_file: std::collections::HashMap<i64, String>,
@@ -2750,17 +2910,31 @@ impl UniqueResolution {
     }
 }
 
-fn rust_module_files_for_path(referrer_file: &str, ref_path: &str, name: &str) -> Vec<String> {
+fn rust_module_files_for_path_with_crate_roots(
+    referrer_file: &str,
+    ref_path: &str,
+    name: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
     let Some(module_path) = ref_path
         .strip_suffix(name)
         .and_then(|path| path.strip_suffix("::"))
     else {
         return Vec::new();
     };
-    rust_module_files_for_module_path(referrer_file, module_path)
+    rust_module_files_for_module_path_with_crate_roots(referrer_file, module_path, crate_roots)
 }
 
-fn rust_module_files_for_module_path(referrer_file: &str, module_path: &str) -> Vec<String> {
+fn rust_module_files_for_module_path_with_crate_roots(
+    referrer_file: &str,
+    module_path: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    // Cargo permits a binary/library target outside the conventional
+    // `src/{main,lib}.rs` location. When Cargo target metadata is available,
+    // choose the nearest ancestor of one of those declared target files for
+    // `crate::` paths. This keeps module resolution lexical without treating
+    // an arbitrary nested `main.rs`/`lib.rs` as a crate root.
     let referrer = Path::new(referrer_file);
     let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
     let is_module_root = referrer
@@ -2779,12 +2953,17 @@ fn rust_module_files_for_module_path(referrer_file: &str, module_path: &str) -> 
     {
         match module {
             "crate" if position == 0 => {
-                let root_end = referrer_file
-                    .rfind("/src/")
-                    .map(|offset| offset + "/src".len())
-                    .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
-                base = root_end
-                    .map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                base = crate_roots
+                    .and_then(|roots| rust_crate_root_for_file(referrer_file, roots))
+                    .or_else(|| {
+                        // Manifest discovery is intentionally bounded. Preserve
+                        // conventional crate resolution for uncovered members.
+                        let root_end = referrer_file
+                            .rfind("/src/")
+                            .map(|offset| offset + "/src".len())
+                            .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                        root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                    })
                     .unwrap_or_else(|| {
                         referrer
                             .parent()
@@ -2807,6 +2986,213 @@ fn rust_module_files_for_module_path(referrer_file: &str, module_path: &str) -> 
     let lib = base.join("lib.rs").to_string_lossy().replace('\\', "/");
     let main = base.join("main.rs").to_string_lossy().replace('\\', "/");
     vec![flat, nested, lib, main]
+}
+
+fn rust_crate_root_for_file(
+    referrer_file: &str,
+    crate_roots: &std::collections::HashSet<String>,
+) -> Option<std::path::PathBuf> {
+    let mut directory = Path::new(referrer_file).parent()?.to_path_buf();
+    loop {
+        if crate_roots
+            .iter()
+            .any(|root| Path::new(root).parent() == Some(directory.as_path()))
+        {
+            return Some(directory);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
+fn rust_crate_roots_for_project(
+    store: &Store,
+    project: &str,
+    known_files: &std::collections::HashSet<String>,
+) -> Option<std::collections::HashSet<String>> {
+    let project = store.get_project(project).ok().flatten()?;
+    let root = std::fs::canonicalize(project.root_path).ok()?;
+    let mut roots = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
+    if !rust_crate_roots_from_manifest(
+        &root.join("Cargo.toml"),
+        &root,
+        known_files,
+        &mut roots,
+        &mut visited,
+    ) {
+        return None;
+    }
+    Some(roots)
+}
+
+fn rust_crate_roots_from_manifest(
+    manifest_path: &std::path::Path,
+    repository_root: &std::path::Path,
+    known_files: &std::collections::HashSet<String>,
+    roots: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> bool {
+    let manifest_path = std::fs::canonicalize(manifest_path)
+        .ok()
+        .unwrap_or_else(|| manifest_path.to_path_buf());
+    if !visited.insert(manifest_path.clone()) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let manifest_root = manifest_path.parent().unwrap_or(repository_root);
+    if let Some(members) = document
+        .get("workspace")
+        .and_then(|item| item.as_table())
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_array())
+    {
+        for member in members.iter().filter_map(|value| value.as_str()) {
+            for member_manifest in workspace_member_manifests(manifest_root, member) {
+                let _ = rust_crate_roots_from_manifest(
+                    &member_manifest,
+                    repository_root,
+                    known_files,
+                    roots,
+                    visited,
+                );
+            }
+        }
+    }
+    let Some(package) = document.get("package").and_then(|item| item.as_table()) else {
+        return true;
+    };
+
+    let relative_path = |path: &std::path::Path| -> Option<String> {
+        let relative = path.strip_prefix(repository_root).ok()?;
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    };
+    let add_target = |target: &str, roots: &mut std::collections::HashSet<String>| {
+        let path = manifest_root.join(target);
+        if let Some(relative) = relative_path(&path) {
+            roots.insert(relative);
+        }
+    };
+    let known_target = |target: &str| {
+        relative_path(&manifest_root.join(target))
+            .is_some_and(|relative| known_files.contains(&relative))
+    };
+    let autolib = package
+        .get("autolib")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+    let autobins = package
+        .get("autobins")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+
+    let lib = document.get("lib").and_then(|item| item.as_table());
+    if let Some(path) = lib
+        .and_then(|table| table.get("path"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_str())
+    {
+        add_target(path, roots);
+    } else if autolib && known_target("src/lib.rs") {
+        add_target("src/lib.rs", roots);
+    }
+
+    if let Some(bins) = document
+        .get("bin")
+        .and_then(|item| item.as_array_of_tables())
+    {
+        for bin in bins {
+            if let Some(path) = bin
+                .get("path")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                add_target(path, roots);
+            } else if let Some(name) = bin
+                .get("name")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                let inferred = format!("src/bin/{name}.rs");
+                if known_target(&inferred) {
+                    add_target(&inferred, roots);
+                }
+            }
+        }
+    }
+    if autobins {
+        if known_target("src/main.rs") {
+            add_target("src/main.rs", roots);
+        }
+        let manifest_prefix = relative_path(manifest_root).unwrap_or_default();
+        let bin_prefix = if manifest_prefix.is_empty() {
+            "src/bin/".to_string()
+        } else {
+            format!("{manifest_prefix}/src/bin/")
+        };
+        for path in known_files {
+            let Some(rest) = path.strip_prefix(&bin_prefix) else {
+                continue;
+            };
+            let direct = !rest.contains('/') && rest.ends_with(".rs");
+            let nested = rest.matches('/').count() == 1 && rest.ends_with("/main.rs");
+            if direct || nested {
+                let target = format!("src/bin/{rest}");
+                add_target(&target, roots);
+            }
+        }
+    }
+    true
+}
+
+fn workspace_member_manifests(
+    workspace_root: &std::path::Path,
+    member: &str,
+) -> Vec<std::path::PathBuf> {
+    // This is deliberately a narrow manifest reader: explicit members and a
+    // single standalone `*` component are enough for the source layouts that
+    // need crate-root resolution here. Cargo's full glob semantics and
+    // `workspace.exclude` are not reproduced by this helper.
+    let pattern = std::path::Path::new(member);
+    let Some((wildcard_index, _)) = pattern
+        .components()
+        .enumerate()
+        .find(|(_, component)| component.as_os_str().to_string_lossy() == "*")
+    else {
+        return vec![workspace_root.join(pattern).join("Cargo.toml")];
+    };
+    let components = pattern.components().collect::<Vec<_>>();
+    let mut prefix = std::path::PathBuf::new();
+    for component in &components[..wildcard_index] {
+        prefix.push(component.as_os_str());
+    }
+    let mut suffix = std::path::PathBuf::new();
+    for component in &components[wildcard_index + 1..] {
+        suffix.push(component.as_os_str());
+    }
+    let Ok(entries) = std::fs::read_dir(workspace_root.join(prefix)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .map(|path| path.join(&suffix).join("Cargo.toml"))
+        .collect()
 }
 
 fn rust_module_files_below_alias(
@@ -2900,6 +3286,7 @@ impl GraphIndex {
                 by_qname.insert(qname, node);
             }
         }
+        let rust_crate_roots = rust_crate_roots_for_project(store, project, &known_files);
         Ok(GraphIndex {
             by_qname,
             by_id,
@@ -2910,6 +3297,7 @@ impl GraphIndex {
             import_module_files_by_file: std::collections::HashMap::new(),
             import_globs_by_file: std::collections::HashMap::new(),
             rust_namespaces_by_file: std::collections::HashMap::new(),
+            rust_crate_roots,
             id_to_file,
             id_to_qname,
             files_by_stem,
@@ -2964,7 +3352,12 @@ impl GraphIndex {
                 .get("path")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let module_files = rust_module_files_for_path(file, path, name);
+            let module_files = rust_module_files_for_path_with_crate_roots(
+                file,
+                path,
+                name,
+                self.rust_crate_roots.as_ref(),
+            );
             let visible_module_files = module_files
                 .iter()
                 .filter(|module_file| self.known_files.contains(*module_file))
@@ -3001,11 +3394,15 @@ impl GraphIndex {
                     .insert(*target);
             }
             let namespace_path = format!("{path}::__namespace__");
-            let existing_modules =
-                rust_module_files_for_path(file, &namespace_path, "__namespace__")
-                    .into_iter()
-                    .filter(|module_file| self.known_files.contains(module_file))
-                    .collect::<Vec<_>>();
+            let existing_modules = rust_module_files_for_path_with_crate_roots(
+                file,
+                &namespace_path,
+                "__namespace__",
+                self.rust_crate_roots.as_ref(),
+            )
+            .into_iter()
+            .filter(|module_file| self.known_files.contains(module_file))
+            .collect::<Vec<_>>();
             if !existing_modules.is_empty() {
                 self.rust_namespaces_by_file
                     .entry(file.to_string())
@@ -3151,10 +3548,15 @@ impl GraphIndex {
             .and_then(|aliases| aliases.get(name))
         {
             for (path, original_name) in sources {
-                let mut source_files = rust_module_files_for_path(module_file, path, original_name)
-                    .into_iter()
-                    .filter(|file| self.known_files.contains(file))
-                    .collect::<Vec<_>>();
+                let mut source_files = rust_module_files_for_path_with_crate_roots(
+                    module_file,
+                    path,
+                    original_name,
+                    self.rust_crate_roots.as_ref(),
+                )
+                .into_iter()
+                .filter(|file| self.known_files.contains(file))
+                .collect::<Vec<_>>();
                 if source_files.is_empty() && path == original_name {
                     source_files.push(module_file.to_string());
                 }
@@ -3180,7 +3582,11 @@ impl GraphIndex {
         }
         if let Some(globs) = self.import_globs_by_file.get(module_file) {
             for glob in globs {
-                for exported_file in rust_module_files_for_module_path(module_file, glob) {
+                for exported_file in rust_module_files_for_module_path_with_crate_roots(
+                    module_file,
+                    glob,
+                    self.rust_crate_roots.as_ref(),
+                ) {
                     if self.known_files.contains(&exported_file) {
                         self.rust_module_export_targets_from_file(
                             &exported_file,
@@ -3252,7 +3658,13 @@ impl GraphIndex {
         if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
             let module_files = globs
                 .iter()
-                .flat_map(|glob| rust_module_files_for_module_path(referrer_file, glob))
+                .flat_map(|glob| {
+                    rust_module_files_for_module_path_with_crate_roots(
+                        referrer_file,
+                        glob,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                })
                 .filter(|file| self.known_files.contains(file))
                 .collect::<Vec<_>>();
             let exported = self.rust_module_export_targets(&module_files, name, labels);
@@ -3368,7 +3780,14 @@ impl GraphIndex {
                 .get(referrer_file)
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
-                .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
+                .unwrap_or_else(|| {
+                    rust_module_files_for_path_with_crate_roots(
+                        referrer_file,
+                        ref_path,
+                        name,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                });
             let module_exists = module_files
                 .iter()
                 .any(|module_file| self.known_files.contains(module_file));
@@ -3435,7 +3854,14 @@ impl GraphIndex {
                 .get(referrer_file)
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, owner_path, owner))
-                .unwrap_or_else(|| rust_module_files_for_path(referrer_file, owner_path, owner));
+                .unwrap_or_else(|| {
+                    rust_module_files_for_path_with_crate_roots(
+                        referrer_file,
+                        owner_path,
+                        owner,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                });
             let owners = self
                 .defs_named(&CONSTRUCTABLE_LABELS, owner)
                 .into_iter()
@@ -3494,7 +3920,14 @@ impl GraphIndex {
                 .get(referrer_file)
                 .and_then(|aliases| aliases.get(first_segment))
                 .map(|alias_files| rust_module_files_below_alias(alias_files, ref_path, name))
-                .unwrap_or_else(|| rust_module_files_for_path(referrer_file, ref_path, name));
+                .unwrap_or_else(|| {
+                    rust_module_files_for_path_with_crate_roots(
+                        referrer_file,
+                        ref_path,
+                        name,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                });
             let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
             if let [id] = imported.as_slice() {
                 return Some(*id);
@@ -5630,6 +6063,175 @@ def Widget():
         )
         .unwrap();
         assert_eq!(clean.files_indexed, 0, "the next sparse run is clean");
+    }
+
+    #[test]
+    fn rust_crate_root_under_src_core_resolves_calls_and_function_items() {
+        let repo = setup_multifile_repo(
+            "rust-crate-root-under-src-core",
+            "// ordinary source root remains in the fixture\n",
+            "// ordinary source root remains in the fixture\n",
+        );
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"src-core-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"fixture\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join("src/core/mission/channels")).unwrap();
+        fs::create_dir_all(repo.join("src/core/business_os")).unwrap();
+        fs::write(
+            repo.join("src/core/main.rs"),
+            "mod mission; mod business_os;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
+        fs::write(
+            repo.join("src/core/mission/channels/mod.rs"),
+            "pub fn direct_target() {}\npub fn alternate_target() {}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/core/business_os/mod.rs"), "pub mod store;\n").unwrap();
+        fs::write(
+            repo.join("src/core/business_os/store.rs"),
+            "use crate::mission::channels;\n\
+             pub fn direct_caller() { channels::direct_target(); }\n\
+             pub fn function_item_caller(flag: bool) {\n\
+                 let selected = if flag { channels::direct_target } else { channels::alternate_target };\n\
+                 selected();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let direct_target = store
+            .get_node_by_qname(
+                "test",
+                "src/core/mission/channels/mod.rs::Function::direct_target",
+            )
+            .unwrap()
+            .expect("direct target");
+        let alternate_target = store
+            .get_node_by_qname(
+                "test",
+                "src/core/mission/channels/mod.rs::Function::alternate_target",
+            )
+            .unwrap()
+            .expect("alternate target");
+        let direct_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/core/business_os/store.rs::Function::direct_caller",
+            )
+            .unwrap()
+            .expect("direct caller");
+        let function_item_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/core/business_os/store.rs::Function::function_item_caller",
+            )
+            .unwrap()
+            .expect("function-item caller");
+
+        assert!(
+            store
+                .incoming_edges(direct_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == direct_caller.id),
+            "crate-root direct call under src/core must resolve"
+        );
+        for target in [direct_target, alternate_target] {
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("USAGE"), 10)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.source_id == function_item_caller.id),
+                "crate-root function item under src/core must resolve: {}",
+                target.qualified_name
+            );
+        }
+    }
+
+    #[test]
+    fn rust_crate_root_uncovered_manifest_member_preserves_conventional_layout() {
+        let roots = std::collections::HashSet::from(["other/src/lib.rs".to_string()]);
+        let files = rust_module_files_for_module_path_with_crate_roots(
+            "crates/widget/src/nested/caller.rs",
+            "crate::helpers",
+            Some(&roots),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "crates/widget/src/helpers.rs".to_string(),
+                "crates/widget/src/helpers/mod.rs".to_string(),
+                "crates/widget/src/helpers/lib.rs".to_string(),
+                "crates/widget/src/helpers/main.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_manifest_targets_cover_workspace_custom_and_implicit_bins() {
+        let repo = tempfile::tempdir().unwrap();
+        let custom = repo.path().join("custom");
+        let implicit = repo.path().join("implicit");
+        fs::create_dir_all(custom.join("src/core")).unwrap();
+        fs::create_dir_all(custom.join("src/core/decoy")).unwrap();
+        fs::create_dir_all(implicit.join("src/bin/nested")).unwrap();
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            custom.join("Cargo.toml"),
+            "[package]\nname = \"custom\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"custom\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            implicit.join("Cargo.toml"),
+            "[package]\nname = \"implicit\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        for path in [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ] {
+            fs::write(repo.path().join(path), "fn item() {}\n").unwrap();
+        }
+        let known_files = [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut roots = std::collections::HashSet::new();
+        assert!(rust_crate_roots_from_manifest(
+            &repo.path().join("Cargo.toml"),
+            repo.path(),
+            &known_files,
+            &mut roots,
+            &mut std::collections::HashSet::new(),
+        ));
+        assert!(roots.contains("custom/src/core/main.rs"));
+        assert!(!roots.contains("custom/src/core/decoy/main.rs"));
+        assert!(roots.contains("implicit/src/main.rs"));
+        assert!(roots.contains("implicit/src/bin/tool.rs"));
+        assert!(roots.contains("implicit/src/bin/nested/main.rs"));
+        assert!(!roots.contains("implicit/src/bin/nested/helper.rs"));
     }
 
     #[test]
