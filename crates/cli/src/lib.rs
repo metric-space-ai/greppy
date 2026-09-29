@@ -5525,7 +5525,9 @@ fn spawn_background_job_handle(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
+    let configured_workers =
+        configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
+    debug_assert_eq!(Some(configured_workers), worker_count);
     if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
@@ -5630,10 +5632,10 @@ fn automatic_index_worker_count(inherited: Option<&std::ffi::OsStr>) -> usize {
 fn configure_automatic_index_workers(
     command: &mut std::process::Command,
     inherited: Option<&std::ffi::OsStr>,
-) -> Option<usize> {
+) -> usize {
     let workers = automatic_index_worker_count(inherited);
     command.env("GREPPY_WORKERS", workers.to_string());
-    Some(workers)
+    workers
 }
 
 fn spawn_background_job(

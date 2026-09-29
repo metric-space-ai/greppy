@@ -1895,7 +1895,7 @@ fn automatic_index_child_command_receives_effective_worker_cap() {
     let mut command = std::process::Command::new("greppy");
     assert_eq!(
         configure_automatic_index_workers(&mut command, Some(OsStr::new("8"))),
-        Some(2)
+        2
     );
     let worker_env = command
         .get_envs()
@@ -1906,7 +1906,7 @@ fn automatic_index_child_command_receives_effective_worker_cap() {
     let mut embedding = std::process::Command::new("greppy");
     assert_eq!(
         configure_automatic_index_workers(&mut embedding, Some(OsStr::new("8"))),
-        Some(2)
+        2
     );
     let embedding_worker_env = embedding
         .get_envs()

@@ -479,11 +479,12 @@ mod tests {
     fn automatic_index_readiness_reports_workers_without_poll_spam() {
         let mut reporter = ProgressReporter::default();
         let mut active = job("extracting_files", 160, 7170);
+        active.unit = "files".into();
         active.worker_count = Some(2);
         let initial = reporter
             .observe("who-calls", Some(active.clone()), Duration::from_secs(2))
             .unwrap();
-        assert!(initial.contains("160/7170 spans"), "{initial}");
+        assert!(initial.contains("160/7170 files"), "{initial}");
         assert!(initial.contains("workers 2"), "{initial}");
         assert!(initial.contains("greppy index status --json"), "{initial}");
         assert!(reporter
