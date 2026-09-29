@@ -224,11 +224,13 @@ fn passthrough_pattern_exception_preserves_command_diagnostics() {
         );
         assert_eq!(output.status.code(), Some(64));
     }
-    let output = greppy_command("empty-command-like-stdin")
-        .arg("research")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    // A closed pipe has a portable, non-consuming EOF proof. /dev/null can
+    // report POLLIN without supporting FIONREAD on Linux, so its availability
+    // is intentionally forwarded conservatively instead of guessed empty.
+    let output = run_with_stdin(
+        &mut greppy_command("empty-command-like-stdin").arg("research"),
+        b"",
+    );
     assert_eq!(output.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&output.stdout).contains("did you mean"));
 }
