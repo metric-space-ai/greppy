@@ -340,6 +340,41 @@ for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
         )
     );
 
+    let output = run(&[
+        std::ffi::OsStr::new("rg"),
+        std::ffi::OsStr::new("grep"),
+        std::ffi::OsStr::new("-g"),
+        std::ffi::OsStr::new("--root"),
+        std::ffi::OsStr::new("docs/user"),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!(
+            "{}\n<grep>\n<-g>\n<--root>\n<docs/user>\n",
+            repository.display()
+        )
+    );
+
+    let output = run(&[
+        std::ffi::OsStr::new("-g"),
+        std::ffi::OsStr::new("--root"),
+        std::ffi::OsStr::new("needle"),
+        std::ffi::OsStr::new("docs/user"),
+        std::ffi::OsStr::new("--root"),
+        repository.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        format!(
+            "{}\n<-g>\n<--root>\n<needle>\n<docs/user>\n",
+            repository.display()
+        )
+    );
+
     let absolute = repository.join("docs/user");
     let output = run(&[
         std::ffi::OsStr::new("rg"),
@@ -423,6 +458,11 @@ fn root_is_shared_by_translated_rg_and_bare_grep() {
     assert_eq!(translated.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&translated.stdout).contains("Alpha rooted"));
 
+    let real_grep = ["/usr/bin/grep", "/bin/grep"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|candidate| candidate.is_file())
+        .expect("system grep");
     let bare = Command::new(binary_path())
         .args(["grep", "-R", "Alpha", "--root", &root])
         .current_dir(&caller)
@@ -430,8 +470,15 @@ fn root_is_shared_by_translated_rg_and_bare_grep() {
         .stdin(Stdio::null())
         .output()
         .expect("spawn rooted grep");
-    assert_eq!(bare.status.code(), Some(0));
-    assert_eq!(bare.stdout, b"Alpha rooted\n");
+    let native = Command::new(real_grep)
+        .args(["-R", "Alpha"])
+        .current_dir(&repository)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn native grep");
+    assert_eq!(bare.status.code(), native.status.code());
+    assert_eq!(bare.stdout, native.stdout);
+    assert_eq!(bare.stderr, native.stderr);
 }
 
 #[test]
