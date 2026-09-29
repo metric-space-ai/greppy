@@ -2620,11 +2620,6 @@ fn rust_free_function_reference_inventory(
                     12,
                 )
             })?;
-        let has_distinct_local_definition = !selected_files.contains(&rel)
-            && extraction
-                .nodes
-                .iter()
-                .any(|node| node.label == "Function" && node.name == short_name);
         for edge in extraction.edges {
             let (name_property, path_property) = match edge.edge_type.as_str() {
                 "CALLS" => ("callee_name", "callee_path"),
@@ -2667,7 +2662,17 @@ fn rust_free_function_reference_inventory(
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.is_empty());
             let unqualified = reference_path.is_none() || reference_path == Some(short_name);
-            if has_distinct_local_definition && unqualified {
+            let unplanned = sites
+                .iter()
+                .copied()
+                .filter(|site| !planned.contains(site))
+                .collect::<Vec<_>>();
+            if !selected_files.contains(&rel)
+                && unqualified
+                && unplanned
+                    .iter()
+                    .all(|site| rust_local_free_function_owns_site(&content, short_name, *site))
+            {
                 continue;
             }
             return Err(EditRefusal::new(
@@ -2678,6 +2683,63 @@ fn rust_free_function_reference_inventory(
         }
     }
     Ok(())
+}
+
+fn rust_local_free_function_owns_site(
+    content: &[u8],
+    short_name: &str,
+    site: (usize, usize),
+) -> bool {
+    let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
+        return false;
+    };
+    let Some(reference) = tree
+        .root_node()
+        .descendant_for_byte_range(site.0, site.1.saturating_sub(1).max(site.0))
+    else {
+        return false;
+    };
+    let mut reference_blocks = std::collections::BTreeSet::new();
+    let mut reference_module = None;
+    let mut ancestor = Some(reference);
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            reference_blocks.insert((node.start_byte(), node.end_byte()));
+        } else if reference_module.is_none() && matches!(node.kind(), "source_file" | "mod_item") {
+            reference_module = Some((node.start_byte(), node.end_byte()));
+        }
+        ancestor = node.parent();
+    }
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| content.get(name.byte_range()))
+                == Some(short_name.as_bytes())
+        {
+            let mut owner = node.parent();
+            while let Some(scope) = owner {
+                if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
+                    let key = (scope.start_byte(), scope.end_byte());
+                    let owns = if scope.kind() == "block" {
+                        reference_blocks.contains(&key)
+                    } else {
+                        reference_module == Some(key)
+                    };
+                    if owns {
+                        return true;
+                    }
+                    break;
+                }
+                owner = scope.parent();
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 fn require_rename_edge_identity(
@@ -3603,9 +3665,9 @@ mod patch_rollback_tests {
     fn qualified_rust_free_function_unknown_caller_refuses_before_publish() {
         let dir = tempfile::tempdir().unwrap();
         let selected = b"fn get_lit_str() {}\n";
-        let unknown = b"fn caller() { get_lit_str(); }\n";
+        let unknown = b"mod selected;\nmod other { fn get_lit_str() {} }\nuse crate::selected::get_lit_str;\nfn caller() { get_lit_str(); }\n";
         std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
-        std::fs::write(dir.path().join("unknown.rs"), unknown).unwrap();
+        std::fs::write(dir.path().join("lib.rs"), unknown).unwrap();
         let sites = greppy_edit::verbs::rename_identifier_sites(
             std::path::Path::new("selected.rs"),
             selected,
@@ -3623,15 +3685,40 @@ mod patch_rollback_tests {
         )
         .unwrap_err();
         assert_eq!(refusal.code, "unresolved_reference_identity");
-        assert!(refusal.message.contains("unknown.rs"));
+        assert!(refusal.message.contains("lib.rs"));
         assert_eq!(
             std::fs::read(dir.path().join("selected.rs")).unwrap(),
             selected
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("unknown.rs")).unwrap(),
-            unknown
-        );
+        assert_eq!(std::fs::read(dir.path().join("lib.rs")).unwrap(), unknown);
+    }
+
+    #[test]
+    fn rust_free_function_local_proof_is_lexically_scoped() {
+        let source = b"fn get_lit_str() {}\nfn top() { get_lit_str(); }\nmod left { fn get_lit_str() {} fn local() { get_lit_str(); } }\nmod right { fn caller() { get_lit_str(); } }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("scope.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 5);
+        assert!(rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[1]
+        ));
+        assert!(rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[3]
+        ));
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[4]
+        ));
     }
 
     #[test]
