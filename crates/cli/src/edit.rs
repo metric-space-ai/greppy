@@ -2711,6 +2711,63 @@ fn rust_local_free_function_owns_site(
         ancestor = node.parent();
     }
 
+    // A same-name import or local binding in an active lexical scope may
+    // shadow an otherwise visible module function. Without name resolution it
+    // is not positive evidence that the unqualified reference is local.
+    let mut shadow_stack = vec![tree.root_node()];
+    while let Some(node) = shadow_stack.pop() {
+        if matches!(
+            node.kind(),
+            "use_declaration" | "let_declaration" | "parameter"
+        ) && (node.kind() == "use_declaration" || node.start_byte() <= reference.start_byte())
+        {
+            let active_scope = if node.kind() == "parameter" {
+                let mut owner = node.parent();
+                let mut active = false;
+                while let Some(scope) = owner {
+                    if scope.kind() == "function_item" {
+                        active = scope.child_by_field_name("body").is_some_and(|body| {
+                            reference_blocks.contains(&(body.start_byte(), body.end_byte()))
+                        });
+                        break;
+                    }
+                    owner = scope.parent();
+                }
+                active
+            } else {
+                let mut owner = node.parent();
+                let mut active = false;
+                while let Some(scope) = owner {
+                    if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
+                        let key = (scope.start_byte(), scope.end_byte());
+                        active = if scope.kind() == "block" {
+                            reference_blocks.contains(&key)
+                        } else {
+                            reference_module == Some(key)
+                        };
+                        break;
+                    }
+                    owner = scope.parent();
+                }
+                active
+            };
+            if active_scope {
+                let mut declaration_stack = vec![node];
+                while let Some(part) = declaration_stack.pop() {
+                    if matches!(part.kind(), "identifier" | "field_identifier")
+                        && content.get(part.byte_range()) == Some(short_name.as_bytes())
+                    {
+                        return false;
+                    }
+                    let mut cursor = part.walk();
+                    declaration_stack.extend(part.named_children(&mut cursor));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        shadow_stack.extend(node.named_children(&mut cursor));
+    }
+
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_item"
@@ -2720,8 +2777,15 @@ fn rust_local_free_function_owns_site(
                 == Some(short_name.as_bytes())
         {
             let mut owner = node.parent();
+            let mut associated = false;
             while let Some(scope) = owner {
+                if matches!(scope.kind(), "impl_item" | "trait_item") {
+                    associated = true;
+                }
                 if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
+                    if associated {
+                        break;
+                    }
                     let key = (scope.start_byte(), scope.end_byte());
                     let owns = if scope.kind() == "block" {
                         reference_blocks.contains(&key)
@@ -3718,6 +3782,42 @@ mod patch_rollback_tests {
             source,
             "get_lit_str",
             sites[4]
+        ));
+    }
+
+    #[test]
+    fn associated_method_cannot_prove_free_function_ownership() {
+        let source = b"struct Helper;\nimpl Helper { fn get_lit_str() {} }\nuse crate::selected::get_lit_str;\nfn caller() { get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("method.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[1]
+        ));
+    }
+
+    #[test]
+    fn block_import_prevents_module_function_ownership_proof() {
+        let source = b"fn get_lit_str() {}\nfn caller() { use crate::selected::get_lit_str; get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("shadow.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 3);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[2]
         ));
     }
 
