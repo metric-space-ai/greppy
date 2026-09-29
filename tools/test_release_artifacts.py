@@ -465,7 +465,9 @@ class ReleaseArtifactTests(unittest.TestCase):
             any(asset.get("optional_group") for asset in contract["assets"] if asset not in windows)
         )
 
-    def test_release_publish_skips_absent_windows_and_unrun_cow_performance(self) -> None:
+    def test_release_publish_excludes_cpu_only_windows_and_unrun_cow_performance(
+        self,
+    ) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
@@ -485,15 +487,47 @@ class ReleaseArtifactTests(unittest.TestCase):
             matrix_emit.signing_enabled({name: "set" for name in matrix_emit.SECRET_ENV})
         )
         without = matrix_emit.filtered_includes(False)
-        with_windows = matrix_emit.filtered_includes(True)
+        with_signing = matrix_emit.filtered_includes(True)
         for key in ("build", "verify"):
-            self.assertNotIn("windows-x86_64", [row["name"] for row in without[key]])
-            self.assertIn("windows-x86_64", [row["name"] for row in with_windows[key]])
-            self.assertIn("macos-arm64", [row["name"] for row in without[key]])
-        windows_build = next(
-            row for row in with_windows["build"] if row["name"] == "windows-x86_64"
+            self.assertEqual(
+                [row["name"] for row in with_signing[key]],
+                [row["name"] for row in without[key]],
+            )
+            self.assertNotIn(
+                "windows-x86_64", [row["name"] for row in with_signing[key]]
+            )
+        self.assertEqual(
+            [row["features"] for row in with_signing["build"]], ["metal", "cuda"]
         )
-        self.assertEqual(windows_build["features"], "cpu-only")
+        output = self.root / "release-matrix-output"
+        matrix_emit.write_github_output(
+            output, {name: "set" for name in matrix_emit.SECRET_ENV}
+        )
+        emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        self.assertEqual(emitted["enabled"], "true")
+        self.assertEqual(
+            [row["name"] for row in json.loads(emitted["build_include"])],
+            ["macos-arm64", "linux-x86_64"],
+        )
+        self.assertEqual(
+            [row["name"] for row in json.loads(emitted["verify_include"])],
+            ["macos-arm64", "linux-x86_64-no-toolkit"],
+        )
+        invalid_matrix = json.loads(
+            (REPOSITORY_ROOT / "tools/release_matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        linux = next(
+            row for row in invalid_matrix["build"] if row["name"] == "linux-x86_64"
+        )
+        linux["features"] = "cpu-only"
+        with self.assertRaisesRegex(
+            ValueError,
+            "invalid production release backend for linux-x86_64: "
+            "expected features='cuda', got 'cpu-only'",
+        ):
+            matrix_emit.filtered_includes(True, invalid_matrix)
         self.assertIn("cow_performance_ok", workflow)
         self.assertIn("cow_performance_failed", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
@@ -548,6 +582,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('test "$sq_sha" = "$GITHUB_SHA"', workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
+
         self.assertNotIn("--workflow agent-benchmark.yml", workflow)
         self.assertIn("task-bank-audit.yml filesystem-cow.yml", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
@@ -949,6 +984,15 @@ class ReleaseArtifactTests(unittest.TestCase):
 
         self.assertIn('"$BIN" web status --json', unix_smoke)
         self.assertIn(".result.process_health.healthy == true", unix_smoke)
+
+    def test_linux_deb_pins_xz_data_archive(self) -> None:
+        builder = (
+            REPOSITORY_ROOT / "platform/linux/build-packages.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'dpkg-deb --root-owner-group -Zxz --build "$deb_root" "$DEB_OUTPUT"',
+            builder,
+        )
 
 
 if __name__ == "__main__":
