@@ -582,6 +582,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn('test "$sq_sha" = "$GITHUB_SHA"', workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("wc -l < release-assets/SHA256SUMS", workflow)
+
         self.assertNotIn("--workflow agent-benchmark.yml", workflow)
         self.assertIn("task-bank-audit.yml filesystem-cow.yml", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
@@ -983,6 +984,15 @@ class ReleaseArtifactTests(unittest.TestCase):
 
         self.assertIn('"$BIN" web status --json', unix_smoke)
         self.assertIn(".result.process_health.healthy == true", unix_smoke)
+
+    def test_linux_deb_pins_xz_data_archive(self) -> None:
+        builder = (
+            REPOSITORY_ROOT / "platform/linux/build-packages.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'dpkg-deb --root-owner-group -Zxz --build "$deb_root" "$DEB_OUTPUT"',
+            builder,
+        )
 
 
 if __name__ == "__main__":
