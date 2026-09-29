@@ -1117,3 +1117,113 @@ fn web_goto_without_scope_is_no_session() {
         "stdout={stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let Some(runtime) = locate_web_runtime() else {
+        eprintln!("skipping artifact recovery CLI proof: optional web-runtime binary is not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server_reads = Arc::clone(&reads);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 2048];
+            let length = stream.read(&mut request).unwrap_or(0);
+            let large = String::from_utf8_lossy(&request[..length]).contains("GET /large ");
+            let body = if large {
+                server_reads.fetch_add(1, Ordering::SeqCst);
+                format!(
+                    "<html><body>{}IMMUTABLE_TAIL</body></html>",
+                    "artifact body ".repeat(10_000)
+                )
+            } else {
+                "<html><body>session bootstrap</body></html>".to_owned()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let run_id = format!("run_artifact_recovery_{}", std::process::id());
+    let workspace = std::env::temp_dir().join(&run_id);
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let bootstrap = format!("http://{address}/bootstrap");
+    let large = format!("http://{address}/large");
+    let (code, _, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "open", &bootstrap, "--json"],
+    );
+    assert_eq!(code, 0, "bootstrap failed: {stderr}");
+
+    let (code, output, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "read", "--url", &large],
+    );
+    assert_eq!(code, 0, "read failed: {stderr}");
+    let digest = output
+        .split_once("greppy web artifact export '")
+        .and_then(|(_, tail)| tail.split_once('\''))
+        .map(|(value, _)| value)
+        .expect("exact artifact export guidance");
+    let session = output
+        .split_once(" --session '")
+        .and_then(|(_, tail)| tail.split_once('\''))
+        .map(|(value, _)| value)
+        .expect("guidance session");
+    assert!(
+        output.contains("saved locally; no repeat request"),
+        "{output}"
+    );
+
+    let exported = workspace.join("full-response.html");
+    let (code, stdout, stderr) = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &[
+            "web",
+            "artifact",
+            "export",
+            digest,
+            "--session",
+            session,
+            "--to",
+            exported.to_str().unwrap(),
+        ],
+    );
+    let _ = run_scoped(
+        &workspace,
+        &runtime,
+        &run_id,
+        &["web", "runtime", "stop", "--json"],
+    );
+    assert_eq!(code, 0, "export failed stdout={stdout} stderr={stderr}");
+    let bytes = std::fs::read(&exported).unwrap();
+    assert!(bytes.ends_with(b"IMMUTABLE_TAIL</body></html>"));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "export repeated the HTTP read"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}

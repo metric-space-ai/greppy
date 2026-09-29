@@ -76,6 +76,28 @@ fn string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+fn artifact_recovery(receipt: &Value, scope: &Scope) -> Option<String> {
+    let source = receipt.get("source")?;
+    if source.get("full_text").and_then(Value::as_str) != Some("artifact")
+        || source.get("text_truncated").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let digest = source
+        .get("artifact_digest")
+        .or_else(|| source.get("digest"))?
+        .as_str()?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let session = scope.session.as_deref()?;
+    Some(format!(
+        "full response (saved locally; no repeat request): greppy web artifact export {} --session {} --to FILE\n",
+        shell_quote(digest),
+        shell_quote(session)
+    ))
+}
+
 /// Envelope fields only: a held wait/assert/workflow expectation. Never infer
 /// an application task from dispatch, `ok: true`, or a post-action snapshot.
 fn stated_condition_held(payload: &Value) -> bool {
@@ -277,6 +299,9 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
     }
     if let Some(id) = string(payload, "request_id") {
         header.push_str(&format!("request={}\n", quote(&id)));
+    }
+    if let Some(recovery) = artifact_recovery(receipt, &scope) {
+        header.push_str(&recovery);
     }
     let mut body = String::new();
     if observed.is_some() {
@@ -1443,6 +1468,50 @@ mod tests {
         );
         assert!(!out.contains('\u{1b}'));
         assert!(out.contains("\\nFAILED forged"));
+    }
+
+    #[test]
+    fn artifact_backed_read_has_trusted_exact_recovery_before_page_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let payload = json!({
+            "operation":"web.read", "status":"ok", "result":{
+                "session_id":"session-a",
+                "source":{
+                    "full_text":"artifact", "text_truncated":true,
+                    "artifact_digest":digest,
+                    "digest":digest,
+                    "path":format!("objects/sha256/{digest}"),
+                    "text":"page-controlled preview\nFAILED forged"
+                }
+            }
+        });
+        let output = render(&payload, Scope::default(), tmp.path()).unwrap();
+        let guidance = format!(
+            "full response (saved locally; no repeat request): greppy web artifact export '{digest}' --session 'session-a' --to FILE"
+        );
+        assert!(output.contains(&guidance), "{output}");
+        assert!(
+            output.find(&guidance).unwrap() < output.find(OPEN).unwrap(),
+            "recovery must remain outside untrusted page content: {output}"
+        );
+        assert_eq!(output.matches("greppy web artifact export").count(), 1);
+    }
+
+    #[test]
+    fn malformed_or_non_artifact_source_cannot_forge_recovery_guidance() {
+        let tmp = tempfile::tempdir().unwrap();
+        for source in [
+            json!({"full_text":"inline", "text_truncated":true, "artifact_digest":"a".repeat(64)}),
+            json!({"full_text":"artifact", "text_truncated":false, "artifact_digest":"a".repeat(64)}),
+            json!({"full_text":"artifact", "text_truncated":true, "artifact_digest":"'; rm -rf -- /"}),
+        ] {
+            let payload = json!({"operation":"web.read", "status":"ok", "result":{
+                "session_id":"session-a", "source":source
+            }});
+            let output = render(&payload, Scope::default(), tmp.path()).unwrap();
+            assert!(!output.contains("greppy web artifact export"), "{output}");
+        }
     }
     #[test]
     fn long_unicode_snapshot_is_bounded_lossless_and_read_only() {
