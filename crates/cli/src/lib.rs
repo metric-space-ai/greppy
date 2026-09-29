@@ -9066,13 +9066,41 @@ struct GrepGlobals {
     root: Option<std::ffi::OsString>,
 }
 
+fn passthrough_flavor(args: &[std::ffi::OsString]) -> PassthroughFlavor {
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_str().unwrap_or_default();
+        if matches!(text, "--root" | "--device") {
+            index += 2;
+            continue;
+        }
+        if text.starts_with("--root=")
+            || text.starts_with("--device=")
+            || matches!(text, "--no-gpu" | "--diagnostics")
+        {
+            index += 1;
+            continue;
+        }
+        return if matches!(text, "rg" | "ripgrep") {
+            PassthroughFlavor::Ripgrep
+        } else if matches!(text, "grep" | "egrep" | "fgrep" | "rgrep") {
+            PassthroughFlavor::Grep
+        } else if greppy_passthrough::is_rg_style(&args[index..]) {
+            PassthroughFlavor::Ripgrep
+        } else {
+            PassthroughFlavor::Grep
+        };
+    }
+    PassthroughFlavor::Grep
+}
+
 fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobals>> {
     const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
     const BARE_FLAGS: [&str; 2] = ["--no-gpu", "--diagnostics"];
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     let mut root: Option<std::ffi::OsString> = None;
     let mut removed = false;
-    let mut flavor = PassthroughFlavor::Grep;
+    let flavor = passthrough_flavor(args);
     let mut index = 0;
     while index < args.len() {
         let text = args[index].to_str().unwrap_or_default();
@@ -9089,11 +9117,6 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobal
                 index += 1;
             }
             continue;
-        }
-        if matches!(text, "rg" | "ripgrep") {
-            flavor = PassthroughFlavor::Ripgrep;
-        } else if matches!(text, "grep" | "egrep" | "fgrep" | "rgrep") {
-            flavor = PassthroughFlavor::Grep;
         }
         if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
             if let Some(value) = args.get(index + 1) {
