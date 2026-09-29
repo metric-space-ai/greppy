@@ -266,7 +266,7 @@ fn index_rename_fixture(root: &std::path::Path) -> (String, std::path::PathBuf) 
     .unwrap();
     std::fs::write(
         root.join("unrelated_b.rs"),
-        "fn iterator_next<I: Iterator>(value: &mut I) { value.next(); }\n",
+        "struct Another;\nimpl Another { fn next(&mut self) {} }\nfn another_call(value: &mut Another) { value.next(); }\n",
     )
     .unwrap();
     std::fs::write(root.join("stale.rs"), "fn stale_candidate() {}\n").unwrap();
@@ -339,6 +339,40 @@ fn rename_identity_planner_subprocess_helper() {
         .unwrap()
         .contains("value.next()"));
 
+    let omitted_root = test_tempdir("rename-identity-omitted");
+    let (_project, store_path) = index_rename_fixture(&omitted_root);
+    {
+        let store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let caller = resolve_symbol_nodes(&store, Some("caller")).unwrap()[0];
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND edge_type = 'CALLS'",
+                (caller, target),
+            )
+            .unwrap();
+    }
+    let omitted_before = ["selected.rs", "caller.rs"]
+        .map(|path| (path, std::fs::read(omitted_root.join(path)).unwrap()));
+    let omitted = run_trained_rename(
+        &omitted_root,
+        omitted_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(omitted.code, "unresolved_reference");
+    assert!(omitted
+        .message
+        .contains("absent from the graph rename plan"));
+    for (path, expected) in omitted_before {
+        assert_eq!(std::fs::read(omitted_root.join(path)).unwrap(), expected);
+    }
+
     let refusal_root = test_tempdir("rename-identity-refusal");
     let (project, store_path) = index_rename_fixture(&refusal_root);
     {
@@ -381,6 +415,7 @@ fn rename_identity_planner_subprocess_helper() {
     }
 
     std::fs::remove_dir_all(success_root).unwrap();
+    std::fs::remove_dir_all(omitted_root).unwrap();
     std::fs::remove_dir_all(refusal_root).unwrap();
 }
 
