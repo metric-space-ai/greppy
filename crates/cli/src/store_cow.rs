@@ -3293,15 +3293,18 @@ mod tests {
                     && matches!(edge.edge_type.as_str(), "CALLS" | "USAGE")),
             "the real parser must republish the dirty caller relation"
         );
-        let vector_after_dirty: Vec<u8> = after_dirty
+        // The edge-only compatibility repair above must preserve vectors.
+        // This later phase actually changes caller.rs, so its stale embedding
+        // must be invalidated by ordinary file reindexing, not carried forward.
+        let stale_caller_vectors: i64 = after_dirty
             .conn()
             .query_row(
-                "SELECT vector FROM main.vector_embeddings WHERE project = 'p'",
+                "SELECT COUNT(*) FROM main.vector_embeddings WHERE project = 'p' AND file_path = 'src/caller.rs'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(vector_after_dirty, vector_before);
+        assert_eq!(stale_caller_vectors, 0);
     }
 
     #[test]
