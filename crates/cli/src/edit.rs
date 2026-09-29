@@ -2431,14 +2431,18 @@ fn rename_edge_identity(
     owner: Option<&str>,
     name: &str,
 ) -> RenameEdgeIdentity {
-    let path_matches = |property: &str| {
+    let known_path_owner = |property: &str| {
         properties
             .get(property)
             .and_then(|value| value.as_str())
-            .is_some_and(|path| {
+            .filter(|path| !path.is_empty())
+            .and_then(|path| {
                 let mut parts = path.rsplit("::");
-                parts.next() == Some(name) && parts.next() == owner
+                (parts.next() == Some(name)).then(|| parts.next()).flatten()
             })
+    };
+    let owner_matches = |candidate: &str| {
+        owner.is_some_and(|selected| candidate.rsplit("::").next() == selected.rsplit("::").next())
     };
     match edge_type {
         "CALLS"
@@ -2451,18 +2455,22 @@ fn rename_edge_identity(
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())
             {
-                Some(candidate) if Some(candidate) == owner => RenameEdgeIdentity::Related,
+                Some(candidate) if owner_matches(candidate) => RenameEdgeIdentity::Related,
                 Some(_) => RenameEdgeIdentity::Unrelated,
                 None => RenameEdgeIdentity::Unknown,
             }
         }
         "CALLS" if owner == Some("Function") => RenameEdgeIdentity::Related,
-        "CALLS" if path_matches("callee_path") => RenameEdgeIdentity::Related,
-        "CALLS" if properties.get("callee_path").is_some() => RenameEdgeIdentity::Unrelated,
+        "CALLS" if known_path_owner("callee_path").is_some_and(owner_matches) => {
+            RenameEdgeIdentity::Related
+        }
+        "CALLS" if known_path_owner("callee_path").is_some() => RenameEdgeIdentity::Unrelated,
         "CALLS" => RenameEdgeIdentity::Unknown,
         "USAGE" | "USES" if owner == Some("Function") => RenameEdgeIdentity::Related,
-        "USAGE" | "USES" if path_matches("ref_path") => RenameEdgeIdentity::Related,
-        "USAGE" | "USES" if properties.get("ref_path").is_some() => RenameEdgeIdentity::Unrelated,
+        "USAGE" | "USES" if known_path_owner("ref_path").is_some_and(owner_matches) => {
+            RenameEdgeIdentity::Related
+        }
+        "USAGE" | "USES" if known_path_owner("ref_path").is_some() => RenameEdgeIdentity::Unrelated,
         "USAGE" | "USES" => RenameEdgeIdentity::Unknown,
         "TYPE_REF" | "IMPORTS" => RenameEdgeIdentity::Related,
         _ => RenameEdgeIdentity::Unrelated,
@@ -2596,35 +2604,6 @@ pub(crate) fn run_trained_rename(
                 "IMPORTS" => "imported_name",
                 _ => continue,
             };
-            let Some(reference_name) = edge
-                .properties
-                .get(property)
-                .and_then(|value| value.as_str())
-            else {
-                return Ok(Err(EditRefusal::new(
-                    "unresolved_reference_identity",
-                    format!(
-                        "graph reference to `{symbol}` at source node {} lacks `{property}` identity; refresh the index — nothing written",
-                        edge.source_id
-                    ),
-                    12,
-                )));
-            };
-            if reference_name.rsplit("::").next() != Some(short_name.as_str()) {
-                continue;
-            }
-            match require_rename_edge_identity(
-                &edge.edge_type,
-                &edge.properties,
-                owner,
-                &short_name,
-                symbol,
-                edge.source_id,
-            ) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(refusal) => return Ok(Err(refusal)),
-            }
             let Some(source) = store.get_node(edge.source_id)? else {
                 return Ok(Err(EditRefusal::new(
                     "unresolved_reference",
@@ -2680,6 +2659,38 @@ pub(crate) fn run_trained_rename(
                     12,
                 )));
             };
+            if sites.is_empty() {
+                continue;
+            }
+            let Some(reference_name) = edge
+                .properties
+                .get(property)
+                .and_then(|value| value.as_str())
+            else {
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference_identity",
+                    format!(
+                        "live graph reference to `{symbol}` at source node {} lacks `{property}` identity; refresh the index — nothing written",
+                        edge.source_id
+                    ),
+                    12,
+                )));
+            };
+            if reference_name.rsplit("::").next() != Some(short_name.as_str()) {
+                continue;
+            }
+            match require_rename_edge_identity(
+                &edge.edge_type,
+                &edge.properties,
+                owner,
+                &short_name,
+                symbol,
+                edge.source_id,
+            ) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(refusal) => return Ok(Err(refusal)),
+            }
             match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
                 Ok(None) => continue,
                 Ok(Some(site)) => scopes
@@ -3126,6 +3137,26 @@ mod patch_rollback_tests {
             "callee_form": "direct",
             "callee_path": "Scheduler::next"
         });
+        let unqualified_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": "next"
+        });
+        let null_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": null
+        });
+        let empty_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": ""
+        });
+        let non_string_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": 7
+        });
 
         assert_eq!(
             rename_edge_identity("CALLS", &selected, Some("Scheduler"), "next"),
@@ -3141,6 +3172,22 @@ mod patch_rollback_tests {
         );
         assert_eq!(
             rename_edge_identity("CALLS", &misleading, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &unqualified_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &null_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &empty_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &non_string_path, Some("Scheduler"), "next"),
             RenameEdgeIdentity::Unknown
         );
         let refusal = require_rename_edge_identity(
