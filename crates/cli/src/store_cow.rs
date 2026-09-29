@@ -2851,7 +2851,7 @@ mod tests {
         // stale and try to launch the CLI through the libtest executable.
         // The dirty file state remains generation 7, so the query still has
         // to exercise the bounded persisted repair below.
-        let fixture_fingerprint = greppy_core::GitFingerprint::capture(root);
+        let fixture_fingerprint = greppy_core::GitFingerprint::capture(&root);
         {
             let mut delta = greppy_store::Store::open(&delta_path).unwrap();
             delta
