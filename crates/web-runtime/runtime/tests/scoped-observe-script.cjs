@@ -81,6 +81,7 @@ function fixture() {
     code = code.replaceAll('__GREPPY_REF_FIRST__', String(first))
       .replaceAll('__GREPPY_REF_LAST__', String(first + 199))
       .replaceAll('__GREPPY_SNAPSHOT__', JSON.stringify('doc-one'))
+      .replaceAll('__GREPPY_EXPECTED_SNAPSHOT__', JSON.stringify(window.__greppyObservedRefs?.snapshot ?? null))
       .replaceAll('__GREPPY_INCLUDE_HTML__', String(html))
       .replaceAll('__GREPPY_QUERY__', JSON.stringify(query));
     first += 200;

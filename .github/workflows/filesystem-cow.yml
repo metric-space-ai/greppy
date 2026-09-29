@@ -284,10 +284,14 @@ jobs:
           Copy-Item tools\windows_driver_contract.py,tools\verify_windows_driver_signatures.ps1 $dist
           Copy-Item bench\release_package_smoke.ps1,bench\release_daemon_stress.ps1 $dist
           Copy-Item licenses (Join-Path $dist 'licenses') -Recurse
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate package metadata' }
+          $version = ($metadata.packages | Where-Object name -eq 'greppy').version
+          if (-not $version) { throw 'Missing candidate CLI version' }
           tools/build_windows_msi.ps1 `
             -DistDir $dist `
             -OutputPath "$env:RUNNER_TEMP\greppy-windows-x86_64-unsigned-smoke.msi" `
-            -Version '0.4.0' `
+            -Version $version `
             -AllowUnsignedForSmokeTest
 
   windows-winfsp-fork-compile:

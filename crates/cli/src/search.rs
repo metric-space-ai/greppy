@@ -128,50 +128,6 @@ pub(crate) fn search_graph_counts_json(
     Ok(())
 }
 
-pub(crate) fn semantic_embedding_indexing_json(
-    project: &str,
-    cfg: &EmbeddingModelConfig,
-    graph_generation: u64,
-    freshness: &serde_json::Value,
-    progress: &serde_json::Value,
-    fallback: SemanticFallbackContext<'_>,
-) -> Result<()> {
-    let eta_seconds = progress
-        .get("eta_seconds")
-        .and_then(serde_json::Value::as_u64);
-    let retry_after_seconds = eta_seconds.map(|eta| eta.clamp(5, 30)).unwrap_or(10);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-            "command": "search",
-            "mode": "vector",
-            "status": "indexing",
-            "project": project,
-            "model_id": cfg.model_id,
-            "prompt_version": greppy_embed_native::PROMPT_VERSION,
-            "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
-            "graph_generation": graph_generation,
-            "fresh": freshness_json_is_fresh(freshness),
-            "freshness": freshness,
-            "retryable": true,
-            "retry_after_seconds": retry_after_seconds,
-            "exit_code": EXIT_TEMPFAIL,
-            "retry_when": "greppy index status --json reports embedding_complete=true",
-            "embedding_index": progress,
-            "query_tokens": semantic_fallback_tokens(fallback.query),
-            "next": semantic_fallback_commands(fallback.query, fallback.paths, fallback.root),
-            "total_exact": 0,
-            "shown": 0,
-            "omitted": 0,
-            "truncated": false,
-            "hits": [],
-        }))
-        .map_err(|error| Error::Invalid(format!("serialize semantic indexing JSON: {error}")))?
-    );
-    Ok(())
-}
-
 fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
@@ -264,12 +220,7 @@ fn search_symbol_no_match_status(
     println!("next: refresh definitions after source changes: greppy index .");
 }
 
-fn search_pattern_no_match_status(
-    query: &str,
-    fixed: bool,
-    path_filters: &QueryPathFilters,
-    matches_outside_filter: usize,
-) {
+fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &QueryPathFilters) {
     println!("status: no_matches");
     if path_filters.is_empty() {
         println!("scope: live Greppy-discovered source files in the repository");
@@ -280,13 +231,9 @@ fn search_pattern_no_match_status(
             "message: no matches under path filter: {}",
             path_filters.shown()
         );
-        if matches_outside_filter > 0 {
-            println!(
-                "reason: {matches_outside_filter} source match(es) exist outside the path filter"
-            );
-        } else {
-            println!("reason: no source match exists inside this scope");
-        }
+        println!(
+            "reason: no source match exists inside this scope; paths outside it were not scanned"
+        );
         let mode = if fixed { " --fixed" } else { "" };
         println!(
             "next: retry without the path filter: greppy search-pattern {}{mode}",
@@ -295,7 +242,7 @@ fn search_pattern_no_match_status(
     }
     let mode = if fixed { "-F " } else { "" };
     println!(
-        "next: search excluded or unindexed source directly: greppy rg -n {mode}{} .",
+        "next: search excluded source directly: greppy rg -n {mode}{} .",
         shell_example_arg(query)
     );
     // `--fixed` takes the pattern literally, so a pattern written as a regular
@@ -317,7 +264,6 @@ fn search_pattern_no_match_status(
         "next: search definition names: greppy search-symbol {}",
         shell_example_arg(query)
     );
-    println!("next: refresh graph-backed definition filters after source changes: greppy index .");
 }
 
 /// Whether a pattern carries regex syntax that `--fixed` would neutralise.
@@ -510,43 +456,6 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(1);
     }
 
-    if json {
-        let fetch = if kind.is_some() {
-            10_000
-        } else {
-            cli_result_limit(20)
-        };
-        let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
-        hits.retain(|hit| {
-            store
-                .get_node(hit.node_id)
-                .ok()
-                .flatten()
-                .is_some_and(|node| {
-                    search_symbol_name_contains(&node, q)
-                        && path_filters.matches(&node.file_path)
-                        && search_kind_matches(&root_path, &node, kind)
-                })
-        });
-        let total_filtered = hits.len() as i64;
-        hits.truncate(cli_result_limit_unless_all(20, all));
-        let status = if hits.is_empty() { "no_matches" } else { "ok" };
-        search_symbols_json(
-            &store,
-            q,
-            &project,
-            status,
-            Some(&freshness),
-            &hits,
-            &path_filters,
-            // The containment filter shapes `hits` on every run, so the total
-            // must count the same set on every run — a count from before the
-            // filter is a false number (measured: total_exact 2 beside 1 hit).
-            Some(total_filtered),
-        )?;
-        return Ok(0);
-    }
-
     let mut all_nodes = search_all_nodes(&store, &project)?;
     all_nodes.retain(|node| search_kind_matches(&root_path, node, kind));
     let matches_outside_filter = all_nodes
@@ -565,6 +474,36 @@ pub(crate) fn dispatch_search_symbols(
         .cloned()
         .collect::<Vec<_>>();
     search_sort_name_rows(q, &mut contained);
+    if json {
+        // JSON changes presentation, not retrieval, ordering or cardinality.
+        // Count the complete filtered name match set before applying the limit.
+        let total_filtered = contained.len() as i64;
+        let hits = contained
+            .iter()
+            .take(cli_result_limit_unless_all(20, all))
+            .enumerate()
+            .map(|(rank, node)| greppy_search::SymbolHit {
+                node_id: node.id,
+                rank: rank as f64,
+            })
+            .collect::<Vec<_>>();
+        let status = if total_filtered == 0 {
+            "no_matches"
+        } else {
+            "ok"
+        };
+        search_symbols_json(
+            &store,
+            q,
+            &project,
+            status,
+            Some(&freshness),
+            &hits,
+            &path_filters,
+            Some(total_filtered),
+        )?;
+        return Ok(if total_filtered == 0 { 1 } else { 0 });
+    }
     if !contained.is_empty() {
         contained.truncate(cli_result_limit_unless_all(20, all));
         search_print_symbol_rows(&root_path, &contained, code);
@@ -617,8 +556,11 @@ pub(crate) fn dispatch_search_symbols(
         similar.truncate(cli_result_limit_unless_all(20, all));
         println!();
         println!("similar names:");
-        search_print_symbol_rows(&root_path, &similar, code);
-        return Ok(0);
+        // `--code` applies to primary matches. These rows are diagnostic
+        // recovery candidates, so expanding their bodies can turn one typo
+        // into an unbounded wall of unrelated source.
+        search_print_symbol_rows(&root_path, &similar, false);
+        return Ok(1);
     }
 
     let meaning = search_symbol_meaning_hits(
@@ -635,14 +577,11 @@ pub(crate) fn dispatch_search_symbols(
         println!();
         println!("closest by meaning:");
         let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
-        print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
+        print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), false)?;
     }
-    // Nothing at all was produced: keep grep's "no lines selected". The system
-    // prompt states this exactly -- "the search commands use grep's codes, 0
-    // for a hit and 1 for none" -- and it is the contract the agent reads, so
-    // the code follows it. The guidance the caller needs is in the status block
-    // above; it does not need the exit code to carry it as well.
-    Ok(if meaning.is_empty() { 1 } else { 0 })
+    // Suggestions help recover from a miss; they are not matches for the
+    // requested name and must not turn an empty primary result into success.
+    Ok(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -768,7 +707,6 @@ pub(crate) fn search_code_definition_entry(
     handle.grammar_id = Some(format!("{language:?}"));
     handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
     Ok(Some(SearchCodeDefinitionEntry {
-        node_id: row.id,
         qualified_name: row.qualified_name.clone(),
         file: row.file_path.clone(),
         start_line: row.start_line,
@@ -779,79 +717,24 @@ pub(crate) fn search_code_definition_entry(
     }))
 }
 
-pub(crate) fn search_code_entries(
-    store: &greppy_store::Store,
-    project: &str,
-    root_path: &std::path::Path,
-    hits: &[greppy_search::CodeHit],
-    resolve_definitions: bool,
-) -> Result<Vec<SearchCodeEntry>> {
-    let mut entries = Vec::new();
-    let mut definition_entries = std::collections::HashMap::<i64, usize>::new();
-    for hit in hits {
-        let Some(match_line) = parse_search_code_match(hit) else {
-            continue;
-        };
-        let row = if resolve_definitions {
-            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
-        } else {
-            None
-        };
-        let Some(row) = row else {
-            entries.push(SearchCodeEntry::Unenclosed(match_line));
-            continue;
-        };
-        if let Some(index) = definition_entries.get(&row.id).copied() {
-            if let SearchCodeEntry::Definition(definition) = &mut entries[index] {
-                definition.matches.push(match_line);
-            }
-            continue;
-        }
-        let Some(mut definition) = search_code_definition_entry(root_path, &row)? else {
-            entries.push(SearchCodeEntry::Unenclosed(match_line));
-            continue;
-        };
-        definition.matches.push(match_line);
-        let index = entries.len();
-        definition_entries.insert(definition.node_id, index);
-        entries.push(SearchCodeEntry::Definition(definition));
-    }
-    Ok(entries)
-}
-
-pub(crate) fn search_code_entry_json(entry: &SearchCodeEntry) -> serde_json::Value {
-    match entry {
-        SearchCodeEntry::Definition(definition) => serde_json::json!({
-            "qualified_name": &definition.qualified_name,
-            "file": &definition.file,
-            "span": {
-                "start_line": definition.start_line,
-                "end_line": definition.end_line,
-            },
-            "source": &definition.source,
-            "handle": &definition.handle,
-            "matches": definition.matches.iter().map(|hit| serde_json::json!({
-                "location": &hit.location,
-                "line": hit.line,
-                "text": &hit.text,
-            })).collect::<Vec<_>>(),
-        }),
-        SearchCodeEntry::Unenclosed(hit) => serde_json::json!({
-            "qualified_name": serde_json::Value::Null,
-            "file": &hit.file,
-            "span": {
-                "start_line": hit.line,
-                "end_line": hit.line,
-            },
-            "source": serde_json::Value::Null,
-            "handle": serde_json::Value::Null,
-            "matches": [{
-                "location": &hit.location,
-                "line": hit.line,
-                "text": &hit.text,
-            }],
-        }),
-    }
+pub(crate) fn search_code_definition_json(
+    definition: &SearchCodeDefinitionEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "qualified_name": &definition.qualified_name,
+        "file": &definition.file,
+        "span": {
+            "start_line": definition.start_line,
+            "end_line": definition.end_line,
+        },
+        "source": &definition.source,
+        "handle": &definition.handle,
+        "matches": definition.matches.iter().map(|hit| serde_json::json!({
+            "location": &hit.location,
+            "line": hit.line,
+            "text": &hit.text,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug)]
@@ -865,21 +748,37 @@ fn search_pattern_case_insensitive_hits(
     query: &str,
     root_path: &std::path::Path,
     fixed: bool,
-) -> Result<Vec<greppy_search::CodeHit>> {
+    path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
+) -> Result<Option<Vec<greppy_search::CodeHit>>> {
+    const MAX_DIAGNOSTIC_FILES: usize = 1_024;
+    if let Some(progress) = progress {
+        progress.phase("discovering_diagnostic_files", 0, "files");
+    }
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
+        .filter(|path| path_filters.matches(path))
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
+    }
+    if paths.len() > MAX_DIAGNOSTIC_FILES {
+        return Ok(None);
+    }
+    if let Some(progress) = progress {
+        progress.phase("scanning_diagnostic_files", paths.len(), "files");
     }
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let mut command = std::process::Command::new("grep");
         command.args(["-H", "-n", "-I", "-i"]);
@@ -903,31 +802,83 @@ fn search_pattern_case_insensitive_hits(
                 .lines()
                 .filter_map(parse_grep_code_hit),
         );
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
-    Ok(hits)
+    Ok(Some(hits))
+}
+
+#[cfg(test)]
+mod case_insensitive_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_optional_scan_is_skipped_but_scoped_scan_remains_available() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        for n in 0..1_025 {
+            std::fs::write(
+                root.path().join(format!("file_{n}.rs")),
+                "pub fn Present() {}\n",
+            )
+            .unwrap();
+        }
+        // An invalid regex would make grep fail if the oversized scan ran.
+        let skipped = search_pattern_case_insensitive_hits(
+            "[",
+            root.path(),
+            false,
+            &QueryPathFilters::default(),
+            None,
+        )
+        .unwrap();
+        assert!(skipped.is_none());
+        let filters = QueryPathFilters::from_args(root.path(), &["file_0.rs".to_owned()]);
+        let scoped =
+            search_pattern_case_insensitive_hits("present", root.path(), true, &filters, None)
+                .unwrap()
+                .expect("one scoped file stays eligible");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].location, "file_0.rs:1");
+    }
 }
 
 fn search_pattern_rows(
-    store: &greppy_store::Store,
     project: &str,
     root_path: &std::path::Path,
     hits: &[greppy_search::CodeHit],
-    resolve_definitions: bool,
     kind: Option<&str>,
+    progress: &query_progress::LocalQueryProgress,
 ) -> Result<Vec<SearchPatternRow>> {
     let mut source_cache: std::collections::HashMap<String, Option<Vec<String>>> =
         Default::default();
+    let mut live_nodes: std::collections::HashMap<String, Vec<greppy_store::Node>> =
+        Default::default();
     let mut rows = Vec::new();
-    for hit in hits {
+    progress.phase("enriching_matches", hits.len(), "matches");
+    for (index, hit) in hits.iter().enumerate() {
+        progress.completed(index);
         let Some(match_line) = parse_search_code_match(hit) else {
             continue;
         };
-        let node = if resolve_definitions {
-            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
-                .and_then(|row| store.get_node(row.id).ok().flatten())
-        } else {
-            None
-        };
+        if !live_nodes.contains_key(&match_line.file) {
+            let nodes = live_search_pattern_nodes(root_path, project, &match_line.file)?;
+            live_nodes.insert(match_line.file.clone(), nodes);
+        }
+        let nodes = &live_nodes[&match_line.file];
+        let node = nodes
+            .iter()
+            .filter(|node| node.start_line <= match_line.line && match_line.line <= node.end_line)
+            .min_by(|left, right| {
+                right
+                    .start_line
+                    .cmp(&left.start_line)
+                    .then_with(|| left.end_line.cmp(&right.end_line))
+                    .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            })
+            .cloned();
         if kind.is_some()
             && node
                 .as_ref()
@@ -947,6 +898,7 @@ fn search_pattern_rows(
             test,
         });
     }
+    progress.completed(hits.len());
     let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
     for row in &rows {
         *per_file.entry(row.hit.file.clone()).or_insert(0) += 1;
@@ -958,6 +910,83 @@ fn search_pattern_rows(
             .then_with(|| left.hit.line.cmp(&right.hit.line))
     });
     Ok(rows)
+}
+
+fn live_search_pattern_nodes(
+    root_path: &std::path::Path,
+    project: &str,
+    file: &str,
+) -> Result<Vec<greppy_store::Node>> {
+    let path = root_path.join(file);
+    let language = greppy_parser::language_for_path(&path);
+    if !language.is_supported() {
+        return Ok(Vec::new());
+    }
+    let source = std::fs::read(&path)
+        .map_err(|error| Error::io(format!("read scoped match {}", path.display()), error))?;
+    let extracted = greppy_parser::extract(language, &source, file)?;
+    Ok(extracted
+        .nodes
+        .into_iter()
+        .map(|node| greppy_store::Node {
+            id: 0,
+            project: project.to_owned(),
+            label: node.label,
+            name: node.name,
+            qualified_name: node.qualified_name,
+            file_path: file.to_owned(),
+            start_line: i64::from(node.start_line),
+            end_line: i64::from(node.end_line),
+            properties: node.properties,
+        })
+        .collect())
+}
+
+fn search_pattern_row_json(
+    row: &SearchPatternRow,
+    root_path: &std::path::Path,
+    _code: bool,
+) -> Result<serde_json::Value> {
+    if let Some(node) = row.node.as_ref() {
+        let graph_row = greppy_search::graph::SearchGraphRow {
+            id: node.id,
+            project: node.project.clone(),
+            label: node.label.clone(),
+            name: node.name.clone(),
+            qualified_name: node.qualified_name.clone(),
+            file_path: node.file_path.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+        };
+        if let Some(mut entry) = search_code_definition_entry(root_path, &graph_row)? {
+            entry.matches.push(row.hit.clone());
+            let mut value = search_code_definition_json(&entry);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("name".into(), serde_json::json!(&node.name));
+                object.insert(
+                    "kind".into(),
+                    serde_json::json!(nav_kind_word(
+                        nav_file_lines(root_path, &node.file_path).as_ref(),
+                        node
+                    )),
+                );
+                object.insert("test".into(), serde_json::json!(row.test));
+            }
+            return Ok(value);
+        }
+    }
+    Ok(serde_json::json!({
+        "qualified_name": serde_json::Value::Null,
+        "file": &row.hit.file,
+        "span": { "start_line": row.hit.line, "end_line": row.hit.line },
+        "source": serde_json::Value::Null,
+        "handle": serde_json::Value::Null,
+        "matches": [{
+            "location": format!("{}:{}", row.hit.file, row.hit.line),
+            "line": row.hit.line,
+            "text": &row.hit.text,
+        }],
+    }))
 }
 
 fn print_search_pattern_rows(
@@ -975,22 +1004,18 @@ fn print_search_pattern_rows(
         *per_file.entry(&row.hit.file).or_insert(0) += 1;
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
-    if summarize {
-        let mut spread = per_file.into_iter().collect::<Vec<_>>();
-        spread.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
+    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
+    if shown < rows.len() {
+        // A limited query must not list every omitted file in its preamble.
         println!(
-            "{} matches: {}",
+            "— {} matches in {} files; showing {}",
             rows.len(),
-            spread
-                .into_iter()
-                .map(|(file, count)| format!("{file} {count}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            per_file.len(),
+            shown
         );
         println!();
     }
-    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
-    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
     // This regex only positions a display window. grep remains authoritative
     // for ERE matching; unsupported regex dialects retain a head preview.
     let display_regex = if code && !fixed {
@@ -1064,26 +1089,24 @@ pub(crate) fn dispatch_search_code(
             "search-pattern requires a regular expression".into(),
         ));
     }
-    let path_filters = prepare_query_path_filters(root, "search-pattern", q, paths)?;
-    let store = open_default_store(root)?;
-    let project = project_for(root)?;
     let root_path = resolve_root(root)?;
-    let decision = freshness_serve_decision(&store, root, &project);
-    let resolve_definitions = matches!(decision, FreshnessServe::Fresh(_));
-    let status = if resolve_definitions {
-        "ok"
-    } else {
-        "live-fallback"
-    };
-    let mut all_hits = live_grep_code_hits_pattern(q, &root_path, fixed)?;
-    let matches_outside_filter = all_hits
-        .iter()
-        .filter(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| !path_filters.matches(file))
-        })
-        .count();
+    let path_filters = prepare_query_path_filters(root, "search-pattern", q, paths)?;
+    let project = project_for(root)?;
+    let decision = serde_json::json!({
+        "state": "not_consulted",
+        "fresh": false,
+        "reasons": ["literal search resolved against selected live source files"],
+    });
+    let status = "live-fallback";
+    let local_progress =
+        query_progress::LocalQueryProgress::start("search-pattern", "discovering_files", "files");
+    let mut all_hits = live_grep_code_hits_pattern_scoped(
+        q,
+        &root_path,
+        fixed,
+        &path_filters,
+        Some(&local_progress),
+    )?;
     // The path filter shapes the hit set BEFORE any count is taken — a count
     // from before the filter is a false number (the --kind discipline).
     all_hits.retain(|hit| {
@@ -1092,52 +1115,102 @@ pub(crate) fn dispatch_search_code(
             .is_some_and(|(file, _)| path_filters.matches(file))
     });
 
+    let rows = search_pattern_rows(&project, &root_path, &all_hits, kind, &local_progress)?;
     if json {
-        let shown_hits = all_hits
-            .iter()
-            .take(cli_result_limit(SEARCH_CODE_LIMIT))
-            .cloned()
-            .collect::<Vec<_>>();
-        emit_search_code_results_with_format(
-            &store,
-            q,
-            &project,
-            status,
-            Some(decision.freshness()),
-            all_hits.len(),
-            &shown_hits,
-            &path_filters,
-            &root_path,
-            true,
-            false,
-            fixed,
-            resolve_definitions,
-        )?;
-        return Ok(0);
+        let mut shown: Vec<serde_json::Value> = Vec::new();
+        let mut definitions = std::collections::HashMap::<String, usize>::new();
+        let shown_matches = cli_result_limit_unless_all(SEARCH_CODE_LIMIT, all).min(rows.len());
+        for row in rows.iter().take(shown_matches) {
+            let value = search_pattern_row_json(row, &root_path, code)?;
+            let key = value
+                .get("qualified_name")
+                .and_then(serde_json::Value::as_str)
+                .map(|qualified_name| {
+                    format!(
+                        "{}\0{}\0{}\0{}",
+                        value["file"],
+                        value["span"]["start_line"],
+                        value["span"]["end_line"],
+                        qualified_name
+                    )
+                });
+            if let Some(index) = key.as_ref().and_then(|key| definitions.get(key)).copied() {
+                if let (Some(matches), Some(next)) = (
+                    shown[index]
+                        .get_mut("matches")
+                        .and_then(serde_json::Value::as_array_mut),
+                    value
+                        .get("matches")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|matches| matches.first()),
+                ) {
+                    matches.push(next.clone());
+                }
+            } else {
+                let index = shown.len();
+                if let Some(key) = key {
+                    definitions.insert(key, index);
+                }
+                shown.push(value);
+            }
+        }
+        let omitted = rows.len().saturating_sub(shown_matches);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": "search-pattern",
+                "status": status,
+                "result_status": if rows.is_empty() { "no_matches" } else { "ok" },
+                "query": q,
+                "pattern_mode": if fixed { "fixed" } else { "regex" },
+                "project": project,
+                "path_filters": path_filters.json_value(),
+                "backend": "live-filesystem",
+                "fresh": true,
+                "freshness": serde_json::Value::Null,
+                "index_freshness": decision,
+                "provider_complete": serde_json::Value::Null,
+                "incomplete_provider_count": serde_json::Value::Null,
+                "incomplete_providers": serde_json::Value::Null,
+                "provider_metadata_status": "not_consulted_for_live_literal_search",
+                "total_exact": rows.len(),
+                "shown": shown_matches,
+                "omitted": omitted,
+                "truncated": omitted > 0,
+                "next": if rows.is_empty() {
+                    vec![
+                        format!("greppy search-symbol {}", shell_example_arg(q)),
+                        "retry without --path/--kind".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                "hits": shown,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize search-pattern JSON: {error}")))?
+        );
+        return Ok(if rows.is_empty() { 1 } else { 0 });
     }
 
-    let rows = search_pattern_rows(
-        &store,
-        &project,
-        &root_path,
-        &all_hits,
-        resolve_definitions,
-        kind,
-    )?;
     if rows.is_empty() {
-        search_pattern_no_match_status(q, fixed, &path_filters, matches_outside_filter);
-        let mut insensitive = search_pattern_case_insensitive_hits(q, &root_path, fixed)?;
-        insensitive.retain(|hit| {
-            hit.location
-                .rsplit_once(':')
-                .is_some_and(|(file, _)| path_filters.matches(file))
-        });
-        if !insensitive.is_empty() {
+        let insensitive = search_pattern_case_insensitive_hits(
+            q,
+            &root_path,
+            fixed,
+            &path_filters,
+            Some(&local_progress),
+        )?;
+        // Finish every source scan before emitting the terminal answer.  A caller
+        // may treat `status: no_matches` as completion even though the optional
+        // case-insensitive diagnostic can still take substantial time on a large
+        // repository.
+        search_pattern_no_match_status(q, fixed, &path_filters);
+        if let Some(insensitive) = insensitive.filter(|hits| !hits.is_empty()) {
             println!("case-insensitive: {} matches", insensitive.len());
         }
         // grep's code, as the prompt promises for the search commands. The
         // status block above carries the guidance.
-        return Ok(if insensitive.is_empty() { 1 } else { 0 });
+        return Ok(1);
     }
     print_search_pattern_rows(&rows, code, all, q, fixed, &root_path);
     Ok(0)
@@ -1245,17 +1318,17 @@ pub(crate) fn dispatch_semantic(
     prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
 
-    let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale(&mut store, root)?;
-    let project = project_for(root)?;
     // Stale/unknown snapshots are never served. Semantic search is always
     // vector-backed on current main, so auto-refresh is allowed only when the
     // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
+    let mut store = open_default_store_query_writer(root)?;
+    maybe_reindex_stale_semantic(&mut store, root, allow_reindex)?;
+    let project = project_for(root)?;
     let decision =
-        freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false);
-    let incomplete_providers = incomplete_provider_json(&store, &project)?;
-    let freshness = decision.freshness().clone();
+        freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false, false);
+    let mut incomplete_providers = incomplete_provider_json(&store, &project)?;
+    let mut freshness = decision.freshness().clone();
 
     if provider_policy_blocks_query(&incomplete_providers)? {
         if json {
@@ -1327,29 +1400,60 @@ pub(crate) fn dispatch_semantic(
         }
         if !embedding_generation_complete(&store, &project, generation, &cfg.model_id) {
             let root_path = resolve_root(root)?;
-            let _ = spawn_background_embed(root, &cfg);
-            let progress = embedding_progress_value(&root_path, &cfg, generation);
-            if json {
-                semantic_embedding_indexing_json(
-                    &project,
-                    &cfg,
-                    generation,
-                    &freshness,
-                    &progress,
-                    SemanticFallbackContext {
-                        query: q,
-                        paths,
-                        root,
-                    },
-                )?;
-            } else {
-                println!(
-                    "semantic search temporarily unavailable — {}; retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit {EXIT_TEMPFAIL})",
-                    embedding_progress_text(&progress)
-                );
+            drop(store);
+            store = wait_for_embedding_publication(root, &root_path, &project, generation, &cfg)?;
+            let reopened_decision = freshness_serve_decision_with_policy(
+                &store,
+                root,
+                &project,
+                allow_reindex,
+                false,
+                false,
+            );
+            freshness = reopened_decision.freshness().clone();
+            incomplete_providers = incomplete_provider_json(&store, &project)?;
+            if provider_policy_blocks_query(&incomplete_providers)? {
+                if json {
+                    semantic_provider_incomplete_json(
+                        &project,
+                        "vector",
+                        Some(&freshness),
+                        &incomplete_providers,
+                    )?;
+                } else {
+                    println!(
+                        "{}",
+                        provider_incomplete_skip_message(
+                            "semantic-search",
+                            incomplete_providers.len()
+                        )
+                    );
+                }
+                return Ok(1);
             }
-            return Ok(EXIT_TEMPFAIL as i32);
+            if !freshness_json_is_fresh(&freshness) {
+                if json {
+                    semantic_vector_json(
+                        &store,
+                        &project,
+                        &cfg,
+                        current_graph_generation(&store, root)?,
+                        0,
+                        candidate_limit,
+                        Some(&freshness),
+                        "skipped_stale_index",
+                        &[],
+                    )?;
+                } else {
+                    println!(
+                        "{}",
+                        vector_stale_skip_message("semantic-search", &freshness)
+                    );
+                }
+                return Ok(freshness_refusal_exit(&freshness));
+            }
         }
+        let generation = current_graph_generation(&store, root)?;
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
             &project,
             &cfg.model_id,
@@ -1470,6 +1574,139 @@ pub(crate) fn dispatch_semantic(
             Err(e) => Err(e),
         }
     }
+}
+
+fn wait_for_embedding_publication(
+    root: Option<&str>,
+    effective_root: &std::path::Path,
+    project: &str,
+    requested_generation: u64,
+    cfg: &EmbeddingModelConfig,
+) -> Result<greppy_store::Store> {
+    let mut announced = false;
+    loop {
+        let mut launch = spawn_background_embed_handle(root, cfg).ok_or_else(|| {
+            let detail = background_embedding_failure(embedding_progress_value(
+                effective_root,
+                cfg,
+                requested_generation,
+            ))
+            .unwrap_or_else(|| "the embedding process could not be started".into());
+            Error::Index(format!(
+                "semantic embedding failed for {}: {detail}",
+                effective_root.display()
+            ))
+        })?;
+        let initial_job = read_background_job(launch.path());
+        let follow_attached_owner = matches!(launch, BackgroundJobLaunch::Attached { .. })
+            && !initial_job.as_ref().is_some_and(|job| {
+                job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
+            });
+        if !announced {
+            let progress = initial_job.unwrap_or_else(|| {
+                embedding_progress_value(effective_root, cfg, requested_generation)
+            });
+            eprintln!("semantic-search: {}", embedding_progress_text(&progress));
+            announced = true;
+        }
+        loop {
+            let owner_active = launch.owner_is_active().map_err(|error| {
+                Error::io(
+                    format!(
+                        "observe semantic embedding owner for {}",
+                        effective_root.display()
+                    ),
+                    error,
+                )
+            })?;
+            if matches!(
+                observe_background_embedding(
+                    read_background_job(launch.path()).as_ref(),
+                    owner_active,
+                    false,
+                    follow_attached_owner,
+                ),
+                BackgroundEmbeddingObservation::Pending
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            break;
+        }
+        if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
+            let _ = child.wait();
+        }
+        let store = open_default_store_query_writer(root)?;
+        let published_generation = current_graph_generation(&store, root)?;
+        let publication_complete =
+            embedding_generation_complete(&store, project, published_generation, &cfg.model_id);
+        match observe_background_embedding(
+            read_background_job(launch.path()).as_ref(),
+            false,
+            publication_complete,
+            follow_attached_owner,
+        ) {
+            BackgroundEmbeddingObservation::Published => return Ok(store),
+            BackgroundEmbeddingObservation::FollowIndex => {
+                drop(store);
+                continue;
+            }
+            BackgroundEmbeddingObservation::Failed(detail) => {
+                return Err(Error::Index(format!(
+                    "semantic embedding failed for {}: {detail}",
+                    effective_root.display()
+                )));
+            }
+            BackgroundEmbeddingObservation::MissingPublication => {}
+            BackgroundEmbeddingObservation::Pending => {
+                unreachable!("inactive owner cannot remain pending")
+            }
+        }
+        return Err(Error::Index(format!(
+            "semantic embedding for {} exited without publishing generation {requested_generation} for model {}",
+            effective_root.display(),
+            cfg.model_id
+        )));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundEmbeddingObservation {
+    Pending,
+    Published,
+    FollowIndex,
+    Failed(String),
+    MissingPublication,
+}
+
+pub(crate) fn observe_background_embedding(
+    job: Option<&serde_json::Value>,
+    owner_active: bool,
+    publication_complete: bool,
+    follow_attached_owner: bool,
+) -> BackgroundEmbeddingObservation {
+    if owner_active {
+        return BackgroundEmbeddingObservation::Pending;
+    }
+    if publication_complete {
+        return BackgroundEmbeddingObservation::Published;
+    }
+    if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
+        return BackgroundEmbeddingObservation::Failed(detail);
+    }
+    if follow_attached_owner {
+        return BackgroundEmbeddingObservation::FollowIndex;
+    }
+    BackgroundEmbeddingObservation::MissingPublication
+}
+
+pub(crate) fn background_embedding_failure(job: serde_json::Value) -> Option<String> {
+    (job.get("state").and_then(serde_json::Value::as_str) == Some("failed")).then(|| {
+        job.get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("background embedding failed without a recorded cause")
+            .to_string()
+    })
 }
 
 pub(crate) fn semantic_vector_purposes(

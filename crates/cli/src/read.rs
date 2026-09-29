@@ -252,6 +252,21 @@ fn read_definition(
         )));
     }
     let line_count = read_line_count(&content);
+    if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+        // A canonical `__file__` node identifies the current indexed file, not
+        // a one-line callable definition. Older graphs persist its bookkeeping
+        // span as 1:1, but JSON caller pipelines legitimately carry this node
+        // into `read` / `read-smart`. Derive the readable span from the
+        // SHA-verified, confined file bytes above so the canonical identity
+        // yields real source without inventing a callable owner. Text
+        // --head/--tail then slice this full-file DefinitionRead normally.
+        return Ok(Some(DefinitionRead {
+            node,
+            content,
+            start_line: 1,
+            end_line: line_count.max(1),
+        }));
+    }
     let node_start = usize::try_from(node.start_line.max(1)).unwrap_or(1);
     if node_start > line_count.max(1) {
         return Ok(None);
@@ -280,25 +295,41 @@ fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<grepp
         };
         if node.file_path.is_empty()
             || node.start_line < 1
-            || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
-            || !seen.insert((node.file_path.clone(), node.start_line, node.end_line))
+            || !seen.insert((
+                node.file_path.clone(),
+                node.start_line,
+                node.end_line,
+                node.qualified_name.clone(),
+                node.label.clone(),
+            ))
         {
             continue;
         }
+        // A persisted module caller is represented by the canonical `__file__`
+        // graph node. `who-calls --json | greppy read -` must be able to carry
+        // that real identity back into the source-reading surface; read-file
+        // already exposes the same source, so accepting the anchor here adds no
+        // new content or resolver interpretation.
         nodes.push(node);
     }
     Ok(nodes)
 }
 
-fn read_is_ambiguous(target: &str, nodes: &[greppy_store::Node]) -> bool {
-    if split_path_qualified(target).is_some() {
-        return false;
+fn read_is_ambiguous(nodes: &[greppy_store::Node]) -> bool {
+    nodes.len() > 1
+}
+
+fn read_report_ambiguous(target: &str, nodes: &[greppy_store::Node]) {
+    println!("`{target}` is {} definitions", nodes.len());
+    for node in nodes {
+        println!(
+            "{}:{}  {} — greppy read {}",
+            node.file_path,
+            node.start_line.max(1),
+            node.qualified_name,
+            node.qualified_name
+        );
     }
-    let sites = nodes
-        .iter()
-        .map(|node| node.file_path.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    sites.len() > 1
 }
 
 fn read_begin_group(printed: &mut bool, previous_ended_with_newline: &mut bool) {
@@ -469,7 +500,10 @@ pub(crate) fn resolve_compact_read_handle(
         .collect::<String>();
     let mut expected = [0u8; 16];
     expected.copy_from_slice(&binary[9..25]);
-    let store = open_default_store_query_writer(root)?;
+    // Compact handles are continuation metadata, not graph evidence. Resolve
+    // them from the workspace-local pack store so a stale linked-worktree Base
+    // binding cannot make a filesystem edit handle require reindexing.
+    let store = open_default_store_pack_writer(root)?;
     let Some(pack) = store.get_expand_pack(&id)? else {
         return Ok(None);
     };
@@ -597,11 +631,12 @@ pub(crate) fn dispatch_read(
     let canonical_root = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
+    let file_base = resolve_file_operand_base(root, &root_path);
     let file_intents = subjects
         .iter()
         .map(|subject| {
             looks_like_path(subject)
-                || read_open_file(&root_path, &canonical_root, subject).is_some()
+                || read_open_file(&file_base, &canonical_root, subject).is_some()
         })
         .collect::<Vec<_>>();
 
@@ -770,12 +805,13 @@ pub(crate) fn dispatch_read_symbols(
             );
             return Ok(1);
         }
-        if read_is_ambiguous(query, &nodes) {
+        if read_is_ambiguous(&nodes) {
             let candidates = nodes
                 .iter()
                 .map(|node| {
                     serde_json::json!({
-                        "qualified_name": node.qualified_name,
+                        "qualified_name": node.qualified_name.clone(),
+                        "selector": node.qualified_name.clone(),
                         "path": node.file_path,
                         "line": node.start_line,
                     })
@@ -858,12 +894,13 @@ pub(crate) fn dispatch_read_symbols(
                 ids.push(id);
             }
         }
-        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+        let nodes = read_real_nodes(&store, &ids)?;
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let nodes = read_real_nodes(&store, &ids)?;
         let Some(node) = nodes.first().cloned() else {
             nav_report_missing(&store, &project, query);
             previous_ended_with_newline = true;
@@ -1152,8 +1189,8 @@ pub(crate) fn dispatch_read_smart(
         let ids = resolve_symbol_nodes(&store, Some(query))?;
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
-        let filtered_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
-        if nav_refuse_ambiguous(&store, query, &filtered_ids)?.is_some() {
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
@@ -1221,12 +1258,7 @@ pub(crate) fn dispatch_read_smart(
 }
 
 fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
-    let supplied = std::path::Path::new(subject);
-    if supplied.is_absolute() {
-        supplied.to_path_buf()
-    } else {
-        root_path.join(supplied)
-    }
+    file_operand_path(root_path, subject)
 }
 
 fn read_open_file(
@@ -1234,6 +1266,16 @@ fn read_open_file(
     canonical_root: &std::path::Path,
     subject: &str,
 ) -> Option<(String, std::path::PathBuf, String)> {
+    let (shown, canonical) = read_resolve_file(root_path, canonical_root, subject)?;
+    let content = std::fs::read_to_string(&canonical).ok()?;
+    Some((shown, canonical, content))
+}
+
+fn read_resolve_file(
+    root_path: &std::path::Path,
+    canonical_root: &std::path::Path,
+    subject: &str,
+) -> Option<(String, std::path::PathBuf)> {
     let candidate = read_file_candidate(root_path, subject);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.is_file() {
@@ -1242,15 +1284,29 @@ fn read_open_file(
     let shown = if let Ok(relative) = canonical.strip_prefix(canonical_root) {
         relative.to_string_lossy().replace('\\', "/")
     } else {
-        // Reading is allowed for an explicitly absolute diagnostic/artifact
-        // path. Keep relative `../` traversal confined to the repository.
-        if !std::path::Path::new(subject).is_absolute() {
-            return None;
+        let subject_path = std::path::Path::new(subject);
+        if subject_path.is_absolute() {
+            // Reading is allowed for an explicitly absolute diagnostic or
+            // artifact path.
+            canonical.to_string_lossy().replace('\\', "/")
+        } else {
+            // A dependency directory may be symlinked outside the workspace.
+            // Permit that ordinary read while keeping parent traversal from
+            // using a symlink plus `..` to escape the workspace implicitly.
+            if subject_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return None;
+            }
+            candidate
+                .strip_prefix(canonical_root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/")
         }
-        canonical.to_string_lossy().replace('\\', "/")
     };
-    let content = std::fs::read_to_string(&canonical).ok()?;
-    Some((shown, canonical, content))
+    Some((shown, canonical))
 }
 
 fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)> {
@@ -1364,6 +1420,7 @@ pub(crate) fn dispatch_read_files(
     // query-writer connection that can collide with the indexer's schema
     // publication. The store is needed only for continuation/handle records.
     let root_path = resolve_root(root)?;
+    let file_base = resolve_file_operand_base(root, &root_path);
     let path_filters = if path_filter_args.is_empty() {
         QueryPathFilters::default()
     } else {
@@ -1374,6 +1431,8 @@ pub(crate) fn dispatch_read_files(
     // only for continuation packs or explicit handles. Re-resolving a linked
     // worktree several times made a plain file read crawl under filesystem
     // pressure and could leave callers waiting with no output.
+    // File operands join against `file_base` (the explicit --root, if any);
+    // shown paths, handles and continuation packs stay workspace-relative.
     let canonical_root = root_path.clone();
     let mut project = None::<String>;
     let mut store = None;
@@ -1381,14 +1440,21 @@ pub(crate) fn dispatch_read_files(
     let mut printed = false;
     let mut previous_ended_with_newline = true;
     for path in paths {
-        if !path_filters.matches(path) {
+        let Some((shown, canonical)) = read_resolve_file(&file_base, &canonical_root, path) else {
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("no such file: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        if !path_filters.matches(&shown) {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("outside path filter: {path}");
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
+        let Ok(content) = std::fs::read_to_string(&canonical) else {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");
             previous_ended_with_newline = true;

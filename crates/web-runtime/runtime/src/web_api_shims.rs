@@ -22,6 +22,26 @@ pub fn shim_source() -> &'static str {
 const SHIM_JS: &str = r#"(function () {
   'use strict';
 
+  // Servo's HeadParsed signal only says that the head has been parsed. Keep
+  // the DOMContentLoaded milestone separate so navigation waits do not return
+  // while the parser or a deferred script is still running.
+  var lifecycleWindow = globalThis;
+  var lifecycleDocument = document;
+  var domContentLoaded = lifecycleDocument.readyState === 'complete';
+  Object.defineProperty(globalThis, '__greppyDOMContentLoaded', {
+    get: function () { return domContentLoaded; },
+    configurable: false,
+    enumerable: false,
+  });
+  if (!domContentLoaded) {
+    var recordDOMContentLoaded = function recordDOMContentLoaded(event) {
+      if (!event.isTrusted) return;
+      domContentLoaded = true;
+      lifecycleWindow.removeEventListener('DOMContentLoaded', recordDOMContentLoaded, true);
+    };
+    lifecycleWindow.addEventListener('DOMContentLoaded', recordDOMContentLoaded, true);
+  }
+
   // requestIdleCallback: Servo has no implementation at all. Deferred work is
   // better run late than not at all, so this maps onto setTimeout. The
   // deadline reports a plausible budget rather than pretending to measure one.
@@ -111,6 +131,8 @@ mod tests {
             "requestIdleCallback",
             "cancelIdleCallback",
             "serviceWorker",
+            "__greppyDOMContentLoaded",
+            "DOMContentLoaded",
         ] {
             assert!(
                 source.contains(symbol),

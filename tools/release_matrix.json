@@ -5,7 +5,7 @@
       "os": "macos-latest",
       "asset": "greppy-macos-arm64.pkg",
       "features": "metal",
-      "footprint_devices": "cpu metal",
+      "footprint_devices": "metal",
       "runner_os": "macOS",
       "runner_arch": "ARM64",
       "rust_host": "aarch64-apple-darwin"

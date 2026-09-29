@@ -3,6 +3,19 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(debug_assertions)]
+    if let Some(code) = greppy::base_build_owner_watchdog_descendant_probe() {
+        return ExitCode::from(code);
+    }
+    #[cfg(debug_assertions)]
+    let is_base_build_child = std::env::var_os(greppy::ENV_BASE_BUILD_OWNER_STDIN).is_some();
+    greppy::install_base_build_owner_watchdog();
+    #[cfg(debug_assertions)]
+    if is_base_build_child {
+        if let Some(code) = greppy::run_base_build_owner_watchdog_test_harness() {
+            return ExitCode::from(code);
+        }
+    }
     greppy::startup_trace("main.enter");
     // Tracing initialisation is best-effort: a failure should not block
     // the binary from running.

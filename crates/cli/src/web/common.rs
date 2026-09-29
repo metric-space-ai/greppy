@@ -13,6 +13,15 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum RunMode {
+    /// Start the script with its own browser, context, and page.
+    #[default]
+    Standalone,
+    /// Bind the script to the selected session's current browser, context, and page.
+    Active,
+}
+
 pub const EXIT_WEB_INVALID: i32 = 30;
 pub const EXIT_WEB_UNAVAILABLE: i32 = 31;
 #[allow(dead_code)]
@@ -340,6 +349,7 @@ pub(super) fn run(
     script_file: Option<String>,
     script_stdin: bool,
     timeout: Option<u64>,
+    mode: RunMode,
     json: bool,
 ) -> Result<i32> {
     let session = match resolve_session(root, session) {
@@ -376,11 +386,122 @@ pub(super) fn run(
             invalid("web run requires --script-file FILE or --script-stdin"),
         );
     };
+    let payload = build_run_payload(
+        &session,
+        script_source,
+        script_file_field.as_deref(),
+        script_text.as_deref(),
+        timeout,
+        mode,
+    );
+    match rpc_response(root, "web.run", payload, Some(session.clone())) {
+        Err(error) => emit_error(json, error),
+        Ok(mut response) => {
+            if let Err(error) = export_trace_artifacts(root, &session, &response) {
+                if response.status == "ok" {
+                    return emit_error(json, error);
+                }
+                response.artifacts.push(json!({
+                    "kind": "trace_export_error",
+                    "code": error.code,
+                    "message": error.message,
+                    "requested_exports_preserved": true,
+                }));
+            }
+            emit_response(json, response)
+        }
+    }
+}
+
+fn export_trace_artifacts(
+    root: Option<&str>,
+    session: &str,
+    response: &Response,
+) -> std::result::Result<(), ErrorObject> {
+    let exports = trace_exports(response);
+    for export in &exports {
+        let id = export
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let destination = export
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if id.is_empty() || destination.is_empty() {
+            return Err(invalid("trace export metadata was incomplete"));
+        }
+        let artifact = rpc_response(
+            root,
+            "web.artifact.path",
+            json!({"session_id":session,"id":id}),
+            Some(session.to_owned()),
+        )?;
+        if artifact.status != "ok" {
+            return Err(artifact
+                .error
+                .unwrap_or_else(|| invalid("trace artifact path failed")));
+        }
+        let source = artifact
+            .result
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let bytes = std::fs::read(source).map_err(|error| {
+            ErrorObject::new(
+                "ARTIFACT_IO",
+                format!("cannot read trace artifact: {error}"),
+                response.request_id.clone(),
+                EXIT_WEB_ARTIFACT,
+                "retry web run",
+            )
+        })?;
+        export_regular_file(Path::new(destination), &bytes)?;
+    }
+    Ok(())
+}
+
+fn trace_exports(response: &Response) -> Vec<serde_json::Value> {
+    let mut exports = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("trace_exports"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for artifact in &response.artifacts {
+        if let (Some(id), Some(path)) = (
+            artifact.get("id").and_then(|value| value.as_str()),
+            artifact
+                .get("requested_path")
+                .and_then(|value| value.as_str()),
+        ) {
+            let duplicate = exports.iter().any(|export| {
+                export.get("id").and_then(|value| value.as_str()) == Some(id)
+                    && export.get("path").and_then(|value| value.as_str()) == Some(path)
+            });
+            if !path.is_empty() && !duplicate {
+                exports.push(json!({"id":id,"path":path}));
+            }
+        }
+    }
+    exports
+}
+
+fn build_run_payload(
+    session: &str,
+    script_source: &str,
+    script_file: Option<&str>,
+    script_text: Option<&str>,
+    timeout: Option<u64>,
+    mode: RunMode,
+) -> serde_json::Value {
     let mut payload = json!({
         "session_id": session,
         "script_source": script_source,
     });
-    if let Some(path) = script_file_field {
+    if let Some(path) = script_file {
         payload["script_file"] = json!(path);
     }
     if let Some(text) = script_text {
@@ -389,7 +510,10 @@ pub(super) fn run(
     if let Some(timeout) = timeout {
         payload["timeout_seconds"] = json!(timeout);
     }
-    rpc(root, json, "web.run", payload, Some(session))
+    if mode == RunMode::Active {
+        payload["bind_session_page"] = json!(true);
+    }
+    payload
 }
 
 pub(super) fn screenshot(
@@ -435,11 +559,11 @@ pub(super) fn screenshot(
                             "retry greppy web doctor",
                         ),
                     ),
-                    Ok(response) => {
+                    Ok(mut response) => {
                         if response.status == "ok" {
                             if let Some(dest) = output.as_deref() {
                                 if let Err(error) =
-                                    export_screenshot_artifact(&ctx.run_id, &response, dest)
+                                    export_screenshot_artifact(&ctx.run_id, &mut response, dest)
                                 {
                                     return emit_error(json, error);
                                 }
@@ -464,7 +588,7 @@ pub(super) fn artifact_store_root(run_id: &str) -> PathBuf {
 
 pub(super) fn export_screenshot_artifact(
     run_id: &str,
-    response: &Response,
+    response: &mut Response,
     dest: &str,
 ) -> std::result::Result<(), ErrorObject> {
     let object_path = response
@@ -496,7 +620,21 @@ pub(super) fn export_screenshot_artifact(
             "retry greppy web screenshot",
         )
     })?;
-    export_regular_file(Path::new(dest), &bytes)
+    export_regular_file(Path::new(dest), &bytes)?;
+    // --output delivers the image as a file. Keep its receipt and artifact
+    // identity, without duplicating the image bytes into the agent context.
+    // Only change the reply after the export succeeds.
+    if let Some(result) = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        result.remove("png_base64");
+        result.remove("cursor");
+        result.remove("truncated");
+        result.insert("output_path".into(), json!(dest));
+    }
+    Ok(())
 }
 
 pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject> {
@@ -918,6 +1056,9 @@ pub(super) fn ensure_supervisor(
                         .unwrap_or("spawn coordination failed")
                 )));
             }
+            crate::inference_daemon::SpawnOutcome::CoordinationFailed(error) => {
+                return Err(spawn_coordination_unavailable(error));
+            }
         }
         let started = Instant::now();
         let budget = Duration::from_secs(60);
@@ -965,6 +1106,16 @@ pub(super) fn ensure_supervisor(
             )
         )))
     }
+}
+
+fn spawn_coordination_unavailable(error: String) -> ErrorObject {
+    ErrorObject::new(
+        "runtime_storage_unavailable",
+        error,
+        new_request_id(),
+        EXIT_WEB_UNAVAILABLE,
+        "fix the Greppy data-root path and ownership, then retry",
+    )
 }
 
 fn attach_cookie_path(socket: &Path) -> PathBuf {
@@ -1649,6 +1800,57 @@ mod target_tests {
     use super::*;
 
     #[test]
+    fn run_payload_binds_only_active_mode() {
+        let standalone = build_run_payload(
+            "wrs_1",
+            "file",
+            Some("spec.mjs"),
+            Some("await page.title()"),
+            Some(12),
+            RunMode::Standalone,
+        );
+        assert_eq!(standalone["session_id"], "wrs_1");
+        assert_eq!(standalone["script_source"], "file");
+        assert_eq!(standalone["script_file"], "spec.mjs");
+        assert_eq!(standalone["script_text"], "await page.title()");
+        assert_eq!(standalone["timeout_seconds"], 12);
+        assert!(standalone.get("bind_session_page").is_none());
+
+        let active = build_run_payload(
+            "wrs_1",
+            "stdin",
+            None,
+            Some("return await page.title()"),
+            None,
+            RunMode::Active,
+        );
+        assert_eq!(active["bind_session_page"], true);
+        assert!(active.get("script_file").is_none());
+    }
+
+    #[test]
+    fn trace_exports_keep_identical_digest_for_distinct_destinations() {
+        let request = greppy_web_client::Request::new("run", "web.run", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({"trace_exports":[{"id":"same-digest","path":"first.zip"}]}),
+        );
+        response.artifacts.extend([
+            json!({"id":"same-digest","requested_path":"first.zip"}),
+            json!({"id":"same-digest","requested_path":"second.zip"}),
+        ]);
+
+        let exports = trace_exports(&response);
+        assert_eq!(
+            exports.len(),
+            2,
+            "same bytes can have multiple requested destinations"
+        );
+        assert!(exports.iter().any(|value| value["path"] == "first.zip"));
+        assert!(exports.iter().any(|value| value["path"] == "second.zip"));
+    }
+
+    #[test]
     fn parse_css_quoted_and_nth() {
         let parsed = parse_target(r#"css="div > a""#, false, false, Some(2)).unwrap();
         assert_eq!(parsed.selector["type"], "css");
@@ -1703,6 +1905,63 @@ mod scope_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_export_returns_file_receipt_without_inline_image() {
+        let parent = artifact_store_root("placeholder")
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::create_dir_all(&parent).unwrap();
+        let artifacts = tempfile::Builder::new()
+            .prefix("screenshot-export-test-")
+            .tempdir_in(&parent)
+            .unwrap();
+        let run_id = artifacts.path().file_name().unwrap().to_str().unwrap();
+        let image = vec![42u8; 32_768];
+        std::fs::write(artifacts.path().join("image.png"), &image).unwrap();
+        let output = tempfile::Builder::new()
+            .prefix("screenshot-output-test-")
+            .tempdir_in(&parent)
+            .unwrap();
+        // macOS temp roots may include /var -> /private/var. This success
+        // fixture needs a canonical destination; symlink rejection is separate.
+        let dest = output.path().canonicalize().unwrap().join("saved.png");
+        let request = Request::new(run_id, "web.screenshot", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({
+                "object_path": "image.png", "digest": "test-digest",
+                "byte_count": image.len(), "media_type": "image/png",
+                "png_base64": "A".repeat(43_692),
+                "truncated": true, "cursor": "sha256:test-digest:0"
+            }),
+        );
+        response.artifacts.push(json!({"object_path": "image.png"}));
+        let original = response.clone();
+        export_screenshot_artifact(run_id, &mut response, dest.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), image);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["output_path"], dest.to_str().unwrap());
+        assert_eq!(result["byte_count"], image.len());
+        assert_eq!(result["digest"], "test-digest");
+        assert!(result.get("png_base64").is_none());
+        assert!(result.get("cursor").is_none());
+        assert!(result.get("truncated").is_none());
+        assert_eq!(response.artifacts, original.artifacts);
+        assert!(serde_json::to_vec(&response).unwrap().len() < 2_000);
+
+        // A failed export must preserve the original inline result and must
+        // not advertise an output file that was never written.
+        let mut failure = original;
+        let before = serde_json::to_value(&failure).unwrap();
+        assert!(
+            export_screenshot_artifact(run_id, &mut failure, output.path().to_str().unwrap())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&failure).unwrap(), before);
+    }
 
     #[test]
     fn page_error_text_cannot_become_a_missing_session_signal() {
@@ -1838,5 +2097,17 @@ mod scope_tests {
             assert_ne!(a, c);
             assert!(a.starts_with("run_ws_"), "{a}");
         });
+    }
+
+    #[test]
+    fn spawn_coordination_error_reports_storage_action_without_install_advice() {
+        let error = spawn_coordination_unavailable(
+            "cannot acquire daemon spawn lock: cache root is not owned".into(),
+        );
+        assert_eq!(error.code, "runtime_storage_unavailable");
+        assert_eq!(error.exit_code, EXIT_WEB_UNAVAILABLE);
+        assert!(error.message.contains("cache root is not owned"));
+        assert!(error.next_action.contains("data-root path and ownership"));
+        assert!(!error.next_action.contains("install"));
     }
 }

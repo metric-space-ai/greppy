@@ -420,8 +420,8 @@ fn graph_grid_csharp_stale_edit_detected() {
         "baseline edge missing: {baseline}"
     );
 
-    // Remove the helper call after indexing. The implementation may report
-    // drift or heal before answering, but it must never return the old caller.
+    // With automatic repair explicitly disabled, report drift without
+    // returning the old caller or silently rebuilding the graph.
     std::fs::write(
         repo.join("src/Main.cs"),
         r#"using Payload = Fixture.Types.Payload;
@@ -462,27 +462,16 @@ namespace Fixture.App
         value["hits"].as_array().is_some_and(Vec::is_empty),
         "stale caller edges must never escape: {value}"
     );
-    match code {
-        75 => {
-            assert_eq!(value["status"], "skipped_stale_index", "{value}");
-            assert_eq!(value["fresh"], false, "{value}");
-            assert!(
-                matches!(
-                    value["freshness"]["state"].as_str(),
-                    Some("drift" | "refreshing")
-                ),
-                "stale refusal must identify drift/refresh: {value}"
-            );
-        }
-        0 => {
-            assert_eq!(value["fresh"], true, "healed result must be fresh: {value}");
-            assert_eq!(
-                value["total_exact"], 0,
-                "healed result must reflect removal of helper call: {value}"
-            );
-        }
-        other => panic!("freshness query returned unexpected exit {other}: {value}"),
-    }
+    assert_eq!(code, 75, "automatic repair is disabled: {value}");
+    assert_eq!(value["status"], "skipped_stale_index", "{value}");
+    assert_eq!(value["fresh"], false, "{value}");
+    assert!(
+        matches!(
+            value["freshness"]["state"].as_str(),
+            Some("drift" | "refreshing")
+        ),
+        "stale refusal must identify drift/refresh: {value}"
+    );
 }
 
 #[test]

@@ -49,6 +49,16 @@ back compacted (verdict line, then errors and warnings). When raw text matching
 is genuinely wanted: `greppy PATTERN [FILE]` behaves exactly like grep,
 `greppy rg …` exactly like ripgrep.
 
+Indexing and embedding preparation are one-time work for the current source
+state, not evidence that Greppy is unavailable. If Greppy reports preparation in
+progress, keep the task pending and use its estimated remaining time for one
+bounded sleep before retrying the original command. Reuse the existing job; do
+not start duplicate indexing. Once preparation completes, resume the full Greppy
+functionality and choose the best command for the task—do not retain a temporary
+fallback to basic text tools. If preparation fails or exceeds its estimate,
+inspect and report the concrete issue instead of silently abandoning the
+function.
+
 Method: orient before editing — `where-am-i` once. Locate with `search`/
 `search-symbol`, then `brief SYMBOL` for what it does and `who-calls SYMBOL`
 before changing it; `read SYMBOL` for a definition; `read-file` only when a
@@ -90,6 +100,31 @@ pub fn system_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::{browser_prompt, system_prompt, SYSTEM_PROMPT};
+
+    #[test]
+    fn preparation_guidance_matches_the_owner_approved_public_prompt() {
+        fn preparation_block(text: &str) -> String {
+            let start = text
+                .find("Indexing and embedding preparation")
+                .expect("preparation guidance must be present");
+            text[start..]
+                .lines()
+                .take_while(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let public = include_str!("../../../AGENTS.md");
+        let windows_public = public.lines().collect::<Vec<_>>().join("\r\n");
+        assert_eq!(
+            preparation_block(SYSTEM_PROMPT),
+            preparation_block(&windows_public)
+        );
+        assert_eq!(
+            preparation_block(SYSTEM_PROMPT),
+            preparation_block(public),
+            "built-in and external agents must receive the same preparation guidance"
+        );
+    }
 
     #[test]
     fn system_prompt_non_empty_and_under_8_kib() {

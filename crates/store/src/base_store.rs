@@ -1028,6 +1028,17 @@ mod tests {
                     .unwrap();
                 let visible = store.list_nodes("p", "", "", 0, usize::MAX).unwrap();
                 assert_eq!(visible.len(), 2);
+                for node in &visible {
+                    let expected: Vec<_> = visible
+                        .iter()
+                        .filter(|other| other.file_path == node.file_path)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        store.list_nodes_for_file("p", &node.file_path).unwrap(),
+                        expected
+                    );
+                }
                 assert!(visible
                     .iter()
                     .any(|candidate| candidate.qualified_name == "p.shared"));

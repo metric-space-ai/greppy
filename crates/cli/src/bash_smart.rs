@@ -43,31 +43,59 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
+// Node's diagnostic reporter emits `fail 0` even for an entirely green run.
+// Only the complete zero counter is exempt; positive counts and failure
+// messages that merely start with zero remain diagnostic blocks.
+static ZERO_FAILURE_COUNT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i-u)^[\t ]*fail(?:ed)?[\t ]+0[\t ]*$")
+        .expect("bash-smart zero failure count regex")
+});
+
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
 });
+// Cargo follows emitted warning diagnostics with a crate-level recap. It is
+// useful when the underlying diagnostics are absent, but counting both makes
+// one compiler warning look like two bash-smart warning blocks.
+static CARGO_WARNING_SUMMARY_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*warning:[\t ]+`[^`\r\n]+`(?:[\t ]+\([^\r\n)]*\))?[\t ]+generated[\t ]+([0-9]+)[\t ]+warnings?(?:[\t ]+\(run[\t ][^\r\n]*\))?[\t ]*$",
+    )
+    .expect("bash-smart Cargo warning summary regex")
+});
 // tsc/tsgo place the source location before the severity, unlike Rust's
 // leading `error:`. Require a numeric location and TS code, not arbitrary
 // prose containing the word "error". Match both plain compiler layouts.
-static TYPESCRIPT_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+error[\t ]+TS[0-9]+:",
+        r"(?i-u)^[^\r\n]+(?:\([0-9]+,[0-9]+\):|:[0-9]+:[0-9]+[\t ]+-)[\t ]+(error|warning)[\t ]+TS[0-9]+:",
     )
-    .expect("bash-smart TypeScript error regex")
+    .expect("bash-smart TypeScript diagnostic regex")
 });
 // GCC/Clang put a numeric file location before the severity. Keep the
 // classifier byte-oriented (paths need not be UTF-8) and require the complete
 // location/severity syntax rather than promoting arbitrary stderr prose.
+// Linters can add a rule identifier, e.g. `error t3code(namespace-node-imports):`.
 static SOURCE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning):(?:[\t ]|$)",
+        r"(?i-u)^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(fatal[\t ]+error|error|warning)(?:[\t ]+[a-z0-9_@][a-z0-9_@./-]*(?:\([a-z0-9_@./-]+\))?)?:(?:[\t ]|$)",
     )
     .expect("bash-smart source diagnostic regex")
+});
+// Python prefixes warnings with a source and line followed by the warning
+// category (`SyntaxWarning`, `DeprecationWarning`, ...). Treat the complete
+// diagnostic shape as a warning without promoting prose that merely contains
+// a `Warning` class name.
+static PYTHON_WARNING_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"^[^\r\n]+:[0-9]+(?::[0-9]+)?:[\t ]+(?:[A-Za-z_][A-Za-z0-9_]*)?Warning:(?:[\t ]|$)",
+    )
+    .expect("bash-smart Python warning regex")
 });
 
 fn heartbeat_tail(path: &Path) -> Option<String> {
@@ -376,8 +404,10 @@ pub(crate) fn run(argv: &[String], regexes: &[String], root: Option<&str>) -> Re
     for (stream, lines) in [("stdout", &stdout_lines), ("stderr", &stderr_lines)] {
         if lines.iter().any(|line| preview::oversized(line.raw)) {
             if let Some(path) = raw.payload[stream]["path"].as_str() {
-                let _ = writeln!(std::io::stdout().lock(),
-                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file");
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "bash-smart: oversized {stream} lines are previews; raw log {path:?}; read with greppy read-file"
+                );
             }
         }
     }
@@ -671,17 +701,35 @@ fn detect_blocks(
         (OutputStream::Stdout, stdout_lines),
         (OutputStream::Stderr, stderr_lines),
     ] {
+        let mut stream_blocks = Vec::new();
         let mut index = 0usize;
+        let mut formatting_diff = false;
         while index < lines.len() {
+            let content = lines[index].content;
+            if content.starts_with(b"Diff in ") && content.ends_with(b":") {
+                formatting_diff = true;
+                index += 1;
+                continue;
+            }
+            if formatting_diff {
+                if blank(content) || matches!(content.first(), Some(b' ' | b'\t' | b'+' | b'-')) {
+                    index += 1;
+                    continue;
+                }
+                formatting_diff = false;
+            }
             let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
-                || TYPESCRIPT_ERROR_RE.is_match(lines[index].content)
+                && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content) {
                 Some(BlockKind::Warning)
+            } else if PYTHON_WARNING_RE.is_match(lines[index].content) {
+                Some(BlockKind::Warning)
             } else {
-                SOURCE_DIAGNOSTIC_RE
+                TYPESCRIPT_DIAGNOSTIC_RE
                     .captures(lines[index].content)
+                    .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
@@ -706,7 +754,7 @@ fn detect_blocks(
                     break;
                 }
             }
-            blocks.push(DiagnosticBlock {
+            stream_blocks.push(DiagnosticBlock {
                 kind,
                 lines: (index..end)
                     .map(|line_index| AnswerLine {
@@ -718,6 +766,31 @@ fn detect_blocks(
             });
             index = end;
         }
+        let mut filtered_blocks = Vec::with_capacity(stream_blocks.len());
+        let mut substantive_warnings = 0usize;
+        for block in stream_blocks {
+            let summary = (block.kind == BlockKind::Warning)
+                .then(|| CARGO_WARNING_SUMMARY_RE.captures(&block.lines[0].bytes))
+                .flatten();
+            if let Some(captures) = summary {
+                let summary_count = std::str::from_utf8(&captures[1])
+                    .ok()
+                    .and_then(|count| count.parse::<usize>().ok());
+                // A recap closes the preceding Cargo diagnostic group. Only
+                // suppress it when the emitted warning-block count proves it
+                // is redundant; otherwise retain the uncertain recap.
+                if summary_count != Some(substantive_warnings) {
+                    filtered_blocks.push(block);
+                }
+                substantive_warnings = 0;
+            } else {
+                if block.kind == BlockKind::Warning {
+                    substantive_warnings += 1;
+                }
+                filtered_blocks.push(block);
+            }
+        }
+        blocks.extend(filtered_blocks);
     }
     blocks
 }
@@ -990,7 +1063,13 @@ where
         // `<token>.tail-ring`, so the two writers could truncate one another.
         let tail_path = tail_ring_path(&path);
         let mut output = std::fs::File::create(&path)?;
-        let mut tail = std::fs::File::create(&tail_path)?;
+        // The ring is read back after the head limit; File::create is write-only.
+        let mut tail = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tail_path)?;
         let mut timestamps = std::fs::File::create(&timestamps_path)?;
         let started = std::time::Instant::now();
         let mut byte_len = 0u64;
@@ -1805,16 +1884,54 @@ fn ensure_newline_after_raw(
     }
 }
 
+// Novelty is an optional supplement to complete mechanical diagnostics and
+// expandable raw output. Bound it to one GPU batch per stream even for huge
+// failed-build logs, sampling across the hidden output rather than its prefix.
+fn novelty_candidate_indices(groups: &[CollapseGroup], line_count: usize) -> Vec<usize> {
+    let middle_end = line_count.saturating_sub(SUCCESS_TAIL_LINES);
+    let eligible = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| {
+            group.count() == 1 && group.start > HEAD_LINES && group.start <= middle_end
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    // The weighted centroid needs representative routine output, otherwise a
+    // lone anomaly becomes its own baseline and can never be lifted. Reserve
+    // up to half a batch for the largest repeated groups; rank_novelty still
+    // permits only hidden singletons as the final lifted lines.
+    let mut baseline = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.count() > 1)
+        .map(|(index, group)| (index, group.count()))
+        .collect::<Vec<_>>();
+    baseline.sort_unstable_by_key(|(index, count)| (std::cmp::Reverse(*count), *index));
+    baseline.truncate(EMBED_BATCH_LINES / 2);
+    let budget = EMBED_BATCH_LINES - baseline.len();
+    let mut selected = if eligible.len() <= budget {
+        eligible
+    } else {
+        (0..budget)
+            .map(|slot| eligible[slot * (eligible.len() - 1) / (budget - 1)])
+            .collect()
+    };
+    selected.extend(baseline.into_iter().map(|(index, _)| index));
+    selected.sort_unstable();
+    selected
+}
+
 fn novelty_lifts(
     lines: &[RawLine<'_>],
     groups: &[CollapseGroup],
     root: Option<&str>,
 ) -> Vec<LiftedLine> {
-    let middle_end = lines.len().saturating_sub(SUCCESS_TAIL_LINES);
-    if !groups
-        .iter()
-        .any(|group| group.count() == 1 && group.start > HEAD_LINES && group.start <= middle_end)
-    {
+    let candidates = novelty_candidate_indices(groups, lines.len());
+    if candidates.is_empty() {
         return Vec::new();
     }
     if test_inference_skipped() {
@@ -1831,21 +1948,21 @@ fn novelty_lifts(
             device: None,
             no_gpu: false,
         };
-        let Ok(Some(cfg)) = embedding_config_optional(args) else {
+        let Some(cfg) = embedding_config_if_daemon_ready_with(
+            args,
+            embedding_config_for_daemon_probe,
+            |probe_cfg, key| embed_daemon::status(probe_cfg, key),
+            || embedding_config_optional(args),
+        ) else {
             return Vec::new();
         };
-        let key = embedding_query_cache_key(&cfg);
-        let status = embed_daemon::status(&cfg, &key);
-        if status.get("state").and_then(serde_json::Value::as_str) != Some("ready") {
-            return Vec::new();
-        }
         let _ = root;
         let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(&cfg);
         let mut embedded = Vec::<(usize, Vec<f32>)>::new();
-        for chunk in groups.chunks(EMBED_BATCH_LINES) {
+        for chunk in candidates.chunks(EMBED_BATCH_LINES) {
             let texts = chunk
                 .iter()
-                .map(|group| std::str::from_utf8(&group.representative).ok())
+                .map(|index| std::str::from_utf8(&groups[*index].representative).ok())
                 .collect::<Vec<_>>();
             let valid = texts
                 .iter()
@@ -1863,19 +1980,41 @@ fn novelty_lifts(
                 return Vec::new();
             }
             for ((index, _), vector) in valid.into_iter().zip(vectors) {
-                embedded.push((groups_index(groups, chunk, index), vector));
+                embedded.push((chunk[index], vector));
             }
         }
         rank_novelty(lines, groups, &embedded)
     }
 }
 
-fn groups_index(groups: &[CollapseGroup], chunk: &[CollapseGroup], local_index: usize) -> usize {
-    let start = chunk
-        .first()
-        .and_then(|first| groups.iter().position(|group| group.start == first.start))
-        .unwrap_or(0);
-    start + local_index
+#[cfg(any(unix, windows))]
+fn embedding_config_if_daemon_ready_with<P, S, M>(
+    args: EmbeddingCliArgs<'_>,
+    probe: P,
+    status: S,
+    materialize: M,
+) -> Option<EmbeddingModelConfig>
+where
+    P: FnOnce(EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>>,
+    S: FnOnce(&EmbeddingModelConfig, &str) -> serde_json::Value,
+    M: FnOnce() -> Result<Option<EmbeddingModelConfig>>,
+{
+    let Ok(Some(probe_cfg)) = probe(args) else {
+        return None;
+    };
+    let key = embedding_query_cache_key(&probe_cfg);
+    if status(&probe_cfg, &key)
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        != Some("ready")
+    {
+        return None;
+    }
+    let Ok(Some(cfg)) = materialize() else {
+        return None;
+    };
+    debug_assert_eq!(key, embedding_query_cache_key(&cfg));
+    Some(cfg)
 }
 
 fn rank_novelty(
@@ -2105,6 +2244,41 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(any(unix, windows))]
+    fn deterministic_daemon_probe_config() -> EmbeddingModelConfig {
+        let (gguf, tokenizer) = embeddinggemma_assets::identity_paths();
+        let source = EmbeddingModelSource::Gguf {
+            gguf: gguf.into(),
+            tokenizer: tokenizer.into(),
+        };
+        let source_digest = embedding_source_content_digest(&source).unwrap();
+        let model_id = format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{source_digest}");
+        let mut embedded = Sha256::new();
+        for (name, digest) in [
+            (
+                "embeddinggemma-300M-Q4_K.gguf",
+                env!("GREPPY_EMBEDDED_GGUF_SHA"),
+            ),
+            ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+        ] {
+            embedded.update(name.as_bytes());
+            embedded.update([0]);
+            embedded.update(digest.as_bytes());
+            embedded.update([0]);
+        }
+        let embedded_model_id = format!(
+            "{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{:x}",
+            embedded.finalize()
+        );
+        assert_eq!(model_id, embedded_model_id);
+        EmbeddingModelConfig {
+            model_id,
+            source,
+            max_length: None,
+            device: "auto".parse().expect("auto device preference"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn spool_directory_uses_effective_private_temp_namespace() {
@@ -2156,6 +2330,143 @@ mod tests {
             assert_eq!(clipped.end, direct.end);
             assert_eq!(clipped.representative, direct.representative);
             assert_eq!(clipped.template, direct.template);
+        }
+    }
+
+    #[test]
+    fn novelty_work_is_bounded_and_spans_large_failed_output() {
+        let groups = (1..=10_000)
+            .map(|line| CollapseGroup {
+                start: line,
+                end: line,
+                representative: format!("context line {line}").into_bytes(),
+                template: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let selected = novelty_candidate_indices(&groups, 10_000);
+        assert!(
+            selected.len() <= 16,
+            "optional log analysis must use at most one batch"
+        );
+        assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(selected.iter().all(|index| {
+            let line = groups[*index].start;
+            line > HEAD_LINES && line <= 10_000 - SUCCESS_TAIL_LINES
+        }));
+        for quarter in 0..4 {
+            assert!(
+                selected.iter().any(|index| {
+                    let line = groups[*index].start;
+                    line > quarter * 2_500 && line <= (quarter + 1) * 2_500
+                }),
+                "sampling must cover the whole log, including late anomalies"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unavailable_daemon_does_not_enter_materializing_path() {
+        let args = EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        };
+        let materialized = std::cell::Cell::new(false);
+        let cfg = embedding_config_if_daemon_ready_with(
+            args,
+            |_| Ok(Some(deterministic_daemon_probe_config())),
+            |_, _| serde_json::json!({"state": "unavailable"}),
+            || {
+                materialized.set(true);
+                embedding_config_optional(args)
+            },
+        );
+        assert!(cfg.is_none());
+        assert!(!materialized.get());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ready_daemon_preserves_materializing_novelty_path() {
+        let args = EmbeddingCliArgs {
+            device: None,
+            no_gpu: false,
+        };
+        let materialized = std::cell::Cell::new(false);
+        let cfg = embedding_config_if_daemon_ready_with(
+            args,
+            |_| Ok(Some(deterministic_daemon_probe_config())),
+            |_, _| serde_json::json!({"state": "ready"}),
+            || {
+                materialized.set(true);
+                Ok(Some(deterministic_daemon_probe_config()))
+            },
+        );
+        assert!(cfg.is_some());
+        assert!(materialized.get());
+    }
+
+    #[test]
+    fn alphabetic_failed_log_fixture_reaches_novelty_candidates() {
+        let output = (0..128)
+            .map(|i| {
+                let name = (0..4)
+                    .map(|place| char::from(b'a' + ((i / 26usize.pow(place)) % 26) as u8))
+                    .collect::<String>();
+                format!("fn source_{name}() {{ error.next_action(); }}\n")
+            })
+            .collect::<String>();
+        let lines = split_lines(output.as_bytes());
+        assert!(lines.len() > SHORT_TOTAL_LINES);
+        let groups = collapse_groups(&lines);
+        assert_eq!(
+            groups.len(),
+            lines.len(),
+            "alphabetic identifiers stay distinct"
+        );
+        assert!(!novelty_candidate_indices(&groups, lines.len()).is_empty());
+    }
+
+    #[test]
+    fn novelty_sampling_retains_repeated_background_for_a_single_anomaly() {
+        let output = format!(
+            "{}novel anomaly\n{}",
+            "routine output\n".repeat(64),
+            "routine output\n".repeat(64),
+        );
+        let lines = split_lines(output.as_bytes());
+        let groups = collapse_groups(&lines);
+        let selected = novelty_candidate_indices(&groups, lines.len());
+        assert!(selected.len() <= EMBED_BATCH_LINES);
+        assert!(selected.iter().any(|index| groups[*index].count() > 1));
+        let embedded = selected
+            .into_iter()
+            .map(|index| {
+                let vector = if groups[index].count() == 1 {
+                    vec![0.0, 1.0]
+                } else {
+                    vec![1.0, 0.0]
+                };
+                (index, vector)
+            })
+            .collect::<Vec<_>>();
+        let lifted = rank_novelty(&lines, &groups, &embedded);
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(lifted[0].line, 65);
+        assert_eq!(lifted[0].bytes, b"novel anomaly");
+    }
+
+    #[test]
+    fn rustfmt_source_diff_is_not_a_compiler_diagnostic() {
+        let output = b"Diff in /work/src/lib.rs:42:\n     error.next_action = next.to_owned();\n-    panic!(\"old\");\n+    panic!(\"new\");\n\nerror: real formatter failure after diff\n";
+        for (stdout, stderr) in [(output.as_slice(), &b""[..]), (&b""[..], output.as_slice())] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "source excerpts are not failures");
+            assert_eq!(blocks[0].kind, BlockKind::Error);
+            assert_eq!(
+                blocks[0].lines[0].bytes,
+                b"error: real formatter failure after diff"
+            );
         }
     }
 
@@ -2251,6 +2562,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_failure_counters_are_not_diagnostics_but_real_failures_remain() {
+        for text in ["fail 0\n", "failed 0\n", "  FAIL 0  \n"] {
+            let lines = split_lines(text.as_bytes());
+            assert!(detect_blocks(&lines, &[]).is_empty(), "{text}");
+            assert!(detect_blocks(&[], &lines).is_empty(), "{text}");
+        }
+        for text in ["fail 1\n", "FAIL zero-case: broken\n", "FAIL 0: broken\n"] {
+            let lines = split_lines(text.as_bytes());
+            let blocks = detect_blocks(&lines, &[]);
+            assert_eq!(blocks.len(), 1, "{text}");
+            assert_eq!(blocks[0].kind, BlockKind::Error, "{text}");
+        }
+    }
+
+    #[test]
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
@@ -2269,6 +2595,32 @@ mod tests {
             assert_eq!(blocks[0].lines.len(), 2);
             assert_eq!(blocks[0].lines[1].bytes, b"  property details");
         }
+    }
+
+    #[test]
+    fn typescript_file_prefixed_warnings_keep_severity_and_details() {
+        let diagnostics = b"src/example.test.ts(113,7): warning TS377033: This expression chains multiple Effect.provide calls. effect(multipleEffectProvide)\n  suggestion details\nC:\\project files\\two.ts:4:1 - warning TS377004: review this expression\napp.ts(8,2): error TS2322: incompatible value\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 3, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(blocks[1].kind, BlockKind::Warning);
+            assert_eq!(blocks[2].kind, BlockKind::Error);
+            let errors = blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Error)
+                .count();
+            assert_eq!(
+                verdict_line(1, errors, blocks.len() - errors, None),
+                "FAILED — exit 1: 1 error, 2 warnings"
+            );
+        }
+        let prose = split_lines(b"docs mention warning TS377033\nexample.ts(x,y): warning TS377033: no numeric location\nexample.ts(1,1): warning TSfoo: no numeric code\nexample.ts(1,1): no warning TS377033: all good\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
     }
 
     #[test]
@@ -2308,6 +2660,24 @@ mod tests {
     }
 
     #[test]
+    fn python_file_prefixed_warning_categories_count_and_keep_source_detail() {
+        let diagnostics = b"<unknown>:251: SyntaxWarning: invalid escape sequence '\\/'\n  value = r\"~/\\/admin\"\nfixture.py:9: DeprecationWarning: old API\nplain prose mentions SyntaxWarning: but has no source line\nfixture.py:x: RuntimeWarning: non-numeric line\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 2, "{blocks:?}");
+            assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
+            assert_eq!(blocks[0].lines.len(), 2);
+            assert_eq!(
+                verdict_line(0, 0, blocks.len(), None),
+                "ok — exit 0, 2 warnings"
+            );
+        }
+    }
+
+    #[test]
     fn warning_marker_inside_error_detail_stays_in_error_block() {
         let stdout = split_lines(b"error: outer\n  warning: nested context\nwarning: separate\n");
         let blocks = detect_blocks(&stdout, &[]);
@@ -2315,6 +2685,70 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Error);
         assert_eq!(blocks[0].lines.len(), 2);
         assert_eq!(blocks[1].kind, BlockKind::Warning);
+    }
+
+    #[test]
+    fn cargo_warning_summary_does_not_double_count_substantive_warning() {
+        let diagnostics = b"warning: unused variable: `x`\n --> src/main.rs:1:1\nwarning: `fixture` (bin \"fixture\") generated 1 warning\n";
+        for (stdout, stderr) in [
+            (diagnostics.as_slice(), &b""[..]),
+            (&b""[..], diagnostics.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+            assert_eq!(blocks[0].lines[1].bytes, b" --> src/main.rs:1:1");
+        }
+    }
+
+    #[test]
+    fn cargo_warning_summary_remains_as_fallback_without_diagnostic() {
+        let summary = b"warning: `fixture` (lib) generated 2 warnings (run `cargo fix --lib -p fixture` to apply 1 suggestion)\n";
+        for (stdout, stderr) in [
+            (summary.as_slice(), &b""[..]),
+            (&b""[..], summary.as_slice()),
+        ] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            assert_eq!(blocks[0].kind, BlockKind::Warning);
+            assert_eq!(blocks[0].lines[0].bytes, &summary[..summary.len() - 1]);
+        }
+    }
+
+    #[test]
+    fn independent_warning_blocks_are_not_deduplicated() {
+        let diagnostics = b"warning: unused variable: `x`\nwarning: deprecated API\nwarning: `fixture` (bin \"fixture\") generated 2 warnings\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert!(blocks.iter().all(|block| block.kind == BlockKind::Warning));
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(blocks[1].lines[0].bytes, b"warning: deprecated API");
+    }
+
+    #[test]
+    fn later_recap_only_crate_is_not_hidden_by_an_earlier_warning_group() {
+        let diagnostics = b"warning: unused variable: `x`\nwarning: `crate-a` (lib) generated 1 warning\nwarning: `crate-b` (lib) generated 1 warning\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `crate-b` (lib) generated 1 warning"
+        );
+    }
+
+    #[test]
+    fn cargo_recap_with_greater_count_than_preceding_warnings_is_retained() {
+        let diagnostics =
+            b"warning: unused variable: `x`\nwarning: `fixture` (lib) generated 2 warnings\n";
+        let blocks = detect_blocks(&split_lines(diagnostics), &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].lines[0].bytes, b"warning: unused variable: `x`");
+        assert_eq!(
+            blocks[1].lines[0].bytes,
+            b"warning: `fixture` (lib) generated 2 warnings"
+        );
     }
 
     #[test]
@@ -2400,6 +2834,47 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"one\ntwo\nlast");
         assert_eq!(std::fs::read_to_string(times).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tail_ring_capture_preserves_overflow_and_wrap_order() {
+        for (overflow, suffix) in [
+            (1, b"!".as_slice()),
+            (PACK_TAIL_BYTES + 19, b"last nineteen bytes".as_slice()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("capture.stdout");
+            let input = std::io::repeat(b'h')
+                .take(PACK_HEAD_BYTES)
+                .chain(std::io::repeat(b't').take(overflow - suffix.len() as u64))
+                .chain(std::io::Cursor::new(suffix));
+            let captured = spawn_drain(input, path.clone(), dir.path().join("times"))
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(captured.byte_len, PACK_HEAD_BYTES + overflow);
+            assert_eq!(captured.line_count, 1);
+            let raw = std::fs::read(&path).unwrap();
+            let head = PACK_HEAD_BYTES as usize;
+            assert!(raw[..head].iter().all(|byte| *byte == b'h'));
+            let tail_start = if overflow > PACK_TAIL_BYTES {
+                let gap = format!(
+                    "\n… bash-smart store gap: {} bytes omitted by pack cap …\n",
+                    overflow - PACK_TAIL_BYTES
+                );
+                assert!(raw[head..].starts_with(gap.as_bytes()));
+                head + gap.len()
+            } else {
+                head
+            };
+            let retained = overflow.min(PACK_TAIL_BYTES) as usize;
+            assert_eq!(raw.len(), tail_start + retained);
+            assert!(raw[tail_start..raw.len() - suffix.len()]
+                .iter()
+                .all(|byte| *byte == b't'));
+            assert!(raw.ends_with(suffix));
+            assert!(!tail_ring_path(&path).exists());
+        }
     }
 
     #[test]

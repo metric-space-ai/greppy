@@ -5,6 +5,7 @@
 mod frame;
 mod observation_scope;
 mod protocol;
+pub mod record_query;
 pub mod workflow;
 
 pub use observation_scope::{guard_scoped_observation, observation_scope_roots};

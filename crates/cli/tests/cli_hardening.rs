@@ -106,6 +106,31 @@ fn run_with_env_and_inference(
 }
 
 #[test]
+fn browser_extra_url_is_refused_without_path_recovery_recursion() {
+    let (repo, store, _scratch) = make_repo("web-extra-url", "marker");
+    for args in [
+        vec![
+            "web",
+            "read",
+            "--url",
+            "https://one.example/",
+            "https://two.example/",
+        ],
+        vec!["web", "observe", "css=body", "https://extra.example/"],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 64, "invalid operands must not crash: {out} {err}");
+        assert!(out.len() + err.len() < 2000, "recovery must stay bounded");
+        assert!(!out.contains("using it as `--path"), "{out}");
+        assert!(!out.contains("ignoring unknown option"), "{out}");
+        assert!(
+            !store.exists(),
+            "syntax refusal must not start a graph index"
+        );
+    }
+}
+
+#[test]
 fn malformed_browser_chain_is_not_recovered_as_system_grep() {
     let (repo, store, _scratch) = make_repo("web-malformed-chain", "marker");
     let (code, out, err) = run(
@@ -152,6 +177,15 @@ fn browser_observe_accepts_one_query_but_never_discards_extra_scope() {
         assert!(out.contains("quote a selector containing spaces"), "{out}");
         assert!(!out.contains("ignoring"), "{out}");
     }
+    let (code, out, err) = run(&["web", "wait", "text", "Koushik", "--help"], &repo, &store);
+    assert_eq!(
+        code, 64,
+        "bare wait text WORD must not be discarded: {out}\n{err}"
+    );
+    assert!(out.contains("No wait was run"), "{out}");
+    assert!(out.contains("text=WORD"), "{out}");
+    assert!(out.contains("--url"), "{out}");
+    assert!(!out.contains("does not fit `web`"), "{out}");
     let (code, out, err) = run(&["web", "observe", "--help"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -252,6 +286,7 @@ fn option_recovery_never_rewrites_arguments_after_double_dash() {
 
 struct HeldIndex {
     child: std::process::Child,
+    release: PathBuf,
 }
 
 impl Drop for HeldIndex {
@@ -266,12 +301,14 @@ impl Drop for HeldIndex {
 /// active fixture unchanged while the query process exercises its refusal path.
 fn hold_index_before_publish(repo: &Path, store: &Path, label: &str) -> HeldIndex {
     let ready = store.join(format!("{label}-writer-ready"));
+    let release = store.join(format!("{label}-writer-release"));
     let mut child = Command::new(bin())
         .args(["index", "."])
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
         .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
         .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
         .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_DISCOVER_INCLUDE")
@@ -292,7 +329,75 @@ fn hold_index_before_publish(repo: &Path, store: &Path, label: &str) -> HeldInde
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    HeldIndex { child }
+    HeldIndex { child, release }
+}
+
+/// Wait for a real query to join a held publication, then release the writer.
+/// Both child processes are cleaned up even if the test fails.
+fn query_after_releasing_writer(
+    args: &[&str],
+    repo: &Path,
+    store: &Path,
+    writer: &mut HeldIndex,
+) -> std::process::Output {
+    struct Query(Option<std::process::Child>);
+    impl Drop for Query {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let diagnostic = store.join("waiting-query.stderr");
+    let mut query = Query(Some(
+        Command::new(bin())
+            .args(args)
+            .current_dir(repo)
+            .env("GREPPY_STORE_DIR", store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&diagnostic).unwrap())
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        assert!(
+            query.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "query returned before the fresh snapshot was published"
+        );
+        assert!(
+            writer.child.try_wait().unwrap().is_none(),
+            "fixture writer must remain held"
+        );
+        if std::fs::read_to_string(&diagnostic)
+            .unwrap()
+            .contains("syncing_snapshot")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query never reported held publication: {}",
+            std::fs::read_to_string(&diagnostic).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::write(&writer.release, "release").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while query.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query did not finish after publication was released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut output = query.0.take().unwrap().wait_with_output().unwrap();
+    output.stderr = std::fs::read(&diagnostic).unwrap();
+    output
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -372,6 +477,56 @@ fn next_snapshot_paths_for_db(db: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     paths.sort();
     paths
+}
+
+#[cfg(unix)]
+fn leave_completed_index_snapshot(repo: &Path, store: &Path, db: &Path) -> PathBuf {
+    let ready = store.join("recovery-candidate-ready");
+    let mut child = Command::new(bin())
+        .args(["index", "."])
+        .current_dir(repo)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_DISCOVER_INCLUDE")
+        .env_remove("GREPPY_DISCOVER_EXCLUDE")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn failpoint greppy index");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().expect("poll failpoint child") {
+            panic!("failpoint child exited before ready marker: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timeout waiting for failpoint ready marker");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    child.kill().expect("kill failpoint child");
+    let killed = child.wait().expect("wait for killed failpoint child");
+    assert!(!killed.success(), "failpoint child must be killed");
+    let candidates = next_snapshot_paths_for_db(db)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.ends_with("-wal") && !name.ends_with("-shm"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "one killed indexer should leave one completed candidate: {candidates:?}"
+    );
+    candidates.into_iter().next().unwrap()
 }
 
 fn corrupt_snapshot_for_db(db: &Path) -> Option<PathBuf> {
@@ -507,22 +662,16 @@ fn search_pattern_json_reports_exact_counts_and_truncation_metadata() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["fresh"], true);
     assert_eq!(v["query"], "json_unique_marker");
     assert_eq!(v["project"], "repo");
-    assert_eq!(v["provider_complete"], false);
-    assert!(
-        v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1,
-        "search-pattern JSON must expose provider incompleteness: {v:?}"
-    );
-    assert!(
-        v["incomplete_providers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["language"] == "rust"),
-        "rust provider incompleteness must be visible: {v:?}"
+    assert!(v["provider_complete"].is_null());
+    assert!(v["incomplete_provider_count"].is_null());
+    assert!(v["incomplete_providers"].is_null());
+    assert_eq!(
+        v["provider_metadata_status"],
+        "not_consulted_for_live_literal_search"
     );
     assert_eq!(v["total_exact"], 25);
     assert_eq!(v["shown"], 20);
@@ -589,10 +738,10 @@ function pickFolder(options: { title: string }) {
     );
 }
 
-/// Small drift is atomically reindexed, while the current search-pattern request
-/// uses the live filesystem rather than the already-open old snapshot.
+/// Search-pattern is a live lexical query: drift does not trigger graph work,
+/// and both old and new text are answered from current source.
 #[test]
-fn search_pattern_json_auto_reindexes_and_reports_current_state() {
+fn search_pattern_json_reports_current_state_without_reindexing() {
     let (repo, store, _scratch) = make_repo("search-json-stale", "old_json_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -616,8 +765,8 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
         &store,
     );
     assert_eq!(
-        code, 0,
-        "healed index returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
+        code, 1,
+        "live search returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
@@ -640,14 +789,15 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
     );
     assert_eq!(
         code, 0,
-        "healed index must find the NEW marker; stderr={err}\nstdout={out}"
+        "live search must find the NEW marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["index_freshness"]["state"], "not_consulted");
     assert!(
         !v["hits"].as_array().unwrap().is_empty(),
-        "healed index must serve the current content: {v:?}"
+        "live search must serve the current content: {v:?}"
     );
 }
 
@@ -679,7 +829,7 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "old marker returns a bounded no-match status from live fallback; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -688,8 +838,7 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     assert_eq!(v["status"], "live-fallback");
     assert_eq!(v["result_status"], "no_matches");
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["index_freshness"]["state"], "drift");
-    assert_eq!(v["index_freshness"]["stale_file_count"], 1);
+    assert_eq!(v["index_freshness"]["state"], "not_consulted");
     assert!(v["hits"].as_array().unwrap().is_empty());
 }
 
@@ -727,8 +876,12 @@ fn provider_policy_require_complete_does_not_block_search_pattern_json() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-pattern");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["status"], "live-fallback");
+    assert!(v["provider_complete"].is_null());
+    assert_eq!(
+        v["provider_metadata_status"],
+        "not_consulted_for_live_literal_search"
+    );
     assert_eq!(v["shown"], 1);
     assert_eq!(v["hits"].as_array().unwrap().len(), 1);
 }
@@ -858,59 +1011,12 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
 }
 
 #[test]
-fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() {
+fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
     let (repo, store, _scratch) = make_repo("semantic-index-progress", "semantic_progress_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
 
-    let (code, out, err) = run(
-        &[
-            "search",
-            "--json",
-            "--diagnostics",
-            "find semantic progress marker",
-        ],
-        &repo,
-        &store,
-    );
-    assert_eq!(
-        code, 75,
-        "an incomplete semantic generation must be retryable; stdout={out} stderr={err}"
-    );
-    assert!(err.is_empty(), "JSON status must stay on stdout: {err:?}");
-    let value: serde_json::Value = serde_json::from_str(&out).expect("semantic progress JSON");
-    assert_eq!(value["status"], "indexing");
-    assert_eq!(value["retryable"], true);
-    assert_eq!(value["exit_code"], 75);
-    assert!(value["retry_when"]
-        .as_str()
-        .is_some_and(|message| message.contains("embedding_complete=true")));
-    assert!(value["retry_after_seconds"].as_u64().is_some());
-    assert!(value["hits"].as_array().unwrap().is_empty());
-    assert!(
-        value["embedding_index"]["backend"].as_str().is_some(),
-        "selected CPU/GPU backend must be visible: {value:?}"
-    );
-    assert!(
-        value["embedding_index"]["eta_seconds"].as_u64().is_some(),
-        "the agent needs a completion estimate: {value:?}"
-    );
-
-    let job_path = find_graph_db(&store)
-        .expect("active graph")
-        .parent()
-        .unwrap()
-        .join("index.job");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while job_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert!(
-        !job_path.exists(),
-        "fixture background index did not finish"
-    );
-
-    let db = find_graph_db(&store).expect("active graph after background index");
+    let db = find_graph_db(&store).expect("active graph after structural index");
     let graph = rusqlite::Connection::open(&db).expect("open graph for partial vector fixture");
     let generation = graph
         .query_row(
@@ -919,10 +1025,27 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
-    let model_id = value["model_id"].as_str().unwrap();
     let mut vector = Vec::new();
     vector.extend_from_slice(&1.0f32.to_le_bytes());
     vector.extend_from_slice(&0.0f32.to_le_bytes());
+    use sha2::Digest as _;
+    let mut embedded_digest = sha2::Sha256::new();
+    for (name, digest) in [
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        embedded_digest.update(name.as_bytes());
+        embedded_digest.update([0]);
+        embedded_digest.update(digest.as_bytes());
+        embedded_digest.update([0]);
+    }
+    let configured_model_id = format!(
+        "google/embeddinggemma-300m@sha256:{:x}",
+        embedded_digest.finalize()
+    );
     graph
         .execute(
             "INSERT INTO vector_embeddings
@@ -933,7 +1056,7 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
                      ?7, 2, 1.0, ?8, 'test', NULL, NULL)",
             rusqlite::params![
                 "repo",
-                model_id,
+                configured_model_id,
                 greppy_embed_native::PROMPT_VERSION,
                 greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
                 "repo.partial_semantic_progress_marker",
@@ -955,15 +1078,23 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
         &repo,
         &store,
     );
-    assert_eq!(
-        code, 75,
-        "partial vectors must remain hidden and retryable; stderr={err}"
+    assert_ne!(
+        code, 0,
+        "missing embeddings must not serve empty or partial hits"
     );
-    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(value["status"], "indexing");
-    assert_eq!(value["retryable"], true);
-    assert_eq!(value["exit_code"], 75);
-    assert!(value["hits"].as_array().unwrap().is_empty());
+    assert_ne!(code, 75, "semantic search must not ask the user to retry");
+    assert!(
+        out.is_empty(),
+        "failed lifecycle must not emit result JSON: {out}"
+    );
+    assert!(
+        err.contains("the embedding process could not be started"),
+        "disabled fixture inference must report the exact start failure: {err}"
+    );
+    assert!(
+        !err.contains("semantic_progress_marker"),
+        "partial semantic hits must remain hidden: {err}"
+    );
 }
 
 #[test]
@@ -1234,7 +1365,8 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["fresh"], false);
-    assert_eq!(v["freshness"]["state"], "drift");
+    // This fixture holds a real index writer: the stale snapshot is refreshing.
+    assert_eq!(v["freshness"]["state"], "refreshing");
     assert_eq!(v["total_exact"], 2);
     assert_eq!(v["shown"], 0);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
@@ -1274,7 +1406,8 @@ fn semantic_stale_index_refuses_vector_hits() {
     assert_eq!(v["mode"], "vector");
     assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["fresh"], false);
-    assert_eq!(v["freshness"]["state"], "drift");
+    // This fixture holds a real index writer: the stale snapshot is refreshing.
+    assert_eq!(v["freshness"]["state"], "refreshing");
     assert_eq!(v["freshness"]["stale_file_count"], 1);
     assert!(v["hits"].as_array().unwrap().is_empty());
 }
@@ -1314,7 +1447,7 @@ fn search_symbol_refuses_stale_partial_definition_hits() {
     assert!(
         value["warning"]
             .as_str()
-            .is_some_and(|warning| warning.contains("index drift")),
+            .is_some_and(|warning| warning.contains("index refreshing")),
         "{value}"
     );
     assert!(value["hits"].as_array().is_some_and(Vec::is_empty));
@@ -1891,7 +2024,7 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "retired symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -1967,7 +2100,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "replaced symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2238,7 +2371,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "pre-crash symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2246,6 +2379,158 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     assert!(
         v["hits"].as_array().unwrap().is_empty(),
         "old symbol must not leak after recovery publish; got {v:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_skips_newest_invalid_completed_candidate() {
+    let (repo, store, _scratch) = make_repo("recover-newest-invalid", "old_recovery_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn recovered_from_older_valid_candidate() -> i32 { 17 }\n",
+    )
+    .unwrap();
+    let valid = leave_completed_index_snapshot(&repo, &store, &db);
+    let invalid = valid.with_file_name(format!(
+        "{}.invalid",
+        valid.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&invalid, b"not a sqlite database").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&valid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&invalid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "newest invalid completed artifact must not block the older valid snapshot: {out}\n{err}"
+    );
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "published", "{out}");
+    assert_eq!(
+        recovery["candidate"].as_str(),
+        Some(valid.to_string_lossy().as_ref()),
+        "recovery must publish the newest valid eligible candidate: {out}"
+    );
+    assert!(
+        next_snapshot_paths_for_db(&db).is_empty(),
+        "successful publication cleans all remaining candidate artifacts"
+    );
+    let (code, out, err) = run(
+        &["search-symbol", "recovered_from_older_valid_candidate"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "recovered graph must be queryable: {out}\n{err}");
+    assert!(
+        out.contains("recovered_from_older_valid_candidate"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_rejects_when_no_completed_candidate_is_valid() {
+    let (repo, store, _scratch) = make_repo("recover-no-valid", "preserved_active_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+    let active_before = std::fs::read(&db).unwrap();
+    let mut dead_owner = Command::new("true")
+        .spawn()
+        .expect("spawn short-lived owner");
+    let dead_pid = dead_owner.id();
+    assert!(dead_owner.wait().unwrap().success());
+    let invalid = db.with_file_name(format!("graph.db.next.{dead_pid}.invalid"));
+    std::fs::write(&invalid, b"not a sqlite database").unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(code, 73, "invalid-only recovery must fail: {out}\n{err}");
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "rejected", "{out}");
+    assert!(
+        recovery["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no safe completed snapshot")),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        active_before,
+        "a rejected recovery must preserve the active store byte-for-byte"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_recover_never_publishes_around_a_live_candidate_owner() {
+    let (repo, store, _scratch) = make_repo("recover-live-owner", "old_live_owner_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("graph.db must exist after initial index");
+    let active_before = std::fs::read(&db).unwrap();
+
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn candidate_blocked_by_live_owner() -> i32 { 19 }\n",
+    )
+    .unwrap();
+    let completed = leave_completed_index_snapshot(&repo, &store, &db);
+    let live = db.with_file_name(format!("graph.db.next.{}.live", std::process::id()));
+    std::fs::copy(&completed, &live).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&live)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&completed)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
+
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
+    assert_eq!(
+        code, 73,
+        "live owner must block all publication: {out}\n{err}"
+    );
+    let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(recovery["status"], "rejected", "{out}");
+    assert_eq!(recovery["owner_pid"], std::process::id(), "{out}");
+    assert!(
+        recovery["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("owner process is still alive")),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        active_before,
+        "live-owner refusal must preserve the active store byte-for-byte"
+    );
+    assert!(
+        completed.exists() && live.exists(),
+        "refusal must leave candidates untouched for the active owner"
     );
 }
 
@@ -2299,8 +2584,8 @@ fn index_publishes_graph_when_embedding_backend_is_unavailable() {
 
 #[cfg(unix)]
 #[test]
-fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
-    let (repo, store, _scratch) = make_repo("large-drift-job", "old_large_drift_marker");
+fn concurrent_large_drift_queries_share_one_refresh_and_return_fresh_graph() {
+    let (repo, store, scratch) = make_repo("large-drift-job", "old_large_drift_marker");
     for index in 0..11 {
         std::fs::write(
             repo.join(format!("extra-{index}.rs")),
@@ -2323,83 +2608,181 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
         .unwrap();
     }
 
-    let ready = store.join("background-ready");
-    let ready_string = ready.to_string_lossy().into_owned();
-    let envs = [
-        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
-        ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
-        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
-    ];
-    let (code, out, err) = run_with_env(
-        &[
-            "search-symbol",
-            "--json",
-            "--diagnostics",
-            "old_large_drift_marker",
-        ],
-        &repo,
-        &store,
-        &envs,
-    );
-    assert_eq!(
-        code, 75,
-        "a refresh in flight is retryable, not a permanent miss; stderr={err}"
-    );
-    let first: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(first["freshness"]["state"], "refreshing");
-    assert!(first["hits"].as_array().unwrap().is_empty());
-
+    let ready = scratch.0.join("large-drift-ready");
+    let release = scratch.0.join("large-drift-release");
+    let spawn = |symbol: &str, demand_ready: &Path| {
+        let mut command = Command::new(bin());
+        command
+            .args(["search-symbol", symbol])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        ReapedQuery::new(command.spawn().expect("spawn large-drift query"))
+    };
+    let first_demand = scratch.0.join("large-drift-first-demand");
+    let second_demand = scratch.0.join("large-drift-second-demand");
+    let mut first = spawn("changed_extra_10", &first_demand);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() {
+    while !ready.exists() || !first_demand.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
         assert!(
             std::time::Instant::now() < deadline,
-            "background index never reached publish failpoint"
+            "large-drift writer did not reach publication hold"
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let job_path = db.parent().unwrap().join("index.job");
     let first_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let pid = first_job["pid"].as_u64().expect("background pid") as u32;
     assert_eq!(first_job["state"], "syncing_snapshot");
-    assert_eq!(first_job["completed_spans"], 0);
-    assert_eq!(first_job["total_spans"], 0);
-    assert_eq!(first_job["progress_unit"], "steps");
 
-    let (code, out, err) = run_with_env(
-        &[
-            "search-symbol",
-            "--json",
-            "--diagnostics",
-            "old_large_drift_marker",
-        ],
-        &repo,
-        &store,
-        &envs,
-    );
-    assert_eq!(
-        code, 75,
-        "second stale query stays a retryable refusal while the same refresh runs; stderr={err}"
-    );
-    let second: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(second["freshness"]["state"], "refreshing");
-    assert!(second["hits"].as_array().unwrap().is_empty());
+    let mut second = spawn("changed_extra_9", &second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second large-drift query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let second_job: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     assert_eq!(second_job["pid"].as_u64(), Some(pid as u64));
+    assert!(process_is_running(pid), "shared refresh must remain alive");
     assert_eq!(
         std::fs::read(&db).unwrap(),
         active_before,
-        "queries and paused background writer must not mutate active graph.db"
+        "the paused writer must not mutate the active graph before atomic publication"
     );
 
-    let status = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .expect("kill background index");
+    std::fs::write(&release, b"release\n").unwrap();
+    let first = first.wait_with_output(std::time::Duration::from_secs(15));
+    let second = second.wait_with_output(std::time::Duration::from_secs(15));
     assert!(
-        status.success(),
-        "background index process must be killable"
+        first.status.success(),
+        "first query failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second query failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("changed_extra_10"),
+        "first query did not return the newly published symbol: {first:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("changed_extra_9"),
+        "second query did not return the newly published symbol: {second:?}"
+    );
+    assert!(
+        !job_path.exists(),
+        "successful publication must remove index.job"
+    );
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn large_drift_semantic_query_waits_for_vector_complete_publication() {
+    let (repo, store, _scratch) = make_repo("large-semantic-drift", "old_semantic_marker");
+    for index in 0..11 {
+        std::fs::write(
+            repo.join(format!("semantic-{index}.rs")),
+            format!("pub fn initial_semantic_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    let (code, out, err) = run_with_inference(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial vector index failed: {out}\n{err}");
+    let db = find_graph_db(&store).expect("initial semantic graph");
+    let initial_generation = greppy_store::Store::open(&db)
+        .unwrap()
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("initial workspace state")
+        .graph_generation;
+
+    for index in 0..11 {
+        let source = if index == 10 {
+            "/// Calculate a spacecraft's orbital apogee from telemetry radius and planet radius.\n\
+             pub fn calculate_satellite_orbital_apogee(telemetry_radius: f64, planet_radius: f64) -> f64 {\n\
+                 telemetry_radius - planet_radius\n\
+             }\n"
+                .to_owned()
+        } else {
+            format!(
+                "pub fn changed_semantic_{index}() -> usize {{ {} }}\n",
+                index + 1
+            )
+        };
+        std::fs::write(repo.join(format!("semantic-{index}.rs")), source).unwrap();
+    }
+    let (code, out, err) = run_with_inference(
+        &[
+            "search",
+            "--json",
+            "--diagnostics",
+            "calculate spacecraft orbital apogee from telemetry and planet radius",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "semantic query must own the large-drift vector publication: {out}\n{err}"
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|error| panic!("invalid JSON: {error}; {out}"));
+    assert_eq!(result["fresh"], true, "{result}");
+    assert!(
+        result["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().any(|hit| {
+                hit["qualified_name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("calculate_satellite_orbital_apogee"))
+            })),
+        "semantic query did not use the newly published vector generation: {result}"
+    );
+    assert!(
+        !out.contains("initial_semantic_"),
+        "fresh semantic results must not expose names from the stale generation: {out}"
+    );
+    let refreshed = greppy_store::Store::open(&db).unwrap();
+    let refreshed_generation = refreshed
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("refreshed workspace state")
+        .graph_generation;
+    assert!(
+        refreshed_generation > initial_generation,
+        "large drift must publish a new graph generation"
+    );
+    drop(refreshed);
+    let (status_code, status_out, status_err) =
+        run_with_inference(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(status_code, 0, "{status_out}\n{status_err}");
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["healthy"], true, "{status}");
+    assert_eq!(status["embedding_complete"], true, "{status}");
+    assert!(
+        !db.parent().unwrap().join("index.job").exists(),
+        "completed semantic refresh must remove index.job"
     );
 }
 
@@ -2524,7 +2907,8 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
         stalled["message"]
             .as_str()
             .is_some_and(|message| message.contains("may be stalled")
-                && message.contains("terminate only that process")),
+                && message.contains("writer_lock")
+                && message.contains("must not be signaled without separate ownership proof")),
         "stalled status needs bounded recovery guidance: {stalled}"
     );
     std::fs::remove_file(job_path).unwrap();
@@ -2565,19 +2949,525 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 
 #[cfg(unix)]
 #[test]
-fn first_use_index_is_bounded_and_reports_retryable_progress() {
-    check_first_use_index_is_bounded(false);
+fn first_use_query_waits_for_healthy_slow_index() {
+    check_first_use_query_waits_for_healthy_slow_index(false);
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+}
+
+#[cfg(unix)]
+struct ReapedQuery(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl ReapedQuery {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.as_mut().expect("query child").try_wait()
+    }
+
+    fn wait_with_output(mut self, timeout: std::time::Duration) -> std::process::Output {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "query did not finish within {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.0
+            .take()
+            .expect("query child")
+            .wait_with_output()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReapedQuery {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits libc pid_t");
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process_is_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} remained alive after query demand ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_sole_first_use_query_stops_its_automatic_index() {
+    let (repo, store, scratch) = make_repo("first-use-cancel-sole", "cancel_sole_marker");
+    let ready = scratch.0.join("cancel-sole-writer-ready");
+    let demand_ready = scratch.0.join("cancel-sole-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search-symbol", "cancel_sole_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first-use query");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() || !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    let job_path = workspace.join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(query.id(), libc::SIGINT);
+    let status = query.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGINT)
+    );
+    wait_for_process_exit(index_pid);
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
+    let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
+    let linked = scratch.0.join("linked");
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-cancel",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let delegated_ready = scratch.0.join("delegated-base-ready");
+    let demand_ready = scratch.0.join("linked-demand-ready");
+    let log_path = scratch.0.join("linked-query.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Keep this as the linked worktree's cold first query. Warming the
+    // structural graph first also prepares the immutable Base; with healthy
+    // real inference assets the semantic query then correctly reuses that Base
+    // and never launches the delegated child this cancellation test exercises.
+    let query = Command::new(bin())
+        .args(["search", "find clean committed marker"])
+        .current_dir(&linked)
+        .env("GREPPY_STORE_DIR", &store)
+        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+        .env("GREPPY_TEST_BASE_OWNER_HOLD_MS", "120000")
+        .env("GREPPY_TEST_BASE_OWNER_READY", &delegated_ready)
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("spawn linked first-use query");
+    let mut query = ReapedQuery::new(query);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !delegated_ready.exists() || !demand_ready.exists() {
+        assert!(
+            query.try_wait().unwrap().is_none(),
+            "query exited early: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegated Base index or demand monitor did not become ready (base={}, demand={}): {}",
+            delegated_ready.exists(),
+            demand_ready.exists(),
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let delegated_pid: u32 = std::fs::read_to_string(&delegated_ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let job_path = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&linked))
+        .join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(query.0.as_ref().expect("query child").id(), libc::SIGKILL);
+    let status = query.0.take().expect("query child").wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    wait_for_process_exit(index_pid);
+    wait_for_process_exit(delegated_pid);
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(
+        cancelled["state"],
+        "cancelled",
+        "delegated cancellation recorded the wrong terminal state; job={cancelled}; query_log={}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_index_stops_only_after_last_shared_query_exits() {
+    let (repo, store, scratch) = make_repo("first-use-cancel-shared", "cancel_shared_marker");
+    let ready = scratch.0.join("cancel-shared-writer-ready");
+    let spawn = |demand_ready: &Path| {
+        Command::new(bin())
+            .args(["search-symbol", "cancel_shared_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn shared first-use query")
+    };
+    let first_demand = scratch.0.join("first-demand-ready");
+    let second_demand = scratch.0.join("second-demand-ready");
+    let mut first = spawn(&first_demand);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() || !first_demand.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let mut second = spawn(&second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let job_path = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo))
+        .join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(first.id(), libc::SIGINT);
+    let _ = first.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        process_is_running(index_pid),
+        "shared waiter must keep index alive"
+    );
+
+    signal_process(second.id(), libc::SIGTERM);
+    let _ = second.wait().unwrap();
+    wait_for_process_exit(index_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_attached_query_does_not_stop_explicit_foreground_index() {
+    let (repo, store, scratch) = make_repo("first-use-explicit-writer", "explicit_writer_marker");
+    let ready = scratch.0.join("explicit-writer-ready");
+    let release = scratch.0.join("explicit-writer-release");
+    let mut writer = Command::new(bin())
+        .args(["index", "."])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn explicit foreground index");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let demand_ready = scratch.0.join("explicit-attached-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search-symbol", "explicit_writer_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn attached query");
+    while !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(std::time::Instant::now() < deadline, "query did not attach");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    signal_process(query.id(), libc::SIGINT);
+    let _ = query.wait().unwrap();
+    assert!(
+        writer.try_wait().unwrap().is_none(),
+        "query cancellation must not stop explicit writer"
+    );
+
+    std::fs::write(&release, b"release\n").unwrap();
+    let status = writer.wait().unwrap();
+    assert!(status.success(), "explicit writer failed: {status}");
+    let (code, out, err) = run(&["search-symbol", "explicit_writer_marker"], &repo, &store);
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("explicit_writer_marker"), "{out}\n{err}");
+}
+
+#[test]
+fn cold_scoped_search_pattern_parses_matches_without_starting_an_index() {
+    let (repo, store, _scratch) = make_repo("cold-scoped-pattern", "unrelated_root_marker");
+    std::fs::create_dir(repo.join("selected")).unwrap();
+    std::fs::write(
+        repo.join("selected/target.rs"),
+        "pub fn selected_hit() {\n    let scoped_literal_marker = 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("selected/ignored.rs"),
+        "pub fn ignored_hit() { let scoped_literal_marker = 2; }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("selected/.gitignore"), "ignored.rs\n").unwrap();
+    std::fs::write(
+        repo.join("unrelated.rs"),
+        "pub fn unrelated_hit() { let scoped_literal_marker = 3; }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "scoped_literal_marker",
+            "--path",
+            "selected",
+            "--kind",
+            "function",
+            "--code",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("selected/target.rs:2"), "{out}");
+    assert!(out.contains("selected_hit"), "{out}");
+    assert!(out.contains("let scoped_literal_marker = 1;"), "{out}");
+    assert!(!out.contains("ignored_hit"), "{out}");
+    assert!(!out.contains("unrelated_hit"), "{out}");
+
+    let missing_base = repo.join("missing-base.db");
+    let missing_base_string = missing_base.to_string_lossy().into_owned();
+    let (code, out, err) = run_with_env(
+        &[
+            "search-pattern",
+            "scoped_literal_marker",
+            "--path",
+            "selected",
+            "--kind",
+            "function",
+            "--code",
+            "--json",
+        ],
+        &repo,
+        &store,
+        &[
+            ("GREPPY_AGENT_BASE_STORE", missing_base_string.as_str()),
+            (
+                "GREPPY_AGENT_BASE_COMMIT",
+                "1111111111111111111111111111111111111111",
+            ),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        json["hits"][0]["matches"][0]["location"],
+        "selected/target.rs:2"
+    );
+    assert_eq!(json["hits"][0]["name"], "selected_hit");
+    assert_eq!(json["hits"][0]["kind"], "function");
+    assert!(json["hits"][0]["handle"]
+        .as_str()
+        .is_some_and(|handle| !handle.is_empty()));
+    assert!(json["hits"][0]["source"]
+        .as_str()
+        .is_some_and(|source| source.contains("scoped_literal_marker")));
+
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    assert!(!workspace.join("index.job").exists());
+    assert!(!workspace.join("graph.db").exists());
+}
+
+#[test]
+fn cold_scoped_search_pattern_admits_only_explicit_hidden_scope_components() {
+    let (repo, store, _scratch) = make_repo("cold-hidden-scoped-pattern", "root_marker");
+    let evidence = repo.join(".codex/task-evidence");
+    std::fs::create_dir_all(&evidence).unwrap();
+    std::fs::write(
+        evidence.join("checkpoint.json"),
+        "{\"source_key\":\"visible_explicit_hidden_scope\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join(".private.json"),
+        "{\"source_key\":\"ordinary_hidden_descendant\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join("ignored.json"),
+        "{\"source_key\":\"ignored_by_rule\"}\n",
+    )
+    .unwrap();
+    std::fs::write(evidence.join(".gitignore"), "ignored.json\n").unwrap();
+    std::fs::create_dir(repo.join(".unrequested")).unwrap();
+    std::fs::write(
+        repo.join(".unrequested/other.json"),
+        "{\"source_key\":\"unrequested_hidden_tree\"}\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "source_key",
+            "--path",
+            ".codex/task-evidence",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(
+        out.contains(".codex/task-evidence/checkpoint.json:1"),
+        "{out}"
+    );
+    assert!(!out.contains("ordinary_hidden_descendant"), "{out}");
+    assert!(!out.contains("ignored_by_rule"), "{out}");
+    assert!(!out.contains("unrequested_hidden_tree"), "{out}");
+
+    let (file_code, file_out, file_err) = run(
+        &[
+            "search-pattern",
+            "ordinary_hidden_descendant",
+            "--path",
+            ".codex/task-evidence/.private.json",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(file_code, 0, "stdout={file_out}\nstderr={file_err}");
+    assert!(
+        file_out.contains(".codex/task-evidence/.private.json:1"),
+        "{file_out}"
+    );
+
+    let (ignored_code, ignored_out, ignored_err) = run(
+        &[
+            "search-pattern",
+            "ignored_by_rule",
+            "--path",
+            ".codex/task-evidence/ignored.json",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        ignored_code, 1,
+        "stdout={ignored_out}\nstderr={ignored_err}"
+    );
+    assert!(ignored_out.contains("status: no_matches"), "{ignored_out}");
+
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    assert!(!workspace.join("index.job").exists());
+    assert!(!workspace.join("graph.db").exists());
 }
 
 #[cfg(all(unix, feature = "bash-smart"))]
 #[test]
-fn first_use_index_after_output_capture_is_bounded_and_reports_retryable_progress() {
-    check_first_use_index_is_bounded(true);
+fn first_use_query_after_output_capture_waits_for_healthy_slow_index() {
+    check_first_use_query_waits_for_healthy_slow_index(true);
 }
 
 #[cfg(unix)]
-fn check_first_use_index_is_bounded(seed_pack: bool) {
-    let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
+fn check_first_use_query_waits_for_healthy_slow_index(seed_pack: bool) {
+    let (repo, store, scratch) = make_repo("first-use-completion", "first_use_marker");
     if seed_pack {
         let (code, out, err) = run(
             &["bash-smart", "--", "sh", "-c", "printf evidence"],
@@ -2610,67 +3500,292 @@ fn check_first_use_index_is_bounded(seed_pack: bool) {
     let envs = [
         ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
         ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
-        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "500"),
     ];
 
     let started = std::time::Instant::now();
     let (code, out, err) =
         run_with_env(&["search-symbol", "first_use_marker"], &repo, &store, &envs);
     let elapsed = started.elapsed();
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() && std::time::Instant::now() < ready_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
     assert!(
         ready.exists(),
         "background index never reached its test hold point"
     );
+    assert_eq!(
+        code, 0,
+        "the initiating query must complete after publication; stdout={out} stderr={err}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(400),
+        "query returned before the deliberately slow publication; elapsed={elapsed:?}"
+    );
+    assert!(
+        out.contains("first_use_marker"),
+        "stdout={out} stderr={err}"
+    );
+    assert!(!err.contains("retry after"), "stderr={err:?}");
+}
 
-    fn find_index_job(dir: &Path) -> Option<PathBuf> {
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_index_job(&path) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("index.job") {
-                return Some(path);
-            }
-        }
-        None
+#[cfg(not(feature = "ci-test-assets"))]
+#[test]
+fn cold_structural_query_publishes_graph_without_resolving_embedding_assets() {
+    let (repo, store, _scratch) = make_repo("structural-first-use", "structural_cold_marker");
+    let (index_code, index_out, index_err) = run_with_env_and_inference(
+        &["index", "."],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_EMBED_ASSET_MISSING", "1")],
+        true,
+    );
+    assert_ne!(
+        index_code, 0,
+        "ordinary index must retain required embedding policy: {index_out} {index_err}"
+    );
+
+    let (code, out, err) = run_with_env_and_inference(
+        &["search-symbol", "structural_cold_marker"],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_EMBED_ASSET_MISSING", "1")],
+        true,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(out.contains("structural_cold_marker"), "stdout={out}");
+    assert!(!err.contains("EmbeddingGemma"), "stderr={err}");
+
+    let db = find_graph_db(&store).expect("structural first use publishes graph.db");
+    let graph = greppy_store::Store::open(&db).unwrap();
+    let state = graph
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("structural workspace state");
+    assert!(state.graph_generation > 0);
+    assert!(graph.vector_model_ids("repo").unwrap().is_empty());
+    let structural_generation = state.graph_generation;
+    drop(graph);
+
+    let (embed_code, embed_out, embed_err) = run_with_env(
+        &["index", "."],
+        &repo,
+        &store,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+        ],
+    );
+    assert_eq!(embed_code, 0, "stdout={embed_out}\nstderr={embed_err}");
+    let embedded = greppy_store::Store::open(&db).unwrap();
+    let embedded_state = embedded
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .expect("embedded workspace state");
+    assert_eq!(
+        embedded_state.graph_generation, structural_generation,
+        "embedding completion must reuse the published graph generation"
+    );
+    assert!(!db.parent().unwrap().join("index.job").exists());
+}
+
+#[test]
+fn first_use_replaces_stale_job_whose_pid_was_reused() {
+    let (repo, store, _scratch) = make_repo("first-use-stale-pid", "stale_pid_marker");
+    let hash = greppy_core::workspace::workspace_hash(&repo);
+    let db = store
+        .join("workspaces")
+        .join("v2")
+        .join(hash)
+        .join("graph.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    drop(greppy_store::Store::open(&db).expect("create cold graph store"));
+    let job_path = db.parent().unwrap().join("index.job");
+    std::fs::write(
+        &job_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": std::process::id(),
+            "started_at_unix_secs": 1,
+            "state": "indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (status_code, status_out, status_err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_ne!(
+        status_code, 75,
+        "reused PID without writer ownership is not active: {status_out}\n{status_err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["writer_active"], false);
+    assert_eq!(status["startup_active"], false);
+    assert_eq!(status["background_state"], "abandoned");
+
+    let (code, out, err) = run(&["search-symbol", "stale_pid_marker"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "a live unrelated PID must not own a first-use job: {out}\n{err}"
+    );
+    assert!(out.contains("stale_pid_marker"), "{out}\n{err}");
+    assert!(!job_path.exists(), "successful publication removes the job");
+}
+
+#[cfg(unix)]
+#[test]
+fn attached_first_use_caller_completes_after_initiator_is_cancelled() {
+    let (repo, store, scratch) = make_repo("first-use-two-callers", "two_caller_marker");
+    let ready = scratch.0.join("first-use-two-callers-ready");
+    let spawn = |demand_ready: &Path| {
+        let mut command = Command::new(bin());
+        command
+            .args(["search-symbol", "two_caller_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
+            .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", demand_ready)
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().expect("spawn first-use query")
+    };
+    let first_demand = scratch.0.join("two-callers-first-demand");
+    let second_demand = scratch.0.join("two-callers-second-demand");
+    let mut first = spawn(&first_demand);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() || !first_demand.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first writer did not reach publication hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let job_path = find_index_job(&store).expect("first-use background job record");
-    let job: serde_json::Value = serde_json::from_slice(&std::fs::read(job_path).unwrap()).unwrap();
-    let pid_value = job["pid"].as_u64().expect("background job pid");
-    let pid = pid_value.to_string();
-    let pid_i32 = i32::try_from(pid_value).expect("background job pid fits pid_t");
+    let mut second = spawn(&second_demand);
+    while !second_demand.exists() {
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second query did not attach"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    signal_process(first.id(), libc::SIGINT);
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
     assert_eq!(
-        unsafe { libc::getpgid(pid_i32) },
-        pid_i32,
-        "first-use index must own a process group independent of its short-lived caller"
+        std::os::unix::process::ExitStatusExt::signal(&first.status),
+        Some(libc::SIGINT)
     );
-    let killed = Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .expect("terminate held background index");
+    assert_eq!(second.status.code(), Some(0), "{second:?}");
     assert!(
-        killed.success(),
-        "failed to terminate background index {pid}"
+        String::from_utf8_lossy(&second.stdout).contains("two_caller_marker"),
+        "{second:?}"
     );
-    assert_eq!(
-        code, 75,
-        "first use must be retryable; stdout={out} stderr={err}"
+}
+
+#[cfg(unix)]
+#[test]
+fn first_use_query_ignores_stale_record_while_foreground_writer_publishes() {
+    for (tag, stale_state) in [("failed", "failed"), ("nonterminal", "indexing")] {
+        let (repo, store, scratch) = make_repo(
+            &format!("first-use-foreground-{tag}"),
+            "foreground_owner_marker",
+        );
+        let ready = scratch.0.join(format!("foreground-{tag}-ready"));
+        let mut writer = Command::new(bin())
+            .args(["index", "."])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "750")
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn foreground writer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreground writer did not reach publication hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let hash = greppy_core::workspace::workspace_hash(&repo);
+        let job_path = store
+            .join("workspaces")
+            .join("v2")
+            .join(hash)
+            .join("index.job");
+        let original_job: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+        assert_eq!(
+            original_job["pid"].as_u64(),
+            Some(u64::from(writer.id())),
+            "canonical progress record must belong to the foreground writer"
+        );
+        assert_eq!(
+            original_job["state"], "syncing_snapshot",
+            "ready failpoint must expose the foreground writer's pre-publication record"
+        );
+        std::fs::write(
+            &job_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "greppy.background-job.v2",
+                "kind": "index",
+                "pid": std::process::id(),
+                "started_at_unix_secs": 1,
+                "state": stale_state,
+                "last_error": (stale_state == "failed").then_some("historical failure")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (code, out, err) = run(&["search-symbol", "foreground_owner_marker"], &repo, &store);
+        assert_eq!(
+            code, 0,
+            "verified writer/publication must override stale {stale_state} record: {out}\n{err}"
+        );
+        assert!(out.contains("foreground_owner_marker"), "{out}\n{err}");
+        let writer = writer.wait_with_output().unwrap();
+        assert_eq!(writer.status.code(), Some(0), "{writer:?}");
+    }
+}
+
+#[test]
+fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
+    let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
+    let started = std::time::Instant::now();
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "spawn_fail_marker"],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")],
+    );
+    assert_ne!(
+        code, 0,
+        "spawn failpoint unexpectedly succeeded: {out} {err}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "a navigation command must never wait for the full first index; elapsed={elapsed:?}"
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "spawn failure deadlocked the ownership handshake"
     );
-    assert!(
-        err.contains("first-use index started")
-            && err.contains("greppy index status --json")
-            && err.contains("healthy=true"),
-        "the refusal must provide state and exact recovery; stderr={err:?}"
-    );
+    assert!(err.contains("spawn background index"), "{out}\n{err}");
 }
 
 #[cfg(unix)]
@@ -2725,7 +3840,7 @@ fn foreground_index_publishes_observable_progress_while_building() {
 
 #[cfg(unix)]
 #[test]
-fn query_wait_for_active_refresh_is_bounded_and_actionable() {
+fn query_wait_for_active_refresh_returns_fresh_results_without_retry() {
     let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -2737,21 +3852,204 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
         "pub fn new_refresh_marker() -> i32 { 9 }\n",
     )
     .unwrap();
-    let _writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
+    let mut writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
+    let output = query_after_releasing_writer(
+        &["search-symbol", "refresh_marker", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &mut writer,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let names: Vec<_> = result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["new_refresh_marker"], "{result}");
+}
 
-    let started = std::time::Instant::now();
-    let (code, out, err) = run(&["search-symbol", "old_refresh_marker"], &repo, &store);
+#[test]
+fn read_queries_handle_lifecycle_contention_without_silent_wait() {
+    let (repo, store, _scratch) = make_repo("query-lifecycle", "lifecycle_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "fixture index failed: {out}\n{err}");
+    let hash = greppy_core::workspace::workspace_hash(&repo);
+    let lock_root = std::fs::canonicalize(&store).unwrap_or_else(|_| store.clone());
+    let lease = greppy_core::cache::acquire_named_lock_in(
+        &lock_root,
+        &format!("workspace-{hash}.lease"),
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    for (command, expected_code) in [("search-symbol", 75), ("search-pattern", 0)] {
+        let mut child = Command::new(bin())
+            .args([command, "lifecycle_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_AUTO_REINDEX", "0")
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{command} blocked on a lifecycle lease instead of returning its command-specific result");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if command == "search-symbol" {
+            let diagnostic = format!("{stdout}{stderr}");
+            assert!(diagnostic.contains("retry this query"), "{diagnostic}");
+        } else {
+            assert!(
+                stdout.contains("lib.rs:1") && stdout.contains("lifecycle_marker"),
+                "unexpected stdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+    drop(lease);
+    let (code, out, err) = run(&["search-symbol", "lifecycle_marker"], &repo, &store);
     assert_eq!(
-        code, 75,
-        "refresh contention is temporary; stdout={out}\nstderr={err}"
+        code, 0,
+        "query must recover after lease release: {out}\n{err}"
     );
+}
+
+#[test]
+fn impact_and_path_accept_the_same_file_selector_as_read() {
+    let (repo, store, _scratch) = make_repo("qualified-navigation", "qualified_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let selector = "lib.rs::qualified_marker";
+    for args in [
+        vec!["read", selector],
+        vec!["impact", selector, "--json", "--diagnostics"],
+        vec![
+            "impact",
+            selector,
+            "--direction",
+            "outgoing",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "path",
+            "--from",
+            selector,
+            "--to",
+            selector,
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{args:?}: {out}\n{err}");
+        if args[0] == "impact" {
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(value["symbol_found"], true, "{value}");
+        }
+    }
+}
+
+#[test]
+fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
+    let (repo, store, _scratch) = make_real_git_repo("query-during-metadata-refresh");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed: {out}\n{err}");
+    // A commit changes the fingerprint without changing any indexed source.
+    git(&repo, &["commit", "--allow-empty", "-m", "metadata only"]);
+    let mut writer = hold_index_before_publish(&repo, &store, "metadata-refresh");
+    for args in [
+        vec![
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "who-calls",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(
+            code, 0,
+            "{args:?} must use the verified active graph: {out}\n{err}"
+        );
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_ne!(result["status"], "skipped_stale_index", "{result}");
+        assert_eq!(
+            result["freshness"]["metadata_refresh_pending"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["freshness"]["source"], "verified_published_snapshot",
+            "{result}"
+        );
+        assert!(
+            result["freshness"]["metadata_drift_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str().unwrap().starts_with("head_oid changed")),
+            "{result}"
+        );
+        if args[0] == "search-symbol" {
+            assert!(
+                result["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit["name"] == "clean_committed_marker"),
+                "{result}"
+            );
+        }
+        assert!(
+            writer.child.try_wait().unwrap().is_none(),
+            "query must finish while the real indexer remains active"
+        );
+    }
+    // Actual source changes still must not be represented as fresh graph data.
+    std::fs::write(repo.join("src/lib.rs"), "pub fn changed_marker() {}\n").unwrap();
+    let output = query_after_releasing_writer(
+        &["search-symbol", "clean_committed_marker", "--json"],
+        &repo,
+        &store,
+        &mut writer,
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "no_matches", "{result}");
+    assert!(result["hits"].as_array().unwrap().is_empty(), "{result}");
+    drop(writer);
+    // The waiting query must have completed the refresh itself; do not repair
+    // the fixture with a separate index command before checking fresh results.
+    let (code, out, err) = run(
+        &["search-symbol", "changed_marker", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "new graph must be queryable: {out}\n{err}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["freshness"]["fresh"], true, "{result}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "query must not wait for the held writer indefinitely"
+        result["freshness"]["metadata_refresh_pending"].is_null(),
+        "{result}"
     );
-    assert!(err.contains("waiting up to 2s"), "stderr={err}");
-    assert!(err.contains("phase=syncing_snapshot"), "stderr={err}");
-    assert!(err.contains("greppy index status --json"), "stderr={err}");
 }
 
 #[test]

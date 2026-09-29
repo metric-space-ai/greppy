@@ -796,7 +796,11 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
 /// symbols and keeps only unique matches. Non-resolving references (locals,
 /// params with no matching def, etc.) are emitted here but dropped at
 /// resolution.
-fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>, emit: &mut F) {
+fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
+    source: &[u8],
+    node: Node<'t>,
+    emit: &mut F,
+) {
     // Try to emit a usage for THIS node.
     if is_rust_reference_kind(node.kind())
         && !rust_usage_is_suppressed(node)
@@ -805,7 +809,9 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str)>(source: &[u8], node: Node<'t>,
         let name_node = rust_reference_leaf(node);
         let text = node_text(source, name_node);
         if !text.is_empty() && !is_rust_keyword_or_self(text) {
-            emit(name_node, text);
+            let ref_path = matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+                .then(|| node_text(source, node));
+            emit(name_node, text, ref_path);
         }
         if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
             return;
@@ -1403,10 +1409,12 @@ const JS_TS_KEYWORDS: &[&str] = &[
 ///   * an anonymous inline callback is skipped and the walk continues to the
 ///     nearest NAMED scope, so a callback nested in a named function is still
 ///     attributed to that function;
-///   * if no named enclosing function at all, fall back to
-///     `{file}::__file__`.
+///   * if no named enclosing function exists but the call is nested in a
+///     module-level variable initializer, use that Variable's qname;
+///   * otherwise fall back to `{file}::__file__` for a true module-scope call.
 fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> String {
     let file_qname = format!("{file_path}::__file__");
+    let mut module_variable = None;
     let mut p = node.parent();
     while let Some(cur) = p {
         if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
@@ -1427,11 +1435,50 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // erase the real caller whenever the callback sits inside a named
             // function (`function outer() { arr.map(x => helper(x)) }` would
             // lose `outer -> helper`) — keep walking to the nearest NAMED scope;
-            // module-level callbacks still fall through to `__file__` below.
+            // module-level callbacks keep walking so a surrounding module
+            // Variable can own the call; a truly bare callback falls through
+            // to `__file__` below.
+        }
+        if module_variable.is_none() && cur.kind() == "variable_declarator" {
+            module_variable = js_ts_module_variable_name(cur, source);
         }
         p = cur.parent();
     }
-    file_qname
+    module_variable
+        .map(|name| format!("{file_path}::Variable::{name}"))
+        .unwrap_or(file_qname)
+}
+
+/// Return the binding name when `declarator` is one of the module Variables
+/// emitted by [`extract_js_ts_variables`]. Calls inside an anonymous callback
+/// nested in a factory expression such as
+/// `const task = Effect.gen(function* () { helper() })` otherwise fall back to
+/// `__file__`; navigation deliberately hides that synthetic anchor and would
+/// falsely report `helper` as uncalled. The real module Variable is a stable,
+/// user-addressable source node for that call.
+fn js_ts_module_variable_name<'a>(declarator: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let declaration = declarator.parent()?;
+    if !matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return None;
+    }
+    let container = declaration.parent()?;
+    let module_level = container.kind() == "program"
+        || matches!(
+            container.kind(),
+            "export_statement" | "statement" | "expression_statement"
+        ) && container
+            .parent()
+            .is_some_and(|parent| parent.kind() == "program");
+    if !module_level {
+        return None;
+    }
+    let name = declarator.child_by_field_name("name")?;
+    (name.kind() == "identifier")
+        .then(|| node_text(source, name))
+        .filter(|name| !name.is_empty())
 }
 
 /// The name of a JS/TS enclosing-function node plus the node whose ancestry
@@ -2680,6 +2727,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         "imported_name": imported_name,
                         "original_name": original_name,
                         "glob": is_glob,
+                        "imported_items": items.iter().map(|item| serde_json::json!({
+                            "path": item.path,
+                            "imported_name": item.imported_name,
+                            "original_name": item.original_name,
+                            "glob": item.is_glob,
+                        })).collect::<Vec<_>>(),
                     }),
                 });
             }
@@ -2797,7 +2850,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     // in a type position is just another reference node) so structs, enums,
     // and traits still get their usage edges.
     {
-        let mut emit = |node: Node<'_>, text: &str| {
+        let mut emit = |node: Node<'_>, text: &str, ref_path: Option<&str>| {
             // The nearest enclosing function's qname, with the same file-node
             // fallback the resolver applies when the reference is not inside
             // any function.
@@ -2813,9 +2866,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 target_qualified_name: format!("{file_path}::__ref__::{text}"),
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
-                properties: serde_json::json!({
-                    "ref_name": text,
-                }),
+                properties: {
+                    let mut properties = serde_json::json!({ "ref_name": text });
+                    if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
+                        object.insert(
+                            "ref_path".into(),
+                            serde_json::Value::String(path.to_string()),
+                        );
+                    }
+                    properties
+                },
             });
         };
         walk_rust_usages(source, tree.root_node(), &mut emit);
@@ -17391,6 +17451,39 @@ const mul = (a, b) => compute(a) * b;
         assert!(
             from_compute.contains(&"add") && from_compute.contains(&"mul"),
             "compute must CALL add and mul: {from_compute:?}"
+        );
+    }
+
+    #[test]
+    fn ts_call_in_factory_callback_sources_from_module_variable() {
+        let r = ts(
+            r#"
+import { helper } from "./helper";
+export const make = Effect.gen(function* () {
+    helper(platform);
+}).pipe(Effect.withSpan("make"));
+"#,
+            "src/app.ts",
+        );
+        assert!(
+            r.nodes.iter().any(|node| {
+                node.label == "Variable" && node.qualified_name == "src/app.ts::Variable::make"
+            }),
+            "module variable `make` must exist: {:?}",
+            r.nodes
+        );
+        assert!(
+            r.edges.iter().any(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.source_qualified_name == "src/app.ts::Variable::make"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("helper")
+            }),
+            "helper call must be attributed to `make`, not the hidden file anchor: {:?}",
+            r.edges
         );
     }
 

@@ -4,7 +4,7 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
   var signaled = false;
   var observer = null;
   var deadlineId = 0;
-  var rafId = 0;
+  var pollId = 0;
   var expirationId = 0;
   var expiresAt = Date.now() + timeoutMs;
   var slot = {
@@ -35,9 +35,9 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
     } catch (_e) {}
     deadlineId = 0;
     try {
-      if (rafId) window.cancelAnimationFrame(rafId);
+      if (pollId) window.clearTimeout(pollId);
     } catch (_e) {}
-    rafId = 0;
+    pollId = 0;
     try {
       if (expirationId) window.clearTimeout(expirationId);
     } catch (_e) {}
@@ -85,20 +85,24 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
     check();
   }
 
-  function scheduleRaf() {
-    // MutationObserver may deliver repeatedly before the next paint. Keep a
-    // single outstanding frame; otherwise each delivery starts another
-    // recurring chain and cleanup can cancel only the last recorded handle.
-    if (finished || rafId) {
+  function schedulePoll() {
+    // Mutation and navigation events check immediately. A low-frequency
+    // fallback still catches property-only changes without forcing Servo to
+    // render every animation frame for the full wait deadline.
+    if (finished || pollId) {
       return;
     }
-    rafId = window.requestAnimationFrame(function () {
-      rafId = 0;
+    var remaining = Math.max(0, expiresAt - Date.now());
+    if (!remaining) {
+      return;
+    }
+    pollId = window.setTimeout(function () {
+      pollId = 0;
       check();
       if (!finished) {
-        scheduleRaf();
+        schedulePoll();
       }
-    });
+    }, Math.min(100, remaining));
   }
 
   function check() {
@@ -128,7 +132,7 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
     observer = new MutationObserver(function () {
       check();
       if (!finished) {
-        scheduleRaf();
+        schedulePoll();
       }
     });
     observer.observe(document.documentElement || document, {
@@ -151,7 +155,7 @@ function greppyWaitForFunction(source, token, timeoutMs, strictBoolean) {
 
   check();
   if (!finished) {
-    scheduleRaf();
+    schedulePoll();
   }
   if (finished && slot.status === "ok") {
     return slot.value;
