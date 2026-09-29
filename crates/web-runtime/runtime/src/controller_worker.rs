@@ -1,6 +1,5 @@
 use crate::protocol::{read_message, timeout_ms_from_json, write_message, Message, WorkerKind};
 use crate::worker::require_worker_auth;
-use std::fs::File;
 use deno_core::error::CoreError;
 use deno_core::url::Url;
 use deno_core::{
@@ -11,6 +10,7 @@ use deno_core::{
 use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -30,18 +30,14 @@ struct EngineBridge {
     next_id: Arc<AtomicU64>,
     stdout: Arc<Mutex<File>>,
     script_stdout: Arc<Mutex<Vec<String>>>,
-    pending: Arc<
-        Mutex<
-            HashMap<
-                u64,
-                tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
-            >,
-        >,
-    >,
+    pending:
+        Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>,
 }
 
 struct PlaywrightLoader {
-    script_root: Option<PathBuf>,
+    // Shared with the controller loop so each RunScript can retarget the
+    // granted root without dropping the V8 isolate.
+    script_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 fn granted_script_root(specifier: &str) -> Option<PathBuf> {
@@ -124,7 +120,12 @@ impl ModuleLoader for PlaywrightLoader {
         if module_specifier.scheme() != "file" {
             return denied_module(module_specifier);
         }
-        let Some(root) = self.script_root.as_deref() else {
+        let root = self
+            .script_root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(root) = root else {
             return denied_module(module_specifier);
         };
         let Ok(path) = module_specifier.to_file_path() else {
@@ -133,7 +134,7 @@ impl ModuleLoader for PlaywrightLoader {
         let Ok(canonical) = path.canonicalize() else {
             return denied_module(module_specifier);
         };
-        if !path_is_within(root, &canonical) {
+        if !path_is_within(&root, &canonical) {
             return denied_module(module_specifier);
         }
         let ext = canonical
@@ -345,12 +346,14 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
         script_stdout: Arc::clone(&script_stdout),
         pending: Arc::clone(&pending),
     };
-    let mut runtime = new_js_runtime(bridge.clone(), None);
+    let script_root = Arc::new(Mutex::new(None));
+    let mut runtime = new_js_runtime(bridge.clone(), Arc::clone(&script_root));
     runtime
         .execute_script("<web-controller-worker>", "1 + 1")
         .map_err(|error| io::Error::other(format!("JavaScript startup probe failed: {error}")))?;
     install_process_env_allow_list(&mut runtime)?;
     install_console_capture(&mut runtime)?;
+    let mut loaded_main = false;
 
     {
         match read_message(&mut protocol_in)? {
@@ -441,10 +444,13 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                 fixture_url,
                 ..
             } => {
-                drop(runtime);
-                runtime = new_js_runtime(bridge.clone(), granted_script_root(&specifier));
-                install_process_env_allow_list(&mut runtime)?;
-                install_console_capture(&mut runtime)?;
+                // Recreating the isolate on every script put V8 teardown on the
+                // next web.run's critical path. After a few hundred cycles that
+                // drop can sit in route_until_script_complete_gated with
+                // wait=controller:script-complete until the Unix client expires.
+                *script_root
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = granted_script_root(&specifier);
                 bridge
                     .script_stdout
                     .lock()
@@ -456,6 +462,7 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     &specifier,
                     source,
                     fixture_url,
+                    &mut loaded_main,
                 );
                 let captured = bridge
                     .script_stdout
@@ -465,10 +472,9 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                 let payload = serde_json::json!({ "stdout": captured });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(()) => write_message(
-                        &mut *stdout,
-                        &Message::script_complete(true, payload, None),
-                    )?,
+                    Ok(()) => {
+                        write_message(&mut *stdout, &Message::script_complete(true, payload, None))?
+                    }
                     Err(error) => write_message(
                         &mut *stdout,
                         &Message::script_complete(false, payload, Some(error)),
@@ -487,7 +493,7 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     }
 }
 
-fn new_js_runtime(bridge: EngineBridge, script_root: Option<PathBuf>) -> JsRuntime {
+fn new_js_runtime(bridge: EngineBridge, script_root: Arc<Mutex<Option<PathBuf>>>) -> JsRuntime {
     JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(PlaywrightLoader { script_root })),
         extensions: vec![greppy_playwright::init(bridge)],
@@ -561,6 +567,7 @@ fn run_script(
     specifier: &str,
     source: String,
     fixture_url: String,
+    loaded_main: &mut bool,
 ) -> Result<(), String> {
     let fixture = serde_json::to_string(&fixture_url).map_err(|error| error.to_string())?;
     runtime
@@ -579,16 +586,31 @@ fn run_script(
         source
     };
 
+    let use_side = *loaded_main;
     let future = async {
-        let module_id = runtime
-            .load_main_es_module_from_code(&module_url, source)
-            .await?;
+        let module_id = if use_side {
+            runtime
+                .load_side_es_module_from_code(&module_url, source)
+                .await?
+        } else {
+            runtime
+                .load_main_es_module_from_code(&module_url, source)
+                .await?
+        };
         let evaluation = runtime.mod_evaluate(module_id);
         runtime.run_event_loop(Default::default()).await?;
         evaluation.await?;
         Ok::<(), CoreError>(())
     };
-    tokio_runtime
+    let result = tokio_runtime
         .block_on(future)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    if result.is_ok() {
+        *loaded_main = true;
+    } else if !use_side {
+        // load_main registers the module even if evaluation fails; the next
+        // script must not ask for a second main module.
+        *loaded_main = true;
+    }
+    result
 }
