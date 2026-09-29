@@ -3345,6 +3345,9 @@ timeout = 30
         .unwrap();
         assert_eq!(cert.status, Status::InvalidResult);
         assert_eq!(cert.exit_code(), 13);
+        let diagnosis = cert.compact_failure_diagnosis().unwrap();
+        assert!(diagnosis.contains("syntax"), "{diagnosis}");
+        assert!(!diagnosis.contains("residual"), "{diagnosis}");
         assert!(!cert.published);
         assert_eq!(std::fs::read(&f).unwrap(), content);
     }
@@ -3511,6 +3514,12 @@ timeout = 30
         assert!(!certificate.published);
         assert_eq!(certificate.operations[0].file_sha256_after, None);
         assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
+        let diagnosis = certificate.compact_failure_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("residual") || diagnosis.contains("occurrence"),
+            "{diagnosis}"
+        );
+        assert!(!diagnosis.contains("new syntax error"), "{diagnosis}");
         assert!(!certificate.operations[0].postconditions_passed);
         assert_eq!(
             std::fs::read(dir.path().join("a.rs")).unwrap(),
