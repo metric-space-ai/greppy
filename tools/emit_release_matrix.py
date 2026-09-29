@@ -22,6 +22,10 @@ PRODUCTION_RELEASE_NAMES = {
     "build": frozenset(("macos-arm64", "linux-x86_64")),
     "verify": frozenset(("macos-arm64", "linux-x86_64-no-toolkit")),
 }
+PRODUCTION_BUILD_FEATURES = {
+    "macos-arm64": "metal",
+    "linux-x86_64": "cuda",
+}
 
 
 def signing_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -39,9 +43,33 @@ def filtered_includes(enabled: bool, matrix: dict | None = None) -> dict[str, li
         matrix = json.loads(path.read_text(encoding="utf-8"))
     chosen = {}
     for key in ("build", "verify"):
-        chosen[key] = [
+        rows = [
             row for row in matrix[key] if row["name"] in PRODUCTION_RELEASE_NAMES[key]
         ]
+        selected_names = [row["name"] for row in rows]
+        missing = sorted(PRODUCTION_RELEASE_NAMES[key] - set(selected_names))
+        duplicates = sorted(
+            name for name in set(selected_names) if selected_names.count(name) != 1
+        )
+        if missing or duplicates:
+            details = []
+            if missing:
+                details.append(f"missing={missing}")
+            if duplicates:
+                details.append(f"duplicates={duplicates}")
+            raise ValueError(
+                f"invalid production release {key} rows: " + ", ".join(details)
+            )
+        chosen[key] = rows
+
+    for row in chosen["build"]:
+        expected = PRODUCTION_BUILD_FEATURES[row["name"]]
+        actual = row.get("features")
+        if actual != expected:
+            raise ValueError(
+                "invalid production release backend for "
+                f"{row['name']}: expected features={expected!r}, got {actual!r}"
+            )
     return chosen
 
 

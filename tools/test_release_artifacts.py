@@ -513,6 +513,21 @@ class ReleaseArtifactTests(unittest.TestCase):
             [row["name"] for row in json.loads(emitted["verify_include"])],
             ["macos-arm64", "linux-x86_64-no-toolkit"],
         )
+        invalid_matrix = json.loads(
+            (REPOSITORY_ROOT / "tools/release_matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        linux = next(
+            row for row in invalid_matrix["build"] if row["name"] == "linux-x86_64"
+        )
+        linux["features"] = "cpu-only"
+        with self.assertRaisesRegex(
+            ValueError,
+            "invalid production release backend for linux-x86_64: "
+            "expected features='cuda', got 'cpu-only'",
+        ):
+            matrix_emit.filtered_includes(True, invalid_matrix)
         self.assertIn("cow_performance_ok", workflow)
         self.assertIn("cow_performance_failed", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
