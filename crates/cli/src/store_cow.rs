@@ -2712,7 +2712,12 @@ mod tests {
         // The freshness proof compares the live workspace with the exact
         // pinned Git tree, so this regression must use a real repository.
         let repo = fixture();
-        let root = repo.path().to_path_buf();
+        // Ordinary navigation resolves an explicit root before locating both
+        // workspace state and its store. Persist the synthetic fixture under
+        // that same spelling: macOS aliases /var to /private/var, and Windows
+        // can similarly normalize an extended path.
+        let raw_root = repo.path().to_string_lossy().into_owned();
+        let root = crate::resolving::resolve_root(Some(&raw_root)).unwrap();
         std::fs::create_dir_all(root.join("src/alias_chain")).unwrap();
         std::fs::write(
             root.join("src/alias_chain/mod.rs"),
@@ -3039,9 +3044,11 @@ mod tests {
                 .all(|edge| edge.source_id != legacy_base_caller.id),
             "the missing Base caller has no stale logical edge before repair"
         );
-        let freshness_proof = overlay_freshness_proof(&root, &legacy, "p").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let freshness_proof = crate::nav_freshness_json(&legacy, Some(&root_string), "p");
         assert!(
-            matches!(freshness_proof, Some(OverlayFreshnessProof::Fresh { .. })),
+            freshness_proof["fresh"] == true
+                && freshness_proof["source"] == "verified_store_cow_overlay",
             "persisted repair fixture must satisfy the real Store-CoW freshness gate before the query; otherwise the unit-test executable would be selected as a background CLI: {freshness_proof:?}"
         );
         drop(legacy);
@@ -3055,7 +3062,6 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-        let root_string = root.to_string_lossy().into_owned();
         let held = greppy_freshness::try_acquire(&delta_path).unwrap();
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_start = std::sync::Arc::clone(&start);
