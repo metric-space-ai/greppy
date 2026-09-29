@@ -3224,14 +3224,36 @@ mod tests {
         // executable, so spawning current_exe would feed CLI arguments to the
         // test harness. Dispatch the same structural index path in-process;
         // embeddings remain deferred and the vector-preservation assertion
-        // below continues to cover the one-shot repair contract.
+        // below continues to cover the one-shot repair contract. Use an
+        // explicit CLI-sized stack rather than the platform's libtest stack.
         std::env::set_var(crate::ENV_STRUCTURAL_FIRST_USE, "1");
-        let index_code = crate::dispatch(
-            crate::Cli::try_parse_from(["greppy", "index", &root_string, "--root", &root_string])
-                .unwrap(),
-        )
-        .unwrap();
+        let index_root = root_string.clone();
+        let index_thread = match std::thread::Builder::new()
+            .name("persisted-repair-structural-index".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                crate::dispatch(
+                    crate::Cli::try_parse_from([
+                        "greppy",
+                        "index",
+                        &index_root,
+                        "--root",
+                        &index_root,
+                    ])
+                    .unwrap(),
+                )
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                std::env::remove_var(crate::ENV_STRUCTURAL_FIRST_USE);
+                panic!("cannot spawn structural index test thread: {error}");
+            }
+        };
+        let index_result = index_thread.join();
         std::env::remove_var(crate::ENV_STRUCTURAL_FIRST_USE);
+        let index_code = index_result
+            .unwrap_or_else(|_| panic!("structural index test thread panicked"))
+            .unwrap();
         assert_eq!(index_code, 0, "dirty structural publication should succeed");
         let code = crate::dispatch(
             crate::Cli::try_parse_from(["greppy", "--root", &root_string, "who-calls", "target"])
