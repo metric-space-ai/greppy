@@ -427,11 +427,48 @@ fn rename_identity_planner_subprocess_helper() {
         assert_eq!(std::fs::read(refusal_root.join(path)).unwrap(), expected);
     }
 
+    // Rust types retain the original whole-definition/incoming-span planner;
+    // the method-only identity inventory must not capture a Class node merely
+    // because its qualified name also has an owner-like segment.
+    let type_root = test_tempdir("rename-identity-type-fallback");
+    std::fs::create_dir(type_root.join(".git")).unwrap();
+    std::fs::write(
+        type_root.join("types.rs"),
+        "struct Widget;\nfn consume(value: Widget) { let _ = value; }\n",
+    )
+    .unwrap();
+    let type_store_path = workspace_locator::store_path(&type_root);
+    std::fs::create_dir_all(type_store_path.parent().unwrap()).unwrap();
+    let mut type_store = greppy_store::Store::open(&type_store_path).unwrap();
+    let type_project = workspace_locator::project_identity(&type_root);
+    let type_report = greppy_indexer::index(&mut type_store, &type_root, &type_project).unwrap();
+    assert!(
+        type_report.is_clean(),
+        "type fixture index report: {type_report:?}"
+    );
+    drop(type_store);
+    let type_outcome = run_trained_rename(
+        &type_root,
+        type_root.to_str(),
+        "Widget",
+        "Gadget",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(type_outcome.published);
+    assert_eq!(
+        std::fs::read_to_string(type_root.join("types.rs")).unwrap(),
+        "struct Gadget;\nfn consume(value: Gadget) { let _ = value; }\n"
+    );
+
     std::fs::remove_dir_all(success_root).unwrap();
     #[cfg(unix)]
     std::fs::remove_dir_all(external_root).unwrap();
     std::fs::remove_dir_all(omitted_root).unwrap();
     std::fs::remove_dir_all(refusal_root).unwrap();
+    std::fs::remove_dir_all(type_root).unwrap();
 }
 
 #[test]

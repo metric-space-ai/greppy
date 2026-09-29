@@ -2661,10 +2661,11 @@ pub(crate) fn run_trained_rename(
     use std::collections::BTreeMap;
     let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let first_owner = def_nodes[0].qualified_name.rsplit("::").nth(1);
-    let rust_inventory_eligible = first_owner != Some("Function")
-        && first_owner.is_some()
+    let rust_inventory_eligible = first_owner.is_some()
         && def_nodes.iter().all(|def| {
-            def.file_path.ends_with(".rs") && def.qualified_name.rsplit("::").nth(1) == first_owner
+            def.label == "Method"
+                && def.file_path.ends_with(".rs")
+                && def.qualified_name.rsplit("::").nth(1) == first_owner
         });
     let rust_method_owner = rust_inventory_eligible.then(|| first_owner.unwrap().to_owned());
     for def in &def_nodes {
