@@ -2038,11 +2038,17 @@ fn count_rename_scope_residuals(
     workspace_root: &Path,
     scopes: &[RenameFileScope],
     name: &str,
+    replacement_name: &str,
     projected: &[crate::journal::FilePublication],
 ) -> Result<usize> {
     let projected = projected
         .iter()
-        .map(|publication| (publication.rel_path.as_str(), publication.content.as_slice()))
+        .map(|publication| {
+            (
+                publication.rel_path.as_str(),
+                publication.content.as_slice(),
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut count = 0usize;
     for scope in scopes {
@@ -2058,19 +2064,24 @@ fn count_rename_scope_residuals(
             })?;
             owned.as_slice()
         };
-        count += rename_identifier_sites(
-            Path::new(&scope.rel_path),
-            content,
-            &scope.spans,
-            name,
-        )
-        .ok_or_else(|| {
-            greppy_core::Error::Invalid(format!(
-                "cannot parse rename residual scope {}",
-                scope.rel_path
-            ))
-        })?
-        .len();
+        let replacement_delta = replacement_name.len() as isize - name.len() as isize;
+        let mut projected_spans = Vec::with_capacity(scope.spans.len());
+        let mut ordered = scope.spans.clone();
+        ordered.sort_unstable();
+        for (index, (start, _)) in ordered.into_iter().enumerate() {
+            let mapped_start = start.saturating_add_signed(replacement_delta * index as isize);
+            let mapped_end = mapped_start.saturating_add(name.len());
+            projected_spans.push((mapped_start, mapped_end));
+        }
+        count +=
+            rename_identifier_sites(Path::new(&scope.rel_path), content, &projected_spans, name)
+                .ok_or_else(|| {
+                    greppy_core::Error::Invalid(format!(
+                        "cannot parse rename residual scope {}",
+                        scope.rel_path
+                    ))
+                })?
+                .len();
     }
     Ok(count)
 }
@@ -2222,6 +2233,7 @@ fn rename_symbol_files_with_residual_scope(
                     workspace_root,
                     scopes,
                     from,
+                    to,
                     publications.as_slice(),
                 )?
             } else {
@@ -3394,13 +3406,9 @@ timeout = 30
             "next",
         )
         .unwrap();
-        let caller_sites = rename_identifier_sites(
-            Path::new("caller.rs"),
-            caller,
-            &[(0, caller.len())],
-            "next",
-        )
-        .unwrap();
+        let caller_sites =
+            rename_identifier_sites(Path::new("caller.rs"), caller, &[(0, caller.len())], "next")
+                .unwrap();
         assert_eq!(selected_sites.len(), 1);
         assert_eq!(caller_sites.len(), 1);
         assert!(
@@ -3420,14 +3428,9 @@ timeout = 30
             },
         ];
 
-        let certificate = rename_symbol_files_scoped(
-            dir.path(),
-            &scopes,
-            "next",
-            "advance",
-            &rename_options(0),
-        )
-        .unwrap();
+        let certificate =
+            rename_symbol_files_scoped(dir.path(), &scopes, "next", "advance", &rename_options(0))
+                .unwrap();
 
         assert_eq!(certificate.status, Status::Applied);
         assert!(std::fs::read_to_string(dir.path().join("selected.rs"))
@@ -3443,6 +3446,40 @@ timeout = 30
         assert_eq!(
             std::fs::read(dir.path().join("unrelated_b.rs")).unwrap(),
             unrelated_b
+        );
+    }
+
+    #[test]
+    fn identity_scoped_residuals_follow_length_changed_multiple_sites() {
+        let dir = ws();
+        let source = b"struct Scheduler;\nimpl Scheduler { fn next(&mut self) { self.next(); } }\n";
+        std::fs::write(dir.path().join("selected.rs"), source).unwrap();
+        let sites = rename_identifier_sites(
+            Path::new("selected.rs"),
+            source,
+            &[(0, source.len())],
+            "next",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+
+        let certificate = rename_symbol_files_scoped(
+            dir.path(),
+            &[RenameFileScope {
+                rel_path: "selected.rs".into(),
+                spans: sites,
+            }],
+            "next",
+            "advance",
+            &rename_options(0),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert_eq!(certificate.operations[0].residual_occurrences, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("selected.rs")).unwrap(),
+            "struct Scheduler;\nimpl Scheduler { fn advance(&mut self) { self.advance(); } }\n"
         );
     }
 

@@ -2418,12 +2418,19 @@ pub(crate) fn edit_rename_receipt_addresses(
         .collect()
 }
 
-fn rename_edge_identity_supported(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameEdgeIdentity {
+    Related,
+    Unrelated,
+    Unknown,
+}
+
+fn rename_edge_identity(
     edge_type: &str,
     properties: &serde_json::Value,
     owner: Option<&str>,
     name: &str,
-) -> bool {
+) -> RenameEdgeIdentity {
     let path_matches = |property: &str| {
         properties
             .get(property)
@@ -2435,18 +2442,51 @@ fn rename_edge_identity_supported(
     };
     match edge_type {
         "CALLS"
-            if properties.get("callee_form").and_then(|value| value.as_str())
+            if properties
+                .get("callee_form")
+                .and_then(|value| value.as_str())
                 == Some("receiver") =>
         {
-            properties
+            match properties
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())
-                == owner
+            {
+                Some(candidate) if Some(candidate) == owner => RenameEdgeIdentity::Related,
+                Some(_) => RenameEdgeIdentity::Unrelated,
+                None => RenameEdgeIdentity::Unknown,
+            }
         }
-        "CALLS" => owner == Some("Function") || path_matches("callee_path"),
-        "USAGE" | "USES" => owner == Some("Function") || path_matches("ref_path"),
-        "TYPE_REF" | "IMPORTS" => true,
-        _ => false,
+        "CALLS" if owner == Some("Function") => RenameEdgeIdentity::Related,
+        "CALLS" if path_matches("callee_path") => RenameEdgeIdentity::Related,
+        "CALLS" if properties.get("callee_path").is_some() => RenameEdgeIdentity::Unrelated,
+        "CALLS" => RenameEdgeIdentity::Unknown,
+        "USAGE" | "USES" if owner == Some("Function") => RenameEdgeIdentity::Related,
+        "USAGE" | "USES" if path_matches("ref_path") => RenameEdgeIdentity::Related,
+        "USAGE" | "USES" if properties.get("ref_path").is_some() => RenameEdgeIdentity::Unrelated,
+        "USAGE" | "USES" => RenameEdgeIdentity::Unknown,
+        "TYPE_REF" | "IMPORTS" => RenameEdgeIdentity::Related,
+        _ => RenameEdgeIdentity::Unrelated,
+    }
+}
+
+fn require_rename_edge_identity(
+    edge_type: &str,
+    properties: &serde_json::Value,
+    owner: Option<&str>,
+    name: &str,
+    symbol: &str,
+    source_id: i64,
+) -> EditResult<bool> {
+    match rename_edge_identity(edge_type, properties, owner, name) {
+        RenameEdgeIdentity::Related => Ok(true),
+        RenameEdgeIdentity::Unrelated => Ok(false),
+        RenameEdgeIdentity::Unknown => Err(EditRefusal::new(
+            "unresolved_reference_identity",
+            format!(
+                "graph reference to `{symbol}` lacks owner identity at source node {source_id}; refresh the index or select a more specific symbol — nothing written"
+            ),
+            12,
+        )),
     }
 }
 
@@ -2505,11 +2545,8 @@ pub(crate) fn run_trained_rename(
                 10,
             )));
         };
-        let definition_range = line_range_to_bytes(
-            &content,
-            def.start_line as usize,
-            span.end_line as usize,
-        );
+        let definition_range =
+            line_range_to_bytes(&content, def.start_line as usize, span.end_line as usize);
         let definition_sites = greppy_edit::verbs::rename_definition_sites(
             std::path::Path::new(&def.file_path),
             &content,
@@ -2537,29 +2574,58 @@ pub(crate) fn run_trained_rename(
                 "IMPORTS" => "imported_name",
                 _ => continue,
             };
-            let Some(reference_name) = edge.properties.get(property).and_then(|value| value.as_str())
+            let Some(reference_name) = edge
+                .properties
+                .get(property)
+                .and_then(|value| value.as_str())
             else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference_identity",
+                    format!(
+                        "graph reference to `{symbol}` at source node {} lacks `{property}` identity; refresh the index — nothing written",
+                        edge.source_id
+                    ),
+                    12,
+                )));
             };
             if reference_name.rsplit("::").next() != Some(short_name.as_str()) {
                 continue;
             }
-            if !rename_edge_identity_supported(
+            match require_rename_edge_identity(
                 &edge.edge_type,
                 &edge.properties,
                 owner,
                 &short_name,
+                symbol,
+                edge.source_id,
             ) {
-                continue;
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(refusal) => return Ok(Err(refusal)),
             }
             let Some(source) = store.get_node(edge.source_id)? else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("graph reference to `{symbol}` has no source node — nothing written"),
+                    12,
+                )));
             };
             if source.file_path.is_empty() || source.start_line < 1 {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("graph reference to `{symbol}` has no readable source location — nothing written"),
+                    12,
+                )));
             }
             let Ok(content) = std::fs::read(root_path.join(&source.file_path)) else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot read graph reference source {} for `{symbol}` — nothing written",
+                        source.file_path
+                    ),
+                    12,
+                )));
             };
             let Some(span) = read_span_with_meta(
                 root_path,
@@ -2569,13 +2635,14 @@ pub(crate) fn run_trained_rename(
                 usize::MAX,
                 false,
             ) else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot resolve graph reference source span {} for `{symbol}` — nothing written", source.file_path),
+                    12,
+                )));
             };
-            let range = line_range_to_bytes(
-                &content,
-                source.start_line as usize,
-                span.end_line as usize,
-            );
+            let range =
+                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize);
             let Some(sites) = greppy_edit::verbs::rename_identifier_sites(
                 std::path::Path::new(&source.file_path),
                 &content,
@@ -2592,6 +2659,9 @@ pub(crate) fn run_trained_rename(
                 )));
             };
             match sites.as_slice() {
+                // The graph can retain a stale edge after its old identifier
+                // disappeared. With no live AST identifier there is nothing
+                // left to rename, so this candidate is safely irrelevant.
                 [] => continue,
                 [site] => scopes
                     .entry(source.file_path.clone())
@@ -3048,30 +3118,33 @@ mod patch_rollback_tests {
             "callee_path": "Scheduler::next"
         });
 
-        assert!(rename_edge_identity_supported(
-            "CALLS",
-            &selected,
-            Some("Scheduler"),
-            "next"
-        ));
-        assert!(rename_edge_identity_supported(
-            "CALLS",
-            &associated,
-            Some("Scheduler"),
-            "next"
-        ));
-        assert!(!rename_edge_identity_supported(
-            "CALLS",
-            &unrelated,
-            Some("Scheduler"),
-            "next"
-        ));
-        assert!(!rename_edge_identity_supported(
+        assert_eq!(
+            rename_edge_identity("CALLS", &selected, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Related
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &associated, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Related
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &unrelated, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unrelated
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &misleading, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        let refusal = require_rename_edge_identity(
             "CALLS",
             &misleading,
             Some("Scheduler"),
-            "next"
-        ));
+            "next",
+            "Scheduler::next",
+            42,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "unresolved_reference_identity");
+        assert!(refusal.message.contains("source node 42"));
     }
 
     #[test]
