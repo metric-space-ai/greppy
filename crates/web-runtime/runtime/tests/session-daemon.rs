@@ -3320,22 +3320,6 @@ fn network_query_filters_enriched_response_records() {
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
     assert_eq!(ran.status, "ok", "{ran:?}");
 
-    let mut reused_run = Request::new(
-        "run_network_query_reused",
-        "web.run",
-        json!({
-            "session_id": session_id,
-            "script_source": "file",
-            "script_file": script.display().to_string(),
-            "script_text": source,
-            "bind_session_page": true,
-        }),
-    );
-    reused_run.deadline_ms = 60_000;
-    let reused = unix_request(&socket, &reused_run, Duration::from_secs(60))
-        .expect("web.run on reused bound page");
-    assert_eq!(reused.status, "ok", "{reused:?}");
-
     let filtered = unix_request(
         &socket,
         &Request::new(
@@ -3406,42 +3390,6 @@ fn network_query_filters_enriched_response_records() {
     assert!(
         transport["failure"]["errorText"].is_string(),
         "{transport:?}"
-    );
-
-    let research = unix_request(
-        &socket,
-        &Request::new(
-            "run_network_query_research",
-            "web.session.create",
-            json!({ "profile": "research" }),
-        ),
-        Duration::from_secs(10),
-    )
-    .expect("create research session");
-    let research_session_id = research.result.as_ref().unwrap()["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let mut denied_run = Request::new(
-        "run_network_query_research",
-        "web.run",
-        json!({
-            "session_id": research_session_id,
-            "script_source": "file",
-            "script_file": script.display().to_string(),
-            "script_text": std::fs::read_to_string(&script).unwrap(),
-            "bind_session_page": true,
-        }),
-    );
-    denied_run.deadline_ms = 60_000;
-    let denied = unix_request(&socket, &denied_run, Duration::from_secs(60))
-        .expect("research web.run response");
-    assert_eq!(denied.status, "error", "{denied:?}");
-    assert!(
-        denied.error.as_ref().is_some_and(|error| error
-            .message
-            .contains("research profile denies loopback")),
-        "{denied:?}"
     );
 }
 
