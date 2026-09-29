@@ -1025,6 +1025,75 @@ fn identifier_sites(
     Some(out)
 }
 
+/// AST-validated identifier ranges used by graph-backed rename planning.
+/// `None` means the file could not be parsed for its registered language.
+pub fn rename_identifier_sites(
+    path: &Path,
+    content: &[u8],
+    ranges: &[(usize, usize)],
+    name: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let language = greppy_parser::language_for_path(path);
+    let mut sites = Vec::new();
+    for &(start, end) in ranges {
+        sites.extend(identifier_sites(
+            language,
+            content,
+            (start, end.min(content.len())),
+            name.as_bytes(),
+        )?);
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    Some(sites)
+}
+
+/// Definition-name identifier ranges inside an indexed definition span.
+pub fn rename_definition_sites(
+    path: &Path,
+    content: &[u8],
+    range: (usize, usize),
+    name: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let language = greppy_parser::language_for_path(path);
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut sites = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        let is_definition_name = node.parent().is_some_and(|parent| {
+            parent.child_by_field_name("name").is_some_and(|field| {
+                field.start_byte() == node.start_byte() && field.end_byte() == node.end_byte()
+            })
+        });
+        if node.start_byte() >= range.0
+            && node.end_byte() <= range.1.min(content.len())
+            && node.child_count() == 0
+            && node.kind().contains("identifier")
+            && is_definition_name
+            && &content[node.start_byte()..node.end_byte()] == name.as_bytes()
+        {
+            sites.push((node.start_byte(), node.end_byte()));
+        }
+        if node.end_byte() >= range.0 && node.start_byte() <= range.1 && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    Some(sites)
+}
+
 /// Compatibility entry point for the pre-M4 parameters-only API. Its inputs
 /// cannot express argument add/remove/reorder, call-site cardinality, or
 /// multi-file CAS, so it now fails closed instead of publishing a partial
@@ -1965,6 +2034,47 @@ fn count_workspace_residuals(
     )
 }
 
+fn count_rename_scope_residuals(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    name: &str,
+    projected: &[crate::journal::FilePublication],
+) -> Result<usize> {
+    let projected = projected
+        .iter()
+        .map(|publication| (publication.rel_path.as_str(), publication.content.as_slice()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut count = 0usize;
+    for scope in scopes {
+        let owned;
+        let content = if let Some(content) = projected.get(scope.rel_path.as_str()) {
+            *content
+        } else {
+            owned = std::fs::read(workspace_root.join(&scope.rel_path)).map_err(|source| {
+                greppy_core::Error::Io {
+                    context: format!("read {}", scope.rel_path),
+                    source,
+                }
+            })?;
+            owned.as_slice()
+        };
+        count += rename_identifier_sites(
+            Path::new(&scope.rel_path),
+            content,
+            &scope.spans,
+            name,
+        )
+        .ok_or_else(|| {
+            greppy_core::Error::Invalid(format!(
+                "cannot parse rename residual scope {}",
+                scope.rel_path
+            ))
+        })?
+        .len();
+    }
+    Ok(count)
+}
+
 /// Graph-backed `rename-symbol`: rename identifier occurrences of `from`
 /// inside the given per-file scopes, publish all files as one journal
 /// transaction. Every site is AST-verified (identifier-kind leaf nodes
@@ -1975,6 +2085,29 @@ pub fn rename_symbol_files(
     from: &str,
     to: &str,
     options: &VerbOptions,
+) -> Result<Certificate> {
+    rename_symbol_files_with_residual_scope(workspace_root, scopes, from, to, options, false)
+}
+
+/// Graph-backed rename variant whose residual proof is limited to the exact
+/// identity-validated files supplied by the caller.
+pub fn rename_symbol_files_scoped(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    from: &str,
+    to: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    rename_symbol_files_with_residual_scope(workspace_root, scopes, from, to, options, true)
+}
+
+fn rename_symbol_files_with_residual_scope(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    from: &str,
+    to: &str,
+    options: &VerbOptions,
+    scoped_residuals: bool,
 ) -> Result<Certificate> {
     use std::collections::BTreeSet;
 
@@ -2084,12 +2217,21 @@ pub fn rename_symbol_files(
     if status == Status::Applied {
         let expected = options.expect_residual.unwrap_or(0);
         if let Some(language) = residual_language {
-            let residual_occurrences = count_workspace_residuals(
-                workspace_root,
-                language,
-                from,
-                Some(publications.as_slice()),
-            )?;
+            let residual_occurrences = if scoped_residuals {
+                count_rename_scope_residuals(
+                    workspace_root,
+                    scopes,
+                    from,
+                    publications.as_slice(),
+                )?
+            } else {
+                count_workspace_residuals(
+                    workspace_root,
+                    language,
+                    from,
+                    Some(publications.as_slice()),
+                )?
+            };
             let passed = residual_occurrences == expected;
             for report in &mut reports {
                 report.residual_occurrences = Some(residual_occurrences);
@@ -3228,6 +3370,80 @@ timeout = 30
         assert_eq!(certificate.exit_code(), 0);
         assert!(certificate.published);
         assert_eq!(certificate.operations[0].residual_occurrences, Some(0));
+    }
+
+    #[test]
+    fn identity_scoped_rename_ignores_unrelated_same_name_methods() {
+        let dir = ws();
+        let selected = b"struct Scheduler;\nimpl Scheduler { fn next(&mut self) {} }\n";
+        let caller = b"fn caller(value: &mut Scheduler) { value.next(); }\n";
+        let unrelated_a = b"struct Other;\nimpl Other { fn next(&mut self) {} }\n";
+        let unrelated_b = b"fn iterator_next<I: Iterator>(value: &mut I) { value.next(); }\n";
+        for (path, content) in [
+            ("selected.rs", selected.as_slice()),
+            ("caller.rs", caller.as_slice()),
+            ("unrelated_a.rs", unrelated_a.as_slice()),
+            ("unrelated_b.rs", unrelated_b.as_slice()),
+        ] {
+            std::fs::write(dir.path().join(path), content).unwrap();
+        }
+        let selected_sites = rename_identifier_sites(
+            Path::new("selected.rs"),
+            selected,
+            &[(0, selected.len())],
+            "next",
+        )
+        .unwrap();
+        let caller_sites = rename_identifier_sites(
+            Path::new("caller.rs"),
+            caller,
+            &[(0, caller.len())],
+            "next",
+        )
+        .unwrap();
+        assert_eq!(selected_sites.len(), 1);
+        assert_eq!(caller_sites.len(), 1);
+        assert!(
+            rename_identifier_sites(Path::new("caller.rs"), caller, &[(0, 8)], "next")
+                .unwrap()
+                .is_empty(),
+            "a misleading graph candidate range must not become an edit site"
+        );
+        let scopes = vec![
+            RenameFileScope {
+                rel_path: "selected.rs".into(),
+                spans: selected_sites,
+            },
+            RenameFileScope {
+                rel_path: "caller.rs".into(),
+                spans: caller_sites,
+            },
+        ];
+
+        let certificate = rename_symbol_files_scoped(
+            dir.path(),
+            &scopes,
+            "next",
+            "advance",
+            &rename_options(0),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert!(std::fs::read_to_string(dir.path().join("selected.rs"))
+            .unwrap()
+            .contains("fn advance"));
+        assert!(std::fs::read_to_string(dir.path().join("caller.rs"))
+            .unwrap()
+            .contains("value.advance()"));
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated_a.rs")).unwrap(),
+            unrelated_a
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated_b.rs")).unwrap(),
+            unrelated_b
+        );
     }
 
     #[test]

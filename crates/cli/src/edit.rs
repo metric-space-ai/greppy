@@ -2418,6 +2418,38 @@ pub(crate) fn edit_rename_receipt_addresses(
         .collect()
 }
 
+fn rename_edge_identity_supported(
+    edge_type: &str,
+    properties: &serde_json::Value,
+    owner: Option<&str>,
+    name: &str,
+) -> bool {
+    let path_matches = |property: &str| {
+        properties
+            .get(property)
+            .and_then(|value| value.as_str())
+            .is_some_and(|path| {
+                let mut parts = path.rsplit("::");
+                parts.next() == Some(name) && parts.next() == owner
+            })
+    };
+    match edge_type {
+        "CALLS"
+            if properties.get("callee_form").and_then(|value| value.as_str())
+                == Some("receiver") =>
+        {
+            properties
+                .get("receiver_owner")
+                .and_then(|value| value.as_str())
+                == owner
+        }
+        "CALLS" => owner == Some("Function") || path_matches("callee_path"),
+        "USAGE" | "USES" => owner == Some("Function") || path_matches("ref_path"),
+        "TYPE_REF" | "IMPORTS" => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn run_trained_rename(
     root_path: &std::path::Path,
     root: Option<&str>,
@@ -2456,11 +2488,70 @@ pub(crate) fn run_trained_rename(
     use std::collections::BTreeMap;
     let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     for def in &def_nodes {
+        let owner = def.qualified_name.rsplit("::").nth(1);
+        let content = std::fs::read(root_path.join(&def.file_path))
+            .map_err(|error| Error::io(format!("read {} for rename", def.file_path), error))?;
+        let Some(span) = read_span_with_meta(
+            root_path,
+            &def.file_path,
+            def.start_line,
+            def.end_line,
+            usize::MAX,
+            false,
+        ) else {
+            return Ok(Err(EditRefusal::new(
+                "symbol_not_found",
+                format!("selected definition `{symbol}` no longer has a readable source span"),
+                10,
+            )));
+        };
+        let definition_range = line_range_to_bytes(
+            &content,
+            def.start_line as usize,
+            span.end_line as usize,
+        );
+        let definition_sites = greppy_edit::verbs::rename_definition_sites(
+            std::path::Path::new(&def.file_path),
+            &content,
+            definition_range,
+            &short_name,
+        );
+        let Some([definition_site]) = definition_sites.as_deref() else {
+            return Ok(Err(EditRefusal::new(
+                "ambiguous_symbol",
+                format!(
+                    "selected definition `{symbol}` does not have one unique live `{short_name}` identifier in its indexed span"
+                ),
+                12,
+            )));
+        };
         scopes
             .entry(def.file_path.clone())
             .or_default()
-            .push((0, usize::MAX));
+            .push(*definition_site);
         for edge in store.incoming_edges(def.id, None, 100_000)? {
+            let property = match edge.edge_type.as_str() {
+                "CALLS" => "callee_name",
+                "USAGE" | "USES" => "ref_name",
+                "TYPE_REF" => "type_name",
+                "IMPORTS" => "imported_name",
+                _ => continue,
+            };
+            let Some(reference_name) = edge.properties.get(property).and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            if reference_name.rsplit("::").next() != Some(short_name.as_str()) {
+                continue;
+            }
+            if !rename_edge_identity_supported(
+                &edge.edge_type,
+                &edge.properties,
+                owner,
+                &short_name,
+            ) {
+                continue;
+            }
             let Some(source) = store.get_node(edge.source_id)? else {
                 continue;
             };
@@ -2480,14 +2571,44 @@ pub(crate) fn run_trained_rename(
             ) else {
                 continue;
             };
-            scopes
-                .entry(source.file_path.clone())
-                .or_default()
-                .push(line_range_to_bytes(
-                    &content,
-                    source.start_line as usize,
-                    span.end_line as usize,
-                ));
+            let range = line_range_to_bytes(
+                &content,
+                source.start_line as usize,
+                span.end_line as usize,
+            );
+            let Some(sites) = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(&source.file_path),
+                &content,
+                &[range],
+                &short_name,
+            ) else {
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot parse graph reference scope {} for `{symbol}`; nothing written",
+                        source.file_path
+                    ),
+                    12,
+                )));
+            };
+            match sites.as_slice() {
+                [] => continue,
+                [site] => scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .push(*site),
+                _ => {
+                    return Ok(Err(EditRefusal::new(
+                        "ambiguous_reference",
+                        format!(
+                            "graph reference scope {} contains {} live `{short_name}` identifiers; select a narrower symbol or refresh the index — nothing written",
+                            source.file_path,
+                            sites.len()
+                        ),
+                        12,
+                    )))
+                }
+            }
         }
     }
     let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
@@ -2511,7 +2632,7 @@ pub(crate) fn run_trained_rename(
         expect_residual: Some(0),
         ..Default::default()
     };
-    let certificate = greppy_edit::verbs::rename_symbol_files(
+    let certificate = greppy_edit::verbs::rename_symbol_files_scoped(
         root_path,
         &scope_vec,
         &short_name,
@@ -2904,6 +3025,54 @@ pub(crate) fn edit_operation_line_span(
 #[cfg(test)]
 mod patch_rollback_tests {
     use super::*;
+
+    #[test]
+    fn rename_edge_requires_selected_method_identity_evidence() {
+        let selected = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver",
+            "receiver_owner": "Scheduler"
+        });
+        let unrelated = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver",
+            "receiver_owner": "Iterator"
+        });
+        let misleading = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver"
+        });
+        let associated = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": "Scheduler::next"
+        });
+
+        assert!(rename_edge_identity_supported(
+            "CALLS",
+            &selected,
+            Some("Scheduler"),
+            "next"
+        ));
+        assert!(rename_edge_identity_supported(
+            "CALLS",
+            &associated,
+            Some("Scheduler"),
+            "next"
+        ));
+        assert!(!rename_edge_identity_supported(
+            "CALLS",
+            &unrelated,
+            Some("Scheduler"),
+            "next"
+        ));
+        assert!(!rename_edge_identity_supported(
+            "CALLS",
+            &misleading,
+            Some("Scheduler"),
+            "next"
+        ));
+    }
 
     #[test]
     fn duplicate_patch_targets_are_refused_before_any_publish() {
