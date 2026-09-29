@@ -2418,6 +2418,437 @@ pub(crate) fn edit_rename_receipt_addresses(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameEdgeIdentity {
+    Related,
+    Unrelated,
+    Unknown,
+}
+
+fn rename_edge_identity(
+    edge_type: &str,
+    properties: &serde_json::Value,
+    owner: Option<&str>,
+    name: &str,
+) -> RenameEdgeIdentity {
+    let known_path_owner = |property: &str| {
+        properties
+            .get(property)
+            .and_then(|value| value.as_str())
+            .filter(|path| !path.is_empty())
+            .and_then(|path| path.strip_suffix(name))
+            .and_then(|path| path.strip_suffix("::"))
+            .filter(|owner| !owner.is_empty())
+    };
+    let owner_relation = |candidate: &str| match owner {
+        Some(selected) if candidate == selected => RenameEdgeIdentity::Related,
+        Some(selected)
+            if candidate.ends_with(&format!("::{selected}"))
+                || selected.ends_with(&format!("::{candidate}")) =>
+        {
+            RenameEdgeIdentity::Unknown
+        }
+        Some(_) => RenameEdgeIdentity::Unrelated,
+        None => RenameEdgeIdentity::Unknown,
+    };
+    match edge_type {
+        "CALLS"
+            if properties
+                .get("callee_form")
+                .and_then(|value| value.as_str())
+                == Some("receiver") =>
+        {
+            match properties
+                .get("receiver_owner")
+                .and_then(|value| value.as_str())
+            {
+                Some(candidate) if !candidate.is_empty() => owner_relation(candidate),
+                Some(_) => RenameEdgeIdentity::Unknown,
+                None => RenameEdgeIdentity::Unknown,
+            }
+        }
+        "CALLS" if owner == Some("Function") => RenameEdgeIdentity::Related,
+        "CALLS" if known_path_owner("callee_path").is_some() => {
+            owner_relation(known_path_owner("callee_path").unwrap())
+        }
+        "CALLS" => RenameEdgeIdentity::Unknown,
+        "USAGE" | "USES" if owner == Some("Function") => RenameEdgeIdentity::Related,
+        "USAGE" | "USES" if known_path_owner("ref_path").is_some() => {
+            owner_relation(known_path_owner("ref_path").unwrap())
+        }
+        "USAGE" | "USES" => RenameEdgeIdentity::Unknown,
+        "TYPE_REF" | "IMPORTS" => RenameEdgeIdentity::Related,
+        _ => RenameEdgeIdentity::Unrelated,
+    }
+}
+
+fn rust_rename_reference_inventory(
+    root_path: &std::path::Path,
+    scopes: &std::collections::BTreeMap<String, Vec<(usize, usize)>>,
+    owner: &str,
+    short_name: &str,
+    symbol: &str,
+) -> EditResult<()> {
+    let files = greppy_discover::walk(root_path).map_err(|error| {
+        EditRefusal::new(
+            "unresolved_reference",
+            format!("cannot inventory Rust references for `{symbol}`: {error} — nothing written"),
+            12,
+        )
+    })?;
+    for entry in files {
+        if std::path::Path::new(&entry.rel_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("rs")
+        {
+            continue;
+        }
+        let rel = entry.rel_path;
+        let content = greppy_discover::read_stable_file(&entry.abs_path)
+            .map(|(content, _)| content)
+            .map_err(|error| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"
+                    ),
+                    12,
+                )
+            })?;
+        let extraction = greppy_parser::extract(greppy_parser::Language::Rust, &content, &rel)
+            .map_err(|error| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot parse {rel} while inventorying `{symbol}`: {error} — nothing written"),
+                    12,
+                )
+            })?;
+        for edge in extraction.edges {
+            let property = match edge.edge_type.as_str() {
+                "CALLS" => "callee_name",
+                "USAGE" | "USES" => "ref_name",
+                _ => continue,
+            };
+            if edge
+                .properties
+                .get(property)
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.rsplit("::").next())
+                != Some(short_name)
+            {
+                continue;
+            }
+            let line_range = line_range_to_bytes(&content, edge.line as usize, edge.line as usize);
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(&rel),
+                &content,
+                &[line_range],
+                short_name,
+            )
+            .ok_or_else(|| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"),
+                    12,
+                )
+            })?;
+            if sites.is_empty() {
+                continue;
+            }
+            match rename_edge_identity(&edge.edge_type, &edge.properties, Some(owner), short_name) {
+                RenameEdgeIdentity::Unrelated => continue,
+                RenameEdgeIdentity::Unknown => {
+                    return Err(EditRefusal::new(
+                        "unresolved_reference_identity",
+                        format!("live Rust reference in {rel}:{} lacks identity proving whether it targets `{symbol}` — nothing written", edge.line),
+                        12,
+                    ));
+                }
+                RenameEdgeIdentity::Related => {}
+            }
+            let planned = scopes.get(&rel).map(Vec::as_slice).unwrap_or_default();
+            if sites.iter().any(|site| !planned.contains(site)) {
+                return Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("live Rust reference in {rel}:{} targets `{symbol}` but is absent from the graph rename plan — refresh the index; nothing written", edge.line),
+                    12,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rust_free_function_reference_inventory(
+    root_path: &std::path::Path,
+    scopes: &std::collections::BTreeMap<String, Vec<(usize, usize)>>,
+    selected_files: &std::collections::BTreeSet<String>,
+    short_name: &str,
+    symbol: &str,
+) -> EditResult<()> {
+    let files = greppy_discover::walk(root_path).map_err(|error| {
+        EditRefusal::new(
+            "unresolved_reference",
+            format!("cannot inventory Rust references for `{symbol}`: {error} — nothing written"),
+            12,
+        )
+    })?;
+    for entry in files {
+        if std::path::Path::new(&entry.rel_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("rs")
+        {
+            continue;
+        }
+        let rel = entry.rel_path;
+        let content = greppy_discover::read_stable_file(&entry.abs_path)
+            .map(|(content, _)| content)
+            .map_err(|error| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"),
+                    12,
+                )
+            })?;
+        let extraction = greppy_parser::extract(greppy_parser::Language::Rust, &content, &rel)
+            .map_err(|error| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot parse {rel} while inventorying `{symbol}`: {error} — nothing written"),
+                    12,
+                )
+            })?;
+        for edge in extraction.edges {
+            let (name_property, path_property) = match edge.edge_type.as_str() {
+                "CALLS" => ("callee_name", "callee_path"),
+                "USAGE" | "USES" => ("ref_name", "ref_path"),
+                _ => continue,
+            };
+            if edge
+                .properties
+                .get(name_property)
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.rsplit("::").next())
+                != Some(short_name)
+            {
+                continue;
+            }
+            let line_range = line_range_to_bytes(&content, edge.line as usize, edge.line as usize);
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(&rel),
+                &content,
+                &[line_range],
+                short_name,
+            )
+            .ok_or_else(|| {
+                EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"),
+                    12,
+                )
+            })?;
+            if sites.is_empty() {
+                continue;
+            }
+            let planned = scopes.get(&rel).map(Vec::as_slice).unwrap_or_default();
+            if sites.iter().all(|site| planned.contains(site)) {
+                continue;
+            }
+            let reference_path = edge
+                .properties
+                .get(path_property)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let unqualified = reference_path.is_none() || reference_path == Some(short_name);
+            let unplanned = sites
+                .iter()
+                .copied()
+                .filter(|site| !planned.contains(site))
+                .collect::<Vec<_>>();
+            if !selected_files.contains(&rel)
+                && unqualified
+                && unplanned
+                    .iter()
+                    .all(|site| rust_local_free_function_owns_site(&content, short_name, *site))
+            {
+                continue;
+            }
+            return Err(EditRefusal::new(
+                "unresolved_reference_identity",
+                format!("live Rust free-function reference in {rel}:{} is not proven to target `{symbol}` or a distinct local definition — refresh the index; nothing written", edge.line),
+                12,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rust_local_free_function_owns_site(
+    content: &[u8],
+    short_name: &str,
+    site: (usize, usize),
+) -> bool {
+    let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
+        return false;
+    };
+    let Some(reference) = tree
+        .root_node()
+        .descendant_for_byte_range(site.0, site.1.saturating_sub(1).max(site.0))
+    else {
+        return false;
+    };
+    let mut reference_blocks = std::collections::BTreeSet::new();
+    let mut reference_module = None;
+    let mut ancestor = Some(reference);
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            reference_blocks.insert((node.start_byte(), node.end_byte()));
+        } else if reference_module.is_none() && matches!(node.kind(), "source_file" | "mod_item") {
+            reference_module = Some((node.start_byte(), node.end_byte()));
+        }
+        ancestor = node.parent();
+    }
+
+    // A same-name import or local binding in an active lexical scope may
+    // shadow an otherwise visible module function. Without name resolution it
+    // is not positive evidence that the unqualified reference is local.
+    let mut shadow_stack = vec![tree.root_node()];
+    while let Some(node) = shadow_stack.pop() {
+        if matches!(
+            node.kind(),
+            "use_declaration" | "let_declaration" | "parameter"
+        ) && (node.kind() == "use_declaration" || node.start_byte() <= reference.start_byte())
+        {
+            let active_scope = if node.kind() == "parameter" {
+                let mut owner = node.parent();
+                let mut active = false;
+                while let Some(scope) = owner {
+                    if scope.kind() == "function_item" {
+                        active = scope.child_by_field_name("body").is_some_and(|body| {
+                            reference_blocks.contains(&(body.start_byte(), body.end_byte()))
+                        });
+                        break;
+                    }
+                    owner = scope.parent();
+                }
+                active
+            } else {
+                let mut owner = node.parent();
+                let mut active = false;
+                while let Some(scope) = owner {
+                    if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
+                        let key = (scope.start_byte(), scope.end_byte());
+                        active = if scope.kind() == "block" {
+                            reference_blocks.contains(&key)
+                        } else {
+                            reference_module == Some(key)
+                        };
+                        break;
+                    }
+                    owner = scope.parent();
+                }
+                active
+            };
+            if active_scope {
+                let mut declaration_stack = vec![node];
+                while let Some(part) = declaration_stack.pop() {
+                    if matches!(part.kind(), "identifier" | "field_identifier")
+                        && content.get(part.byte_range()) == Some(short_name.as_bytes())
+                    {
+                        return false;
+                    }
+                    let mut cursor = part.walk();
+                    declaration_stack.extend(part.named_children(&mut cursor));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        shadow_stack.extend(node.named_children(&mut cursor));
+    }
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| content.get(name.byte_range()))
+                == Some(short_name.as_bytes())
+        {
+            let mut owner = node.parent();
+            let mut associated = false;
+            while let Some(scope) = owner {
+                if matches!(scope.kind(), "impl_item" | "trait_item") {
+                    associated = true;
+                }
+                if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
+                    if associated {
+                        break;
+                    }
+                    let key = (scope.start_byte(), scope.end_byte());
+                    let owns = if scope.kind() == "block" {
+                        reference_blocks.contains(&key)
+                    } else {
+                        reference_module == Some(key)
+                    };
+                    if owns {
+                        return true;
+                    }
+                    break;
+                }
+                owner = scope.parent();
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn require_rename_edge_identity(
+    edge_type: &str,
+    properties: &serde_json::Value,
+    owner: Option<&str>,
+    name: &str,
+    symbol: &str,
+    source_id: i64,
+) -> EditResult<bool> {
+    match rename_edge_identity(edge_type, properties, owner, name) {
+        RenameEdgeIdentity::Related => Ok(true),
+        RenameEdgeIdentity::Unrelated => Ok(false),
+        RenameEdgeIdentity::Unknown => Err(EditRefusal::new(
+            "unresolved_reference_identity",
+            format!(
+                "graph reference to `{symbol}` lacks owner identity at source node {source_id}; refresh the index or select a more specific symbol — nothing written"
+            ),
+            12,
+        )),
+    }
+}
+
+fn select_rename_reference_site(
+    symbol: &str,
+    short_name: &str,
+    file_path: &str,
+    sites: &[(usize, usize)],
+) -> EditResult<Option<(usize, usize)>> {
+    match sites {
+        // A structurally valid source span with no live old identifier is a
+        // stale graph candidate, not an unresolved source reference.
+        [] => Ok(None),
+        [site] => Ok(Some(*site)),
+        _ => Err(EditRefusal::new(
+            "ambiguous_reference",
+            format!(
+                "graph reference scope {file_path} contains {} live `{short_name}` identifiers for `{symbol}`; select a narrower symbol or refresh the index — nothing written",
+                sites.len()
+            ),
+            12,
+        )),
+    }
+}
+
 pub(crate) fn run_trained_rename(
     root_path: &std::path::Path,
     root: Option<&str>,
@@ -2455,20 +2886,131 @@ pub(crate) fn run_trained_rename(
     let short_name = def_nodes[0].name.clone();
     use std::collections::BTreeMap;
     let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    let first_owner = def_nodes[0].qualified_name.rsplit("::").nth(1);
+    let rust_method_inventory_eligible = first_owner.is_some()
+        && def_nodes.iter().all(|def| {
+            def.label == "Method"
+                && def.file_path.ends_with(".rs")
+                && def.qualified_name.rsplit("::").nth(1) == first_owner
+        });
+    let rust_free_function_inventory_eligible = def_nodes.iter().all(|def| {
+        def.label == "Function"
+            && def.file_path.ends_with(".rs")
+            && symbol.starts_with(&format!("{}::", def.file_path))
+    });
+    let rust_inventory_eligible =
+        rust_method_inventory_eligible || rust_free_function_inventory_eligible;
+    let rust_method_owner = rust_method_inventory_eligible.then(|| first_owner.unwrap().to_owned());
+    let rust_selected_files = def_nodes
+        .iter()
+        .map(|def| def.file_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     for def in &def_nodes {
+        let owner = def.qualified_name.rsplit("::").nth(1);
+        if !rust_inventory_eligible {
+            scopes
+                .entry(def.file_path.clone())
+                .or_default()
+                .push((0, usize::MAX));
+            for edge in store.incoming_edges(def.id, None, 100_000)? {
+                let Some(source) = store.get_node(edge.source_id)? else {
+                    continue;
+                };
+                if source.file_path.is_empty() || source.start_line < 1 {
+                    continue;
+                }
+                let Ok(content) = std::fs::read(root_path.join(&source.file_path)) else {
+                    continue;
+                };
+                let Some(span) = read_span_with_meta(
+                    root_path,
+                    &source.file_path,
+                    source.start_line,
+                    source.end_line,
+                    usize::MAX,
+                    false,
+                ) else {
+                    continue;
+                };
+                scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .push(line_range_to_bytes(
+                        &content,
+                        source.start_line as usize,
+                        span.end_line as usize,
+                    ));
+            }
+            continue;
+        }
+        let content = std::fs::read(root_path.join(&def.file_path))
+            .map_err(|error| Error::io(format!("read {} for rename", def.file_path), error))?;
+        let Some(span) = read_span_with_meta(
+            root_path,
+            &def.file_path,
+            def.start_line,
+            def.end_line,
+            usize::MAX,
+            false,
+        ) else {
+            return Ok(Err(EditRefusal::new(
+                "symbol_not_found",
+                format!("selected definition `{symbol}` no longer has a readable source span"),
+                10,
+            )));
+        };
+        let definition_range =
+            line_range_to_bytes(&content, def.start_line as usize, span.end_line as usize);
+        let definition_sites = greppy_edit::verbs::rename_definition_sites(
+            std::path::Path::new(&def.file_path),
+            &content,
+            definition_range,
+            &short_name,
+        );
+        let Some([definition_scope]) = definition_sites.as_deref() else {
+            return Ok(Err(EditRefusal::new(
+                "ambiguous_symbol",
+                format!(
+                    "selected definition `{symbol}` does not have one unique live `{short_name}` identifier in its indexed span"
+                ),
+                12,
+            )));
+        };
         scopes
             .entry(def.file_path.clone())
             .or_default()
-            .push((0, usize::MAX));
+            .push(*definition_scope);
         for edge in store.incoming_edges(def.id, None, 100_000)? {
+            let property = match edge.edge_type.as_str() {
+                "CALLS" => "callee_name",
+                "USAGE" | "USES" => "ref_name",
+                "TYPE_REF" => "type_name",
+                "IMPORTS" => "imported_name",
+                _ => continue,
+            };
             let Some(source) = store.get_node(edge.source_id)? else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("graph reference to `{symbol}` has no source node — nothing written"),
+                    12,
+                )));
             };
             if source.file_path.is_empty() || source.start_line < 1 {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("graph reference to `{symbol}` has no readable source location — nothing written"),
+                    12,
+                )));
             }
             let Ok(content) = std::fs::read(root_path.join(&source.file_path)) else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot read graph reference source {} for `{symbol}` — nothing written",
+                        source.file_path
+                    ),
+                    12,
+                )));
             };
             let Some(span) = read_span_with_meta(
                 root_path,
@@ -2478,16 +3020,90 @@ pub(crate) fn run_trained_rename(
                 usize::MAX,
                 false,
             ) else {
-                continue;
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!("cannot resolve graph reference source span {} for `{symbol}` — nothing written", source.file_path),
+                    12,
+                )));
             };
-            scopes
-                .entry(source.file_path.clone())
-                .or_default()
-                .push(line_range_to_bytes(
-                    &content,
-                    source.start_line as usize,
-                    span.end_line as usize,
-                ));
+            let range =
+                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize);
+            let Some(sites) = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(&source.file_path),
+                &content,
+                &[range],
+                &short_name,
+            ) else {
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference",
+                    format!(
+                        "cannot parse graph reference scope {} for `{symbol}`; nothing written",
+                        source.file_path
+                    ),
+                    12,
+                )));
+            };
+            if sites.is_empty() {
+                continue;
+            }
+            let Some(reference_name) = edge
+                .properties
+                .get(property)
+                .and_then(|value| value.as_str())
+            else {
+                return Ok(Err(EditRefusal::new(
+                    "unresolved_reference_identity",
+                    format!(
+                        "live graph reference to `{symbol}` at source node {} lacks `{property}` identity; refresh the index — nothing written",
+                        edge.source_id
+                    ),
+                    12,
+                )));
+            };
+            if reference_name.rsplit("::").next() != Some(short_name.as_str()) {
+                continue;
+            }
+            match require_rename_edge_identity(
+                &edge.edge_type,
+                &edge.properties,
+                owner,
+                &short_name,
+                symbol,
+                edge.source_id,
+            ) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+            match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
+                Ok(None) => continue,
+                Ok(Some(site)) => scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .push(site),
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        }
+    }
+    if rust_method_inventory_eligible {
+        if let Err(refusal) = rust_rename_reference_inventory(
+            root_path,
+            &scopes,
+            rust_method_owner.as_deref().expect("eligible method owner"),
+            &short_name,
+            symbol,
+        ) {
+            return Ok(Err(refusal));
+        }
+    } else if rust_free_function_inventory_eligible {
+        if let Err(refusal) = rust_free_function_reference_inventory(
+            root_path,
+            &scopes,
+            &rust_selected_files,
+            &short_name,
+            symbol,
+        ) {
+            return Ok(Err(refusal));
         }
     }
     let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
@@ -2511,24 +3127,30 @@ pub(crate) fn run_trained_rename(
         expect_residual: Some(0),
         ..Default::default()
     };
-    let certificate = greppy_edit::verbs::rename_symbol_files(
-        root_path,
-        &scope_vec,
-        &short_name,
-        new_name,
-        &options,
-    )?;
+    let certificate = if rust_inventory_eligible {
+        greppy_edit::verbs::rename_symbol_files_scoped(
+            root_path,
+            &scope_vec,
+            &short_name,
+            new_name,
+            &options,
+        )?
+    } else {
+        greppy_edit::verbs::rename_symbol_files(
+            root_path,
+            &scope_vec,
+            &short_name,
+            new_name,
+            &options,
+        )?
+    };
     if certificate.exit_code() != 0 {
-        let message = if certificate.status == greppy_edit::Status::InvalidResult {
-            "refused: the edit would break the file's syntax — nothing written".to_string()
-        } else {
-            certificate.compact_failure_diagnosis().unwrap_or_else(|| {
-                format!(
-                    "rename {} — nothing written",
-                    edit_status_name(certificate.status)
-                )
-            })
-        };
+        let message = certificate.compact_failure_diagnosis().unwrap_or_else(|| {
+            format!(
+                "rename {} — nothing written",
+                edit_status_name(certificate.status)
+            )
+        });
         return Ok(Err(EditRefusal::new(
             certificate_refusal_code(&certificate),
             message,
@@ -2904,6 +3526,300 @@ pub(crate) fn edit_operation_line_span(
 #[cfg(test)]
 mod patch_rollback_tests {
     use super::*;
+
+    #[test]
+    fn rename_edge_requires_selected_method_identity_evidence() {
+        let selected = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver",
+            "receiver_owner": "Scheduler"
+        });
+        let unrelated = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver",
+            "receiver_owner": "Iterator"
+        });
+        let misleading = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver"
+        });
+        let empty_receiver = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "receiver",
+            "receiver_owner": ""
+        });
+        let associated = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": "Scheduler::next"
+        });
+        let unqualified_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": "next"
+        });
+        let null_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": null
+        });
+        let empty_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": ""
+        });
+        let non_string_path = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": 7
+        });
+        let qualified_same_tail = serde_json::json!({
+            "callee_name": "next",
+            "callee_form": "direct",
+            "callee_path": "a::Scheduler::next"
+        });
+
+        assert_eq!(
+            rename_edge_identity("CALLS", &selected, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Related
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &associated, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Related
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &unrelated, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unrelated
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &misleading, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &empty_receiver, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &unqualified_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &null_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &empty_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &non_string_path, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        assert_eq!(
+            rename_edge_identity("CALLS", &qualified_same_tail, Some("Scheduler"), "next"),
+            RenameEdgeIdentity::Unknown
+        );
+        let refusal = require_rename_edge_identity(
+            "CALLS",
+            &misleading,
+            Some("Scheduler"),
+            "next",
+            "Scheduler::next",
+            42,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "unresolved_reference_identity");
+        assert!(refusal.message.contains("source node 42"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected_path = dir.path().join("selected.rs");
+        let caller_path = dir.path().join("caller.rs");
+        std::fs::write(&selected_path, b"impl Scheduler { fn next(&self) {} }\n").unwrap();
+        std::fs::write(&caller_path, b"fn call(s: &Scheduler) { s.next(); }\n").unwrap();
+        let before_selected = std::fs::read(&selected_path).unwrap();
+        let before_caller = std::fs::read(&caller_path).unwrap();
+        assert!(require_rename_edge_identity(
+            "CALLS",
+            &misleading,
+            Some("Scheduler"),
+            "next",
+            "Scheduler::next",
+            42,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&selected_path).unwrap(), before_selected);
+        assert_eq!(std::fs::read(&caller_path).unwrap(), before_caller);
+
+        assert_eq!(
+            select_rename_reference_site("Scheduler::next", "next", "stale.rs", &[]).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_rename_reference_site("Scheduler::next", "next", "caller.rs", &[(30, 34)])
+                .unwrap(),
+            Some((30, 34))
+        );
+        assert!(select_rename_reference_site(
+            "Scheduler::next",
+            "next",
+            "ambiguous.rs",
+            &[(10, 14), (30, 34)]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn qualified_rust_free_function_rename_preserves_distinct_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected =
+            b"fn get_lit_str() {}\nfn selected_caller() { get_lit_str(); get_lit_str(); }\n";
+        let unrelated = b"fn get_lit_str() {}\nfn unrelated_caller() { get_lit_str(); }\n";
+        std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
+        std::fs::write(dir.path().join("unrelated.rs"), unrelated).unwrap();
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("selected.rs"),
+            selected,
+            &[(0, selected.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        let scopes = std::collections::BTreeMap::from([("selected.rs".to_string(), sites.clone())]);
+        rust_free_function_reference_inventory(
+            dir.path(),
+            &scopes,
+            &std::collections::BTreeSet::from(["selected.rs".to_string()]),
+            "get_lit_str",
+            "selected.rs::get_lit_str",
+        )
+        .unwrap();
+        let certificate = greppy_edit::verbs::rename_symbol_files_scoped(
+            dir.path(),
+            &[greppy_edit::verbs::RenameFileScope {
+                rel_path: "selected.rs".into(),
+                spans: sites,
+            }],
+            "get_lit_str",
+            "get_str_literal",
+            &greppy_edit::verbs::VerbOptions {
+                expect_residual: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(certificate.status, greppy_edit::Status::Applied);
+        let changed = std::fs::read(dir.path().join("selected.rs")).unwrap();
+        assert_eq!(
+            changed,
+            b"fn get_str_literal() {}\nfn selected_caller() { get_str_literal(); get_str_literal(); }\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated.rs")).unwrap(),
+            unrelated
+        );
+        assert_eq!(
+            greppy_edit::txn::syntax_counts(greppy_parser::Language::Rust, &changed),
+            Some(greppy_edit::txn::SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+    }
+
+    #[test]
+    fn qualified_rust_free_function_unknown_caller_refuses_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = b"fn get_lit_str() {}\n";
+        let unknown = b"mod selected;\nmod other { fn get_lit_str() {} }\nuse crate::selected::get_lit_str;\nfn caller() { get_lit_str(); }\n";
+        std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
+        std::fs::write(dir.path().join("lib.rs"), unknown).unwrap();
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("selected.rs"),
+            selected,
+            &[(0, selected.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        let scopes = std::collections::BTreeMap::from([("selected.rs".to_string(), sites)]);
+        let refusal = rust_free_function_reference_inventory(
+            dir.path(),
+            &scopes,
+            &std::collections::BTreeSet::from(["selected.rs".to_string()]),
+            "get_lit_str",
+            "selected.rs::get_lit_str",
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "unresolved_reference_identity");
+        assert!(refusal.message.contains("lib.rs"));
+        assert_eq!(
+            std::fs::read(dir.path().join("selected.rs")).unwrap(),
+            selected
+        );
+        assert_eq!(std::fs::read(dir.path().join("lib.rs")).unwrap(), unknown);
+    }
+
+    #[test]
+    fn rust_free_function_local_proof_is_lexically_scoped() {
+        let source = b"fn get_lit_str() {}\nfn top() { get_lit_str(); }\nmod left { fn get_lit_str() {} fn local() { get_lit_str(); } }\nmod right { fn caller() { get_lit_str(); } }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("scope.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 5);
+        assert!(rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[1]
+        ));
+        assert!(rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[3]
+        ));
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[4]
+        ));
+    }
+
+    #[test]
+    fn associated_method_cannot_prove_free_function_ownership() {
+        let source = b"struct Helper;\nimpl Helper { fn get_lit_str() {} }\nuse crate::selected::get_lit_str;\nfn caller() { get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("method.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[1]
+        ));
+    }
+
+    #[test]
+    fn block_import_prevents_module_function_ownership_proof() {
+        let source = b"fn get_lit_str() {}\nfn caller() { use crate::selected::get_lit_str; get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("shadow.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 3);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[2]
+        ));
+    }
 
     #[test]
     fn duplicate_patch_targets_are_refused_before_any_publish() {

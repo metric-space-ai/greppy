@@ -245,6 +245,252 @@ fn edit_symbol_replaces_indexed_typescript_and_kotlin_bodies() {
     std::fs::remove_dir_all(store_root).unwrap();
 }
 
+const RENAME_IDENTITY_HELPER_STORE: &str = "GREPPY_TEST_RENAME_IDENTITY_HELPER_STORE";
+
+fn index_rename_fixture(root: &std::path::Path) -> (String, std::path::PathBuf) {
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(
+        root.join("selected.rs"),
+        "struct Scheduler;\nimpl Scheduler { fn next(&mut self) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("caller.rs"),
+        "fn caller(value: &mut Scheduler) { value.next(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unrelated_a.rs"),
+        "struct Other;\nimpl Other { fn next(&mut self) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unrelated_b.rs"),
+        "struct Another;\nimpl Another { fn next(&mut self) {} }\nfn another_call(value: &mut Another) { value.next(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("stale.rs"), "fn stale_candidate() {}\n").unwrap();
+    let store_path = workspace_locator::store_path(root);
+    std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+    let mut store = greppy_store::Store::open(&store_path).unwrap();
+    let project = workspace_locator::project_identity(root);
+    let report = greppy_indexer::index(&mut store, root, &project).unwrap();
+    assert!(report.is_clean(), "rename fixture index report: {report:?}");
+    (project, store_path)
+}
+
+#[test]
+fn rename_identity_planner_subprocess_helper() {
+    let Some(store_root) = std::env::var_os(RENAME_IDENTITY_HELPER_STORE) else {
+        return;
+    };
+    assert_eq!(std::env::var_os("GREPPY_STORE_DIR"), Some(store_root));
+
+    let success_root = test_tempdir("rename-identity-success");
+    let (project, store_path) = index_rename_fixture(&success_root);
+    #[cfg(unix)]
+    let external_root = {
+        use std::os::unix::fs::symlink;
+        let external = test_tempdir("rename-identity-external");
+        std::fs::write(
+            external.join("outside.rs"),
+            "fn outside(value: UnknownOwner) { value.next(); }\n",
+        )
+        .unwrap();
+        symlink(&external, success_root.join("external-link")).unwrap();
+        symlink(&success_root, success_root.join("ancestor-loop")).unwrap();
+        external
+    };
+    {
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let stale_source = store
+            .insert_node(&greppy_store::NewNode {
+                project: project.clone(),
+                label: "Function".into(),
+                name: "stale_candidate".into(),
+                qualified_name: "stale.rs::Function::stale_candidate".into(),
+                file_path: "stale.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: project.clone(),
+                source_id: stale_source,
+                target_id: target,
+                edge_type: "CALLS".into(),
+                // Deliberately missing identity: the live AST span has zero
+                // `next` identifiers, so this stale candidate is ignorable.
+                properties: serde_json::json!({"callee_form": "receiver"}),
+            })
+            .unwrap();
+    }
+    let outcome = run_trained_rename(
+        &success_root,
+        success_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(outcome.published);
+    assert!(std::fs::read_to_string(success_root.join("selected.rs"))
+        .unwrap()
+        .contains("fn advance"));
+    assert!(std::fs::read_to_string(success_root.join("caller.rs"))
+        .unwrap()
+        .contains("value.advance()"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_a.rs"))
+        .unwrap()
+        .contains("fn next"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_b.rs"))
+        .unwrap()
+        .contains("value.next()"));
+
+    let omitted_root = test_tempdir("rename-identity-omitted");
+    let (_project, store_path) = index_rename_fixture(&omitted_root);
+    {
+        let store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let caller = resolve_symbol_nodes(&store, Some("caller")).unwrap()[0];
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND edge_type = 'CALLS'",
+                (caller, target),
+            )
+            .unwrap();
+    }
+    let omitted_before = ["selected.rs", "caller.rs"]
+        .map(|path| (path, std::fs::read(omitted_root.join(path)).unwrap()));
+    let omitted = run_trained_rename(
+        &omitted_root,
+        omitted_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(omitted.code, "unresolved_reference");
+    assert!(omitted
+        .message
+        .contains("absent from the graph rename plan"));
+    for (path, expected) in omitted_before {
+        assert_eq!(std::fs::read(omitted_root.join(path)).unwrap(), expected);
+    }
+
+    let refusal_root = test_tempdir("rename-identity-refusal");
+    let (project, store_path) = index_rename_fixture(&refusal_root);
+    {
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let caller = resolve_symbol_nodes(&store, Some("caller")).unwrap()[0];
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project,
+                source_id: caller,
+                target_id: target,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({
+                    "callee_name": "next",
+                    "callee_form": "receiver"
+                }),
+            })
+            .unwrap();
+    }
+    let before = [
+        "selected.rs",
+        "caller.rs",
+        "unrelated_a.rs",
+        "unrelated_b.rs",
+    ]
+    .map(|path| (path, std::fs::read(refusal_root.join(path)).unwrap()));
+    let refusal = run_trained_rename(
+        &refusal_root,
+        refusal_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(refusal.code, "unresolved_reference_identity");
+    for (path, expected) in before {
+        assert_eq!(std::fs::read(refusal_root.join(path)).unwrap(), expected);
+    }
+
+    // Rust types retain the original whole-definition/incoming-span planner;
+    // the method-only identity inventory must not capture a Class node merely
+    // because its qualified name also has an owner-like segment.
+    let type_root = test_tempdir("rename-identity-type-fallback");
+    std::fs::create_dir(type_root.join(".git")).unwrap();
+    std::fs::write(
+        type_root.join("types.rs"),
+        "struct Widget;\nfn consume(value: Widget) { let _ = value; }\n",
+    )
+    .unwrap();
+    let type_store_path = workspace_locator::store_path(&type_root);
+    std::fs::create_dir_all(type_store_path.parent().unwrap()).unwrap();
+    let mut type_store = greppy_store::Store::open(&type_store_path).unwrap();
+    let type_project = workspace_locator::project_identity(&type_root);
+    let type_report = greppy_indexer::index(&mut type_store, &type_root, &type_project).unwrap();
+    assert!(
+        type_report.is_clean(),
+        "type fixture index report: {type_report:?}"
+    );
+    drop(type_store);
+    let type_outcome = run_trained_rename(
+        &type_root,
+        type_root.to_str(),
+        "Widget",
+        "Gadget",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(type_outcome.published);
+    assert_eq!(
+        std::fs::read_to_string(type_root.join("types.rs")).unwrap(),
+        "struct Gadget;\nfn consume(value: Gadget) { let _ = value; }\n"
+    );
+
+    std::fs::remove_dir_all(success_root).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_dir_all(external_root).unwrap();
+    std::fs::remove_dir_all(omitted_root).unwrap();
+    std::fs::remove_dir_all(refusal_root).unwrap();
+    std::fs::remove_dir_all(type_root).unwrap();
+}
+
+#[test]
+fn rename_identity_planner_runs_against_fixture_graph() {
+    let store_root = test_tempdir("rename-identity-store");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::rename_identity_planner_subprocess_helper")
+        .arg("--nocapture")
+        .env(RENAME_IDENTITY_HELPER_STORE, &store_root)
+        .env("GREPPY_STORE_DIR", &store_root)
+        .output()
+        .expect("spawn isolated rename-identity helper");
+    assert!(
+        output.status.success(),
+        "isolated rename-identity helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    std::fs::remove_dir_all(store_root).unwrap();
+}
+
 #[test]
 fn embedding_eta_uses_backend_prior_then_measured_throughput() {
     assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
