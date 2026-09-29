@@ -300,6 +300,24 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
     ];
     let progress_job_path = scratch.path().join("overlay-progress.json");
     let progress_ready_path = scratch.path().join("overlay-progress-ready");
+    // A delegated indexer updates an existing launcher-owned journal. It must
+    // not recreate a missing journal after the launcher has completed.
+    let progress_owner = std::process::id();
+    let progress_started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        &progress_job_path,
+        serde_json::to_vec(&serde_json::json!({
+            "pid": progress_owner,
+            "started_at_unix_secs": progress_started,
+            "target_generation": 1,
+            "state": "indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let progress_job = progress_job_path.to_string_lossy().into_owned();
     let progress_ready = progress_ready_path.to_string_lossy().into_owned();
     let progress_env = [
@@ -331,6 +349,9 @@ fn committed_task_delta_status_uses_base_union_across_worktrees() {
     );
     let progress: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&progress_job_path).unwrap()).unwrap();
+    assert_eq!(progress["pid"], progress_owner);
+    assert_eq!(progress["started_at_unix_secs"], progress_started);
+    assert_eq!(progress["target_generation"], 1);
     assert_ne!(
         progress["state"], "indexing",
         "an active Overlay graph build must publish its real indexer phase: {progress:#}"
@@ -569,7 +590,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     );
     let third_graph = greppy_store::Store::open(&third_delta).unwrap();
     let third_generation = third_graph
-        .get_workspace_state(third.to_string_lossy().as_ref())
+        .get_workspace_state(third.canonicalize().unwrap().to_string_lossy().as_ref())
         .unwrap()
         .expect("third workspace state")
         .graph_generation;
@@ -592,7 +613,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     let embedded_delta = greppy_store::Store::open(&third_delta).unwrap();
     assert_eq!(
         embedded_delta
-            .get_workspace_state(third.to_string_lossy().as_ref())
+            .get_workspace_state(third.canonicalize().unwrap().to_string_lossy().as_ref())
             .unwrap()
             .expect("embedded third workspace state")
             .graph_generation,
@@ -676,7 +697,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     let mut refreshed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
     let project = greppy_core::project_identity(&first);
     let generation = refreshed_delta
-        .get_workspace_state(first.to_string_lossy().as_ref())
+        .get_workspace_state(first.canonicalize().unwrap().to_string_lossy().as_ref())
         .unwrap()
         .expect("refreshed workspace state")
         .graph_generation;
@@ -1027,7 +1048,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     );
     let completed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
     let completed_generation = completed_delta
-        .get_workspace_state(first.to_string_lossy().as_ref())
+        .get_workspace_state(first.canonicalize().unwrap().to_string_lossy().as_ref())
         .unwrap()
         .expect("semantically completed Delta workspace")
         .graph_generation;
