@@ -3249,7 +3249,13 @@ fn bound_page_uses_immutable_session_network_profile() {
             json!({
                 "session_id": session_id,
                 "script_source": "inline",
-                "script_text": format!("await page.goto({origin:?}); console.log(page.url());"),
+                "script_text": format!(r#"
+await page.goto({origin:?});
+console.log(JSON.stringify({{
+  url: page.url(),
+  body: await page.locator('body').textContent(),
+}}));
+"#),
                 "bind_session_page": true,
             }),
         );
@@ -3261,6 +3267,9 @@ fn bound_page_uses_immutable_session_network_profile() {
     for phase in ["fresh project page", "reused project page"] {
         let response = run(&project);
         assert_eq!(response.status, "ok", "{phase}: {response:?}");
+        let stdout = response.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        assert!(stdout.contains(&origin), "{phase}: {response:?}");
+        assert!(stdout.contains("bound profile"), "{phase}: {response:?}");
     }
 
     let research = create("research");
@@ -3275,6 +3284,12 @@ fn bound_page_uses_immutable_session_network_profile() {
 
     let restored = run(&project);
     assert_eq!(restored.status, "ok", "project after research: {restored:?}");
+    let stdout = restored.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+    assert!(stdout.contains(&origin), "project after research: {restored:?}");
+    assert!(
+        stdout.contains("bound profile"),
+        "project after research: {restored:?}"
+    );
 }
 
 #[test]
