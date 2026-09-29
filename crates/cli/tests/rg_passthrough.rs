@@ -281,6 +281,30 @@ for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
     };
     let root_flag = std::ffi::OsString::from(format!("--root={}", repository.display()));
 
+    for prefix in [
+        vec![std::ffi::OsStr::new("--root"), repository.as_os_str()],
+        vec![root_flag.as_os_str()],
+        vec![
+            std::ffi::OsStr::new("--limit"),
+            std::ffi::OsStr::new("3"),
+            std::ffi::OsStr::new("--root"),
+            repository.as_os_str(),
+        ],
+    ] {
+        let mut args = prefix;
+        args.extend([
+            std::ffi::OsStr::new("rg"),
+            std::ffi::OsStr::new("--files"),
+            std::ffi::OsStr::new("docs/user"),
+        ]);
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            format!("{}\n<--files>\n<docs/user>\n", repository.display())
+        );
+    }
+
     let output = run(&[
         std::ffi::OsStr::new("rg"),
         std::ffi::OsStr::new("--files"),
@@ -443,6 +467,52 @@ for arg in "$@"; do printf '<%s>\n' "$arg" >> "$RG_ROOT_RECEIPT"; done
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(diagnostic.contains("not a directory"), "{diagnostic}");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_root_preserves_cwd_and_option_values_in_both_positions() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::PermissionsExt;
+
+    let caller = unique_tempdir("nonutf8-root").canonicalize().unwrap();
+    let repository = caller.join(OsString::from_vec(b"repo-\xff".to_vec()));
+    std::fs::create_dir(&repository).unwrap();
+    let shim = caller.join("rg-shim.sh");
+    std::fs::write(&shim, b"#!/bin/sh\npwd -P\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut equals_root = OsString::from("--root=");
+    equals_root.push(&repository);
+    for root in [
+        vec![OsString::from("--root"), repository.as_os_str().to_owned()],
+        vec![equals_root],
+    ] {
+        for leading in [true, false] {
+            let tail: Vec<OsString> = ["rg", "-g", "--root", "--files", "docs/user"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            let args: Vec<OsString> = if leading {
+                root.iter().chain(tail.iter()).cloned().collect()
+            } else {
+                tail.iter().chain(root.iter()).cloned().collect()
+            };
+            let output = Command::new(binary_path())
+                .args(&args)
+                .current_dir(&caller)
+                .env("GREPPY_REAL_RG", &shim)
+                .env("GREPPY_STORE_DIR", caller.join("store"))
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let mut expected = repository.as_os_str().as_bytes().to_vec();
+            expected.extend_from_slice(b"\n<-g>\n<--root>\n<--files>\n<docs/user>\n");
+            assert_eq!(output.stdout, expected, "args={args:?}");
+        }
+    }
+    std::fs::remove_dir_all(caller).unwrap();
 }
 
 #[cfg(unix)]

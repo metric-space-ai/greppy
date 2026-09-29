@@ -933,7 +933,27 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         // remaining arguments are forwarded verbatim.
         let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
         full.push(std::ffi::OsString::from("greppy"));
-        full.extend_from_slice(grep_passthrough_args(&argv));
+        let rest = grep_passthrough_args(&argv);
+        // Command discovery skips leading globals, but the child still needs
+        // their root. Preserve it byte-for-byte until dispatch consumes it;
+        // other leading globals retain their existing passthrough behavior.
+        let mut prefix = argv[1..argv.len() - rest.len()].iter();
+        while let Some(arg) = prefix.next() {
+            if arg == "--root" {
+                full.push(arg.clone());
+                if let Some(value) = prefix.next() {
+                    full.push(value.clone());
+                }
+            } else if arg.as_encoded_bytes().starts_with(b"--root=") {
+                full.push(arg.clone());
+            } else if matches!(
+                arg.to_str(),
+                Some("--device" | "--limit" | "--max" | "--max-bytes" | "--offset")
+            ) {
+                prefix.next();
+            }
+        }
+        full.extend_from_slice(rest);
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(msg)) => {
@@ -9236,7 +9256,7 @@ fn passthrough_flavor(args: &[std::ffi::OsString]) -> PassthroughFlavor {
             index += 2;
             continue;
         }
-        if text.starts_with("--root=")
+        if args[index].as_encoded_bytes().starts_with(b"--root=")
             || text.starts_with("--device=")
             || matches!(text, "--no-gpu" | "--diagnostics")
         {
@@ -9299,17 +9319,20 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobal
             removed = true;
             continue;
         }
-        if let Some(flag) = VALUE_FLAGS
-            .iter()
-            .find(|flag| text.starts_with(&format!("{flag}=")))
-        {
-            if *flag == "--root" {
-                let value = &text[flag.len() + 1..];
-                if value.is_empty() {
-                    return Err(Error::Invalid("--root needs a directory".into()));
-                }
-                root = Some(std::ffi::OsString::from(value));
+        if let Some(value) = args[index].as_encoded_bytes().strip_prefix(b"--root=") {
+            if value.is_empty() {
+                return Err(Error::Invalid("--root needs a directory".into()));
             }
+            // SAFETY: these bytes came from an OsString on this platform.
+            // Splitting immediately after the known ASCII '=' preserves the
+            // self-synchronizing encoded-byte boundary required by OsString.
+            root =
+                Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(value.to_vec()) });
+            index += 1;
+            removed = true;
+            continue;
+        }
+        if text.starts_with("--device=") {
             index += 1;
             removed = true;
             continue;
