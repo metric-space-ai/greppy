@@ -2754,6 +2754,11 @@ fn rust_local_free_function_owns_site(
             if active_scope {
                 let mut declaration_stack = vec![node];
                 while let Some(part) = declaration_stack.pop() {
+                    if node.kind() == "use_declaration"
+                        && matches!(part.kind(), "use_wildcard" | "wildcard_import")
+                    {
+                        return false;
+                    }
                     if matches!(part.kind(), "identifier" | "field_identifier")
                         && content.get(part.byte_range()) == Some(short_name.as_bytes())
                     {
@@ -3818,6 +3823,25 @@ mod patch_rollback_tests {
             source,
             "get_lit_str",
             sites[2]
+        ));
+    }
+
+    #[test]
+    fn block_glob_import_prevents_module_function_ownership_proof() {
+        let source =
+            b"fn get_lit_str() {}\nfn caller() { use crate::selected::*; get_lit_str(); }\n";
+        let sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("glob.rs"),
+            source,
+            &[(0, source.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+        assert!(!rust_local_free_function_owns_site(
+            source,
+            "get_lit_str",
+            sites[1]
         ));
     }
 
