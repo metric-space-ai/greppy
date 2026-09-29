@@ -5479,8 +5479,7 @@ fn spawn_background_job_handle(
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
     let inherited_workers = std::env::var_os("GREPPY_WORKERS");
-    let worker_count =
-        (kind == "index").then(|| automatic_index_worker_count(inherited_workers.as_deref()));
+    let worker_count = Some(automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
     // call can observe the child-owned writer lock while background_job is
     // still null and provide no useful progress or recovery information.
@@ -5526,7 +5525,7 @@ fn spawn_background_job_handle(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    configure_automatic_index_workers(&mut command, kind, inherited_workers.as_deref());
+    configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
@@ -5630,12 +5629,8 @@ fn automatic_index_worker_count(inherited: Option<&std::ffi::OsStr>) -> usize {
 
 fn configure_automatic_index_workers(
     command: &mut std::process::Command,
-    kind: &str,
     inherited: Option<&std::ffi::OsStr>,
 ) -> Option<usize> {
-    if kind != "index" {
-        return None;
-    }
     let workers = automatic_index_worker_count(inherited);
     command.env("GREPPY_WORKERS", workers.to_string());
     Some(workers)
