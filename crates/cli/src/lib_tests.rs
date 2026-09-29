@@ -337,7 +337,7 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap();
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
     assert!(outcome.published);
     assert!(std::fs::read_to_string(success_root.join("selected.rs"))
         .unwrap()
@@ -377,7 +377,8 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap_err();
+    .err()
+    .expect("omitted caller edge must refuse");
     assert_eq!(omitted.code, "unresolved_reference");
     assert!(omitted
         .message
@@ -421,7 +422,8 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap_err();
+    .err()
+    .expect("unidentified caller edge must refuse");
     assert_eq!(refusal.code, "unresolved_reference_identity");
     for (path, expected) in before {
         assert_eq!(std::fs::read(refusal_root.join(path)).unwrap(), expected);
@@ -456,7 +458,7 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap();
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
     assert!(type_outcome.published);
     assert_eq!(
         std::fs::read_to_string(type_root.join("types.rs")).unwrap(),
@@ -494,7 +496,7 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap();
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
     assert!(free_outcome.published);
     assert_eq!(
         std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
@@ -544,7 +546,8 @@ fn rename_identity_planner_subprocess_helper() {
         false,
     )
     .unwrap()
-    .unwrap_err();
+    .err()
+    .expect("omitted exact import edge must refuse");
     assert_eq!(import_refusal.code, "unresolved_reference_identity");
     for (path, expected) in import_before {
         assert_eq!(std::fs::read(import_root.join(path)).unwrap(), expected);

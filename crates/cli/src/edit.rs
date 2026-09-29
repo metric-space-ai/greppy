@@ -3689,12 +3689,13 @@ mod patch_rollback_tests {
         assert_eq!(std::fs::read(&caller_path).unwrap(), before_caller);
 
         assert_eq!(
-            select_rename_reference_site("Scheduler::next", "next", "stale.rs", &[]).unwrap(),
+            select_rename_reference_site("Scheduler::next", "next", "stale.rs", &[])
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message)),
             None
         );
         assert_eq!(
             select_rename_reference_site("Scheduler::next", "next", "caller.rs", &[(30, 34)])
-                .unwrap(),
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message)),
             Some((30, 34))
         );
         assert!(select_rename_reference_site(
@@ -3729,7 +3730,7 @@ mod patch_rollback_tests {
             "get_lit_str",
             "selected.rs::get_lit_str",
         )
-        .unwrap();
+        .unwrap_or_else(|refusal| panic!("{}", refusal.message));
         let certificate = greppy_edit::verbs::rename_symbol_files_scoped(
             dir.path(),
             &[greppy_edit::verbs::RenameFileScope {
@@ -3923,7 +3924,7 @@ mod patch_rollback_tests {
             "get_lit_str",
             "selected.rs::get_lit_str",
         )
-        .unwrap();
+        .unwrap_or_else(|refusal| panic!("{}", refusal.message));
 
         std::fs::write(
             dir.path().join("glob_call.rs"),
@@ -3937,7 +3938,8 @@ mod patch_rollback_tests {
             "get_lit_str",
             "selected.rs::get_lit_str",
         )
-        .unwrap_err();
+        .err()
+        .expect("live call omitted from graph plan must refuse");
         assert_eq!(refusal.code, "unresolved_reference_identity");
         assert!(refusal.message.contains("glob_call.rs"));
     }
