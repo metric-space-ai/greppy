@@ -602,6 +602,17 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
     StdinAvailability::Unknown
 }
 
+/// Distinguish a command-like grep pattern from a typo without consuming stdin.
+/// Explicit `-` retains grep's unbounded producer wait; implicit input uses the
+/// same bounded producer grace and empty-input policy as normal passthrough.
+pub(crate) fn stdin_supplies_grep_pattern(args: &[OsString]) -> bool {
+    match grep_stdin_demand(args) {
+        StdinDemand::Explicit(_) => true,
+        StdinDemand::WhenNonTerminal(_) => stdin_availability() == StdinAvailability::Data,
+        StdinDemand::None | StdinDemand::Unknown => false,
+    }
+}
+
 pub(crate) fn missing_stdin_message(demand: StdinDemand<'_>, tool: &str) -> Option<String> {
     let pattern = match (demand, stdin_availability()) {
         (StdinDemand::None | StdinDemand::Unknown, _) => return None,

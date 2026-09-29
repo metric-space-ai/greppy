@@ -737,6 +737,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
         .filter(|command| levenshtein(verb, command) <= 2)
         .min_by_key(|command| levenshtein(verb, command))
     {
+        // A piped grep pattern can resemble a command too (e.g. `research`).
+        // Use the existing non-consuming producer grace, not a zero-time
+        // readiness check that would race a delayed pipeline producer.
+        if greppy_only_flag(&rest[1..]).is_none() && passthrough::stdin_supplies_grep_pattern(rest)
+        {
+            return None;
+        }
         return Some(format!(
             "status: invalid_invocation\ncommand: `{verb}`\nmessage: unknown greppy command; nothing was passed to grep\nnext: did you mean `greppy {command} ...`?"
         ));
