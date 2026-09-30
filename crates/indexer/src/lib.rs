@@ -4187,6 +4187,25 @@ impl GraphIndex {
             }
         };
         let owner_file = self.file_of(owner_id)?;
+        if self.by_id.get(&owner_id)?.label == "Enum"
+            && (owner_path == owner || owner_path == "Self")
+        {
+            // Enum owners must be bound in the current file. Project-wide
+            // uniqueness alone does not make another module's type visible.
+            let bound_name = if owner_path == "Self" {
+                self.qname_for_id(src_id)?.rsplit("::").nth(1)?
+            } else {
+                owner
+            };
+            let scoped = self.rust_module_export_targets(
+                &[referrer_file.to_string()],
+                bound_name,
+                &["Enum"],
+            );
+            if scoped.as_slice() != [owner_id] {
+                return None;
+            }
+        }
         let resolved_owner = self.qname_for_id(owner_id)?.rsplit("::").next()?;
         let suffix = format!("::{resolved_owner}::{name}");
         let matches = self
@@ -6492,6 +6511,10 @@ def Widget():
             "enum-variant-references",
             r#"
 mod caller;
+mod foreign;
+use crate::foreign::Remote as Renamed;
+pub fn unimported() { let _ = Remote::Halt; }
+pub fn remote_alias() { let _ = Renamed::Halt; }
 pub enum Instruction { AddImmediateByte { amount: u8 }, Tuple(u8), Halt }
 pub enum Other { AddImmediateByte { amount: u8 } }
 pub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }
@@ -6518,6 +6541,7 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
 "#,
         )
         .unwrap();
+        fs::write(repo.join("src/foreign.rs"), "pub enum Remote { Halt }\n").unwrap();
         let mut store = Store::open(":memory:").unwrap();
         index(&mut store, &repo, "test").unwrap();
         for (target, callers) in [
@@ -6567,6 +6591,24 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 );
             }
         }
+        let remote = store
+            .get_node_by_qname("test", "src/foreign.rs::Remote::Halt")
+            .unwrap()
+            .unwrap();
+        let imported = store
+            .get_node_by_qname("test", "src/lib.rs::Function::remote_alias")
+            .unwrap()
+            .unwrap();
+        let unimported = store
+            .get_node_by_qname("test", "src/lib.rs::Function::unimported")
+            .unwrap()
+            .unwrap();
+        let edges = store.incoming_edges(remote.id, Some("USAGE"), 20).unwrap();
+        assert!(edges.iter().any(|edge| edge.source_id == imported.id));
+        assert!(
+            edges.iter().all(|edge| edge.source_id != unimported.id),
+            "a unique cross-file enum is not an in-scope binding"
+        );
         let missing = store
             .get_node_by_qname("test", "src/lib.rs::Function::missing")
             .unwrap()
