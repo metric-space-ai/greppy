@@ -3049,7 +3049,13 @@ pub(crate) fn run_trained_rename(
                     12,
                 )));
             };
-            let range = if rust_free_function_inventory_eligible {
+            let selected_local_call_scope = rust_free_function_inventory_eligible
+                && edge.edge_type == "CALLS"
+                && rust_selected_files.contains(&source.file_path)
+                && matches!(source.label.as_str(), "Function" | "Method");
+            let range = if selected_local_call_scope {
+                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize)
+            } else if rust_free_function_inventory_eligible {
                 edge.properties
                     .get("line")
                     .and_then(serde_json::Value::as_u64)
@@ -3112,6 +3118,22 @@ pub(crate) fn run_trained_rename(
                 Ok(false) => continue,
                 Ok(true) => {}
                 Err(refusal) => return Ok(Err(refusal)),
+            }
+            if selected_local_call_scope
+                && sites.iter().all(|site| {
+                    rust_selected_local_free_function_owns_site(
+                        &content,
+                        &short_name,
+                        *definition_scope,
+                        *site,
+                    )
+                })
+            {
+                scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .extend(sites);
+                continue;
             }
             match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
                 Ok(None) => continue,
@@ -3232,6 +3254,151 @@ pub(crate) fn run_trained_rename(
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(Ok(record))
+}
+
+fn rust_selected_local_free_function_owns_site(
+    content: &[u8],
+    short_name: &str,
+    definition_site: (usize, usize),
+    reference_site: (usize, usize),
+) -> bool {
+    if !rust_local_free_function_owns_site(content, short_name, reference_site) {
+        return false;
+    }
+    let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
+        return false;
+    };
+    let node_at = |site: (usize, usize)| {
+        tree.root_node()
+            .descendant_for_byte_range(site.0, site.1.saturating_sub(1).max(site.0))
+    };
+    let (Some(definition), Some(reference)) = (node_at(definition_site), node_at(reference_site))
+    else {
+        return false;
+    };
+    let mut call = Some(reference);
+    let mut unqualified_call = false;
+    while let Some(node) = call {
+        if node.kind() == "call_expression" {
+            unqualified_call = node
+                .child_by_field_name("function")
+                .is_some_and(|function| function.byte_range() == reference.byte_range());
+            break;
+        }
+        if matches!(node.kind(), "scoped_identifier" | "field_expression") {
+            break;
+        }
+        call = node.parent();
+    }
+    if !unqualified_call {
+        return false;
+    }
+    let mut definition_module = None;
+    let mut ancestor = Some(definition);
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "source_file" | "mod_item") {
+            definition_module = Some((node.start_byte(), node.end_byte()));
+            break;
+        }
+        ancestor = node.parent();
+    }
+    let mut reference_module = None;
+    let mut ancestor = Some(reference);
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "source_file" | "mod_item") {
+            reference_module = Some((node.start_byte(), node.end_byte()));
+            break;
+        }
+        ancestor = node.parent();
+    }
+    if definition_module.is_none() || definition_module != reference_module {
+        return false;
+    }
+
+    // Cover binding forms that are not ordinary function parameters or `let`
+    // declarations: for/match/if-let/while-let patterns and closure parameters.
+    // Any earlier same-name binding whose lexical owner contains this call
+    // makes the call's target ambiguous without name resolution.
+    let mut binding_stack = vec![tree.root_node()];
+    while let Some(candidate) = binding_stack.pop() {
+        if matches!(candidate.kind(), "identifier" | "field_identifier")
+            && candidate.start_byte() < reference.start_byte()
+            && content.get(candidate.byte_range()) == Some(short_name.as_bytes())
+        {
+            let mut ancestor = candidate.parent();
+            let mut binding_owner = None;
+            while let Some(node) = ancestor {
+                if matches!(
+                    node.kind(),
+                    "let_declaration"
+                        | "parameter"
+                        | "for_expression"
+                        | "match_arm"
+                        | "let_condition"
+                        | "closure_parameters"
+                ) {
+                    binding_owner = Some(node);
+                    break;
+                }
+                if matches!(node.kind(), "function_item" | "mod_item" | "source_file") {
+                    break;
+                }
+                ancestor = node.parent();
+            }
+            if let Some(binding) = binding_owner {
+                let mut scope = Some(binding);
+                while let Some(node) = scope {
+                    if matches!(
+                        node.kind(),
+                        "block"
+                            | "for_expression"
+                            | "match_arm"
+                            | "if_expression"
+                            | "while_expression"
+                            | "closure_expression"
+                            | "function_item"
+                    ) && node.byte_range().contains(&reference.start_byte())
+                    {
+                        return false;
+                    }
+                    scope = node.parent();
+                }
+            }
+        }
+        let mut cursor = candidate.walk();
+        binding_stack.extend(candidate.named_children(&mut cursor));
+    }
+
+    // A nested function item can shadow the selected module function for only
+    // part of the caller. Refuse expansion for any site inside such a block;
+    // the persisted edge's exact line remains the only proven site.
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| content.get(name.byte_range()))
+                == Some(short_name.as_bytes())
+            && !node.byte_range().contains(&definition_site.0)
+        {
+            let mut owner = node.parent();
+            while let Some(scope) = owner {
+                if scope.kind() == "block" {
+                    if scope.byte_range().contains(&reference_site.0) {
+                        return false;
+                    }
+                    break;
+                }
+                if matches!(scope.kind(), "source_file" | "mod_item") {
+                    break;
+                }
+                owner = scope.parent();
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
 }
 
 pub(crate) fn dispatch_edit_grammar(
@@ -3822,6 +3989,132 @@ mod patch_rollback_tests {
             "get_lit_str",
             sites[4]
         ));
+    }
+
+    #[test]
+    fn selected_local_free_function_proof_rejects_nested_identity_changes() {
+        let block_shadow = b"fn get_lit_str() {}\nfn caller() { get_lit_str(); { fn get_lit_str() {} get_lit_str(); } }\n";
+        let block_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("block.rs"),
+            block_shadow,
+            &[(0, block_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(block_sites.len(), 4);
+        assert!(rust_selected_local_free_function_owns_site(
+            block_shadow,
+            "get_lit_str",
+            block_sites[0],
+            block_sites[1],
+        ));
+        assert!(!rust_selected_local_free_function_owns_site(
+            block_shadow,
+            "get_lit_str",
+            block_sites[0],
+            block_sites[3],
+        ));
+
+        let nested_module = b"fn get_lit_str() {}\nmod other { fn get_lit_str() {} fn caller() { get_lit_str(); } }\n";
+        let module_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("module.rs"),
+            nested_module,
+            &[(0, nested_module.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(module_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            nested_module,
+            "get_lit_str",
+            module_sites[0],
+            module_sites[2],
+        ));
+
+        let mixed_form =
+            b"fn get_lit_str() {}\nfn caller() { get_lit_str(); other::get_lit_str(); }\n";
+        let mixed_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("mixed.rs"),
+            mixed_form,
+            &[(0, mixed_form.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(mixed_sites.len(), 3);
+        assert!(rust_selected_local_free_function_owns_site(
+            mixed_form,
+            "get_lit_str",
+            mixed_sites[0],
+            mixed_sites[1],
+        ));
+        assert!(!rust_selected_local_free_function_owns_site(
+            mixed_form,
+            "get_lit_str",
+            mixed_sites[0],
+            mixed_sites[2],
+        ));
+
+        let closure_shadow = b"fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n";
+        let closure_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("closure.rs"),
+            closure_shadow,
+            &[(0, closure_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(closure_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            closure_shadow,
+            "get_lit_str",
+            closure_sites[0],
+            closure_sites[2],
+        ));
+
+        let match_shadow = b"fn get_lit_str() {}\nfn caller(value: Option<fn()>) { match value { Some(get_lit_str) => get_lit_str(), None => {} } }\n";
+        let match_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("match.rs"),
+            match_shadow,
+            &[(0, match_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(match_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            match_shadow,
+            "get_lit_str",
+            match_sites[0],
+            match_sites[2],
+        ));
+
+        for (path, source) in [
+            (
+                "for.rs",
+                b"fn get_lit_str() {}\nfn caller(items: Vec<fn()>) { for get_lit_str in items { get_lit_str(); } }\n".as_slice(),
+            ),
+            (
+                "if-let.rs",
+                b"fn get_lit_str() {}\nfn caller(value: Option<fn()>) { if let Some(get_lit_str) = value { get_lit_str(); } }\n".as_slice(),
+            ),
+            (
+                "while-let.rs",
+                b"fn get_lit_str() {}\nfn caller(mut value: Option<fn()>) { while let Some(get_lit_str) = value.take() { get_lit_str(); } }\n".as_slice(),
+            ),
+        ] {
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(path),
+                source,
+                &[(0, source.len())],
+                "get_lit_str",
+            )
+            .unwrap();
+            assert_eq!(sites.len(), 3, "{path}");
+            assert!(!rust_selected_local_free_function_owns_site(
+                source,
+                "get_lit_str",
+                sites[0],
+                sites[2],
+            ));
+        }
     }
 
     #[test]
