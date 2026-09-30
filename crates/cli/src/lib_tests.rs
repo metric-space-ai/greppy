@@ -504,6 +504,56 @@ fn rename_identity_planner_subprocess_helper() {
         unrelated_free
     );
 
+    // One proven local edge must not sweep a distinct qualified call or a
+    // closure-bound call merely because they share the same identifier text.
+    for (name, source) in [
+        (
+            "mixed-qualified",
+            "pub fn get_lit_str() {}\nfn caller() { get_lit_str(); other::get_lit_str(); }\n",
+        ),
+        (
+            "closure-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n",
+        ),
+    ] {
+        let root = test_tempdir(name);
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("selected_free.rs"), source).unwrap();
+        if name == "mixed-qualified" {
+            std::fs::write(root.join("other.rs"), "pub fn get_lit_str() {}\n").unwrap();
+        }
+        let store_path = workspace_locator::store_path(&root);
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let project = workspace_locator::project_identity(&root);
+        let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
+        assert!(report.is_clean(), "{name} fixture: {report:?}");
+        drop(store);
+        let before = std::fs::read(root.join("selected_free.rs")).unwrap();
+        let refusal = run_trained_rename(
+            &root,
+            root.to_str(),
+            "selected_free.rs::get_lit_str",
+            "get_str_literal",
+            false,
+            false,
+        )
+        .unwrap()
+        .err()
+        .expect("mixed-identity caller must refuse");
+        assert!(
+            matches!(
+                refusal.code.as_str(),
+                "ambiguous_reference" | "unresolved_reference_identity"
+            ),
+            "{}: {}",
+            refusal.code,
+            refusal.message
+        );
+        assert_eq!(std::fs::read(root.join("selected_free.rs")).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Removing an exact IMPORTS edge must be caught by the live Rust
     // inventory before either the definition or import is published.
     let import_root = test_tempdir("rename-identity-free-missing-import");
