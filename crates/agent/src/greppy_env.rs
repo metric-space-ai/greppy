@@ -551,6 +551,7 @@ fn finalize_outcome(
 ///
 /// Must match the format string in `crates/cli/src/inference.rs`
 /// (`embedding_progress_text`): `"semantic index building — {completed}/…"`.
+#[cfg(test)]
 const SEMANTIC_INDEX_BUILDING_PREFIX: &str = "semantic index building —";
 
 /// Recognize a complete CLI status line, not a substring in source or hints.
