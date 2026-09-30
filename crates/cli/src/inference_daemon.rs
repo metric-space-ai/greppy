@@ -2246,18 +2246,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inference_spawn_entrypoint_drops_lease_while_detached_owner_stays_live() {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
         struct OwnedProbe {
             pid: libc::pid_t,
-            stop: std::path::PathBuf,
+            stop: std::os::unix::net::UnixStream,
         }
         impl Drop for OwnedProbe {
             fn drop(&mut self) {
-                let _ = std::fs::write(&self.stop, b"stop\n");
-                // Only reap our direct child. It also self-expires after five
-                // seconds; no unrelated daemon or PID receives a signal.
+                let _ = self.stop.write_all(b"stop\n");
+                // Only reap our direct child. Its explicit stdin channel
+                // also closes when this parent exits; no unrelated daemon
+                // or PID receives a signal.
                 let mut status = 0;
                 loop {
                     let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
@@ -2274,18 +2275,20 @@ mod tests {
         let lease = inheritable_locked_file(&path);
         let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
         let marker = temp.path().join("owned.pid");
-        let stop = temp.path().join("stop");
+        let (stop_reader, stop_writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let stderr_path = temp.path().join("owned.stderr");
         let started = std::time::Instant::now();
         let (mut pid_reader, pid_writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let pid_fd = pid_writer.as_raw_fd();
         let mut command = std::process::Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "printf '%s' \"$$\" > \"$1\"; i=0; while [ ! -e \"$2\" ] && [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
-            "greppy-owned-detached-probe",
-        ]).arg(&marker).arg(&stop)
-            .stdin(std::process::Stdio::null())
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r stop",
+                "greppy-owned-detached-probe",
+            ])
+            .arg(&marker)
+            .stdin(std::process::Stdio::from(OwnedFd::from(stop_reader)))
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(&stderr_path).unwrap());
         // Capture the exact child PID before exec. A successful spawn means
@@ -2305,7 +2308,10 @@ mod tests {
         let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
         pid_reader.read_exact(&mut bytes).unwrap();
         let pid = libc::pid_t::from_ne_bytes(bytes);
-        let _owner = OwnedProbe { pid, stop };
+        let _owner = OwnedProbe {
+            pid,
+            stop: stop_writer,
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(ready_pid) = std::fs::read_to_string(&marker)
