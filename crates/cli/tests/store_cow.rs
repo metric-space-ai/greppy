@@ -827,6 +827,11 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         .unwrap()
         .pop()
         .expect("v6 Base symbol");
+    // Embeddings hash the normalized chunk text produced from `str::lines`,
+    // not the file bytes (which include the trailing newline in this fixture).
+    // Seed the exact one-line document so this row represents a reusable v6
+    // embedding rather than a stale vector that migration may discard.
+    let base_vector_content = "pub fn shared_base_symbol() -> i32 { 1 }";
     let base_generation = previous_store
         .list_workspace_states()
         .unwrap()
@@ -846,9 +851,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             file_path: base_node.file_path,
             start_line: base_node.start_line,
             end_line: base_node.end_line,
-            content_sha256: greppy_store::file_state::sha256_hex(
-                &std::fs::read(primary.join("src/base.rs")).unwrap(),
-            ),
+            content_sha256: greppy_store::file_state::sha256_hex(base_vector_content.as_bytes()),
             graph_generation: base_generation,
             vector: vec![0.0, 1.0],
         })
