@@ -2092,7 +2092,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v4";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v5";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -2123,6 +2123,73 @@ pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Recover references omitted by older Rust extractors without rebuilding nodes
+/// or embeddings. Validate every visible Rust source before writing anything.
+/// Additive raw rows also work for immutable Base files: no file-state ownership
+/// is copied into Delta, and ordinary sparse publication remains Delta-bounded.
+pub fn recover_persisted_rust_usages(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<usize> {
+    let states = store.list_file_states(project)?;
+    let indexed_paths = {
+        let mut statement = store.conn().prepare("SELECT DISTINCT file_path FROM nodes WHERE project=?1 AND file_path LIKE '%.rs'").map_err(sqlite_err)?;
+        let rows = statement.query_map([project], |row| row.get::<_, String>(0)).map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(sqlite_err)?
+    };
+    if indexed_paths.iter().any(|path| !states.iter().any(|state| &state.rel_path == path)) {
+        return Err(greppy_core::Error::Invalid("Rust reference repair requires indexed source fingerprints for every visible Rust file".into()));
+    }
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        greppy_core::Error::Invalid(format!("Rust reference repair cannot read root: {error}"))
+    })?;
+    let mut existing = store.list_raw_edges(project)?.into_iter().map(|edge| {
+        (edge.file_path, edge.source_qname, edge.target_qname, edge.edge_type,
+         edge.properties.to_string())
+    }).collect::<std::collections::HashSet<_>>();
+    let mut additions = Vec::new();
+    for state in states.iter().filter(|state| state.rel_path.ends_with(".rs")) {
+        let relative = Path::new(&state.rel_path);
+        if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            return Err(greppy_core::Error::Invalid("unsafe Rust repair source path".into()));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|error| {
+            greppy_core::Error::Invalid(format!("Rust reference repair source {} unavailable: {error}", state.rel_path))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid("Rust repair source escapes root".into()));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|error| {
+            greppy_core::Error::Invalid(format!("Rust reference repair source {} unreadable: {error}", state.rel_path))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} changed since indexing", state.rel_path
+            )));
+        }
+        let extraction = parser_extract(Language::Rust, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) = validate_or_degrade(Language::Rust, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(format!("Rust reference repair source {} failed extraction validation", state.rel_path)));
+        }
+        for edge in extraction.edges.iter().filter(|edge| edge.edge_type == "USAGE") {
+            let candidate = new_raw_edge_for(project, &state.rel_path, edge);
+            if existing.insert((candidate.file_path.clone(), candidate.source_qname.clone(),
+                candidate.target_qname.clone(), candidate.edge_type.clone(),
+                candidate.properties.to_string())) {
+                additions.push(candidate);
+            }
+        }
+    }
+    // Source validation above is all-or-nothing. Raw insertion is transactional;
+    // a later resolver failure leaves the completion marker pending and retry
+    // deduplicates these additive rows instead of losing cached relations.
+    let count = additions.len();
+    store.insert_raw_edges(&additions)?;
+    Ok(count)
+}
+
 /// One-shot single-store compatibility repair. Replace only Rust-owned
 /// non-structural relations from persisted raw edges; nodes, file identity,
 /// graph generation, content, embeddings and non-Rust edges remain untouched.
@@ -2133,6 +2200,9 @@ pub fn rebuild_single_store_rust_edges(store: &mut Store, project: &str) -> Resu
             "single-store Rust repair requires a private Store".into(),
         ));
     }
+    let root = store.get_project(project)?.ok_or_else(||
+        greppy_core::Error::Invalid("Rust repair project is missing".into()))?.root_path;
+    recover_persisted_rust_usages(store, project, Path::new(&root))?;
     let raw = load_all_raw_edges(store, project)?;
     let rust_edges = raw
         .into_iter()
@@ -6665,6 +6735,7 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             )
             .unwrap();
         store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v3','complete')", []).unwrap();
+        store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
         rebuild_single_store_rust_edges(&mut store, "test").unwrap();
         assert!(rust_caller_edges_repaired(&store).unwrap());
         assert!(
@@ -6672,8 +6743,50 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .incoming_edges(instruction.id, Some("USAGE"), 20)
                 .unwrap()
                 .is_empty(),
-            "an unchanged older store regains enum references from existing raw edges"
+            "an unchanged older store recovers omitted constructor raw references"
         );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
+        let repo = setup_repo("constructor-recovery", "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\n");
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='USAGE'", []).unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        }
+        let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let states_before = overlay.list_file_states("test").unwrap();
+        let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
+        let original = fs::read(repo.join("src/lib.rs")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::remove_file(repo.join("src/lib.rs")).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::write(repo.join("src/lib.rs"), original).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        let target = overlay.get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte").unwrap().unwrap();
+        let caller = overlay.get_node_by_qname("test", "src/lib.rs::Function::decode").unwrap().unwrap();
+        assert!(overlay.incoming_edges(target.id, Some("USAGE"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
+        assert_eq!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(), 0);
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert_eq!(overlay.list_file_states("test").unwrap(), states_before);
+        assert_eq!(format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()), nodes_before);
+        rebuild_overlay_edges(&mut overlay, "test").unwrap();
+        assert!(overlay.incoming_edges(target.id, Some("USAGE"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
+        drop(overlay);
+        let base = Store::open(&base_path).unwrap();
+        assert!(base.list_raw_edges("test").unwrap().iter().all(|edge| !edge.target_qname.contains("AddImmediateByte")));
+        drop(base);
         fs::remove_dir_all(repo).unwrap();
     }
 
