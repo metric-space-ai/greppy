@@ -328,6 +328,30 @@ fn lint_help_error_prose_preserves_bytes_and_child_status() {
 }
 
 #[test]
+fn global_compiler_error_codes_are_lifted_from_long_output() {
+    let workspace = fresh_workspace("global-compiler-error-codes");
+    let errors = "error TS18003: No inputs were found in config file\nerror MSB1009: Project file does not exist.\n";
+    let log = format!(
+        "{}{errors}{}",
+        "ordinary output\n".repeat(100),
+        "ordinary tail\n".repeat(100)
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{log}'{redirect}; exit 2");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(text(&output.stdout).starts_with("FAILED — exit 2: 2 errors, 0 warnings\n"));
+        let diagnostics = if redirect.is_empty() {
+            text(&output.stdout)
+        } else {
+            text(&output.stderr)
+        };
+        assert!(diagnostics.contains("error TS18003: No inputs were found in config file"));
+        assert!(diagnostics.contains("error MSB1009: Project file does not exist."));
+    }
+}
+
+#[test]
 fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
     let workspace = fresh_workspace("typescript-diagnostic");
     for redirect in ["", " >&2"] {

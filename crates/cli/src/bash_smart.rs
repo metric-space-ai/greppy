@@ -43,7 +43,7 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -2592,6 +2592,10 @@ mod tests {
             "error[E0308]: mismatched types\n",
             "ERROR: unavailable\n",
             "error\n",
+            "error TS18003: No inputs were found in config file\n",
+            "error MSB1009: Project file does not exist.\n",
+            "error NETSDK1045: SDK does not support this target\n",
+            "error CS2008: No source files specified\n",
         ] {
             let lines = split_lines(diagnostic.as_bytes());
             for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
