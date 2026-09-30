@@ -2829,7 +2829,7 @@ mod tests {
             "[package]\nname = \"vcop2-tools\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub mod m68000_aot;\npub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod m68000_aot;\npub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n").unwrap();
         std::fs::write(root.join("src/m68000_aot.rs"), "pub fn compile() {}\n").unwrap();
         std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(
@@ -2924,6 +2924,15 @@ mod tests {
             .get_node_by_qname("p", "src/lib.rs::Function::decode")
             .unwrap()
             .unwrap();
+        let amount = store.get_node_by_qname("p", "src/lib.rs::Function::amount").unwrap().unwrap();
+        let valid = store.get_node_by_qname("p", "src/lib.rs::Function::valid").unwrap().unwrap();
+        store.insert_raw_edges(&[greppy_store::NewRawEdge {
+            project: "p".into(), file_path: "src/lib.rs".into(), source_qname: decode.qualified_name.clone(),
+            target_qname: amount.qualified_name.clone(), edge_type: "USAGE".into(),
+            properties: serde_json::json!({"ref_name": "amount", "line": 3}),
+        }]).unwrap();
+        store.insert_edge(&greppy_store::NewEdge { project: "p".into(), source_id: decode.id, target_id: amount.id,
+            edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount"}) }).unwrap();
         store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
         store
             .conn()
@@ -2973,6 +2982,9 @@ mod tests {
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == decode.id));
+        let amount_usages = store.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
+        assert!(amount_usages.iter().all(|edge| edge.source_id != decode.id));
+        assert!(amount_usages.iter().any(|edge| edge.source_id == valid.id));
         assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
         assert_eq!(
             format!(

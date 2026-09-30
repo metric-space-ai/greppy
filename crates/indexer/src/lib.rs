@@ -2092,7 +2092,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v5";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v6";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -2125,7 +2125,7 @@ pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
 
 /// Recover references omitted by older Rust extractors without rebuilding nodes
 /// or embeddings. Validate every visible Rust source before writing anything.
-/// Additive raw rows also work for immutable Base files: no file-state ownership
+/// Private usage overrides also work for immutable Base files: no file-state ownership
 /// is copied into Delta, and ordinary sparse publication remains Delta-bounded.
 pub fn recover_persisted_rust_usages(
     store: &mut Store,
@@ -2155,20 +2155,8 @@ pub fn recover_persisted_rust_usages(
     let root = std::fs::canonicalize(root).map_err(|error| {
         greppy_core::Error::Invalid(format!("Rust reference repair cannot read root: {error}"))
     })?;
-    let mut existing = store
-        .list_raw_edges(project)?
-        .into_iter()
-        .map(|edge| {
-            (
-                edge.file_path,
-                edge.source_qname,
-                edge.target_qname,
-                edge.edge_type,
-                edge.properties.to_string(),
-            )
-        })
-        .collect::<std::collections::HashSet<_>>();
-    let mut additions = Vec::new();
+    let mut replacements = Vec::new();
+    let mut files = Vec::new();
     for state in states
         .iter()
         .filter(|state| state.rel_path.ends_with(".rs"))
@@ -2214,29 +2202,14 @@ pub fn recover_persisted_rust_usages(
                 state.rel_path
             )));
         }
-        for edge in extraction
-            .edges
-            .iter()
+        files.push(state.rel_path.clone());
+        replacements.extend(extraction.edges.iter()
             .filter(|edge| edge.edge_type == "USAGE")
-        {
-            let candidate = new_raw_edge_for(project, &state.rel_path, edge);
-            if existing.insert((
-                candidate.file_path.clone(),
-                candidate.source_qname.clone(),
-                candidate.target_qname.clone(),
-                candidate.edge_type.clone(),
-                candidate.properties.to_string(),
-            )) {
-                additions.push(candidate);
-            }
-        }
+            .map(|edge| new_raw_edge_for(project, &state.rel_path, edge)));
     }
-    // Source validation above is all-or-nothing. Raw insertion is transactional;
-    // a later resolver failure leaves the completion marker pending and retry
-    // deduplicates these additive rows instead of losing cached relations.
-    let count = additions.len();
-    store.insert_raw_edges(&additions)?;
-    Ok(count)
+    // All source fingerprints validate before any persisted write. Replace
+    // exactly the USAGE contribution, retaining imports/calls and cached data.
+    Ok(store.replace_validated_rust_usages(project, &files, &replacements)?)
 }
 
 /// One-shot single-store compatibility repair. Replace only Rust-owned
@@ -2344,7 +2317,7 @@ fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()
                          WHERE h.path = s.file_path
                      )
                )
-               AND NOT EXISTS (
+               AND (d.edge_type = 'USAGE' OR NOT EXISTS (
                    SELECT 1
                    FROM greppy_base.nodes bs
                    JOIN greppy_base.edges e
@@ -2357,7 +2330,7 @@ fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()
                      AND bt.qualified_name = d.target_qualified_name
                      AND e.project = d.project
                      AND e.edge_type = d.edge_type
-               )
+               ))
                AND json_extract(d.properties, '$.greppy_base_repair_v2') IS NULL",
             rusqlite::params![project],
         )
@@ -6801,16 +6774,23 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
 
     #[test]
     fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
-        let repo = setup_repo("constructor-recovery", "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\n");
+        let repo = setup_repo("constructor-recovery", "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n");
         let base_path = repo.join("base.db");
         let delta_path = repo.join("delta.db");
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, &repo, "test").unwrap();
             base.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
-            base.conn()
-                .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
-                .unwrap();
+            let decode = base.get_node_by_qname("test", "src/lib.rs::Function::decode").unwrap().unwrap();
+            let amount = base.get_node_by_qname("test", "src/lib.rs::Function::amount").unwrap().unwrap();
+            base.insert_raw_edges(&[NewRawEdge {
+                project: "test".into(), file_path: "src/lib.rs".into(),
+                source_qname: decode.qualified_name.clone(), target_qname: amount.qualified_name.clone(),
+                edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount", "line": 2}),
+            }]).unwrap();
+            base.insert_edge(&NewEdge { project: "test".into(), source_id: decode.id,
+                target_id: amount.id, edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount"}) }).unwrap();
+            base.conn().execute("DELETE FROM edges WHERE target_id IN (SELECT id FROM nodes WHERE name='AddImmediateByte')", []).unwrap();
             base.conn()
                 .execute(
                     "DELETE FROM schema_meta WHERE key=?1",
@@ -6853,6 +6833,12 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
+        let amount = overlay.get_node_by_qname("test", "src/lib.rs::Function::amount").unwrap().unwrap();
+        let valid = overlay.get_node_by_qname("test", "src/lib.rs::Function::valid").unwrap().unwrap();
+        let usages = overlay.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
+        assert!(usages.iter().all(|edge| edge.source_id != caller.id), "obsolete struct field label must not resolve to a free function");
+        assert!(usages.iter().any(|edge| edge.source_id == valid.id), "legitimate raw usage remains visible");
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty(), "Base compatibility repair must not enter sparse raw re-resolution");
         assert_eq!(
             recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
             0
@@ -6869,7 +6855,14 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
+        let usages = overlay.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
+        assert!(usages.iter().all(|edge| edge.source_id != caller.id));
+        assert!(usages.iter().any(|edge| edge.source_id == valid.id));
         drop(overlay);
+        // Persisted override works after a normal overlay reopen too.
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(reopened.incoming_edges(amount.id, Some("USAGE"), 20).unwrap().iter().all(|edge| edge.source_id != caller.id));
+        drop(reopened);
         let base = Store::open(&base_path).unwrap();
         assert_eq!(
             format!("{:?}", base.list_raw_edges("test").unwrap()),
