@@ -2092,7 +2092,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v3";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v4";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -4076,7 +4076,12 @@ impl GraphIndex {
                 .iter()
                 .any(|module_file| self.known_files.contains(module_file));
             if !module_exists {
-                return self.resolve_associated_method(src_id, ref_path, name);
+                return self.resolve_associated_member(
+                    src_id,
+                    ref_path,
+                    name,
+                    &["Method", "EnumVariant"],
+                );
             }
             let in_module = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
             match in_module.as_slice() {
@@ -4118,17 +4123,31 @@ impl GraphIndex {
         }
     }
 
-    /// Resolve `Type::method()` only when `Type` itself resolves in the
+    /// Resolve a qualified method or enum member only when its owner resolves in the
     /// referrer's scope. This preserves imported and lowercase Rust type names
     /// without treating a missing qualified module as an unqualified call.
-    fn resolve_associated_method(&self, src_id: i64, ref_path: &str, name: &str) -> Option<i64> {
+    fn resolve_associated_member(
+        &self,
+        src_id: i64,
+        ref_path: &str,
+        name: &str,
+        member_labels: &[&str],
+    ) -> Option<i64> {
         let owner = ref_path.rsplit("::").nth(1).unwrap_or("");
         if owner.is_empty() || name.is_empty() {
             return None;
         }
         let referrer_file = self.file_of(src_id)?;
         let owner_path = ref_path.strip_suffix(name)?.strip_suffix("::")?;
-        let owner_id = if owner_path == owner {
+        let owner_id = if owner_path == "Self" {
+            let source_qname = self.qname_for_id(src_id)?;
+            if self.by_qname(source_qname)?.label != "Method" {
+                return None;
+            }
+            let context_owner = source_qname.rsplit("::").nth(1)?;
+            self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, context_owner, src_id)
+                .unique_id()?
+        } else if owner_path == owner {
             self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
                 .unique_id()?
         } else {
@@ -4168,9 +4187,10 @@ impl GraphIndex {
             }
         };
         let owner_file = self.file_of(owner_id)?;
-        let suffix = format!("::{owner}::{name}");
+        let resolved_owner = self.qname_for_id(owner_id)?.rsplit("::").next()?;
+        let suffix = format!("::{resolved_owner}::{name}");
         let matches = self
-            .defs_named(&["Method"], name)
+            .defs_named(member_labels, name)
             .into_iter()
             .filter(|node| {
                 node.file_path == owner_file
@@ -4217,6 +4237,12 @@ impl GraphIndex {
             let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
             if let [id] = imported.as_slice() {
                 return Some(*id);
+            }
+            if !module_files
+                .iter()
+                .any(|file| self.known_files.contains(file))
+            {
+                return self.resolve_associated_member(src_id, ref_path, name, &["EnumVariant"]);
             }
             // Never discard syntactic qualification and retry this as an
             // unqualified same-file/import lookup.
@@ -6458,6 +6484,142 @@ def Widget():
                 "crates/widget/src/helpers/main.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn rust_enum_variants_resolve_constructors_patterns_and_exact_owners() {
+        let repo = setup_repo(
+            "enum-variant-references",
+            r#"
+mod caller;
+pub enum Instruction { AddImmediateByte { amount: u8 }, Tuple(u8), Halt }
+pub enum Other { AddImmediateByte { amount: u8 } }
+pub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }
+pub fn state(value: Instruction) -> u8 {
+    match value { Instruction::AddImmediateByte { amount } => amount, _ => 0 }
+}
+pub fn tuple() -> Instruction { Instruction::Tuple(1) }
+pub fn unit() -> Instruction { Instruction::Halt }
+pub fn function_item() { let _ = Instruction::Tuple; }
+pub fn other() -> Other { Other::AddImmediateByte { amount: 1 } }
+pub fn missing() { let _ = missing::Instruction::AddImmediateByte { amount: 1 }; }
+impl Instruction {
+    pub fn self_pattern(&self) -> u8 {
+        match self { Self::AddImmediateByte { amount } => *amount, _ => 0 }
+    }
+}
+"#,
+        );
+        fs::write(
+            repo.join("src/caller.rs"),
+            r#"
+use crate::Instruction as Opcode;
+pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
+"#,
+        )
+        .unwrap();
+        let mut store = Store::open(":memory:").unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        for (target, callers) in [
+            (
+                "src/lib.rs::Instruction::AddImmediateByte",
+                vec![
+                    ("src/lib.rs::Function::decode", "USAGE"),
+                    ("src/lib.rs::Function::state", "USAGE"),
+                    ("src/lib.rs::Instruction::self_pattern", "USAGE"),
+                    ("src/caller.rs::Function::aliased", "USAGE"),
+                ],
+            ),
+            (
+                "src/lib.rs::Instruction::Tuple",
+                vec![
+                    ("src/lib.rs::Function::tuple", "CALLS"),
+                    ("src/lib.rs::Function::function_item", "USAGE"),
+                ],
+            ),
+            (
+                "src/lib.rs::Instruction::Halt",
+                vec![("src/lib.rs::Function::unit", "USAGE")],
+            ),
+            (
+                "src/lib.rs::Other::AddImmediateByte",
+                vec![("src/lib.rs::Function::other", "USAGE")],
+            ),
+        ] {
+            let target = store
+                .get_node_by_qname("test", target)
+                .unwrap()
+                .expect("enum variant");
+            for (source, edge_type) in callers {
+                let source = store
+                    .get_node_by_qname("test", source)
+                    .unwrap()
+                    .expect("caller");
+                assert!(
+                    store
+                        .incoming_edges(target.id, Some(edge_type), 20)
+                        .unwrap()
+                        .iter()
+                        .any(|edge| edge.source_id == source.id),
+                    "missing {edge_type} {} -> {}",
+                    source.qualified_name,
+                    target.qualified_name
+                );
+            }
+        }
+        let missing = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .outgoing_edges(missing.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty(),
+            "an unknown qualified owner must not bind to a same-name local enum"
+        );
+        let other = store
+            .get_node_by_qname("test", "src/lib.rs::Function::other")
+            .unwrap()
+            .unwrap();
+        let instruction = store
+            .get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .incoming_edges(instruction.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != other.id),
+            "same-name variants retain their enum ownership"
+        );
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id = ?1 AND edge_type IN ('CALLS', 'USAGE')",
+                [instruction.id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key = ?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v3','complete')", []).unwrap();
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(
+            !store
+                .incoming_edges(instruction.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty(),
+            "an unchanged older store regains enum references from existing raw edges"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
