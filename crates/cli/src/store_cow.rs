@@ -3485,10 +3485,12 @@ mod tests {
         // The one-shot composed rebuild shadows an existing Base relation too.
         // Store visibility suppresses the matching Base row, so this is one
         // visible relation, not two. Only missing Base edges carry repair markers.
+        // Exact reexport resolution also retains the caller's import of outer.
         let expected_relations = [
             ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
             ("src/base.rs::Function::base_caller", "CALLS", 1),
             ("src/caller.rs::Function::caller", "USAGE", 0),
+            ("src/caller.rs::__file__", "IMPORTS", 0),
             ("src/stable.rs::Function::stable_caller", "CALLS", 0),
         ]
         .into_iter()
