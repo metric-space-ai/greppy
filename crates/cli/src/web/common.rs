@@ -103,9 +103,9 @@ pub(super) struct CurrentScope {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionRoute {
-    socket: PathBuf,
-    run_id: String,
     runtime_image_id: String,
+    #[serde(default)]
+    legacy: bool,
 }
 
 fn session_route_path(root: Option<&str>, session: &str) -> PathBuf {
@@ -140,9 +140,8 @@ fn save_session_route(
 ) -> std::result::Result<(), ErrorObject> {
     let path = session_route_path(root, session);
     let route = SessionRoute {
-        socket: ctx.socket.clone(),
-        run_id: ctx.run_id.clone(),
         runtime_image_id: ctx.runtime_image_id.clone(),
+        legacy: ctx.legacy,
     };
     persist_route(&path, &route)
 }
@@ -152,9 +151,8 @@ fn save_runtime_route(
     ctx: &SupervisorCtx,
 ) -> std::result::Result<(), ErrorObject> {
     let route = SessionRoute {
-        socket: ctx.socket.clone(),
-        run_id: ctx.run_id.clone(),
         runtime_image_id: ctx.runtime_image_id.clone(),
+        legacy: ctx.legacy,
     };
     persist_route(&runtime_route_path(root, &ctx.runtime_image_id), &route)
 }
@@ -200,6 +198,24 @@ fn known_runtime_routes(root: Option<&str>) -> Vec<SessionRoute> {
 
 fn remove_session_route(root: Option<&str>, session: &str) {
     let _ = std::fs::remove_file(session_route_path(root, session));
+}
+
+fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str) {
+    let _ = std::fs::remove_file(runtime_route_path(root, runtime_image_id));
+    let directory = workspace_dir(root).join(".greppy/web/session-routes");
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matches = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SessionRoute>(&bytes).ok())
+                .is_some_and(|route| route.runtime_image_id == runtime_image_id);
+            if matches {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(current_scope_path(root));
 }
 /// Drop only the remembered session that the runtime actually rejected.
 ///
@@ -909,6 +925,7 @@ pub(super) fn rpc_with_spawn(
                     }
                 } else if operation == "web.session.close" || operation == "session.close" {
                     if let Some(session) = rejected_session.as_deref() {
+                        forget_current_session(root, session);
                         remove_session_route(root, session);
                     }
                 } else {
@@ -947,24 +964,34 @@ fn supervisor_for_session(
 ) -> std::result::Result<SupervisorCtx, ErrorObject> {
     if let Some(session) = session {
         if let Some(route) = load_session_route(root, session) {
+            let (route_run_id, route_identity) = runtime_run_id(root);
+            let route_identity = if route.legacy {
+                route_identity
+            } else {
+                runtime_identity_for_image(&route_identity, &route.runtime_image_id)
+            };
+            let Some(route_socket) = web_runtime_socket(&route_identity) else {
+                return Err(unavailable("cannot allocate saved session runtime socket"));
+            };
             let capability =
-                crate::web_attach::current_token().or_else(|| load_attach_cookie(&route.socket));
+                load_attach_cookie(&route_socket).or_else(crate::web_attach::current_token);
             if let Some(capability) = capability {
-                if let Some(live) = live_runtime_status(&route.socket, &route.run_id, &capability) {
+                if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
                     if live.runtime_image_id == route.runtime_image_id {
                         return Ok(SupervisorCtx {
-                            socket: route.socket,
-                            run_id: route.run_id,
+                            socket: route_socket,
+                            run_id: route_run_id,
                             capability,
                             runtime_image_id: route.runtime_image_id,
+                            legacy: route.legacy,
                         });
                     }
-                } else if socket_connected(&route.socket) {
+                } else if socket_connected(&route_socket) {
                     return Err(not_owned(
                         "saved session belongs to a live runtime with a different attach capability",
                     ));
                 }
-            } else if socket_connected(&route.socket) {
+            } else if socket_connected(&route_socket) {
                 return Err(not_owned(
                     "saved session belongs to a live runtime without an inherited attach capability",
                 ));
@@ -972,18 +999,28 @@ fn supervisor_for_session(
             remove_session_route(root, session);
         }
         for route in known_runtime_routes(root) {
+            let (route_run_id, route_identity) = runtime_run_id(root);
+            let route_identity = if route.legacy {
+                route_identity
+            } else {
+                runtime_identity_for_image(&route_identity, &route.runtime_image_id)
+            };
+            let Some(route_socket) = web_runtime_socket(&route_identity) else {
+                continue;
+            };
             let capability =
-                load_attach_cookie(&route.socket).or_else(crate::web_attach::current_token);
+                load_attach_cookie(&route_socket).or_else(crate::web_attach::current_token);
             if let Some(capability) = capability {
-                if let Some(live) = live_runtime_status(&route.socket, &route.run_id, &capability) {
+                if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
                     if live.runtime_image_id == route.runtime_image_id
-                        && runtime_has_session(&route.socket, &route.run_id, &capability, session)
+                        && runtime_has_session(&route_socket, &route_run_id, &capability, session)
                     {
                         let ctx = SupervisorCtx {
-                            socket: route.socket,
-                            run_id: route.run_id,
+                            socket: route_socket,
+                            run_id: route_run_id,
                             capability,
                             runtime_image_id: route.runtime_image_id,
+                            legacy: route.legacy,
                         };
                         save_session_route(root, session, &ctx)?;
                         return Ok(ctx);
@@ -1007,6 +1044,7 @@ fn supervisor_for_session(
                             run_id: legacy_run_id,
                             capability,
                             runtime_image_id: live.runtime_image_id,
+                            legacy: true,
                         };
                         save_runtime_route(root, &ctx)?;
                         save_session_route(root, session, &ctx)?;
@@ -1073,6 +1111,7 @@ pub(super) struct SupervisorCtx {
     run_id: String,
     capability: String,
     runtime_image_id: String,
+    legacy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1285,6 +1324,7 @@ pub(super) fn ensure_supervisor(
                     run_id,
                     capability,
                     runtime_image_id: expected_runtime_image_id,
+                    legacy: false,
                 };
                 save_runtime_route(root, &ctx)?;
                 return Ok(ctx);
@@ -1412,6 +1452,7 @@ pub(super) fn ensure_supervisor(
                         run_id,
                         capability,
                         runtime_image_id: expected_runtime_image_id,
+                        legacy: false,
                     };
                     save_runtime_route(root, &ctx)?;
                     return Ok(ctx);
@@ -1631,7 +1672,12 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
             let socket = PathBuf::from(endpoint.address());
             let mut request = Request::new(&run_id, "web.shutdown", json!({}));
             request.capability = capability;
-            let _ = greppy_web_client::unix_request(&socket, &request, Duration::from_secs(3));
+            if greppy_web_client::unix_request(&socket, &request, Duration::from_secs(3))
+                .ok()
+                .is_some_and(|response| response.status == "ok" && response.error.is_none())
+            {
+                remove_runtime_routes(root, &image);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -2289,6 +2335,43 @@ mod target_tests {
             "wrs_plain",
             None
         ));
+    }
+
+    #[test]
+    fn planted_route_cannot_supply_socket_or_run_id() {
+        let route: SessionRoute = serde_json::from_value(json!({
+            "socket": "/attacker/socket",
+            "run_id": "attacker",
+            "runtime_image_id": "sha256:abc",
+            "legacy": false
+        }))
+        .unwrap();
+        let (_, workspace_identity) = runtime_run_id(Some("/trusted/workspace"));
+        assert_eq!(
+            runtime_identity_for_image(&workspace_identity, &route.runtime_image_id),
+            format!("{workspace_identity}:image:sha256:abc")
+        );
+    }
+
+    #[test]
+    fn stop_cleanup_removes_generation_routes_and_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let ctx = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: "sha256:test".into(),
+            legacy: false,
+        };
+        save_runtime_route(Some(root_text), &ctx).unwrap();
+        save_session_route(Some(root_text), "wrs_test", &ctx).unwrap();
+        std::fs::create_dir_all(current_scope_path(Some(root_text)).parent().unwrap()).unwrap();
+        std::fs::write(current_scope_path(Some(root_text)), b"{}").unwrap();
+        remove_runtime_routes(Some(root_text), &ctx.runtime_image_id);
+        assert!(!runtime_route_path(Some(root_text), &ctx.runtime_image_id).exists());
+        assert!(!session_route_path(Some(root_text), "wrs_test").exists());
+        assert!(!current_scope_path(Some(root_text)).exists());
     }
 
     #[test]

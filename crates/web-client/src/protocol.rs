@@ -12,27 +12,6 @@ pub const SCHEMA: &str = "greppy.web-runtime.v1";
 #[cfg(unix)]
 pub fn runtime_image_id(path: &Path) -> io::Result<String> {
     use sha2::{Digest, Sha256};
-    if let Some(parent) = path.parent() {
-        for sums in [
-            parent.join("SHA256SUMS"),
-            parent.join("..").join("SHA256SUMS"),
-        ] {
-            if let Ok(text) = std::fs::read_to_string(sums) {
-                for line in text.lines() {
-                    let mut parts = line.split_whitespace();
-                    if let (Some(hex), Some(name)) = (parts.next(), parts.next()) {
-                        let name = name.trim_start_matches('*');
-                        if hex.len() == 64
-                            && hex.bytes().all(|b| b.is_ascii_hexdigit())
-                            && (name == "web-runtime" || name == "bin/web-runtime")
-                        {
-                            return Ok(format!("sha256:{}", hex.to_ascii_lowercase()));
-                        }
-                    }
-                }
-            }
-        }
-    }
     let bytes = std::fs::read(path)?;
     let digest = format!("{:x}", Sha256::digest(bytes));
     Ok(format!("sha256:{digest}"))
@@ -261,10 +240,16 @@ mod tests {
         let old = runtime_image_id(&executable).unwrap();
         std::fs::write(&replacement, b"new image").unwrap();
         std::fs::rename(&replacement, &executable).unwrap();
+        std::fs::write(
+            root.join("SHA256SUMS"),
+            format!("{}  web-runtime\n", "0".repeat(64)),
+        )
+        .unwrap();
         let new = runtime_image_id(&executable).unwrap();
         assert_ne!(old, new);
+        assert_ne!(new, format!("sha256:{}", "0".repeat(64)));
 
-        let copy = dir.path().join("copy");
+        let copy = root.join("copy");
         std::fs::copy(&executable, &copy).unwrap();
         assert_eq!(new, runtime_image_id(&copy).unwrap());
         std::fs::remove_dir_all(root).unwrap();
