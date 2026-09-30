@@ -207,7 +207,7 @@ impl WebView {
         match builder.create_new_webview_responder.as_mut() {
             Some(responder) => {
                 let _ = responder.send(Some(new_webview_details));
-            },
+            }
             None => {
                 let url = builder.url.unwrap_or(
                     Url::parse("about:blank")
@@ -220,7 +220,7 @@ impl WebView {
                         url.into(),
                         new_webview_details,
                     ));
-            },
+            }
         }
 
         webview
@@ -775,6 +775,22 @@ impl WebView {
         );
     }
 
+    /// Evaluate a closed, typed DOM query supplied by the embedder.
+    ///
+    /// The script process validates the JSON schema and constructs the fixed
+    /// dispatcher. Caller-provided JavaScript is never accepted on this path.
+    pub fn evaluate_structured_dom<T: ToString>(
+        &self,
+        request_json: T,
+        callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static,
+    ) {
+        self.inner().servo.javascript_evaluator_mut().evaluate(
+            self.id(),
+            format!("__GREPPY_STRUCTURED_DOM_V1__{}", request_json.to_string()),
+            Box::new(callback),
+        );
+    }
+
     /// Asynchronously take a screenshot of the [`WebView`] contents, given a `rect` or the whole
     /// viewport, if no `rect` is given.
     ///
@@ -842,7 +858,7 @@ impl WebView {
                     constellation_proxy,
                     response_sent: false,
                 })
-            },
+            }
             EmbedderControlRequest::ColorPicker(current_color) => {
                 EmbedderControl::ColorPicker(ColorPicker {
                     id: control_id,
@@ -851,7 +867,7 @@ impl WebView {
                     constellation_proxy,
                     response_sent: false,
                 })
-            },
+            }
             EmbedderControlRequest::InputMethod(input_method_request) => {
                 EmbedderControl::InputMethod(InputMethodControl {
                     id: control_id,
@@ -862,7 +878,7 @@ impl WebView {
                     multiline: input_method_request.multiline,
                     allow_virtual_keyboard: input_method_request.allow_virtual_keyboard,
                 })
-            },
+            }
             EmbedderControlRequest::ContextMenu(mut context_menu_request) => {
                 for item in context_menu_request.items.iter_mut() {
                     match item {
@@ -876,7 +892,7 @@ impl WebView {
                             enabled,
                             ..
                         } => *enabled = self.can_go_forward(),
-                        _ => {},
+                        _ => {}
                     }
                 }
                 EmbedderControl::ContextMenu(ContextMenu {
@@ -887,10 +903,10 @@ impl WebView {
                     constellation_proxy,
                     response_sent: false,
                 })
-            },
+            }
             EmbedderControlRequest::FilePicker { .. } => {
                 unreachable!("This message should be routed through the FileManagerThread")
-            },
+            }
         };
 
         self.delegate()

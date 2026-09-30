@@ -79,6 +79,35 @@ use script_traits::{
     NewPipelineInfo, Painter, ProgressiveWebMetricType, ScriptThreadMessage,
     UpdatePipelineIdReason,
 };
+
+const GREPPY_STRUCTURED_DOM_PREFIX: &str = "__GREPPY_STRUCTURED_DOM_V1__";
+fn structured_dom_script(source: &str) -> Result<Option<String>, ()> {
+    let Some(payload) = source.strip_prefix(GREPPY_STRUCTURED_DOM_PREFIX) else { return Ok(None) };
+    let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| ())?;
+    let object = value.as_object().ok_or(())?;
+    if object.keys().any(|key| !matches!(key.as_str(), "op"|"selector"|"fields"|"limit")) { return Err(()) }
+    let op = object.get("op").and_then(|v| v.as_str()).ok_or(())?;
+    if !matches!(op, "find"|"extract") { return Err(()) }
+    let selector = object.get("selector").and_then(|v| v.as_str()).ok_or(())?;
+    if selector.is_empty() || selector.len() > 16_384 { return Err(()) }
+    let limit = object.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(10_000);
+    let fields = object.get("fields").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let allowed = ["text","href","value","id","tag","checked"];
+    if fields.iter().any(|v| v.as_str().is_none_or(|f| !allowed.contains(&f))) { return Err(()) }
+    let selector = serde_json::to_string(selector).map_err(|_| ())?;
+    let fields = serde_json::to_string(&fields).map_err(|_| ())?;
+    Ok(Some(format!(r#"(function(){{var nodes=Array.prototype.slice.call(document.querySelectorAll({selector}));var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f==='text')o.text=String(e.textContent==null?'':e.textContent).replace(/\s+/g,' ').trim();else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(function(e){{return {{tag:e.tagName.toLowerCase(),id:e.id||null,text:String(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,120)}};}})}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
+}
+#[cfg(test)]
+mod greppy_structured_dom_tests {
+    use super::*;
+    #[test]
+    fn closed_schema_cannot_promote_arbitrary_source() {
+        assert!(structured_dom_script(r#"__GREPPY_STRUCTURED_DOM_V1__{"op":"extract","selector":"a","fields":["text"]}"#).unwrap().is_some());
+        assert!(structured_dom_script(r#"__GREPPY_STRUCTURED_DOM_V1__{"op":"extract","selector":"a","fields":[],"source":"alert(1)"}"#).is_err());
+        assert!(structured_dom_script("alert(1)").unwrap().is_none());
+    }
+}
 use servo_arc::Arc as ServoArc;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSender;
@@ -4375,12 +4404,20 @@ impl ScriptThread {
         let mut realm = enter_auto_realm(cx, global_scope);
         let cx = &mut realm.current_realm();
 
+        let (script, introduction_type) = match structured_dom_script(&script) {
+            Ok(Some(script)) => (script, Some(IntroductionType::DEBUGGER_EVAL)),
+            Ok(None) => (script, None),
+            Err(()) => {
+                let _ = self.senders.pipeline_to_constellation_sender.send((webview_id, pipeline_id, ScriptToConstellationMessage::FinishJavaScriptEvaluation(evaluation_id, Err(JavaScriptEvaluationError::InternalError))));
+                return;
+            }
+        };
         rooted!(&in(cx) let mut return_value = UndefinedValue());
         if let Err(err) = global_scope.evaluate_js_on_global(
             cx,
             script.into(),
             "",
-            None, // No known `introductionType` for JS code from embedder
+            introduction_type,
             Some(return_value.handle_mut()),
         ) {
             _ = self.senders.pipeline_to_constellation_sender.send((

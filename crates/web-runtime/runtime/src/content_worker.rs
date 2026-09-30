@@ -1217,7 +1217,9 @@ fn authorize_text_transfer(
     let difference = supplied_capability
         .bytes()
         .zip(expected_capability.bytes())
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right));
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        });
     if !same_length || difference != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1227,9 +1229,7 @@ fn authorize_text_transfer(
     let valid_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if path.parent() != Some(transfer_root) || !valid_name {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1463,11 +1463,7 @@ impl ContentEngine {
         }
     }
 
-    fn spin_until(
-        &self,
-        timeout: Duration,
-        predicate: impl FnMut() -> bool,
-    ) -> io::Result<bool> {
+    fn spin_until(&self, timeout: Duration, predicate: impl FnMut() -> bool) -> io::Result<bool> {
         self.spin_until_on(&self.wake, timeout, predicate)
     }
 
@@ -1889,6 +1885,30 @@ impl ContentEngine {
         self.evaluate_until(webview, script, ACTION_TIMEOUT)
     }
 
+    fn evaluate_structured_dom(
+        &self,
+        webview: WebView,
+        request: &serde_json::Value,
+    ) -> io::Result<JSValue> {
+        let saved = Rc::new(RefCell::new(None));
+        let callback_slot = Rc::clone(&saved);
+        webview.evaluate_structured_dom(request.to_string(), move |result| {
+            *callback_slot.borrow_mut() = Some(result);
+        });
+        let ready = Rc::clone(&saved);
+        if !self.spin_until(ACTION_TIMEOUT, move || ready.borrow().is_some())? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out evaluating structured DOM query",
+            ));
+        }
+        saved
+            .borrow_mut()
+            .take()
+            .expect("evaluation completed")
+            .map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
+    }
+
     /// Playwright awaits a Promise returned by `page.evaluate`. Servo's
     /// evaluate callback reports the Promise object itself, whose enumerable
     /// property map is empty, so serialize it through a page-realm slot and
@@ -1909,9 +1929,9 @@ impl ContentEngine {
         script: &str,
         timeout: Duration,
     ) -> io::Result<JSValue> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout"))?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid evaluate timeout")
+        })?;
         let token = alloc_wait_nonce()?;
         let key = Self::wait_slot_key(&token);
         let key_js = serde_json::to_string(&key).map_err(io::Error::other)?;
@@ -1945,11 +1965,15 @@ impl ContentEngine {
         };
         let JSValue::Array(mut parts) = first else {
             self.drop_wait_slot(&webview, &token, None);
-            return Err(io::Error::other("page.evaluate returned an invalid await envelope"));
+            return Err(io::Error::other(
+                "page.evaluate returned an invalid await envelope",
+            ));
         };
         if parts.len() < 2 {
             self.drop_wait_slot(&webview, &token, None);
-            return Err(io::Error::other("page.evaluate returned an incomplete await envelope"));
+            return Err(io::Error::other(
+                "page.evaluate returned an incomplete await envelope",
+            ));
         }
         let value = parts.remove(1);
         let pending = match parts.remove(0) {
@@ -3115,6 +3139,12 @@ impl ContentEngine {
                 let source = required_str(&params, "source")?;
                 let (webview, delegate) = self.page(&page_id)?.clone();
                 evaluate_serialized(self.evaluate_awaited(webview, &delegate, &source)?)
+            }
+            "page.structuredDom" => {
+                let page_id = required_str(&params, "page")?;
+                let request = params.get("request").ok_or_else(|| io::Error::other("missing request"))?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                evaluate_serialized(self.evaluate_structured_dom(webview, request)?)
             }
             "page.waitForFunction" | "page.waitForBoolean" => {
                 let page_id = required_str(&params, "page")?;
@@ -5335,9 +5365,10 @@ fn response_for_request<'a>(
     request_id: Option<&str>,
 ) -> Option<&'a serde_json::Value> {
     let request_id = request_id?;
-    responses.iter().rev().find(|row| {
-        row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id)
-    })
+    responses
+        .iter()
+        .rev()
+        .find(|row| row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id))
 }
 
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {

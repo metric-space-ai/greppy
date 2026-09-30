@@ -1069,6 +1069,7 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.structured_dom" => self.web_structured_dom(&request),
             "web.wait" => self.web_wait(&request),
             "web.workflow" => self.web_workflow(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
@@ -3397,6 +3398,21 @@ impl Daemon {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn web_structured_dom(&mut self, request: &Request) -> Response {
+        match self.with_session_page(request, "web.structured_dom") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let mut structured = request.payload.clone();
+                if let Some(object) = structured.as_object_mut() { object.remove("session_id"); object.remove("tab_id"); object.remove("agent_id"); }
+                let response = match self.engine_call("page.structuredDom", json!({"page":page,"request":structured})) {
+                    Ok(value) => { let tagged=value.get("serialized").cloned().unwrap_or(json!(null)); Response::ok(request,json!({"session_id":session_id,"value":Self::plain_value(&tagged),"serialized":tagged,"untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT"})) }
+                    Err(error) => engine_error(request,error,34),
+                };
+                self.finish_session(&session_id); response
             }
         }
     }
