@@ -1,6 +1,75 @@
 use super::*;
 use clap::Parser;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn disposable_initializers_use_ensured_path_after_late_durable_store() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let volume = std::path::Path::new("/Volumes/tmp");
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(volume) else {
+        return;
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() == std::fs::metadata("/Volumes").unwrap().dev()
+    {
+        return;
+    }
+    let _restore = EnvRestore::capture(&["HOME", "GREPPY_STORE_DIR"]);
+    let base = tempfile::tempdir().unwrap();
+    assert!(
+        base.path().starts_with(volume),
+        "fixture TMPDIR must use disposable volume"
+    );
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("HOME", base.path().join("home"));
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let repo = base.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    // Reproduce the review interleaving before any tmp ownership is established.
+    let cached_lookup = workspace_locator::store_path(&repo);
+    assert!(!cached_lookup.exists());
+    let durable_data = greppy_core::cache::data_root();
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &durable_data);
+    }
+    let old_store = ensured_workspace_store_path(&repo).unwrap();
+    unsafe {
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let ensured = ensured_workspace_store_path(&repo).unwrap();
+    assert_eq!(ensured, old_store);
+    assert_ne!(ensured, cached_lookup);
+    // Initialization locks and opens the returned authoritative path. The
+    // writer identity remains the workspace hash even across path selection.
+    let writer = greppy_freshness::try_acquire(&ensured).unwrap();
+    assert_eq!(writer.path(), greppy_freshness::lock_path_for(&ensured));
+    assert_eq!(
+        writer.path(),
+        greppy_freshness::lock_path_for(&cached_lookup)
+    );
+    assert!(matches!(
+        greppy_freshness::try_acquire(&cached_lookup),
+        Err(greppy_freshness::LockError::Held { .. })
+    ));
+    let store = open_default_store_pack_writer(Some(repo.to_str().unwrap())).unwrap();
+    let opened: String = store
+        .conn()
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(&opened).canonicalize().unwrap(),
+        ensured.canonicalize().unwrap()
+    );
+    assert!(!cached_lookup.exists());
+    assert!(!cached_lookup.parent().unwrap().exists());
+    drop(store);
+    drop(writer);
+}
+
 struct InterruptedOnce {
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }

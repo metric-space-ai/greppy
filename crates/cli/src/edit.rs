@@ -64,9 +64,8 @@ pub(crate) fn dispatch_edit_inner(
     let _transaction_lock = if dry_run {
         None
     } else {
-        Some(acquire_edit_transaction_lock(&edit_journal_dir(
-            &root_path,
-        ))?)
+        let journal = ensured_workspace_store_path(&root_path)?.with_file_name(EDIT_JOURNAL_DIR);
+        Some(acquire_edit_transaction_lock(&journal)?)
     };
     Ok(dispatch_edit_grammar(command, json, root, &root_path, &file_base)?.0)
 }
@@ -1360,7 +1359,9 @@ pub(crate) fn edit_journal_open(
     if before.is_empty() {
         return None;
     }
-    let dir = edit_journal_dir(root_path);
+    let dir = ensured_workspace_store_path(root_path)
+        .ok()?
+        .with_file_name(EDIT_JOURNAL_DIR);
     std::fs::create_dir_all(dir.join(EDIT_JOURNAL_BLOBS)).ok()?;
     let seed = format!(
         "{}-{}",

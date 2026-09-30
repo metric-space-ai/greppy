@@ -558,7 +558,126 @@ pub fn trash_root() -> PathBuf {
 }
 
 pub fn workspace_store_dir(workspace_root: &Path) -> PathBuf {
-    workspaces_root().join(crate::workspace::workspace_hash(workspace_root))
+    workspace_stores_root(workspace_root).join(crate::workspace::workspace_hash(workspace_root))
+}
+
+/// Route new disposable workspace stores without relocating a live cache.
+/// The complete retained directory remains authoritative until an explicit,
+/// coordinated migration can account for old clients and all CoW sidecars.
+/// Shared model/Base caches and workspace lock identities remain unchanged.
+fn workspace_stores_root(workspace_root: &Path) -> PathBuf {
+    let durable = workspaces_root();
+    workspace_stores_root_for(
+        workspace_root,
+        &durable,
+        &data_root(),
+        std::env::var_os("GREPPY_STORE_DIR").is_some(),
+        Path::new("/Volumes/tmp"),
+    )
+}
+
+fn workspace_stores_root_for(
+    workspace_root: &Path,
+    durable: &Path,
+    data: &Path,
+    explicit: bool,
+    volume: &Path,
+) -> PathBuf {
+    let hash = crate::workspace::workspace_hash(workspace_root);
+    let disposable = disposable_workspaces_root(volume);
+    if !explicit
+        && (workspace_root.starts_with(volume)
+            || canonical_root(workspace_root).starts_with(volume))
+        && (!fs::symlink_metadata(disposable.join(&hash))
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            || (fs::symlink_metadata(durable.join(&hash))
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+                && fs::symlink_metadata(data.join(&hash))
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)))
+    {
+        disposable
+    } else {
+        durable.to_path_buf()
+    }
+}
+
+fn disposable_workspaces_root(volume: &Path) -> PathBuf {
+    volume
+        .join("dev-artifacts/greppy/workspace-stores")
+        .join(format!("v{STORE_FORMAT_VERSION}"))
+}
+
+fn validate_existing_disposable_store(dir: &Path, workspace: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(io::Error::other(
+                "invalid disposable workspace store directory",
+            ))
+        }
+    }
+    match read_store_manifest(dir) {
+        Ok(manifest) if manifest.canonical_root == canonical_root(workspace) => Ok(()),
+        Ok(_) => Err(io::Error::other(
+            "disposable workspace store manifest identity mismatch",
+        )),
+        // Recover an empty directory left between mkdir and manifest publication,
+        // but never adopt unowned graph/sidecar bytes as a new managed store.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::read_dir(dir)?.next().is_none() => {
+            Ok(())
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "invalid retained disposable store at {}: {e}",
+                dir.display()
+            ),
+        )),
+    }
+}
+
+fn ensure_disposable_namespace(root: &Path, volume: &Path) -> io::Result<()> {
+    validate_disposable_volume(volume)?;
+    ensure_disposable_children(root, volume)
+}
+
+fn validate_disposable_volume(volume: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(volume)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "disposable cache volume is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = volume
+            .parent()
+            .ok_or_else(|| io::Error::other("missing volume parent"))?;
+        if metadata.dev() == fs::metadata(parent)?.dev() {
+            return Err(io::Error::other(
+                "disposable cache volume is not mounted; refusing system-disk fallback",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_disposable_children(root: &Path, volume: &Path) -> io::Result<()> {
+    let relative = root
+        .strip_prefix(volume)
+        .map_err(|_| io::Error::other("cache namespace escapes disposable volume"))?;
+    let mut current = volume.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(io::Error::other("invalid disposable cache namespace"));
+        }
+        current.push(component.as_os_str());
+        ensure_one_directory(&current)?;
+    }
+    Ok(())
 }
 
 pub fn workspace_store_path(workspace_root: &Path) -> PathBuf {
@@ -570,12 +689,34 @@ pub fn legacy_workspace_store_dir(workspace_root: &Path) -> PathBuf {
 }
 
 pub fn ensure_workspace_store(workspace_root: &Path) -> io::Result<PathBuf> {
+    let stores = workspace_stores_root(workspace_root);
+    if stores != workspaces_root() {
+        let volume = Path::new("/Volumes/tmp");
+        if !canonical_root(workspace_root).starts_with(volume) {
+            return Err(io::Error::other(
+                "disposable workspace resolves outside /Volumes/tmp",
+            ));
+        }
+        ensure_disposable_namespace(&stores, volume)?;
+    }
     ensure_owned_namespace(&data_root())?;
-    ensure_owned_namespace(&workspaces_root())?;
+    if stores == workspaces_root() {
+        ensure_owned_namespace(&stores)?;
+    }
     ensure_owned_namespace(&locks_root())?;
     ensure_owned_namespace(&trash_root())?;
-    let dir = workspace_store_dir(workspace_root);
+    // Hold the selected path throughout initialization; late old-client stores
+    // cannot redirect this operation to an unrelated cache.
+    let dir = stores.join(crate::workspace::workspace_hash(workspace_root));
+    if stores != workspaces_root() {
+        validate_existing_disposable_store(&dir, workspace_root)?;
+    }
     ensure_owned_namespace(&dir)?;
+    ensure_workspace_manifest(&dir, workspace_root)?;
+    Ok(dir)
+}
+
+fn ensure_workspace_manifest(dir: &Path, workspace_root: &Path) -> io::Result<()> {
     let expected = StoreManifest {
         format_version: STORE_FORMAT_VERSION,
         workspace_hash: crate::workspace::workspace_hash(workspace_root),
@@ -599,8 +740,8 @@ pub fn ensure_workspace_store(workspace_root: &Path) -> io::Result<PathBuf> {
         }
         Err(e) => return Err(e),
     }
-    touch_last_used_dir(&dir);
-    Ok(dir)
+    touch_last_used_dir(dir);
+    Ok(())
 }
 
 /// Create one model digest directory without following symlinked namespace
@@ -962,48 +1103,81 @@ fn remove_managed_entry(
     }
 }
 
+fn scan_workspace_namespace(
+    root: &Path,
+    anchor: &Path,
+    source_prefix: Option<&Path>,
+    mark_new_orphans: bool,
+    entries: &mut Vec<ManagedEntry>,
+    unmanaged_paths: &mut Vec<PathBuf>,
+    unmanaged: &mut u64,
+) -> io::Result<()> {
+    if !namespace_chain_is_safe_in(root, anchor) {
+        if fs::symlink_metadata(root).is_ok() {
+            unmanaged_paths.push(root.to_path_buf());
+        }
+        return Ok(());
+    }
+    for item in fs::read_dir(root)?.flatten() {
+        let path = item.path();
+        let manifest = read_store_manifest(&path)
+            .ok()
+            .filter(|m| source_prefix.is_none_or(|prefix| m.canonical_root.starts_with(prefix)));
+        if let Some(manifest) = manifest {
+            let last_used = read_last_used(&path).unwrap_or_else(|| {
+                fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(UNIX_EPOCH)
+            });
+            let orphaned = !manifest.canonical_root.exists();
+            let orphaned_since = update_orphan_marker(&path, orphaned, mark_new_orphans);
+            entries.push(ManagedEntry {
+                kind: ManagedKind::Workspace,
+                id: manifest.workspace_hash,
+                path: path.clone(),
+                workspace_root: Some(manifest.canonical_root),
+                bytes: path_size_no_symlink(&path),
+                last_used,
+                orphaned,
+                orphaned_since,
+            });
+        } else {
+            *unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
+            unmanaged_paths.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn scan_entries(mark_new_orphans: bool) -> io::Result<(Vec<ManagedEntry>, Vec<PathBuf>, u64)> {
     let mut entries = Vec::new();
     let mut unmanaged_paths = Vec::new();
     let mut unmanaged = 0u64;
-    let ws_root = workspaces_root();
-    if namespace_chain_is_safe(&ws_root) {
-        let rd = fs::read_dir(&ws_root)?;
-        for item in rd.flatten() {
-            let path = item.path();
-            if item.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
-                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
-                unmanaged_paths.push(path);
-                continue;
-            }
-            match read_store_manifest(&path) {
-                Ok(manifest) => {
-                    let last_used = read_last_used(&path).unwrap_or_else(|| {
-                        fs::metadata(&path)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(UNIX_EPOCH)
-                    });
-                    let orphaned = !manifest.canonical_root.exists();
-                    let orphaned_since = update_orphan_marker(&path, orphaned, mark_new_orphans);
-                    entries.push(ManagedEntry {
-                        kind: ManagedKind::Workspace,
-                        id: manifest.workspace_hash,
-                        path: path.clone(),
-                        workspace_root: Some(manifest.canonical_root.clone()),
-                        bytes: path_size_no_symlink(&path),
-                        last_used,
-                        orphaned,
-                        orphaned_since,
-                    });
-                }
-                Err(_) => {
-                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
-                    unmanaged_paths.push(path);
-                }
-            }
+    scan_workspace_namespace(
+        &workspaces_root(),
+        &data_root(),
+        None,
+        mark_new_orphans,
+        &mut entries,
+        &mut unmanaged_paths,
+        &mut unmanaged,
+    )?;
+    if std::env::var_os("GREPPY_STORE_DIR").is_none() {
+        let volume = Path::new("/Volumes/tmp");
+        let root = disposable_workspaces_root(volume);
+        if validate_disposable_volume(volume).is_ok() {
+            scan_workspace_namespace(
+                &root,
+                volume,
+                Some(volume),
+                mark_new_orphans,
+                &mut entries,
+                &mut unmanaged_paths,
+                &mut unmanaged,
+            )?;
+        } else if fs::symlink_metadata(&root).is_ok() {
+            unmanaged_paths.push(root);
         }
-    } else if ws_root.exists() {
-        unmanaged_paths.push(ws_root.clone());
     }
     let models = models_root();
     if namespace_chain_is_safe(&models) {
@@ -1173,17 +1347,18 @@ fn scan_entries(mark_new_orphans: bool) -> io::Result<(Vec<ManagedEntry>, Vec<Pa
             unmanaged_paths.push(path);
         }
     }
-    if namespace_chain_is_safe(&trash_root()) {
-        let trash_entries = fs::read_dir(trash_root())?;
-        for entry in trash_entries.flatten() {
-            let path = entry.path();
-            if !trash_entry_is_verified(&path) {
-                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
-                unmanaged_paths.push(path);
+    for (root, anchor) in cache_trash_roots() {
+        if namespace_chain_is_safe_in(&root, &anchor) {
+            for entry in fs::read_dir(&root)?.flatten() {
+                let path = entry.path();
+                if !trash_entry_is_verified(&path) {
+                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
+                    unmanaged_paths.push(path);
+                }
             }
+        } else if fs::symlink_metadata(&root).is_ok() {
+            unmanaged_paths.push(root);
         }
-    } else if trash_root().exists() {
-        unmanaged_paths.push(trash_root());
     }
     unmanaged_paths.sort();
     unmanaged_paths.dedup();
@@ -1220,25 +1395,89 @@ fn read_unix_timestamp(path: &Path) -> Option<SystemTime> {
         .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
-fn try_entry_lock(entry: &ManagedEntry) -> io::Result<Option<FileLock>> {
+fn workspace_gc_locks_in(data: &Path, id: &str) -> io::Result<Option<Vec<FileLock>>> {
+    let Some(lease) = acquire_named_lock_in(
+        data,
+        &format!("workspace-{id}.lease"),
+        LockMode::Exclusive,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(writer) = acquire_named_lock_in(
+        data,
+        &format!("workspace-{id}.writer"),
+        LockMode::Exclusive,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(vec![lease, writer]))
+}
+
+fn try_entry_lock(entry: &ManagedEntry) -> io::Result<Option<Vec<FileLock>>> {
     match entry.kind {
-        ManagedKind::Workspace => acquire_named_lock(
-            &format!("workspace-{}.lease", entry.id),
-            LockMode::Exclusive,
-            true,
-        ),
-        ManagedKind::Model => acquire_model_lifecycle(&entry.id, LockMode::Exclusive, true),
+        ManagedKind::Workspace => workspace_gc_locks_in(&data_root(), &entry.id),
+        ManagedKind::Model => acquire_model_lifecycle(&entry.id, LockMode::Exclusive, true)
+            .map(|lock| lock.map(|lock| vec![lock])),
         ManagedKind::AgentBase => acquire_named_lock(
             &format!("agent-base-{}.builder", entry.id),
             LockMode::Exclusive,
             true,
-        ),
+        )
+        .map(|lock| lock.map(|lock| vec![lock])),
     }
 }
 
+fn disposable_trash_root(volume: &Path) -> PathBuf {
+    volume.join("dev-artifacts/greppy/workspace-stores/trash")
+}
+
+fn cache_trash_roots() -> Vec<(PathBuf, PathBuf)> {
+    let mut roots = vec![(trash_root(), data_root())];
+    let volume = Path::new("/Volumes/tmp");
+    if std::env::var_os("GREPPY_STORE_DIR").is_none() && validate_disposable_volume(volume).is_ok()
+    {
+        roots.push((disposable_trash_root(volume), volume.to_path_buf()));
+    }
+    roots
+}
+
 fn move_to_trash(entry: &ManagedEntry) -> io::Result<PathBuf> {
-    ensure_owned_namespace(&trash_root())?;
-    let target = trash_root().join(format!(
+    let volume = Path::new("/Volumes/tmp");
+    let disposable = disposable_workspaces_root(volume);
+    let root = if entry.kind == ManagedKind::Workspace
+        && entry.path.parent() == Some(disposable.as_path())
+    {
+        validate_disposable_volume(volume)?;
+        if !namespace_chain_is_safe_in(&entry.path, volume) {
+            return Err(io::Error::other(
+                "unsafe disposable cache namespace during removal",
+            ));
+        }
+        let manifest = read_store_manifest(&entry.path)?;
+        if manifest.workspace_hash != entry.id
+            || !manifest.canonical_root.starts_with(volume)
+            || entry.workspace_root.as_ref() != Some(&manifest.canonical_root)
+        {
+            return Err(io::Error::other(
+                "disposable cache identity changed during removal",
+            ));
+        }
+        let root = disposable_trash_root(volume);
+        ensure_disposable_namespace(&root, volume)?;
+        root
+    } else {
+        ensure_owned_namespace(&trash_root())?;
+        trash_root()
+    };
+    rename_entry_to_trash(entry, &root)
+}
+
+fn rename_entry_to_trash(entry: &ManagedEntry, root: &Path) -> io::Result<PathBuf> {
+    let target = root.join(format!(
         "{}-{}-{}-{}",
         entry.kind.as_str(),
         entry.id,
@@ -1250,19 +1489,15 @@ fn move_to_trash(entry: &ManagedEntry) -> io::Result<PathBuf> {
 }
 
 fn cleanup_trash() -> io::Result<()> {
-    let root = trash_root();
-    if root.exists() && !namespace_chain_is_safe(&root) {
-        return Ok(());
-    }
-    let rd = match fs::read_dir(&root) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if trash_entry_is_verified(&path) {
-            let _ = remove_path_no_symlink(&path);
+    for (root, anchor) in cache_trash_roots() {
+        if !namespace_chain_is_safe_in(&root, &anchor) {
+            continue;
+        }
+        for entry in fs::read_dir(&root)?.flatten() {
+            let path = entry.path();
+            if trash_entry_is_verified(&path) {
+                let _ = remove_path_no_symlink(&path);
+            }
         }
     }
     Ok(())
@@ -1670,11 +1905,14 @@ fn secure_windows_path(path: &Path) -> io::Result<()> {
 }
 
 fn namespace_chain_is_safe(dir: &Path) -> bool {
-    let data = data_root();
-    let Ok(relative) = dir.strip_prefix(&data) else {
+    namespace_chain_is_safe_in(dir, &data_root())
+}
+
+fn namespace_chain_is_safe_in(dir: &Path, anchor: &Path) -> bool {
+    let Ok(relative) = dir.strip_prefix(anchor) else {
         return false;
     };
-    let mut current = data;
+    let mut current = anchor.to_path_buf();
     let safe_dir = |path: &Path| {
         fs::symlink_metadata(path)
             .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
@@ -1684,6 +1922,9 @@ fn namespace_chain_is_safe(dir: &Path) -> bool {
         return false;
     }
     for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return false;
+        }
         current.push(component.as_os_str());
         if !safe_dir(&current) {
             return false;
@@ -1859,6 +2100,93 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::*;
 
+    #[test]
+    fn disposable_store_routing_preserves_retained_data_and_overrides() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-routing");
+        let volume = base.join("volume");
+        let repo = volume.join("worktrees/project/task");
+        fs::create_dir_all(&repo).unwrap();
+        let data = base.join("durable");
+        let durable = data.join("workspaces/v2");
+        let route = || workspace_stores_root_for(&repo, &durable, &data, false, &volume);
+        assert_eq!(
+            route(),
+            volume.join("dev-artifacts/greppy/workspace-stores/v2")
+        );
+        assert_eq!(
+            workspace_stores_root_for(&repo, &durable, &data, true, &volume),
+            durable
+        );
+        assert_eq!(
+            workspace_stores_root_for(&base.join("canonical"), &durable, &data, false, &volume),
+            durable
+        );
+        let retained = durable.join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(retained.join("cow/nested")).unwrap();
+        for name in [
+            "graph.db",
+            "graph.db-wal",
+            "embeddings.bin",
+            "cow/nested/delta.db",
+        ] {
+            fs::write(retained.join(name), name.as_bytes()).unwrap();
+        }
+        assert_eq!(route(), durable);
+        // Retaining the entire directory does not need writer quiescence or
+        // select a fresh graph when a sidecar/client is still present.
+        let lock = acquire_named_lock_in(
+            &data,
+            &format!(
+                "workspace-{}.writer",
+                crate::workspace::workspace_hash(&repo)
+            ),
+            LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(route(), durable);
+        for name in [
+            "graph.db",
+            "graph.db-wal",
+            "embeddings.bin",
+            "cow/nested/delta.db",
+        ] {
+            assert_eq!(fs::read(retained.join(name)).unwrap(), name.as_bytes());
+        }
+        drop(lock);
+        assert_eq!(route(), durable);
+        fs::remove_dir_all(&retained).unwrap();
+        let legacy = data.join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("graph.db"), b"legacy").unwrap();
+        assert_eq!(route(), durable);
+        assert_eq!(fs::read(legacy.join("graph.db")).unwrap(), b"legacy");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disposable_namespace_never_creates_missing_or_unmounted_volume() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-volume");
+        let missing = base.join("missing");
+        assert!(ensure_disposable_namespace(&missing.join("stores"), &missing).is_err());
+        assert!(!missing.exists());
+        #[cfg(unix)]
+        {
+            let unmounted = base.join("unmounted");
+            fs::create_dir(&unmounted).unwrap();
+            assert!(ensure_disposable_namespace(&unmounted.join("stores"), &unmounted).is_err());
+            assert!(!unmounted.join("stores").exists());
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&unmounted, &alias).unwrap();
+            assert!(ensure_disposable_namespace(&alias.join("stores"), &alias).is_err());
+            assert!(!unmounted.join("stores").exists());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn private_acl_and_atomic_write_accept_long_existing_paths() {
@@ -1904,6 +2232,273 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposable_namespace_rejects_symlinks_and_routes_workspace_aliases() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-symlink");
+        let volume = base.join("volume");
+        let outside = base.join("outside");
+        fs::create_dir_all(volume.join("worktrees/repo")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, volume.join("dev-artifacts")).unwrap();
+        assert!(ensure_disposable_children(&volume.join("dev-artifacts/stores"), &volume).is_err());
+        assert!(!outside.join("stores").exists());
+        let alias = base.join("repo-alias");
+        std::os::unix::fs::symlink(volume.join("worktrees/repo"), &alias).unwrap();
+        let durable = base.join("durable/workspaces/v2");
+        assert_eq!(
+            workspace_stores_root_for(&alias, &durable, &base.join("durable"), false, &volume),
+            volume.join("dev-artifacts/greppy/workspace-stores/v2")
+        );
+        assert!(ensure_disposable_children(&base.join("escape"), &volume).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disposable_store_selection_is_stable_in_both_creation_orders() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-orders");
+        let volume = base.join("volume");
+        let data = base.join("data");
+        let durable = data.join("workspaces/v2");
+        for old_first in [false, true] {
+            let repo = volume.join(if old_first { "old-first" } else { "tmp-first" });
+            fs::create_dir_all(&repo).unwrap();
+            let hash = crate::workspace::workspace_hash(&repo);
+            let old = durable.join(&hash);
+            let tmp_root = disposable_workspaces_root(&volume);
+            let tmp = tmp_root.join(&hash);
+            let lookup =
+                || workspace_stores_root_for(&repo, &durable, &data, false, &volume).join(&hash);
+            if old_first {
+                fs::create_dir_all(&old).unwrap();
+                ensure_workspace_manifest(&old, &repo).unwrap();
+                assert_eq!(lookup(), old);
+            } else {
+                assert_eq!(lookup(), tmp);
+            }
+            // The exact same manifest helper is used by ensure_workspace_store.
+            fs::create_dir_all(&tmp).unwrap();
+            validate_existing_disposable_store(&tmp, &repo).unwrap();
+            ensure_workspace_manifest(&tmp, &repo).unwrap();
+            fs::write(tmp.join("graph.db"), b"selected tmp graph").unwrap();
+            if !old_first {
+                fs::create_dir_all(&old).unwrap();
+                ensure_workspace_manifest(&old, &repo).unwrap();
+            }
+            fs::write(old.join("graph.db"), b"retained old graph").unwrap();
+            assert_eq!(lookup(), tmp);
+            validate_existing_disposable_store(&tmp, &repo).unwrap();
+            ensure_workspace_manifest(&tmp, &repo).unwrap();
+            assert_eq!(lookup(), tmp);
+            assert_eq!(
+                fs::read(tmp.join("graph.db")).unwrap(),
+                b"selected tmp graph"
+            );
+            assert_eq!(
+                fs::read(old.join("graph.db")).unwrap(),
+                b"retained old graph"
+            );
+        }
+        let repo = volume.join("unowned");
+        fs::create_dir_all(&repo).unwrap();
+        let tmp = disposable_workspaces_root(&volume).join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("graph.db"), b"unowned bytes").unwrap();
+        assert!(validate_existing_disposable_store(&tmp, &repo).is_err());
+        assert!(!tmp.join(STORE_MANIFEST_FILE).exists());
+        fs::write(tmp.join(STORE_MANIFEST_FILE), b"invalid manifest").unwrap();
+        assert!(validate_existing_disposable_store(&tmp, &repo).is_err());
+        assert_eq!(fs::read(tmp.join("graph.db")).unwrap(), b"unowned bytes");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disposable_inventory_ownership_and_gc_locks_preserve_foreign_entries() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-inventory");
+        let volume = base.join("volume");
+        let stores = disposable_workspaces_root(&volume);
+        let repo = volume.join("repo");
+        let foreign_repo = base.join("foreign-repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&foreign_repo).unwrap();
+        let hash = crate::workspace::workspace_hash(&repo);
+        let store = stores.join(&hash);
+        fs::create_dir_all(store.join("cow")).unwrap();
+        ensure_workspace_manifest(&store, &repo).unwrap();
+        fs::write(store.join("graph.db"), b"graph").unwrap();
+        fs::write(store.join("cow/delta.db"), b"delta").unwrap();
+        let foreign = stores.join(crate::workspace::workspace_hash(&foreign_repo));
+        fs::create_dir_all(&foreign).unwrap();
+        ensure_workspace_manifest(&foreign, &foreign_repo).unwrap();
+        fs::write(foreign.join("graph.db"), b"foreign").unwrap();
+        let unowned = stores.join("unowned");
+        fs::create_dir_all(&unowned).unwrap();
+        fs::write(unowned.join("sentinel"), b"keep").unwrap();
+        let mut entries = Vec::new();
+        let mut unmanaged = Vec::new();
+        let mut unmanaged_bytes = 0;
+        scan_workspace_namespace(
+            &stores,
+            &volume,
+            Some(&volume),
+            false,
+            &mut entries,
+            &mut unmanaged,
+            &mut unmanaged_bytes,
+        )
+        .unwrap();
+        let data = base.join("data");
+        let durable = data.join("workspaces/v2");
+        let old_store = durable.join(&hash);
+        fs::create_dir_all(&old_store).unwrap();
+        ensure_workspace_manifest(&old_store, &repo).unwrap();
+        fs::write(old_store.join("graph.db"), b"old graph").unwrap();
+        scan_workspace_namespace(
+            &durable,
+            &data,
+            None,
+            false,
+            &mut entries,
+            &mut unmanaged,
+            &mut unmanaged_bytes,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, store);
+        assert_eq!(entries[1].path, old_store);
+        assert!(entries[0].bytes >= 10);
+        assert!(unmanaged.contains(&foreign));
+        assert!(unmanaged.contains(&unowned));
+        let writer = acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.writer"),
+            LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(workspace_gc_locks_in(&data, &hash).unwrap().is_none());
+        assert_eq!(fs::read(store.join("graph.db")).unwrap(), b"graph");
+        drop(writer);
+        let lease = acquire_named_lock_in(
+            &data,
+            &format!("workspace-{hash}.lease"),
+            LockMode::Shared,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(workspace_gc_locks_in(&data, &hash).unwrap().is_none());
+        drop(lease);
+        let _gc_locks = workspace_gc_locks_in(&data, &hash).unwrap().unwrap();
+        let trash = disposable_trash_root(&volume);
+        ensure_disposable_children(&trash, &volume).unwrap();
+        let trashed = rename_entry_to_trash(&entries[0], &trash).unwrap();
+        assert!(trashed.starts_with(&volume));
+        assert!(trash_entry_is_verified(&trashed));
+        assert_eq!(fs::read(trashed.join("cow/delta.db")).unwrap(), b"delta");
+        remove_path_no_symlink(&trashed).unwrap();
+        assert!(!store.exists());
+        assert_eq!(fs::read(old_store.join("graph.db")).unwrap(), b"old graph");
+        assert_eq!(fs::read(foreign.join("graph.db")).unwrap(), b"foreign");
+        assert_eq!(fs::read(unowned.join("sentinel")).unwrap(), b"keep");
+        drop(_gc_locks);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposable_inventory_does_not_follow_namespace_symlinks() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("disposable-inventory-alias");
+        let volume = base.join("volume");
+        let outside = base.join("outside");
+        fs::create_dir_all(&volume).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, volume.join("dev-artifacts")).unwrap();
+        let mut entries = Vec::new();
+        let mut unmanaged = Vec::new();
+        let mut bytes = 0;
+        scan_workspace_namespace(
+            &disposable_workspaces_root(&volume),
+            &volume,
+            Some(&volume),
+            true,
+            &mut entries,
+            &mut unmanaged,
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(bytes, 0);
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+        assert!(!outside.join(".orphaned_since").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disposable_public_lookup_and_ensure_agree_after_late_old_store() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        if validate_disposable_volume(Path::new("/Volumes/tmp")).is_err() {
+            return; // Portable runners have no designated mounted tmp volume.
+        }
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, old) in &self.0 {
+                    if let Some(value) = old {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            ["HOME", "GREPPY_STORE_DIR"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        let base = tempdir("disposable-public");
+        assert!(
+            base.starts_with("/Volumes/tmp"),
+            "fixture TMPDIR must use disposable volume"
+        );
+        std::env::set_var("HOME", base.join("home"));
+        std::env::remove_var("GREPPY_STORE_DIR");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let selected = workspace_store_dir(&repo);
+        assert!(selected.starts_with(disposable_workspaces_root(Path::new("/Volumes/tmp"))));
+        assert!(
+            !selected.exists(),
+            "fixture must own a fresh workspace identity"
+        );
+        assert_eq!(ensure_workspace_store(&repo).unwrap(), selected);
+        fs::write(selected.join("graph.db"), b"selected").unwrap();
+        let old = workspaces_root().join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(&old).unwrap();
+        ensure_workspace_manifest(&old, &repo).unwrap();
+        fs::write(old.join("graph.db"), b"old").unwrap();
+        assert_eq!(workspace_store_dir(&repo), selected);
+        assert_eq!(ensure_workspace_store(&repo).unwrap(), selected);
+        assert_eq!(workspace_store_path(&repo), selected.join("graph.db"));
+        assert_eq!(fs::read(selected.join("graph.db")).unwrap(), b"selected");
+        assert_eq!(fs::read(old.join("graph.db")).unwrap(), b"old");
+        assert_eq!(
+            read_store_manifest(&selected).unwrap().canonical_root,
+            repo.canonicalize().unwrap()
+        );
+        fs::remove_dir_all(selected).unwrap();
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn tempdir(tag: &str) -> PathBuf {

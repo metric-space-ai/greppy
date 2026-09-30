@@ -1735,7 +1735,9 @@ pub(crate) fn semantic_vector_purposes(
     // One cache connection for every purpose span of this command.
     #[cfg(any(unix, windows))]
     let summary_cache = summary_runtime.as_ref().and_then(|_| {
-        greppy_store::SummaryCache::open(&workspace_locator::store_dir(&root_path)).ok()
+        greppy_core::cache::ensure_workspace_store(&root_path)
+            .ok()
+            .and_then(|directory| greppy_store::SummaryCache::open(&directory).ok())
     });
     #[cfg(any(unix, windows))]
     let base_summary_cache = summary_runtime.as_ref().and_then(|_| {
