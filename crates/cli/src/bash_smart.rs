@@ -43,7 +43,7 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error\b|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -2580,6 +2580,25 @@ mod tests {
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn error_help_prose_is_not_a_diagnostic_but_explicit_markers_remain() {
+        let prose = split_lines(b"Usage: vp lint [OPTIONS]\n  --max-warnings <COUNT>\n      error status if there are too many warning-level rule violations in\n      error handling is configurable\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
+        assert!(detect_blocks(&[], &prose).is_empty());
+        for diagnostic in [
+            "error: lint failed\n",
+            "error[E0308]: mismatched types\n",
+            "ERROR: unavailable\n",
+            "error\n",
+        ] {
+            let lines = split_lines(diagnostic.as_bytes());
+            for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
+                assert_eq!(blocks.len(), 1, "{diagnostic}");
+                assert_eq!(blocks[0].kind, BlockKind::Error);
+            }
+        }
     }
 
     #[test]

@@ -303,6 +303,31 @@ fn node_assertion_error_counts_and_keeps_the_original_failure() {
 }
 
 #[test]
+fn lint_help_error_prose_preserves_bytes_and_child_status() {
+    let workspace = fresh_workspace("lint-help-error-prose");
+    let help = "Usage: vp lint [OPTIONS]\n  --max-warnings <COUNT>\n      error status if there are too many warning-level rule violations in\n      the checked files\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{help}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{help}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, help.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
     let workspace = fresh_workspace("typescript-diagnostic");
     for redirect in ["", " >&2"] {
