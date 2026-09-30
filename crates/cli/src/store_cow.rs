@@ -3056,6 +3056,14 @@ mod tests {
     }
 
     fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors_body() {
+        let timing_start = std::time::Instant::now();
+        let timing = |stage: &str| {
+            eprintln!(
+                "cow_repair_stage={stage} elapsed_ms={}",
+                timing_start.elapsed().as_millis()
+            );
+        };
+        timing("start");
         let _env_lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3067,10 +3075,13 @@ mod tests {
             ENV_BASE_COMMIT,
             crate::ENV_STRUCTURAL_FIRST_USE,
         ]);
+        timing("environment-lock-acquired");
         let scratch = tempfile::tempdir().unwrap();
         // The freshness proof compares the live workspace with the exact
         // pinned Git tree, so this regression must use a real repository.
+        timing("fixture-start");
         let repo = fixture();
+        timing("fixture-created");
         // Ordinary navigation resolves an explicit root before locating both
         // workspace state and its store. Persist the synthetic fixture under
         // that same spelling: macOS aliases /var to /private/var, and Windows
@@ -3235,6 +3246,7 @@ mod tests {
             ])
             .unwrap();
         }
+        timing("base-store-populated");
         let base_identity = base_identity_parts(&root, &base_commit).unwrap();
         let base_layout = BaseStoreLayout::new(scratch.path(), &base_identity).unwrap();
         let summary_dir = scratch.path().join("base-summary-cache");
@@ -3247,6 +3259,7 @@ mod tests {
         base_layout
             .publish_graph_with_summary(base_identity, &staged_base_path, &summary_path)
             .unwrap();
+        timing("base-published");
         let base_path = base_layout.graph.clone();
         let caller_rel_path = "src/caller.rs";
         let caller_metadata = greppy_discover::stable_metadata(
@@ -3393,6 +3406,7 @@ mod tests {
                 .unwrap();
         }
 
+        timing("delta-populated");
         let visibility =
             greppy_store::VisibilityIndex::new(["src/caller.rs".to_string()], Vec::<String>::new())
                 .unwrap();
@@ -3455,6 +3469,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
+        timing("freshness-proven");
         let held = greppy_freshness::try_acquire(&delta_path).unwrap();
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_start = std::sync::Arc::clone(&start);
@@ -3473,8 +3488,11 @@ mod tests {
         // Exercise the normal freshness wait budget rather than the old
         // repair-local cap: a legitimate graph-only repair may exceed two
         // seconds while still being a live publication.
+        timing("contending-queries-started");
         std::thread::sleep(std::time::Duration::from_millis(2_500));
+        timing("fixture-sleep-ended");
         drop(held);
+        timing("fixture-lock-released");
         first
             .join()
             .unwrap_or_else(|_| Err("first concurrent query panicked".into()))
