@@ -3113,6 +3113,22 @@ pub(crate) fn run_trained_rename(
                 Ok(true) => {}
                 Err(refusal) => return Ok(Err(refusal)),
             }
+            if selected_local_call_scope
+                && sites.iter().all(|site| {
+                    rust_selected_local_free_function_owns_site(
+                        &content,
+                        &short_name,
+                        *definition_scope,
+                        *site,
+                    )
+                })
+            {
+                scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .extend(sites);
+                continue;
+            }
             match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
                 Ok(None) => continue,
                 Ok(Some(site)) => scopes
@@ -3232,6 +3248,80 @@ pub(crate) fn run_trained_rename(
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(Ok(record))
+}
+
+fn rust_selected_local_free_function_owns_site(
+    content: &[u8],
+    short_name: &str,
+    definition_site: (usize, usize),
+    reference_site: (usize, usize),
+) -> bool {
+    if !rust_local_free_function_owns_site(content, short_name, reference_site) {
+        return false;
+    }
+    let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
+        return false;
+    };
+    let node_at = |site: (usize, usize)| {
+        tree.root_node()
+            .descendant_for_byte_range(site.0, site.1.saturating_sub(1).max(site.0))
+    };
+    let (Some(definition), Some(reference)) = (node_at(definition_site), node_at(reference_site))
+    else {
+        return false;
+    };
+    let mut definition_module = None;
+    let mut ancestor = Some(definition);
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "source_file" | "mod_item") {
+            definition_module = Some((node.start_byte(), node.end_byte()));
+            break;
+        }
+        ancestor = node.parent();
+    }
+    let mut reference_module = None;
+    let mut ancestor = Some(reference);
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "source_file" | "mod_item") {
+            reference_module = Some((node.start_byte(), node.end_byte()));
+            break;
+        }
+        ancestor = node.parent();
+    }
+    if definition_module.is_none() || definition_module != reference_module {
+        return false;
+    }
+
+    // A nested function item can shadow the selected module function for only
+    // part of the caller. Refuse expansion for any site inside such a block;
+    // the persisted edge's exact line remains the only proven site.
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| content.get(name.byte_range()))
+                == Some(short_name.as_bytes())
+            && !node.byte_range().contains(&definition_site.0)
+        {
+            let mut owner = node.parent();
+            while let Some(scope) = owner {
+                if scope.kind() == "block" {
+                    if scope.byte_range().contains(&reference_site.0) {
+                        return false;
+                    }
+                    break;
+                }
+                if matches!(scope.kind(), "source_file" | "mod_item") {
+                    break;
+                }
+                owner = scope.parent();
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
 }
 
 pub(crate) fn dispatch_edit_grammar(
@@ -3821,6 +3911,47 @@ mod patch_rollback_tests {
             source,
             "get_lit_str",
             sites[4]
+        ));
+    }
+
+    #[test]
+    fn selected_local_free_function_proof_rejects_nested_identity_changes() {
+        let block_shadow = b"fn get_lit_str() {}\nfn caller() { get_lit_str(); { fn get_lit_str() {} get_lit_str(); } }\n";
+        let block_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("block.rs"),
+            block_shadow,
+            &[(0, block_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(block_sites.len(), 4);
+        assert!(rust_selected_local_free_function_owns_site(
+            block_shadow,
+            "get_lit_str",
+            block_sites[0],
+            block_sites[1],
+        ));
+        assert!(!rust_selected_local_free_function_owns_site(
+            block_shadow,
+            "get_lit_str",
+            block_sites[0],
+            block_sites[3],
+        ));
+
+        let nested_module = b"fn get_lit_str() {}\nmod other { fn get_lit_str() {} fn caller() { get_lit_str(); } }\n";
+        let module_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("module.rs"),
+            nested_module,
+            &[(0, nested_module.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(module_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            nested_module,
+            "get_lit_str",
+            module_sites[0],
+            module_sites[2],
         ));
     }
 
