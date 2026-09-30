@@ -4119,7 +4119,7 @@ impl Daemon {
             &transfer_root,
             &format!("{session_id}:{}", request.request_id),
         )
-            .map_err(|error| engine_error(request, error, 39))?;
+            .map_err(|error| engine_error(request, error.to_string(), 39))?;
         let transfer_result = self
             .engine_call(
                 "page.textToFile",
@@ -4141,10 +4141,10 @@ impl Daemon {
             .ok_or_else(|| engine_error(request, "page.textToFile missing digest", 39))?;
         let rendered_text = transfer
             .read_verified(transfer_bytes, transfer_digest)
-            .map_err(|error| engine_error(request, error, 39))
+            .map_err(|error| engine_error(request, error.to_string(), 39))
             .and_then(|bytes| {
                 String::from_utf8(bytes)
-                    .map_err(|error| engine_error(request, error, 39))
+                    .map_err(|error| engine_error(request, error.to_string(), 39))
             })?;
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
