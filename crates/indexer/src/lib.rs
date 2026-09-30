@@ -6585,9 +6585,22 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                         .unwrap()
                         .iter()
                         .any(|edge| edge.source_id == source.id),
-                    "missing {edge_type} {} -> {}",
+                    "missing {edge_type} {} -> {}; direct member={:?}; raw={:?}",
                     source.qualified_name,
-                    target.qualified_name
+                    target.qualified_name,
+                    GraphIndex::load(&store, "test")
+                        .unwrap()
+                        .resolve_associated_member(
+                            source.id,
+                            "Instruction::AddImmediateByte",
+                            "AddImmediateByte",
+                            &["EnumVariant"]
+                        ),
+                    load_all_raw_edges(&store, "test")
+                        .unwrap()
+                        .into_iter()
+                        .filter(|edge| edge.source_qualified_name == source.qualified_name)
+                        .collect::<Vec<_>>()
                 );
             }
         }

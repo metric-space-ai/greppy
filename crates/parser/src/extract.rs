@@ -804,8 +804,13 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
     // Try to emit a usage for THIS node.
     if is_rust_reference_kind(node.kind())
         && !rust_usage_is_suppressed(node)
-        && !is_definition_name(node)
+        && (!is_definition_name(node)
+            || node.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "struct_expression" | "struct_pattern")
+            }))
     {
+        // Rust names in struct expressions/patterns reference a value; the
+        // grammar's `name` field does not make them definition names.
         let name_node = rust_reference_leaf(node);
         let text = node_text(source, name_node);
         if !text.is_empty() && !is_rust_keyword_or_self(text) {
@@ -822,6 +827,42 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
         if let Some(child) = node.child(i) {
             walk_rust_usages(source, child, emit);
         }
+    }
+}
+
+#[cfg(test)]
+mod rust_constructor_reference_tests {
+    use super::*;
+
+    #[test]
+    fn structured_rust_value_paths_are_usages_not_definitions() {
+        let code = r#"
+pub enum Instruction { AddImmediateByte { amount: u8 } }
+pub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }
+pub fn state(value: Instruction) -> u8 {
+    match value { Instruction::AddImmediateByte { amount } => amount }
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut paths = Vec::new();
+        walk_rust_usages(code.as_bytes(), tree.root_node(), &mut |_, name, path| {
+            if name == "AddImmediateByte" {
+                paths.push(path.map(str::to_owned));
+            }
+        });
+        assert_eq!(
+            paths,
+            vec![
+                Some("Instruction::AddImmediateByte".into()),
+                Some("Instruction::AddImmediateByte".into()),
+            ],
+            "constructor and pattern are usages; the variant declaration is not"
+        );
     }
 }
 
