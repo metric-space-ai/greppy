@@ -1013,6 +1013,12 @@ pub(super) fn ensure_supervisor(
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(stderr));
             crate::inference_daemon::detach_command(&mut command);
+            if let Err(error) = crate::inference_daemon::seal_detached_child_fds(&mut command) {
+                spawn_error = Some(format!(
+                    "cannot protect detached web-runtime descriptors: {error}"
+                ));
+                return None;
+            }
             match crate::web_attach::give_child_attach_token(&mut command, &issued_for_child) {
                 Ok(pass) => attach_pass = Some(pass),
                 Err(error) => {
