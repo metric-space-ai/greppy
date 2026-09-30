@@ -89,7 +89,6 @@ pub(crate) fn failure_detail(
 
 #[cfg(unix)]
 fn default_gate_lease_is_inherited(gate: &Path) -> bool {
-    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return false;
     };
@@ -101,6 +100,7 @@ fn default_gate_lease_is_inherited(gate: &Path) -> bool {
 
 #[cfg(unix)]
 fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
     let Ok(probe) = fs::File::open(&lock) else {
         return false;
     };
