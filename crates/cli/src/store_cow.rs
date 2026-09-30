@@ -904,6 +904,23 @@ pub(crate) fn persisted_v7_delta_needs_repair(
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
+    if store.is_overlay() && !greppy_indexer::rust_caller_edges_repaired(store)? {
+        let base_marker = store.conn().query_row(
+            "SELECT value FROM greppy_base.schema_meta WHERE key = ?1",
+            [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            |row| row.get::<_, String>(0),
+        );
+        let base_current = match base_marker {
+            Ok(value) => value == RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => return Err(Error::Store(format!("read Base Rust repair marker: {error}"))),
+        };
+        if !base_current {
+            // A sparse Delta rebuild does not certify an older immutable
+            // Base. Leave repair pending for its one-shot visible raw pass.
+            return Ok(());
+        }
+    }
     store
         .conn()
         .execute(
@@ -2734,6 +2751,30 @@ mod tests {
     }
 
     #[test]
+    fn sparse_cow_marker_does_not_certify_an_unrepaired_base() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        }
+        let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(!greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "Delta-only work cannot mark a legacy Base complete");
+        drop(store);
+        let base = greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::query_writer()).unwrap();
+        greppy_indexer::mark_rust_caller_edges_repaired(&base).unwrap();
+        drop(base);
+        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "a current Base makes sparse publication current without a Base pass");
+    }
+
+    #[test]
     fn persisted_single_store_rust_repair_preserves_cache_and_is_one_shot() {
         let test = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -2752,6 +2793,7 @@ mod tests {
             "GREPPY_STORE_DIR",
             "GREPPY_PROJECT_IDENTITY",
             "GREPPY_AUTO_REINDEX",
+            crate::ENV_TEST_SKIP_INFERENCE,
             ENV_MODE,
             ENV_BASE_PATH,
             ENV_BASE_COMMIT,
@@ -2785,6 +2827,7 @@ mod tests {
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
         std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
         std::env::set_var("GREPPY_AUTO_REINDEX", "0");
+        std::env::set_var(crate::ENV_TEST_SKIP_INFERENCE, "1");
         let path = crate::workspace_locator::store_path(&root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut store = greppy_store::Store::open(&path).unwrap();
