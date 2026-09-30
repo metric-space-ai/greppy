@@ -88,13 +88,14 @@ fn structured_dom_script(source: &str) -> Result<Option<String>, ()> {
     if !matches!(op, "find"|"extract") { return Err(()) }
     let selector = object.get("selector").and_then(|v| v.as_str()).ok_or(())?;
     if selector.is_empty() || selector.len() > 16_384 { return Err(()) }
-    let limit = object.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(10_000);
-    let fields = object.get("fields").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let limit = object.get("limit").and_then(|v| v.as_u64()).ok_or(())?;
+    if limit > 10_000 { return Err(()) }
+    let fields = object.get("fields").and_then(|v| v.as_array()).cloned().ok_or(())?;
     let allowed = ["text","href","value","id","tag","checked"];
-    if fields.iter().any(|v| v.as_str().is_none_or(|f| !allowed.contains(&f))) { return Err(()) }
+    if fields.iter().any(|v| v.as_str().is_none_or(|f| !allowed.contains(&f) && !f.strip_prefix("attr:").is_some_and(|name| !name.is_empty()))) { return Err(()) }
     let selector = serde_json::to_string(selector).map_err(|_| ())?;
     let fields = serde_json::to_string(&fields).map_err(|_| ())?;
-    Ok(Some(format!(r#"(function(){{var nodes=Array.prototype.slice.call(document.querySelectorAll({selector}));var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f==='text')o.text=String(e.textContent==null?'':e.textContent).replace(/\s+/g,' ').trim();else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(function(e){{return {{tag:e.tagName.toLowerCase(),id:e.id||null,text:String(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,120)}};}})}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
+    Ok(Some(format!(r#"(function(){{var nodes=Array.prototype.slice.call(document.querySelectorAll({selector}));var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f.indexOf('attr:')===0)o[f]=e.getAttribute(f.slice(5));else if(f==='text')o.text=String(e.textContent==null?'':e.textContent).replace(/\s+/g,' ').trim();else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(function(e){{var b=e.getBoundingClientRect();return {{tag:e.tagName.toLowerCase(),id:e.id||null,text:String(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,120),visible:!!(b.width||b.height)&&getComputedStyle(e).visibility!=='hidden'&&getComputedStyle(e).display!=='none',box:{{x:Math.round(b.x),y:Math.round(b.y),w:Math.round(b.width),h:Math.round(b.height)}}}};}})}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
 }
 fn prepare_embedder_script(source: String, structured: bool) -> Result<(String, bool), ()> {
     if !structured { return Ok((source, false)); }
