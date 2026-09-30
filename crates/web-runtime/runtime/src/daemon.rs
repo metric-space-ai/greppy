@@ -1069,7 +1069,7 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
-            "web.find" | "web.extract" => self.web_structured_dom(&request),
+            "web.structured_dom" => self.web_structured_dom(&request),
             "web.wait" => self.web_wait(&request),
             "web.workflow" => self.web_workflow(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
@@ -3403,7 +3403,7 @@ impl Daemon {
     }
 
     fn web_structured_dom(&mut self, request: &Request) -> Response {
-        match self.with_session_page(request, request.operation.as_str()) {
+        match self.with_session_page(request, "web.structured_dom") {
             Err(response) => response,
             Ok((session_id, page)) => {
                 let mut structured = request.payload.clone();
@@ -3411,15 +3411,34 @@ impl Daemon {
                 let response = match self.engine_call("page.structuredDom", json!({"page":page,"request":structured})) {
                     Ok(value) => {
                         let tagged=value.get("serialized").cloned().unwrap_or(json!(null));
-                        let mut projected=Self::plain_value(&tagged);
-                        if let Some(object)=projected.as_object_mut(){object.insert("session_id".into(),json!(session_id));object.insert("untrusted_content_boundary".into(),json!("UNTRUSTED_PAGE_CONTENT"));}
-                        Response::ok(request,projected)
+                        Self::structured_dom_response(request, &session_id, tagged)
                     }
                     Err(error) => engine_error(request,error,34),
                 };
                 self.finish_session(&session_id); response
             }
         }
+    }
+
+    fn structured_dom_response(
+        request: &Request,
+        session_id: &str,
+        tagged: serde_json::Value,
+    ) -> Response {
+        let value = Self::plain_value(&tagged);
+        let mut response = Response::ok(
+            request,
+            json!({
+                "session_id": session_id,
+                "value": value,
+                "serialized": tagged,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }),
+        );
+        // find/extract historically travel through web.evaluate. Keep that raw
+        // protocol contract while the engine uses a distinct trusted IPC route.
+        response.operation = "web.evaluate".into();
+        response
     }
 
     fn bind_condition_source(
@@ -5895,6 +5914,38 @@ mod script_stage_tests {
         assert!(super::parse_result_cursor("offset=12").is_err());
         assert!(super::parse_result_cursor("sha256:short:0").is_err());
         assert!(super::parse_result_cursor(&format!("sha256:{digest}:x")).is_err());
+    }
+
+    #[test]
+    fn structured_find_and_extract_preserve_raw_evaluate_envelope() {
+        let serialized = json!({
+            "o": [
+                {"k": "count", "v": {"n": 1.0}},
+                {"k": "nodes", "v": {"a": [{"o": [{"k": "text", "v": {"s": "match"}}]}]}},
+            ]
+        });
+        let expected = json!({
+            "session_id": "strict-csp",
+            "value": {"count": 1.0, "nodes": [{"text": "match"}]},
+            "serialized": serialized,
+            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+        });
+
+        for operation in ["find", "extract"] {
+            let request = super::Request::new(
+                format!("structured-{operation}"),
+                "web.structured_dom",
+                json!({"op": operation}),
+            );
+            let response = super::Daemon::structured_dom_response(
+                &request,
+                "strict-csp",
+                expected["serialized"].clone(),
+            );
+
+            assert_eq!(response.operation, "web.evaluate");
+            assert_eq!(response.result, Some(expected.clone()));
+        }
     }
 
     #[test]
