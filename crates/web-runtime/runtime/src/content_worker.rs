@@ -3205,6 +3205,17 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
+            "page.text" => {
+                let page_id = required_str(&params, "page")?;
+                let (webview, _) = self.page(&page_id)?.clone();
+                match self.evaluate(
+                    webview,
+                    "(document.body && document.body.innerText) || \"\"",
+                )? {
+                    JSValue::String(text) => Ok(json!({ "text": text })),
+                    other => Err(io::Error::other(format!("text returned {other:?}"))),
+                }
+            }
             "page.take_navigation_failure" => {
                 let page_id = required_str(&params, "page")?;
                 let expected_epoch = params

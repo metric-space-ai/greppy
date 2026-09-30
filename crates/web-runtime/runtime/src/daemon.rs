@@ -2550,6 +2550,14 @@ impl Daemon {
             .map(str::to_owned)
             .ok_or_else(|| "page.content missing html".to_owned())
     }
+
+    pub(crate) fn text_from_page_text(value: &serde_json::Value) -> Result<String, String> {
+        value
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "page.text missing text".to_owned())
+    }
     fn web_search(&mut self, request: &Request) -> Response {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.search requires query");
@@ -4098,6 +4106,10 @@ impl Daemon {
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
+        let rendered_text = self
+            .engine_call("page.text", json!({ "page": page }))
+            .and_then(|value| Self::text_from_page_text(&value))
+            .map_err(|error| engine_error(request, error, 34))?;
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
             .unwrap_or_else(|_| json!({ "requests": [] }));
@@ -4111,11 +4123,7 @@ impl Daemon {
             .iter()
             .rev()
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
-        let text = tree
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let text = rendered_text;
         let title = tree
             .get("title")
             .and_then(|v| v.as_str())
@@ -6389,6 +6397,18 @@ mod redirect_chain_tests {
         assert_eq!(
             super::Daemon::html_from_page_content(&json!({"html": null})).unwrap_err(),
             "page.content missing html"
+        );
+    }
+
+    #[test]
+    fn text_from_page_text_preserves_full_rendered_text() {
+        let rendered = format!("{}IMMUTABLE_TAIL", "artifact body ".repeat(10_000));
+        let extracted = super::Daemon::text_from_page_text(&json!({"text": rendered})).unwrap();
+        assert!(extracted.ends_with("IMMUTABLE_TAIL"));
+        assert_eq!(extracted.chars().count(), rendered.chars().count());
+        assert_eq!(
+            super::Daemon::text_from_page_text(&json!({})).unwrap_err(),
+            "page.text missing text"
         );
     }
 }
