@@ -120,9 +120,10 @@ fn session_route_path(root: Option<&str>, session: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-fn runtime_route_path(root: Option<&str>, runtime_image_id: &str) -> PathBuf {
+fn runtime_route_path(root: Option<&str>, runtime_image_id: &str, legacy: bool) -> PathBuf {
     use sha2::{Digest, Sha256};
-    let name = format!("{:x}.json", Sha256::digest(runtime_image_id.as_bytes()));
+    let generation = format!("{runtime_image_id}:legacy={legacy}");
+    let name = format!("{:x}.json", Sha256::digest(generation.as_bytes()));
     workspace_dir(root)
         .join(".greppy/web/runtime-routes")
         .join(name)
@@ -154,7 +155,10 @@ fn save_runtime_route(
         runtime_image_id: ctx.runtime_image_id.clone(),
         legacy: ctx.legacy,
     };
-    persist_route(&runtime_route_path(root, &ctx.runtime_image_id), &route)
+    persist_route(
+        &runtime_route_path(root, &ctx.runtime_image_id, ctx.legacy),
+        &route,
+    )
 }
 
 fn persist_route(path: &Path, route: &SessionRoute) -> std::result::Result<(), ErrorObject> {
@@ -200,13 +204,13 @@ fn remove_session_route(root: Option<&str>, session: &str) {
     let _ = std::fs::remove_file(session_route_path(root, session));
 }
 
-fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str) {
+fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str, legacy: bool) {
     let clear_scope = read_current_scope(root)
         .session
         .as_deref()
         .and_then(|session| load_session_route(root, session))
-        .is_some_and(|route| route.runtime_image_id == runtime_image_id);
-    let _ = std::fs::remove_file(runtime_route_path(root, runtime_image_id));
+        .is_some_and(|route| route.runtime_image_id == runtime_image_id && route.legacy == legacy);
+    let _ = std::fs::remove_file(runtime_route_path(root, runtime_image_id, legacy));
     let directory = workspace_dir(root).join(".greppy/web/session-routes");
     if let Ok(entries) = std::fs::read_dir(directory) {
         for entry in entries.flatten() {
@@ -214,7 +218,9 @@ fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str) {
             let matches = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<SessionRoute>(&bytes).ok())
-                .is_some_and(|route| route.runtime_image_id == runtime_image_id);
+                .is_some_and(|route| {
+                    route.runtime_image_id == runtime_image_id && route.legacy == legacy
+                });
             if matches {
                 let _ = std::fs::remove_file(path);
             }
@@ -1714,7 +1720,7 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
                 .ok()
                 .is_some_and(|response| response.status == "ok" && response.error.is_none())
             {
-                remove_runtime_routes(root, &image);
+                remove_runtime_routes(root, &image, false);
             }
         }
     }
@@ -2414,9 +2420,13 @@ mod target_tests {
         save_runtime_route(Some(root_text), &ctx).unwrap();
         save_session_route(Some(root_text), "wrs_test", &ctx).unwrap();
         std::fs::create_dir_all(current_scope_path(Some(root_text)).parent().unwrap()).unwrap();
-        std::fs::write(current_scope_path(Some(root_text)), b"{}").unwrap();
-        remove_runtime_routes(Some(root_text), &ctx.runtime_image_id);
-        assert!(!runtime_route_path(Some(root_text), &ctx.runtime_image_id).exists());
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_test","tab":"tab_test"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(Some(root_text), &ctx.runtime_image_id, ctx.legacy);
+        assert!(!runtime_route_path(Some(root_text), &ctx.runtime_image_id, ctx.legacy).exists());
         assert!(!session_route_path(Some(root_text), "wrs_test").exists());
         assert!(!current_scope_path(Some(root_text)).exists());
     }
@@ -2438,9 +2448,38 @@ mod target_tests {
             br#"{"session":"wrs_live","tab":"tab_live"}"#,
         )
         .unwrap();
-        remove_runtime_routes(Some(root_text), &format!("sha256:{}", "2".repeat(64)));
+        remove_runtime_routes(
+            Some(root_text),
+            &format!("sha256:{}", "2".repeat(64)),
+            false,
+        );
         assert!(current_scope_path(Some(root_text)).exists());
         assert!(session_route_path(Some(root_text), "wrs_live").exists());
+    }
+
+    #[test]
+    fn stopping_current_generation_preserves_same_digest_legacy_session() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let digest = format!("sha256:{}", "3".repeat(64));
+        let legacy = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: digest.clone(),
+            legacy: true,
+        };
+        save_runtime_route(Some(root_text), &legacy).unwrap();
+        save_session_route(Some(root_text), "wrs_legacy", &legacy).unwrap();
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_legacy","tab":"tab_legacy"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(Some(root_text), &digest, false);
+        assert!(runtime_route_path(Some(root_text), &digest, true).exists());
+        assert!(session_route_path(Some(root_text), "wrs_legacy").exists());
+        assert!(current_scope_path(Some(root_text)).exists());
     }
 
     #[test]
