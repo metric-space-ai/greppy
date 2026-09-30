@@ -2134,50 +2134,99 @@ pub fn recover_persisted_rust_usages(
 ) -> Result<usize> {
     let states = store.list_file_states(project)?;
     let indexed_paths = {
-        let mut statement = store.conn().prepare("SELECT DISTINCT file_path FROM nodes WHERE project=?1 AND file_path LIKE '%.rs'").map_err(sqlite_err)?;
-        let rows = statement.query_map([project], |row| row.get::<_, String>(0)).map_err(sqlite_err)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(sqlite_err)?
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT DISTINCT file_path FROM nodes WHERE project=?1 AND file_path LIKE '%.rs'",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map([project], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
     };
-    if indexed_paths.iter().any(|path| !states.iter().any(|state| &state.rel_path == path)) {
+    if indexed_paths
+        .iter()
+        .any(|path| !states.iter().any(|state| &state.rel_path == path))
+    {
         return Err(greppy_core::Error::Invalid("Rust reference repair requires indexed source fingerprints for every visible Rust file".into()));
     }
     let root = std::fs::canonicalize(root).map_err(|error| {
         greppy_core::Error::Invalid(format!("Rust reference repair cannot read root: {error}"))
     })?;
-    let mut existing = store.list_raw_edges(project)?.into_iter().map(|edge| {
-        (edge.file_path, edge.source_qname, edge.target_qname, edge.edge_type,
-         edge.properties.to_string())
-    }).collect::<std::collections::HashSet<_>>();
+    let mut existing = store
+        .list_raw_edges(project)?
+        .into_iter()
+        .map(|edge| {
+            (
+                edge.file_path,
+                edge.source_qname,
+                edge.target_qname,
+                edge.edge_type,
+                edge.properties.to_string(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
     let mut additions = Vec::new();
-    for state in states.iter().filter(|state| state.rel_path.ends_with(".rs")) {
+    for state in states
+        .iter()
+        .filter(|state| state.rel_path.ends_with(".rs"))
+    {
         let relative = Path::new(&state.rel_path);
-        if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
-            return Err(greppy_core::Error::Invalid("unsafe Rust repair source path".into()));
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Rust repair source path".into(),
+            ));
         }
         let path = std::fs::canonicalize(root.join(relative)).map_err(|error| {
-            greppy_core::Error::Invalid(format!("Rust reference repair source {} unavailable: {error}", state.rel_path))
+            greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} unavailable: {error}",
+                state.rel_path
+            ))
         })?;
         if !path.starts_with(&root) {
-            return Err(greppy_core::Error::Invalid("Rust repair source escapes root".into()));
+            return Err(greppy_core::Error::Invalid(
+                "Rust repair source escapes root".into(),
+            ));
         }
         let (bytes, _) = read_stable_file(&path).map_err(|error| {
-            greppy_core::Error::Invalid(format!("Rust reference repair source {} unreadable: {error}", state.rel_path))
+            greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} unreadable: {error}",
+                state.rel_path
+            ))
         })?;
         if file_state::sha256_hex(&bytes) != state.sha256 {
             return Err(greppy_core::Error::Invalid(format!(
-                "Rust reference repair source {} changed since indexing", state.rel_path
+                "Rust reference repair source {} changed since indexing",
+                state.rel_path
             )));
         }
         let extraction = parser_extract(Language::Rust, &bytes, &state.rel_path)?;
-        let (extraction, dropped, error) = validate_or_degrade(Language::Rust, &state.rel_path, extraction);
+        let (extraction, dropped, error) =
+            validate_or_degrade(Language::Rust, &state.rel_path, extraction);
         if dropped != 0 || error.is_some() {
-            return Err(greppy_core::Error::Invalid(format!("Rust reference repair source {} failed extraction validation", state.rel_path)));
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} failed extraction validation",
+                state.rel_path
+            )));
         }
-        for edge in extraction.edges.iter().filter(|edge| edge.edge_type == "USAGE") {
+        for edge in extraction
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_type == "USAGE")
+        {
             let candidate = new_raw_edge_for(project, &state.rel_path, edge);
-            if existing.insert((candidate.file_path.clone(), candidate.source_qname.clone(),
-                candidate.target_qname.clone(), candidate.edge_type.clone(),
-                candidate.properties.to_string())) {
+            if existing.insert((
+                candidate.file_path.clone(),
+                candidate.source_qname.clone(),
+                candidate.target_qname.clone(),
+                candidate.edge_type.clone(),
+                candidate.properties.to_string(),
+            )) {
                 additions.push(candidate);
             }
         }
@@ -2200,8 +2249,10 @@ pub fn rebuild_single_store_rust_edges(store: &mut Store, project: &str) -> Resu
             "single-store Rust repair requires a private Store".into(),
         ));
     }
-    let root = store.get_project(project)?.ok_or_else(||
-        greppy_core::Error::Invalid("Rust repair project is missing".into()))?.root_path;
+    let root = store
+        .get_project(project)?
+        .ok_or_else(|| greppy_core::Error::Invalid("Rust repair project is missing".into()))?
+        .root_path;
     recover_persisted_rust_usages(store, project, Path::new(&root))?;
     let raw = load_all_raw_edges(store, project)?;
     let rust_edges = raw
@@ -6757,10 +6808,18 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, &repo, "test").unwrap();
             base.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
-            base.conn().execute("DELETE FROM edges WHERE edge_type='USAGE'", []).unwrap();
-            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
+                .unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
         }
-        let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         let states_before = overlay.list_file_states("test").unwrap();
         let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
@@ -6774,18 +6833,42 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         fs::write(repo.join("src/lib.rs"), original).unwrap();
         assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
         rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
-        let target = overlay.get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte").unwrap().unwrap();
-        let caller = overlay.get_node_by_qname("test", "src/lib.rs::Function::decode").unwrap().unwrap();
-        assert!(overlay.incoming_edges(target.id, Some("USAGE"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
-        assert_eq!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(), 0);
+        let target = overlay
+            .get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        let caller = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::decode")
+            .unwrap()
+            .unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert_eq!(
+            recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
+            0
+        );
         assert!(overlay.list_private_file_states("test").unwrap().is_empty());
         assert_eq!(overlay.list_file_states("test").unwrap(), states_before);
-        assert_eq!(format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()), nodes_before);
+        assert_eq!(
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()),
+            nodes_before
+        );
         rebuild_overlay_edges(&mut overlay, "test").unwrap();
-        assert!(overlay.incoming_edges(target.id, Some("USAGE"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
         drop(overlay);
         let base = Store::open(&base_path).unwrap();
-        assert!(base.list_raw_edges("test").unwrap().iter().all(|edge| !edge.target_qname.contains("AddImmediateByte")));
+        assert!(base
+            .list_raw_edges("test")
+            .unwrap()
+            .iter()
+            .all(|edge| !edge.target_qname.contains("AddImmediateByte")));
         drop(base);
         fs::remove_dir_all(repo).unwrap();
     }
