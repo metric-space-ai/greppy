@@ -1100,22 +1100,24 @@ pub(crate) fn dispatch_impact(
         "all": false,
     });
     insert_impact_edge_meta(&mut graph_gate_extra, &edge_spec);
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra.clone(),
         "hits",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "impact",
+        &edge_spec.edge_types,
         json,
         graph_gate_extra,
         "hits",
@@ -3405,9 +3407,13 @@ pub(crate) fn dispatch_who_calls(
     // Collect each reference-site line persisted in the edge properties. The
     // line locates the statement that `--code` prints for the answer row.
     let mut sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
+    let mut call_sites: std::collections::HashMap<i64, Vec<u32>> = std::collections::HashMap::new();
     for e in &edges {
         if let Some(l) = e.properties.get("line").and_then(|v| v.as_u64()) {
             sites.entry(e.source_id).or_default().push(l as u32);
+            if e.edge_type == "CALLS" {
+                call_sites.entry(e.source_id).or_default().push(l as u32);
+            }
         }
         if !seen.insert(e.source_id) {
             continue;
@@ -3416,11 +3422,20 @@ pub(crate) fn dispatch_who_calls(
             nodes.push(n);
         }
     }
-    // A file anchor emitted on the definition itself (the C++ extractor's
-    // bookkeeping USAGE edge) is not a caller. Filter BEFORE deciding
-    // emptiness — otherwise an uncalled function prints nothing at all
-    // instead of its true answer.
-    nodes.retain(|node| !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name));
+    // A file anchor reached only through a bookkeeping USAGE edge (notably the
+    // C++ extractor's definition edge) is not a caller. A CALLS edge sourced
+    // from the anchor is different: it is a real module-scope call and must
+    // remain visible, or we would turn source evidence into a false
+    // authoritative `no callers` answer.
+    let module_callers = edges
+        .iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .map(|edge| edge.source_id)
+        .collect::<std::collections::HashSet<_>>();
+    nodes.retain(|node| {
+        !is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
+            || module_callers.contains(&node.id)
+    });
     nodes.retain(|node| path_filters.matches(&node.file_path));
     if nodes.is_empty() {
         if json {
@@ -3449,6 +3464,25 @@ pub(crate) fn dispatch_who_calls(
     let total = nodes.len();
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
+    let preferred_site_lines =
+        |node_id: i64| sorted_site_lines(call_sites.get(&node_id).or_else(|| sites.get(&node_id)));
+    let repo_root = resolve_root(root)?;
+    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
+    let mut evidence: std::collections::HashMap<i64, (u32, (u32, u32))> = Default::default();
+    for node in &nodes {
+        let site = preferred_site_lines(node.id)
+            .first()
+            .copied()
+            .unwrap_or_else(|| node.start_line.max(1) as u32);
+        let lines = sources
+            .entry(node.file_path.clone())
+            .or_insert_with(|| nav_file_lines(&repo_root, &node.file_path));
+        let span = match lines.as_ref() {
+            Some(lines) if code || json => nav_statement_span(lines, site),
+            _ => (site, site),
+        };
+        evidence.insert(node.id, (site, span));
+    }
     // The expand pack exists only for the JSON consumer now: in text mode
     // everything the pack could carry is one flag away, so offering it would be
     // a second spelling of `--all` plus a handle to remember.
@@ -3456,9 +3490,13 @@ pub(crate) fn dispatch_who_calls(
         let rows = nodes
             .iter()
             .map(|n| ExpandEvidenceNode {
-                title: display_node_name(n),
+                title: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+                    "<module>".into()
+                } else {
+                    display_node_name(n)
+                },
                 node: n,
-                site_lines: sorted_site_lines(sites.get(&n.id)),
+                site_lines: preferred_site_lines(n.id),
                 extra_json: serde_json::json!({"role": "caller"}),
             })
             .collect::<Vec<_>>();
@@ -3476,7 +3514,30 @@ pub(crate) fn dispatch_who_calls(
     };
     if json {
         let project = project_for(root)?;
-        let hits = nodes[..shown].iter().map(node_hit_json).collect();
+        let hits = nodes[..shown]
+            .iter()
+            .map(|node| {
+                let (site, span) = evidence.get(&node.id).copied().unwrap_or_else(|| {
+                    let start = node.start_line.max(1) as u32;
+                    let end = node.end_line.max(node.start_line).max(1) as u32;
+                    (start, (start, end))
+                });
+                let module =
+                    is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name);
+                serde_json::json!({
+                    // Keep the stored graph identity so JSON piping can
+                    // resolve this row again. `<module>` is presentation,
+                    // never a replacement symbol invented by the renderer.
+                    "qualified_name": node.qualified_name.clone(),
+                    "name": if module { "<module>".into() } else { nav_short_name(node) },
+                    "file": &node.file_path,
+                    "line": site,
+                    "file_path": &node.file_path,
+                    "start_line": span.0,
+                    "end_line": span.1,
+                })
+            })
+            .collect();
         nav_counts_json_with_expand(
             &store,
             root,
@@ -3492,34 +3553,26 @@ pub(crate) fn dispatch_who_calls(
         )?;
         return Ok(0);
     }
-    let repo_root = resolve_root(root)?;
     // The caller's name answers "who"; the call site answers "where the
     // dependency sits". Both fit one line, and nothing else belongs on it.
-    let mut sources: std::collections::HashMap<String, Option<Vec<String>>> = Default::default();
     let mut rows = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        // A file anchor is greppy's own bookkeeping, not a symbol. `__file__`
-        // in a result list is a name the agent cannot carry anywhere.
-        if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
-            continue;
-        }
-        let site = sorted_site_lines(sites.get(&n.id))
-            .first()
-            .copied()
-            .unwrap_or_else(|| n.start_line.max(1) as u32);
-        let lines = sources
-            .entry(n.file_path.clone())
-            .or_insert_with(|| nav_file_lines(&repo_root, &n.file_path));
-        let span = match lines.as_ref() {
-            Some(lines) if code => nav_statement_span(lines, site),
-            _ => (site, site),
-        };
+        let (site, span) = evidence.get(&n.id).copied().unwrap_or_else(|| {
+            let start = n.start_line.max(1) as u32;
+            let end = n.end_line.max(n.start_line).max(1) as u32;
+            (start, (start, end))
+        });
+        let lines = sources.get(&n.file_path).and_then(Option::as_ref);
         rows.push(NavAnswerRow {
             file: n.file_path.clone(),
             line: site,
             span,
-            name: nav_short_name(n),
-            test: nav_is_test(lines.as_ref(), n),
+            name: if is_synthetic_file_anchor(&n.label, &n.name, &n.qualified_name) {
+                "<module>".into()
+            } else {
+                nav_short_name(n)
+            },
+            test: nav_is_test(lines, n),
         });
     }
     print_nav_rows(&repo_root, "callers", &mut rows, code, all);
@@ -3985,7 +4038,8 @@ pub(crate) fn dispatch_path(
         return Err(Error::Invalid("path --edge must not be empty".into()));
     }
 
-    let store = open_default_store(root)?;
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     let max_hops = greppy_search::MAX_REACH_HOPS;
     let graph_gate_extra = serde_json::json!({
@@ -4001,22 +4055,24 @@ pub(crate) fn dispatch_path(
         "max_hops": max_hops,
         "hops": serde_json::Value::Null,
     });
-    if let Some(code) = graph_stale_gate(
+    if let Some(code) = graph_stale_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         graph_gate_extra.clone(),
         "steps",
     )? {
         return Ok(code);
     }
-    if let Some(code) = provider_policy_graph_gate(
+    if let Some(code) = provider_policy_graph_gate_for_edges(
         &store,
         root,
         &project,
         "path",
+        &[edge_upper.as_str()],
         json,
         serde_json::json!({
             "from": from,

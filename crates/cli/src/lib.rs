@@ -25,19 +25,25 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A binary without a GPU backend is not buildable, the same way a binary
-/// without the embedded models is not buildable. Nothing fails at runtime when
-/// the backend is missing — the work just takes twenty times longer, measured
-/// on this repo at 7.5 s against 0.3 s for one navigation summary — so the
-/// mistake is invisible unless the compiler refuses it. Building on a platform
-/// that has no backend, or measuring against the CPU path, is
-/// `--features cpu-only`.
+#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
+compile_error!(
+    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
+     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
+     debug and numerical-reference use"
+);
+
+#[cfg(test)]
+mod build_policy;
+
+/// Product binaries require compiled GPU implementations for both inference
+/// workloads. The CUDA constants include the build-script signal emitted only
+/// after nvcc creates the shared backend, so a requested feature is not enough.
 #[cfg(not(feature = "cpu-only"))]
 const _: () = assert!(
-    greppy_embed_native::HAS_GPU_BACKEND,
-    "no GPU backend for this target. Metal is enabled for macOS and CUDA for \
-     Linux/Windows in crates/cli/Cargo.toml; if this target genuinely has \
-     neither, build with --features cpu-only."
+    greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
+    "Greppy requires compiled GPU backends for both embeddings and summaries. \
+     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
+     `cpu-only` is restricted to debug and numerical-reference use"
 );
 
 // Route this module's stdout through one optional collector. Query commands
@@ -69,6 +75,8 @@ use nav::*;
 mod inference;
 use inference::*;
 mod freshness;
+mod index_admission;
+mod query_progress;
 use freshness::*;
 mod emit;
 use emit::*;
@@ -177,7 +185,9 @@ const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
 const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
+const ENV_STRUCTURAL_FIRST_USE: &str = "GREPPY_STRUCTURAL_FIRST_USE";
 const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
+const AUTOMATIC_INDEX_MAX_WORKERS: usize = 2;
 const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
 const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
 /// Bound the source sent to the summary daemon. Cache keys continue to use the
@@ -385,7 +395,11 @@ pub enum CacheCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove one worktree's verified store, or every verified cache object.
+    /// Remove the selected worktree store and repository-wide shared agent Bases.
+    ///
+    /// --root also selects shared agent Bases used by linked worktrees of the
+    /// same repository. --all selects every verified cache object. Locked
+    /// stores are retained and reported; --yes is required.
     Clear {
         #[arg(long)]
         all: bool,
@@ -683,6 +697,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
+    // An explicit ripgrep token owns every following option. In particular,
+    // `--json` is a valid ripgrep output flag as well as a Greppy navigation
+    // flag; diagnosing it here prevented `greppy rg --json ...` from ever
+    // reaching the byte-exact passthrough dispatcher.
+    if matches!(verb, "rg" | "ripgrep") {
+        return None;
+    }
     if let Some(flag) = rest
         .iter()
         .skip(1)
@@ -718,6 +739,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
         .filter(|command| levenshtein(verb, command) <= 2)
         .min_by_key(|command| levenshtein(verb, command))
     {
+        // A piped grep pattern can resemble a command too (e.g. `research`).
+        // Use the existing non-consuming producer grace, not a zero-time
+        // readiness check that would race a delayed pipeline producer.
+        if greppy_only_flag(&rest[1..]).is_none() && passthrough::stdin_supplies_grep_pattern(rest)
+        {
+            return None;
+        }
         return Some(format!(
             "status: invalid_invocation\ncommand: `{verb}`\nmessage: unknown greppy command; nothing was passed to grep\nnext: did you mean `greppy {command} ...`?"
         ));
@@ -753,6 +781,84 @@ pub fn startup_trace(phase: &str) {
         "startup-trace +{:.3}ms {phase}",
         t0.elapsed().as_secs_f64() * 1000.0
     );
+}
+
+/// Private contract used by the immutable Base builder to bind its staging
+/// index process to the builder's lifetime.
+pub const ENV_BASE_BUILD_OWNER_STDIN: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
+
+fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce()) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match owner.read(&mut byte) {
+            Ok(0) => {
+                owner_lost();
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                owner_lost();
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Installs the lifetime guard for a nested immutable Base staging index.
+///
+/// The parent holds the write side of stdin until the nested index exits. If
+/// the parent disappears, EOF stops this process before it can keep indexing a
+/// staging database that no surviving process can publish. The marker is
+/// removed before CLI dispatch so model daemons spawned by this process do not
+/// inherit the internal ownership contract.
+pub fn install_base_build_owner_watchdog() {
+    let marker = std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN);
+    if marker.is_none() {
+        return;
+    }
+    std::env::remove_var(ENV_BASE_BUILD_OWNER_STDIN);
+    if let Err(error) = std::thread::Builder::new()
+        .name("greppy-base-build-owner".into())
+        .spawn(|| {
+            watch_base_build_owner(std::io::stdin(), || std::process::exit(73));
+        })
+    {
+        eprintln!("greppy: cannot install immutable Base owner guard: {error}");
+        std::process::exit(73);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_owner_watchdog_descendant_probe() -> Option<u8> {
+    std::env::var_os("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE")
+        .map(|_| u8::from(std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN).is_some()))
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn run_base_build_owner_watchdog_test_harness() -> Option<u8> {
+    let hold_ms = std::env::var("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let descendant = std::process::Command::new(std::env::current_exe().ok()?)
+        .env("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE", "1")
+        .env_remove("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .env_remove("GREPPY_TEST_BASE_OWNER_READY")
+        .status()
+        .ok()?;
+    if !descendant.success() {
+        return Some(74);
+    }
+    if let Some(ready) = std::env::var_os("GREPPY_TEST_BASE_OWNER_READY") {
+        if std::fs::write(ready, format!("{}\n", std::process::id())).is_err() {
+            return Some(74);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    Some(0)
 }
 
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
@@ -816,7 +922,12 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     if agent::is_agent_p_invocation(&argv) {
         return agent::run_agent_p(&argv);
     }
-    if agent::is_agent_tui_invocation(&argv) && !is_agent_admin_invocation(&argv) {
+    let agent_help_in_agent_run =
+        std::env::var_os(greppy_agent::AGENT_RUN_ENV).is_some() && agent_help_invocation(&argv);
+    if agent::is_agent_tui_invocation(&argv)
+        && !is_agent_admin_invocation(&argv)
+        && !agent_help_in_agent_run
+    {
         return agent::run_agent_tui(&argv);
     }
     if let Some(message) = unknown_verb_refusal(&argv) {
@@ -831,7 +942,27 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         // remaining arguments are forwarded verbatim.
         let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
         full.push(std::ffi::OsString::from("greppy"));
-        full.extend_from_slice(grep_passthrough_args(&argv));
+        let rest = grep_passthrough_args(&argv);
+        // Command discovery skips leading globals, but the child still needs
+        // their root. Preserve it byte-for-byte until dispatch consumes it;
+        // other leading globals retain their existing passthrough behavior.
+        let mut prefix = argv[1..argv.len() - rest.len()].iter();
+        while let Some(arg) = prefix.next() {
+            if arg == "--root" {
+                full.push(arg.clone());
+                if let Some(value) = prefix.next() {
+                    full.push(value.clone());
+                }
+            } else if arg.as_encoded_bytes().starts_with(b"--root=") {
+                full.push(arg.clone());
+            } else if matches!(
+                arg.to_str(),
+                Some("--device" | "--limit" | "--max" | "--max-bytes" | "--offset")
+            ) {
+                prefix.next();
+            }
+        }
+        full.extend_from_slice(rest);
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(msg)) => {
@@ -976,6 +1107,19 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                         "`web observe` accepts one optional QUERY; quote a selector containing spaces. \
                          No observation was run. Use `greppy web observe QUERY` for matching visible \
                          regions, or omit QUERY for the unfiltered page."
+                    );
+                } else if sub == "web"
+                    && grep_passthrough_args(&argv)
+                        .get(1)
+                        .and_then(|arg| arg.to_str())
+                        == Some("wait")
+                    && !stray.starts_with('-')
+                {
+                    println!(
+                        "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
+                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                         `greppy web wait 'text~/WORD/i'` for partial text, or \
+                         `greppy web wait --url '~/PATTERN/'` for a URL."
                     );
                 } else if sub == "path" && stray == "--code" {
                     println!(
@@ -1265,7 +1409,7 @@ fn prune_expired_evidence_packs() {
         ) else {
             continue;
         };
-        let path = workspace_locator::store_path(&root);
+        let path = entry.path.join("graph.db");
         let Ok(_writer) = greppy_freshness::try_acquire(&path) else {
             continue;
         };
@@ -1648,6 +1792,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    let _query_progress = query_progress::for_command(cli.command.as_ref(), cli.root.as_deref());
     // If a recognised subcommand matched, dispatch it. Otherwise treat
     // the trailing args as a `grep` passthrough. This makes both
     //   greppy grep -R foo .
@@ -1662,7 +1807,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     if cli.limit == Some(0) {
         return Err(Error::Invalid("--limit/--max must be at least 1".into()));
     }
-    if cli.max_bytes == Some(0) {
+    if let Some(Command::Web { command }) = cli.command.as_ref() {
+        web::validate_output_budget(command, cli.max_bytes)?;
+    } else if cli.max_bytes == Some(0) {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
@@ -1720,6 +1867,18 @@ fn is_agent_admin_invocation(argv: &[std::ffi::OsString]) -> bool {
                 || token == "interrupt"
                 || token == "quit"
         })
+}
+
+fn agent_help_invocation(argv: &[std::ffi::OsString]) -> bool {
+    let rest = grep_passthrough_args(argv);
+    let Some(args) = rest
+        .iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    greppy_agent::greppy_env::agent_help_invocation(&args)
 }
 
 fn dispatch_agent_admin(command: AgentCommand, root: Option<&str>) -> Result<i32> {
@@ -1866,49 +2025,38 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             Ok(0)
         }
         WorkspaceCommand::Status { json } => {
-            let provider =
-                match greppy_workspace_core::ProviderInstallation::require_healthy(&data_root) {
-                    Ok(provider) => provider,
-                    Err(error) if json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "ready": false,
-                                "error": error.to_string(),
-                                "data_root": data_root
-                            }))
-                            .map_err(|error| Error::Invalid(error.to_string()))?
-                        );
-                        return Ok(EXIT_IO as i32);
-                    }
-                    Err(error) => return Err(Error::Invalid(error.to_string())),
-                };
-            let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let workspaces = core
-                .list_workspaces()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            let stats = core
-                .chunks()
-                .stats()
-                .map_err(|error| Error::Invalid(error.to_string()))?;
+            let status = match agent_workspace_status(&data_root) {
+                Ok(status) => status,
+                Err(error) if json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ready": false,
+                            "agent_workspace_ready": false,
+                            "provider_ready": false,
+                            "error": error.to_string(),
+                            "data_root": data_root
+                        }))
+                        .map_err(|error| Error::Invalid(error.to_string()))?
+                    );
+                    return Ok(EXIT_IO as i32);
+                }
+                Err(error) => return Err(Error::Invalid(error.to_string())),
+            };
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "provider": provider.manifest(),
-                        "workspaces": workspaces,
-                        "chunks": stats
-                    }))
-                    .map_err(|error| Error::Invalid(error.to_string()))?
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|error| Error::Invalid(error.to_string()))?
                 );
             } else {
                 println!(
-                    "provider {:?} ready; {} workspace(s), {} chunks, {} physical bytes",
-                    provider.manifest().adapter_kind,
-                    workspaces.len(),
-                    stats.chunk_count,
-                    stats.segment_bytes
+                    "agent workspace ready ({} backend; provider {}); {} workspace(s), {} chunks, {} physical bytes",
+                    status.backend,
+                    if status.provider_ready { "ready" } else { "inactive" },
+                    status.workspaces.len(),
+                    status.chunks.chunk_count,
+                    status.chunks.segment_bytes
                 );
             }
             Ok(0)
@@ -1928,6 +2076,124 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
             );
             Ok(0)
         }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AgentWorkspaceStatus {
+    ready: bool,
+    agent_workspace_ready: bool,
+    provider_ready: bool,
+    backend: &'static str,
+    provider: Option<greppy_workspace_core::ProviderManifest>,
+    data_root: std::path::PathBuf,
+    workspaces: Vec<greppy_workspace_core::WorkspaceStatus>,
+    chunks: greppy_workspace_core::ChunkStoreStats,
+}
+
+fn agent_workspace_status(
+    data_root: &std::path::Path,
+) -> std::result::Result<AgentWorkspaceStatus, greppy_workspace_core::Error> {
+    let (provider_ready, backend, provider) =
+        match greppy_workspace_core::ProviderInstallation::optional(data_root)? {
+            greppy_workspace_core::OptionalProvider::Ready(provider) => {
+                if provider
+                    .doctor_io(&format!("status-{}", std::process::id()))
+                    .is_ok()
+                {
+                    (true, "provider", Some(provider.manifest().clone()))
+                } else {
+                    (false, "ordinary", Some(provider.manifest().clone()))
+                }
+            }
+            greppy_workspace_core::OptionalProvider::Inactive => (false, "ordinary", None),
+        };
+    if !provider_ready {
+        greppy_agent::ensure_ordinary_workspace_available(data_root)
+            .map_err(|error| greppy_workspace_core::Error::AdapterUnavailable(error.to_string()))?;
+    }
+    let core = greppy_workspace_core::WorkspaceCore::open(data_root.join("core"))?;
+    let workspaces = core.list_workspaces()?;
+    let stats = core.chunks().stats()?;
+    Ok(AgentWorkspaceStatus {
+        ready: true,
+        agent_workspace_ready: true,
+        provider_ready,
+        backend,
+        provider,
+        data_root: data_root.into(),
+        workspaces,
+        chunks: stats,
+    })
+}
+
+#[cfg(test)]
+mod optional_workspace_status_tests {
+    use super::*;
+    use greppy_workspace_core::{
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
+        PROVIDER_PROTOCOL_VERSION,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_without_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = agent_workspace_status(temp.path()).unwrap();
+        assert!(status.ready);
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["chunks"].is_object());
+        assert!(json["provider"].is_null());
+        assert!(json["workspaces"].is_array());
+        assert!(json.get("chunk_count").is_none());
+    }
+
+    #[test]
+    fn status_reports_ordinary_workspace_ready_with_unmounted_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let manifest = ProviderManifest {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            adapter_version: "0.4.1-installed".into(),
+            adapter_kind: AdapterKind::FsKit,
+            state: ProviderState::Ready,
+            instance_id: "installed-not-mounted".into(),
+            data_root: data.clone(),
+            mount_root: temp.path().join("inactive-mount"),
+            heartbeat_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            capabilities: ProviderCapabilities {
+                hard_links: true,
+                symbolic_links: true,
+                byte_range_locks: true,
+                memory_maps: true,
+                atomic_rename: true,
+                case_preserving: true,
+            },
+        };
+        fs::write(
+            data.join("provider.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let status = agent_workspace_status(&data).unwrap();
+        assert!(status.agent_workspace_ready);
+        assert!(!status.provider_ready);
+        assert_eq!(status.backend, "ordinary");
+    }
+
+    #[test]
+    fn status_rejects_malformed_present_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("provider.json"), b"not valid json").unwrap();
+        assert!(agent_workspace_status(temp.path()).is_err());
     }
 }
 
@@ -1987,7 +2253,7 @@ fn dispatch_subcommand(
                         "index status takes no repository path; use `--root PATH`".into(),
                     ));
                 }
-                dispatch_index_status(json, root)
+                dispatch_index_status(json, root, EmbeddingCliArgs { device, no_gpu })
             } else if path.as_deref() == Some("recover") {
                 if agent_worktree {
                     return Err(Error::Invalid(
@@ -2310,7 +2576,9 @@ fn dispatch_subcommand(
         ),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
-        Command::Doctor { json } => dispatch_doctor(json, root),
+        Command::Doctor { json } => {
+            dispatch_doctor(json, root, EmbeddingCliArgs { device, no_gpu })
+        }
         Command::Web { command } => web::dispatch(command, root),
         Command::WhoCalls {
             symbols,
@@ -3181,7 +3449,7 @@ fn nav_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers = query_incomplete_provider_json(store, project, command)?;
     // Rule 3: a one-symbol answer is a batch of one. The caller parses ONE
     // shape — `targets` plus per-hit attribution — however many symbols it
     // named.
@@ -3233,11 +3501,33 @@ fn incomplete_provider_json(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, &[])
+}
+
+/// Provider completeness for a graph answer is scoped to the relations that
+/// answer actually reads. A provider may be broadly partial because it omits
+/// semantic, infrastructure, or history edges while still fully covering a
+/// navigation command's CALLS/USAGE union. File failures remain relevant for
+/// every relation because they can remove otherwise-supported edges.
+fn incomplete_provider_json_for_edges(
+    store: &greppy_store::Store,
+    project: &str,
+    required_edge_classes: &[&str],
+) -> Result<Vec<serde_json::Value>> {
     Ok(store
         .list_provider_states(project)?
         .into_iter()
-        .filter(greppy_store::ProviderState::is_incomplete)
         .filter(|p| !is_noncode_provider(&p.status, &p.language))
+        .filter(|p| {
+            p.files_failed > 0
+                || if required_edge_classes.is_empty() {
+                    p.is_incomplete()
+                } else {
+                    required_edge_classes
+                        .iter()
+                        .any(|class| !p.supports_edge_class(class))
+                }
+        })
         .map(|p| {
             // Agent responses only need to know which language is partial.
             // Per-edge-class and per-file diagnostics belong to doctor and
@@ -3248,6 +3538,55 @@ fn incomplete_provider_json(
             })
         })
         .collect())
+}
+
+const WHO_CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls", "usages"];
+const CALLS_PROVIDER_EDGE_CLASSES: &[&str] = &["calls"];
+
+fn provider_edge_classes_for_command(command: &str) -> &'static [&'static str] {
+    match command {
+        // dispatch_who_calls and the batched equivalent both read the incoming
+        // union of CALLS and USAGE edges.
+        "who-calls" => WHO_CALLS_PROVIDER_EDGE_CLASSES,
+        "callees" => CALLS_PROVIDER_EDGE_CLASSES,
+        _ => &[],
+    }
+}
+
+fn provider_edge_classes_for_graph_edges(edge_types: &[&str]) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    for edge_type in edge_types {
+        let class = match *edge_type {
+            "CALLS" => "calls",
+            "USAGE" | "USES" => "usages",
+            "TYPE_REF" => "type_refs",
+            "IMPORTS" => "imports",
+            // Unknown/custom graph relations have no trustworthy provider
+            // capability mapping, so retain broad completeness semantics.
+            _ => return Vec::new(),
+        };
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
+}
+
+fn query_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    command: &str,
+) -> Result<Vec<serde_json::Value>> {
+    incomplete_provider_json_for_edges(store, project, provider_edge_classes_for_command(command))
+}
+
+fn graph_edge_incomplete_provider_json(
+    store: &greppy_store::Store,
+    project: &str,
+    edge_types: &[&str],
+) -> Result<Vec<serde_json::Value>> {
+    let required = provider_edge_classes_for_graph_edges(edge_types);
+    incomplete_provider_json_for_edges(store, project, &required)
 }
 
 /// A provider row is "non-code noise" when it exists only because the indexer
@@ -3263,17 +3602,6 @@ fn is_noncode_provider(status: &str, language: &str) -> bool {
     status == "unsupported"
         || language.starts_with("file extension .")
         || language == "no file extension"
-}
-
-/// Compact incomplete-provider metadata, excluding non-code snapshot/fixture
-/// providers (see [`is_noncode_provider`]) so the reported
-/// `incomplete_provider_count` / `provider_complete` reflects only real code
-/// callers, not `.stderr` / `.snap` files.
-fn code_incomplete_provider_json(
-    store: &greppy_store::Store,
-    project: &str,
-) -> Result<Vec<serde_json::Value>> {
-    incomplete_provider_json(store, project)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3422,9 +3750,10 @@ fn impact_counts_json_with_expand(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    // Only real code providers count toward impact completeness; `.stderr` /
-    // `.snap` snapshot files are not callers (see `code_incomplete_provider_json`).
-    let incomplete_providers = code_incomplete_provider_json(store, project)?;
+    // Only providers for the relations impact actually reads count toward
+    // completeness; non-code snapshot rows are filtered by the shared helper.
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, meta.edge_types)?;
     // Rule 3: the one-symbol answer has the same shape as a batch of several.
     let mut hits = hits;
     for hit in &mut hits {
@@ -3699,7 +4028,8 @@ fn path_counts_json(
         .get("fresh")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let incomplete_providers = incomplete_provider_json(store, project)?;
+    let incomplete_providers =
+        graph_edge_incomplete_provider_json(store, project, &[meta.edge_type])?;
     let steps: Vec<_> = path
         .map(|p| p.rows.iter().map(graph_row_json).collect())
         .unwrap_or_default();
@@ -3744,6 +4074,23 @@ fn nav_freshness_json(
     store: &greppy_store::Store,
     root: Option<&str>,
     project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, false)
+}
+
+fn nav_freshness_json_uncached(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+) -> serde_json::Value {
+    nav_freshness_json_with_policy(store, root, project, true)
+}
+
+fn nav_freshness_json_with_policy(
+    store: &greppy_store::Store,
+    root: Option<&str>,
+    project: &str,
+    force_uncached: bool,
 ) -> serde_json::Value {
     let overrides = match discover_overrides_from_env() {
         Ok(overrides) => overrides,
@@ -3840,13 +4187,25 @@ fn nav_freshness_json(
             }
         }
     }
-    match greppy_freshness::check_files_report_with_overrides(
-        store,
-        &root_path,
-        project,
-        NAV_FRESHNESS_BUDGET,
-        &overrides,
-    ) {
+    let report = if force_uncached {
+        greppy_freshness::check_files_report_with_ttl(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+            std::time::Duration::ZERO,
+        )
+    } else {
+        greppy_freshness::check_files_report_with_overrides(
+            store,
+            &root_path,
+            project,
+            NAV_FRESHNESS_BUDGET,
+            &overrides,
+        )
+    };
+    match report {
         Ok(report) => {
             let (fresh, state_name, reasons) = match report.state.outcome {
                 greppy_freshness::FreshnessOutcome::Fresh => (true, "fresh", Vec::<String>::new()),
@@ -3861,7 +4220,7 @@ fn nav_freshness_json(
                     (false, "unknown", reasons)
                 }
             };
-            serde_json::json!({
+            let mut freshness = serde_json::json!({
                 "fresh": fresh,
                 "state": state_name,
                 "reasons": reasons,
@@ -3878,7 +4237,21 @@ fn nav_freshness_json(
                     "include": ENV_DISCOVER_INCLUDE,
                     "exclude": ENV_DISCOVER_EXCLUDE,
                 },
-            })
+            });
+            // An active writer prevents persisting a metadata-only fingerprint
+            // update, not reading content-equivalent graph rows. The completed
+            // inventory proof above must establish zero changed files and no
+            // root, scope, indexer-version or unknown-state drift. Keep the
+            // pending metadata visible rather than pretending it was persisted.
+            if metadata_only_fingerprint_drift(&freshness) && workspace_writer_active(root) {
+                freshness["metadata_drift_reasons"] = freshness["reasons"].clone();
+                freshness["metadata_refresh_pending"] = serde_json::json!(true);
+                freshness["source"] = serde_json::json!("verified_published_snapshot");
+                freshness["fresh"] = serde_json::json!(true);
+                freshness["state"] = serde_json::json!("fresh");
+                freshness["reasons"] = serde_json::json!([]);
+            }
+            freshness
         }
         Err(e) => serde_json::json!({
             "fresh": false,
@@ -4023,12 +4396,229 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
 
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
+const ENV_BACKGROUND_DEMAND_LOCK: &str = "GREPPY_BACKGROUND_DEMAND_LOCK";
+static DELEGATED_BASE_OWNER: std::sync::Mutex<Option<std::process::ChildStdin>> =
+    std::sync::Mutex::new(None);
+static DELEGATED_BASE_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BACKGROUND_DEMAND_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn begin_delegated_base_owner() {
+    DELEGATED_BASE_STARTING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn register_delegated_base_owner(owner: std::process::ChildStdin) {
+    *DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(owner);
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_delegated_base_owner() {
+    DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn delegated_base_owner_starting() -> bool {
+    DELEGATED_BASE_STARTING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn cancel_delegated_base_owner(demand_cancelled: bool) -> bool {
+    let owner = DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if owner.is_none() {
+        return false;
+    }
+    // Publish the terminal reason before dropping the pipe writer. EOF wakes
+    // the delegated child and can make the indexing thread reach `fail()`
+    // immediately; recording cancellation afterwards races with that path and
+    // mislabels a demand-driven stop as a background-index failure.
+    if demand_cancelled {
+        BACKGROUND_DEMAND_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    drop(owner);
+    true
+}
+
+/// Initialization must consume this returned path, rather than caching a locator
+/// lookup that can change before the workspace ownership manifest is published.
+fn ensured_workspace_store_path(root: &std::path::Path) -> Result<std::path::PathBuf> {
+    greppy_core::cache::ensure_workspace_store(root)
+        .map(|directory| directory.join("graph.db"))
+        .map_err(|error| {
+            Error::io(
+                format!("create workspace store for {}", root.display()),
+                error,
+            )
+        })
+}
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(BACKGROUND_JOB_FILE)
+}
+
+fn background_job_demand_name(root: &std::path::Path) -> String {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    format!("workspace-{hash}.query-demand")
+}
+
+fn acquire_background_job_demand(
+    root: &std::path::Path,
+) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    greppy_core::cache::acquire_named_lock(
+        &background_job_demand_name(root),
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+}
+
+fn start_background_demand_monitor(
+    job_path: &std::path::Path,
+    terminal: std::sync::Arc<std::sync::Mutex<bool>>,
+    expected_pid: u32,
+    expected_generation: u64,
+) {
+    let Some(lock_name) = std::env::var_os(ENV_BACKGROUND_DEMAND_LOCK) else {
+        return;
+    };
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    let job_path = job_path.to_owned();
+    let monitor_path = job_path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("greppy-query-demand".into())
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    if cancel_delegated_base_owner(true) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner(false) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        let owned = read_background_job(&monitor_path).is_some_and(|job| {
+            background_demand_may_cancel(Some(&job), false, expected_pid, expected_generation)
+        });
+        if owned {
+            finish_background_demand_monitor(
+                &monitor_path,
+                "failed",
+                &format!("automatic index demand monitor could not start: {error}"),
+                70,
+            );
+        }
+        std::process::exit(70);
+    }
+}
+
+fn background_demand_may_cancel(
+    job: Option<&serde_json::Value>,
+    terminal: bool,
+    expected_pid: u32,
+    expected_generation: u64,
+) -> bool {
+    !terminal
+        && job.is_some_and(|job| {
+            job.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(expected_pid))
+                && job
+                    .get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(expected_generation)
+        })
+}
+
+fn finish_background_demand_monitor(
+    job_path: &std::path::Path,
+    state: &str,
+    detail: &str,
+    exit_code: i32,
+) -> ! {
+    if let Some(mut job) = read_background_job(job_path) {
+        job["state"] = serde_json::json!(state);
+        job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+        job["last_error"] = serde_json::json!(detail);
+        let _ = write_background_job(job_path, &job);
+    }
+    std::process::exit(exit_code);
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -4067,7 +4657,40 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+fn background_job_writer_active(root: &std::path::Path) -> bool {
+    matches!(
+        greppy_freshness::try_acquire(&workspace_locator::store_path(root)),
+        Err(greppy_freshness::LockError::Held { .. })
+    )
+}
+
+fn background_job_spawn_active(root: &std::path::Path) -> bool {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    matches!(
+        greppy_core::cache::acquire_named_lock(
+            &format!("workspace-{hash}.job-spawn"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        ),
+        Ok(None)
+    )
+}
+
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, false)
+}
+
+// Only a launcher holding the spawn lease or an explicit index holding the
+// workspace writer lease may replace another job's identity.
+fn start_background_job_record(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    write_background_job_record(path, value, true)
+}
+
+fn write_background_job_record(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    new_owner: bool,
+) -> Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -4075,6 +4698,46 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
         .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| Error::io(format!("create {}", parent.display()), error))?;
+    // The index thread, its cancellation monitor and a delegated Base child
+    // can publish concurrently. Atomic rename alone permits late progress to
+    // overwrite the terminal cancellation record. Serialize the read/replace
+    // across processes and retain cancellation for this exact job identity.
+    let _publication = greppy_core::cache::acquire_named_lock_in(
+        parent,
+        "background-job-publication",
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .map_err(|error| Error::io("lock background job publication", error))?
+    .ok_or_else(|| Error::Invalid("background job publication lock unavailable".into()))?;
+    if !new_owner {
+        // Completed owners remove their journal. Late progress must not
+        // recreate it; only an authorized new launcher establishes records.
+        let Some(current) = read_background_job(path) else {
+            return Ok(());
+        };
+        let same_epoch = ["target_generation", "started_at_unix_secs"]
+            .iter()
+            .all(|key| {
+                current
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                    && current.get(key) == value.get(key)
+            });
+        // Only the launcher may install the PID into a pid=null record;
+        // otherwise an old writer can hijack an immediate same-second retry.
+        let same_owner = current.get("pid") == value.get("pid");
+        if !same_epoch
+            || !same_owner
+            || matches!(
+                current.get("state").and_then(serde_json::Value::as_str),
+                Some("cancelled" | "failed")
+            )
+        {
+            return Ok(());
+        }
+    }
     let temp = parent.join(format!(
         ".background.job.{}.{}.tmp",
         std::process::id(),
@@ -4151,6 +4814,7 @@ struct BackgroundJobGuard {
     kind: String,
     started_at_unix_secs: u64,
     target_generation: u64,
+    worker_count: Option<usize>,
     backend: Option<String>,
     device: Option<String>,
     completed_documents: usize,
@@ -4164,6 +4828,7 @@ struct BackgroundJobGuard {
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
+    demand_terminal: std::sync::Arc<std::sync::Mutex<bool>>,
     complete: bool,
 }
 
@@ -4175,6 +4840,7 @@ impl BackgroundJobGuard {
         let detached = direct_path.is_some();
         let delegated = direct_path.is_none() && delegated_path.is_some();
         let path = direct_path.or(delegated_path);
+        let demand_terminal = std::sync::Arc::new(std::sync::Mutex::new(false));
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
@@ -4199,22 +4865,58 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
+        let inherited = published.as_ref();
+        let target_generation = inherited
+            .and_then(|job| {
+                job.get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(0);
+        if detached {
+            if let Some(path) = &path {
+                start_background_demand_monitor(
+                    path,
+                    demand_terminal.clone(),
+                    std::process::id(),
+                    target_generation,
+                );
+            }
+        }
         Self {
             path,
             detached,
             delegated,
             owner_pid,
-            cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
-                .unwrap_or_else(|_| "background-refresh".into()),
-            kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
-            started_at_unix_secs: std::env::var("GREPPY_BACKGROUND_STARTED_AT")
-                .ok()
-                .and_then(|value| value.parse().ok())
+            cause: inherited
+                .and_then(|job| job.get("cause").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_CAUSE").ok())
+                .unwrap_or_else(|| "background-refresh".into()),
+            kind: inherited
+                .and_then(|job| job.get("kind").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| std::env::var("GREPPY_BACKGROUND_KIND").ok())
+                .unwrap_or_else(|| "index".into()),
+            started_at_unix_secs: inherited
+                .and_then(|job| {
+                    job.get("started_at_unix_secs")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .or_else(|| {
+                    std::env::var("GREPPY_BACKGROUND_STARTED_AT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
                 .unwrap_or_else(unix_now_secs_cli),
-            target_generation: std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            target_generation,
+            worker_count: inherited
+                .and_then(|job| job.get("worker_count").and_then(serde_json::Value::as_u64))
+                .and_then(|workers| usize::try_from(workers).ok()),
             backend: published
                 .as_ref()
                 .and_then(|job| job.get("backend"))
@@ -4244,6 +4946,7 @@ impl BackgroundJobGuard {
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
+            demand_terminal,
             complete: false,
         }
     }
@@ -4398,6 +5101,7 @@ impl BackgroundJobGuard {
             "updated_at_unix_secs": now,
             "cause": self.cause,
             "target_generation": self.target_generation,
+            "worker_count": self.worker_count,
             "state": state,
             "backend": self.backend,
             "device": self.device,
@@ -4415,10 +5119,15 @@ impl BackgroundJobGuard {
             "current_detail": self.current_detail,
             "last_error": last_error,
         });
-        let _ = write_background_job(path, &value);
+        if state == "starting" && self.is_foreground_owner() {
+            let _ = start_background_job_record(path, &value);
+        } else {
+            let _ = write_background_job(path, &value);
+        }
     }
 
     fn complete(&mut self) {
+        self.publication_finished();
         self.complete = true;
         if self.delegated {
             self.write_state("base_graph_ready", None);
@@ -4434,8 +5143,42 @@ impl BackgroundJobGuard {
         self.path.as_deref()
     }
 
+    fn publication_finished(&self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
+    pub(crate) fn publication_boundary<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T>,
+        committed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let mut terminal = self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = publish()?;
+        if committed(&result) {
+            *terminal = true;
+        }
+        Ok(result)
+    }
+
     fn fail(&mut self, error: &Error) {
-        self.write_state("failed", Some(&error.to_string()));
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        if BACKGROUND_DEMAND_CANCELLED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.write_state(
+                "cancelled",
+                Some("automatic index stopped after its last query waiter exited"),
+            );
+        } else {
+            self.write_state("failed", Some(&error.to_string()));
+        }
         self.complete = true;
     }
 
@@ -4444,6 +5187,10 @@ impl BackgroundJobGuard {
     /// state with the degradation reason so the next semantic query
     /// retries the remaining vectors; the published graph stays live.
     fn degraded(&mut self, reason: &str) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
@@ -4484,8 +5231,94 @@ mod background_progress_tests {
     }
 }
 
+#[cfg(test)]
+mod background_job_status_tests {
+    use super::{read_background_job, start_background_job_record, write_background_job};
+    use serde_json::json;
+
+    #[test]
+    fn cancelled_job_cannot_be_resurrected_by_late_progress_or_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let cancelled = json!({
+            "pid": 42,
+            "target_generation": 2,
+            "started_at_unix_secs": 123,
+            "state": "cancelled",
+            "last_error": "automatic index stopped after its last query waiter exited"
+        });
+        start_background_job_record(&path, &cancelled).unwrap();
+        let mut late = cancelled.clone();
+        for phase in [
+            "preparing_base_checkout",
+            "base_graph_ready",
+            "embedding",
+            "failed",
+        ] {
+            late["state"] = json!(phase);
+            late["last_error"] = json!(null);
+            write_background_job(&path, &late).unwrap();
+            assert_eq!(read_background_job(&path).unwrap(), cancelled);
+        }
+    }
+
+    #[test]
+    fn cancelled_job_allows_a_fresh_launch_and_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let mut job = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "cancelled"
+        });
+        start_background_job_record(&path, &job).unwrap();
+        let mut stale = job.clone();
+        stale["state"] = json!("base_graph_ready");
+        job["pid"] = json!(null);
+        job["state"] = json!("launching");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["pid"] = json!(43);
+        job["state"] = json!("starting");
+        start_background_job_record(&path, &job).unwrap();
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        stale["target_generation"] = json!(0);
+        stale["started_at_unix_secs"] = json!(124);
+        write_background_job(&path, &stale).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+        job["state"] = json!("embedding");
+        write_background_job(&path, &job).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), job);
+    }
+
+    #[test]
+    fn failed_or_removed_job_cannot_be_revived_by_a_late_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.job");
+        let failed = json!({
+            "pid": 42, "target_generation": 2,
+            "started_at_unix_secs": 123, "state": "failed",
+            "last_error": "demand monitor failed"
+        });
+        start_background_job_record(&path, &failed).unwrap();
+        let mut late = failed.clone();
+        late["state"] = json!("preparing_base_checkout");
+        late["last_error"] = json!(null);
+        write_background_job(&path, &late).unwrap();
+        assert_eq!(read_background_job(&path).unwrap(), failed);
+        std::fs::remove_file(&path).unwrap();
+        write_background_job(&path, &late).unwrap();
+        assert!(!path.exists());
+    }
+}
+
 impl Drop for BackgroundJobGuard {
     fn drop(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         if self.complete {
             return;
         }
@@ -4562,16 +5395,27 @@ pub(crate) enum BackgroundJobLaunch {
     Owned {
         child: std::process::Child,
         path: std::path::PathBuf,
+        demand: Option<greppy_core::cache::FileLock>,
     },
     Attached {
         path: std::path::PathBuf,
+        root: std::path::PathBuf,
+        // Retaining this lease, rather than reading it, keeps shared work alive.
+        _demand: Option<greppy_core::cache::FileLock>,
     },
 }
 
 impl BackgroundJobLaunch {
     pub(crate) fn path(&self) -> &std::path::Path {
         match self {
-            Self::Owned { path, .. } | Self::Attached { path } => path,
+            Self::Owned { path, .. } | Self::Attached { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn owner_is_active(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Owned { child, .. } => child.try_wait().map(|status| status.is_none()),
+            Self::Attached { root, .. } => Ok(background_job_writer_active(root)),
         }
     }
 }
@@ -4593,42 +5437,45 @@ fn spawn_background_job_handle(
     let Ok(root) = resolve_root(root) else {
         return None;
     };
-    if greppy_core::cache::ensure_workspace_store(&root).is_err() {
+    let store_path = ensured_workspace_store_path(&root).ok()?;
+    let demand_name = background_job_demand_name(&root);
+    let Ok(Some(demand)) = acquire_background_job_demand(&root) else {
         return None;
+    };
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_DEMAND_READY") {
+        let _ = std::fs::write(path, b"ready\n");
     }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
         &format!("workspace-{hash}.job-spawn"),
         greppy_core::cache::LockMode::Exclusive,
+        // `false` is the blocking mode: concurrent first queries serialize
+        // here, then the follower observes and attaches to the active writer.
         false,
     ) else {
         return None;
     };
     let job_path = background_job_path(&root);
-    if let Some(job) = read_background_job(&job_path) {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive)
-        {
-            return Some(BackgroundJobLaunch::Attached { path: job_path });
-        }
+    if background_job_writer_active(&root) {
+        return Some(BackgroundJobLaunch::Attached {
+            path: job_path,
+            root,
+            _demand: Some(demand),
+        });
     }
-    let target_generation = greppy_store::Store::open_with(
-        &workspace_locator::store_path(&root),
-        greppy_store::OpenOptions::read_only(),
-    )
-    .ok()
-    .and_then(|store| {
-        store
-            .get_workspace_state(root.to_string_lossy().as_ref())
+    let target_generation =
+        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())
             .ok()
-            .flatten()
-            .map(|state| state.graph_generation)
-    })
-    .unwrap_or(0)
-    .saturating_add(1);
+            .and_then(|store| {
+                store
+                    .get_workspace_state(root.to_string_lossy().as_ref())
+                    .ok()
+                    .flatten()
+                    .map(|state| state.graph_generation)
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
@@ -4643,6 +5490,8 @@ fn spawn_background_job_handle(
     };
     let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
     let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+    let inherited_workers = std::env::var_os("GREPPY_WORKERS");
+    let worker_count = Some(automatic_index_worker_count(inherited_workers.as_deref()));
     // Publish a launch record before spawning. Otherwise a concurrent status
     // call can observe the child-owned writer lock while background_job is
     // still null and provide no useful progress or recovery information.
@@ -4654,6 +5503,7 @@ fn spawn_background_job_handle(
         "updated_at_unix_secs": started_at,
         "cause": cause,
         "target_generation": target_generation,
+        "worker_count": worker_count,
         "state": "launching",
         "backend": backend,
         "device": device,
@@ -4666,10 +5516,20 @@ fn spawn_background_job_handle(
         "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         return None;
     }
-    let mut command = std::process::Command::new(exe);
+    let (mut command, admission_stderr) = match index_admission::command(&exe, &job_path) {
+        Ok(command) => command,
+        Err(error) => {
+            value["state"] = serde_json::json!("failed");
+            value["last_error"] = serde_json::json!(format!(
+                "automatic {kind} admission could not start; no index work started: {error}"
+            ));
+            let _ = write_background_job(&job_path, &value);
+            return None;
+        }
+    };
     command
         .arg("index")
         .arg(&root)
@@ -4683,9 +5543,24 @@ fn spawn_background_job_handle(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
             target_generation.to_string(),
         )
+        .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    if admission_stderr.is_none() {
+        command.stderr(std::process::Stdio::null());
+    }
+    let configured_workers =
+        configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
+    debug_assert_eq!(Some(configured_workers), worker_count);
+    if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
+        command.env(ENV_STRUCTURAL_FIRST_USE, "1");
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GREPPY_TEST_BACKGROUND_SPAWN_FAIL").is_some() {
+        command = std::process::Command::new(
+            root.join("__greppy_deliberately_missing_background_indexer__"),
+        );
+    }
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
@@ -4722,15 +5597,72 @@ fn spawn_background_job_handle(
     } else {
         "refreshing"
     });
-    if write_background_job(&job_path, &value).is_err() {
+    if start_background_job_record(&job_path, &value).is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return None;
     }
+    // The spawn lock remains held until the child either owns the portable
+    // workspace writer lock or has exited. A later launcher can therefore use
+    // that OS lock as the ownership identity without a PID/start-time race.
+    // There is intentionally no elapsed-time takeover: process exit and lock
+    // acquisition are the only state transitions.
+    loop {
+        if background_job_writer_active(&root) {
+            break;
+        }
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let recorded_failure = read_background_job(&job_path).is_some_and(|job| {
+                        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+                    });
+                    if !recorded_failure {
+                        value["state"] = serde_json::json!("failed");
+                        value["last_error"] = serde_json::json!(
+                            index_admission::failure_detail(admission_stderr.as_deref(), status)
+                                .unwrap_or_else(|| format!(
+                                    "background {kind} exited before acquiring the workspace writer lock: {status}"
+                                ))
+                        );
+                        let _ = write_background_job(&job_path, &value);
+                    }
+                }
+                break;
+            }
+            Err(error) => {
+                value["state"] = serde_json::json!("failed");
+                value["last_error"] =
+                    serde_json::json!(format!("observe background {kind} startup: {error}"));
+                let _ = write_background_job(&job_path, &value);
+                break;
+            }
+        }
+    }
     Some(BackgroundJobLaunch::Owned {
         child,
         path: job_path,
+        demand: Some(demand),
     })
+}
+
+fn automatic_index_worker_count(inherited: Option<&std::ffi::OsStr>) -> usize {
+    inherited
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| (1..=256).contains(workers))
+        .unwrap_or(AUTOMATIC_INDEX_MAX_WORKERS)
+        .min(AUTOMATIC_INDEX_MAX_WORKERS)
+}
+
+fn configure_automatic_index_workers(
+    command: &mut std::process::Command,
+    inherited: Option<&std::ffi::OsStr>,
+) -> usize {
+    let workers = automatic_index_worker_count(inherited);
+    command.env("GREPPY_WORKERS", workers.to_string());
+    workers
 }
 
 fn spawn_background_job(
@@ -4742,11 +5674,15 @@ fn spawn_background_job(
     let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
         return false;
     };
-    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+    if let BackgroundJobLaunch::Owned {
+        mut child, demand, ..
+    } = launch
+    {
         // Detached refreshes still need a reaper in this long-lived process.
         let _ = std::thread::Builder::new()
             .name("greppy-index-reaper".into())
             .spawn(move || {
+                let _demand = demand;
                 let _ = child.wait();
             });
     }
@@ -4771,6 +5707,13 @@ fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> boo
     spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
 }
 
+pub(crate) fn spawn_background_embed_handle(
+    root: Option<&str>,
+    cfg: &EmbeddingModelConfig,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg))
+}
+
 fn format_embedding_eta(seconds: u64) -> String {
     let minutes = seconds / 60;
     let remainder = seconds % 60;
@@ -4781,13 +5724,6 @@ fn format_embedding_eta(seconds: u64) -> String {
     } else {
         format!("{minutes}m {remainder}s")
     }
-}
-
-#[derive(Clone, Copy)]
-struct SemanticFallbackContext<'a> {
-    query: &'a str,
-    paths: &'a [String],
-    root: Option<&'a str>,
 }
 
 /// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each
@@ -4986,6 +5922,13 @@ fn summarize_source_cached(
     source: &str,
     unbounded: bool,
 ) -> Option<Vec<String>> {
+    // Literal source facts outrank cached/model expansions of register acronyms.
+    // Keep the trained summary prompt and complex-function path unchanged.
+    if file_path.ends_with(".rs") {
+        if let Some(fact) = greppy_parser::grounded_hint::rust_conditional_bit_writes(source) {
+            return Some(vec![fact]);
+        }
+    }
     let (cache, fallback_cache, global_cache) = caches;
     let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
@@ -5074,7 +6017,9 @@ fn summarize_definition_span(
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        let cache = greppy_store::SummaryCache::open(&workspace_locator::store_dir(root_path)).ok();
+        let cache = greppy_core::cache::ensure_workspace_store(root_path)
+            .ok()
+            .and_then(|directory| greppy_store::SummaryCache::open(&directory).ok());
         let base_cache = std::env::var_os(crate::store_cow::ENV_BASE_PATH)
             .map(std::path::PathBuf::from)
             .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
@@ -5431,18 +6376,28 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if id.is_empty() {
         return Err(Error::Invalid("expand requires an id".into()));
     }
+    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
+    // File and command-output continuations live in the workspace-local pack
+    // store and do not depend on graph completeness. Serve them before opening
+    // a linked-worktree overlay, whose immutable Base may have been cleaned up.
+    let pack_store = open_default_store_pack_writer(root)?;
+    if let Some(pack) = pack_store.get_expand_pack(&lookup_id)? {
+        #[cfg(feature = "bash-smart")]
+        if pack.command == "bash-smart" {
+            return bash_smart::expand(&pack_store, pack, json);
+        }
+        if pack.command == "read-file" {
+            return dispatch_read_expand(&pack_store, &pack, json, root);
+        }
+    }
+    drop(pack_store);
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
     let Some(pack) = store.get_expand_pack(&lookup_id)? else {
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
-    #[cfg(feature = "bash-smart")]
-    if pack.command == "bash-smart" {
-        return bash_smart::expand(&store, pack, json);
-    }
-    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
+    if pack.command == "read-smart" {
         return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
@@ -5596,8 +6551,12 @@ fn dispatch_diagnostics(json: bool, root: Option<&str>) -> Result<i32> {
     Ok(if diag.is_healthy() { 0 } else { EXIT_IO as i32 })
 }
 
-fn dispatch_doctor(json: bool, root: Option<&str>) -> Result<i32> {
-    dispatch_index_health("doctor", json, root)
+fn dispatch_doctor(
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    dispatch_index_health("doctor", json, root, embedding_args)
 }
 
 fn combined_inference_gpu_memory() -> u64 {
@@ -6375,7 +7334,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             .get("fresh")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let incomplete_providers = incomplete_provider_json(&store, &project)?;
+        let incomplete_providers = query_incomplete_provider_json(&store, &project, req.command)?;
         let omitted = total.saturating_sub(shown);
         let value = serde_json::json!({
             "command": req.command,
@@ -6850,7 +7809,6 @@ struct SearchCodeMatchLine {
 
 #[derive(Debug)]
 struct SearchCodeDefinitionEntry {
-    node_id: i64,
     qualified_name: String,
     file: String,
     start_line: i64,
@@ -6858,12 +7816,6 @@ struct SearchCodeDefinitionEntry {
     source: String,
     handle: String,
     matches: Vec<SearchCodeMatchLine>,
-}
-
-#[derive(Debug)]
-enum SearchCodeEntry {
-    Definition(SearchCodeDefinitionEntry),
-    Unenclosed(SearchCodeMatchLine),
 }
 
 fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {
@@ -6964,17 +7916,32 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
+    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default(), None)
+}
+
+fn live_grep_code_hits_pattern_scoped(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
+    path_filters: &QueryPathFilters,
+    progress: Option<&query_progress::LocalQueryProgress>,
+) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect::<Vec<_>>();
-    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed)
+    if let Some(progress) = progress {
+        progress.phase("scanning_files", paths.len(), "files");
+    }
+    live_grep_search_code_paths_pattern(query, root_path, &paths, fixed, progress)
 }
 
 fn source_code_hits_ranked(
@@ -7005,6 +7972,7 @@ fn live_grep_search_code_paths_pattern(
     root_path: &std::path::Path,
     paths: &[String],
     fixed: bool,
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -7016,6 +7984,7 @@ fn live_grep_search_code_paths_pattern(
         ["-HnIE", "--", query]
     };
     let mut hits = Vec::new();
+    let mut completed = 0;
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
             .args(grep_args)
@@ -7025,7 +7994,7 @@ fn live_grep_search_code_paths_pattern(
         let out = match out {
             Ok(out) => out,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && fixed => {
-                return internal_literal_search_code_paths(query, root_path, paths);
+                return internal_literal_search_code_paths(query, root_path, paths, progress);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Invalid(
@@ -7045,6 +8014,10 @@ fn live_grep_search_code_paths_pattern(
         }
         let text = String::from_utf8_lossy(&out.stdout);
         hits.extend(text.lines().filter_map(parse_grep_code_hit));
+        completed += chunk.len();
+        if let Some(progress) = progress {
+            progress.completed(completed);
+        }
     }
     Ok(hits)
 }
@@ -7057,12 +8030,16 @@ fn internal_literal_search_code_paths(
     query: &str,
     root_path: &std::path::Path,
     paths: &[String],
+    progress: Option<&query_progress::LocalQueryProgress>,
 ) -> Result<Vec<greppy_search::CodeHit>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(progress) = progress {
+            progress.completed(index);
+        }
         let absolute = root_path.join(path);
         let bytes = match std::fs::read(&absolute) {
             Ok(bytes) => bytes,
@@ -7081,6 +8058,9 @@ fn internal_literal_search_code_paths(
                 });
             }
         }
+    }
+    if let Some(progress) = progress {
+        progress.completed(paths.len());
     }
     Ok(hits)
 }
@@ -7259,6 +8239,31 @@ fn absolutize_path(p: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Canonicalize the deepest existing ancestor while retaining a missing
+/// lexical suffix. This keeps deleted-file filters comparable with a
+/// canonical repository root without requiring the filtered path to exist.
+fn canonicalize_with_missing_suffix(p: &std::path::Path) -> std::path::PathBuf {
+    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
+}
+
 /// Walk up from `start` looking for a repository marker. Returns the
 /// first ancestor (including `start`) that contains a marker, or `start`
 /// itself when none is found. Pure path logic so it is unit-testable
@@ -7333,26 +8338,40 @@ impl QueryPathFilters {
             .map(|filter| filter.shown.as_str())
             .collect::<Vec<_>>())
     }
+
+    fn repo_prefixes(&self) -> Vec<String> {
+        self.filters
+            .iter()
+            .filter_map(|filter| filter.repo_prefix.clone())
+            .collect()
+    }
 }
 
 fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    // Normalize both sides through their deepest existing ancestor so platform
+    // aliases (for example macOS /var -> /private/var), Windows path
+    // normalization, and deleted-file suffixes remain comparable.
+    let normalized_root = canonicalize_with_missing_suffix(root_path);
     let supplied = std::path::Path::new(raw);
     let candidate = if supplied.is_absolute() {
-        absolutize_path(supplied)
+        supplied.to_path_buf()
     } else {
         let cwd = std::env::current_dir().ok();
         let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
         if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
-            absolutize_path(path)
+            path.to_path_buf()
         } else if root_path.join(supplied).exists() {
-            absolutize_path(&root_path.join(supplied))
-        } else if let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(root_path)) {
+            root_path.join(supplied)
+        } else if let Some(cwd) =
+            cwd.filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root))
+        {
             cwd.join(supplied)
         } else {
             root_path.join(supplied)
         }
     };
-    let relative = candidate.strip_prefix(root_path).ok()?;
+    let candidate = canonicalize_with_missing_suffix(&candidate);
+    let relative = candidate.strip_prefix(&normalized_root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
@@ -7792,16 +8811,34 @@ mod release_embedded_model_guards {
 /// makes the unchanged fast path constant-time without accepting stale or torn
 /// payloads.
 mod embeddinggemma_assets {
+    const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
+    const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
+    const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
+    const TOK_NAME: &str = "tokenizer.json";
+
+    /// Return the eventual model paths without creating or verifying assets.
+    pub fn identity_paths() -> (String, String) {
+        let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
+        (
+            root.join(GGUF_SHA)
+                .join(GGUF_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            root.join(TOK_SHA)
+                .join(TOK_NAME)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     pub fn paths() -> Option<(String, String)> {
-        const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
-        const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         #[cfg(not(debug_assertions))]
         {
             static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
-            let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
-            let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
+            let gguf = extract(&root, GGUF_SHA, GGUF_NAME, GGUF)?;
+            let tok = extract(&root, TOK_SHA, TOK_NAME, TOK)?;
             return Some((gguf, tok));
         }
         #[cfg(debug_assertions)]
@@ -7809,13 +8846,13 @@ mod embeddinggemma_assets {
             let gguf = super::extract_repo_model_asset(
                 &root,
                 GGUF_SHA,
-                "embeddinggemma-300M-Q4_K.gguf",
+                GGUF_NAME,
                 env!("GREPPY_EMBEDDED_GGUF_PATH"),
             )?;
             let tok = super::extract_repo_model_asset(
                 &root,
                 TOK_SHA,
-                "tokenizer.json",
+                TOK_NAME,
                 env!("GREPPY_EMBEDDED_TOK_PATH"),
             )?;
             Some((gguf, tok))
@@ -8094,7 +9131,7 @@ fn acquire_cached_model_lease(
 fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -> Result<Vec<f32>> {
     let store_dir = resolve_root(root)
         .ok()
-        .map(|r| workspace_locator::store_dir(&r));
+        .and_then(|r| greppy_core::cache::ensure_workspace_store(&r).ok());
     let cache = store_dir
         .as_ref()
         .and_then(|dir| greppy_store::QueryEmbeddingCache::open(dir).ok());
@@ -8277,37 +9314,98 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// tells agents to pass `--root .` on every command. Forwarding them made real
 /// grep answer `unrecognized option '--root'`, which cost the agent a turn every
 /// time it searched — measured at 2.3 wasted turns per task, and zero in an arm
-/// that just calls grep directly. `--root DIR` also carries intent: when no path
-/// operand is present we append DIR so the search still covers what was asked.
-fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+/// that just calls grep directly. `--root DIR` selects the child search process's
+/// working directory; it must never become an additional grep path operand.
+struct GrepGlobals {
+    args: Vec<std::ffi::OsString>,
+    root: Option<std::ffi::OsString>,
+}
+
+fn passthrough_flavor(args: &[std::ffi::OsString]) -> PassthroughFlavor {
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_str().unwrap_or_default();
+        if matches!(text, "--root" | "--device") {
+            index += 2;
+            continue;
+        }
+        if args[index].as_encoded_bytes().starts_with(b"--root=")
+            || text.starts_with("--device=")
+            || matches!(text, "--no-gpu" | "--diagnostics")
+        {
+            index += 1;
+            continue;
+        }
+        return if matches!(text, "rg" | "ripgrep") {
+            PassthroughFlavor::Ripgrep
+        } else if matches!(text, "grep" | "egrep" | "fgrep" | "rgrep") {
+            PassthroughFlavor::Grep
+        } else if greppy_passthrough::is_rg_style(&args[index..]) {
+            PassthroughFlavor::Ripgrep
+        } else {
+            PassthroughFlavor::Grep
+        };
+    }
+    PassthroughFlavor::Grep
+}
+
+fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Result<Option<GrepGlobals>> {
     const VALUE_FLAGS: [&str; 2] = ["--root", "--device"];
     const BARE_FLAGS: [&str; 2] = ["--no-gpu", "--diagnostics"];
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     let mut root: Option<std::ffi::OsString> = None;
     let mut removed = false;
+    let flavor = passthrough_flavor(args);
     let mut index = 0;
     while index < args.len() {
         let text = args[index].to_str().unwrap_or_default();
+        if text == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
+        if passthrough_option_consumes_next(&args[index], flavor) {
+            out.push(args[index].clone());
+            if let Some(value) = args.get(index + 1) {
+                out.push(value.clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         if let Some(flag) = VALUE_FLAGS.iter().find(|flag| text == **flag) {
             if let Some(value) = args.get(index + 1) {
                 if *flag == "--root" {
+                    if value.is_empty() {
+                        return Err(Error::Invalid("--root needs a directory".into()));
+                    }
                     root = Some(value.clone());
                 }
                 index += 2;
                 removed = true;
                 continue;
             }
+            if *flag == "--root" {
+                return Err(Error::Invalid("--root needs a directory".into()));
+            }
             index += 1;
             removed = true;
             continue;
         }
-        if let Some(flag) = VALUE_FLAGS
-            .iter()
-            .find(|flag| text.starts_with(&format!("{flag}=")))
-        {
-            if *flag == "--root" {
-                root = Some(std::ffi::OsString::from(&text[flag.len() + 1..]));
+        if let Some(value) = args[index].as_encoded_bytes().strip_prefix(b"--root=") {
+            if value.is_empty() {
+                return Err(Error::Invalid("--root needs a directory".into()));
             }
+            // SAFETY: these bytes came from an OsString on this platform.
+            // Splitting immediately after the known ASCII '=' preserves the
+            // self-synchronizing encoded-byte boundary required by OsString.
+            root =
+                Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(value.to_vec()) });
+            index += 1;
+            removed = true;
+            continue;
+        }
+        if text.starts_with("--device=") {
             index += 1;
             removed = true;
             continue;
@@ -8321,23 +9419,39 @@ fn strip_greppy_globals(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsS
         index += 1;
     }
     if !removed {
-        return None;
+        return Ok(None);
     }
-    // A bare `--root DIR` with no path operand still means "search DIR". The
-    // first non-flag argument is the PATTERN, so a path operand only exists from
-    // the second one on — counting the pattern as a path silently searched the
-    // wrong place.
-    if let Some(root) = root {
-        let non_flags = out
-            .iter()
-            .skip(1)
-            .filter(|arg| !arg.to_str().unwrap_or_default().starts_with('-'))
-            .count();
-        if non_flags <= 1 {
-            out.push(root);
-        }
+    Ok(Some(GrepGlobals { args: out, root }))
+}
+
+fn grep_working_dir(root: Option<&std::ffi::OsStr>) -> Result<Option<std::path::PathBuf>> {
+    let Some(root) = root else { return Ok(None) };
+    let supplied = std::path::PathBuf::from(root);
+    let canonical = supplied.canonicalize().map_err(|error| {
+        Error::Invalid(format!("invalid --root `{}`: {error}", supplied.display()))
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::Invalid(format!(
+            "invalid --root `{}`: not a directory",
+            supplied.display()
+        )));
     }
-    Some(out)
+    Ok(Some(canonical))
+}
+
+fn add_root_default_path(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+    demand: StdinDemand<'_>,
+) -> Option<Vec<std::ffi::OsString>> {
+    if working_dir.is_some() && matches!(demand, StdinDemand::WhenNonTerminal(_)) {
+        let mut rooted = Vec::with_capacity(args.len() + 1);
+        rooted.extend_from_slice(args);
+        rooted.push(std::ffi::OsString::from("."));
+        Some(rooted)
+    } else {
+        None
+    }
 }
 
 /// Greppy-only flags, with the subcommand that owns each one.
@@ -8395,8 +9509,13 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // grep-family (or rg-family) placeholder in full[1] if present so
     // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
     // all agree.
-    let cleaned = strip_greppy_globals(&full[1..]);
-    let args: &[std::ffi::OsString] = cleaned.as_deref().unwrap_or(&full[1..]);
+    let cleaned = strip_greppy_globals(&full[1..])?;
+    let args: &[std::ffi::OsString] = cleaned
+        .as_ref()
+        .map(|cleaned| cleaned.args.as_slice())
+        .unwrap_or(&full[1..]);
+    let working_dir =
+        grep_working_dir(cleaned.as_ref().and_then(|cleaned| cleaned.root.as_deref()))?;
     let (stripped, named_rg, named_grep): (&[std::ffi::OsString], bool, bool) = match args
         .first()
         .and_then(|s| s.to_str())
@@ -8412,14 +9531,19 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // Blindly forwarding them to real grep would be a usage error at
     // best and a silently different search at worst.
     if named_rg || greppy_passthrough::is_rg_style(stripped) {
-        return dispatch_rg_os(stripped);
+        return dispatch_rg_os(stripped, working_dir.as_deref());
     }
 
     // Ordinary grep invocations are a byte-exact delegation contract. In
     // particular, a directory operand without `-r` must keep real grep's
     // diagnostic and exit code rather than silently acquiring recursion.
     let _ = named_grep;
-    let grep_args = stripped;
+    let rooted = add_root_default_path(
+        stripped,
+        working_dir.as_deref(),
+        grep_stdin_demand(stripped),
+    );
+    let grep_args = rooted.as_deref().unwrap_or(stripped);
     if let Some((flag, owner)) = greppy_only_flag(grep_args) {
         let guidance = if owner.is_empty() {
             "it belongs to greppy's navigation commands. Drop it, or name the command it goes with"
@@ -8444,7 +9568,7 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.extend_from_slice(grep_args);
 
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir.as_deref())
 }
 
 /// Route a ripgrep-style invocation: byte-exact delegation to real
@@ -8452,7 +9576,12 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
 /// real-grep call, otherwise fail loudly naming the flag and the closest
 /// alternative. Absence of ripgrep must never silently change search
 /// semantics.
-fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
+fn dispatch_rg_os(
+    args: &[std::ffi::OsString],
+    working_dir: Option<&std::path::Path>,
+) -> Result<i32> {
+    let rooted = add_root_default_path(args, working_dir, rg_stdin_demand(args));
+    let args = rooted.as_deref().unwrap_or(args);
     if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
         return Err(Error::Invalid(message));
     }
@@ -8460,7 +9589,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
         let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
         rebuilt.push(std::ffi::OsString::from("rg"));
         rebuilt.extend_from_slice(args);
-        return greppy_passthrough::run_grep_os(&real_rg, &rebuilt);
+        return greppy_passthrough::run_grep_os_in_dir(&real_rg, &rebuilt, working_dir);
     }
     use std::io::IsTerminal;
     let stdin_piped = !std::io::stdin().is_terminal();
@@ -8470,7 +9599,7 @@ fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend(grep_args);
     let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep_os(&real, &rebuilt)
+    greppy_passthrough::run_grep_os_in_dir(&real, &rebuilt, working_dir)
 }
 
 fn retire_verified_legacy_store(root: &std::path::Path) {
@@ -9303,6 +10432,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9364,6 +10494,7 @@ const BUDGET_ARRAY_FIELDS: &[&str] = &[
     "callers",
     "references",
     "callees",
+    "candidates",
 ];
 
 fn result_item_count(value: &serde_json::Value) -> usize {
@@ -9851,11 +10982,8 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("unresolved textual candidates:")
 }
 
-fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
-    if exit_code != 0 {
-        return bytes.to_vec();
-    }
     let mut priority = Vec::new();
     let mut content = Vec::new();
     for line in text.lines() {
@@ -9885,11 +11013,25 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || selected.pop().is_none()
         {
             return rendered;
         }
+        if selected.pop().is_none() {
+            return hard_cap_text_output(rendered, spec.max_bytes.unwrap_or(usize::MAX));
+        }
     }
+}
+
+fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&rendered[..end]).is_err() {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered
 }
 
 /// Translate a `Result<i32>` into the actual exit code we should return.
@@ -9903,6 +11045,10 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
+    let _web_output_budget = match cli.command.as_ref() {
+        Some(Command::Web { .. }) => Some(web::human_output_budget(cli.max_bytes)),
+        _ => None,
+    };
     let budget = output_budget_spec(&cli);
     let compact_json = compact_default_json_requested(&cli);
     if budget.is_some() || compact_json {

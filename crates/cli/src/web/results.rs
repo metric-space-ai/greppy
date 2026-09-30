@@ -7,10 +7,33 @@ use greppy_web_client::ErrorObject;
 use serde_json::json;
 use std::path::Path;
 
+// Keep URL arguments in a separate derive so the large results parser does not
+// add every Read argument temporary to its debug-build stack frame.
+#[derive(Debug, clap::Args)]
+pub struct ReadArgs {
+    #[arg(value_name = "URL", conflicts_with = "url")]
+    pub(super) positional_url: Option<String>,
+    #[arg(long)]
+    pub(super) url: Option<String>,
+    #[arg(long)]
+    pub(super) query: Option<String>,
+    #[arg(long)]
+    pub(super) session: Option<String>,
+    #[arg(long = "fixture-url")]
+    pub(super) fixture_url: Option<String>,
+    #[arg(long = "search-endpoint")]
+    pub(super) search_endpoint: Option<String>,
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ResultsCommand {
     /// Run an unchanged Playwright script in a session.
     Run {
+        /// Choose whether the script owns a new browser or uses the active session page.
+        #[arg(long, value_enum, default_value_t = RunMode::Standalone)]
+        mode: RunMode,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
@@ -67,20 +90,7 @@ pub enum ResultsCommand {
         json: bool,
     },
     /// Read one URL through the runtime.
-    Read {
-        #[arg(long)]
-        url: Option<String>,
-        #[arg(long)]
-        query: Option<String>,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long = "fixture-url")]
-        fixture_url: Option<String>,
-        #[arg(long = "search-endpoint")]
-        search_endpoint: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Read(ReadArgs),
     /// Bounded research over the runtime.
     Research {
         #[arg(long)]
@@ -184,15 +194,47 @@ pub enum ResultCommand {
     },
 }
 
+pub(super) fn requests_json(command: &ResultsCommand) -> bool {
+    match command {
+        ResultsCommand::Run { json, .. }
+        | ResultsCommand::Observe { json, .. }
+        | ResultsCommand::Screenshot { json, .. }
+        | ResultsCommand::Search { json, .. }
+        | ResultsCommand::Research { json, .. }
+        | ResultsCommand::Artifacts { json, .. }
+        | ResultsCommand::Cancel { json, .. }
+        | ResultsCommand::Heartbeat { json, .. } => *json,
+        ResultsCommand::Read(args) => args.json,
+        ResultsCommand::Artifact { command } => match command {
+            ArtifactCommand::List { json, .. }
+            | ArtifactCommand::Show { json, .. }
+            | ArtifactCommand::Path { json, .. }
+            | ArtifactCommand::Export { json, .. } => *json,
+        },
+        ResultsCommand::Result { command } => match command {
+            ResultCommand::Next { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i32> {
     match command {
         ResultsCommand::Run {
+            mode,
             session,
             script_file,
             script_stdin,
             timeout,
             json,
-        } => run(root, session, script_file, script_stdin, timeout, json),
+        } => run(
+            root,
+            session,
+            script_file,
+            script_stdin,
+            timeout,
+            mode,
+            json,
+        ),
         ResultsCommand::Observe {
             query,
             session,
@@ -265,16 +307,17 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 },
             )
         }
-        ResultsCommand::Read {
+        ResultsCommand::Read(ReadArgs {
+            positional_url,
             url,
             query,
             session,
             fixture_url,
             search_endpoint,
             json,
-        } => {
-            let Some(url) = url.filter(|url| !url.is_empty()) else {
-                return emit_error(json, invalid("web read requires --url URL"));
+        }) => {
+            let Some(url) = url.or(positional_url).filter(|url| !url.is_empty()) else {
+                return emit_error(json, invalid("web read requires URL or --url URL"));
             };
             let session = match resolve_session(root, session) {
                 Ok(session) => session,
@@ -432,7 +475,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                         json,
                     ) {
                         Ok(text) => {
-                            println!("{text}");
+                            // View pages already include their terminating newline. Printing one
+                            // more byte can exceed the renderer's exact 8 KiB output contract.
+                            print!("{text}");
                             Ok(0)
                         }
                         Err(message) => emit_error(json, invalid(&message)),
@@ -457,7 +502,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
     }
 }
 
-fn artifact_export(
+pub(super) fn artifact_export(
     root: Option<&str>,
     session: Option<String>,
     id: String,

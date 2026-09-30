@@ -97,6 +97,21 @@ pub enum ScriptCommand {
     },
 }
 
+pub(super) fn requests_json(command: &ChainCommand) -> bool {
+    match command {
+        ChainCommand::Do { json, steps, .. } => {
+            *json || steps.iter().any(|arg| arg == "--json" || arg == "--jsonl")
+        }
+        ChainCommand::Script { command } => match command {
+            ScriptCommand::Save { json, .. }
+            | ScriptCommand::List { json }
+            | ScriptCommand::Show { json, .. }
+            | ScriptCommand::Rm { json, .. }
+            | ScriptCommand::Run { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: ChainCommand, root: Option<&str>) -> Result<i32> {
     let command = match command {
         ChainCommand::Do {

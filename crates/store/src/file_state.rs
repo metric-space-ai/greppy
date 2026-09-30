@@ -90,6 +90,20 @@ impl Store {
         Ok(())
     }
 
+    /// List only this writable layer, excluding an attached immutable Base.
+    /// Migration must not turn visible Base rows into private Delta ownership.
+    pub fn list_private_file_states(&self, project: &str) -> Result<Vec<FileState>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT project, rel_path, language, sha256, mtime_ns, size,
+                    parser_version, extractor_version, last_indexed_generation
+             FROM main.file_state WHERE project = ?1 ORDER BY rel_path",
+        )?;
+        let rows = stmt
+            .query_map(params![project], |row| Ok(row_to_file_state(row)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// List all `(project, rel_path)` pairs. Used by freshness checks.
     pub fn list_file_states(&self, project: &str) -> Result<Vec<FileState>> {
         let mut stmt = self.conn().prepare(

@@ -204,7 +204,11 @@ impl GreppyEnv {
 
         match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
             Ok(captured) => {
-                let mut outcome = finalize_outcome(captured, self.max_output_bytes);
+                let mut outcome = finalize_outcome(
+                    captured,
+                    self.max_output_bytes,
+                    matches!(args.first().map(String::as_str), Some("search" | "context")),
+                );
                 if args.first().map(String::as_str) == Some("web")
                     && args.get(1).map(String::as_str) == Some("screenshot")
                 {
@@ -259,7 +263,7 @@ fn greppy_guard(args: &[String]) -> Option<String> {
         return Some("greppy tool requires a non-empty args array".to_string());
     }
     let first = args[0].as_str();
-    if first == "-p" || first == "agent" {
+    if first == "-p" || (first == "agent" && !agent_help_invocation(args)) {
         return Some(format!(
             "nested agent runs are not supported (first arg {first:?}) — you are \
              the agent; carry out the task directly with the other greppy commands"
@@ -290,6 +294,21 @@ fn greppy_guard(args: &[String]) -> Option<String> {
     None
 }
 
+/// Help-only `agent` shapes that may reach clap without enabling an agent
+/// launch or an administrative operation.
+pub fn agent_help_invocation(args: &[String]) -> bool {
+    let help = |value: &str| matches!(value, "--help" | "-h");
+    let command = |value: &str| !value.is_empty() && !value.starts_with('-');
+    match args {
+        [agent, flag] => agent == "agent" && help(flag),
+        [agent, subcommand, flag] => agent == "agent" && command(subcommand) && help(flag),
+        [agent, sessions, subcommand, flag] => {
+            agent == "agent" && sessions == "sessions" && command(subcommand) && help(flag)
+        }
+        _ => false,
+    }
+}
+
 fn parse_string_array(arguments: &Value, field: &str) -> Result<Vec<String>, String> {
     let obj = arguments
         .as_object()
@@ -314,6 +333,7 @@ struct Captured {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
+    exit_code: Option<i32>,
     timed_out: bool,
     timeout: Option<Duration>,
 }
@@ -412,6 +432,7 @@ fn run_capture_held(
         stdout,
         stderr,
         success: status.success(),
+        exit_code: status.code(),
         timed_out,
         timeout,
     })
@@ -461,7 +482,11 @@ fn extract_png_base64(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome {
+fn finalize_outcome(
+    captured: Captured,
+    max_output_bytes: usize,
+    semantic_query: bool,
+) -> ToolOutcome {
     if captured.timed_out {
         let secs = captured.timeout.map(|d| d.as_secs()).unwrap_or_default();
         // Still surface any partial output so the model has context, then the
@@ -476,23 +501,25 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
     }
 
     let body = merge_stdio(&captured.stdout, &captured.stderr);
-    // Narrow detection of the retryable semantic-index build status greppy
-    // prints on stdout when embeddings are incomplete (exit 1). That status
-    // must never reach the model as an error — the agent should retry soon
-    // and use name/text search meanwhile.
-    //
-    // Emitting site: `embedding_progress_text` in `crates/cli/src/inference.rs`
-    // (also called from search.rs / context.rs / indexing.rs). Stable prefix
-    // is the literal below (em dash U+2014). Match that prefix only — do not
-    // re-derive from JSON fields here (text form is what the tool captures).
-    if is_retryable_semantic_index_building(&body) {
+    // Only a semantic query's exit-1 preparation status is pending. Text
+    // returned by read/rg/bash-smart, a successful query, or a genuine failure
+    // must retain its actual outcome even if it contains this status phrase.
+    if semantic_query
+        && captured.exit_code == Some(1)
+        && is_retryable_semantic_index_building(&body)
+        && String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .all(|line| line.is_empty() || semantic_preparation_line(line))
+        && semantic_preparation_stderr(&captured.stderr)
+    {
         let mut msg = body;
         if !msg.is_empty() && !msg.ends_with('\n') {
             msg.push('\n');
         }
         msg.push_str(
-            "semantic index still building — not an error. Retry this same command \
-             shortly; meanwhile use search-symbol or search-pattern for name/text matches.",
+            "Pending semantic result: keep this query pending and retry the same command \
+             after the reported ETA. If ETA is measuring, obtain an estimate with index status \
+             before retrying. Index preparation is reused by that retry.",
         );
         let msg = truncate_output(msg, max_output_bytes);
         return ToolOutcome::ok(msg);
@@ -526,14 +553,74 @@ fn finalize_outcome(captured: Captured, max_output_bytes: usize) -> ToolOutcome 
 /// (`embedding_progress_text`): `"semantic index building — {completed}/…"`.
 const SEMANTIC_INDEX_BUILDING_PREFIX: &str = "semantic index building —";
 
-/// True when tool output is the retryable "semantic index building" status.
-///
-/// Matches the CLI's text form by its stable prefix (em dash U+2014). Exit
-/// code is ignored — the status prints with exit 1, which would otherwise
-/// surface as a tool error. Emitting site: `embedding_progress_text` in
-/// `crates/cli/src/inference.rs`.
+/// Recognize a complete CLI status line, not a substring in source or hints.
 fn is_retryable_semantic_index_building(body: &str) -> bool {
-    body.contains(SEMANTIC_INDEX_BUILDING_PREFIX)
+    body.lines().any(semantic_preparation_line)
+}
+
+fn semantic_preparation_line(line: &str) -> bool {
+    fn number(text: &str) -> Option<u64> {
+        (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    let line = line.strip_prefix("semantic-search: ").unwrap_or(line);
+    let Some(rest) = line.strip_prefix("semantic index building — ") else {
+        return false;
+    };
+    let Some((counts, rest)) = rest.split_once(" spans, ETA ") else {
+        return false;
+    };
+    let Some((completed, total)) = counts.split_once('/') else {
+        return false;
+    };
+    let (Some(completed), Some(total)) = (number(completed), number(total)) else {
+        return false;
+    };
+    if completed > total {
+        return false;
+    }
+    let Some((eta, backend)) = rest.rsplit_once(" (backend ") else {
+        return false;
+    };
+    let Some(backend) = backend.strip_suffix(')') else {
+        return false;
+    };
+    if backend.is_empty()
+        || !backend
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return false;
+    }
+    if eta == "measuring" {
+        return true;
+    }
+    let Some(eta) = eta.strip_prefix('~') else {
+        return false;
+    };
+    match eta.split(' ').collect::<Vec<_>>().as_slice() {
+        [seconds] if seconds.ends_with('s') => {
+            number(&seconds[..seconds.len() - 1]).is_some_and(|s| s < 60)
+        }
+        [minutes] if minutes.ends_with('m') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+        }
+        [minutes, seconds] if minutes.ends_with('m') && seconds.ends_with('s') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+                && number(&seconds[..seconds.len() - 1]).is_some_and(|s| s > 0 && s < 60)
+        }
+        _ => false,
+    }
+}
+
+/// A pending status must never hide a separate fatal diagnostic.
+fn semantic_preparation_stderr(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).lines().all(|line| {
+        line.is_empty()
+            || semantic_preparation_line(line)
+            || line == "greppy: search still running; no detailed progress is available"
+    })
 }
 
 /// True when tool output looks like a write-sandbox refusal.
@@ -623,6 +710,9 @@ pub struct SelfCheckOk {
     /// parsed for a file count. Treated as a pass (never fail on formatting
     /// drift); callers should mention it on the success diagnostic line.
     pub unrecognized_census_shape: bool,
+    /// True when the index is healthy and current but the repository has no
+    /// indexable files. This is valid for web-only or new-file agent tasks.
+    pub legitimate_empty_index: bool,
 }
 
 /// Failed startup self-check probe.
@@ -652,9 +742,10 @@ impl SelfCheckError {
 ///
 /// Two probes, both via [`GreppyEnv::call_tool`] with the env's current
 /// [`SandboxMode`] (never a raw `Command`):
-/// 1. index-backed navigation: `greppy where-am-i` — must succeed and must
-///    not report an empty repository (`N files` == 0). Unrecognized census
-///    shape is a pass (formatting drift must not abort).
+/// 1. index-backed navigation: `greppy where-am-i` — must succeed. A zero-file
+///    census is accepted only when `doctor --json` independently confirms a
+///    healthy, current zero-file generation for this exact root. Unrecognized
+///    census shape is a pass (formatting drift must not abort).
 /// 2. write probe inside the worktree:
 ///    `bash-smart -- sh -c 'printf ok > .greppy-selfcheck && rm -f .greppy-selfcheck'`.
 ///
@@ -671,16 +762,37 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
         });
     }
     let mut unrecognized_census_shape = false;
+    let mut legitimate_empty_index = false;
     match parse_where_am_i_file_count(&where_out.content) {
         Some(0) => {
-            return Err(SelfCheckError {
-                probe: "where-am-i",
-                output: truncate_chars_for_diag(&where_out.content, SELFCHECK_OUTPUT_CHARS),
-                likely_cause: "the worktree index is empty (0 files) while the tool exited \
-                     successfully — prewarm did not produce a usable index (invalid seed, \
-                     wrong store, or sandbox blocked greppy data root)"
-                    .to_string(),
-            });
+            let doctor_out = env.call_tool("greppy", &json!({"args": ["doctor", "--json"]}));
+            let healthy_empty = !doctor_out.is_error
+                && serde_json::from_str::<Value>(&doctor_out.content)
+                    .ok()
+                    .is_some_and(|doctor| {
+                        doctor.get("healthy").and_then(Value::as_bool) == Some(true)
+                            && doctor.get("project_present").and_then(Value::as_bool) == Some(true)
+                            && doctor
+                                .get("graph_generation")
+                                .and_then(Value::as_u64)
+                                .is_some()
+                            && doctor.pointer("/stats/files").and_then(Value::as_u64) == Some(0)
+                            && doctor
+                                .get("root_path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|root| same_physical_path(Path::new(root), env.root()))
+                    });
+            if !healthy_empty {
+                return Err(SelfCheckError {
+                    probe: "doctor --json after empty where-am-i",
+                    output: truncate_chars_for_diag(&doctor_out.content, SELFCHECK_OUTPUT_CHARS),
+                    likely_cause: "where-am-i reported 0 files, but doctor did not confirm a \
+                         healthy current zero-file generation for this worktree — prewarm may \
+                         have used an invalid seed, wrong root/store, or blocked data root"
+                        .to_string(),
+                });
+            }
+            legitimate_empty_index = true;
         }
         Some(_) => {}
         None => {
@@ -711,7 +823,15 @@ pub fn run_startup_self_check(env: &mut GreppyEnv) -> Result<SelfCheckOk, SelfCh
 
     Ok(SelfCheckOk {
         unrecognized_census_shape,
+        legitimate_empty_index,
     })
+}
+
+fn same_physical_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Parse the hub census file count from `where-am-i` text output.
@@ -952,6 +1072,37 @@ exit 2
     }
 
     #[test]
+    fn guard_allows_only_bounded_agent_help_shapes() {
+        for args in [
+            vec!["agent", "--help"],
+            vec!["agent", "list", "--help"],
+            vec!["agent", "sessions", "--help"],
+            vec!["agent", "sessions", "list", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(greppy_guard(&args), None, "args={args:?}");
+        }
+
+        for args in [
+            vec!["agent"],
+            vec!["agent", "sessions", "list"],
+            vec!["agent", "apply", "refs/greppy/agent/example"],
+            vec!["agent", "apply", "refs/greppy/agent/example", "--help"],
+            vec!["agent", "--", "--help"],
+            vec!["agent", "", "--help"],
+            vec!["agent", "-invalid", "--help"],
+            vec!["agent", "sessions", "--", "--help"],
+            vec!["agent", "sessions", "", "--help"],
+            vec!["agent", "sessions", "-invalid", "--help"],
+            vec!["agent", "--help", "trailing"],
+            vec!["-p", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(greppy_guard(&args).is_some(), "args={args:?}");
+        }
+    }
+
+    #[test]
     fn guard_leading_greppy_rejected() {
         let sentinel = std::env::temp_dir().join(format!(
             "greppy-env-sentinel-nested-greppy-{}",
@@ -1124,16 +1275,82 @@ exit 2
             "content={}",
             out.content
         );
-        assert!(
-            out.content.contains("search-symbol") || out.content.contains("search-pattern"),
-            "must advise interim name/text search; content={}",
-            out.content
-        );
+        assert!(out.content.contains("Pending semantic result:"));
+        assert!(out.content.contains("reported ETA"));
+        assert!(!out.content.contains("search-symbol"));
+        assert!(!out.content.contains("search-pattern"));
         assert!(
             out.content.to_ascii_lowercase().contains("retry"),
             "must tell the model to retry; content={}",
             out.content
         );
+    }
+
+    #[test]
+    fn semantic_preparation_status_grammar_and_diagnostics() {
+        for line in [
+            "semantic index building — 0/12 spans, ETA measuring (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda)",
+            "semantic-search: semantic index building — 3/12 spans, ETA ~2m (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~86m 23s (backend cuda-q4k)",
+        ] {
+            assert!(semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(!out.is_error && out.content.contains("Pending semantic result:"));
+            }
+        }
+        for line in [
+            "semantic index building —",
+            "semantic index building — failed to open index",
+            "semantic index building — 3/no spans, ETA ~9s (backend cuda)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda) failed",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda failed)",
+            "semantic index building — 3/12 spans, ETA ~2m 90s (backend cuda)",
+        ] {
+            assert!(!semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(out.is_error && !out.content.contains("Pending semantic result:"));
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_status_text_preserves_success_and_other_tool_failures() {
+        let exact = "semantic index building — 3/12 spans, ETA ~9s (backend metal)";
+        for (command, exit, expected_error) in [
+            ("read-file", 1, true),
+            ("bash-smart", 1, true),
+            ("search", 0, false),
+            ("search", 13, true),
+        ] {
+            let stub = format!("printf '%s\n' '{exact}'\nexit {exit}\n");
+            let (mut env, _, _) = env_with_stub(&stub);
+            let out = env.call_tool("greppy", &json!({"args": [command, "target"]}));
+            assert_eq!(out.is_error, expected_error, "{command}: {}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
+    }
+
+    #[test]
+    fn semantic_status_cannot_hide_a_fatal_diagnostic_or_source_substring() {
+        for stub in [
+            "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\n'; printf 'greppy: failed to open index\n' >&2; exit 1",
+            "printf 'source says semantic index building — 3/12 spans\n'; exit 1",
+            "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\nfailed to open index\n'; exit 1",
+        ] {
+            let (mut env, _, _) = env_with_stub(stub);
+            let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+            assert!(out.is_error, "{}", out.content);
+            assert!(!out.content.contains("Pending semantic result:"));
+        }
     }
 
     #[test]
@@ -1501,6 +1718,7 @@ exit 2
         );
         let ok = run_startup_self_check(&mut env).expect("self-check must pass");
         assert!(!ok.unrecognized_census_shape);
+        assert!(!ok.legitimate_empty_index);
     }
 
     #[test]
@@ -1529,11 +1747,15 @@ exit 1
     }
 
     #[test]
-    fn self_check_empty_index_is_failure() {
+    fn self_check_empty_index_is_failure_when_doctor_is_unhealthy() {
         let (mut env, _, _) = env_with_stub(
             r#"
 if [ "$1" = "where-am-i" ]; then
   printf '/tmp/fixture — 0 files, 0 definitions\n'
+  exit 0
+fi
+if [ "$1" = "doctor" ]; then
+  printf '{"healthy":false,"project_present":true,"graph_generation":1,"stats":{"files":0},"root_path":"/tmp/fixture"}\n'
   exit 0
 fi
 printf 'ok\n'
@@ -1541,13 +1763,38 @@ exit 0
 "#,
         );
         let err = run_startup_self_check(&mut env).expect_err("empty index must fail");
-        assert_eq!(err.probe, "where-am-i");
+        assert_eq!(err.probe, "doctor --json after empty where-am-i");
         assert!(
             err.likely_cause.contains("0 files") || err.likely_cause.contains("empty"),
             "cause={}",
             err.likely_cause
         );
-        assert!(err.output.contains("0 files"), "output={}", err.output);
+        assert!(err.output.contains("healthy"), "output={}", err.output);
+    }
+
+    #[test]
+    fn self_check_accepts_doctor_verified_empty_index_for_exact_root() {
+        let root = temp_root();
+        let root_json = serde_json::to_string(root.to_str().unwrap()).unwrap();
+        let script = format!(
+            r#"
+if [ "$1" = "where-am-i" ]; then
+  printf '/tmp/fixture — 0 files, 0 definitions\n'
+  exit 0
+fi
+if [ "$1" = "doctor" ]; then
+  printf '{{"healthy":true,"project_present":true,"graph_generation":1,"stats":{{"files":0}},"root_path":%s}}\n' '{root_json}'
+  exit 0
+fi
+if [ "$1" = "bash-smart" ]; then exit 0; fi
+exit 2
+"#
+        );
+        let bin = write_stub(&script);
+        let mut env = GreppyEnv::with_binary(bin, root).expect("env");
+        let ok = run_startup_self_check(&mut env).expect("healthy empty index must pass");
+        assert!(ok.legitimate_empty_index);
+        assert!(!ok.unrecognized_census_shape);
     }
 
     #[test]
@@ -1570,6 +1817,7 @@ exit 0
             ok.unrecognized_census_shape,
             "must flag unrecognized census shape"
         );
+        assert!(!ok.legitimate_empty_index);
     }
 
     #[test]

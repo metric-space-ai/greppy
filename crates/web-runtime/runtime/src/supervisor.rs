@@ -412,6 +412,20 @@ pub(crate) fn route_until_script_complete(
     route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
+#[derive(Debug)]
+pub(crate) struct ScriptFailure {
+    pub message: String,
+    pub result: serde_json::Value,
+}
+
+impl std::fmt::Display for ScriptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ScriptFailure {}
+
 pub(crate) fn route_until_script_complete_gated(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
@@ -549,10 +563,13 @@ pub(crate) fn route_until_script_complete_gated(
                     ok, result, error, ..
                 }) => {
                     if !ok {
-                        return Err(io::Error::other(format!(
-                            "controller script failed: {}",
-                            error.unwrap_or_else(|| result.to_string())
-                        )));
+                        return Err(io::Error::other(ScriptFailure {
+                            message: format!(
+                                "controller script failed: {}",
+                                error.unwrap_or_else(|| result.to_string())
+                            ),
+                            result,
+                        }));
                     }
                     return Ok(result);
                 }
@@ -806,7 +823,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
-    content_config_dir: Option<OwnedTempDir>,
+    worker_temp_dir: Option<OwnedTempDir>,
     reaped: bool,
 }
 
@@ -817,10 +834,15 @@ struct OwnedTempDir {
 
 impl OwnedTempDir {
     fn for_content_worker() -> io::Result<Self> {
+        Self::for_content_worker_in(&std::env::temp_dir())
+    }
+
+    fn for_content_worker_in(temp_root: &Path) -> io::Result<Self> {
         static SEQUENCE: AtomicU32 = AtomicU32::new(1);
-        reap_stale_content_worker_dirs();
+        let temp_root = temp_root.canonicalize()?;
+        reap_stale_content_worker_dirs_in(&temp_root);
         for _ in 0..32 {
-            let path = std::env::temp_dir().join(format!(
+            let path = temp_root.join(format!(
                 "greppy-web-content-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -848,9 +870,17 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn reap_stale_content_worker_dirs() {
+    let Ok(temp_root) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    reap_stale_content_worker_dirs_in(&temp_root);
+}
+
+#[cfg(unix)]
+fn reap_stale_content_worker_dirs_in(temp_root: &Path) {
     const PREFIX: &str = "greppy-web-content-";
     let self_pid = std::process::id();
-    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = fs::read_dir(temp_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -905,11 +935,20 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
         "GREPPY_WEB_TEST_IGNORE_CERTS",
+        #[cfg(debug_assertions)]
+        "GREPPY_TEST_TRACE_LIMIT_BYTES",
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        // Worker protocol and engine-call milestones. The supervisor reads
+        // this flag too, so scrubbing it from child workers produces a
+        // misleading supervisor-only trace exactly when a content call hangs.
+        "GREPPY_WEB_TRACE_PHASE",
         // Bounded, opt-in initialization milestones; no page data or secrets.
         "GREPPY_WEB_TRACE_STARTUP",
+        // Opt-in request-body producer lifecycle diagnostics. Values contain only
+        // process/request/channel identities and never page or body data.
+        "GREPPY_WEB_BODY_DIAGNOSTICS",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))
@@ -918,9 +957,17 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
 
 impl WorkerProcess {
     pub(crate) fn spawn(worker: WorkerKind, capability: String) -> io::Result<Self> {
+        Self::spawn_with_persistent_profiles(worker, capability, None)
+    }
+
+    pub(crate) fn spawn_with_persistent_profiles(
+        worker: WorkerKind,
+        capability: String,
+        persistent_profiles: Option<PathBuf>,
+    ) -> io::Result<Self> {
         #[cfg(not(unix))]
         {
-            let _ = (worker, capability);
+            let _ = (worker, capability, persistent_profiles);
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "worker re-exec requires a Unix inherited capability FD",
@@ -928,7 +975,7 @@ impl WorkerProcess {
         }
         #[cfg(unix)]
         {
-            spawn_unix(worker, capability)
+            spawn_unix(worker, capability, persistent_profiles)
         }
     }
 }
@@ -967,7 +1014,11 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
 }
 
 #[cfg(unix)]
-fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProcess> {
+fn spawn_unix(
+    worker: WorkerKind,
+    capability: String,
+    persistent_profiles: Option<PathBuf>,
+) -> io::Result<WorkerProcess> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
@@ -981,8 +1032,12 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
+        let worker_temp_dir = OwnedTempDir::for_content_worker()?;
+        let worker_temp_root = worker_temp_dir.path.clone();
         let content_config_dir = if worker == WorkerKind::Content {
-            Some(OwnedTempDir::for_content_worker()?)
+            let path = worker_temp_root.join("content-config");
+            fs::create_dir(&path)?;
+            Some(path)
         } else {
             None
         };
@@ -1015,11 +1070,17 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             .arg(role)
             .env_clear()
             .envs(inherited_worker_env())
+            .env("TMPDIR", &worker_temp_root)
+            .env("TMP", &worker_temp_root)
+            .env("TEMP", &worker_temp_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(dir) = content_config_dir.as_ref() {
-            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", &dir.path);
+            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
+        }
+        if let Some(dir) = persistent_profiles.as_ref() {
+            command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
         command.process_group(0);
         let sandbox_exe = path.clone();
@@ -1146,7 +1207,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
-            content_config_dir,
+            worker_temp_dir: Some(worker_temp_dir),
             reaped: false,
         })
 }
@@ -1177,7 +1238,11 @@ fn sbpl_subpath(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
+pub(crate) fn apply_worker_sandbox(
+    exe: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int};
     extern "C" {
@@ -1185,7 +1250,11 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
         fn sandbox_free_error(errorbuf: *mut c_char);
     }
     let exe_dir = exe.parent().unwrap_or(exe);
-    let profile = macos_sandbox_profile(exe, exe_dir, tmp);
+    // Seatbelt authorizes resolved filesystem paths. TMPDIR can be a symlink
+    // (notably on the shared development host), so grant its physical target.
+    let tmp = tmp.canonicalize()?;
+    let persistent_profiles = persistent_profiles.map(Path::canonicalize).transpose()?;
+    let profile = macos_sandbox_profile(exe, exe_dir, &tmp, persistent_profiles.as_deref());
     let profile = CString::new(profile)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut errorbuf: *mut c_char = std::ptr::null_mut();
@@ -1206,7 +1275,15 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
+fn macos_sandbox_profile(
+    exe: &Path,
+    exe_dir: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> String {
+    let persistent_profiles = persistent_profiles
+        .map(sbpl_subpath)
+        .unwrap_or_default();
     format!(
         r#"(version 1)
 (deny default)
@@ -1225,6 +1302,7 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
   {exe}
   {exe_dir}
   {tmp}
+  {persistent_profiles}
   (subpath "/private/var/folders")
   (subpath "/private/tmp")
   (subpath "/tmp")
@@ -1235,9 +1313,7 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
 )
 (allow file-write*
   {tmp}
-  (subpath "/private/var/folders")
-  (subpath "/private/tmp")
-  (subpath "/tmp")
+  {persistent_profiles}
 )
 (allow sysctl-read)
 (allow mach-lookup)
@@ -1256,16 +1332,25 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
         exe = sbpl_subpath(exe),
         exe_dir = sbpl_subpath(exe_dir),
         tmp = sbpl_subpath(tmp),
+        persistent_profiles = persistent_profiles,
     )
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
-    crate::linux_sandbox::apply(exe, tmp)
+pub(crate) fn apply_worker_sandbox(
+    exe: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
+    crate::linux_sandbox::apply(exe, tmp, persistent_profiles)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn apply_worker_sandbox(_exe: &Path, _tmp: &Path) -> io::Result<()> {
+pub(crate) fn apply_worker_sandbox(
+    _exe: &Path,
+    _tmp: &Path,
+    _persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "worker OS sandbox is not implemented on this platform; refusing to start unsandboxed",
@@ -1649,6 +1734,14 @@ impl WorkerProcess {
         self.child.id()
     }
 
+    pub(crate) fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    pub(crate) fn temp_dir(&self) -> Option<&Path> {
+        self.worker_temp_dir.as_ref().map(|dir| dir.path.as_path())
+    }
+
     pub(crate) fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(None) => true,
@@ -1676,19 +1769,23 @@ impl WorkerProcess {
         unregister_owned_worker(pid);
         kill_process_tree(pid);
         let deadline = Instant::now() + reap_wait;
+        let mut reaped = false;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
                 Ok(None) if Instant::now() >= deadline => {
                     kill_process_tree(pid);
-                    let _ = self.child.try_wait();
+                    reaped = self.child.try_wait().is_ok_and(|status| status.is_some());
                     break;
                 }
                 Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
                 Err(_) => break,
             }
         }
-        self.reaped = true;
+        self.reaped = reaped;
         self.input.take();
         self.join_reader_bounded(reader_wait);
         phase!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
@@ -1888,7 +1985,13 @@ impl Drop for WorkerProcess {
         if !self.reaped {
             self.kill_tree();
         }
-        self.content_config_dir.take();
+        if self.reaped {
+            self.worker_temp_dir.take();
+        } else if let Some(temp_dir) = self.worker_temp_dir.take() {
+            // A still-live process may hold cwd/files in this directory. Leak
+            // the bounded path for stale-dir reaping on a later clean startup.
+            std::mem::forget(temp_dir);
+        }
     }
 }
 
@@ -1936,6 +2039,22 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_worker_temp_dir_resolves_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = OwnedTempDir::for_content_worker().unwrap();
+        let physical = fixture.path.join("physical");
+        let alias = fixture.path.join("alias");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+
+        let content = OwnedTempDir::for_content_worker_in(&alias).unwrap();
+        assert!(content.path.starts_with(&physical), "{}", content.path.display());
+        assert!(!content.path.starts_with(&alias), "{}", content.path.display());
     }
 
     #[cfg(unix)]
@@ -2049,7 +2168,7 @@ mod tests {
     #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     #[test]
     fn non_macos_worker_sandbox_refuses_unsandboxed_start() {
-        let err = apply_worker_sandbox(Path::new("/"), Path::new("/tmp")).unwrap_err();
+        let err = apply_worker_sandbox(Path::new("/"), Path::new("/tmp"), None).unwrap_err();
         assert!(
             err.to_string().contains("refusing to start unsandboxed"),
             "{err}"
@@ -2059,7 +2178,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_worker_sandbox_allows_public_network_outbound() {
-        let profile = macos_sandbox_profile(Path::new("/tmp/exe"), Path::new("/tmp"), Path::new("/tmp"));
+        let profile = macos_sandbox_profile(
+            Path::new("/tmp/exe"),
+            Path::new("/tmp"),
+            Path::new("/tmp/greppy-worker-unit"),
+            Some(Path::new("/var/lib/greppy/web-runtime/profiles")),
+        );
         assert!(
             profile.contains("(allow network-outbound)\n"),
             "policy proxy must be able to dial non-loopback hosts; seatbelt is not the policy layer: {profile}"
@@ -2076,12 +2200,39 @@ mod tests {
             profile.contains("/etc/resolv.conf"),
             "DNS needs resolv.conf: {profile}"
         );
+        assert!(
+            profile.contains("/var/lib/greppy/web-runtime/profiles"),
+            "only the explicit persistent profile root should be added: {profile}"
+        );
+        let writes = profile
+            .split_once("(allow file-write*")
+            .and_then(|(_, tail)| tail.split_once("(allow sysctl-read)"))
+            .map(|(writes, _)| writes)
+            .expect("file-write policy block");
+        for broad_temp in [
+            "(subpath \"/private/var/folders\")",
+            "(subpath \"/private/tmp\")",
+            "(subpath \"/tmp\")",
+        ] {
+            assert!(
+                !writes.contains(broad_temp),
+                "worker write policy must not expose sibling daemon locks: {writes}"
+            );
+        }
+        assert!(
+            writes.contains("/tmp/greppy-worker-unit"),
+            "owned worker temp is missing: {writes}"
+        );
+        assert!(
+            !writes.contains("profile-locks"),
+            "daemon lock root must never enter the worker policy: {writes}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_worker_sandbox_refuses_filesystem_root() {
-        let err = apply_worker_sandbox(Path::new("/"), Path::new("/")).unwrap_err();
+        let err = apply_worker_sandbox(Path::new("/"), Path::new("/"), None).unwrap_err();
         assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert!(
             !err.to_string().is_empty(),

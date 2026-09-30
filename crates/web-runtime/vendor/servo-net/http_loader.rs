@@ -12,7 +12,10 @@ use std::time::{Duration, SystemTime};
 use async_recursion::async_recursion;
 use content_security_policy::percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use devtools_traits::ChromeToDevtoolsControlMsg;
-use embedder_traits::{AuthenticationResponse, GenericEmbedderProxy};
+use embedder_traits::{
+    AuthenticationResponse, GenericEmbedderProxy, WebResourceLoadId,
+    WebResourceResponseCompleted,
+};
 use futures::{TryFutureExt, TryStreamExt, future};
 use headers::authorization::Basic;
 use headers::{
@@ -509,6 +512,7 @@ async fn obtain_response(
     method: &Method,
     request_headers: &mut HeaderMap,
     body_sender: Option<StdArc<Mutex<Option<IpcSender<BodyChunkRequest>>>>>,
+    in_memory_body: Option<GenericSharedMemory>,
     source_is_null: bool,
     pipeline_id: &Option<PipelineId>,
     request_id: Option<&str>,
@@ -525,7 +529,17 @@ async fn obtain_response(
     // https://url.spec.whatwg.org/#percent-encoded-bytes
     let encoded_url = utf8_percent_encode(url.as_str(), FRAGMENT).to_string();
 
-    let request = if let Some(chunk_requester) = body_sender {
+    let request = if let Some(bytes) = in_memory_body {
+        devtools_bytes.lock().extend_from_slice(&bytes);
+        HyperRequest::builder()
+            .method(method)
+            .uri(encoded_url)
+            .body(
+                Full::new(Bytes::copy_from_slice(&bytes))
+                    .map_err(|_| unreachable!())
+                    .boxed(),
+            )
+    } else if let Some(chunk_requester) = body_sender {
         let (sink, stream) = if source_is_null {
             // Step 4.2 of https://fetch.spec.whatwg.org/#concept-http-network-fetch
             // TODO: this should not be set for HTTP/2(currently not supported?).
@@ -549,6 +563,7 @@ async fn obtain_response(
             chunk_requester,
             sink,
             fetch_terminated,
+            request_id,
         )?;
 
         let body = match stream {
@@ -702,17 +717,32 @@ fn obtain_response_setup_router_callback(
     chunk_requester: StdArc<Mutex<Option<IpcSender<BodyChunkRequest>>>>,
     sink: BodySink,
     fetch_terminated: UnboundedSender<bool>,
+    request_id: Option<&str>,
 ) -> Result<(), NetworkError> {
     let (body_chan, body_port) = ipc::channel().unwrap();
 
     {
         let mut lock = chunk_requester.lock();
         if let Some(chunk_requester) = lock.as_mut() {
+            if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "greppy-web-body pid={} request={} event=connect-attempt sender={chunk_requester:?}",
+                    std::process::id(),
+                    request_id.unwrap_or("none")
+                );
+            }
             if let Err(error) = chunk_requester.send(BodyChunkRequest::Connect(body_chan)) {
+                if std::env::var_os("GREPPY_WEB_BODY_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "greppy-web-body pid={} request={} event=connect-failed sender={chunk_requester:?} error={error}",
+                        std::process::id(),
+                        request_id.unwrap_or("none")
+                    );
+                }
                 log_request_body_stream_closed("connect to the request body stream", Some(&error));
-                return Err(request_body_stream_closed_error(
-                    "connect to the request body stream",
-                ));
+                return Err(NetworkError::Crash(format!(
+                    "Request body stream disconnected while trying to connect to the request body stream: {error}"
+                )));
             }
 
             // https://fetch.spec.whatwg.org/#concept-request-transmit-body
@@ -2131,9 +2161,13 @@ async fn http_network_fetch(
     let (fetch_terminated_sender, mut fetch_terminated_receiver) = unbounded_channel();
 
     let body = request.body.as_ref().map(|body| body.clone_stream());
+    let in_memory_body = request
+        .body
+        .as_ref()
+        .and_then(|body| body.in_memory_bytes());
 
-    if body.is_none() {
-        // There cannot be an error streaming a non-existent body.
+    if body.is_none() || in_memory_body.is_some() {
+        // There cannot be an error streaming a non-existent or already materialized body.
         // However in such a case the channel will remain unused
         // and drop inside `obtain_response`.
         // Send the confirmation now, ensuring the receiver will not dis-connect first.
@@ -2203,6 +2237,7 @@ async fn http_network_fetch(
                 &request.method,
                 &mut request.headers,
                 body,
+                in_memory_body,
                 request
                     .body
                     .as_ref()
@@ -2303,6 +2338,21 @@ async fn http_network_fetch(
     let status = response.status.clone();
     let headers = response.headers.clone();
     let devtools_chan = context.devtools_chan.clone();
+    let response_embedder = context
+        .request_interceptor
+        .lock()
+        .await
+        .embedder_proxy();
+    let completed_embedder = response_embedder.clone();
+    let failed_embedder = response_embedder;
+    let completed_request = devtools_request.clone();
+    let failed_request = devtools_request.clone();
+    let completed_status = res.status();
+    let failed_status = completed_status;
+    let completed_status_message = response.status.message().to_vec();
+    let failed_status_message = completed_status_message.clone();
+    let completed_headers = response.headers.clone();
+    let failed_headers = completed_headers.clone();
 
     if let Some(possible_length) = res
         .headers()
@@ -2340,6 +2390,7 @@ async fn http_network_fetch(
                     _ => vec![],
                 };
                 let devtools_response_body = completed_body.clone();
+                let body_bytes = completed_body.len() as u64;
                 *body = ResponseBody::Done(completed_body);
                 send_response_values_to_devtools(
                     Some(headers),
@@ -2349,11 +2400,28 @@ async fn http_network_fetch(
                     &devtools_request,
                     devtools_chan,
                 );
+                completed_embedder.send(NetToEmbedderMsg::WebResourceResponseCompleted(
+                    completed_request.target_webview_id,
+                    WebResourceResponseCompleted {
+                        id: WebResourceLoadId {
+                            fetch_id: completed_request.id.0.to_string(),
+                            redirect_count: completed_request.redirect_count,
+                        },
+                        url: completed_request.current_url().into_url(),
+                        headers: completed_headers,
+                        status_code: Some(completed_status.as_u16()),
+                        status_message: completed_status_message,
+                        body_bytes,
+                        from_cache: false,
+                        failure: None,
+                    },
+                ));
                 timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender2.send(Data::Done);
                 future::ready(Ok(()))
             })
             .map_err(move |error| {
+                let failure = error.to_string();
                 if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", url2);
                     let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
@@ -2367,7 +2435,24 @@ async fn http_network_fetch(
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
                 };
+                let body_bytes = completed_body.len() as u64;
                 *body = ResponseBody::Done(completed_body);
+                failed_embedder.send(NetToEmbedderMsg::WebResourceResponseCompleted(
+                    failed_request.target_webview_id,
+                    WebResourceResponseCompleted {
+                        id: WebResourceLoadId {
+                            fetch_id: failed_request.id.0.to_string(),
+                            redirect_count: failed_request.redirect_count,
+                        },
+                        url: failed_request.current_url().into_url(),
+                        headers: failed_headers,
+                        status_code: Some(failed_status.as_u16()),
+                        status_message: failed_status_message,
+                        body_bytes,
+                        from_cache: false,
+                        failure: Some(failure),
+                    },
+                ));
                 timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender3.send(Data::Done);
             }),

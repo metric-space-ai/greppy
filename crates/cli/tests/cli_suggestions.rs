@@ -93,6 +93,47 @@ fn similar_name_rows(text: &str) -> Vec<&str> {
 }
 
 #[test]
+fn search_symbol_code_keeps_miss_suggestions_compact_but_expands_exact_hits() {
+    let (repo, store) = fresh_repo("search-symbol-code-miss");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn handle_command() -> usize {\n    let diagnostic_body_marker = 41;\n    diagnostic_body_marker + 1\n}\n",
+    )
+    .unwrap();
+    commit_all(&repo, "base");
+    index(&repo, &store);
+
+    let miss = run(
+        &repo,
+        &store,
+        &["search-symbol", "handle_email_command", "--code"],
+        &[],
+    );
+    let miss_text = combined(&miss);
+    assert_eq!(miss.0, 1, "{miss_text}");
+    assert!(miss_text.contains("status: no_matches"), "{miss_text}");
+    assert!(miss_text.contains("similar names:"), "{miss_text}");
+    assert!(miss_text.contains("handle_command"), "{miss_text}");
+    assert!(
+        !miss_text.contains("diagnostic_body_marker"),
+        "a diagnostic suggestion must stay a name/location row even with --code; got: {miss_text}"
+    );
+
+    let hit = run(
+        &repo,
+        &store,
+        &["search-symbol", "handle_command", "--code"],
+        &[],
+    );
+    let hit_text = combined(&hit);
+    assert_eq!(hit.0, 0, "{hit_text}");
+    assert!(
+        hit_text.contains("diagnostic_body_marker"),
+        "--code must still expand a primary exact-name hit; got: {hit_text}"
+    );
+}
+
+#[test]
 fn miss_normalizes_case_and_underscores() {
     let (repo, store) = fresh_repo("normalized");
     std::fs::write(

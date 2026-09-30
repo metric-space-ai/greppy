@@ -6,7 +6,25 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 Nothing yet.
 
-## [0.4.0] — 2026-09-22
+## [0.4.1] — Unreleased
+
+The owner selected 0.4.1 as the next release on 2026-09-28. No 0.4.0 tag or
+GitHub release was published; 0.4.1 will include the unreleased 0.4.0 line below
+and its subsequent repairs. Version metadata is preparation, not release acceptance.
+
+- External and built-in agents receive the owner-approved preparation guidance:
+  retain the task, reuse the running index job, use a reported estimate for one
+  bounded wait, and resume full Greppy functionality afterward. This prompt
+  change does not itself implement a runtime ETA.
+- FSKit is optional acceleration. The ordinary workspace backend must provide
+  the same agent/TUI proposal and apply behavior without extension activation;
+  its implementation and acceptance are in progress.
+- Release acceptance remains open for persisted-index/caller repair, native web
+  regressions and real agent/TUI/benchmark workflows. Optional FSKit has separate
+  provider regression and performance checks; activation is not a core prerequisite.
+  Production inference must use Metal on macOS and CUDA on Linux.
+
+## [0.4.0] — Unreleased development history (superseded by 0.4.1)
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache
 

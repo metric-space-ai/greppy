@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-pub(super) const PROTOCOL_VERSION: u32 = 3;
+// Version 4 separates clients requiring actual backend status and strict macOS
+// Metal loading from live version 3 daemons, which could silently use CPU.
+pub(super) const PROTOCOL_VERSION: u32 = 4;
 const READER_WORKERS: usize = 4;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,16 +28,17 @@ pub(super) enum RequestOutcome<T> {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SpawnOutcome {
     Spawned,
     SpawnFailed,
     Contended,
     Cooldown,
+    CoordinationFailed(String),
 }
 
 impl SpawnOutcome {
-    pub(super) fn attempted(self) -> bool {
+    pub(super) fn attempted(&self) -> bool {
         matches!(self, Self::Spawned | Self::SpawnFailed)
     }
 }
@@ -70,6 +73,7 @@ struct RuntimeStatus {
     completed_requests: u64,
     rejected_requests: u64,
     last_error: Option<String>,
+    backend: Option<String>,
 }
 
 impl Default for RuntimeStatus {
@@ -82,6 +86,7 @@ impl Default for RuntimeStatus {
             completed_requests: 0,
             rejected_requests: 0,
             last_error: None,
+            backend: None,
         }
     }
 }
@@ -517,14 +522,18 @@ pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>
     if cooldown_active(endpoint) {
         return SpawnOutcome::Cooldown;
     }
-    let Some(lock) = greppy_core::cache::acquire_named_lock(
+    let lock = match greppy_core::cache::acquire_named_lock(
         &endpoint.spawn_lock_name(),
         greppy_core::cache::LockMode::Exclusive,
         true,
-    )
-    .ok()
-    .flatten() else {
-        return SpawnOutcome::Contended;
+    ) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return SpawnOutcome::Contended,
+        Err(error) => {
+            return SpawnOutcome::CoordinationFailed(format!(
+                "cannot acquire daemon spawn lock: {error}"
+            ))
+        }
     };
     let outcome = if spawn().is_some() {
         SpawnOutcome::Spawned
@@ -596,9 +605,58 @@ pub(crate) fn detach_command(command: &mut std::process::Command) {
     }
 }
 
+/// Mark ambient descriptors close-on-exec in the detached child only.
+/// Register this before any explicit child FD handoff: a later `dup2` hook
+/// installs that channel at its fixed descriptor and clears CLOEXEC there.
+/// Rust's exec-error pipe remains open long enough to report pre-exec/exec
+/// failures and is closed automatically only by a successful exec.
+#[cfg(unix)]
+pub(crate) fn seal_detached_child_fds(command: &mut std::process::Command) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let maximum = unsafe { libc::getdtablesize() };
+    if maximum < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    CLOSE_RANGE_CLOEXEC,
+                ) == 0
+                {
+                    return Ok(());
+                }
+            }
+            for fd in 3..maximum {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                    if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn seal_detached_child_fds(_command: &mut std::process::Command) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        // Inference owners outlive a requesting workflow and must release
+        // its host admission lease and other ambient channels on exec.
+        seal_detached_child_fds(command)?;
         detach_command(command);
         command.spawn().map(|_| ())
     }
@@ -839,18 +897,20 @@ fn append_windows_command_arg(command_line: &mut Vec<u16>, arg: &std::ffi::OsStr
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn serve<M, Load, Validate, Handle>(
+pub(super) fn serve<M, Load, BackendName, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
     policy: ServerPolicy,
     prewarm: bool,
     mut load: Load,
+    mut backend_name: BackendName,
     mut validate: Validate,
     mut handle: Handle,
     log_prefix: &'static str,
 ) -> !
 where
     Load: FnMut() -> Result<M, String>,
+    BackendName: FnMut(&M) -> String,
     Validate: FnMut(&str) -> Result<(), serde_json::Value>,
     Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
 {
@@ -860,6 +920,7 @@ where
         policy,
         prewarm,
         &mut load,
+        &mut backend_name,
         &mut validate,
         &mut handle,
         log_prefix,
@@ -868,18 +929,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_server<M, Load, Validate, Handle>(
+fn run_server<M, Load, BackendName, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
     policy: ServerPolicy,
     prewarm: bool,
     mut load: Load,
+    mut backend_name: BackendName,
     mut validate: Validate,
     mut handle: Handle,
     log_prefix: &'static str,
 ) -> i32
 where
     Load: FnMut() -> Result<M, String>,
+    BackendName: FnMut(&M) -> String,
     Validate: FnMut(&str) -> Result<(), serde_json::Value>,
     Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
 {
@@ -938,8 +1001,9 @@ where
         set_state(&status, LifecycleState::Loading, None);
         match load() {
             Ok(loaded) => {
+                let backend = backend_name(&loaded);
                 model = Some(loaded);
-                set_state(&status, LifecycleState::Ready, None);
+                set_ready(&status, backend);
             }
             Err(error) => set_state(&status, LifecycleState::Faulted, Some(error)),
         }
@@ -977,7 +1041,11 @@ where
             if model.is_none() {
                 set_state(&status, LifecycleState::Loading, None);
                 match load() {
-                    Ok(loaded) => model = Some(loaded),
+                    Ok(loaded) => {
+                        let backend = backend_name(&loaded);
+                        model = Some(loaded);
+                        set_ready(&status, backend);
+                    }
                     Err(error) => {
                         set_state(&status, LifecycleState::Faulted, Some(error.clone()));
                         set_active(&status, None);
@@ -1215,6 +1283,7 @@ fn status_response(
         "completed_requests": status.completed_requests,
         "rejected_requests": status.rejected_requests,
         "last_error": status.last_error,
+        "backend": status.backend,
         "queue_policy": "fair-round-robin-unbounded",
         "pending_requests": pending_requests,
     })
@@ -1416,6 +1485,20 @@ fn set_state(status: &Arc<Mutex<RuntimeStatus>>, state: LifecycleState, error: O
         }
         status.state = state;
         status.last_error = error;
+        if state != LifecycleState::Ready {
+            status.backend = None;
+        }
+    }
+}
+
+fn set_ready(status: &Arc<Mutex<RuntimeStatus>>, backend: String) {
+    if let Ok(mut status) = status.lock() {
+        if status.state != LifecycleState::Ready {
+            status.state_started = Instant::now();
+        }
+        status.state = LifecycleState::Ready;
+        status.last_error = None;
+        status.backend = Some(backend);
     }
 }
 
@@ -1441,6 +1524,9 @@ fn complete(status: &Arc<Mutex<RuntimeStatus>>, model_loaded: bool, error: Optio
             status.state_started = Instant::now();
         }
         status.state = next_state;
+        if !model_loaded {
+            status.backend = None;
+        }
     }
 }
 
@@ -2086,6 +2172,299 @@ fn wide_string(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn inheritable_locked_file(path: &std::path::Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        file
+    }
+
+    #[cfg(unix)]
+    fn lock_available(path: &std::path::Path) -> bool {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn sleeping_child() -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_fd_seal_releases_parent_lease_while_daemon_remains_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        use std::os::fd::AsRawFd;
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = sleeping_child();
+        seal_detached_child_fds(&mut command).unwrap();
+        let mut daemon = command.spawn().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        drop(lease);
+        assert!(
+            lock_available(&path),
+            "detached daemon inherited the host lease"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon did not remain alive"
+        );
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_entrypoint_drops_lease_while_detached_owner_stays_live() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        struct OwnedProbe {
+            pid: libc::pid_t,
+            stop: std::os::unix::net::UnixStream,
+        }
+        impl Drop for OwnedProbe {
+            fn drop(&mut self) {
+                let _ = self.stop.write_all(b"stop\n");
+                // Only reap our direct child. Its explicit stdin channel
+                // also closes when this parent exits; no unrelated daemon
+                // or PID receives a signal.
+                let mut status = 0;
+                loop {
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                    if result >= 0
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let marker = temp.path().join("owned.pid");
+        let (stop_reader, stop_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stderr_path = temp.path().join("owned.stderr");
+        let started = std::time::Instant::now();
+        let (mut pid_reader, pid_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pid_fd = pid_writer.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r stop",
+                "greppy-owned-detached-probe",
+            ])
+            .arg(&marker)
+            .stdin(std::process::Stdio::from(OwnedFd::from(stop_reader)))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        // Capture the exact child PID before exec. A successful spawn means
+        // these bytes were already written, so cleanup ownership is installed
+        // before any readiness deadline can fail.
+        unsafe {
+            command.pre_exec(move || {
+                let bytes = libc::getpid().to_ne_bytes();
+                if libc::write(pid_fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        spawn_detached(&mut command).unwrap();
+        drop(pid_writer);
+        let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        pid_reader.read_exact(&mut bytes).unwrap();
+        let pid = libc::pid_t::from_ne_bytes(bytes);
+        let _owner = OwnedProbe {
+            pid,
+            stop: stop_writer,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(ready_pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok())
+            {
+                assert_eq!(ready_pid, pid);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned detached probe did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        drop(lease);
+        assert!(
+            lock_available(&path),
+            "inference spawn retained the parent's host lease"
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            0,
+            "detached owner already exited; that cannot prove descriptor sealing; \
+             wait status={status}, elapsed={:?}, stderr={:?}",
+            started.elapsed(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_failure_preserves_parent_descriptor_flags() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = std::process::Command::new(temp.path().join("missing-inference-owner"));
+        assert!(spawn_detached(&mut command).is_err());
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            before
+        );
+        drop(lease);
+        assert!(lock_available(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_running_child_still_retains_inherited_parent_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let mut child = sleeping_child().spawn().unwrap();
+        drop(lease);
+        assert!(
+            !lock_available(&path),
+            "ordinary heavy child lost its inherited lease"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child did not remain alive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(lock_available(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_ordinary_spawn_keeps_lease_while_detached_child_drops_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let detached_barrier = barrier.clone();
+        let detached = std::thread::spawn(move || {
+            let mut command = sleeping_child();
+            seal_detached_child_fds(&mut command).unwrap();
+            detached_barrier.wait();
+            command.spawn().unwrap()
+        });
+        let ordinary_barrier = barrier.clone();
+        let ordinary = std::thread::spawn(move || {
+            let mut command = sleeping_child();
+            ordinary_barrier.wait();
+            command.spawn().unwrap()
+        });
+        barrier.wait();
+        let mut detached = detached.join().unwrap();
+        let mut ordinary = ordinary.join().unwrap();
+        drop(lease);
+        assert!(
+            !lock_available(&path),
+            "concurrent ordinary child lost the lease"
+        );
+        let _ = ordinary.kill();
+        let _ = ordinary.wait();
+        assert!(lock_available(&path), "detached child retained the lease");
+        assert!(detached.try_wait().unwrap().is_none());
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_detached_spawn_does_not_change_parent_descriptor_flags() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = std::process::Command::new(temp.path().join("missing-runtime"));
+        seal_detached_child_fds(&mut command).unwrap();
+        assert!(command.spawn().is_err());
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(lease);
+        assert!(lock_available(&path));
+    }
+
+    #[test]
+    fn runtime_status_reports_only_the_loaded_backend() {
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        assert!(status_response(&status, "starting", 0)["backend"].is_null());
+
+        set_state(&status, LifecycleState::Loading, None);
+        assert!(status_response(&status, "loading", 0)["backend"].is_null());
+
+        set_ready(&status, "metal".into());
+        assert_eq!(status_response(&status, "ready", 0)["backend"], "metal");
+
+        set_state(&status, LifecycleState::Evicted, None);
+        assert!(status_response(&status, "evicted", 0)["backend"].is_null());
+
+        set_ready(&status, "metal".into());
+        set_state(
+            &status,
+            LifecycleState::Faulted,
+            Some("inference failed".into()),
+        );
+        assert!(status_response(&status, "faulted", 0)["backend"].is_null());
+    }
+
     /// The embedding daemon writes its response and closes. On macOS the
     /// reader could not re-arm SO_RCVTIMEO after that and dropped the
     /// buffered remainder of any frame longer than one read; the summary
@@ -2128,6 +2507,18 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
         assert!(a.address().contains("summary-"));
+    }
+
+    #[test]
+    fn new_clients_do_not_reuse_pre_gpu_contract_daemons() {
+        // Captured version 3 endpoint identities for the same Auto model.
+        // Reusing either would bypass the new loaded-backend/Metal contract.
+        for (kind, legacy) in [
+            ("embedding", "fe9209ef93b6fe7c4784c35e0eafac45"),
+            ("summary", "33cb66d9a4b281f23aa5491fc007924d"),
+        ] {
+            assert_ne!(endpoint_digest(kind, "model|prompt|auto", None), legacy);
+        }
     }
 
     #[test]
@@ -2383,6 +2774,47 @@ mod tests {
             SpawnOutcome::Contended
         );
         drop(lock);
+    }
+
+    #[test]
+    fn spawn_lock_setup_error_is_distinct_from_contention() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let invalid_store = root.path().join("not-a-directory");
+        std::fs::write(&invalid_store, b"data").unwrap();
+        let previous = std::env::var_os("GREPPY_STORE_DIR");
+        // SAFETY: serialized by the crate-wide environment lock and restored below.
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &invalid_store) };
+        let endpoint = Endpoint::for_identity(
+            "spawn-error-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let outcome = spawn_once(&endpoint, || {
+            panic!("lock setup failure must prevent spawn")
+        });
+        // SAFETY: still serialized by the crate-wide environment lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+                None => std::env::remove_var("GREPPY_STORE_DIR"),
+            }
+        }
+        match outcome {
+            SpawnOutcome::CoordinationFailed(error) => {
+                assert!(
+                    error.contains("cannot acquire daemon spawn lock"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("refusing non-directory cache namespace"),
+                    "{error}"
+                );
+            }
+            other => panic!("expected coordination failure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2666,6 +3098,7 @@ mod tests {
                     load_finished_tx.send(()).expect("signal prewarm complete");
                     Ok::<_, String>(())
                 },
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| serde_json::json!({"ok": model.is_some()}),
                 "prewarm-status-test",
@@ -2687,6 +3120,7 @@ mod tests {
                 status,
                 RequestOutcome::Response(ref value)
                     if value["state"] == "loading"
+                        && value["backend"].is_null()
                         && value["daemon_pid"].as_u64().unwrap_or_default() > 0
             ),
             "status was unavailable during prewarm load: {status:?}"
@@ -2729,7 +3163,8 @@ mod tests {
         assert!(
             matches!(
                 ready,
-                RequestOutcome::Response(ref value) if value["state"] == "ready"
+                RequestOutcome::Response(ref value)
+                    if value["state"] == "ready" && value["backend"] == "test-backend"
             ),
             "status was unavailable after a slow prewarm load: {ready:?}"
         );
@@ -2768,6 +3203,7 @@ mod tests {
                     let owner = server_loads.fetch_add(1, Ordering::SeqCst) + 1;
                     Ok::<_, String>(owner)
                 },
+                |owner| format!("test-{owner}"),
                 |raw| {
                     let value: serde_json::Value = serde_json::from_str(raw)
                         .map_err(|_| serde_json::json!({"error": "malformed request"}))?;
@@ -2856,8 +3292,10 @@ mod tests {
 
         let evict_deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let state = diagnostic(&endpoint)["state"].as_str().map(str::to_string);
+            let status = diagnostic(&endpoint);
+            let state = status["state"].as_str().map(str::to_string);
             if state.as_deref() == Some("evicted") {
+                assert!(status["backend"].is_null());
                 break;
             }
             assert!(
@@ -2876,6 +3314,7 @@ mod tests {
             ),
             RequestOutcome::Response(ref value) if value["ok"] == true
         ));
+        assert_eq!(diagnostic(&endpoint)["backend"], "test-2");
         assert_eq!(loads.load(Ordering::SeqCst), 2);
         assert_eq!(server.join().expect("server thread"), 0);
     }
@@ -2904,6 +3343,7 @@ mod tests {
                 },
                 false,
                 || Ok::<_, String>(()),
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| serde_json::json!({"ok": model.is_some()}),
                 "slow-client-test",
@@ -2967,6 +3407,7 @@ mod tests {
                     server_loads.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, String>(())
                 },
+                |_| "test-backend".to_string(),
                 |_| Ok(()),
                 |_raw, model| {
                     std::thread::sleep(Duration::from_millis(10));
@@ -3052,6 +3493,7 @@ mod tests {
                 }
                 Ok::<_, String>(())
             },
+            |_| "test-backend".to_string(),
             |_| Ok(()),
             move |_raw, model| {
                 if hang {

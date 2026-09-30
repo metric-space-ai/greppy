@@ -56,6 +56,16 @@ pub enum NavCommand {
     },
 }
 
+pub(super) fn requests_json(command: &NavCommand) -> bool {
+    match command {
+        NavCommand::Goto { json, .. }
+        | NavCommand::Open { json, .. }
+        | NavCommand::Back { json, .. }
+        | NavCommand::Forward { json, .. }
+        | NavCommand::Reload { json, .. } => *json,
+    }
+}
+
 pub(super) fn dispatch(command: NavCommand, root: Option<&str>) -> Result<i32> {
     match command {
         NavCommand::Goto {

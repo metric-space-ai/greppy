@@ -323,6 +323,7 @@ pub(super) fn daemon_main(socket: String, cfg: super::QwenSummaryConfig, prewarm
         policy,
         prewarm,
         || super::load_qwen35_summarizer(&cfg).map_err(|error| error.to_string()),
+        |model| model.backend_name().to_string(),
         |raw| validate(raw, &model_key),
         respond,
         "summarize-daemon",

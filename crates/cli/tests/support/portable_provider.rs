@@ -29,6 +29,19 @@ impl Drop for FakeProvider {
 /// identity and heartbeat contract as a real provider and only mirrors the
 /// fixture repository after WorkspaceCore creates a namespace.
 pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
+    spawn_fake_provider_with_edits(root, repo, Vec::new())
+}
+
+/// Spawn the fixture provider with deterministic content edits to publish in
+/// the content namespace after the agent has captured its private Git base.
+/// The mounted bytes and WorkspaceCore state are updated together before the
+/// provider exposes that private Git namespace, so the agent cannot finish
+/// against a stale clean core.
+pub fn spawn_fake_provider_with_edits(
+    root: &Path,
+    repo: &Path,
+    edits: Vec<(PathBuf, Vec<u8>)>,
+) -> FakeProvider {
     let data = root.join("provider-data");
     let mount = root.join("provider-mount");
     std::fs::create_dir_all(mount.join("doctor")).unwrap();
@@ -66,6 +79,7 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
         let git_dir = tracked_repo.join(".git");
         let mut tracker_fences = HashSet::new();
         let mut mirrored = HashSet::new();
+        let mut edited = HashSet::new();
         let mut last_heartbeat = 0;
         let mut last_tracker_heartbeat = 0;
         while !stop_thread.load(Ordering::SeqCst) {
@@ -120,6 +134,25 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
                         tracker_fences = current_fences;
                     }
                 }
+                // The private Git template is published only after the
+                // agent has captured the content baseline and prepared its
+                // Git base. Publish planned content edits immediately before
+                // exposing the Git namespace, which makes this fixture's
+                // provider/core handoff deterministic.
+                if !edits.is_empty() && git_control_payload(&data_thread).is_some() {
+                    if let Ok(workspaces) = core.list_workspaces() {
+                        for workspace in workspaces.iter().filter(|workspace| {
+                            !workspace.id.starts_with("git-") && mirrored.contains(&workspace.id)
+                        }) {
+                            if edited.contains(&workspace.id) {
+                                continue;
+                            }
+                            let destination = mount_thread.join("workspaces").join(&workspace.id);
+                            apply_content_edits(core, &workspace.id, &destination, &edits);
+                            edited.insert(workspace.id.clone());
+                        }
+                    }
+                }
                 if let Ok(workspaces) = core.list_workspaces() {
                     let active = workspaces
                         .iter()
@@ -159,6 +192,28 @@ pub fn spawn_fake_provider(root: &Path, repo: &Path) -> FakeProvider {
         data,
         stop,
         handle: Some(handle),
+    }
+}
+
+fn apply_content_edits(
+    core: &WorkspaceCore,
+    workspace_id: &str,
+    destination: &Path,
+    edits: &[(PathBuf, Vec<u8>)],
+) {
+    let workspace = core.open_workspace(workspace_id).unwrap();
+    for (relative, bytes) in edits {
+        let target = destination.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&target, bytes).unwrap();
+        if core.metadata(&workspace, relative).unwrap().is_none() {
+            core.create_file(&workspace, relative, 0o100644).unwrap();
+        }
+        core.write(&workspace, relative, 0, bytes).unwrap();
+        core.truncate(&workspace, relative, bytes.len() as u64)
+            .unwrap();
     }
 }
 

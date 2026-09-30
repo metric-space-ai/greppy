@@ -54,6 +54,58 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+pub struct ArtifactTransfer {
+    path: PathBuf,
+}
+
+impl ArtifactTransfer {
+    pub fn begin(root: &Path, label: &str) -> io::Result<Self> {
+        let dir = root.join("transfers");
+        fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let name = hex_sha256(format!("{}:{nonce}:{label}", std::process::id()).as_bytes());
+        Ok(Self {
+            path: dir.join(name),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read_verified(&self, byte_count: u64, digest_hex: &str) -> io::Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if !metadata.file_type().is_file() || metadata.len() != byte_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact transfer metadata did not match",
+            ));
+        }
+        let actual_digest = hex_sha256_file(&self.path)?;
+        if actual_digest != digest_hex {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact transfer digest did not match",
+            ));
+        }
+        fs::read(&self.path)
+    }
+}
+
+impl Drop for ArtifactTransfer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl ArtifactStore {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(root.join("objects").join("sha256"))?;
@@ -63,6 +115,7 @@ impl ArtifactStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
 
     pub fn put(
         &self,
@@ -226,6 +279,29 @@ mod tests {
         let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         fs::write(&path, &bytes).unwrap();
         assert_eq!(hex_sha256_file(&path).unwrap(), hex_sha256(&bytes));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn transfer_verifies_content_and_removes_sidecar_on_drop() {
+        let root = std::env::temp_dir().join(format!("greppy-transfer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::new(root.clone()).unwrap();
+        let transfer = ArtifactTransfer::begin(store.root(), "request-1").unwrap();
+        let path = transfer.path().to_owned();
+        let bytes = b"full rendered body IMMUTABLE_TAIL";
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            transfer
+                .read_verified(bytes.len() as u64, &hex_sha256(bytes))
+                .unwrap(),
+            bytes
+        );
+        assert!(transfer
+            .read_verified(bytes.len() as u64, &"00".repeat(32))
+            .is_err());
+        drop(transfer);
+        assert!(!path.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

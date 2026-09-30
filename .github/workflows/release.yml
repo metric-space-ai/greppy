@@ -1159,7 +1159,6 @@ jobs:
           bash "$docs/release_package_smoke.sh" "$cli" "$PWD/smoke"
           bash "$docs/release_daemon_stress.sh" "$cli" "$PWD/daemon-stress"
           if [[ "$GITHUB_REF" == refs/tags/* || "${{ inputs.measure_runtime_footprint }}" == true ]]; then
-            test -s package/runtime-footprint-macos-arm64-cpu.json
             test -s package/runtime-footprint-macos-arm64-metal.json
           fi
           python3 "$docs/release_artifacts.py" verify-spdx \

@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const src = path.join(__dirname, '../src');
-const worker = fs.readFileSync(path.join(src, 'content_worker.rs'), 'utf8');
+const worker = fs.readFileSync(path.join(src, 'selector_runtime.rs'), 'utf8');
 const match = worker.match(/function greppyObservedRefMatches\(selector, nodes\) \{[\s\S]*?\n\}/);
 assert.ok(match, 'must test the actual native locator identity check');
 const guard = fs.readFileSync(path.join(src, 'observed-ref-condition.js'), 'utf8');
@@ -65,4 +65,22 @@ test('every repeated sample checks identity again', () => {
   run('original.isConnected = false');
   assert.throws(() => run('sample()'), /STALE_REF/);
   assert.equal(run('evaluated'), 2);
+});
+
+test('same document in supervisor scope retains node references', () => {
+  const run = fixture();
+  run("window.__greppyObservedRefs = makeRegistry(document, window.__greppyObservedRefs, 'proposed-two', 201, 400, snapshot)");
+  assert.equal(run('window.__greppyObservedRefs.snapshot'), 'document-one');
+  assert.equal(run('window.__greppyObservedRefs.refFor(original)'), 1);
+  assert.equal(run('sample()'), true);
+});
+
+test('history-restored document renews expired scope without reviving old refs', () => {
+  const run = fixture();
+  run("window.__greppyObservedRefs = makeRegistry(document, window.__greppyObservedRefs, 'restored-one', 401, 600, 'document-two'); snapshot = 'restored-one'");
+  assert.equal(run('window.__greppyObservedRefs.snapshot'), 'restored-one');
+  assert.equal(run('window.__greppyObservedRefs.refFor(original)'), 401);
+  assert.throws(() => run('sample()'), /STALE_REF/);
+  run('selector.snapshot = snapshot; selector.observed_ref = 401');
+  assert.equal(run('sample()'), true);
 });

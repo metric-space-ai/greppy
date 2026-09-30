@@ -57,7 +57,26 @@ impl Store {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
+        let overlay = self.is_overlay();
         let tx = self.transaction()?;
+        // SQLite foreign keys are confined to main. An additive repair can
+        // reference a project visible only through immutable Base; materialize
+        // its metadata in this transaction without copying any file ownership.
+        if overlay {
+            let projects = edges
+                .iter()
+                .map(|edge| edge.project.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            for project in projects {
+                tx.raw().execute(
+                    "INSERT INTO main.projects(name, indexed_at, root_path)
+                     SELECT name, indexed_at, root_path FROM greppy_base.projects
+                     WHERE name = ?1
+                     ON CONFLICT(name) DO NOTHING",
+                    [project],
+                )?;
+            }
+        }
         let mut ids = Vec::with_capacity(edges.len());
         {
             let raw = tx.raw();
@@ -87,6 +106,65 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Replace only fingerprint-validated Rust USAGE contributions. Base stays
+    /// immutable: a persisted per-project file mask hides its obsolete usages.
+    /// Replacement rows for Base files are compatibility data, not Delta file
+    /// ownership, and are excluded from ordinary sparse re-resolution.
+    pub fn replace_validated_rust_usages(
+        &mut self,
+        project: &str,
+        files: &[String],
+        edges: &[NewRawEdge],
+    ) -> Result<usize> {
+        let overlay = self.is_overlay();
+        let old = self.list_raw_edges(project)?;
+        let key = format!("greppy.rust_usage_override_files.{project}");
+        let signature = |file: &str, source: &str, target: &str, properties: &serde_json::Value| {
+            (file.to_owned(), source.to_owned(), target.to_owned(), properties.to_string())
+        };
+        let file_set = files.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+        let previous = old.iter().filter(|edge| edge.edge_type == "USAGE" && file_set.contains(edge.file_path.as_str()))
+            .map(|edge| signature(&edge.file_path, &edge.source_qname, &edge.target_qname, &edge.properties))
+            .collect::<std::collections::HashSet<_>>();
+        let current = edges.iter().map(|edge| signature(&edge.file_path, &edge.source_qname, &edge.target_qname, &edge.properties))
+            .collect::<std::collections::HashSet<_>>();
+        if previous == current {
+            return Ok(0);
+        }
+        let tx = self.transaction()?;
+        if overlay {
+            tx.raw().execute("INSERT INTO main.projects(name,indexed_at,root_path)
+                SELECT name,indexed_at,root_path FROM greppy_base.projects WHERE name=?1
+                ON CONFLICT(name) DO NOTHING", [project])?;
+            tx.raw().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, serde_json::to_string(files)?])?;
+        }
+        for file in files {
+            tx.raw().execute("DELETE FROM main.raw_edges WHERE project=?1 AND file_path=?2 AND edge_type='USAGE'", params![project, file])?;
+        }
+        let mut base_replacements = Vec::new();
+        for edge in edges {
+            let owned: bool = !overlay || tx.raw().query_row("SELECT EXISTS(SELECT 1 FROM main.file_state WHERE project=?1 AND rel_path=?2)", params![project, edge.file_path], |row| row.get(0))?;
+            if !owned {
+                base_replacements.push(serde_json::json!({
+                    "file_path": edge.file_path, "source_qname": edge.source_qname,
+                    "target_qname": edge.target_qname, "properties": edge.properties,
+                }));
+            } else {
+                tx.raw().execute("INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+                    VALUES(?1,?2,?3,?4,'USAGE',?5)", params![project, edge.file_path, edge.source_qname, edge.target_qname, serde_json::to_string(&edge.properties)?])?;
+            }
+        }
+        if overlay {
+            tx.raw().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("greppy.rust_usage_override_rows.{project}"), serde_json::to_string(&base_replacements)?])?;
+        }
+        tx.commit()?;
+        Ok(previous.symmetric_difference(&current).count())
     }
 
     /// List every raw edge for `project` in a deterministic order
@@ -213,6 +291,84 @@ mod tests {
             edge_type: ty.into(),
             properties: serde_json::json!({"line": 1}),
         }
+    }
+
+    #[test]
+    fn validated_usage_replacement_rolls_back_base_override_on_failure() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project { name: "p".into(), indexed_at: "cached-time".into(), root_path: "/cached/root".into() }).unwrap();
+            base.insert_raw_edges(&[new_raw_edge("p", "base.rs", "p.source", "p.obsolete", "USAGE")]).unwrap();
+        }
+        let visibility = crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = overlay.list_raw_edges("p").unwrap();
+        overlay.conn().execute_batch("CREATE TRIGGER reject_usage_override BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.rust_usage_override_rows.p' BEGIN SELECT RAISE(ABORT,'fixture override failure'); END;").unwrap();
+        let files = vec!["base.rs".to_owned()];
+        let replacements = vec![new_raw_edge("p", "base.rs", "p.source", "p.correct", "USAGE")];
+        assert!(overlay.replace_validated_rust_usages("p", &files, &replacements).is_err());
+        assert_eq!(overlay.list_raw_edges("p").unwrap(), original);
+        let markers: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.schema_meta WHERE key LIKE 'greppy.rust_usage_override_%'", [], |row| row.get(0)).unwrap();
+        assert_eq!(markers, 0, "replacement failure rolls back the Base mask");
+        overlay.conn().execute_batch("DROP TRIGGER reject_usage_override").unwrap();
+        overlay.replace_validated_rust_usages("p", &files, &replacements).unwrap();
+        assert!(overlay.list_raw_edges("p").unwrap().iter().all(|edge| edge.target_qname != "p.obsolete"));
+        assert!(overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        assert!(overlay.list_private_file_states("p").unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlay_raw_insert_materializes_only_project_metadata_atomically() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        let project = Project {
+            name: "p".into(),
+            indexed_at: "cached-time".into(),
+            root_path: "/cached/root".into(),
+        };
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&project).unwrap();
+        }
+        let visibility =
+            crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        overlay.conn().execute_batch("CREATE TRIGGER main.reject_raw BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'fixture raw failure'); END;").unwrap();
+        let edge = new_raw_edge("p", "base.rs", "p.source", "p.target", "USAGE");
+        assert!(overlay.insert_raw_edges(&[edge.clone()]).is_err());
+        let private_projects: i64 = overlay
+            .conn()
+            .query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            private_projects, 0,
+            "failed raw batch rolls back project metadata"
+        );
+        overlay
+            .conn()
+            .execute_batch("DROP TRIGGER reject_raw")
+            .unwrap();
+        overlay.insert_raw_edges(&[edge]).unwrap();
+        let private_metadata: (String, String) = overlay
+            .conn()
+            .query_row(
+                "SELECT indexed_at,root_path FROM main.projects WHERE name='p'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(private_metadata, (project.indexed_at, project.root_path));
+        assert!(overlay.list_private_file_states("p").unwrap().is_empty());
+        assert!(overlay.list_private_workspace_states().unwrap().is_empty());
+        assert!(overlay.list_nodes("p", "", "", 0, 10).unwrap().is_empty());
+        assert_eq!(overlay.list_delta_raw_edges("p").unwrap().len(), 1);
+        drop(overlay);
+        let base = Store::open(&base_path).unwrap();
+        assert!(base.list_raw_edges("p").unwrap().is_empty());
     }
 
     #[test]

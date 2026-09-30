@@ -177,6 +177,65 @@ fn passthrough_stdin_pipe() {
 }
 
 #[test]
+fn passthrough_command_like_pattern_keeps_piped_bytes_and_status() {
+    for input in [&b"research\nother\nresearch\n"[..], &b"other\n"[..]] {
+        let mut ours = greppy_command("command-like-stdin");
+        ours.arg("research");
+        let actual = run_with_stdin(&mut ours, input);
+        let mut real = Command::new(real_grep_path());
+        real.arg("research");
+        let expected = run_with_stdin(&mut real, input);
+        diff_outputs("command-like-stdin", &actual, &expected);
+    }
+}
+
+#[test]
+fn passthrough_command_like_pattern_waits_for_delayed_producer() {
+    for explicit in [false, true] {
+        let mut command = greppy_command("delayed-command-like-stdin");
+        command.arg("research");
+        if explicit {
+            command.arg("-");
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stdin.write_all(b"research\n").unwrap();
+        });
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b"research\n");
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn passthrough_pattern_exception_preserves_command_diagnostics() {
+    for args in [&["references"][..], &["research", "--json"][..]] {
+        let output = run_with_stdin(
+            &mut greppy_command("command-diagnostics").args(args),
+            b"research\n",
+        );
+        assert_eq!(output.status.code(), Some(64));
+    }
+    // A closed pipe has a portable, non-consuming EOF proof. /dev/null can
+    // report POLLIN without supporting FIONREAD on Linux, so its availability
+    // is intentionally forwarded conservatively instead of guessed empty.
+    let output = run_with_stdin(
+        &mut greppy_command("empty-command-like-stdin").arg("research"),
+        b"",
+    );
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("did you mean"));
+}
+
+#[test]
 fn passthrough_delayed_stdin_data_is_still_forwarded_byte_exactly() {
     let mut ours = greppy_command("delayed-stdin");
     ours.arg("hallo")
