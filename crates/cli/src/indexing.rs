@@ -97,13 +97,7 @@ pub(crate) fn dispatch_index_recover(
         )));
     }
     let project = workspace_locator::project_identity(&effective_root);
-    let store_path = workspace_locator::store_path(&effective_root);
-    greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
-        Error::io(
-            format!("create workspace store for {}", effective_root.display()),
-            error,
-        )
-    })?;
+    let store_path = ensured_workspace_store_path(&effective_root)?;
     let _lifecycle = greppy_core::cache::acquire_workspace_lifecycle(
         &effective_root,
         greppy_core::cache::LockMode::Shared,
@@ -1041,13 +1035,7 @@ pub(crate) fn dispatch_index(
     // never at `<root>/.greppy/graph.db` (which would
     // pollute `grep -R .`). The versioned platform data directory is used on
     // Linux/macOS and can be overridden via `GREPPY_STORE_DIR`.
-    let store_path = workspace_locator::store_path(&effective_root);
-    greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|e| {
-        Error::io(
-            format!("create workspace store for {}", effective_root.display()),
-            e,
-        )
-    })?;
+    let store_path = ensured_workspace_store_path(&effective_root)?;
     let _lifecycle = greppy_core::cache::acquire_workspace_lifecycle(
         &effective_root,
         greppy_core::cache::LockMode::Shared,

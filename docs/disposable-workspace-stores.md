@@ -21,6 +21,11 @@ caches keep their complete sidecars, including incomplete caches. Store selectio
 does not relocate or rebuild data while another client may use it.
 An explicit `GREPPY_STORE_DIR` continues to select its existing namespace.
 
+Initializing graph, pack, cache and journal writers consume the authoritative
+directory returned by store creation before locking or opening a path. A read-only
+locator lookup is only a candidate: an old client can create a retained durable
+store between that lookup and initialization.
+
 Cache inventory, status, clear and GC include both validated store namespaces
 when no explicit store override is supplied. Disposable inventory requires the tmp
 volume to be mounted and every namespace component to be a directory without

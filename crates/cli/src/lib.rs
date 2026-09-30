@@ -1409,7 +1409,7 @@ fn prune_expired_evidence_packs() {
         ) else {
             continue;
         };
-        let path = workspace_locator::store_path(&root);
+        let path = entry.path.join("graph.db");
         let Ok(_writer) = greppy_freshness::try_acquire(&path) else {
             continue;
         };
@@ -4446,6 +4446,19 @@ fn cancel_delegated_base_owner(demand_cancelled: bool) -> bool {
     true
 }
 
+/// Initialization must consume this returned path, rather than caching a locator
+/// lookup that can change before the workspace ownership manifest is published.
+fn ensured_workspace_store_path(root: &std::path::Path) -> Result<std::path::PathBuf> {
+    greppy_core::cache::ensure_workspace_store(root)
+        .map(|directory| directory.join("graph.db"))
+        .map_err(|error| {
+            Error::io(
+                format!("create workspace store for {}", root.display()),
+                error,
+            )
+        })
+}
+
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
         .parent()
@@ -5424,9 +5437,7 @@ fn spawn_background_job_handle(
     let Ok(root) = resolve_root(root) else {
         return None;
     };
-    if greppy_core::cache::ensure_workspace_store(&root).is_err() {
-        return None;
-    }
+    let store_path = ensured_workspace_store_path(&root).ok()?;
     let demand_name = background_job_demand_name(&root);
     let Ok(Some(demand)) = acquire_background_job_demand(&root) else {
         return None;
@@ -5453,20 +5464,18 @@ fn spawn_background_job_handle(
             _demand: Some(demand),
         });
     }
-    let target_generation = greppy_store::Store::open_with(
-        &workspace_locator::store_path(&root),
-        greppy_store::OpenOptions::read_only(),
-    )
-    .ok()
-    .and_then(|store| {
-        store
-            .get_workspace_state(root.to_string_lossy().as_ref())
+    let target_generation =
+        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())
             .ok()
-            .flatten()
-            .map(|state| state.graph_generation)
-    })
-    .unwrap_or(0)
-    .saturating_add(1);
+            .and_then(|store| {
+                store
+                    .get_workspace_state(root.to_string_lossy().as_ref())
+                    .ok()
+                    .flatten()
+                    .map(|state| state.graph_generation)
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
@@ -6008,7 +6017,9 @@ fn summarize_definition_span(
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
-        let cache = greppy_store::SummaryCache::open(&workspace_locator::store_dir(root_path)).ok();
+        let cache = greppy_core::cache::ensure_workspace_store(root_path)
+            .ok()
+            .and_then(|directory| greppy_store::SummaryCache::open(&directory).ok());
         let base_cache = std::env::var_os(crate::store_cow::ENV_BASE_PATH)
             .map(std::path::PathBuf::from)
             .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
@@ -9120,7 +9131,7 @@ fn acquire_cached_model_lease(
 fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -> Result<Vec<f32>> {
     let store_dir = resolve_root(root)
         .ok()
-        .map(|r| workspace_locator::store_dir(&r));
+        .and_then(|r| greppy_core::cache::ensure_workspace_store(&r).ok());
     let cache = store_dir
         .as_ref()
         .and_then(|dir| greppy_store::QueryEmbeddingCache::open(dir).ok());

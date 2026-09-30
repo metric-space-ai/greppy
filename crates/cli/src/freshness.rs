@@ -376,7 +376,7 @@ pub(crate) fn try_refresh_metadata_only_fingerprint(
     }
     let effective_root = resolve_root(root).ok()?;
     let overrides = discover_overrides_from_env().ok()?;
-    let store_path = workspace_locator::store_path(&effective_root);
+    let store_path = ensured_workspace_store_path(&effective_root).ok()?;
     let _writer = greppy_freshness::try_acquire(&store_path).ok()?;
     let mut store =
         greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::query_writer())
@@ -561,7 +561,9 @@ pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     let Ok(overrides) = discover_overrides_from_env() else {
         return false;
     };
-    let store_path = workspace_locator::store_path(&effective_root);
+    let Ok(store_path) = ensured_workspace_store_path(&effective_root) else {
+        return false;
+    };
     let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
         &effective_root,
         greppy_core::cache::LockMode::Shared,
@@ -665,7 +667,7 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // indexer wrote from the repo root (instead of opening an empty
     // store under the subdir's hash and exiting 73).
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     // RV-007: tighten the store dir + DB file permissions on every open.
     // This is a no-op when the store doesn't exist yet (read paths before
     // any `greppy index` would have failed to open the store anyway).
@@ -675,15 +677,6 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     recover_missing_query_base(root, &effective_root)?;
     if let Some((base_path, base_commit)) = crate::store_cow::overlay_environment(&effective_root)?
     {
-        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
-            Error::io(
-                format!(
-                    "create private Delta Store for {}",
-                    effective_root.display()
-                ),
-                error,
-            )
-        })?;
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }
@@ -951,7 +944,7 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
 /// index; their pagination records are not graph-query evidence.
 pub(crate) fn open_default_store_pack_writer(root: Option<&str>) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     if let Some(parent) = path.parent() {
         workspace_locator::ensure_store_dir(parent)
             .map_err(|error| Error::io("create continuation pack store", error))?;
@@ -969,20 +962,11 @@ fn open_default_store_writer(
     require_existing_index: bool,
 ) -> Result<greppy_store::Store> {
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     if require_existing_index {
         recover_missing_query_base(root, &effective_root)?;
     }
     if let Some(overlay) = crate::store_cow::overlay_spec(&effective_root)? {
-        greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|error| {
-            Error::io(
-                format!(
-                    "create private Delta Store for {}",
-                    effective_root.display()
-                ),
-                error,
-            )
-        })?;
         if !path.exists() {
             drop(greppy_store::Store::open(&path)?);
         }

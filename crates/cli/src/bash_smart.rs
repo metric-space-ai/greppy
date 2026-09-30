@@ -1429,7 +1429,7 @@ fn open_pack_store(root: Option<&str>) -> Result<greppy_store::Store> {
         ));
     }
     let effective_root = resolve_root(root)?;
-    let path = workspace_locator::store_path(&effective_root);
+    let path = ensured_workspace_store_path(&effective_root)?;
     if let Some(parent) = path.parent() {
         workspace_locator::ensure_store_dir(parent)
             .map_err(|error| Error::io("create bash-smart pack store", error))?;
