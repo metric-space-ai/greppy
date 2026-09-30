@@ -372,7 +372,23 @@ SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
 FROM greppy_base.raw_edges b
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
-);
+)
+AND NOT (b.edge_type = 'USAGE' AND EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = 'greppy.rust_usage_override_files.' || b.project AND f.value = b.file_path
+))
+UNION ALL
+SELECT -9223372036854775807 + CAST(r.key AS INTEGER) AS id,
+       substr(m.key, length('greppy.rust_usage_override_rows.') + 1) AS project,
+       json_extract(r.value, '$.file_path') AS file_path,
+       json_extract(r.value, '$.source_qname') AS source_qname,
+       json_extract(r.value, '$.target_qname') AS target_qname,
+       'USAGE' AS edge_type, json_extract(r.value, '$.properties') AS properties
+FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) r
+WHERE substr(m.key, 1, length('greppy.rust_usage_override_rows.')) = 'greppy.rust_usage_override_rows.'
+  AND NOT EXISTS (
+      SELECT 1 FROM greppy_hidden_paths h WHERE h.path = json_extract(r.value, '$.file_path')
+  );
 
 CREATE TEMP VIEW edges AS
 SELECT d.id, d.project, visible_source.id AS source_id,
@@ -401,6 +417,10 @@ JOIN nodes visible_target
 WHERE NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
 )
+AND NOT (e.edge_type = 'USAGE' AND EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = 'greppy.rust_usage_override_files.' || e.project AND f.value = base_source.file_path
+))
 AND NOT EXISTS (
     SELECT 1 FROM main.overlay_edges d
     WHERE d.project = e.project
