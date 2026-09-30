@@ -50,6 +50,15 @@ impl JavaScriptEvaluator {
             .insert(evaluation_id, PendingEvaluation { callback });
     }
 
+    pub(crate) fn evaluate_structured_dom(
+        &mut self, webview_id: WebViewId, request: String,
+        callback: Box<dyn FnOnce(Result<JSValue, JavaScriptEvaluationError>)>,
+    ) {
+        let evaluation_id = self.generate_id();
+        self.constellation_proxy.send(EmbedderToConstellationMessage::EvaluateStructuredDom(webview_id, evaluation_id, request));
+        self.pending_evaluations.insert(evaluation_id, PendingEvaluation { callback });
+    }
+
     pub(crate) fn finish_evaluation(
         &mut self,
         evaluation_id: JavaScriptEvaluationId,

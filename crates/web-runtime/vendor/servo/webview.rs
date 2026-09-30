@@ -784,9 +784,9 @@ impl WebView {
         request_json: T,
         callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static,
     ) {
-        self.inner().servo.javascript_evaluator_mut().evaluate(
+        self.inner().servo.javascript_evaluator_mut().evaluate_structured_dom(
             self.id(),
-            format!("__GREPPY_STRUCTURED_DOM_V1__{}", request_json.to_string()),
+            request_json.to_string(),
             Box::new(callback),
         );
     }

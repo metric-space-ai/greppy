@@ -80,10 +80,8 @@ use script_traits::{
     UpdatePipelineIdReason,
 };
 
-const GREPPY_STRUCTURED_DOM_PREFIX: &str = "__GREPPY_STRUCTURED_DOM_V1__";
 fn structured_dom_script(source: &str) -> Result<Option<String>, ()> {
-    let Some(payload) = source.strip_prefix(GREPPY_STRUCTURED_DOM_PREFIX) else { return Ok(None) };
-    let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| ())?;
+    let value: serde_json::Value = serde_json::from_str(source).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
     if object.keys().any(|key| !matches!(key.as_str(), "op"|"selector"|"fields"|"limit")) { return Err(()) }
     let op = object.get("op").and_then(|v| v.as_str()).ok_or(())?;
@@ -98,14 +96,19 @@ fn structured_dom_script(source: &str) -> Result<Option<String>, ()> {
     let fields = serde_json::to_string(&fields).map_err(|_| ())?;
     Ok(Some(format!(r#"(function(){{var nodes=Array.prototype.slice.call(document.querySelectorAll({selector}));var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f==='text')o.text=String(e.textContent==null?'':e.textContent).replace(/\s+/g,' ').trim();else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(function(e){{return {{tag:e.tagName.toLowerCase(),id:e.id||null,text:String(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,120)}};}})}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
 }
+fn prepare_embedder_script(source: String, structured: bool) -> Result<(String, bool), ()> {
+    if !structured { return Ok((source, false)); }
+    structured_dom_script(&source)?.map(|script| (script, true)).ok_or(())
+}
 #[cfg(test)]
 mod greppy_structured_dom_tests {
     use super::*;
     #[test]
     fn closed_schema_cannot_promote_arbitrary_source() {
-        assert!(structured_dom_script(r#"__GREPPY_STRUCTURED_DOM_V1__{"op":"extract","selector":"a","fields":["text"]}"#).unwrap().is_some());
-        assert!(structured_dom_script(r#"__GREPPY_STRUCTURED_DOM_V1__{"op":"extract","selector":"a","fields":[],"source":"alert(1)"}"#).is_err());
-        assert!(structured_dom_script("alert(1)").unwrap().is_none());
+        let valid = r#"{"op":"extract","selector":"a","fields":["text"]}"#;
+        assert!(prepare_embedder_script(valid.into(), true).unwrap().1);
+        assert!(prepare_embedder_script(r#"{"op":"extract","selector":"a","fields":[],"source":"alert(1)"}"#.into(), true).is_err());
+        assert_eq!(prepare_embedder_script(valid.into(), false).unwrap(), (valid.into(), false));
     }
 }
 use servo_arc::Arc as ServoArc;
@@ -2008,7 +2011,10 @@ impl ScriptThread {
                 evaluation_id,
                 script,
             ) => {
-                self.handle_evaluate_javascript(webview_id, pipeline_id, evaluation_id, script, cx);
+                self.handle_evaluate_javascript(webview_id, pipeline_id, evaluation_id, script, false, cx);
+            },
+            ScriptThreadMessage::EvaluateStructuredDom(webview_id, pipeline_id, evaluation_id, request) => {
+                self.handle_evaluate_javascript(webview_id, pipeline_id, evaluation_id, request, true, cx);
             },
             ScriptThreadMessage::SendImageKeysBatch(pipeline_id, image_keys) => {
                 if let Some(window) = self.documents.borrow().find_window(pipeline_id) {
@@ -4386,6 +4392,7 @@ impl ScriptThread {
         pipeline_id: PipelineId,
         evaluation_id: JavaScriptEvaluationId,
         script: String,
+        structured: bool,
         cx: &mut js::context::JSContext,
     ) {
         let Some(window) = self.documents.borrow().find_window(pipeline_id) else {
@@ -4404,14 +4411,14 @@ impl ScriptThread {
         let mut realm = enter_auto_realm(cx, global_scope);
         let cx = &mut realm.current_realm();
 
-        let (script, introduction_type) = match structured_dom_script(&script) {
-            Ok(Some(script)) => (script, Some(IntroductionType::DEBUGGER_EVAL)),
-            Ok(None) => (script, None),
+        let (script, trusted) = match prepare_embedder_script(script, structured) {
+            Ok(value) => value,
             Err(()) => {
                 let _ = self.senders.pipeline_to_constellation_sender.send((webview_id, pipeline_id, ScriptToConstellationMessage::FinishJavaScriptEvaluation(evaluation_id, Err(JavaScriptEvaluationError::InternalError))));
                 return;
             }
         };
+        let introduction_type = trusted.then_some(IntroductionType::DEBUGGER_EVAL);
         rooted!(&in(cx) let mut return_value = UndefinedValue());
         if let Err(err) = global_scope.evaluate_js_on_global(
             cx,
