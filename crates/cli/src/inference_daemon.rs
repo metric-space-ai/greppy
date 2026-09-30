@@ -2238,7 +2238,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inference_spawn_entrypoint_drops_lease_while_detached_owner_stays_live() {
+        use std::io::Read;
         use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
         struct OwnedProbe {
             pid: libc::pid_t,
             stop: std::path::PathBuf,
@@ -2258,6 +2260,8 @@ mod tests {
         let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
         let marker = temp.path().join("owned.pid");
         let stop = temp.path().join("stop");
+        let (mut pid_reader, pid_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let pid_fd = pid_writer.as_raw_fd();
         let mut command = std::process::Command::new("/bin/sh");
         command.args([
             "-c",
@@ -2267,17 +2271,34 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Capture the exact child PID before exec. A successful spawn means
+        // these bytes were already written, so cleanup ownership is installed
+        // before any readiness deadline can fail.
+        unsafe {
+            command.pre_exec(move || {
+                let bytes = libc::getpid().to_ne_bytes();
+                if libc::write(pid_fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         spawn_detached(&mut command).unwrap();
+        drop(pid_writer);
+        let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        pid_reader.read_exact(&mut bytes).unwrap();
+        let pid = libc::pid_t::from_ne_bytes(bytes);
+        let _owner = OwnedProbe { pid, stop };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&marker).ok()
+        loop {
+            if let Some(ready_pid) = std::fs::read_to_string(&marker).ok()
                 .and_then(|text| text.parse::<libc::pid_t>().ok()) {
-                break pid;
+                assert_eq!(ready_pid, pid);
+                break;
             }
             assert!(std::time::Instant::now() < deadline, "owned detached probe did not start");
             std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        let _owner = OwnedProbe { pid, stop };
+        }
         assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
         drop(lease);
         assert!(lock_available(&path), "inference spawn retained the parent's host lease");
