@@ -469,7 +469,7 @@ fn rename_identity_planner_subprocess_helper() {
     std::fs::create_dir(free_root.join(".git")).unwrap();
     std::fs::write(
         free_root.join("selected_free.rs"),
-        "struct Container;\nimpl Container {\n    fn from_ast() {\n        if let Some(_) = get_lit_str() {}\n        if let Some(_) = get_lit_str() {}\n        if let Some(_) = get_lit_str() {}\n    }\n}\npub fn get_lit_str() {}\n",
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_lit_str(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_lit_str(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n",
     )
     .unwrap();
     let unrelated_free = "pub fn get_lit_str() {}\npub fn unrelated_caller() { get_lit_str(); }\n";
@@ -497,7 +497,7 @@ fn rename_identity_planner_subprocess_helper() {
     assert!(free_outcome.published);
     assert_eq!(
         std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
-        "struct Container;\nimpl Container {\n    fn from_ast() {\n        if let Some(_) = get_str_literal() {}\n        if let Some(_) = get_str_literal() {}\n        if let Some(_) = get_str_literal() {}\n    }\n}\npub fn get_str_literal() {}\n"
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_str_literal(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_str_literal(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n"
     );
     assert_eq!(
         std::fs::read_to_string(free_root.join("unrelated_free.rs")).unwrap(),
@@ -514,6 +514,10 @@ fn rename_identity_planner_subprocess_helper() {
         (
             "closure-shadow",
             "pub fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n",
+        ),
+        (
+            "block-glob-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); get_lit_str(); }\n",
         ),
     ] {
         let root = test_tempdir(name);
