@@ -658,6 +658,9 @@ pub(crate) fn seal_detached_child_fds(
 pub(super) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        // Inference owners outlive a requesting workflow and must release
+        // its host admission lease and other ambient channels on exec.
+        seal_detached_child_fds(command)?;
         detach_command(command);
         command.spawn().map(|_| ())
     }
@@ -2230,6 +2233,70 @@ mod tests {
         assert!(daemon.try_wait().unwrap().is_none(), "daemon did not remain alive");
         let _ = daemon.kill();
         let _ = daemon.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_entrypoint_drops_lease_while_detached_owner_stays_live() {
+        use std::os::fd::AsRawFd;
+        struct OwnedProbe {
+            pid: libc::pid_t,
+            stop: std::path::PathBuf,
+        }
+        impl Drop for OwnedProbe {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.stop, b"stop\n");
+                // Only reap our direct child. It also self-expires after five
+                // seconds; no unrelated daemon or PID receives a signal.
+                let mut status = 0;
+                unsafe { libc::waitpid(self.pid, &mut status, 0); }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let marker = temp.path().join("owned.pid");
+        let stop = temp.path().join("stop");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; i=0; while [ ! -e \"$2\" ] && [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
+            "greppy-owned-detached-probe",
+        ]).arg(&marker).arg(&stop)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        spawn_detached(&mut command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker).ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok()) {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "owned detached probe did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _owner = OwnedProbe { pid, stop };
+        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
+        drop(lease);
+        assert!(lock_available(&path), "inference spawn retained the parent's host lease");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "detached owner did not remain alive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_spawn_failure_preserves_parent_descriptor_flags() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heavy.lock");
+        let lease = inheritable_locked_file(&path);
+        let before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+        let mut command = std::process::Command::new(temp.path().join("missing-inference-owner"));
+        assert!(spawn_detached(&mut command).is_err());
+        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, before);
+        drop(lease);
+        assert!(lock_available(&path));
     }
 
     #[cfg(unix)]
