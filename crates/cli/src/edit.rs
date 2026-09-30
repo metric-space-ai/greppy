@@ -3328,15 +3328,16 @@ fn rust_selected_local_free_function_owns_site(
             let mut ancestor = candidate.parent();
             let mut binding_owner = None;
             while let Some(node) = ancestor {
-                if matches!(
-                    node.kind(),
-                    "let_declaration"
-                        | "parameter"
-                        | "for_expression"
-                        | "match_arm"
-                        | "let_condition"
-                        | "closure_parameters"
-                ) {
+                let binds_candidate = match node.kind() {
+                    "parameter" | "closure_parameters" => true,
+                    "let_declaration" | "for_expression" | "match_arm" | "let_condition" => {
+                        node.child_by_field_name("pattern").is_some_and(|pattern| {
+                            pattern.byte_range().contains(&candidate.start_byte())
+                        })
+                    }
+                    _ => false,
+                };
+                if binds_candidate {
                     binding_owner = Some(node);
                     break;
                 }
@@ -4113,6 +4114,24 @@ mod patch_rollback_tests {
                 "get_lit_str",
                 sites[0],
                 sites[2],
+            ));
+        }
+
+        let serde_shape = b"fn get_lit_str() {}\nfn caller() { if let Some(_) = get_lit_str() {} if let Some(_) = get_lit_str() {} if let Some(_) = get_lit_str() {} }\n";
+        let serde_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("serde-shape.rs"),
+            serde_shape,
+            &[(0, serde_shape.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(serde_sites.len(), 4);
+        for site in &serde_sites[1..] {
+            assert!(rust_selected_local_free_function_owns_site(
+                serde_shape,
+                "get_lit_str",
+                serde_sites[0],
+                *site,
             ));
         }
     }
