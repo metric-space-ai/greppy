@@ -926,7 +926,14 @@ fn supervisor_for_session(
 }
 
 fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &str) -> bool {
-    let mut request = Request::new(run_id, "web.session.list", inject_agent_id(json!({})));
+    let Ok(agent) = std::env::var("GREPPY_WEB_AGENT") else {
+        return false;
+    };
+    let agent = agent.trim();
+    if agent.is_empty() {
+        return false;
+    }
+    let mut request = Request::new(run_id, "web.session.list", json!({ "agent_id": agent }));
     request.capability = capability.to_owned();
     greppy_web_client::unix_request(socket, &request, Duration::from_millis(400))
         .ok()
@@ -944,6 +951,7 @@ fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &
                     .or_else(|| row.get("id"))
                     .and_then(|value| value.as_str())
                     == Some(session)
+                    && row.get("owner").and_then(|value| value.as_str()) == Some(agent)
             })
         })
 }
