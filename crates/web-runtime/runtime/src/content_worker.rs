@@ -1192,6 +1192,8 @@ struct ContentEngine {
     /// Carries the Web API shims. Shared by every page, so a shim reaches
     /// frames and popups too, not just the tab the agent drove.
     user_content: Rc<UserContentManager>,
+    transfer_capability: String,
+    transfer_root: PathBuf,
     _proxy: PolicyProxy,
 }
 
@@ -1205,8 +1207,40 @@ impl Drop for ContentEngine {
     }
 }
 
+fn authorize_text_transfer(
+    path: &Path,
+    supplied_capability: &str,
+    expected_capability: &str,
+    transfer_root: &Path,
+) -> io::Result<()> {
+    let same_length = supplied_capability.len() == expected_capability.len();
+    let difference = supplied_capability
+        .bytes()
+        .zip(expected_capability.bytes())
+        .fold(0_u8, |difference, (left, right)| difference | (left ^ right));
+    if !same_length || difference != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile requires daemon authorization",
+        ));
+    }
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if path.parent() != Some(transfer_root) || !valid_name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "page.textToFile destination is not daemon-owned",
+        ));
+    }
+    Ok(())
+}
+
 impl ContentEngine {
-    fn new(parent_alive: Arc<AtomicBool>) -> io::Result<Self> {
+    fn new(parent_alive: Arc<AtomicBool>, transfer_capability: String) -> io::Result<Self> {
         trace_startup("renderer-create");
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
@@ -1257,6 +1291,8 @@ impl ContentEngine {
             wake,
             profile,
             user_content,
+            transfer_capability,
+            transfer_root: std::env::temp_dir().join("transfers"),
             _proxy: proxy,
         })
     }
@@ -3208,6 +3244,13 @@ impl ContentEngine {
             "page.textToFile" => {
                 let page_id = required_str(&params, "page")?;
                 let path = PathBuf::from(required_str(&params, "path")?);
+                let capability = required_str(&params, "capability")?;
+                authorize_text_transfer(
+                    &path,
+                    capability,
+                    &self.transfer_capability,
+                    &self.transfer_root,
+                )?;
                 let max_bytes = params
                     .get("max_bytes")
                     .and_then(serde_json::Value::as_u64)
@@ -5431,6 +5474,22 @@ mod serialize_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn text_transfer_requires_daemon_capability_and_owned_destination() {
+        let root = PathBuf::from("/daemon-owned/transfers");
+        let owned = root.join("ab".repeat(32));
+        assert!(authorize_text_transfer(&owned, "secret", "secret", &root).is_ok());
+
+        let forged_capability = authorize_text_transfer(&owned, "forged", "secret", &root)
+            .expect_err("controller capability must not authorize transfer");
+        assert_eq!(forged_capability.kind(), io::ErrorKind::PermissionDenied);
+
+        let arbitrary = PathBuf::from("/attacker-selected").join("cd".repeat(32));
+        let forged_destination = authorize_text_transfer(&arbitrary, "secret", "secret", &root)
+            .expect_err("daemon capability must stay confined to its owned root");
+        assert_eq!(forged_destination.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn click_navigation_epoch_survives_redirect_request_id_changes() {
         let aborted = json!({
             "requestId": "different-fetch-uuid:2",
@@ -6476,7 +6535,7 @@ pub fn run() -> io::Result<()> {
     trace_startup("protocol-channel");
     let (mut protocol_in, mut protocol_out) = crate::worker::take_protocol_channel()?;
     let parent_alive = Arc::new(AtomicBool::new(true));
-    let mut engine = ContentEngine::new(Arc::clone(&parent_alive))?;
+    let mut engine = ContentEngine::new(Arc::clone(&parent_alive), capability.clone())?;
     trace_startup("read-hello");
     match read_message(&mut protocol_in)? {
         Message::Hello {
