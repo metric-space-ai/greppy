@@ -201,6 +201,11 @@ fn remove_session_route(root: Option<&str>, session: &str) {
 }
 
 fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str) {
+    let clear_scope = read_current_scope(root)
+        .session
+        .as_deref()
+        .and_then(|session| load_session_route(root, session))
+        .is_some_and(|route| route.runtime_image_id == runtime_image_id);
     let _ = std::fs::remove_file(runtime_route_path(root, runtime_image_id));
     let directory = workspace_dir(root).join(".greppy/web/session-routes");
     if let Ok(entries) = std::fs::read_dir(directory) {
@@ -215,7 +220,17 @@ fn remove_runtime_routes(root: Option<&str>, runtime_image_id: &str) {
             }
         }
     }
-    let _ = std::fs::remove_file(current_scope_path(root));
+    if clear_scope {
+        let _ = std::fs::remove_file(current_scope_path(root));
+    }
+}
+
+fn select_route_capability(
+    saved_cookie: Option<String>,
+    current_token: Option<String>,
+    is_current_image: bool,
+) -> Option<String> {
+    saved_cookie.or_else(|| is_current_image.then_some(current_token).flatten())
 }
 /// Drop only the remembered session that the runtime actually rejected.
 ///
@@ -382,6 +397,12 @@ pub(super) fn runtime_run_id(root: Option<&str>) -> (String, String) {
 
 fn runtime_identity_for_image(identity: &str, runtime_image_id: &str) -> String {
     format!("{identity}:image:{runtime_image_id}")
+}
+
+fn valid_runtime_image_id(runtime_image_id: &str) -> bool {
+    runtime_image_id
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
@@ -962,8 +983,17 @@ fn supervisor_for_session(
     spawn: &SupervisorSpawn,
     session: Option<&str>,
 ) -> std::result::Result<SupervisorCtx, ErrorObject> {
+    let current_image = resolve_runtime()
+        .ok()
+        .and_then(|runtime| greppy_web_client::runtime_image_id(&runtime.executable).ok());
     if let Some(session) = session {
         if let Some(route) = load_session_route(root, session) {
+            if !valid_runtime_image_id(&route.runtime_image_id) {
+                remove_session_route(root, session);
+                return Err(unavailable(
+                    "saved session route has an invalid runtime image identity",
+                ));
+            }
             let (route_run_id, route_identity) = runtime_run_id(root);
             let route_identity = if route.legacy {
                 route_identity
@@ -973,8 +1003,11 @@ fn supervisor_for_session(
             let Some(route_socket) = web_runtime_socket(&route_identity) else {
                 return Err(unavailable("cannot allocate saved session runtime socket"));
             };
-            let capability =
-                load_attach_cookie(&route_socket).or_else(crate::web_attach::current_token);
+            let capability = select_route_capability(
+                load_attach_cookie(&route_socket),
+                crate::web_attach::current_token(),
+                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+            );
             if let Some(capability) = capability {
                 if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
                     if live.runtime_image_id == route.runtime_image_id {
@@ -999,6 +1032,9 @@ fn supervisor_for_session(
             remove_session_route(root, session);
         }
         for route in known_runtime_routes(root) {
+            if !valid_runtime_image_id(&route.runtime_image_id) {
+                continue;
+            }
             let (route_run_id, route_identity) = runtime_run_id(root);
             let route_identity = if route.legacy {
                 route_identity
@@ -1008,8 +1044,11 @@ fn supervisor_for_session(
             let Some(route_socket) = web_runtime_socket(&route_identity) else {
                 continue;
             };
-            let capability =
-                load_attach_cookie(&route_socket).or_else(crate::web_attach::current_token);
+            let capability = select_route_capability(
+                load_attach_cookie(&route_socket),
+                crate::web_attach::current_token(),
+                current_image.as_deref() == Some(route.runtime_image_id.as_str()) && !route.legacy,
+            );
             if let Some(capability) = capability {
                 if let Some(live) = live_runtime_status(&route_socket, &route_run_id, &capability) {
                     if live.runtime_image_id == route.runtime_image_id
@@ -1033,8 +1072,7 @@ fn supervisor_for_session(
         // owner-filtered session inventory contains this exact session.
         let (legacy_run_id, legacy_identity) = runtime_run_id(root);
         if let Some(legacy_socket) = web_runtime_socket(&legacy_identity) {
-            let capability =
-                load_attach_cookie(&legacy_socket).or_else(crate::web_attach::current_token);
+            let capability = load_attach_cookie(&legacy_socket);
             if let Some(capability) = capability {
                 if let Some(live) = live_runtime_status(&legacy_socket, &legacy_run_id, &capability)
                 {
@@ -2351,6 +2389,15 @@ mod target_tests {
             runtime_identity_for_image(&workspace_identity, &route.runtime_image_id),
             format!("{workspace_identity}:image:sha256:abc")
         );
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), false),
+            None,
+            "a recovered non-current generation without its own cookie must fail closed"
+        );
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), true),
+            Some("current-token".into())
+        );
     }
 
     #[test]
@@ -2372,6 +2419,28 @@ mod target_tests {
         assert!(!runtime_route_path(Some(root_text), &ctx.runtime_image_id).exists());
         assert!(!session_route_path(Some(root_text), "wrs_test").exists());
         assert!(!current_scope_path(Some(root_text)).exists());
+    }
+
+    #[test]
+    fn stopping_other_generation_preserves_remembered_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let ctx = SupervisorCtx {
+            socket: PathBuf::from("/unused"),
+            run_id: "run".into(),
+            capability: "capability".into(),
+            runtime_image_id: format!("sha256:{}", "1".repeat(64)),
+            legacy: false,
+        };
+        save_session_route(Some(root_text), "wrs_live", &ctx).unwrap();
+        std::fs::write(
+            current_scope_path(Some(root_text)),
+            br#"{"session":"wrs_live","tab":"tab_live"}"#,
+        )
+        .unwrap();
+        remove_runtime_routes(Some(root_text), &format!("sha256:{}", "2".repeat(64)));
+        assert!(current_scope_path(Some(root_text)).exists());
+        assert!(session_route_path(Some(root_text), "wrs_live").exists());
     }
 
     #[test]
