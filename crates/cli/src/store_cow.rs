@@ -2924,15 +2924,33 @@ mod tests {
             .get_node_by_qname("p", "src/lib.rs::Function::decode")
             .unwrap()
             .unwrap();
-        let amount = store.get_node_by_qname("p", "src/lib.rs::Function::amount").unwrap().unwrap();
-        let valid = store.get_node_by_qname("p", "src/lib.rs::Function::valid").unwrap().unwrap();
-        store.insert_raw_edges(&[greppy_store::NewRawEdge {
-            project: "p".into(), file_path: "src/lib.rs".into(), source_qname: decode.qualified_name.clone(),
-            target_qname: amount.qualified_name.clone(), edge_type: "USAGE".into(),
-            properties: serde_json::json!({"ref_name": "amount", "line": 3}),
-        }]).unwrap();
-        store.insert_edge(&greppy_store::NewEdge { project: "p".into(), source_id: decode.id, target_id: amount.id,
-            edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount"}) }).unwrap();
+        let amount = store
+            .get_node_by_qname("p", "src/lib.rs::Function::amount")
+            .unwrap()
+            .unwrap();
+        let valid = store
+            .get_node_by_qname("p", "src/lib.rs::Function::valid")
+            .unwrap()
+            .unwrap();
+        store
+            .insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "p".into(),
+                file_path: "src/lib.rs".into(),
+                source_qname: decode.qualified_name.clone(),
+                target_qname: amount.qualified_name.clone(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount", "line": 3}),
+            }])
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: "p".into(),
+                source_id: decode.id,
+                target_id: amount.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount"}),
+            })
+            .unwrap();
         store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
         store
             .conn()

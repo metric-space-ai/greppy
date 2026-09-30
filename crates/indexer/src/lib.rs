@@ -2203,9 +2203,13 @@ pub fn recover_persisted_rust_usages(
             )));
         }
         files.push(state.rel_path.clone());
-        replacements.extend(extraction.edges.iter()
-            .filter(|edge| edge.edge_type == "USAGE")
-            .map(|edge| new_raw_edge_for(project, &state.rel_path, edge)));
+        replacements.extend(
+            extraction
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_type == "USAGE")
+                .map(|edge| new_raw_edge_for(project, &state.rel_path, edge)),
+        );
     }
     // All source fingerprints validate before any persisted write. Replace
     // exactly the USAGE contribution, retaining imports/calls and cached data.
@@ -6781,15 +6785,31 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, &repo, "test").unwrap();
             base.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
-            let decode = base.get_node_by_qname("test", "src/lib.rs::Function::decode").unwrap().unwrap();
-            let amount = base.get_node_by_qname("test", "src/lib.rs::Function::amount").unwrap().unwrap();
+            let decode = base
+                .get_node_by_qname("test", "src/lib.rs::Function::decode")
+                .unwrap()
+                .unwrap();
+            let amount = base
+                .get_node_by_qname("test", "src/lib.rs::Function::amount")
+                .unwrap()
+                .unwrap();
             base.insert_raw_edges(&[NewRawEdge {
-                project: "test".into(), file_path: "src/lib.rs".into(),
-                source_qname: decode.qualified_name.clone(), target_qname: amount.qualified_name.clone(),
-                edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount", "line": 2}),
-            }]).unwrap();
-            base.insert_edge(&NewEdge { project: "test".into(), source_id: decode.id,
-                target_id: amount.id, edge_type: "USAGE".into(), properties: serde_json::json!({"ref_name": "amount"}) }).unwrap();
+                project: "test".into(),
+                file_path: "src/lib.rs".into(),
+                source_qname: decode.qualified_name.clone(),
+                target_qname: amount.qualified_name.clone(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount", "line": 2}),
+            }])
+            .unwrap();
+            base.insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: decode.id,
+                target_id: amount.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount"}),
+            })
+            .unwrap();
             base.conn().execute("DELETE FROM edges WHERE target_id IN (SELECT id FROM nodes WHERE name='AddImmediateByte')", []).unwrap();
             base.conn()
                 .execute(
@@ -6833,12 +6853,29 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
-        let amount = overlay.get_node_by_qname("test", "src/lib.rs::Function::amount").unwrap().unwrap();
-        let valid = overlay.get_node_by_qname("test", "src/lib.rs::Function::valid").unwrap().unwrap();
-        let usages = overlay.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
-        assert!(usages.iter().all(|edge| edge.source_id != caller.id), "obsolete struct field label must not resolve to a free function");
-        assert!(usages.iter().any(|edge| edge.source_id == valid.id), "legitimate raw usage remains visible");
-        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty(), "Base compatibility repair must not enter sparse raw re-resolution");
+        let amount = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::amount")
+            .unwrap()
+            .unwrap();
+        let valid = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::valid")
+            .unwrap()
+            .unwrap();
+        let usages = overlay
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap();
+        assert!(
+            usages.iter().all(|edge| edge.source_id != caller.id),
+            "obsolete struct field label must not resolve to a free function"
+        );
+        assert!(
+            usages.iter().any(|edge| edge.source_id == valid.id),
+            "legitimate raw usage remains visible"
+        );
+        assert!(
+            overlay.list_delta_raw_edges("test").unwrap().is_empty(),
+            "Base compatibility repair must not enter sparse raw re-resolution"
+        );
         assert_eq!(
             recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
             0
@@ -6855,13 +6892,19 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .unwrap()
             .iter()
             .any(|edge| edge.source_id == caller.id));
-        let usages = overlay.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
+        let usages = overlay
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap();
         assert!(usages.iter().all(|edge| edge.source_id != caller.id));
         assert!(usages.iter().any(|edge| edge.source_id == valid.id));
         drop(overlay);
         // Persisted override works after a normal overlay reopen too.
         let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        assert!(reopened.incoming_edges(amount.id, Some("USAGE"), 20).unwrap().iter().all(|edge| edge.source_id != caller.id));
+        assert!(reopened
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .all(|edge| edge.source_id != caller.id));
         drop(reopened);
         let base = Store::open(&base_path).unwrap();
         assert_eq!(

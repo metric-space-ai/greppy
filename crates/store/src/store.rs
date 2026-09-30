@@ -378,7 +378,7 @@ AND NOT (b.edge_type = 'USAGE' AND EXISTS (
     WHERE m.key = 'greppy.rust_usage_override_files.' || b.project AND f.value = b.file_path
 ))
 UNION ALL
-SELECT -9223372036854775807 + CAST(r.key AS INTEGER) AS id,
+SELECT -9223372036854775807 + row_number() OVER (ORDER BY m.key, CAST(r.key AS INTEGER)) AS id,
        substr(m.key, length('greppy.rust_usage_override_rows.') + 1) AS project,
        json_extract(r.value, '$.file_path') AS file_path,
        json_extract(r.value, '$.source_qname') AS source_qname,
