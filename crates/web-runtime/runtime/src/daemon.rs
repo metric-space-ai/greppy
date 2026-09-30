@@ -2551,13 +2551,6 @@ impl Daemon {
             .ok_or_else(|| "page.content missing html".to_owned())
     }
 
-    pub(crate) fn text_from_page_text(value: &serde_json::Value) -> Result<String, String> {
-        value
-            .get("text")
-            .and_then(|text| text.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| "page.text missing text".to_owned())
-    }
     fn web_search(&mut self, request: &Request) -> Response {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.search requires query");
@@ -4106,10 +4099,45 @@ impl Daemon {
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
-        let rendered_text = self
-            .engine_call("page.text", json!({ "page": page }))
-            .and_then(|value| Self::text_from_page_text(&value))
+        let max_transfer_bytes = self
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .limits
+                    .max_artifact_bytes
+                    .saturating_sub(session.artifact_bytes)
+            })
+            .ok_or_else(|| engine_error(request, "session disappeared", 39))?;
+        let transfer = self
+            .store
+            .begin_transfer(&format!("{session_id}:{}", request.request_id))
+            .map_err(|error| engine_error(request, error, 39))?;
+        let transfer_result = self
+            .engine_call(
+                "page.textToFile",
+                json!({
+                    "page": page,
+                    "path": transfer.path(),
+                    "max_bytes": max_transfer_bytes,
+                }),
+            )
             .map_err(|error| engine_error(request, error, 34))?;
+        let transfer_bytes = transfer_result
+            .get("byte_count")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing byte_count", 39))?;
+        let transfer_digest = transfer_result
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing digest", 39))?;
+        let rendered_text = transfer
+            .read_verified(transfer_bytes, transfer_digest)
+            .map_err(|error| engine_error(request, error, 39))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| engine_error(request, error, 39))
+            })?;
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
             .unwrap_or_else(|_| json!({ "requests": [] }));
@@ -6400,15 +6428,4 @@ mod redirect_chain_tests {
         );
     }
 
-    #[test]
-    fn text_from_page_text_preserves_full_rendered_text() {
-        let rendered = format!("{}IMMUTABLE_TAIL", "artifact body ".repeat(10_000));
-        let extracted = super::Daemon::text_from_page_text(&json!({"text": rendered})).unwrap();
-        assert!(extracted.ends_with("IMMUTABLE_TAIL"));
-        assert_eq!(extracted.chars().count(), rendered.chars().count());
-        assert_eq!(
-            super::Daemon::text_from_page_text(&json!({})).unwrap_err(),
-            "page.text missing text"
-        );
-    }
 }
