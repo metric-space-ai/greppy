@@ -57,7 +57,24 @@ impl Store {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
+        let overlay = self.is_overlay();
         let tx = self.transaction()?;
+        // SQLite foreign keys are confined to main. An additive repair can
+        // reference a project visible only through immutable Base; materialize
+        // its metadata in this transaction without copying any file ownership.
+        if overlay {
+            let projects = edges.iter().map(|edge| edge.project.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            for project in projects {
+                tx.raw().execute(
+                    "INSERT INTO main.projects(name, indexed_at, root_path)
+                     SELECT name, indexed_at, root_path FROM greppy_base.projects
+                     WHERE name = ?1
+                     ON CONFLICT(name) DO NOTHING",
+                    [project],
+                )?;
+            }
+        }
         let mut ids = Vec::with_capacity(edges.len());
         {
             let raw = tx.raw();
@@ -213,6 +230,38 @@ mod tests {
             edge_type: ty.into(),
             properties: serde_json::json!({"line": 1}),
         }
+    }
+
+    #[test]
+    fn overlay_raw_insert_materializes_only_project_metadata_atomically() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        let project = Project {
+            name: "p".into(), indexed_at: "cached-time".into(), root_path: "/cached/root".into(),
+        };
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&project).unwrap();
+        }
+        let visibility = crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        overlay.conn().execute_batch("CREATE TRIGGER reject_raw BEFORE INSERT ON raw_edges BEGIN SELECT RAISE(ABORT,'fixture raw failure'); END;").unwrap();
+        let edge = new_raw_edge("p", "base.rs", "p.source", "p.target", "USAGE");
+        assert!(overlay.insert_raw_edges(&[edge.clone()]).is_err());
+        let private_projects: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get(0)).unwrap();
+        assert_eq!(private_projects, 0, "failed raw batch rolls back project metadata");
+        overlay.conn().execute_batch("DROP TRIGGER reject_raw").unwrap();
+        overlay.insert_raw_edges(&[edge]).unwrap();
+        let private_metadata: (String, String) = overlay.conn().query_row("SELECT indexed_at,root_path FROM main.projects WHERE name='p'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(private_metadata, (project.indexed_at, project.root_path));
+        assert!(overlay.list_private_file_states("p").unwrap().is_empty());
+        assert!(overlay.list_private_workspace_states().unwrap().is_empty());
+        assert!(overlay.list_nodes("p", "", "", 0, 10).unwrap().is_empty());
+        assert_eq!(overlay.list_delta_raw_edges("p").unwrap().len(), 1);
+        drop(overlay);
+        let base = Store::open(&base_path).unwrap();
+        assert!(base.list_raw_edges("p").unwrap().is_empty());
     }
 
     #[test]
