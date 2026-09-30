@@ -2916,10 +2916,22 @@ mod tests {
                 [RUST_CALLER_EDGES_REPAIR_META_KEY],
             )
             .unwrap();
-        let constructor = store.get_node_by_qname("p", "src/lib.rs::Instruction::AddImmediateByte").unwrap().unwrap();
-        let decode = store.get_node_by_qname("p", "src/lib.rs::Function::decode").unwrap().unwrap();
+        let constructor = store
+            .get_node_by_qname("p", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        let decode = store
+            .get_node_by_qname("p", "src/lib.rs::Function::decode")
+            .unwrap()
+            .unwrap();
         store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
-        store.conn().execute("DELETE FROM edges WHERE target_id=?1 AND edge_type='USAGE'", [constructor.id]).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id=?1 AND edge_type='USAGE'",
+                [constructor.id],
+            )
+            .unwrap();
         store.conn().execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v2','complete')", []).unwrap();
         store.conn().execute_batch("CREATE TRIGGER reject_rust_repair BEFORE INSERT ON edges WHEN NEW.edge_type='CALLS' BEGIN SELECT RAISE(ABORT,'fixture repair failure'); END;").unwrap();
         drop(store);
@@ -2956,7 +2968,11 @@ mod tests {
             .unwrap()
             .iter()
             .all(|edge| edge.target_id != caller.id));
-        assert!(store.incoming_edges(constructor.id, Some("USAGE"), 20).unwrap().iter().any(|edge| edge.source_id == decode.id));
+        assert!(store
+            .incoming_edges(constructor.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == decode.id));
         assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
         assert_eq!(
             format!(
@@ -3043,8 +3059,16 @@ mod tests {
             "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n",
         )
         .unwrap();
-        std::fs::write(root.join("src/base.rs"), "pub fn base_caller() { crate::alias_chain::sub::target(); }\n").unwrap();
-        std::fs::write(root.join("src/stable.rs"), "pub fn stable_caller() { crate::alias_chain::sub::target(); }\n").unwrap();
+        std::fs::write(
+            root.join("src/base.rs"),
+            "pub fn base_caller() { crate::alias_chain::sub::target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/stable.rs"),
+            "pub fn stable_caller() { crate::alias_chain::sub::target(); }\n",
+        )
+        .unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-q", "-m", "alias base"]);
         let base_commit = git(&root, &["rev-parse", "HEAD"]);
@@ -3122,16 +3146,28 @@ mod tests {
             })
             .unwrap();
             // Persist real source fingerprints for this pre-fix Base fixture.
-            for rel in ["src/alias_chain/mod.rs", "src/alias_chain/sub.rs", "src/base.rs", "src/stable.rs"] {
+            for rel in [
+                "src/alias_chain/mod.rs",
+                "src/alias_chain/sub.rs",
+                "src/base.rs",
+                "src/stable.rs",
+            ] {
                 let bytes = std::fs::read(root.join(rel)).unwrap();
-                let metadata = greppy_discover::stable_metadata(&std::fs::symlink_metadata(root.join(rel)).unwrap());
+                let metadata = greppy_discover::stable_metadata(
+                    &std::fs::symlink_metadata(root.join(rel)).unwrap(),
+                );
                 base.upsert_file_state(&greppy_store::FileState {
-                    project: "p".into(), rel_path: rel.into(), language: "Rust".into(),
+                    project: "p".into(),
+                    rel_path: rel.into(),
+                    language: "Rust".into(),
                     sha256: greppy_store::file_state::sha256_hex(&bytes),
-                    mtime_ns: metadata.mtime_ns.unwrap_or_default(), size: metadata.size as i64,
-                    parser_version: "fixture".into(), extractor_version: "fixture".into(),
+                    mtime_ns: metadata.mtime_ns.unwrap_or_default(),
+                    size: metadata.size as i64,
+                    parser_version: "fixture".into(),
+                    extractor_version: "fixture".into(),
                     last_indexed_generation: 7,
-                }).unwrap();
+                })
+                .unwrap();
             }
             base.insert_raw_edges(&[
                 greppy_store::NewRawEdge {
