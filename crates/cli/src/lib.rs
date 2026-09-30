@@ -5897,6 +5897,13 @@ fn summarize_source_cached(
     source: &str,
     unbounded: bool,
 ) -> Option<Vec<String>> {
+    // Literal source facts outrank cached/model expansions of register acronyms.
+    // Keep the trained summary prompt and complex-function path unchanged.
+    if file_path.ends_with(".rs") {
+        if let Some(fact) = greppy_parser::grounded_hint::rust_conditional_bit_writes(source) {
+            return Some(vec![fact]);
+        }
+    }
     let (cache, fallback_cache, global_cache) = caches;
     let cache_key = format!("{model_key}#{SUMMARY_CACHE_GENERATION}");
     let hash = greppy_store::span_hash(file_path, source);
