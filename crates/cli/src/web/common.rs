@@ -945,15 +945,17 @@ fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &
                 .and_then(|value| value.as_array())
                 .cloned()
         })
-        .is_some_and(|sessions| {
-            sessions.iter().any(|row| {
-                row.get("session_id")
-                    .or_else(|| row.get("id"))
-                    .and_then(|value| value.as_str())
-                    == Some(session)
-                    && row.get("owner").and_then(|value| value.as_str()) == Some(agent)
-            })
-        })
+        .is_some_and(|sessions| session_inventory_contains(&sessions, session, agent))
+}
+
+fn session_inventory_contains(sessions: &[serde_json::Value], session: &str, agent: &str) -> bool {
+    sessions.iter().any(|row| {
+        row.get("session_id")
+            .or_else(|| row.get("id"))
+            .and_then(|value| value.as_str())
+            == Some(session)
+            && row.get("owner").and_then(|value| value.as_str()) == Some(agent)
+    })
 }
 
 pub(super) struct SupervisorCtx {
@@ -2136,6 +2138,19 @@ mod target_tests {
             runtime_disposition(None, false, "image-new"),
             RuntimeDisposition::Spawn
         );
+    }
+
+    #[test]
+    fn legacy_session_adoption_requires_exact_owner_and_session() {
+        let rows = vec![json!({ "session_id": "wrs_old", "owner": "agent-a" })];
+        assert!(session_inventory_contains(&rows, "wrs_old", "agent-a"));
+        assert!(!session_inventory_contains(&rows, "wrs_old", "agent-b"));
+        assert!(!session_inventory_contains(&rows, "wrs_other", "agent-a"));
+        assert!(!session_inventory_contains(
+            &[json!({ "session_id": "wrs_old" })],
+            "wrs_old",
+            "agent-a"
+        ));
     }
 
     #[test]
