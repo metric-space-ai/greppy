@@ -3066,7 +3066,15 @@ fn rust_crate_roots_from_manifest(
     };
 
     let relative_path = |path: &std::path::Path| -> Option<String> {
-        let relative = path.strip_prefix(repository_root).ok()?;
+        // Cargo accepts `./` and parent components in explicit target paths.
+        // Canonicalize existing targets before comparing with indexed files;
+        // targets escaping the repository still fail the prefix check.
+        let canonical = std::fs::canonicalize(path).ok();
+        let relative = canonical
+            .as_deref()
+            .unwrap_or(path)
+            .strip_prefix(repository_root)
+            .ok()?;
         Some(relative.to_string_lossy().replace('\\', "/"))
     };
     let add_target = |target: &str, roots: &mut std::collections::HashSet<String>| {
@@ -6262,7 +6270,7 @@ def Widget():
         for (manifest_lib, library_file, library_name) in [
             ("", "src/lib.rs", "vcop2_tools"),
             (
-                "[lib]\nname = \"tool_api\"\npath = \"engine/entry.rs\"\n",
+                "[lib]\nname = \"tool_api\"\npath = \"./engine/entry.rs\"\n",
                 "engine/entry.rs",
                 "tool_api",
             ),
@@ -6383,7 +6391,7 @@ def Widget():
                 index(&mut base, &repo, "test").unwrap();
                 // Simulate an old resolver: retain raw edges and all nodes,
                 // but remove the previously missing Cargo library relations.
-                base.conn().execute("DELETE FROM edges WHERE label IN ('CALLS', 'USAGE', 'IMPORTS')", []).unwrap();
+                base.conn().execute("DELETE FROM edges WHERE edge_type IN ('CALLS', 'USAGE', 'IMPORTS')", []).unwrap();
             }
             let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
             let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
