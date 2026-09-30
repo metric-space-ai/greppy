@@ -3086,7 +3086,7 @@ mod tests {
         std::fs::write(root.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
         std::fs::write(
             root.join("src/caller.rs"),
-            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n",
+            "use crate::alias_chain::outer;\npub fn caller() { let _ = outer; }\n",
         )
         .unwrap();
         std::fs::write(
@@ -3104,7 +3104,7 @@ mod tests {
         let base_commit = git(&root, &["rev-parse", "HEAD"]);
         std::fs::write(
             root.join("src/caller.rs"),
-            "use crate::alias_chain::outer;\npub fn caller() { outer(); }\n// dirty Delta\n",
+            "use crate::alias_chain::outer;\npub fn caller() { let _ = outer; }\n// dirty Delta\n",
         )
         .unwrap();
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));

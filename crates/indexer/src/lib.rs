@@ -7235,9 +7235,12 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         .map(str::to_string)
         .collect();
         let mut roots = std::collections::HashSet::new();
+        // Match the production caller, which canonicalizes the repository
+        // before comparing canonical Cargo targets (TMPDIR may be an alias).
+        let repository_root = std::fs::canonicalize(repo.path()).unwrap();
         assert!(rust_crate_roots_from_manifest(
-            &repo.path().join("Cargo.toml"),
-            repo.path(),
+            &repository_root.join("Cargo.toml"),
+            &repository_root,
             &known_files,
             &mut roots,
             &mut Vec::new(),
