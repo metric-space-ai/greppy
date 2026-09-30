@@ -7,6 +7,18 @@ use std::{
 };
 
 pub(crate) fn command(executable: &Path, job: &Path) -> io::Result<(Command, Option<PathBuf>)> {
+    let Some(gate) = configured_gate()? else {
+        return Ok((Command::new(executable), None));
+    };
+    // A real inherited lease keeps an already-admitted workflow from trying to
+    // acquire its own exclusive lease again. An environment flag is not proof.
+    if default_gate_lease_is_inherited(&gate) {
+        return Ok((Command::new(executable), None));
+    }
+    gated_command(executable, &gate, job)
+}
+
+fn configured_gate() -> io::Result<Option<PathBuf>> {
     let configured = std::env::var_os("GREPPY_HEAVY_GATE").map(PathBuf::from);
     let default = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -21,15 +33,23 @@ pub(crate) fn command(executable: &Path, job: &Path) -> io::Result<(Command, Opt
         }
         None => default.filter(|path| path.is_file()),
     };
-    let Some(gate) = gate else {
-        return Ok((Command::new(executable), None));
-    };
-    // A real inherited lease keeps an already-admitted workflow from trying to
-    // acquire its own exclusive lease again. An environment flag is not proof.
-    if default_gate_lease_is_inherited(&gate) {
-        return Ok((Command::new(executable), None));
+    Ok(gate)
+}
+
+/// Ungated inline refresh must never compete with an admitted host job.
+/// Returning false routes normal queries to the existing gated child refresh.
+pub(crate) fn inline_refresh_is_admitted() -> bool {
+    match configured_gate() {
+        Ok(gate) => inline_refresh_allowed_for_gate(gate.as_deref()),
+        Err(_) => false,
     }
-    gated_command(executable, &gate, job)
+}
+
+fn inline_refresh_allowed_for_gate(gate: Option<&Path>) -> bool {
+    match gate {
+        Some(gate) => default_gate_lease_is_inherited(gate),
+        None => true,
+    }
 }
 
 fn gated_command(
@@ -216,6 +236,15 @@ fn default_gate_lease_is_inherited(_: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_gate_requires_child_admission_before_inline_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = tmp.path().join("gate.py");
+        fs::write(&gate, "raise SystemExit(75)\n").unwrap();
+        assert!(!inline_refresh_allowed_for_gate(Some(&gate)));
+        assert!(inline_refresh_allowed_for_gate(None));
+    }
+
     #[test]
     fn rejecting_gate_never_runs_index_and_preserves_capacity_diagnostic() {
         let tmp = tempfile::tempdir().unwrap();

@@ -552,6 +552,9 @@ pub(crate) fn auto_reindex_inline_allowed(
 /// background refresh instead of hiding model loading or a full repository
 /// rebuild inside a navigation command.
 pub(crate) fn try_auto_reindex_inline(root: Option<&str>) -> bool {
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        return false;
+    }
     let Ok(effective_root) = resolve_root(root) else {
         return false;
     };
