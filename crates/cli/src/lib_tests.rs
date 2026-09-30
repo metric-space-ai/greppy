@@ -543,7 +543,7 @@ fn rename_identity_planner_subprocess_helper() {
         .expect("mixed-identity caller must refuse");
         assert!(
             matches!(
-                refusal.code.as_str(),
+                refusal.code,
                 "ambiguous_reference" | "unresolved_reference_identity"
             ),
             "{}: {}",
