@@ -890,8 +890,62 @@ fn supervisor_for_session(
             }
             remove_session_route(root, session);
         }
+        // Upgrade from clients which predate route files: interrogate only the
+        // authenticated legacy workspace endpoint, and adopt it only when its
+        // owner-filtered session inventory contains this exact session.
+        let (legacy_run_id, legacy_identity) = runtime_run_id(root);
+        if let Some(legacy_socket) = web_runtime_socket(&legacy_identity) {
+            let capability =
+                load_attach_cookie(&legacy_socket).or_else(crate::web_attach::current_token);
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&legacy_socket, &legacy_run_id, &capability)
+                {
+                    if runtime_has_session(&legacy_socket, &legacy_run_id, &capability, session) {
+                        let ctx = SupervisorCtx {
+                            socket: legacy_socket,
+                            run_id: legacy_run_id,
+                            capability,
+                            runtime_image_id: live.runtime_image_id,
+                        };
+                        save_session_route(root, session, &ctx);
+                        return Ok(ctx);
+                    }
+                } else if socket_connected(&legacy_socket) {
+                    return Err(not_owned(
+                        "legacy session runtime has a different attach capability",
+                    ));
+                }
+            } else if socket_connected(&legacy_socket) {
+                return Err(not_owned(
+                    "legacy session runtime has no inherited attach capability",
+                ));
+            }
+        }
     }
     ensure_supervisor(root, spawn)
+}
+
+fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &str) -> bool {
+    let mut request = Request::new(run_id, "web.session.list", inject_agent_id(json!({})));
+    request.capability = capability.to_owned();
+    greppy_web_client::unix_request(socket, &request, Duration::from_millis(400))
+        .ok()
+        .filter(|response| response.status == "ok" && response.error.is_none())
+        .and_then(|response| response.result)
+        .and_then(|result| {
+            result
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .cloned()
+        })
+        .is_some_and(|sessions| {
+            sessions.iter().any(|row| {
+                row.get("session_id")
+                    .or_else(|| row.get("id"))
+                    .and_then(|value| value.as_str())
+                    == Some(session)
+            })
+        })
 }
 
 pub(super) struct SupervisorCtx {
