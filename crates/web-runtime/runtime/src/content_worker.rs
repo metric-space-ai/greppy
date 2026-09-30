@@ -3205,16 +3205,48 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
-            "page.text" => {
+            "page.textToFile" => {
                 let page_id = required_str(&params, "page")?;
+                let path = PathBuf::from(required_str(&params, "path")?);
+                let max_bytes = params
+                    .get("max_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| io::Error::other("page.textToFile requires max_bytes"))?;
                 let (webview, _) = self.page(&page_id)?.clone();
-                match self.evaluate(
+                let text = match self.evaluate(
                     webview,
                     "(document.body && document.body.innerText) || \"\"",
                 )? {
-                    JSValue::String(text) => Ok(json!({ "text": text })),
-                    other => Err(io::Error::other(format!("text returned {other:?}"))),
+                    JSValue::String(text) => text,
+                    other => return Err(io::Error::other(format!("text returned {other:?}"))),
+                };
+                let bytes = text.as_bytes();
+                if bytes.len() as u64 > max_bytes {
+                    return Err(io::Error::other(format!(
+                        "artifact limit exceeded ({} > {max_bytes})",
+                        bytes.len()
+                    )));
                 }
+                let write_result = (|| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    std::io::Write::write_all(&mut file, bytes)?;
+                    file.sync_all()?;
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_readonly(true);
+                    std::fs::set_permissions(&path, permissions)?;
+                    Ok::<_, io::Error>(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                Ok(json!({
+                    "byte_count": bytes.len(),
+                    "digest": crate::artifacts::hex_sha256(bytes),
+                }))
             }
             "page.take_navigation_failure" => {
                 let page_id = required_str(&params, "page")?;
