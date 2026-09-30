@@ -1,6 +1,43 @@
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::Path;
 
 pub const SCHEMA: &str = "greppy.web-runtime.v1";
+
+/// Cheap identity for the executable file a runtime was launched from.
+///
+/// The daemon captures this once at startup. A later client compares the
+/// currently resolved executable's identity, so an atomic package replacement
+/// cannot silently reuse a process backed by the previous image.
+#[cfg(unix)]
+pub fn runtime_image_id(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok(format!(
+        "unix:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn runtime_image_id(path: &Path) -> io::Result<String> {
+    use std::time::UNIX_EPOCH;
+
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(format!("portable:{:x}:{modified:x}", metadata.len()))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Request {
@@ -196,6 +233,26 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_image_id_changes_when_executable_path_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-runtime-image-id-{}-{}",
+            std::process::id(),
+            random_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("web-runtime");
+        let replacement = root.join("web-runtime.new");
+        std::fs::write(&executable, b"old image").unwrap();
+        let old = runtime_image_id(&executable).unwrap();
+        std::fs::write(&replacement, b"new image").unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+        let new = runtime_image_id(&executable).unwrap();
+        assert_ne!(old, new);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn request_ids_use_required_prefix() {

@@ -270,16 +270,18 @@ pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
     };
     let running = socket_connected(&socket);
-    let owned = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
-        Some(capability) if running => socket_is_live(&socket, &run_id, &capability),
-        _ => false,
+    let live = match crate::web_attach::current_token().or_else(|| load_attach_cookie(&socket)) {
+        Some(capability) if running => live_runtime_status(&socket, &run_id, &capability),
+        _ => None,
     };
     let payload = json!({
         "schema": SCHEMA,
         "status": "ok",
         "result": {
             "running": running,
-            "owned": owned,
+            "owned": live.is_some(),
+            "runtime_build_id": live.as_ref().map(|status| &status.runtime_image_id),
+            "sessions": live.as_ref().map(|status| status.sessions),
             "run_id": run_id,
             "socket": socket,
         }
@@ -799,6 +801,35 @@ pub(super) struct SupervisorCtx {
     capability: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveRuntimeStatus {
+    runtime_image_id: String,
+    sessions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeDisposition {
+    Reuse,
+    DrainOwned,
+    RefuseUnowned,
+    Spawn,
+}
+
+fn runtime_disposition(
+    live: Option<&LiveRuntimeStatus>,
+    connected: bool,
+    expected_runtime_image_id: &str,
+) -> RuntimeDisposition {
+    match live {
+        Some(status) if status.runtime_image_id == expected_runtime_image_id => {
+            RuntimeDisposition::Reuse
+        }
+        Some(_) => RuntimeDisposition::DrainOwned,
+        None if connected => RuntimeDisposition::RefuseUnowned,
+        None => RuntimeDisposition::Spawn,
+    }
+}
+
 pub(super) fn rpc_on(
     ctx: &SupervisorCtx,
     json_out: bool,
@@ -925,10 +956,20 @@ pub(super) fn ensure_supervisor(
         ));
     }
     let ResolvedRuntime { dist, executable } = resolve_runtime()?;
+    let expected_runtime_image_id = greppy_web_client::runtime_image_id(&executable)
+        .map_err(|error| unavailable(&format!("cannot identify web-runtime executable: {error}")))?;
     let (run_id, identity) = runtime_run_id(root);
     #[cfg(not(unix))]
     {
-        let _ = (root, dist, executable, run_id, identity, spawn);
+        let _ = (
+            root,
+            dist,
+            executable,
+            expected_runtime_image_id,
+            run_id,
+            identity,
+            spawn,
+        );
         return Err(unavailable("web runtime sockets require Unix"));
     }
     #[cfg(unix)]
@@ -954,13 +995,30 @@ pub(super) fn ensure_supervisor(
                 unavailable(&format!("failed to generate attach token: {error}"))
             })?,
         };
-        if let Some(ctx) = wait_live_supervisor(&socket, &run_id, &capability) {
-            return Ok(ctx);
-        }
-        if socket_connected(&socket) {
-            return Err(not_owned(
+        let live = wait_runtime_status(&socket, &run_id, &capability);
+        match runtime_disposition(
+            live.as_ref(),
+            socket_connected(&socket),
+            &expected_runtime_image_id,
+        ) {
+            RuntimeDisposition::Reuse => {
+                return Ok(SupervisorCtx {
+                    socket,
+                    run_id,
+                    capability,
+                });
+            }
+            RuntimeDisposition::DrainOwned => drain_stale_owned_runtime(
+                &socket,
+                &run_id,
+                &capability,
+                root,
+                live.as_ref().expect("owned runtime status"),
+            )?,
+            RuntimeDisposition::RefuseUnowned => return Err(not_owned(
                 "attach capability does not match the live web-runtime supervisor",
-            ));
+            )),
+            RuntimeDisposition::Spawn => {}
         }
         save_attach_cookie(&socket, &capability);
         let _ = std::fs::remove_file(&socket);
@@ -1064,12 +1122,14 @@ pub(super) fn ensure_supervisor(
         let budget = Duration::from_secs(60);
         let mut startup_exit = None;
         loop {
-            if socket_is_live(&socket, &run_id, &capability) {
-                return Ok(SupervisorCtx {
-                    socket,
-                    run_id,
-                    capability,
-                });
+            if let Some(live) = live_runtime_status(&socket, &run_id, &capability) {
+                if live.runtime_image_id == expected_runtime_image_id {
+                    return Ok(SupervisorCtx {
+                        socket,
+                        run_id,
+                        capability,
+                    });
+                }
             }
             if started.elapsed() >= budget {
                 break;
@@ -1139,22 +1199,67 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
-fn wait_live_supervisor(socket: &Path, run_id: &str, capability: &str) -> Option<SupervisorCtx> {
+fn wait_runtime_status(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+) -> Option<LiveRuntimeStatus> {
     let started = Instant::now();
     let budget = Duration::from_secs(60);
     loop {
-        if socket_is_live(socket, run_id, capability) {
-            return Some(SupervisorCtx {
-                socket: socket.to_path_buf(),
-                run_id: run_id.to_owned(),
-                capability: capability.to_owned(),
-            });
+        if let Some(status) = live_runtime_status(socket, run_id, capability) {
+            return Some(status);
         }
         if !socket_connected(socket) || started.elapsed() >= budget {
             return None;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn drain_stale_owned_runtime(
+    socket: &Path,
+    run_id: &str,
+    capability: &str,
+    root: Option<&str>,
+    stale: &LiveRuntimeStatus,
+) -> std::result::Result<(), ErrorObject> {
+    // Browser DOM state is process-local and cannot cross an executable image
+    // boundary. An authenticated drain releases profile locks and worker trees;
+    // persistent project-profile cookies remain in the shared profile store.
+    // Clear only this workspace's selected ephemeral session after the old
+    // supervisor acknowledges shutdown so the replacement starts cleanly.
+    let mut request = Request::new(run_id, "web.shutdown", json!({
+        "reason": "runtime_image_replaced",
+        "stale_runtime_image_id": &stale.runtime_image_id,
+        "session_count": stale.sessions,
+    }));
+    request.capability = capability.to_owned();
+    let response = greppy_web_client::unix_request(socket, &request, Duration::from_secs(3))
+        .map_err(|error| {
+            unavailable(&format!(
+                "owned stale web-runtime could not be drained safely: {error}"
+            ))
+        })?;
+    if let Some(error) = response.error {
+        return Err(unavailable(&format!(
+            "owned stale web-runtime refused shutdown: {}",
+            error.message
+        )));
+    }
+    if let Some(session) = read_current_scope(root).session {
+        forget_current_session(root, &session);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket_connected(socket) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if socket_connected(socket) {
+        return Err(unavailable(
+            "owned stale web-runtime acknowledged shutdown but did not release its socket",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn socket_connected(socket: &std::path::Path) -> bool {
@@ -1180,19 +1285,43 @@ pub(super) fn not_owned(message: &str) -> ErrorObject {
 }
 
 pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
+    live_runtime_status(socket, run_id, capability).is_some()
+}
+
+fn live_runtime_status(
+    socket: &std::path::Path,
+    run_id: &str,
+    capability: &str,
+) -> Option<LiveRuntimeStatus> {
     #[cfg(unix)]
     {
         if !socket.exists() {
-            return false;
+            return None;
         }
         let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
         probe.capability = capability.to_owned();
-        greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).is_ok()
+        let response = greppy_web_client::unix_request(
+            socket,
+            &probe,
+            Duration::from_millis(400),
+        )
+        .ok()?;
+        if response.status != "ok" || response.error.is_some() {
+            return None;
+        }
+        let result = response.result.as_ref()?;
+        Some(LiveRuntimeStatus {
+            runtime_image_id: result.get("runtime_build_id")?.as_str()?.to_owned(),
+            sessions: result
+                .get("sessions")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = (socket, run_id, capability);
-        false
+        None
     }
 }
 
@@ -1798,6 +1927,35 @@ fn parse_complete_selector_value(input: &str) -> std::result::Result<String, Err
 #[cfg(test)]
 mod target_tests {
     use super::*;
+
+    #[test]
+    fn runtime_upgrade_disposition_requires_authenticated_status() {
+        let current = LiveRuntimeStatus {
+            runtime_image_id: "image-new".into(),
+            sessions: 1,
+        };
+        let stale = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: 2,
+        };
+        assert_eq!(
+            runtime_disposition(Some(&current), true, "image-new"),
+            RuntimeDisposition::Reuse
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale), true, "image-new"),
+            RuntimeDisposition::DrainOwned
+        );
+        assert_eq!(
+            runtime_disposition(None, true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "a connected runtime without an authenticated status must never be terminated"
+        );
+        assert_eq!(
+            runtime_disposition(None, false, "image-new"),
+            RuntimeDisposition::Spawn
+        );
+    }
 
     #[test]
     fn run_payload_binds_only_active_mode() {

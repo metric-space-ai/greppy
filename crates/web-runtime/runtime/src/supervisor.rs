@@ -276,9 +276,12 @@ pub fn run(config: Config) -> io::Result<()> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --run-id"))?;
         #[cfg(unix)]
         {
+            let executable = std::env::current_exe()?;
+            let runtime_image_id = greppy_web_client::runtime_image_id(&executable)?;
             return crate::daemon::serve(crate::daemon::DaemonConfig {
                 socket,
                 run_id,
+                runtime_image_id,
                 fixture_url: config.fixture_url,
                 search_endpoint: config.search_endpoint,
                 idle_ttl: config

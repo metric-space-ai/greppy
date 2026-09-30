@@ -2256,6 +2256,12 @@ fn web_status_reports_observability_fields() {
             "missing web.status field {key}: {status:?}"
         );
     }
+    assert_eq!(
+        result["runtime_build_id"],
+        greppy_web_client::runtime_image_id(Path::new(env!("CARGO_BIN_EXE_web-runtime")))
+            .expect("runtime executable identity"),
+        "status must expose the image identity captured by the running supervisor"
+    );
     assert_eq!(result["playwright_compatibility_version"], "1.62.1");
     assert_eq!(result["inventory_entries"], 1354);
     assert_eq!(result["unsupported_capability_count"], 500);
