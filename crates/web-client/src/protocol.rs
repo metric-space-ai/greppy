@@ -12,28 +12,29 @@ pub const SCHEMA: &str = "greppy.web-runtime.v1";
 #[cfg(unix)]
 pub fn runtime_image_id(path: &Path) -> io::Result<String> {
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path)?;
-    let key = format!(
-        "greppy-web-client-image-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}.sha256",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec()
-    );
-    let cache = std::env::temp_dir().join(key);
-    if let Ok(value) = std::fs::read_to_string(&cache) {
-        let value = value.trim();
-        if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(format!("sha256:{}", value.to_ascii_lowercase()));
+    if let Some(parent) = path.parent() {
+        for sums in [
+            parent.join("SHA256SUMS"),
+            parent.join("..").join("SHA256SUMS"),
+        ] {
+            if let Ok(text) = std::fs::read_to_string(sums) {
+                for line in text.lines() {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(hex), Some(name)) = (parts.next(), parts.next()) {
+                        let name = name.trim_start_matches('*');
+                        if hex.len() == 64
+                            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                            && (name == "web-runtime" || name == "bin/web-runtime")
+                        {
+                            return Ok(format!("sha256:{}", hex.to_ascii_lowercase()));
+                        }
+                    }
+                }
+            }
         }
     }
     let bytes = std::fs::read(path)?;
     let digest = format!("{:x}", Sha256::digest(bytes));
-    let _ = std::fs::write(cache, &digest);
     Ok(format!("sha256:{digest}"))
 }
 

@@ -120,32 +120,82 @@ fn session_route_path(root: Option<&str>, session: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+fn runtime_route_path(root: Option<&str>, runtime_image_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let name = format!("{:x}.json", Sha256::digest(runtime_image_id.as_bytes()));
+    workspace_dir(root)
+        .join(".greppy/web/runtime-routes")
+        .join(name)
+}
+
 fn load_session_route(root: Option<&str>, session: &str) -> Option<SessionRoute> {
     let bytes = std::fs::read(session_route_path(root, session)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_session_route(root: Option<&str>, session: &str, ctx: &SupervisorCtx) {
+fn save_session_route(
+    root: Option<&str>,
+    session: &str,
+    ctx: &SupervisorCtx,
+) -> std::result::Result<(), ErrorObject> {
     let path = session_route_path(root, session);
-    let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
     let route = SessionRoute {
         socket: ctx.socket.clone(),
         run_id: ctx.run_id.clone(),
         runtime_image_id: ctx.runtime_image_id.clone(),
     };
-    if serde_json::to_vec_pretty(&route)
-        .ok()
-        .is_some_and(|bytes| std::fs::write(&path, bytes).is_ok())
+    persist_route(&path, &route)
+}
+
+fn save_runtime_route(
+    root: Option<&str>,
+    ctx: &SupervisorCtx,
+) -> std::result::Result<(), ErrorObject> {
+    let route = SessionRoute {
+        socket: ctx.socket.clone(),
+        run_id: ctx.run_id.clone(),
+        runtime_image_id: ctx.runtime_image_id.clone(),
+    };
+    persist_route(&runtime_route_path(root, &ctx.runtime_image_id), &route)
+}
+
+fn persist_route(path: &Path, route: &SessionRoute) -> std::result::Result<(), ErrorObject> {
+    let Some(parent) = path.parent() else {
+        return Err(unavailable("invalid runtime route path"));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| unavailable(&format!("cannot create runtime route directory: {error}")))?;
+    let bytes = serde_json::to_vec_pretty(route)
+        .map_err(|error| unavailable(&format!("cannot encode runtime route: {error}")))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| unavailable(&format!("cannot create session route: {error}")))?;
+    use std::io::Write as _;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.flush())
+        .map_err(|error| unavailable(&format!("cannot persist session route: {error}")))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| unavailable(&format!("cannot install session route: {}", error.error)))?;
+    #[cfg(unix)]
     {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| unavailable(&format!("cannot protect session route: {error}")))?;
     }
+    Ok(())
+}
+
+fn known_runtime_routes(root: Option<&str>) -> Vec<SessionRoute> {
+    let directory = workspace_dir(root).join(".greppy/web/runtime-routes");
+    std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+        .collect()
 }
 
 fn remove_session_route(root: Option<&str>, session: &str) {
@@ -320,6 +370,20 @@ fn runtime_identity_for_image(identity: &str, runtime_image_id: &str) -> String 
 
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     let (run_id, identity) = runtime_run_id(root);
+    let runtime = match resolve_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => return emit_error(json, error),
+    };
+    let image = match greppy_web_client::runtime_image_id(&runtime.executable) {
+        Ok(image) => image,
+        Err(error) => {
+            return emit_error(
+                json,
+                unavailable(&format!("cannot identify web-runtime executable: {error}")),
+            )
+        }
+    };
+    let identity = runtime_identity_for_image(&identity, &image);
     let Some(socket) = web_runtime_socket(&identity) else {
         return emit_error(json, unavailable("cannot allocate web-runtime socket"));
     };
@@ -356,7 +420,7 @@ pub(super) fn runtime_restart(json: bool, root: Option<&str>) -> Result<i32> {
             unavailable(&format!("failed to claim runtime owner: {error}")),
         );
     }
-    shutdown_if_running();
+    shutdown_runtime(root);
     match ensure_supervisor(root, &SupervisorSpawn::default()) {
         Ok(ctx) => rpc_on(&ctx, json, "web.status", json!({}), None),
         Err(error) => emit_error(json, error),
@@ -371,6 +435,15 @@ pub(super) fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
     };
     crate::startup_trace("web.doctor.resolved");
     let handshake = Handshake::runtime_facts();
+    let runtime_build_id = match greppy_web_client::runtime_image_id(&runtime.executable) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return emit_error(
+                json,
+                unavailable(&format!("cannot identify web-runtime executable: {error}")),
+            )
+        }
+    };
     let stamp = runtime
         .dist
         .as_ref()
@@ -383,7 +456,7 @@ pub(super) fn doctor(json: bool, _root: Option<&str>) -> Result<i32> {
             "dist": runtime.dist,
             "stamp": stamp,
             "protocol_version": handshake.protocol_version,
-            "runtime_build_id": handshake.runtime_build_id,
+            "runtime_build_id": runtime_build_id,
             "playwright_compatibility_version": handshake.playwright_compatibility_version,
             "servo_revision": handshake.servo_revision,
             "v8_revision": handshake.v8_revision,
@@ -834,14 +907,22 @@ pub(super) fn rpc_with_spawn(
                         forget_current_session(root, session);
                         remove_session_route(root, session);
                     }
-                } else if let Some(session) = response
-                    .result
-                    .as_ref()
-                    .and_then(|value| value.get("session_id"))
-                    .and_then(|value| value.as_str())
-                    .or(rejected_session.as_deref())
-                {
-                    save_session_route(root, session, &ctx);
+                } else if operation == "web.session.close" || operation == "session.close" {
+                    if let Some(session) = rejected_session.as_deref() {
+                        remove_session_route(root, session);
+                    }
+                } else {
+                    let routed_session = response
+                        .result
+                        .as_ref()
+                        .and_then(|value| value.get("session_id"))
+                        .and_then(|value| value.as_str())
+                        .or(rejected_session.as_deref());
+                    if let Some(session) = routed_session {
+                        if let Err(error) = save_session_route(root, session, &ctx) {
+                            return emit_error(json_out, error);
+                        }
+                    }
                 }
                 emit_response(json_out, response)
             }
@@ -890,6 +971,26 @@ fn supervisor_for_session(
             }
             remove_session_route(root, session);
         }
+        for route in known_runtime_routes(root) {
+            let capability =
+                load_attach_cookie(&route.socket).or_else(crate::web_attach::current_token);
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&route.socket, &route.run_id, &capability) {
+                    if live.runtime_image_id == route.runtime_image_id
+                        && runtime_has_session(&route.socket, &route.run_id, &capability, session)
+                    {
+                        let ctx = SupervisorCtx {
+                            socket: route.socket,
+                            run_id: route.run_id,
+                            capability,
+                            runtime_image_id: route.runtime_image_id,
+                        };
+                        save_session_route(root, session, &ctx)?;
+                        return Ok(ctx);
+                    }
+                }
+            }
+        }
         // Upgrade from clients which predate route files: interrogate only the
         // authenticated legacy workspace endpoint, and adopt it only when its
         // owner-filtered session inventory contains this exact session.
@@ -907,7 +1008,8 @@ fn supervisor_for_session(
                             capability,
                             runtime_image_id: live.runtime_image_id,
                         };
-                        save_session_route(root, session, &ctx);
+                        save_runtime_route(root, &ctx)?;
+                        save_session_route(root, session, &ctx)?;
                         return Ok(ctx);
                     }
                 } else if socket_connected(&legacy_socket) {
@@ -926,14 +1028,13 @@ fn supervisor_for_session(
 }
 
 fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &str) -> bool {
-    let Ok(agent) = std::env::var("GREPPY_WEB_AGENT") else {
-        return false;
-    };
-    let agent = agent.trim();
-    if agent.is_empty() {
-        return false;
-    }
-    let mut request = Request::new(run_id, "web.session.list", json!({ "agent_id": agent }));
+    let agent = std::env::var("GREPPY_WEB_AGENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let payload = agent
+        .as_ref()
+        .map_or_else(|| json!({}), |agent| json!({ "agent_id": agent.trim() }));
+    let mut request = Request::new(run_id, "web.session.list", payload);
     request.capability = capability.to_owned();
     greppy_web_client::unix_request(socket, &request, Duration::from_millis(400))
         .ok()
@@ -945,16 +1046,25 @@ fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &
                 .and_then(|value| value.as_array())
                 .cloned()
         })
-        .is_some_and(|sessions| session_inventory_contains(&sessions, session, agent))
+        .is_some_and(|sessions| {
+            session_inventory_contains(&sessions, session, agent.as_deref().map(str::trim))
+        })
 }
 
-fn session_inventory_contains(sessions: &[serde_json::Value], session: &str, agent: &str) -> bool {
+fn session_inventory_contains(
+    sessions: &[serde_json::Value],
+    session: &str,
+    agent: Option<&str>,
+) -> bool {
     sessions.iter().any(|row| {
         row.get("session_id")
             .or_else(|| row.get("id"))
             .and_then(|value| value.as_str())
             == Some(session)
-            && row.get("owner").and_then(|value| value.as_str()) == Some(agent)
+            && match agent {
+                Some(agent) => row.get("owner").and_then(|value| value.as_str()) == Some(agent),
+                None => row.get("owner").is_none_or(|value| value.is_null()),
+            }
     })
 }
 
@@ -1170,12 +1280,14 @@ pub(super) fn ensure_supervisor(
             &expected_runtime_image_id,
         ) {
             RuntimeDisposition::Reuse => {
-                return Ok(SupervisorCtx {
+                let ctx = SupervisorCtx {
                     socket,
                     run_id,
                     capability,
                     runtime_image_id: expected_runtime_image_id,
-                });
+                };
+                save_runtime_route(root, &ctx)?;
+                return Ok(ctx);
             }
             RuntimeDisposition::DrainOwned => drain_stale_owned_runtime(
                 &socket,
@@ -1295,12 +1407,14 @@ pub(super) fn ensure_supervisor(
         loop {
             if let Some(live) = live_runtime_status(&socket, &run_id, &capability) {
                 if live.runtime_image_id == expected_runtime_image_id {
-                    return Ok(SupervisorCtx {
+                    let ctx = SupervisorCtx {
                         socket,
                         run_id,
                         capability,
                         runtime_image_id: expected_runtime_image_id,
-                    });
+                    };
+                    save_runtime_route(root, &ctx)?;
+                    return Ok(ctx);
                 }
             }
             if started.elapsed() >= budget {
@@ -1498,6 +1612,13 @@ pub(super) fn shutdown_runtime(root: Option<&str>) {
     #[cfg(unix)]
     {
         let (run_id, identity) = runtime_run_id(root);
+        let Ok(runtime) = resolve_runtime() else {
+            return;
+        };
+        let Ok(image) = greppy_web_client::runtime_image_id(&runtime.executable) else {
+            return;
+        };
+        let identity = runtime_identity_for_image(&identity, &image);
         let Some(capability) = crate::web_attach::current_token().or_else(|| {
             crate::inference_daemon::Endpoint::for_identity("web-runtime", &identity)
                 .and_then(|endpoint| load_attach_cookie(&PathBuf::from(endpoint.address())))
@@ -2143,13 +2264,30 @@ mod target_tests {
     #[test]
     fn legacy_session_adoption_requires_exact_owner_and_session() {
         let rows = vec![json!({ "session_id": "wrs_old", "owner": "agent-a" })];
-        assert!(session_inventory_contains(&rows, "wrs_old", "agent-a"));
-        assert!(!session_inventory_contains(&rows, "wrs_old", "agent-b"));
-        assert!(!session_inventory_contains(&rows, "wrs_other", "agent-a"));
+        assert!(session_inventory_contains(
+            &rows,
+            "wrs_old",
+            Some("agent-a")
+        ));
+        assert!(!session_inventory_contains(
+            &rows,
+            "wrs_old",
+            Some("agent-b")
+        ));
+        assert!(!session_inventory_contains(
+            &rows,
+            "wrs_other",
+            Some("agent-a")
+        ));
         assert!(!session_inventory_contains(
             &[json!({ "session_id": "wrs_old" })],
             "wrs_old",
-            "agent-a"
+            Some("agent-a")
+        ));
+        assert!(session_inventory_contains(
+            &[json!({ "session_id": "wrs_plain", "owner": null })],
+            "wrs_plain",
+            None
         ));
     }
 
