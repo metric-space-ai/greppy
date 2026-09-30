@@ -18,6 +18,7 @@
 #![allow(clippy::doc_lazy_continuation)]
 
 pub mod extract;
+pub mod grounded_hint;
 pub mod langs;
 pub mod language;
 pub mod provider;

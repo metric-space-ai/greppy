@@ -1854,6 +1854,37 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
 
 #[cfg(any(unix, windows))]
 #[test]
+fn grounded_bit_writes_outrank_false_workspace_base_and_global_summaries() {
+    let root = test_tempdir("grounded-bit-writes-cache");
+    let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
+    let base = greppy_store::SummaryCache::open(&root.join("base")).unwrap();
+    let global = greppy_store::SummaryCache::open(&root.join("global")).unwrap();
+    let path = "reference/audio-aot-state.rs";
+    let source = "pub fn and_word(s: &mut Core, value: u16) { s.m_isr = s.m_sr & 0x10; if value == 0 { s.m_isr |= 4; } if value & 0x8000 != 0 { s.m_isr |= 8; } s.m_aluo = value; }";
+    let key = "missing-model-must-not-load";
+    let cache_key = format!("{key}#{SUMMARY_CACHE_GENERATION}");
+    let hash = greppy_store::span_hash(path, source);
+    let wrong = vec!["Sets the AOT word value and clears the interrupt flag".to_owned()];
+    for cache in [&workspace, &base, &global] {
+        cache.put(&cache_key, &hash, &wrong).unwrap();
+    }
+    let config = QwenSummaryConfig {
+        model_id: key.into(),
+        gguf: root.join("missing.gguf"),
+        tokenizer: root.join("missing-tokenizer.json"),
+        device: greppy_qwen35_native::DevicePreference::Cpu,
+    };
+    assert_eq!(summarize_source_cached(&config, key,
+        (Some(&workspace), Some(&base), Some(&global)), path, source, false),
+        Some(vec!["Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes".to_owned()]));
+    // Repair the returned description without globally flushing independent caches.
+    for cache in [&workspace, &base, &global] {
+        assert_eq!(cache.get(&cache_key, &hash).unwrap(), Some(wrong.clone()));
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
 fn global_summary_hit_populates_workspace_without_daemon() {
     let root = test_tempdir("global-summary-hit");
     let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
