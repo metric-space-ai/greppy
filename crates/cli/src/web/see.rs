@@ -128,7 +128,7 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             }
             let take = if first { 1 } else { limit };
             super::runtimes::structured_dom(
-                root, json, session,
+                root, json, session, "web.find",
                 serde_json::json!({"op":"find","query":normalize_node_query(&query),"limit":take,"fields":[]}),
             )
         }
@@ -179,7 +179,7 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                 }
             }
             super::runtimes::structured_dom(
-                root, json, session,
+                root, json, session, "web.extract",
                 serde_json::json!({"op":"extract","query":normalize_node_query(&query),"limit":limit,"fields":wanted}),
             )
         }
