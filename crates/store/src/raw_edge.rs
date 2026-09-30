@@ -63,7 +63,9 @@ impl Store {
         // reference a project visible only through immutable Base; materialize
         // its metadata in this transaction without copying any file ownership.
         if overlay {
-            let projects = edges.iter().map(|edge| edge.project.as_str())
+            let projects = edges
+                .iter()
+                .map(|edge| edge.project.as_str())
                 .collect::<std::collections::HashSet<_>>();
             for project in projects {
                 tx.raw().execute(
@@ -238,22 +240,41 @@ mod tests {
         let base_path = scratch.path().join("base.db");
         let delta_path = scratch.path().join("delta.db");
         let project = Project {
-            name: "p".into(), indexed_at: "cached-time".into(), root_path: "/cached/root".into(),
+            name: "p".into(),
+            indexed_at: "cached-time".into(),
+            root_path: "/cached/root".into(),
         };
         {
             let mut base = Store::open(&base_path).unwrap();
             base.upsert_project(&project).unwrap();
         }
-        let visibility = crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let visibility =
+            crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        overlay.conn().execute_batch("CREATE TRIGGER reject_raw BEFORE INSERT ON raw_edges BEGIN SELECT RAISE(ABORT,'fixture raw failure'); END;").unwrap();
+        overlay.conn().execute_batch("CREATE TRIGGER main.reject_raw BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'fixture raw failure'); END;").unwrap();
         let edge = new_raw_edge("p", "base.rs", "p.source", "p.target", "USAGE");
         assert!(overlay.insert_raw_edges(&[edge.clone()]).is_err());
-        let private_projects: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get(0)).unwrap();
-        assert_eq!(private_projects, 0, "failed raw batch rolls back project metadata");
-        overlay.conn().execute_batch("DROP TRIGGER reject_raw").unwrap();
+        let private_projects: i64 = overlay
+            .conn()
+            .query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            private_projects, 0,
+            "failed raw batch rolls back project metadata"
+        );
+        overlay
+            .conn()
+            .execute_batch("DROP TRIGGER reject_raw")
+            .unwrap();
         overlay.insert_raw_edges(&[edge]).unwrap();
-        let private_metadata: (String, String) = overlay.conn().query_row("SELECT indexed_at,root_path FROM main.projects WHERE name='p'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        let private_metadata: (String, String) = overlay
+            .conn()
+            .query_row(
+                "SELECT indexed_at,root_path FROM main.projects WHERE name='p'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(private_metadata, (project.indexed_at, project.root_path));
         assert!(overlay.list_private_file_states("p").unwrap().is_empty());
         assert!(overlay.list_private_workspace_states().unwrap().is_empty());

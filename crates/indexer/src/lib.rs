@@ -6752,7 +6752,7 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .outgoing_edges(missing.id, Some("USAGE"), 20)
                 .unwrap()
                 .is_empty(),
-            "an unknown qualified owner must not bind to a same-name local enum"
+            "an unknown qualified owner must not bind to a same-name local enum; resolved={:?}; raw={:?}", store.outgoing_edges(missing.id, Some("USAGE"), 20).unwrap(), load_all_raw_edges(&store, "test").unwrap().into_iter().filter(|edge| edge.source_qualified_name == missing.qualified_name).collect::<Vec<_>>()
         );
         let other = store
             .get_node_by_qname("test", "src/lib.rs::Function::other")
@@ -6823,6 +6823,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         let states_before = overlay.list_file_states("test").unwrap();
         let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
+        let base_raw_before = format!(
+            "{:?}",
+            Store::open(&base_path)
+                .unwrap()
+                .list_raw_edges("test")
+                .unwrap()
+        );
         let original = fs::read(repo.join("src/lib.rs")).unwrap();
         fs::write(repo.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
         assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
@@ -6864,11 +6871,11 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .any(|edge| edge.source_id == caller.id));
         drop(overlay);
         let base = Store::open(&base_path).unwrap();
-        assert!(base
-            .list_raw_edges("test")
-            .unwrap()
-            .iter()
-            .all(|edge| !edge.target_qname.contains("AddImmediateByte")));
+        assert_eq!(
+            format!("{:?}", base.list_raw_edges("test").unwrap()),
+            base_raw_before,
+            "all immutable Base raw edges are preserved exactly"
+        );
         drop(base);
         fs::remove_dir_all(repo).unwrap();
     }

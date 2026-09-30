@@ -341,11 +341,9 @@ fn global_compiler_error_codes_are_lifted_from_long_output() {
         let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
         assert_eq!(output.status.code(), Some(2));
         assert!(text(&output.stdout).starts_with("FAILED — exit 2: 2 errors, 0 warnings\n"));
-        let diagnostics = if redirect.is_empty() {
-            text(&output.stdout)
-        } else {
-            text(&output.stderr)
-        };
+        // Long-output diagnostic prefixes are emitted on stdout for both
+        // origins; original stream bytes remain in the recovery payload.
+        let diagnostics = text(&output.stdout);
         assert!(diagnostics.contains("error TS18003: No inputs were found in config file"));
         assert!(diagnostics.contains("error MSB1009: Project file does not exist."));
     }

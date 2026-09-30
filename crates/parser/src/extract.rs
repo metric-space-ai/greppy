@@ -801,8 +801,16 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
     node: Node<'t>,
     emit: &mut F,
 ) {
+    // A named struct-literal field is a label selected by its owner, not a
+    // value lookup in the surrounding scope. Bare-name resolution would bind
+    // it to an unrelated same-named parameter or function elsewhere.
+    let field_label = node.kind() == "field_identifier"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "field_initializer");
     // Try to emit a usage for THIS node.
-    if is_rust_reference_kind(node.kind())
+    if !field_label
+        && is_rust_reference_kind(node.kind())
         && !rust_usage_is_suppressed(node)
         && (!is_definition_name(node)
             || node.parent().is_some_and(|parent| {
@@ -850,11 +858,19 @@ pub fn state(value: Instruction) -> u8 {
         let tree = parser.parse(code, None).unwrap();
         assert!(!tree.root_node().has_error());
         let mut paths = Vec::new();
-        walk_rust_usages(code.as_bytes(), tree.root_node(), &mut |_, name, path| {
-            if name == "AddImmediateByte" {
-                paths.push(path.map(str::to_owned));
-            }
-        });
+        let mut constructor_field_labels = Vec::new();
+        walk_rust_usages(
+            code.as_bytes(),
+            tree.root_node(),
+            &mut |node, name, path| {
+                if name == "amount" && node.start_position().row == 2 {
+                    constructor_field_labels.push(name.to_owned());
+                }
+                if name == "AddImmediateByte" {
+                    paths.push(path.map(str::to_owned));
+                }
+            },
+        );
         assert_eq!(
             paths,
             vec![
@@ -862,6 +878,10 @@ pub fn state(value: Instruction) -> u8 {
                 Some("Instruction::AddImmediateByte".into()),
             ],
             "constructor and pattern are usages; the variant declaration is not"
+        );
+        assert!(
+            constructor_field_labels.is_empty(),
+            "named field labels are not unqualified value reads"
         );
     }
 }
