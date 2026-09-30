@@ -507,6 +507,9 @@ fn finalize_outcome(
     if semantic_query
         && captured.exit_code == Some(1)
         && is_retryable_semantic_index_building(&body)
+        && String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .all(|line| line.is_empty() || semantic_preparation_line(line))
         && semantic_preparation_stderr(&captured.stderr)
     {
         let mut msg = body;
@@ -1341,6 +1344,7 @@ exit 2
         for stub in [
             "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\n'; printf 'greppy: failed to open index\n' >&2; exit 1",
             "printf 'source says semantic index building — 3/12 spans\n'; exit 1",
+            "printf 'semantic index building — 3/12 spans, ETA ~9s (backend metal)\nfailed to open index\n'; exit 1",
         ] {
             let (mut env, _, _) = env_with_stub(stub);
             let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
