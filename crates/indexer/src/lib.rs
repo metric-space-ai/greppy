@@ -558,6 +558,13 @@ pub fn index_with_options_and_progress(
         }
     }
 
+    if !store.is_overlay() {
+        if incremental && !rust_caller_edges_repaired(store)? {
+            report.edges_extracted += rebuild_single_store_rust_edges(store, project_name)?;
+        }
+        mark_rust_caller_edges_repaired(store)?;
+    }
+
     // Structural spine (Project / Folder / File nodes + CONTAINS_FILE /
     // CONTAINS_FOLDER / DEFINES edges) — builds the structural pass plus the
     // File→DEFINES edges. Runs AFTER
@@ -1671,6 +1678,24 @@ fn resolve_and_persist_edges_with_progress_and_preserved(
     progress: &mut dyn FnMut(IndexBuildProgress),
     preserved_overlay_edges: &[NewOverlayEdge],
 ) -> Result<usize> {
+    resolve_edges_with_replacement(
+        store,
+        project,
+        edges,
+        progress,
+        preserved_overlay_edges,
+        false,
+    )
+}
+
+fn resolve_edges_with_replacement(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+    preserved_overlay_edges: &[NewOverlayEdge],
+    replace_single_rust_edges: bool,
+) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
     let mut index = GraphIndex::load(store, project)?;
@@ -1901,7 +1926,11 @@ fn resolve_and_persist_edges_with_progress_and_preserved(
         logical.extend(resolved_logical);
         store.replace_overlay_edges(project, &logical)?;
     } else {
-        insert_edges_batched(store, &resolved)?;
+        persist_edges_batched(
+            store,
+            &resolved,
+            replace_single_rust_edges.then_some(project),
+        )?;
     }
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
@@ -2051,6 +2080,74 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
         store.list_raw_edges(project)?
     };
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
+}
+
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v3";
+pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
+
+pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
+    let marker = store.conn().query_row(
+        "SELECT value FROM main.schema_meta WHERE key = ?1",
+        [RUST_CALLER_EDGES_REPAIR_META_KEY],
+        |row| row.get::<_, String>(0),
+    );
+    match marker {
+        Ok(value) => Ok(value == RUST_CALLER_EDGES_REPAIR_COMPLETE),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(sqlite_err(error)),
+    }
+}
+
+pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "INSERT INTO main.schema_meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                RUST_CALLER_EDGES_REPAIR_META_KEY,
+                RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            ),
+        )
+        .map_err(sqlite_err)?;
+    Ok(())
+}
+
+/// One-shot single-store compatibility repair. Replace only Rust-owned
+/// non-structural relations from persisted raw edges; nodes, file identity,
+/// graph generation, content, embeddings and non-Rust edges remain untouched.
+/// Edge replacement and completion marker commit in the same transaction.
+pub fn rebuild_single_store_rust_edges(store: &mut Store, project: &str) -> Result<usize> {
+    if store.is_overlay() {
+        return Err(greppy_core::Error::Invalid(
+            "single-store Rust repair requires a private Store".into(),
+        ));
+    }
+    let raw = load_all_raw_edges(store, project)?;
+    let rust_edges = raw
+        .into_iter()
+        .filter(|edge| edge.file_path.ends_with(".rs"))
+        .collect::<Vec<_>>();
+    if rust_edges.is_empty() {
+        let existing: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.edges WHERE project = ?1
+             AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')
+             AND source_id IN (SELECT id FROM nodes WHERE project = ?1 AND file_path LIKE '%.rs')",
+                [project],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if existing != 0 {
+            return Err(greppy_core::Error::Invalid(
+                "single-store Rust graph has relations but no persisted Rust raw edges to repair"
+                    .into(),
+            ));
+        }
+    }
+    note_reresolved(rust_edges.len());
+    resolve_edges_with_replacement(store, project, &rust_edges, &mut |_| {}, &[], true)
 }
 
 /// Rebuild the complete bounded logical edge contribution of a private
@@ -2708,7 +2805,15 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
 }
 
 fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
-    if edges.is_empty() {
+    persist_edges_batched(store, edges, None)
+}
+
+fn persist_edges_batched(
+    store: &mut Store,
+    edges: &[NewEdge],
+    replace_rust_project: Option<&str>,
+) -> Result<()> {
+    if edges.is_empty() && replace_rust_project.is_none() {
         return Ok(());
     }
     if store.is_overlay() {
@@ -2769,6 +2874,14 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     let conn = store.conn();
     conn.execute_batch("BEGIN").map_err(sqlite_err)?;
     let result = (|| -> Result<()> {
+        if let Some(project) = replace_rust_project {
+            conn.execute(
+                "DELETE FROM main.edges WHERE project = ?1
+                 AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')
+                 AND source_id IN (SELECT id FROM nodes WHERE project = ?1 AND file_path LIKE '%.rs')",
+                [project],
+            ).map_err(sqlite_err)?;
+        }
         let mut stmt = conn
             .prepare_cached(
                 "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
@@ -2788,6 +2901,9 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
                 props_str,
             ])
             .map_err(sqlite_err)?;
+        }
+        if replace_rust_project.is_some() {
+            mark_rust_caller_edges_repaired(store)?;
         }
         Ok(())
     })();
@@ -3297,6 +3413,19 @@ impl GraphIndex {
         let normalized = module.trim_start_matches("::");
         let mut segments = normalized.split("::");
         let first = segments.next().unwrap_or("");
+        if !module.starts_with("::") && !matches!(first, "crate" | "self" | "super") {
+            let lexical = rust_module_files_for_module_path_with_crate_roots(
+                file,
+                module,
+                self.rust_crate_roots.as_ref(),
+            );
+            if lexical
+                .iter()
+                .any(|candidate| self.known_files.contains(candidate))
+            {
+                return lexical;
+            }
+        }
         let owning = self
             .rust_libraries
             .iter()
@@ -6407,6 +6536,49 @@ def Widget():
             drop(overlay);
             fs::remove_dir_all(repo).unwrap();
         }
+    }
+
+    #[test]
+    fn cargo_library_name_does_not_override_a_local_binary_module() {
+        let repo = setup_repo("cargo-library-shadowing", "pub fn compile() {}\n");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"tools\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/main.rs"),
+            "mod tools; fn main() { tools::compile(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/tools.rs"), "pub fn compile() {}\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/main.rs::Function::main")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .get_node_by_qname("test", "src/tools.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let library = store
+            .get_node_by_qname("test", "src/lib.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let edges = store.outgoing_edges(caller.id, Some("CALLS"), 20).unwrap();
+        assert!(edges.iter().any(|edge| edge.target_id == local.id));
+        assert!(edges.iter().all(|edge| edge.target_id != library.id));
+        assert!(
+            rust_caller_edges_repaired(&store).unwrap(),
+            "fresh index already uses current resolver"
+        );
+        let unchanged = index(&mut store, &repo, "test").unwrap();
+        assert_eq!(
+            unchanged.edges_extracted, 0,
+            "current unchanged index must not repeat repair"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

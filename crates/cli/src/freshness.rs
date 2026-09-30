@@ -763,6 +763,17 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         wait_for_first_use_index(root, &effective_root)?;
         return open_default_store(root);
     }
+    let store = if crate::store_cow::persisted_v7_delta_needs_repair(&store, &effective_root)? {
+        drop(store);
+        crate::store_cow::ensure_persisted_single_store_repaired(
+            &path,
+            &effective_root,
+            &project_for(root)?,
+        )?;
+        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?
+    } else {
+        store
+    };
     let _ = workspace_locator::ensure_db_mode(&path);
     // Feature B: record that this store was just used to serve a query.
     // A read-only open never bumps graph.db's mtime, so a dedicated
@@ -993,6 +1004,13 @@ fn open_default_store_writer(
     }
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);
+    }
+    if require_existing_index && path.exists() {
+        crate::store_cow::ensure_persisted_single_store_repaired(
+            &path,
+            &effective_root,
+            &project_for(root)?,
+        )?;
     }
     let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())?;
     let _ = workspace_locator::ensure_db_mode(&path);
