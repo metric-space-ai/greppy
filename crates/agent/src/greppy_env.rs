@@ -515,7 +515,8 @@ fn finalize_outcome(
         }
         msg.push_str(
             "Pending semantic result: keep this query pending and retry the same command \
-             after the reported ETA. Index preparation is reused by that retry.",
+             after the reported ETA. If ETA is measuring, obtain an estimate with index status \
+             before retrying. Index preparation is reused by that retry.",
         );
         let msg = truncate_output(msg, max_output_bytes);
         return ToolOutcome::ok(msg);
@@ -555,8 +556,59 @@ fn is_retryable_semantic_index_building(body: &str) -> bool {
 }
 
 fn semantic_preparation_line(line: &str) -> bool {
+    fn number(text: &str) -> Option<u64> {
+        (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    }
     let line = line.strip_prefix("semantic-search: ").unwrap_or(line);
-    line.starts_with(SEMANTIC_INDEX_BUILDING_PREFIX)
+    let Some(rest) = line.strip_prefix("semantic index building — ") else {
+        return false;
+    };
+    let Some((counts, rest)) = rest.split_once(" spans, ETA ") else {
+        return false;
+    };
+    let Some((completed, total)) = counts.split_once('/') else {
+        return false;
+    };
+    let (Some(completed), Some(total)) = (number(completed), number(total)) else {
+        return false;
+    };
+    if completed > total {
+        return false;
+    }
+    let Some((eta, backend)) = rest.rsplit_once(" (backend ") else {
+        return false;
+    };
+    let Some(backend) = backend.strip_suffix(')') else {
+        return false;
+    };
+    if backend.is_empty()
+        || !backend
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return false;
+    }
+    if eta == "measuring" {
+        return true;
+    }
+    let Some(eta) = eta.strip_prefix('~') else {
+        return false;
+    };
+    match eta.split(' ').collect::<Vec<_>>().as_slice() {
+        [seconds] if seconds.ends_with('s') => {
+            number(&seconds[..seconds.len() - 1]).is_some_and(|s| s < 60)
+        }
+        [minutes] if minutes.ends_with('m') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+        }
+        [minutes, seconds] if minutes.ends_with('m') && seconds.ends_with('s') => {
+            number(&minutes[..minutes.len() - 1]).is_some_and(|m| m > 0)
+                && number(&seconds[..seconds.len() - 1]).is_some_and(|s| s > 0 && s < 60)
+        }
+        _ => false,
+    }
 }
 
 /// A pending status must never hide a separate fatal diagnostic.
@@ -1229,6 +1281,42 @@ exit 2
             "must tell the model to retry; content={}",
             out.content
         );
+    }
+
+    #[test]
+    fn semantic_preparation_status_grammar_and_diagnostics() {
+        for line in [
+            "semantic index building — 0/12 spans, ETA measuring (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda)",
+            "semantic-search: semantic index building — 3/12 spans, ETA ~2m (backend metal)",
+            "semantic index building — 3/12 spans, ETA ~86m 23s (backend cuda-q4k)",
+        ] {
+            assert!(semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(!out.is_error && out.content.contains("Pending semantic result:"));
+            }
+        }
+        for line in [
+            "semantic index building —",
+            "semantic index building — failed to open index",
+            "semantic index building — 3/no spans, ETA ~9s (backend cuda)",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda) failed",
+            "semantic index building — 3/12 spans, ETA ~9s (backend cuda failed)",
+            "semantic index building — 3/12 spans, ETA ~2m 90s (backend cuda)",
+        ] {
+            assert!(!semantic_preparation_line(line), "{line}");
+            for stderr in [false, true] {
+                let redirect = if stderr { " >&2" } else { "" };
+                let (mut env, _, _) =
+                    env_with_stub(&format!("printf '%s\n' '{line}'{redirect}\nexit 1"));
+                let out = env.call_tool("greppy", &json!({"args": ["search", "target"]}));
+                assert!(out.is_error && !out.content.contains("Pending semantic result:"));
+            }
+        }
     }
 
     #[test]
