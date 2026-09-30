@@ -6,34 +6,57 @@ use tree_sitter::Node;
 struct Facts {
     targets: Vec<String>,
     assignments: usize,
-    conditions: usize,
+    conditional_assignments: usize,
     bitwise: bool,
 }
 
 /// Unknown syntax, calls, macros, locals and incomplete spans retain the model
 /// path. This projects source facts without claiming verified runtime effects.
 pub fn rust_conditional_bit_writes(source: &str) -> Option<String> {
-    if source.len() > 2048 { return None; }
+    if source.len() > 2048 {
+        return None;
+    }
     let bytes = source.as_bytes();
     let tree = crate::parse(crate::Language::Rust, bytes).ok()?;
     let root = tree.root_node();
-    if root.has_error() { return None; }
+    if root.has_error() {
+        return None;
+    }
     let mut cursor = root.walk();
-    let items: Vec<_> = root.named_children(&mut cursor)
+    let items: Vec<_> = root
+        .named_children(&mut cursor)
         .filter(|node| !matches!(node.kind(), "line_comment" | "block_comment"))
         .collect();
-    if items.len() != 1 || items[0].kind() != "function_item" { return None; }
+    if items.len() != 1 || items[0].kind() != "function_item" {
+        return None;
+    }
     let function = items[0];
     let parameters = function.child_by_field_name("parameters")?;
     let mut cursor = parameters.walk();
-    let names: Vec<_> = parameters.named_children(&mut cursor).map(|parameter| {
-        let pattern = parameter.child_by_field_name("pattern")?;
-        (pattern.kind() == "identifier").then(|| pattern.utf8_text(bytes).ok()).flatten()
-    }).collect::<Option<Vec<_>>>()?;
+    let names: Vec<_> = parameters
+        .named_children(&mut cursor)
+        .map(|parameter| {
+            let pattern = parameter.child_by_field_name("pattern")?;
+            (pattern.kind() == "identifier")
+                .then(|| pattern.utf8_text(bytes).ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut facts = Facts::default();
-    visit(function.child_by_field_name("body")?, bytes, &names, &mut facts)?;
-    if facts.assignments < 2 || facts.assignments > 8 || facts.conditions == 0
-        || !facts.bitwise || facts.targets.is_empty() || facts.targets.len() > 3 {
+    visit(
+        function.child_by_field_name("body")?,
+        bytes,
+        &names,
+        &mut facts,
+        false,
+    )?;
+    if facts.assignments < 2
+        || facts.assignments > 8
+        || facts.conditional_assignments == 0
+        || !facts.bitwise
+        || facts.targets.is_empty()
+        || facts.targets.len() > 3
+    {
         return None;
     }
     let targets = match facts.targets.as_slice() {
@@ -46,33 +69,62 @@ pub fn rust_conditional_bit_writes(source: &str) -> Option<String> {
     (description.chars().count() <= 140).then_some(description)
 }
 
-fn visit(node: Node<'_>, source: &[u8], parameters: &[&str], facts: &mut Facts) -> Option<()> {
+fn visit(
+    node: Node<'_>,
+    source: &[u8],
+    parameters: &[&str],
+    facts: &mut Facts,
+    conditional: bool,
+) -> Option<()> {
     match node.kind() {
         "line_comment" | "block_comment" => return Some(()),
-        "block" | "expression_statement" | "binary_expression" | "field_expression"
-        | "field_identifier" | "integer_literal" | "boolean_literal"
+        "block"
+        | "expression_statement"
+        | "binary_expression"
+        | "field_expression"
+        | "field_identifier"
+        | "integer_literal"
+        | "boolean_literal"
         | "parenthesized_expression" => {}
         "identifier" => {
-            if !parameters.contains(&node.utf8_text(source).ok()?) { return None; }
+            if !parameters.contains(&node.utf8_text(source).ok()?) {
+                return None;
+            }
         }
-        "if_expression" => facts.conditions += 1,
+        "if_expression" => {}
         "assignment_expression" | "compound_assignment_expr" => {
             let left = node.child_by_field_name("left")?;
-            if left.kind() != "field_expression" { return None; }
+            if left.kind() != "field_expression" {
+                return None;
+            }
             let base = left.child_by_field_name("value")?;
             if base.kind() != "identifier" || !parameters.contains(&base.utf8_text(source).ok()?) {
                 return None;
             }
             let target = left.utf8_text(source).ok()?.to_string();
-            if !facts.targets.contains(&target) { facts.targets.push(target); }
+            if !facts.targets.contains(&target) {
+                facts.targets.push(target);
+            }
             facts.assignments += 1;
+            if conditional {
+                facts.conditional_assignments += 1;
+            }
         }
         _ => return None,
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.is_named() { visit(child, source, parameters, facts)?; }
-        else if matches!(child.kind(), "&" | "|" | "^" | "&=" | "|=" | "^=" | "<<" | ">>") {
+        if child.is_named() {
+            let in_branch = conditional
+                || (node.kind() == "if_expression"
+                    && node
+                        .child_by_field_name("consequence")
+                        .is_some_and(|branch| branch.id() == child.id()));
+            visit(child, source, parameters, facts, in_branch)?;
+        } else if matches!(
+            child.kind(),
+            "&" | "|" | "^" | "&=" | "|=" | "^=" | "<<" | ">>"
+        ) {
             facts.bitwise = true;
         }
     }
@@ -91,15 +143,29 @@ mod tests {
 
     #[test]
     fn reports_written_fields_without_inventing_interrupt_semantics() {
-        assert_eq!(rust_conditional_bit_writes(WORD_FLAGS).as_deref(), Some(
-            "Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes"));
+        assert_eq!(
+            rust_conditional_bit_writes(WORD_FLAGS).as_deref(),
+            Some("Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes")
+        );
     }
 
     #[test]
     fn architectural_names_do_not_change_source_fact_contract() {
-        let source = WORD_FLAGS.replace("m_isr", "irq_mask").replace("and_word", "set_irq_mask");
-        assert_eq!(rust_conditional_bit_writes(&source).as_deref(), Some(
-            "Updates s.irq_mask and s.m_aluo with bitwise operations and conditional writes"));
+        let source = WORD_FLAGS
+            .replace("m_isr", "irq_mask")
+            .replace("and_word", "set_irq_mask");
+        assert_eq!(
+            rust_conditional_bit_writes(&source).as_deref(),
+            Some("Updates s.irq_mask and s.m_aluo with bitwise operations and conditional writes")
+        );
+    }
+
+    #[test]
+    fn an_empty_condition_does_not_turn_unconditional_writes_into_conditional_writes() {
+        let source = "fn flags(s: &mut Core, value: u16) { s.m_isr = value & 4; s.m_aluo = value; if value == 0 {} }";
+        assert_eq!(rust_conditional_bit_writes(source), None);
+        let source = "fn flags(s: &mut Core, value: u16) { s.m_isr = value & 4; s.m_aluo = value; if { s.m_isr |= 8; true } {} }";
+        assert_eq!(rust_conditional_bit_writes(source), None);
     }
 
     #[test]
