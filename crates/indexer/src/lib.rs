@@ -6542,7 +6542,7 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         )
         .unwrap();
         fs::write(repo.join("src/foreign.rs"), "pub enum Remote { Halt }\n").unwrap();
-        let mut store = Store::open(":memory:").unwrap();
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
         index(&mut store, &repo, "test").unwrap();
         for (target, callers) in [
             (
