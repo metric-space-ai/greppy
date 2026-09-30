@@ -6875,6 +6875,19 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             "legitimate raw usage remains visible"
         );
         assert!(
+            overlay
+                .outgoing_edges(caller.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.target_id != amount.id),
+            "typed outgoing queries must honor the same repair mask as incoming queries"
+        );
+        assert!(overlay
+            .outgoing_edges(valid.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.target_id == amount.id));
+        assert!(
             overlay.list_delta_raw_edges("test").unwrap().is_empty(),
             "Base compatibility repair must not enter sparse raw re-resolution"
         );
