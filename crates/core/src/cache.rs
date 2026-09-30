@@ -558,7 +558,83 @@ pub fn trash_root() -> PathBuf {
 }
 
 pub fn workspace_store_dir(workspace_root: &Path) -> PathBuf {
-    workspaces_root().join(crate::workspace::workspace_hash(workspace_root))
+    workspace_stores_root(workspace_root).join(crate::workspace::workspace_hash(workspace_root))
+}
+
+/// Route new disposable workspace stores without relocating a live cache.
+/// The complete retained directory remains authoritative until an explicit,
+/// coordinated migration can account for old clients and all CoW sidecars.
+/// Shared model/Base caches and workspace lock identities remain unchanged.
+fn workspace_stores_root(workspace_root: &Path) -> PathBuf {
+    let durable = workspaces_root();
+    workspace_stores_root_for(
+        workspace_root,
+        &durable,
+        &data_root(),
+        std::env::var_os("GREPPY_STORE_DIR").is_some(),
+        Path::new("/Volumes/tmp"),
+    )
+}
+
+fn workspace_stores_root_for(
+    workspace_root: &Path,
+    durable: &Path,
+    data: &Path,
+    explicit: bool,
+    volume: &Path,
+) -> PathBuf {
+    let hash = crate::workspace::workspace_hash(workspace_root);
+    if !explicit
+        && (workspace_root.starts_with(volume)
+            || canonical_root(workspace_root).starts_with(volume))
+        && fs::symlink_metadata(durable.join(&hash))
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        && fs::symlink_metadata(data.join(&hash))
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    {
+        volume
+            .join("dev-artifacts/greppy/workspace-stores")
+            .join(format!("v{STORE_FORMAT_VERSION}"))
+    } else {
+        durable.to_path_buf()
+    }
+}
+
+fn ensure_disposable_namespace(root: &Path, volume: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(volume)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "disposable cache volume is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = volume
+            .parent()
+            .ok_or_else(|| io::Error::other("missing volume parent"))?;
+        if metadata.dev() == fs::metadata(parent)?.dev() {
+            return Err(io::Error::other(
+                "disposable cache volume is not mounted; refusing system-disk fallback",
+            ));
+        }
+    }
+    ensure_disposable_children(root, volume)
+}
+
+fn ensure_disposable_children(root: &Path, volume: &Path) -> io::Result<()> {
+    let relative = root
+        .strip_prefix(volume)
+        .map_err(|_| io::Error::other("cache namespace escapes disposable volume"))?;
+    let mut current = volume.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(io::Error::other("invalid disposable cache namespace"));
+        }
+        current.push(component.as_os_str());
+        ensure_one_directory(&current)?;
+    }
+    Ok(())
 }
 
 pub fn workspace_store_path(workspace_root: &Path) -> PathBuf {
@@ -570,8 +646,20 @@ pub fn legacy_workspace_store_dir(workspace_root: &Path) -> PathBuf {
 }
 
 pub fn ensure_workspace_store(workspace_root: &Path) -> io::Result<PathBuf> {
+    let stores = workspace_stores_root(workspace_root);
+    if stores != workspaces_root() {
+        let volume = Path::new("/Volumes/tmp");
+        if !canonical_root(workspace_root).starts_with(volume) {
+            return Err(io::Error::other(
+                "disposable workspace resolves outside /Volumes/tmp",
+            ));
+        }
+        ensure_disposable_namespace(&stores, volume)?;
+    }
     ensure_owned_namespace(&data_root())?;
-    ensure_owned_namespace(&workspaces_root())?;
+    if stores == workspaces_root() {
+        ensure_owned_namespace(&stores)?;
+    }
     ensure_owned_namespace(&locks_root())?;
     ensure_owned_namespace(&trash_root())?;
     let dir = workspace_store_dir(workspace_root);
@@ -1859,6 +1947,91 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::*;
 
+    #[test]
+    fn disposable_store_routing_preserves_retained_data_and_overrides() {
+        let base = tempdir("disposable-routing");
+        let volume = base.join("volume");
+        let repo = volume.join("worktrees/project/task");
+        fs::create_dir_all(&repo).unwrap();
+        let data = base.join("durable");
+        let durable = data.join("workspaces/v2");
+        let route = || workspace_stores_root_for(&repo, &durable, &data, false, &volume);
+        assert_eq!(
+            route(),
+            volume.join("dev-artifacts/greppy/workspace-stores/v2")
+        );
+        assert_eq!(
+            workspace_stores_root_for(&repo, &durable, &data, true, &volume),
+            durable
+        );
+        assert_eq!(
+            workspace_stores_root_for(&base.join("canonical"), &durable, &data, false, &volume),
+            durable
+        );
+        let retained = durable.join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(retained.join("cow/nested")).unwrap();
+        for name in [
+            "graph.db",
+            "graph.db-wal",
+            "embeddings.bin",
+            "cow/nested/delta.db",
+        ] {
+            fs::write(retained.join(name), name.as_bytes()).unwrap();
+        }
+        assert_eq!(route(), durable);
+        // Retaining the entire directory does not need writer quiescence or
+        // select a fresh graph when a sidecar/client is still present.
+        let lock = acquire_named_lock_in(
+            &data,
+            &format!(
+                "workspace-{}.writer",
+                crate::workspace::workspace_hash(&repo)
+            ),
+            LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(route(), durable);
+        for name in [
+            "graph.db",
+            "graph.db-wal",
+            "embeddings.bin",
+            "cow/nested/delta.db",
+        ] {
+            assert_eq!(fs::read(retained.join(name)).unwrap(), name.as_bytes());
+        }
+        drop(lock);
+        assert_eq!(route(), durable);
+        fs::remove_dir_all(&retained).unwrap();
+        let legacy = data.join(crate::workspace::workspace_hash(&repo));
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("graph.db"), b"legacy").unwrap();
+        assert_eq!(route(), durable);
+        assert_eq!(fs::read(legacy.join("graph.db")).unwrap(), b"legacy");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disposable_namespace_never_creates_missing_or_unmounted_volume() {
+        let base = tempdir("disposable-volume");
+        let missing = base.join("missing");
+        assert!(ensure_disposable_namespace(&missing.join("stores"), &missing).is_err());
+        assert!(!missing.exists());
+        #[cfg(unix)]
+        {
+            let unmounted = base.join("unmounted");
+            fs::create_dir(&unmounted).unwrap();
+            assert!(ensure_disposable_namespace(&unmounted.join("stores"), &unmounted).is_err());
+            assert!(!unmounted.join("stores").exists());
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&unmounted, &alias).unwrap();
+            assert!(ensure_disposable_namespace(&alias.join("stores"), &alias).is_err());
+            assert!(!unmounted.join("stores").exists());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn private_acl_and_atomic_write_accept_long_existing_paths() {
@@ -1904,6 +2077,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposable_namespace_rejects_symlinks_and_routes_workspace_aliases() {
+        let base = tempdir("disposable-symlink");
+        let volume = base.join("volume");
+        let outside = base.join("outside");
+        fs::create_dir_all(volume.join("worktrees/repo")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, volume.join("dev-artifacts")).unwrap();
+        assert!(ensure_disposable_children(&volume.join("dev-artifacts/stores"), &volume).is_err());
+        assert!(!outside.join("stores").exists());
+        let alias = base.join("repo-alias");
+        std::os::unix::fs::symlink(volume.join("worktrees/repo"), &alias).unwrap();
+        let durable = base.join("durable/workspaces/v2");
+        assert_eq!(
+            workspace_stores_root_for(&alias, &durable, &base.join("durable"), false, &volume),
+            volume.join("dev-artifacts/greppy/workspace-stores/v2")
+        );
+        assert!(ensure_disposable_children(&base.join("escape"), &volume).is_err());
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn tempdir(tag: &str) -> PathBuf {
