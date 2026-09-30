@@ -3049,7 +3049,13 @@ pub(crate) fn run_trained_rename(
                     12,
                 )));
             };
-            let range = if rust_free_function_inventory_eligible {
+            let selected_local_call_scope = rust_free_function_inventory_eligible
+                && edge.edge_type == "CALLS"
+                && rust_selected_files.contains(&source.file_path)
+                && matches!(source.label.as_str(), "Function" | "Method");
+            let range = if selected_local_call_scope {
+                line_range_to_bytes(&content, source.start_line as usize, span.end_line as usize)
+            } else if rust_free_function_inventory_eligible {
                 edge.properties
                     .get("line")
                     .and_then(serde_json::Value::as_u64)
@@ -3112,6 +3118,17 @@ pub(crate) fn run_trained_rename(
                 Ok(false) => continue,
                 Ok(true) => {}
                 Err(refusal) => return Ok(Err(refusal)),
+            }
+            if selected_local_call_scope
+                && sites
+                    .iter()
+                    .all(|site| rust_local_free_function_owns_site(&content, &short_name, *site))
+            {
+                scopes
+                    .entry(source.file_path.clone())
+                    .or_default()
+                    .extend(sites);
+                continue;
             }
             match select_rename_reference_site(symbol, &short_name, &source.file_path, &sites) {
                 Ok(None) => continue,
