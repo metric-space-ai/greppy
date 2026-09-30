@@ -18,7 +18,7 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v2";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v3";
 const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
@@ -716,7 +716,7 @@ pub(crate) fn visibility_for_open_connection(
         .unwrap_or_else(|| visibility_against(root, base_commit))
 }
 
-/// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
+/// Repair a Delta from an older Rust path resolver whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
 /// The repair consumes the composed visible raw-edge view, including raw edges
@@ -2931,7 +2931,7 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO main.schema_meta (key, value) VALUES (?1, ?2)",
                     [
-                        "greppy.rust_caller_edges_repair.v1",
+                        "greppy.rust_caller_edges_repair.v2",
                         RUST_CALLER_EDGES_REPAIR_COMPLETE,
                     ],
                 )
