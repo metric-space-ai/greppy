@@ -13,9 +13,20 @@ and symlinked disposable cache namespace components. It does not create a
 replacement `/Volumes/tmp` directory on the system disk.
 
 An existing versioned or legacy workspace cache remains authoritative in its
-original directory. This includes incomplete caches and all sidecars; selection
-does not move, delete, snapshot or reindex data while another client may use it.
+original directory when no disposable store has been established. Once a disposable
+store has been created, later durable directories cannot redirect its selection.
+Existing disposable stores require a matching ownership manifest; nonempty unowned
+stores are rejected without adopting or deleting their bytes. Retained original
+caches keep their complete sidecars, including incomplete caches. Store selection
+does not relocate or rebuild data while another client may use it.
 An explicit `GREPPY_STORE_DIR` continues to select its existing namespace.
+
+Cache inventory, status, clear and GC include both validated store namespaces
+when no explicit store override is supplied. Disposable inventory requires the tmp
+volume to be mounted and every namespace component to be a directory without
+symlinks. Only matching manifests whose source identity is under the disposable
+volume are managed there. GC respects both lifecycle and writer leases, and moves
+disposable entries to trash on that same volume; invalid entries remain unmanaged.
 
 **Remaining migration gap:** retained system-disk stores have not been relocated,
 and the storage policy is not satisfied for those entries. This change deliberately
