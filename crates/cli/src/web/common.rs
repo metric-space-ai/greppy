@@ -101,6 +101,56 @@ pub(super) struct CurrentScope {
     pub tab: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionRoute {
+    socket: PathBuf,
+    run_id: String,
+    runtime_image_id: String,
+}
+
+fn session_route_path(root: Option<&str>, session: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(session.as_bytes());
+    let name = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    workspace_dir(root)
+        .join(".greppy/web/session-routes")
+        .join(format!("{name}.json"))
+}
+
+fn load_session_route(root: Option<&str>, session: &str) -> Option<SessionRoute> {
+    let bytes = std::fs::read(session_route_path(root, session)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_session_route(root: Option<&str>, session: &str, ctx: &SupervisorCtx) {
+    let path = session_route_path(root, session);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let route = SessionRoute {
+        socket: ctx.socket.clone(),
+        run_id: ctx.run_id.clone(),
+        runtime_image_id: ctx.runtime_image_id.clone(),
+    };
+    if serde_json::to_vec_pretty(&route)
+        .ok()
+        .is_some_and(|bytes| std::fs::write(&path, bytes).is_ok())
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn remove_session_route(root: Option<&str>, session: &str) {
+    let _ = std::fs::remove_file(session_route_path(root, session));
+}
 /// Drop only the remembered session that the runtime actually rejected.
 ///
 /// A stored session belongs to a runtime that may be gone -- after a crash,
@@ -262,6 +312,10 @@ pub(super) fn runtime_run_id(root: Option<&str>) -> (String, String) {
         None => run_id.clone(),
     };
     (run_id, identity)
+}
+
+fn runtime_identity_for_image(identity: &str, runtime_image_id: &str) -> String {
+    format!("{identity}:image:{runtime_image_id}")
 }
 
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
@@ -767,7 +821,7 @@ pub(super) fn rpc_with_spawn(
         .and_then(|value| value.as_str())
         .map(str::to_owned)
         .or_else(|| session_id.clone());
-    match ensure_supervisor(root, &spawn) {
+    match supervisor_for_session(root, &spawn, rejected_session.as_deref()) {
         Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
             Ok(response) => {
                 // A remembered session that turns out to be gone or wedged
@@ -778,7 +832,16 @@ pub(super) fn rpc_with_spawn(
                 if response.error.as_ref().is_some_and(is_missing_session) {
                     if let Some(session) = rejected_session.as_deref() {
                         forget_current_session(root, session);
+                        remove_session_route(root, session);
                     }
+                } else if let Some(session) = response
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("session_id"))
+                    .and_then(|value| value.as_str())
+                    .or(rejected_session.as_deref())
+                {
+                    save_session_route(root, session, &ctx);
                 }
                 emit_response(json_out, response)
             }
@@ -786,6 +849,7 @@ pub(super) fn rpc_with_spawn(
                 if is_missing_session(&error) {
                     if let Some(session) = rejected_session.as_deref() {
                         forget_current_session(root, session);
+                        remove_session_route(root, session);
                     }
                 }
                 emit_error(json_out, error)
@@ -795,16 +859,52 @@ pub(super) fn rpc_with_spawn(
     }
 }
 
+fn supervisor_for_session(
+    root: Option<&str>,
+    spawn: &SupervisorSpawn,
+    session: Option<&str>,
+) -> std::result::Result<SupervisorCtx, ErrorObject> {
+    if let Some(session) = session {
+        if let Some(route) = load_session_route(root, session) {
+            let capability =
+                crate::web_attach::current_token().or_else(|| load_attach_cookie(&route.socket));
+            if let Some(capability) = capability {
+                if let Some(live) = live_runtime_status(&route.socket, &route.run_id, &capability) {
+                    if live.runtime_image_id == route.runtime_image_id {
+                        return Ok(SupervisorCtx {
+                            socket: route.socket,
+                            run_id: route.run_id,
+                            capability,
+                            runtime_image_id: route.runtime_image_id,
+                        });
+                    }
+                } else if socket_connected(&route.socket) {
+                    return Err(not_owned(
+                        "saved session belongs to a live runtime with a different attach capability",
+                    ));
+                }
+            } else if socket_connected(&route.socket) {
+                return Err(not_owned(
+                    "saved session belongs to a live runtime without an inherited attach capability",
+                ));
+            }
+            remove_session_route(root, session);
+        }
+    }
+    ensure_supervisor(root, spawn)
+}
+
 pub(super) struct SupervisorCtx {
     socket: PathBuf,
     run_id: String,
     capability: String,
+    runtime_image_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveRuntimeStatus {
     runtime_image_id: String,
-    sessions: u64,
+    sessions: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -824,7 +924,8 @@ fn runtime_disposition(
         Some(status) if status.runtime_image_id == expected_runtime_image_id => {
             RuntimeDisposition::Reuse
         }
-        Some(_) => RuntimeDisposition::DrainOwned,
+        Some(status) if status.sessions == Some(0) => RuntimeDisposition::DrainOwned,
+        Some(_) => RuntimeDisposition::RefuseUnowned,
         None if connected => RuntimeDisposition::RefuseUnowned,
         None => RuntimeDisposition::Spawn,
     }
@@ -956,9 +1057,12 @@ pub(super) fn ensure_supervisor(
         ));
     }
     let ResolvedRuntime { dist, executable } = resolve_runtime()?;
-    let expected_runtime_image_id = greppy_web_client::runtime_image_id(&executable)
-        .map_err(|error| unavailable(&format!("cannot identify web-runtime executable: {error}")))?;
+    let expected_runtime_image_id =
+        greppy_web_client::runtime_image_id(&executable).map_err(|error| {
+            unavailable(&format!("cannot identify web-runtime executable: {error}"))
+        })?;
     let (run_id, identity) = runtime_run_id(root);
+    let identity = runtime_identity_for_image(&identity, &expected_runtime_image_id);
     #[cfg(not(unix))]
     {
         let _ = (
@@ -1006,6 +1110,7 @@ pub(super) fn ensure_supervisor(
                     socket,
                     run_id,
                     capability,
+                    runtime_image_id: expected_runtime_image_id,
                 });
             }
             RuntimeDisposition::DrainOwned => drain_stale_owned_runtime(
@@ -1015,9 +1120,11 @@ pub(super) fn ensure_supervisor(
                 root,
                 live.as_ref().expect("owned runtime status"),
             )?,
-            RuntimeDisposition::RefuseUnowned => return Err(not_owned(
-                "attach capability does not match the live web-runtime supervisor",
-            )),
+            RuntimeDisposition::RefuseUnowned => {
+                return Err(not_owned(
+                    "attach capability does not match the live web-runtime supervisor",
+                ))
+            }
             RuntimeDisposition::Spawn => {}
         }
         save_attach_cookie(&socket, &capability);
@@ -1128,6 +1235,7 @@ pub(super) fn ensure_supervisor(
                         socket,
                         run_id,
                         capability,
+                        runtime_image_id: expected_runtime_image_id,
                     });
                 }
             }
@@ -1199,11 +1307,7 @@ fn save_attach_cookie(socket: &Path, token: &str) {
     }
 }
 
-fn wait_runtime_status(
-    socket: &Path,
-    run_id: &str,
-    capability: &str,
-) -> Option<LiveRuntimeStatus> {
+fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> Option<LiveRuntimeStatus> {
     let started = Instant::now();
     let budget = Duration::from_secs(60);
     loop {
@@ -1229,11 +1333,15 @@ fn drain_stale_owned_runtime(
     // persistent project-profile cookies remain in the shared profile store.
     // Clear only this workspace's selected ephemeral session after the old
     // supervisor acknowledges shutdown so the replacement starts cleanly.
-    let mut request = Request::new(run_id, "web.shutdown", json!({
-        "reason": "runtime_image_replaced",
-        "stale_runtime_image_id": &stale.runtime_image_id,
-        "session_count": stale.sessions,
-    }));
+    let mut request = Request::new(
+        run_id,
+        "web.shutdown",
+        json!({
+            "reason": "runtime_image_replaced",
+            "stale_runtime_image_id": &stale.runtime_image_id,
+                "session_count": stale.sessions,
+        }),
+    );
     request.capability = capability.to_owned();
     let response = greppy_web_client::unix_request(socket, &request, Duration::from_secs(3))
         .map_err(|error| {
@@ -1300,22 +1408,15 @@ fn live_runtime_status(
         }
         let mut probe = Request::new(run_id, "web.status", serde_json::json!({}));
         probe.capability = capability.to_owned();
-        let response = greppy_web_client::unix_request(
-            socket,
-            &probe,
-            Duration::from_millis(400),
-        )
-        .ok()?;
+        let response =
+            greppy_web_client::unix_request(socket, &probe, Duration::from_millis(400)).ok()?;
         if response.status != "ok" || response.error.is_some() {
             return None;
         }
         let result = response.result.as_ref()?;
         Some(LiveRuntimeStatus {
             runtime_image_id: result.get("runtime_build_id")?.as_str()?.to_owned(),
-            sessions: result
-                .get("sessions")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0),
+            sessions: result.get("sessions").and_then(|value| value.as_u64()),
         })
     }
     #[cfg(not(unix))]
@@ -1932,19 +2033,37 @@ mod target_tests {
     fn runtime_upgrade_disposition_requires_authenticated_status() {
         let current = LiveRuntimeStatus {
             runtime_image_id: "image-new".into(),
-            sessions: 1,
+            sessions: Some(1),
         };
-        let stale = LiveRuntimeStatus {
+        let stale_active = LiveRuntimeStatus {
             runtime_image_id: "image-old".into(),
-            sessions: 2,
+            sessions: Some(2),
+        };
+        let stale_empty = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: Some(0),
+        };
+        let stale_unknown = LiveRuntimeStatus {
+            runtime_image_id: "image-old".into(),
+            sessions: None,
         };
         assert_eq!(
             runtime_disposition(Some(&current), true, "image-new"),
             RuntimeDisposition::Reuse
         );
         assert_eq!(
-            runtime_disposition(Some(&stale), true, "image-new"),
+            runtime_disposition(Some(&stale_empty), true, "image-new"),
             RuntimeDisposition::DrainOwned
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale_active), true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "an active older runtime must remain available to its sessions"
+        );
+        assert_eq!(
+            runtime_disposition(Some(&stale_unknown), true, "image-new"),
+            RuntimeDisposition::RefuseUnowned,
+            "missing or malformed session counts must never authorize draining"
         );
         assert_eq!(
             runtime_disposition(None, true, "image-new"),

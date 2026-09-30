@@ -4,26 +4,37 @@ use std::path::Path;
 
 pub const SCHEMA: &str = "greppy.web-runtime.v1";
 
-/// Cheap identity for the executable file a runtime was launched from.
+/// Immutable content identity for the executable image.
 ///
-/// The daemon captures this once at startup. A later client compares the
-/// currently resolved executable's identity, so an atomic package replacement
-/// cannot silently reuse a process backed by the previous image.
+/// File metadata only keys a private digest cache. The identity exposed over
+/// the protocol is the content digest, so reinstalling identical signed bytes
+/// does not create a different runtime generation.
 #[cfg(unix)]
 pub fn runtime_image_id(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::MetadataExt;
-
     let metadata = std::fs::metadata(path)?;
-    Ok(format!(
-        "unix:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+    let key = format!(
+        "greppy-web-client-image-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}.sha256",
         metadata.dev(),
         metadata.ino(),
         metadata.len(),
         metadata.mtime(),
         metadata.mtime_nsec(),
         metadata.ctime(),
-        metadata.ctime_nsec(),
-    ))
+        metadata.ctime_nsec()
+    );
+    let cache = std::env::temp_dir().join(key);
+    if let Ok(value) = std::fs::read_to_string(&cache) {
+        let value = value.trim();
+        if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(format!("sha256:{}", value.to_ascii_lowercase()));
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let _ = std::fs::write(cache, &digest);
+    Ok(format!("sha256:{digest}"))
 }
 
 #[cfg(not(unix))]
@@ -236,7 +247,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_image_id_changes_when_executable_path_is_replaced() {
+    fn runtime_image_id_tracks_content_not_file_instance() {
         let root = std::env::temp_dir().join(format!(
             "greppy-runtime-image-id-{}-{}",
             std::process::id(),
@@ -251,6 +262,10 @@ mod tests {
         std::fs::rename(&replacement, &executable).unwrap();
         let new = runtime_image_id(&executable).unwrap();
         assert_ne!(old, new);
+
+        let copy = dir.path().join("copy");
+        std::fs::copy(&executable, &copy).unwrap();
+        assert_eq!(new, runtime_image_id(&copy).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
