@@ -2251,7 +2251,12 @@ mod tests {
                 // Only reap our direct child. It also self-expires after five
                 // seconds; no unrelated daemon or PID receives a signal.
                 let mut status = 0;
-                unsafe { libc::waitpid(self.pid, &mut status, 0); }
+                loop {
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                    if result >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
             }
         }
         let temp = tempfile::tempdir().unwrap();
@@ -2302,7 +2307,9 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
         drop(lease);
         assert!(lock_available(&path), "inference spawn retained the parent's host lease");
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "detached owner did not remain alive");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, 0,
+            "detached owner already exited; that cannot prove descriptor sealing");
     }
 
     #[cfg(unix)]
