@@ -74,6 +74,7 @@ mod nav;
 use nav::*;
 mod inference;
 use inference::*;
+mod index_admission;
 mod freshness;
 mod query_progress;
 use freshness::*;
@@ -5509,7 +5510,17 @@ fn spawn_background_job_handle(
     if start_background_job_record(&job_path, &value).is_err() {
         return None;
     }
-    let mut command = std::process::Command::new(exe);
+    let (mut command, admission_stderr) = match index_admission::command(&exe, &job_path) {
+        Ok(command) => command,
+        Err(error) => {
+            value["state"] = serde_json::json!("failed");
+            value["last_error"] = serde_json::json!(format!(
+                "automatic {kind} admission could not start; no index work started: {error}"
+            ));
+            let _ = write_background_job(&job_path, &value);
+            return None;
+        }
+    };
     command
         .arg("index")
         .arg(&root)
@@ -5525,8 +5536,10 @@ fn spawn_background_job_handle(
         )
         .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    if admission_stderr.is_none() {
+        command.stderr(std::process::Stdio::null());
+    }
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     debug_assert_eq!(Some(configured_workers), worker_count);
@@ -5598,9 +5611,12 @@ fn spawn_background_job_handle(
                     });
                     if !recorded_failure {
                         value["state"] = serde_json::json!("failed");
-                        value["last_error"] = serde_json::json!(format!(
-                            "background {kind} exited before acquiring the workspace writer lock: {status}"
-                        ));
+                        value["last_error"] = serde_json::json!(
+                            index_admission::failure_detail(admission_stderr.as_deref(), status)
+                                .unwrap_or_else(|| format!(
+                                    "background {kind} exited before acquiring the workspace writer lock: {status}"
+                                ))
+                        );
                         let _ = write_background_job(&job_path, &value);
                     }
                 }
