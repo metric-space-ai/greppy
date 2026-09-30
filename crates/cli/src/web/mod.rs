@@ -32,6 +32,41 @@ pub use runtimes::RuntimesCommand;
 pub use see::SeeCommand;
 pub use sessions::SessionsCommand;
 
+pub(crate) fn human_output_budget(max_bytes: Option<usize>) -> impl Drop {
+    view::human_budget(max_bytes)
+}
+
+pub(crate) fn validate_human_output_budget(max_bytes: Option<usize>) -> Result<()> {
+    if max_bytes.is_some_and(|budget| budget < view::MIN_BUDGET) {
+        return Err(greppy_core::error::Error::Invalid(format!(
+            "web --max-bytes must be at least {}; this preserves status and a lossless continuation command",
+            view::MIN_BUDGET
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_output_budget(command: &WebCommand, max_bytes: Option<usize>) -> Result<()> {
+    if view::enabled() && !requests_json(command) {
+        validate_human_output_budget(max_bytes)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn requests_json(command: &WebCommand) -> bool {
+    match command {
+        WebCommand::Sessions(command) => sessions::requests_json(command),
+        WebCommand::Results(command) => results::requests_json(command),
+        WebCommand::Nav(command) => nav::requests_json(command),
+        WebCommand::Act(command) => act::requests_json(command),
+        WebCommand::See(command) => see::requests_json(command),
+        WebCommand::Chain(command) => chain::requests_json(command),
+        WebCommand::Runtimes(command) => runtimes::requests_json(command),
+        WebCommand::Expect(command) => expect::requests_json(command),
+        WebCommand::Diagnose(command) => diagnose::requests_json(command),
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum WebCommand {
     #[command(flatten)]
@@ -118,6 +153,57 @@ mod tests {
                 command: WebCommand::Sessions(SessionsCommand::Status { json: true })
             })
         ));
+    }
+
+    #[test]
+    fn human_web_budget_rejects_values_too_small_for_continuation_metadata() {
+        for budget in [Some(0), Some(1), Some(view::MIN_BUDGET - 1)] {
+            let error = validate_human_output_budget(budget).unwrap_err().to_string();
+            assert!(error.contains("web --max-bytes must be at least"));
+            assert!(error.contains("lossless continuation"));
+        }
+        assert!(validate_human_output_budget(Some(view::MIN_BUDGET)).is_ok());
+        assert!(validate_human_output_budget(None).is_ok());
+    }
+
+    #[test]
+    fn raw_and_json_web_output_keep_their_existing_small_budget_contract() {
+        let human_cli = Cli::try_parse_from([
+            "greppy", "web", "open", "https://example.com", "--max-bytes", "100",
+        ])
+        .unwrap();
+        let Some(Command::Web { command }) = human_cli.command else {
+            panic!("expected web command")
+        };
+        let error = validate_output_budget(&command, human_cli.max_bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lossless continuation"));
+
+        let json_cli = Cli::try_parse_from([
+            "greppy", "web", "open", "https://example.com", "--json", "--max-bytes", "100",
+        ])
+        .unwrap();
+        let Some(Command::Web { command }) = json_cli.command else {
+            panic!("expected web command")
+        };
+        assert!(validate_output_budget(&command, json_cli.max_bytes).is_ok());
+
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("GREPPY_WEB_VIEW");
+        unsafe { std::env::set_var("GREPPY_WEB_VIEW", "raw") };
+        let raw_cli = Cli::try_parse_from([
+            "greppy", "web", "open", "https://example.com", "--max-bytes", "100",
+        ])
+        .unwrap();
+        let Some(Command::Web { command }) = raw_cli.command else {
+            panic!("expected web command")
+        };
+        assert!(validate_output_budget(&command, raw_cli.max_bytes).is_ok());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("GREPPY_WEB_VIEW", value) },
+            None => unsafe { std::env::remove_var("GREPPY_WEB_VIEW") },
+        }
     }
 
     #[test]

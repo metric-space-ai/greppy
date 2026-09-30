@@ -283,6 +283,14 @@ pub enum ExpectCommand {
     },
 }
 
+pub(super) fn requests_json(command: &ExpectCommand) -> bool {
+    match command {
+        ExpectCommand::Wait { condition, .. } | ExpectCommand::Assert { condition } => {
+            condition.json
+        }
+    }
+}
+
 pub(super) fn dispatch(command: ExpectCommand, root: Option<&str>) -> Result<i32> {
     match command {
         ExpectCommand::Wait {

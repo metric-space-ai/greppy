@@ -113,6 +113,18 @@ pub enum DomCommand {
     },
 }
 
+pub(super) fn requests_json(command: &SeeCommand) -> bool {
+    match command {
+        SeeCommand::Match { json, .. }
+        | SeeCommand::Find { json, .. }
+        | SeeCommand::Extract { json, .. }
+        | SeeCommand::Inspect { json, .. } => *json,
+        SeeCommand::Dom { command } => match command {
+            DomCommand::Html { json, .. } | DomCommand::Stats { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
     match command {
         SeeCommand::Match { query, count, json } => run_match(&query, count, json),

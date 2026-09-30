@@ -10,16 +10,93 @@ mod workflow_projection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) const BUDGET: usize = 8192;
+pub(super) const MIN_BUDGET: usize = 600;
 const TTL: u64 = 24 * 60 * 60;
 const PREFIX: &str = "view1:";
 const OPEN: &str = "UNTRUSTED_PAGE_CONTENT\n";
 const CLOSE: &str = "\nEND_UNTRUSTED_PAGE_CONTENT\n";
+
+thread_local! {
+    static REQUESTED_BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(super) struct BudgetGuard(Option<usize>);
+
+pub(super) fn human_budget(max_bytes: Option<usize>) -> BudgetGuard {
+    let previous = REQUESTED_BUDGET.with(|budget| budget.replace(max_bytes));
+    BudgetGuard(previous)
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        REQUESTED_BUDGET.with(|budget| budget.set(self.0));
+    }
+}
+
+fn output_budget() -> usize {
+    REQUESTED_BUDGET.with(|budget| budget.get().unwrap_or(BUDGET).min(BUDGET))
+}
+
+fn default_budget() -> usize {
+    BUDGET
+}
+
+fn decoded_json_duplicate(serialized: &Value) -> Option<Value> {
+    let object = serialized.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    if let Some(entries) = object.get("o").and_then(Value::as_array) {
+        let mut decoded = serde_json::Map::new();
+        for entry in entries {
+            let entry = entry.as_object()?;
+            if entry.len() != 2 {
+                return None;
+            }
+            let key = entry.get("k")?.as_str()?;
+            if decoded.contains_key(key) {
+                return None;
+            }
+            decoded.insert(key.to_owned(), decoded_json_duplicate(entry.get("v")?)?);
+        }
+        return Some(Value::Object(decoded));
+    }
+    if let Some(items) = object.get("a").and_then(Value::as_array) {
+        return items
+            .iter()
+            .map(decoded_json_duplicate)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array);
+    }
+    for key in ["b", "n", "s"] {
+        if let Some(value) = object.get(key) {
+            return match key {
+                "b" if value.is_boolean() => Some(value.clone()),
+                "n" if value.is_number() => Some(value.clone()),
+                "s" if value.is_string() => Some(value.clone()),
+                _ => None,
+            };
+        }
+    }
+    (object.get("v").and_then(Value::as_str) == Some("null")).then_some(Value::Null)
+}
+
+fn evaluate_value_is_duplicate(result: &Value) -> bool {
+    match (
+        result.get("serialized").and_then(decoded_json_duplicate),
+        result.get("value"),
+    ) {
+        (Some(decoded), Some(value)) => &decoded == value,
+        _ => false,
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scope {
@@ -34,6 +111,8 @@ struct Snapshot {
     scope: Scope,
     header: String,
     body: String,
+    #[serde(default = "default_budget")]
+    budget: usize,
 }
 
 pub(super) fn enabled() -> bool {
@@ -492,6 +571,25 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
                 }
                 body.push_str(&format!("{}: {value}\n", quote(key)));
             }
+        } else if operation == "web.evaluate"
+            && payload.get("status").and_then(Value::as_str) == Some("ok")
+            && evaluate_value_is_duplicate(result)
+        {
+            // Native evaluate receipts contain both the transport encoding and
+            // its decoded JSON value. Human output needs the answer once; JSON
+            // mode bypasses this formatter and retains both protocol fields.
+            body.push_str(&format!("value: {}\n", result["value"]));
+            for (key, value) in result.as_object().expect("evaluate object") {
+                if ["value", "serialized"].contains(&key.as_str())
+                    || (key == "session_id" && value.as_str() == scope.session.as_deref())
+                    || (key == "tab_id" && value.as_str() == scope.tab.as_deref())
+                    || (key == "untrusted_content_boundary"
+                        && value.as_str() == Some("UNTRUSTED_PAGE_CONTENT"))
+                {
+                    continue;
+                }
+                body.push_str(&format!("{}: {value}\n", quote(key)));
+            }
         } else {
             body.push_str(&format!("{result}\n"));
         }
@@ -508,6 +606,7 @@ fn describe_with_workflow(payload: &Value, mut scope: Scope, workflow: Option<&s
         scope,
         header,
         body,
+        budget: output_budget(),
     }
 }
 
@@ -523,6 +622,7 @@ pub(super) fn archive_chain(records: &Value, scope: Scope, dir: &Path) -> Result
         header: "Earlier chain observations — not current page state; references may be stale\n"
             .into(),
         body: serde_json::to_string(records).map_err(|error| error.to_string())?,
+        budget: output_budget(),
     };
     let id = save(dir, &snapshot)?;
     let cursor = format!("{PREFIX}{id}:0");
@@ -634,6 +734,7 @@ pub(super) fn render(payload: &Value, scope: Scope, dir: &Path) -> Result<String
             scope: original.scope.clone(),
             header: "Complete returned state — archived; references may now be stale\n".into(),
             body: payload.to_string(),
+            budget: output_budget(),
         };
         match save(dir, &archive) {
             Ok(id) => {
@@ -661,11 +762,12 @@ pub(super) fn render(payload: &Value, scope: Scope, dir: &Path) -> Result<String
         original
     };
     let full = format!("{}{OPEN}{}{CLOSE}", snapshot.header, snapshot.body);
-    if full.len() <= BUDGET {
+    let budget = snapshot.budget.min(BUDGET);
+    if full.len() <= budget {
         return Ok(full);
     }
     let id = save(dir, &snapshot)?;
-    page(&snapshot, &id, 0, BUDGET).map(|p| p.0)
+    page(&snapshot, &id, 0, budget).map(|p| p.0)
 }
 
 pub(super) fn is_cursor(cursor: &str) -> bool {
@@ -707,16 +809,17 @@ pub(super) fn resume(
                 .into(),
         );
     }
-    let (text, _next, end) = page(&snapshot, id, offset, BUDGET)?;
+    let budget = snapshot.budget.min(BUDGET);
+    let (text, _next, end) = page(&snapshot, id, offset, budget)?;
     if json_out {
         let mut end = end;
         loop {
             let next = (end < snapshot.body.len()).then(|| format!("{PREFIX}{id}:{end}"));
             let output = json!({"schema":"greppy.web-view.v1", "snapshot":true, "digest":id, "session_id":snapshot.scope.session, "tab_id":snapshot.scope.tab, "offset":offset, "end_offset":end, "total_bytes":snapshot.body.len(), "content":&snapshot.body[offset..end], "next_cursor":next, "untrusted_content_boundary":"UNTRUSTED_PAGE_CONTENT"}).to_string();
-            if output.len() <= BUDGET {
+            if output.len() <= budget {
                 return Ok(output);
             }
-            let excess = output.len() - BUDGET;
+            let excess = output.len() - budget;
             end = end.saturating_sub(excess).max(offset);
             while end > offset && !snapshot.body.is_char_boundary(end) {
                 end -= 1;
@@ -1449,6 +1552,83 @@ mod tests {
         assert!(render(&malformed, scope(), tmp.path())
             .unwrap()
             .contains("missing node"));
+    }
+
+    #[test]
+    fn successful_evaluate_shows_decoded_value_once_but_errors_remain_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = json!({"operation":"web.evaluate", "status":"ok", "result":{
+            "serialized":{"o":[
+                {"k":"count","v":{"n":1}},
+                {"k":"rows","v":{"a":[{"o":[{"k":"text","v":{"s":"click.echo(message=None)"}}]}]}}
+            ]},
+            "value":{"count":1,"rows":[{"text":"click.echo(message=None)"}]},
+            "future_receipt":{"kept":true}
+        }});
+        let output = render(&payload, Scope::default(), tmp.path()).unwrap();
+        assert!(!output.contains("\"serialized\""));
+        assert_eq!(output.matches("click.echo(message=None)").count(), 1);
+        assert!(output.contains("future_receipt") && output.contains("\"kept\":true"));
+
+        let failed = json!({"operation":"web.evaluate", "status":"error",
+            "error":{"code":"engine_error","message":"failed"},
+            "result":{"serialized":{"diagnostic":"keep me"},"value":{"count":0}}});
+        let output = render(&failed, Scope::default(), tmp.path()).unwrap();
+        assert!(output.contains("\"serialized\"") && output.contains("keep me"));
+    }
+
+    #[test]
+    fn evaluate_preserves_transport_when_decoding_is_not_a_proven_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (serialized, value) in [
+            (json!({"v":"undefined"}), json!("undefined")),
+            (json!({"bi":"9007199254740993"}), Value::Null),
+            (json!({"d":"2026-09-30T00:00:00.000Z"}), Value::Null),
+            (json!({"n":1,"future":true}), json!(1)),
+            (json!({"b":"true"}), json!("true")),
+            (json!({"n":"1"}), json!("1")),
+            (json!({"s":1}), json!(1)),
+            (json!({"o":[{"k":"x"}]}), json!({"x":null})),
+            (json!({"s":"one"}), json!("different")),
+        ] {
+            let payload = json!({"operation":"web.evaluate", "status":"ok", "result":{
+                "serialized":serialized, "value":value
+            }});
+            let output = render(&payload, Scope::default(), tmp.path()).unwrap();
+            assert!(output.contains("\"serialized\""), "lost transport: {output}");
+            assert!(output.contains("\"value\""), "lost decoded value: {output}");
+        }
+        let missing_value = json!({"operation":"web.evaluate", "status":"ok", "result":{
+            "serialized":{"diagnostic":"malformed"}
+        }});
+        let output = render(&missing_value, Scope::default(), tmp.path()).unwrap();
+        assert!(output.contains("\"serialized\"") && output.contains("malformed"));
+    }
+
+    #[test]
+    fn explicit_human_budget_pages_without_losing_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _budget = human_budget(Some(600));
+        let output = render(&observed(&"x".repeat(4_000)), scope(), tmp.path()).unwrap();
+        assert!(output.len() <= 600, "{} bytes", output.len());
+        assert!(output.contains("greppy web result next"));
+        let snapshot_path = tmp.path().read_dir().unwrap().next().unwrap().unwrap().path();
+        let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        let snapshot: Snapshot = serde_json::from_slice(&snapshot_bytes).unwrap();
+        assert_eq!(snapshot.budget, 600);
+        let id = snapshot_path.file_stem().unwrap().to_str().unwrap();
+        let mut offset = 0;
+        let mut pages = 0;
+        while offset < snapshot.body.len() {
+            let (page_text, next, end) = page(&snapshot, id, offset, snapshot.budget).unwrap();
+            assert!(page_text.len() <= 600, "{} bytes", page_text.len());
+            assert!(end > offset, "continuation made no progress");
+            assert_eq!(next.is_some(), end < snapshot.body.len());
+            offset = end;
+            pages += 1;
+            assert!(pages < 100, "continuation did not terminate");
+        }
+        assert_eq!(offset, snapshot.body.len(), "continuation lost body bytes");
     }
 
     #[test]

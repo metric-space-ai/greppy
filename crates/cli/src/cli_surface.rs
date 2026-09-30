@@ -45,7 +45,7 @@ pub struct Cli {
     #[arg(long, alias = "max", global = true, value_name = "N")]
     pub limit: Option<usize>,
 
-    /// Hard stdout payload budget for navigation, search, and read commands.
+    /// Hard stdout payload budget for navigation, search, read, and human web views.
     /// Result rows/content are trimmed before status and continuation metadata.
     #[arg(long, global = true, value_name = "N")]
     pub max_bytes: Option<usize>,

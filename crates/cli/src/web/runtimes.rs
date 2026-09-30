@@ -50,6 +50,12 @@ pub enum RuntimesCommand {
     },
 }
 
+pub(super) fn requests_json(command: &RuntimesCommand) -> bool {
+    match command {
+        RuntimesCommand::Pw { json, .. } | RuntimesCommand::Js { json, .. } => *json,
+    }
+}
+
 pub(super) fn dispatch(command: RuntimesCommand, root: Option<&str>) -> Result<i32> {
     match command {
         RuntimesCommand::Js {
