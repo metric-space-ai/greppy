@@ -2917,7 +2917,8 @@ fn rust_module_files_for_module_path_with_crate_roots(
     let is_module_root = referrer
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| matches!(name, "lib.rs" | "main.rs" | "mod.rs"));
+        .is_some_and(|name| matches!(name, "lib.rs" | "main.rs" | "mod.rs"))
+        || crate_roots.is_some_and(|roots| roots.contains(referrer_file));
     let mut base = if is_module_root {
         parent.to_path_buf()
     } else {
