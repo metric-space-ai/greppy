@@ -1264,7 +1264,10 @@ fn artifact_backed_read_guides_lossless_export_without_repeating_request() {
     assert_eq!(code, 0, "export failed stdout={stdout} stderr={stderr}");
     let bytes = std::fs::read(&exported).unwrap();
     let expected = format!("{}IMMUTABLE_TAIL", "artifact body ".repeat(100_000));
-    assert!(expected.len() > 1024 * 1024, "fixture must cross the engine frame limit");
+    assert!(
+        expected.len() > 1024 * 1024,
+        "fixture must cross the engine frame limit"
+    );
     assert_eq!(bytes, expected.as_bytes(), "artifact is rendered page text");
     assert!(bytes.ends_with(b"IMMUTABLE_TAIL"));
     assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));

@@ -202,15 +202,12 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         if start
             .checked_sub(1)
             .and_then(|at| content.get(at))
-            .is_some_and(|byte| identifier_byte(*byte)) ||
-            content.get(scan).is_some_and(|byte| identifier_byte(*byte))
+            .is_some_and(|byte| identifier_byte(*byte))
+            || content.get(scan).is_some_and(|byte| identifier_byte(*byte))
         {
             continue;
         }
-        let Some(type_node) = raw_tree
-            .root_node()
-            .descendant_for_byte_range(start, scan)
-        else {
+        let Some(type_node) = raw_tree.root_node().descendant_for_byte_range(start, scan) else {
             continue;
         };
         let Some(unary_expression) = std::iter::successors(Some(type_node), |node| node.parent())
@@ -233,7 +230,10 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         }
 
         let whitespace_start = scan;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while content
+            .get(scan)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             scan += 1;
         }
         if scan == whitespace_start || !content[scan..].starts_with(b"import") {
@@ -244,14 +244,20 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         if content.get(scan).is_some_and(|byte| identifier_byte(*byte)) {
             continue;
         }
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while content
+            .get(scan)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             scan += 1;
         }
         if content.get(scan) != Some(&b'(') {
             continue;
         }
         scan += 1;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while content
+            .get(scan)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             scan += 1;
         }
         let Some(&quote @ (b'\'' | b'"')) = content.get(scan) else {
@@ -275,7 +281,10 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
             continue;
         }
         scan += 1;
-        while content.get(scan).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while content
+            .get(scan)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             scan += 1;
         }
         if content.get(scan) != Some(&b')') {
@@ -283,12 +292,10 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         }
         let import_end = scan + 1;
         let suffix_end = import_end + 3;
-        if content.get(import_end..suffix_end) != Some(b">()") ||
-            !errors
-                .iter()
-                .any(|(error_start, error_end, missing)| {
-                    !missing && *error_start == import_end && *error_end == suffix_end
-                })
+        if content.get(import_end..suffix_end) != Some(b">()")
+            || !errors.iter().any(|(error_start, error_end, missing)| {
+                !missing && *error_start == import_end && *error_end == suffix_end
+            })
         {
             continue;
         }
@@ -576,8 +583,7 @@ mod tests {
             );
         }
 
-        let escaped_newline =
-            b"type ChildProcess = typeof import(\"node:\\\nchild_process\");";
+        let escaped_newline = b"type ChildProcess = typeof import(\"node:\\\nchild_process\");";
         assert_eq!(
             syntax_validation_content(language, escaped_newline).as_ref(),
             escaped_newline,

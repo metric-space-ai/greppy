@@ -913,7 +913,11 @@ pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Re
         let base_current = match base_marker {
             Ok(value) => value == RUST_CALLER_EDGES_REPAIR_COMPLETE,
             Err(rusqlite::Error::QueryReturnedNoRows) => false,
-            Err(error) => return Err(Error::Store(format!("read Base Rust repair marker: {error}"))),
+            Err(error) => {
+                return Err(Error::Store(format!(
+                    "read Base Rust repair marker: {error}"
+                )))
+            }
         };
         if !base_current {
             // A sparse Delta rebuild does not certify an older immutable
@@ -2759,19 +2763,34 @@ mod tests {
         {
             let mut base = greppy_store::Store::open(&base_path).unwrap();
             greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
-            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
         }
         let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
-        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         mark_rust_caller_edges_repaired(&store).unwrap();
-        assert!(!greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "Delta-only work cannot mark a legacy Base complete");
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "Delta-only work cannot mark a legacy Base complete"
+        );
         drop(store);
-        let base = greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::query_writer()).unwrap();
+        let base =
+            greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
         greppy_indexer::mark_rust_caller_edges_repaired(&base).unwrap();
         drop(base);
-        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         mark_rust_caller_edges_repaired(&store).unwrap();
-        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "a current Base makes sparse publication current without a Base pass");
+        assert!(
+            greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "a current Base makes sparse publication current without a Base pass"
+        );
     }
 
     #[test]

@@ -1874,9 +1874,20 @@ fn grounded_bit_writes_outrank_false_workspace_base_and_global_summaries() {
         tokenizer: root.join("missing-tokenizer.json"),
         device: greppy_qwen35_native::DevicePreference::Cpu,
     };
-    assert_eq!(summarize_source_cached(&config, key,
-        (Some(&workspace), Some(&base), Some(&global)), path, source, false),
-        Some(vec!["Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes".to_owned()]));
+    assert_eq!(
+        summarize_source_cached(
+            &config,
+            key,
+            (Some(&workspace), Some(&base), Some(&global)),
+            path,
+            source,
+            false
+        ),
+        Some(vec![
+            "Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes"
+                .to_owned()
+        ])
+    );
     // Repair the returned description without globally flushing independent caches.
     for cache in [&workspace, &base, &global] {
         assert_eq!(cache.get(&cache_key, &hash).unwrap(), Some(wrong.clone()));

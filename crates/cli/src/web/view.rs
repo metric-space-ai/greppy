@@ -1595,7 +1595,10 @@ mod tests {
                 "serialized":serialized, "value":value
             }});
             let output = render(&payload, Scope::default(), tmp.path()).unwrap();
-            assert!(output.contains("\"serialized\""), "lost transport: {output}");
+            assert!(
+                output.contains("\"serialized\""),
+                "lost transport: {output}"
+            );
             assert!(output.contains("\"value\""), "lost decoded value: {output}");
         }
         let missing_value = json!({"operation":"web.evaluate", "status":"ok", "result":{
@@ -1612,7 +1615,14 @@ mod tests {
         let output = render(&observed(&"x".repeat(4_000)), scope(), tmp.path()).unwrap();
         assert!(output.len() <= 600, "{} bytes", output.len());
         assert!(output.contains("greppy web result next"));
-        let snapshot_path = tmp.path().read_dir().unwrap().next().unwrap().unwrap().path();
+        let snapshot_path = tmp
+            .path()
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
         let snapshot: Snapshot = serde_json::from_slice(&snapshot_bytes).unwrap();
         assert_eq!(snapshot.budget, 600);

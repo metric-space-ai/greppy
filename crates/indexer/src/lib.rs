@@ -1738,7 +1738,12 @@ fn resolve_edges_with_replacement(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
+                index.resolve_import_target(
+                    &src_file,
+                    name,
+                    path,
+                    edge.properties.get("imported_items"),
+                )
             }
             // Brace groups / globs / renames leave imported_name empty —
             // a future expansion pass owns those.
@@ -1812,7 +1817,12 @@ fn resolve_edges_with_replacement(
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 if let Some(target_id) = index
-                    .resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
+                    .resolve_import_target(
+                        &src_file,
+                        name,
+                        path,
+                        edge.properties.get("imported_items"),
+                    )
                     .filter(|target_id| *target_id != src_id)
                 {
                     index.record_import(&src_file, target_id);
@@ -2550,7 +2560,12 @@ fn resolve_edges_incremental(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
+                index.resolve_import_target(
+                    &src_file,
+                    name,
+                    path,
+                    edge.properties.get("imported_items"),
+                )
             }
             _ => None,
         };
@@ -2724,7 +2739,15 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if index.resolve_import_target(&edge.file_path, name, path, edge.properties.get("imported_items")).is_some() {
+        if index
+            .resolve_import_target(
+                &edge.file_path,
+                name,
+                path,
+                edge.properties.get("imported_items"),
+            )
+            .is_some()
+        {
             continue; // already resolved to a symbol by the reference pass
         }
         // Only a FILESYSTEM-style import names a file: a bare stem
@@ -3382,7 +3405,13 @@ fn rust_module_files_below_alias(
 }
 
 impl GraphIndex {
-    fn resolve_import_target(&self, file: &str, name: &str, path: &str, imported_items: Option<&serde_json::Value>) -> Option<i64> {
+    fn resolve_import_target(
+        &self,
+        file: &str,
+        name: &str,
+        path: &str,
+        imported_items: Option<&serde_json::Value>,
+    ) -> Option<i64> {
         if !file.ends_with(".rs") {
             return self.unique_def_named_with_path(
                 &greppy_resolver::IMPORTABLE_LABELS,
@@ -3395,16 +3424,36 @@ impl GraphIndex {
             // only in imported_items. Recover that path rather than guessing
             // a project-wide namesake or requiring source re-extraction.
             let mut targets = Vec::new();
-            for item in imported_items.and_then(|value| value.as_array()).into_iter().flatten() {
-                let Some(original) = item.get("original_name").and_then(|value| value.as_str()) else { continue };
-                if original != name && item.get("imported_name").and_then(|value| value.as_str()) != Some(name) { continue; }
-                let Some(item_path) = item.get("path").and_then(|value| value.as_str()) else { continue };
+            for item in imported_items
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(original) = item.get("original_name").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if original != name
+                    && item.get("imported_name").and_then(|value| value.as_str()) != Some(name)
+                {
+                    continue;
+                }
+                let Some(item_path) = item.get("path").and_then(|value| value.as_str()) else {
+                    continue;
+                };
                 let files = self.rust_module_files_for_path(file, item_path, original);
-                targets.extend(self.rust_module_export_targets(&files, original, &greppy_resolver::IMPORTABLE_LABELS));
+                targets.extend(self.rust_module_export_targets(
+                    &files,
+                    original,
+                    &greppy_resolver::IMPORTABLE_LABELS,
+                ));
             }
             targets.sort_unstable();
             targets.dedup();
-            return match targets.as_slice() { [target] => Some(*target), _ => None };
+            return match targets.as_slice() {
+                [target] => Some(*target),
+                _ => None,
+            };
         }
         let files = self.rust_module_files_for_path(file, path, name);
         let targets =
@@ -6496,34 +6545,28 @@ def Widget():
                 .get_node_by_qname("test", "examples/qualified.rs::Function::function_item")
                 .unwrap()
                 .unwrap();
-            assert!(
-                store
-                    .outgoing_edges(item.id, Some("USAGE"), 20)
-                    .unwrap()
-                    .iter()
-                    .any(|edge| edge.target_id == reachable.id)
-            );
+            assert!(store
+                .outgoing_edges(item.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.target_id == reachable.id));
             let grouped = store
                 .get_node_by_qname("test", "tests/grouped.rs::Function::grouped")
                 .unwrap()
                 .unwrap();
-            assert!(
-                store
-                    .outgoing_edges(grouped.id, Some("CALLS"), 20)
-                    .unwrap()
-                    .iter()
-                    .any(|edge| edge.target_id == reachable.id)
-            );
+            assert!(store
+                .outgoing_edges(grouped.id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.target_id == reachable.id));
             let root = store
                 .get_node_by_qname("test", &format!("{library_file}::Function::root_target"))
                 .unwrap()
                 .unwrap();
-            assert!(
-                !store
-                    .incoming_edges(root.id, Some("CALLS"), 20)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(!store
+                .incoming_edges(root.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty());
             assert_eq!(
                 index(&mut store, &repo, "test").unwrap().files_indexed,
                 0,
@@ -6537,18 +6580,55 @@ def Widget():
                 index(&mut base, &repo, "test").unwrap();
                 // Simulate an old resolver: retain raw edges and all nodes,
                 // but remove the previously missing Cargo library relations.
-                base.conn().execute("DELETE FROM edges WHERE edge_type IN ('CALLS', 'USAGE', 'IMPORTS')", []).unwrap();
+                base.conn()
+                    .execute(
+                        "DELETE FROM edges WHERE edge_type IN ('CALLS', 'USAGE', 'IMPORTS')",
+                        [],
+                    )
+                    .unwrap();
             }
-            let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+            let visibility =
+                greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new())
+                    .unwrap();
             let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-            let before = overlay.list_nodes_by_label("test", "Function", 100).unwrap();
+            let before = overlay
+                .list_nodes_by_label("test", "Function", 100)
+                .unwrap();
             rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
-            let repaired_target = overlay.get_node_by_qname("test", &target.qualified_name).unwrap().unwrap();
-            assert_eq!(overlay.incoming_edges(repaired_target.id, Some("CALLS"), 20).unwrap().len(), 4);
-            assert!(overlay.list_private_file_states("test").unwrap().is_empty(), "repair must not copy Base file state into Delta");
-            assert_eq!(overlay.list_nodes_by_label("test", "Function", 100).unwrap().iter().map(|node| node.id).collect::<Vec<_>>(), before.iter().map(|node| node.id).collect::<Vec<_>>(), "repair must preserve cached node identities");
+            let repaired_target = overlay
+                .get_node_by_qname("test", &target.qualified_name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                overlay
+                    .incoming_edges(repaired_target.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert!(
+                overlay.list_private_file_states("test").unwrap().is_empty(),
+                "repair must not copy Base file state into Delta"
+            );
+            assert_eq!(
+                overlay
+                    .list_nodes_by_label("test", "Function", 100)
+                    .unwrap()
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>(),
+                before.iter().map(|node| node.id).collect::<Vec<_>>(),
+                "repair must preserve cached node identities"
+            );
             rebuild_overlay_edges(&mut overlay, "test").unwrap();
-            assert_eq!(overlay.incoming_edges(repaired_target.id, Some("CALLS"), 20).unwrap().len(), 4, "ordinary sparse rebuild preserves the one-shot repair");
+            assert_eq!(
+                overlay
+                    .incoming_edges(repaired_target.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .len(),
+                4,
+                "ordinary sparse rebuild preserves the one-shot repair"
+            );
             drop(overlay);
             fs::remove_dir_all(repo).unwrap();
         }
@@ -6593,7 +6673,8 @@ def Widget():
         let unchanged = index(&mut store, &repo, "test").unwrap();
         assert_eq!(unchanged.files_indexed, 0);
         assert_eq!(
-            reresolve_count(), 0,
+            reresolve_count(),
+            0,
             "current unchanged index must not repeat repair"
         );
         fs::remove_dir_all(repo).unwrap();
@@ -6630,12 +6711,10 @@ def Widget():
             "binary/src/main.rs::Function::unrelated",
         ] {
             let caller = store.get_node_by_qname("test", qname).unwrap().unwrap();
-            assert!(
-                store
-                    .outgoing_edges(caller.id, Some("CALLS"), 20)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(store
+                .outgoing_edges(caller.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty());
         }
         fs::remove_dir_all(repo).unwrap();
     }

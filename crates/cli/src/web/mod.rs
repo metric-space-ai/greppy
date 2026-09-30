@@ -158,7 +158,9 @@ mod tests {
     #[test]
     fn human_web_budget_rejects_values_too_small_for_continuation_metadata() {
         for budget in [Some(0), Some(1), Some(view::MIN_BUDGET - 1)] {
-            let error = validate_human_output_budget(budget).unwrap_err().to_string();
+            let error = validate_human_output_budget(budget)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("web --max-bytes must be at least"));
             assert!(error.contains("lossless continuation"));
         }
@@ -169,7 +171,12 @@ mod tests {
     #[test]
     fn raw_and_json_web_output_keep_their_existing_small_budget_contract() {
         let human_cli = Cli::try_parse_from([
-            "greppy", "web", "open", "https://example.com", "--max-bytes", "100",
+            "greppy",
+            "web",
+            "open",
+            "https://example.com",
+            "--max-bytes",
+            "100",
         ])
         .unwrap();
         let Some(Command::Web { command }) = human_cli.command else {
@@ -181,7 +188,13 @@ mod tests {
         assert!(error.contains("lossless continuation"));
 
         let json_cli = Cli::try_parse_from([
-            "greppy", "web", "open", "https://example.com", "--json", "--max-bytes", "100",
+            "greppy",
+            "web",
+            "open",
+            "https://example.com",
+            "--json",
+            "--max-bytes",
+            "100",
         ])
         .unwrap();
         let Some(Command::Web { command }) = json_cli.command else {
@@ -193,7 +206,12 @@ mod tests {
         let previous = std::env::var_os("GREPPY_WEB_VIEW");
         unsafe { std::env::set_var("GREPPY_WEB_VIEW", "raw") };
         let raw_cli = Cli::try_parse_from([
-            "greppy", "web", "open", "https://example.com", "--max-bytes", "100",
+            "greppy",
+            "web",
+            "open",
+            "https://example.com",
+            "--max-bytes",
+            "100",
         ])
         .unwrap();
         let Some(Command::Web { command }) = raw_cli.command else {
