@@ -6573,9 +6573,11 @@ def Widget():
             rust_caller_edges_repaired(&store).unwrap(),
             "fresh index already uses current resolver"
         );
+        reset_reresolve_counter();
         let unchanged = index(&mut store, &repo, "test").unwrap();
+        assert_eq!(unchanged.files_indexed, 0);
         assert_eq!(
-            unchanged.edges_extracted, 0,
+            reresolve_count(), 0,
             "current unchanged index must not repeat repair"
         );
         fs::remove_dir_all(repo).unwrap();
