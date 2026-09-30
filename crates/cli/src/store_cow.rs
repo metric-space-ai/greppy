@@ -1987,7 +1987,14 @@ fn seed_previous_indexer_base(
     std::io::copy(&mut previous_graph, &mut migrated_graph)
         .map_err(|error| Error::io("copy previous Base graph for migration", error))?;
     drop(migrated_graph);
-    let root = worktree_path.to_string_lossy();
+    // The indexer keys workspace compatibility by its canonical repository
+    // root. Temporary checkouts can have a different lexical spelling on
+    // macOS (`/var/...` versus `/private/var/...`); persisting the lexical
+    // path makes the v6 workspace lookup miss, forcing a full rebuild whose
+    // node cascade discards otherwise reusable vectors.
+    let canonical_worktree = std::fs::canonicalize(worktree_path)
+        .map_err(|error| Error::io("resolve migrated Base worktree", error))?;
+    let root = canonical_worktree.to_string_lossy();
     let store =
         greppy_store::Store::open_with(staged_graph, greppy_store::OpenOptions::query_writer())?;
     store
