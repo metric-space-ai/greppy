@@ -611,9 +611,7 @@ pub(crate) fn detach_command(command: &mut std::process::Command) {
 /// Rust's exec-error pipe remains open long enough to report pre-exec/exec
 /// failures and is closed automatically only by a successful exec.
 #[cfg(unix)]
-pub(crate) fn seal_detached_child_fds(
-    command: &mut std::process::Command,
-) -> std::io::Result<()> {
+pub(crate) fn seal_detached_child_fds(command: &mut std::process::Command) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let maximum = unsafe { libc::getdtablesize() };
     if maximum < 0 {
@@ -649,9 +647,7 @@ pub(crate) fn seal_detached_child_fds(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn seal_detached_child_fds(
-    _command: &mut std::process::Command,
-) -> std::io::Result<()> {
+pub(crate) fn seal_detached_child_fds(_command: &mut std::process::Command) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2190,7 +2186,10 @@ mod tests {
         assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(flags >= 0);
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
         file
     }
 
@@ -2227,10 +2226,19 @@ mod tests {
         let mut command = sleeping_child();
         seal_detached_child_fds(&mut command).unwrap();
         let mut daemon = command.spawn().unwrap();
-        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
         drop(lease);
-        assert!(lock_available(&path), "detached daemon inherited the host lease");
-        assert!(daemon.try_wait().unwrap().is_none(), "daemon did not remain alive");
+        assert!(
+            lock_available(&path),
+            "detached daemon inherited the host lease"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon did not remain alive"
+        );
         let _ = daemon.kill();
         let _ = daemon.wait();
     }
@@ -2253,7 +2261,9 @@ mod tests {
                 let mut status = 0;
                 loop {
                     let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-                    if result >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    if result >= 0
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
                         break;
                     }
                 }
@@ -2265,6 +2275,8 @@ mod tests {
         let flags_before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
         let marker = temp.path().join("owned.pid");
         let stop = temp.path().join("stop");
+        let stderr_path = temp.path().join("owned.stderr");
+        let started = std::time::Instant::now();
         let (mut pid_reader, pid_writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let pid_fd = pid_writer.as_raw_fd();
         let mut command = std::process::Command::new("/bin/sh");
@@ -2275,7 +2287,7 @@ mod tests {
         ]).arg(&marker).arg(&stop)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
         // Capture the exact child PID before exec. A successful spawn means
         // these bytes were already written, so cleanup ownership is installed
         // before any readiness deadline can fail.
@@ -2296,20 +2308,37 @@ mod tests {
         let _owner = OwnedProbe { pid, stop };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if let Some(ready_pid) = std::fs::read_to_string(&marker).ok()
-                .and_then(|text| text.parse::<libc::pid_t>().ok()) {
+            if let Some(ready_pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok())
+            {
                 assert_eq!(ready_pid, pid);
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "owned detached probe did not start");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned detached probe did not start"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
         drop(lease);
-        assert!(lock_available(&path), "inference spawn retained the parent's host lease");
+        assert!(
+            lock_available(&path),
+            "inference spawn retained the parent's host lease"
+        );
         let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, 0,
-            "detached owner already exited; that cannot prove descriptor sealing");
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            0,
+            "detached owner already exited; that cannot prove descriptor sealing; \
+             wait status={status}, elapsed={:?}, stderr={:?}",
+            started.elapsed(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
     }
 
     #[cfg(unix)]
@@ -2322,7 +2351,10 @@ mod tests {
         let before = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
         let mut command = std::process::Command::new(temp.path().join("missing-inference-owner"));
         assert!(spawn_detached(&mut command).is_err());
-        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, before);
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            before
+        );
         drop(lease);
         assert!(lock_available(&path));
     }
@@ -2335,8 +2367,14 @@ mod tests {
         let lease = inheritable_locked_file(&path);
         let mut child = sleeping_child().spawn().unwrap();
         drop(lease);
-        assert!(!lock_available(&path), "ordinary heavy child lost its inherited lease");
-        assert!(child.try_wait().unwrap().is_none(), "child did not remain alive");
+        assert!(
+            !lock_available(&path),
+            "ordinary heavy child lost its inherited lease"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child did not remain alive"
+        );
         let _ = child.kill();
         let _ = child.wait();
         assert!(lock_available(&path));
@@ -2366,7 +2404,10 @@ mod tests {
         let mut detached = detached.join().unwrap();
         let mut ordinary = ordinary.join().unwrap();
         drop(lease);
-        assert!(!lock_available(&path), "concurrent ordinary child lost the lease");
+        assert!(
+            !lock_available(&path),
+            "concurrent ordinary child lost the lease"
+        );
         let _ = ordinary.kill();
         let _ = ordinary.wait();
         assert!(lock_available(&path), "detached child retained the lease");
@@ -2386,7 +2427,10 @@ mod tests {
         let mut command = std::process::Command::new(temp.path().join("missing-runtime"));
         seal_detached_child_fds(&mut command).unwrap();
         assert!(command.spawn().is_err());
-        assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) }, flags_before);
+        assert_eq!(
+            unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+            flags_before
+        );
         assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lease);
         assert!(lock_available(&path));
