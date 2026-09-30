@@ -96,7 +96,11 @@ fn default_gate_lease_is_inherited(gate: &Path) -> bool {
     if gate != home.join(".codex/bin/dev-heavy-run.py") {
         return false;
     }
-    let lock = home.join(".codex/run/heavy-job.lock");
+    inherited_lease_owned_by_ancestor(&home.join(".codex/run/heavy-job.lock"))
+}
+
+#[cfg(unix)]
+fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
     let Ok(probe) = fs::File::open(&lock) else {
         return false;
     };
@@ -254,5 +258,54 @@ mod tests {
     #[test]
     fn an_unrelated_pid_cannot_authorize_lease_reuse() {
         assert!(!ancestor_contains(u64::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_probe_child() {
+        let Some(path) = std::env::var_os("GREPPY_TEST_ADMISSION_LEASE") else {
+            return;
+        };
+        let expected = std::env::var("GREPPY_TEST_ADMISSION_INHERITED").unwrap() == "yes";
+        assert_eq!(
+            inherited_lease_owned_by_ancestor(Path::new(&path)),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_ancestor_lease_requires_the_actual_inheritable_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let python = if cfg!(target_os = "macos") {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let script = r#"import fcntl,json,os,subprocess,sys
+with open(sys.argv[1], 'w+') as lease:
+    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    json.dump({'pid':os.getpid()}, lease); lease.flush()
+    env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED=sys.argv[3])
+    inherited=(lease.fileno(),) if sys.argv[3]=='yes' else ()
+    result=subprocess.run([sys.argv[2],'--exact','index_admission::tests::lease_probe_child','--nocapture'],env=env,pass_fds=inherited)
+    sys.exit(result.returncode)
+"#;
+        for expected in ["yes", "no"] {
+            let output = Command::new(python)
+                .arg("-c")
+                .arg(script)
+                .arg(tmp.path().join("lease.lock"))
+                .arg(std::env::current_exe().unwrap())
+                .arg(expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        }
     }
 }
