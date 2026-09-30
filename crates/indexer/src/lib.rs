@@ -1738,7 +1738,7 @@ fn resolve_edges_with_replacement(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.resolve_import_target(&src_file, name, path)
+                index.resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
             }
             // Brace groups / globs / renames leave imported_name empty —
             // a future expansion pass owns those.
@@ -1812,7 +1812,7 @@ fn resolve_edges_with_replacement(
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 if let Some(target_id) = index
-                    .resolve_import_target(&src_file, name, path)
+                    .resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
                     .filter(|target_id| *target_id != src_id)
                 {
                     index.record_import(&src_file, target_id);
@@ -2550,7 +2550,7 @@ fn resolve_edges_incremental(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.resolve_import_target(&src_file, name, path)
+                index.resolve_import_target(&src_file, name, path, edge.properties.get("imported_items"))
             }
             _ => None,
         };
@@ -2724,7 +2724,7 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if index.resolve_import_target(&edge.file_path, name, path).is_some() {
+        if index.resolve_import_target(&edge.file_path, name, path, edge.properties.get("imported_items")).is_some() {
             continue; // already resolved to a symbol by the reference pass
         }
         // Only a FILESYSTEM-style import names a file: a bare stem
@@ -3382,13 +3382,29 @@ fn rust_module_files_below_alias(
 }
 
 impl GraphIndex {
-    fn resolve_import_target(&self, file: &str, name: &str, path: &str) -> Option<i64> {
+    fn resolve_import_target(&self, file: &str, name: &str, path: &str, imported_items: Option<&serde_json::Value>) -> Option<i64> {
         if !file.ends_with(".rs") {
             return self.unique_def_named_with_path(
                 &greppy_resolver::IMPORTABLE_LABELS,
                 name,
                 path,
             );
+        }
+        if path.is_empty() {
+            // Older cached Rust imports may preserve the exact provenance
+            // only in imported_items. Recover that path rather than guessing
+            // a project-wide namesake or requiring source re-extraction.
+            let mut targets = Vec::new();
+            for item in imported_items.and_then(|value| value.as_array()).into_iter().flatten() {
+                let Some(original) = item.get("original_name").and_then(|value| value.as_str()) else { continue };
+                if original != name && item.get("imported_name").and_then(|value| value.as_str()) != Some(name) { continue; }
+                let Some(item_path) = item.get("path").and_then(|value| value.as_str()) else { continue };
+                let files = self.rust_module_files_for_path(file, item_path, original);
+                targets.extend(self.rust_module_export_targets(&files, original, &greppy_resolver::IMPORTABLE_LABELS));
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            return match targets.as_slice() { [target] => Some(*target), _ => None };
         }
         let files = self.rust_module_files_for_path(file, path, name);
         let targets =
