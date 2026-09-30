@@ -515,6 +515,10 @@ fn rename_identity_planner_subprocess_helper() {
             "closure-shadow",
             "pub fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n",
         ),
+        (
+            "block-glob-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); get_lit_str(); }\n",
+        ),
     ] {
         let root = test_tempdir(name);
         std::fs::create_dir(root.join(".git")).unwrap();
