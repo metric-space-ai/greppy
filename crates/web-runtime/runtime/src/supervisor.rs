@@ -1734,6 +1734,14 @@ impl WorkerProcess {
         self.child.id()
     }
 
+    pub(crate) fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    pub(crate) fn temp_dir(&self) -> Option<&Path> {
+        self.worker_temp_dir.as_ref().map(|dir| dir.path.as_path())
+    }
+
     pub(crate) fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(None) => true,

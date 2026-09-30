@@ -1,6 +1,6 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
-use crate::artifacts::ArtifactStore;
+use crate::artifacts::{ArtifactStore, ArtifactTransfer};
 use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error, recovery_with_observed_state};
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
@@ -2550,6 +2550,7 @@ impl Daemon {
             .map(str::to_owned)
             .ok_or_else(|| "page.content missing html".to_owned())
     }
+
     fn web_search(&mut self, request: &Request) -> Response {
         let Some(query) = request.payload.get("query").and_then(|v| v.as_str()) else {
             return protocol_error(request, "web.search requires query");
@@ -4098,6 +4099,53 @@ impl Daemon {
         let tree = self
             .engine_call("page.observe", json!({ "page": page }))
             .map_err(|error| engine_error(request, error, 34))?;
+        let max_transfer_bytes = self
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .limits
+                    .max_artifact_bytes
+                    .saturating_sub(session.artifact_bytes)
+            })
+            .ok_or_else(|| engine_error(request, "session disappeared", 39))?;
+        let transfer_root = self
+            .content
+            .temp_dir()
+            .map(Path::to_owned)
+            .ok_or_else(|| engine_error(request, "content transfer root unavailable", 39))?;
+        let transfer_capability = self.content.capability().to_owned();
+        let transfer = ArtifactTransfer::begin(
+            &transfer_root,
+            &format!("{session_id}:{}", request.request_id),
+        )
+            .map_err(|error| engine_error(request, error, 39))?;
+        let transfer_result = self
+            .engine_call(
+                "page.textToFile",
+                json!({
+                    "page": page,
+                    "path": transfer.path(),
+                    "capability": transfer_capability,
+                    "max_bytes": max_transfer_bytes,
+                }),
+            )
+            .map_err(|error| engine_error(request, error, 34))?;
+        let transfer_bytes = transfer_result
+            .get("byte_count")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing byte_count", 39))?;
+        let transfer_digest = transfer_result
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| engine_error(request, "page.textToFile missing digest", 39))?;
+        let rendered_text = transfer
+            .read_verified(transfer_bytes, transfer_digest)
+            .map_err(|error| engine_error(request, error, 39))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| engine_error(request, error, 39))
+            })?;
         let recorded = self
             .engine_call("page.requests", json!({ "page": page }))
             .unwrap_or_else(|_| json!({ "requests": [] }));
@@ -4111,11 +4159,7 @@ impl Daemon {
             .iter()
             .rev()
             .find_map(|row| row.get("status").and_then(|value| value.as_u64()));
-        let text = tree
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let text = rendered_text;
         let title = tree
             .get("title")
             .and_then(|v| v.as_str())
@@ -6391,4 +6435,5 @@ mod redirect_chain_tests {
             "page.content missing html"
         );
     }
+
 }
