@@ -1,6 +1,6 @@
 //! Unix-socket client/supervisor daemon (guide §6.3, §9).
 
-use crate::artifacts::ArtifactStore;
+use crate::artifacts::{ArtifactStore, ArtifactTransfer};
 use crate::locator_diagnostics::{failure_observation_budget, recovery_for_locator_error, recovery_with_observed_state};
 use crate::policy::{decide_url, NetworkProfile, UrlDecision};
 use crate::protocol::{Message, WorkerKind};
@@ -4109,9 +4109,16 @@ impl Daemon {
                     .saturating_sub(session.artifact_bytes)
             })
             .ok_or_else(|| engine_error(request, "session disappeared", 39))?;
-        let transfer = self
-            .store
-            .begin_transfer(&format!("{session_id}:{}", request.request_id))
+        let transfer_root = self
+            .content
+            .temp_dir()
+            .map(Path::to_owned)
+            .ok_or_else(|| engine_error(request, "content transfer root unavailable", 39))?;
+        let transfer_capability = self.content.capability().to_owned();
+        let transfer = ArtifactTransfer::begin(
+            &transfer_root,
+            &format!("{session_id}:{}", request.request_id),
+        )
             .map_err(|error| engine_error(request, error, 39))?;
         let transfer_result = self
             .engine_call(
@@ -4119,6 +4126,7 @@ impl Daemon {
                 json!({
                     "page": page,
                     "path": transfer.path(),
+                    "capability": transfer_capability,
                     "max_bytes": max_transfer_bytes,
                 }),
             )

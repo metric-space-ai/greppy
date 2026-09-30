@@ -59,6 +59,24 @@ pub struct ArtifactTransfer {
 }
 
 impl ArtifactTransfer {
+    pub fn begin(root: &Path, label: &str) -> io::Result<Self> {
+        let dir = root.join("transfers");
+        fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let name = hex_sha256(format!("{}:{nonce}:{label}", std::process::id()).as_bytes());
+        Ok(Self {
+            path: dir.join(name),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -98,23 +116,6 @@ impl ArtifactStore {
         &self.root
     }
 
-    pub fn begin_transfer(&self, label: &str) -> io::Result<ArtifactTransfer> {
-        let dir = self.root.join("transfers");
-        fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let name = hex_sha256(format!("{}:{nonce}:{label}", std::process::id()).as_bytes());
-        Ok(ArtifactTransfer {
-            path: dir.join(name),
-        })
-    }
 
     pub fn put(
         &self,
@@ -286,7 +287,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("greppy-transfer-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let store = ArtifactStore::new(root.clone()).unwrap();
-        let transfer = store.begin_transfer("request-1").unwrap();
+        let transfer = ArtifactTransfer::begin(store.root(), "request-1").unwrap();
         let path = transfer.path().to_owned();
         let bytes = b"full rendered body IMMUTABLE_TAIL";
         fs::write(&path, bytes).unwrap();
