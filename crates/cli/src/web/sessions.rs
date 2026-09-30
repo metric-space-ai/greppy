@@ -74,6 +74,28 @@ pub enum RuntimeCommand {
     },
 }
 
+pub(super) fn requests_json(command: &SessionsCommand) -> bool {
+    match command {
+        SessionsCommand::Status { json } | SessionsCommand::Doctor { json } => *json,
+        SessionsCommand::Session { command } => match command {
+            SessionCommand::Create { json, .. }
+            | SessionCommand::List { json }
+            | SessionCommand::Close { json, .. } => *json,
+        },
+        SessionsCommand::Runtime { command } => match command {
+            RuntimeCommand::Status { json }
+            | RuntimeCommand::Stop { json }
+            | RuntimeCommand::Restart { json } => *json,
+        },
+        SessionsCommand::Tab { command } => match command {
+            TabCommand::New { json, .. }
+            | TabCommand::List { json, .. }
+            | TabCommand::Switch { json, .. }
+            | TabCommand::Close { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: SessionsCommand, root: Option<&str>) -> Result<i32> {
     match command {
         SessionsCommand::Tab { command } => dispatch_tab(command, root),

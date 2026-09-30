@@ -194,6 +194,29 @@ pub enum ResultCommand {
     },
 }
 
+pub(super) fn requests_json(command: &ResultsCommand) -> bool {
+    match command {
+        ResultsCommand::Run { json, .. }
+        | ResultsCommand::Observe { json, .. }
+        | ResultsCommand::Screenshot { json, .. }
+        | ResultsCommand::Search { json, .. }
+        | ResultsCommand::Research { json, .. }
+        | ResultsCommand::Artifacts { json, .. }
+        | ResultsCommand::Cancel { json, .. }
+        | ResultsCommand::Heartbeat { json, .. } => *json,
+        ResultsCommand::Read(args) => args.json,
+        ResultsCommand::Artifact { command } => match command {
+            ArtifactCommand::List { json, .. }
+            | ArtifactCommand::Show { json, .. }
+            | ArtifactCommand::Path { json, .. }
+            | ArtifactCommand::Export { json, .. } => *json,
+        },
+        ResultsCommand::Result { command } => match command {
+            ResultCommand::Next { json, .. } => *json,
+        },
+    }
+}
+
 pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i32> {
     match command {
         ResultsCommand::Run {

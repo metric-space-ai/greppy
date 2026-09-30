@@ -1806,7 +1806,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     if cli.limit == Some(0) {
         return Err(Error::Invalid("--limit/--max must be at least 1".into()));
     }
-    if cli.max_bytes == Some(0) {
+    if let Some(Command::Web { command }) = cli.command.as_ref() {
+        web::validate_output_budget(command, cli.max_bytes)?;
+    } else if cli.max_bytes == Some(0) {
         return Err(Error::Invalid("--max-bytes must be at least 1".into()));
     }
     set_cli_result_window(cli.limit, cli.offset);
@@ -11009,6 +11011,10 @@ fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
+    let _web_output_budget = match cli.command.as_ref() {
+        Some(Command::Web { .. }) => Some(web::human_output_budget(cli.max_bytes)),
+        _ => None,
+    };
     let budget = output_budget_spec(&cli);
     let compact_json = compact_default_json_requested(&cli);
     if budget.is_some() || compact_json {

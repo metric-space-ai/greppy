@@ -119,6 +119,22 @@ pub enum ActCommand {
     },
 }
 
+pub(super) fn requests_json(command: &ActCommand) -> bool {
+    match command {
+        ActCommand::Click { opts, .. }
+        | ActCommand::Fill { opts, .. }
+        | ActCommand::Type { opts, .. }
+        | ActCommand::Clear { opts, .. }
+        | ActCommand::Select { opts, .. }
+        | ActCommand::Check { opts, .. }
+        | ActCommand::Uncheck { opts, .. }
+        | ActCommand::Press { opts, .. }
+        | ActCommand::Hover { opts, .. }
+        | ActCommand::Scroll { opts, .. }
+        | ActCommand::Upload { opts, .. } => opts.json,
+    }
+}
+
 pub(super) fn dispatch(command: ActCommand, root: Option<&str>) -> Result<i32> {
     let opts = match &command {
         ActCommand::Click { opts, .. }
