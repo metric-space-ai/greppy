@@ -353,20 +353,17 @@ fn rename_identity_planner_subprocess_helper() {
         .contains("value.next()"));
 
     let omitted_root = test_tempdir("rename-identity-omitted");
-    let (_project, store_path) = index_rename_fixture(&omitted_root);
-    {
-        let store = greppy_store::Store::open(&store_path).unwrap();
-        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
-        let caller = resolve_symbol_nodes(&store, Some("caller")).unwrap()[0];
-        store
-            .conn()
-            .execute(
-                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND edge_type = 'CALLS'",
-                (caller, target),
-            )
-            .unwrap();
-    }
-    let omitted_before = ["selected.rs", "caller.rs"]
+    let (_project, _store_path) = index_rename_fixture(&omitted_root);
+    // Add a live caller after publication so no Base or Delta relation can
+    // legitimately plan its identifier. Deleting only a main-table edge is
+    // not an omission in the composed store: the matching Base edge remains
+    // visible until an overlay triple shadows it.
+    std::fs::write(
+        omitted_root.join("omitted.rs"),
+        "fn omitted(value: &mut Scheduler) { value.next(); }\n",
+    )
+    .unwrap();
+    let omitted_before = ["selected.rs", "caller.rs", "omitted.rs"]
         .map(|path| (path, std::fs::read(omitted_root.join(path)).unwrap()));
     let omitted = run_trained_rename(
         &omitted_root,
