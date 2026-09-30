@@ -3247,7 +3247,7 @@ impl ContentEngine {
                 let capability = required_str(&params, "capability")?;
                 authorize_text_transfer(
                     &path,
-                    capability,
+                    &capability,
                     &self.transfer_capability,
                     &self.transfer_root,
                 )?;
