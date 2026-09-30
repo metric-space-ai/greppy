@@ -863,6 +863,14 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         })
         .unwrap();
     assert_eq!(v6_vectors, 1, "v6 fixture must contain one valid vector");
+    // `publish_graph_with_summary` publishes the completed database file; it
+    // intentionally does not copy SQLite sidecars. Match the production Base
+    // builder contract by folding this fixture's workspace downgrade and
+    // vector row out of the WAL before publishing it.
+    previous_store
+        .conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
     drop(previous_store);
 
     let previous_layout = greppy_store::BaseStoreLayout::new(&store, &previous_identity).unwrap();
@@ -879,6 +887,30 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             )
             .unwrap();
     }
+    let published_v6 = greppy_store::Store::open_with(
+        &previous_layout.graph,
+        greppy_store::OpenOptions::read_only(),
+    )
+    .unwrap();
+    let published_v6_vectors: i64 = published_v6
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        published_v6_vectors, v6_vectors,
+        "published v6 fixture must contain the vector before migration"
+    );
+    let published_v6_workspaces = published_v6.list_workspace_states().unwrap();
+    assert!(
+        !published_v6_workspaces.is_empty()
+            && published_v6_workspaces
+                .iter()
+                .all(|workspace| workspace.indexer_version == "greppy-indexer-v6"),
+        "published v6 fixture must preserve the downgraded workspace version"
+    );
+    drop(published_v6);
     std::fs::remove_dir_all(base_path.parent().expect("Base graph parent"))
         .expect("remove current v7 Base generation");
     let bound_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
