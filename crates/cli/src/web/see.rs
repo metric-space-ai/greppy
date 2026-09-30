@@ -127,21 +127,10 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                 return emit_error(json, invalid(&format!("web find: {message}")));
             }
             let take = if first { 1 } else { limit };
-            if let Some(selector) = structured_css_selector(&query) {
-                return super::runtimes::structured_dom(
-                    root,
-                    json,
-                    session,
-                    serde_json::json!({
-                        "op": "find", "selector": selector, "limit": take, "fields": []
-                    }),
-                );
-            }
-            let body = format!(
-                "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) \
-                 {{ return describe(e, false); }}) }};"
-            );
-            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+            super::runtimes::structured_dom(
+                root, json, session,
+                serde_json::json!({"op":"find","query":normalize_node_query(&query),"limit":take,"fields":[]}),
+            )
         }
         SeeCommand::Extract {
             query,
@@ -189,32 +178,10 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                     );
                 }
             }
-            if let Some(selector) = structured_css_selector(&query) {
-                return super::runtimes::structured_dom(
-                    root,
-                    json,
-                    session,
-                    serde_json::json!({
-                        "op": "extract", "selector": selector, "limit": limit, "fields": wanted
-                    }),
-                );
-            }
-            let list = serde_json::Value::String(wanted.join(",")).to_string();
-            let body = format!(
-                "var want = {list}.split(','); \
-                 return {{ count: nodes.length, rows: nodes.slice(0, {limit}).map(function(e) {{ \
-                   var row = {{}}; \
-                   want.forEach(function(f) {{ \
-                     if (f.indexOf('attr:') === 0) row[f] = e.getAttribute(f.slice(5)); \
-                     else if (f === 'text') row.text = String(e.textContent == null ? '' : e.textContent).replace(/\\s+/g, ' ').trim(); \
-                     else if (f === 'tag') row.tag = e.tagName.toLowerCase(); \
-                     else if (f === 'id') row.id = e.id || null; \
-                     else row[f] = e[f] === undefined ? null : e[f]; \
-                   }}); \
-                   return row; \
-                 }}) }};"
-            );
-            super::runtimes::evaluate(root, json, session, &query_expression(&query, &body))
+            super::runtimes::structured_dom(
+                root, json, session,
+                serde_json::json!({"op":"extract","query":normalize_node_query(&query),"limit":limit,"fields":wanted}),
+            )
         }
         SeeCommand::Inspect {
             query,
@@ -657,14 +624,6 @@ fn query_expression(query: &str, body: &str) -> String {
         "(function(){{ var resolve = {RESOLVER_JS}; var describe = {DESCRIBE_JS}; \
          var nodes = resolve({literal}); {body} }})()"
     )
-}
-
-fn structured_css_selector(query: &str) -> Option<&str> {
-    let query = query.trim();
-    if let Some(selector) = query.strip_prefix("css=") {
-        return (!selector.trim().is_empty()).then_some(selector.trim());
-    }
-    (!query.contains(['=', '~'])).then_some(query)
 }
 
 pub(super) fn normalize_node_query(query: &str) -> String {

@@ -83,19 +83,19 @@ use script_traits::{
 fn structured_dom_script(source: &str) -> Result<Option<String>, ()> {
     let value: serde_json::Value = serde_json::from_str(source).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
-    if object.keys().any(|key| !matches!(key.as_str(), "op"|"selector"|"fields"|"limit")) { return Err(()) }
+    if object.keys().any(|key| !matches!(key.as_str(), "op"|"query"|"fields"|"limit")) { return Err(()) }
     let op = object.get("op").and_then(|v| v.as_str()).ok_or(())?;
     if !matches!(op, "find"|"extract") { return Err(()) }
-    let selector = object.get("selector").and_then(|v| v.as_str()).ok_or(())?;
-    if selector.is_empty() || selector.len() > 16_384 { return Err(()) }
+    let query = object.get("query").and_then(|v| v.as_str()).ok_or(())?;
+    if query.is_empty() || query.len() > 16_384 { return Err(()) }
     let limit = object.get("limit").and_then(|v| v.as_u64()).ok_or(())?;
     if limit > 10_000 { return Err(()) }
     let fields = object.get("fields").and_then(|v| v.as_array()).cloned().ok_or(())?;
     let allowed = ["text","href","value","id","tag","checked"];
     if fields.iter().any(|v| v.as_str().is_none_or(|f| !allowed.contains(&f) && !f.strip_prefix("attr:").is_some_and(|name| !name.is_empty()))) { return Err(()) }
-    let selector = serde_json::to_string(selector).map_err(|_| ())?;
+    let query = serde_json::to_string(query).map_err(|_| ())?;
     let fields = serde_json::to_string(&fields).map_err(|_| ())?;
-    Ok(Some(format!(r#"(function(){{var nodes=Array.prototype.slice.call(document.querySelectorAll({selector}));var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f.indexOf('attr:')===0)o[f]=e.getAttribute(f.slice(5));else if(f==='text')o.text=String(e.textContent==null?'':e.textContent).replace(/\s+/g,' ').trim();else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(function(e){{var b=e.getBoundingClientRect();return {{tag:e.tagName.toLowerCase(),id:e.id||null,text:String(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,120),visible:!!(b.width||b.height)&&getComputedStyle(e).visibility!=='hidden'&&getComputedStyle(e).display!=='none',box:{{x:Math.round(b.x),y:Math.round(b.y),w:Math.round(b.width),h:Math.round(b.height)}}}};}})}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
+    Ok(Some(format!(r#"(function(){{var q={query},m=/^([a-z]+)(=|~)([\s\S]*)$/.exec(q),kind=m?m[1]:'css',op=m?m[2]:'=',val=m?m[3]:q,all=Array.prototype.slice.call(document.querySelectorAll('*'));function norm(s){{return String(s==null?'':s).replace(/\s+/g,' ').trim();}}function regex(v){{var r=/^\/([\s\S]*)\/([imsu]*)$/.exec(v);return r?new RegExp(r[1],r[2]):new RegExp(v);}}var nodes=[];if(kind==='css')nodes=Array.prototype.slice.call(document.querySelectorAll(val));else if(kind==='xpath'){{var it=document.evaluate(val,document,null,5,null),n;while((n=it.iterateNext()))nodes.push(n);}}else if(kind==='id')nodes=Array.prototype.slice.call(document.querySelectorAll(String.fromCharCode(35)+CSS.escape(val)));else if(kind==='tag')nodes=Array.prototype.slice.call(document.getElementsByTagName(val));else if(kind==='text'){{var re=op==='~'?regex(val):null;nodes=all.filter(function(e){{return re?re.test(norm(e.textContent)):norm(e.textContent)===norm(val);}});}}else if(kind==='role')nodes=all.filter(function(e){{var r=e.getAttribute('role'),t=e.tagName.toLowerCase();if(r)return r===val;if(val==='button')return t==='button'||(t==='input'&&/^(button|submit|reset)$/.test(e.type||''));if(val==='link')return t==='a'&&e.hasAttribute('href');if(val==='textbox')return t==='textarea'||(t==='input'&&!/^(button|submit|reset|checkbox|radio|file)$/.test(e.type||''));if(val==='checkbox')return t==='input'&&e.type==='checkbox';if(val==='heading')return /^h[1-6]$/.test(t);return false;}});var fields={fields};function row(e){{var o={{}};fields.forEach(function(f){{if(f.indexOf('attr:')===0)o[f]=e.getAttribute(f.slice(5));else if(f==='text')o.text=norm(e.textContent);else if(f==='tag')o.tag=e.tagName.toLowerCase();else if(f==='id')o.id=e.id||null;else o[f]=e[f]===undefined?null:e[f];}});return o;}}function describe(e){{var b=e.getBoundingClientRect(),o={{tag:e.tagName.toLowerCase(),id:e.id||null,text:norm(e.textContent).slice(0,120),visible:!!(b.width||b.height)&&getComputedStyle(e).visibility!=='hidden'&&getComputedStyle(e).display!=='none',box:{{x:Math.round(b.x),y:Math.round(b.y),w:Math.round(b.width),h:Math.round(b.height)}}}};if(e.value!==undefined)o.value=e.value;if(e.checked!==undefined)o.checked=e.checked;if(e.disabled!==undefined)o.disabled=e.disabled;if(e.href)o.href=e.href;return o;}}return {op:?}==='find'?{{count:nodes.length,nodes:nodes.slice(0,{limit}).map(describe)}}:{{count:nodes.length,rows:nodes.slice(0,{limit}).map(row)}};}})()"#)))
 }
 fn prepare_embedder_script(source: String, structured: bool) -> Result<(String, bool), ()> {
     if !structured { return Ok((source, false)); }
@@ -106,10 +106,16 @@ mod greppy_structured_dom_tests {
     use super::*;
     #[test]
     fn closed_schema_cannot_promote_arbitrary_source() {
-        let valid = r#"{"op":"extract","selector":"a","fields":["text"]}"#;
+        let valid = r#"{"op":"extract","query":"css=a","fields":["text"],"limit":5}"#;
         assert!(prepare_embedder_script(valid.into(), true).unwrap().1);
-        assert!(prepare_embedder_script(r#"{"op":"extract","selector":"a","fields":[],"source":"alert(1)"}"#.into(), true).is_err());
+        assert!(prepare_embedder_script(r#"{"op":"extract","query":"css=a","fields":[],"limit":5,"source":"alert(1)"}"#.into(), true).is_err());
         assert_eq!(prepare_embedder_script(valid.into(), false).unwrap(), (valid.into(), false));
+        let (_, trusted) = prepare_embedder_script(
+            r#"{"op":"find","query":"text~/hello\\s+world/i","fields":[],"limit":3}"#.into(), true,
+        ).unwrap();
+        assert!(trusted);
+        let script = structured_dom_script(valid).unwrap().unwrap();
+        assert!(script.contains("replace(/\s+/g,' ')") && script.contains("getBoundingClientRect"));
     }
 }
 use servo_arc::Arc as ServoArc;
