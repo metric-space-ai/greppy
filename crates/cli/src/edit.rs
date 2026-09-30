@@ -3276,6 +3276,23 @@ fn rust_selected_local_free_function_owns_site(
     else {
         return false;
     };
+    let mut call = Some(reference);
+    let mut unqualified_call = false;
+    while let Some(node) = call {
+        if node.kind() == "call_expression" {
+            unqualified_call = node
+                .child_by_field_name("function")
+                .is_some_and(|function| function.byte_range() == reference.byte_range());
+            break;
+        }
+        if matches!(node.kind(), "scoped_identifier" | "field_expression") {
+            break;
+        }
+        call = node.parent();
+    }
+    if !unqualified_call {
+        return false;
+    }
     let mut definition_module = None;
     let mut ancestor = Some(definition);
     while let Some(node) = ancestor {
@@ -3296,6 +3313,60 @@ fn rust_selected_local_free_function_owns_site(
     }
     if definition_module.is_none() || definition_module != reference_module {
         return false;
+    }
+
+    // Cover binding forms that are not ordinary function parameters or `let`
+    // declarations: for/match/if-let/while-let patterns and closure parameters.
+    // Any earlier same-name binding whose lexical owner contains this call
+    // makes the call's target ambiguous without name resolution.
+    let mut binding_stack = vec![tree.root_node()];
+    while let Some(candidate) = binding_stack.pop() {
+        if matches!(candidate.kind(), "identifier" | "field_identifier")
+            && candidate.start_byte() < reference.start_byte()
+            && content.get(candidate.byte_range()) == Some(short_name.as_bytes())
+        {
+            let mut ancestor = candidate.parent();
+            let mut binding_owner = None;
+            while let Some(node) = ancestor {
+                if matches!(
+                    node.kind(),
+                    "let_declaration"
+                        | "parameter"
+                        | "for_expression"
+                        | "match_arm"
+                        | "let_condition"
+                        | "closure_parameters"
+                ) {
+                    binding_owner = Some(node);
+                    break;
+                }
+                if matches!(node.kind(), "function_item" | "mod_item" | "source_file") {
+                    break;
+                }
+                ancestor = node.parent();
+            }
+            if let Some(binding) = binding_owner {
+                let mut scope = Some(binding);
+                while let Some(node) = scope {
+                    if matches!(
+                        node.kind(),
+                        "block"
+                            | "for_expression"
+                            | "match_arm"
+                            | "if_expression"
+                            | "while_expression"
+                            | "closure_expression"
+                            | "function_item"
+                    ) && node.byte_range().contains(&reference.start_byte())
+                    {
+                        return false;
+                    }
+                    scope = node.parent();
+                }
+            }
+        }
+        let mut cursor = candidate.walk();
+        binding_stack.extend(candidate.named_children(&mut cursor));
     }
 
     // A nested function item can shadow the selected module function for only
@@ -3959,6 +4030,91 @@ mod patch_rollback_tests {
             module_sites[0],
             module_sites[2],
         ));
+
+        let mixed_form =
+            b"fn get_lit_str() {}\nfn caller() { get_lit_str(); other::get_lit_str(); }\n";
+        let mixed_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("mixed.rs"),
+            mixed_form,
+            &[(0, mixed_form.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(mixed_sites.len(), 3);
+        assert!(rust_selected_local_free_function_owns_site(
+            mixed_form,
+            "get_lit_str",
+            mixed_sites[0],
+            mixed_sites[1],
+        ));
+        assert!(!rust_selected_local_free_function_owns_site(
+            mixed_form,
+            "get_lit_str",
+            mixed_sites[0],
+            mixed_sites[2],
+        ));
+
+        let closure_shadow = b"fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n";
+        let closure_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("closure.rs"),
+            closure_shadow,
+            &[(0, closure_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(closure_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            closure_shadow,
+            "get_lit_str",
+            closure_sites[0],
+            closure_sites[2],
+        ));
+
+        let match_shadow = b"fn get_lit_str() {}\nfn caller(value: Option<fn()>) { match value { Some(get_lit_str) => get_lit_str(), None => {} } }\n";
+        let match_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("match.rs"),
+            match_shadow,
+            &[(0, match_shadow.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(match_sites.len(), 3);
+        assert!(!rust_selected_local_free_function_owns_site(
+            match_shadow,
+            "get_lit_str",
+            match_sites[0],
+            match_sites[2],
+        ));
+
+        for (path, source) in [
+            (
+                "for.rs",
+                b"fn get_lit_str() {}\nfn caller(items: Vec<fn()>) { for get_lit_str in items { get_lit_str(); } }\n".as_slice(),
+            ),
+            (
+                "if-let.rs",
+                b"fn get_lit_str() {}\nfn caller(value: Option<fn()>) { if let Some(get_lit_str) = value { get_lit_str(); } }\n".as_slice(),
+            ),
+            (
+                "while-let.rs",
+                b"fn get_lit_str() {}\nfn caller(mut value: Option<fn()>) { while let Some(get_lit_str) = value.take() { get_lit_str(); } }\n".as_slice(),
+            ),
+        ] {
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new(path),
+                source,
+                &[(0, source.len())],
+                "get_lit_str",
+            )
+            .unwrap();
+            assert_eq!(sites.len(), 3, "{path}");
+            assert!(!rust_selected_local_free_function_owns_site(
+                source,
+                "get_lit_str",
+                sites[0],
+                sites[2],
+            ));
+        }
     }
 
     #[test]
