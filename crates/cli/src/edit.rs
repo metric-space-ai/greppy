@@ -2740,7 +2740,7 @@ fn rust_local_free_function_owns_site(
             "use_declaration" | "let_declaration" | "parameter"
         ) && (node.kind() == "use_declaration" || node.start_byte() <= reference.start_byte())
         {
-            let active_scope = if node.kind() == "parameter" {
+            let (active_scope, active_module_scope) = if node.kind() == "parameter" {
                 let mut owner = node.parent();
                 let mut active = false;
                 while let Some(scope) = owner {
@@ -2752,10 +2752,11 @@ fn rust_local_free_function_owns_site(
                     }
                     owner = scope.parent();
                 }
-                active
+                (active, false)
             } else {
                 let mut owner = node.parent();
                 let mut active = false;
+                let mut module_scope = false;
                 while let Some(scope) = owner {
                     if matches!(scope.kind(), "source_file" | "mod_item" | "block") {
                         let key = (scope.start_byte(), scope.end_byte());
@@ -2764,18 +2765,19 @@ fn rust_local_free_function_owns_site(
                         } else {
                             reference_module == Some(key)
                         };
+                        module_scope = active && scope.kind() != "block";
                         break;
                     }
                     owner = scope.parent();
                 }
-                active
+                (active, module_scope)
             };
             if active_scope {
                 let mut declaration_stack = vec![node];
                 while let Some(part) = declaration_stack.pop() {
-                    if glob_import_shadows
-                        && node.kind() == "use_declaration"
+                    if node.kind() == "use_declaration"
                         && matches!(part.kind(), "use_wildcard" | "wildcard_import")
+                        && (glob_import_shadows || !active_module_scope)
                     {
                         return false;
                     }
@@ -4038,6 +4040,22 @@ mod patch_rollback_tests {
             "get_lit_str",
             module_sites[0],
             module_sites[2],
+        ));
+
+        let block_glob = b"fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); }\n";
+        let glob_sites = greppy_edit::verbs::rename_identifier_sites(
+            std::path::Path::new("block-glob.rs"),
+            block_glob,
+            &[(0, block_glob.len())],
+            "get_lit_str",
+        )
+        .unwrap();
+        assert_eq!(glob_sites.len(), 2);
+        assert!(!rust_selected_local_free_function_owns_site(
+            block_glob,
+            "get_lit_str",
+            glob_sites[0],
+            glob_sites[1],
         ));
 
         let mixed_form =
