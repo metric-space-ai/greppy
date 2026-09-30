@@ -469,7 +469,7 @@ fn rename_identity_planner_subprocess_helper() {
     std::fs::create_dir(free_root.join(".git")).unwrap();
     std::fs::write(
         free_root.join("selected_free.rs"),
-        "pub fn get_lit_str() {}\npub fn selected_caller() {\n    get_lit_str();\n    get_lit_str();\n    get_lit_str();\n}\n",
+        "struct Container;\nimpl Container {\n    fn from_ast() {\n        if let Some(_) = get_lit_str() {}\n        if let Some(_) = get_lit_str() {}\n        if let Some(_) = get_lit_str() {}\n    }\n}\npub fn get_lit_str() {}\n",
     )
     .unwrap();
     let unrelated_free = "pub fn get_lit_str() {}\npub fn unrelated_caller() { get_lit_str(); }\n";
@@ -497,7 +497,7 @@ fn rename_identity_planner_subprocess_helper() {
     assert!(free_outcome.published);
     assert_eq!(
         std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
-        "pub fn get_str_literal() {}\npub fn selected_caller() {\n    get_str_literal();\n    get_str_literal();\n    get_str_literal();\n}\n"
+        "struct Container;\nimpl Container {\n    fn from_ast() {\n        if let Some(_) = get_str_literal() {}\n        if let Some(_) = get_str_literal() {}\n        if let Some(_) = get_str_literal() {}\n    }\n}\npub fn get_str_literal() {}\n"
     );
     assert_eq!(
         std::fs::read_to_string(free_root.join("unrelated_free.rs")).unwrap(),
