@@ -149,10 +149,14 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
         if fd < 3 || fd == probe.as_raw_fd() {
             continue;
         }
-        let Ok(candidate) = fs::metadata(entry.path()) else {
+        // macOS stat(/dev/fd/N) reports the fdesc filesystem's device,
+        // not the backing file's device. Compare the descriptor itself.
+        let mut candidate = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, candidate.as_mut_ptr()) } != 0 {
             continue;
-        };
-        if candidate.dev() != metadata.dev() || candidate.ino() != metadata.ino() {
+        }
+        let candidate = unsafe { candidate.assume_init() };
+        if candidate.st_dev as u64 != metadata.dev() || candidate.st_ino as u64 != metadata.ino() {
             continue;
         }
         unsafe {
