@@ -2689,7 +2689,7 @@ fn rust_free_function_reference_inventory(
             if !selected_files.contains(&rel)
                 && unqualified
                 && unplanned.iter().all(|site| {
-                    rust_local_free_function_owns_site(&content, short_name, *site, true)
+                    rust_local_free_function_owns_site(&content, short_name, *site, false)
                 })
             {
                 continue;
@@ -3888,7 +3888,9 @@ mod patch_rollback_tests {
         let dir = tempfile::tempdir().unwrap();
         let selected =
             b"fn get_lit_str() {}\nfn selected_caller() { get_lit_str(); get_lit_str(); }\n";
-        let unrelated = b"fn get_lit_str() {}\nfn unrelated_caller() { get_lit_str(); }\n";
+        // A module-level wildcard cannot shadow an explicit local function.
+        // Serde's two independent attr.rs copies both import symbol::*.
+        let unrelated = b"mod symbols { pub const TAG: u8 = 0; }\nuse symbols::*;\nfn get_lit_str() {}\nfn unrelated_caller() { get_lit_str(); }\n";
         std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
         std::fs::write(dir.path().join("unrelated.rs"), unrelated).unwrap();
         let sites = greppy_edit::verbs::rename_identifier_sites(
@@ -4236,7 +4238,7 @@ mod patch_rollback_tests {
             source,
             "get_lit_str",
             sites[1],
-            true
+            false
         ));
     }
 
