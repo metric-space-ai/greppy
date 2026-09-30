@@ -18,8 +18,8 @@ pub(crate) const MODE_OVERLAY: &str = "overlay";
 pub(crate) const MODE_PRIVATE: &str = "private";
 const VISIBILITY_META_KEY: &str = "store_cow.visibility.v1";
 const OVERLAY_BINDING_META_KEY: &str = "store_cow.binding.v1";
-const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v2";
-const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
+const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY;
+const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = greppy_indexer::RUST_CALLER_EDGES_REPAIR_COMPLETE;
 const BASE_EMBEDDING_DEFERRED_META_PREFIX: &str = "store_cow.embedding_deferred.v1:";
 #[cfg(debug_assertions)]
 const ENV_TEST_BASE_SUMMARY_FAIL: &str = "GREPPY_TEST_BASE_SUMMARY_FAIL";
@@ -716,7 +716,7 @@ pub(crate) fn visibility_for_open_connection(
         .unwrap_or_else(|| visibility_against(root, base_commit))
 }
 
-/// Repair a pre-PR138 Delta whose workspace state already advertises v7 but
+/// Repair a Delta from an older Rust path resolver whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
 /// The repair consumes the composed visible raw-edge view, including raw edges
@@ -807,6 +807,48 @@ pub(crate) fn repair_persisted_v7_delta(
     Ok(true)
 }
 
+/// Repair an already-indexed single/private store on normal query open.
+/// This shares the one-shot resolver marker with CoW, but never attaches or
+/// scans an immutable Base. The writer lock covers re-check through commit.
+pub(crate) fn ensure_persisted_single_store_repaired(
+    path: &Path,
+    root: &Path,
+    project: &str,
+) -> Result<()> {
+    let observed = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    if !persisted_v7_delta_needs_repair(&observed, root)? {
+        return Ok(());
+    }
+    drop(observed);
+    let deadline = std::time::Instant::now() + crate::NAV_FRESHNESS_BUDGET;
+    let _lock = loop {
+        match greppy_freshness::try_acquire(path) {
+            Ok(lock) => break lock,
+            Err(greppy_freshness::LockError::Held { path: lock_path }) => {
+                let observed =
+                    greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+                if !persisted_v7_delta_needs_repair(&observed, root)? {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Lock(format!(
+                        "timed out waiting for single-store Rust repair; lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut store =
+        greppy_store::Store::open_with(path, greppy_store::OpenOptions::query_writer())?;
+    if persisted_v7_delta_needs_repair(&store, root)? {
+        greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_persisted_v7_delta_repaired(
     delta_path: &Path,
     base_path: &Path,
@@ -862,6 +904,23 @@ pub(crate) fn persisted_v7_delta_needs_repair(
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
+    if store.is_overlay() && !greppy_indexer::rust_caller_edges_repaired(store)? {
+        let base_marker = store.conn().query_row(
+            "SELECT value FROM greppy_base.schema_meta WHERE key = ?1",
+            [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            |row| row.get::<_, String>(0),
+        );
+        let base_current = match base_marker {
+            Ok(value) => value == RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => return Err(Error::Store(format!("read Base Rust repair marker: {error}"))),
+        };
+        if !base_current {
+            // A sparse Delta rebuild does not certify an older immutable
+            // Base. Leave repair pending for its one-shot visible raw pass.
+            return Ok(());
+        }
+    }
     store
         .conn()
         .execute(
@@ -2692,6 +2751,228 @@ mod tests {
     }
 
     #[test]
+    fn sparse_cow_marker_does_not_certify_an_unrepaired_base() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        }
+        let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(!greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "Delta-only work cannot mark a legacy Base complete");
+        drop(store);
+        let base = greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::query_writer()).unwrap();
+        greppy_indexer::mark_rust_caller_edges_repaired(&base).unwrap();
+        drop(base);
+        let store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        mark_rust_caller_edges_repaired(&store).unwrap();
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap(), "a current Base makes sparse publication current without a Base pass");
+    }
+
+    #[test]
+    fn persisted_single_store_rust_repair_preserves_cache_and_is_one_shot() {
+        let test = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(persisted_single_store_rust_repair_preserves_cache_and_is_one_shot_body)
+            .unwrap();
+        if let Err(panic) = test.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn persisted_single_store_rust_repair_preserves_cache_and_is_one_shot_body() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::capture(&[
+            "GREPPY_STORE_DIR",
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_AUTO_REINDEX",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
+        ]);
+        for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] {
+            std::env::remove_var(name);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let root = crate::resolving::resolve_root(Some(&repo.path().to_string_lossy())).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"vcop2-tools\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod m68000_aot;\n").unwrap();
+        std::fs::write(root.join("src/m68000_aot.rs"), "pub fn compile() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/callers.rs"),
+            "use vcop2_tools::m68000_aot::{compile};\nfn caller() { compile(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/other.py"),
+            "def py_target():\n    pass\ndef py_caller():\n    py_target()\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "single-store fixture"]);
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_AUTO_REINDEX", "0");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        let path = crate::workspace_locator::store_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&path).unwrap();
+        let indexed = greppy_indexer::index(&mut store, &root, "p").unwrap();
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        let target = store
+            .get_node_by_qname("p", "src/m68000_aot.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("p", "tests/callers.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "fixture".into(),
+                prompt_version: "fixture".into(),
+                task: "code".into(),
+                node_id: Some(caller.id),
+                chunk_idx: 0,
+                qualified_name: caller.qualified_name.clone(),
+                file_path: caller.file_path.clone(),
+                start_line: 2,
+                end_line: 2,
+                content_sha256: "a".repeat(64),
+                graph_generation: indexed.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        let nodes_before = format!(
+            "{:?}",
+            store.list_nodes_by_label("p", "Function", 100).unwrap()
+        );
+        let states_before = format!("{:?}", store.list_file_states("p").unwrap());
+        let workspace_before = format!("{:?}", store.list_workspace_states().unwrap());
+        let vector_before: Vec<u8> = store
+            .conn()
+            .query_row(
+                "SELECT vector FROM vector_embeddings WHERE project = 'p'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let py_before: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id=e.source_id WHERE n.file_path='src/other.py'", [], |row| row.get(0)).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id=?1 AND edge_type IN ('CALLS','USAGE','IMPORTS')",
+                [target.id],
+            )
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: "p".into(),
+                source_id: caller.id,
+                target_id: caller.id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v2','complete')", []).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_rust_repair BEFORE INSERT ON edges WHEN NEW.edge_type='CALLS' BEGIN SELECT RAISE(ABORT,'fixture repair failure'); END;").unwrap();
+        drop(store);
+        let root_string = root.to_string_lossy().into_owned();
+        assert!(crate::freshness::open_default_store(Some(&root_string)).is_err());
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
+            "failed replacement cannot publish completeness"
+        );
+        assert_eq!(
+            store
+                .outgoing_edges(caller.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1,
+            "failed repair rolls back old edge deletion"
+        );
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER reject_rust_repair")
+            .unwrap();
+        drop(store);
+        let store = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(store
+            .outgoing_edges(caller.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .all(|edge| edge.target_id != caller.id));
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        assert_eq!(
+            format!(
+                "{:?}",
+                store.list_nodes_by_label("p", "Function", 100).unwrap()
+            ),
+            nodes_before
+        );
+        assert_eq!(
+            format!("{:?}", store.list_file_states("p").unwrap()),
+            states_before
+        );
+        assert_eq!(
+            format!("{:?}", store.list_workspace_states().unwrap()),
+            workspace_before
+        );
+        assert_eq!(
+            store
+                .conn()
+                .query_row(
+                    "SELECT vector FROM vector_embeddings WHERE project='p'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            vector_before
+        );
+        assert_eq!(store.conn().query_row("SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id=e.source_id WHERE n.file_path='src/other.py'", [], |row| row.get::<_, i64>(0)).unwrap(), py_before);
+        drop(store);
+        // A trigger makes any repeated relation resolution fail, so successful
+        // ordinary read and writer opens prove the marker skips that work.
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
+                .unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_repeat_repair BEFORE INSERT ON edges BEGIN SELECT RAISE(ABORT,'repair repeated'); END;").unwrap();
+        drop(store);
+        drop(crate::freshness::open_default_store(Some(&root_string)).unwrap());
+        drop(crate::freshness::open_default_store_query_writer(Some(&root_string)).unwrap());
+    }
+
+    #[test]
     fn persisted_v7_delta_repair_is_one_shot_and_preserves_vectors() {
         let test = std::thread::Builder::new()
             .name("persisted-v7-delta-repair".into())
@@ -2931,7 +3212,7 @@ mod tests {
                 .execute(
                     "INSERT OR REPLACE INTO main.schema_meta (key, value) VALUES (?1, ?2)",
                     [
-                        "greppy.rust_caller_edges_repair.v1",
+                        "greppy.rust_caller_edges_repair.v2",
                         RUST_CALLER_EDGES_REPAIR_COMPLETE,
                     ],
                 )
@@ -3204,10 +3485,12 @@ mod tests {
         // The one-shot composed rebuild shadows an existing Base relation too.
         // Store visibility suppresses the matching Base row, so this is one
         // visible relation, not two. Only missing Base edges carry repair markers.
+        // Exact reexport resolution also retains the caller's import of outer.
         let expected_relations = [
             ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
             ("src/base.rs::Function::base_caller", "CALLS", 1),
             ("src/caller.rs::Function::caller", "USAGE", 0),
+            ("src/caller.rs::__file__", "IMPORTS", 0),
             ("src/stable.rs::Function::stable_caller", "CALLS", 0),
         ]
         .into_iter()
