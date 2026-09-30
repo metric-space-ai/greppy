@@ -3908,7 +3908,8 @@ mod patch_rollback_tests {
         assert!(refusal.message.contains("remove its @@ header"));
         assert!(refusal.message.contains("nothing written"));
         let recovered = &diff[..diff.len() - 3];
-        let files = parse_trained_patch(recovered).unwrap();
+        let files =
+            parse_trained_patch(recovered).unwrap_or_else(|refusal| panic!("{}", refusal.message));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].hunks.len(), 1);
     }
