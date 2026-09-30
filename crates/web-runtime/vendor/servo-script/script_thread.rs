@@ -106,7 +106,7 @@ mod greppy_structured_dom_tests {
     use super::*;
     #[test]
     fn closed_schema_cannot_promote_arbitrary_source() {
-        let valid = r#"{"op":"extract","query":"css=a","fields":["text"],"limit":5}"#;
+        let valid = r#"{"op":"extract","query":"css=a","fields":["text","href","attr:data-id"],"limit":5}"#;
         assert!(prepare_embedder_script(valid.into(), true).unwrap().1);
         assert!(prepare_embedder_script(r#"{"op":"extract","query":"css=a","fields":[],"limit":5,"source":"alert(1)"}"#.into(), true).is_err());
         assert_eq!(prepare_embedder_script(valid.into(), false).unwrap(), (valid.into(), false));
@@ -116,6 +116,11 @@ mod greppy_structured_dom_tests {
         assert!(trusted);
         let script = structured_dom_script(valid).unwrap().unwrap();
         assert!(script.contains("replace(/\s+/g,' ')") && script.contains("getBoundingClientRect"));
+        for query in ["css=a", "xpath=//a", "id=main", "tag=h1", "role=link", "text=Hello", "text~/hello\\s+world/i"] {
+            let request = serde_json::json!({"op":"find","query":query,"fields":[],"limit":3}).to_string();
+            assert!(structured_dom_script(&request).unwrap().is_some(), "{query}");
+        }
+        assert!(structured_dom_script(r#"{"op":"find","query":"css=a","fields":[],"limit":"3"}"#).is_err());
     }
 }
 use servo_arc::Arc as ServoArc;
