@@ -2793,7 +2793,7 @@ mod tests {
             "GREPPY_STORE_DIR",
             "GREPPY_PROJECT_IDENTITY",
             "GREPPY_AUTO_REINDEX",
-            crate::ENV_TEST_SKIP_INFERENCE,
+            "GREPPY_TEST_SKIP_INFERENCE",
             ENV_MODE,
             ENV_BASE_PATH,
             ENV_BASE_COMMIT,
@@ -2827,7 +2827,7 @@ mod tests {
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
         std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
         std::env::set_var("GREPPY_AUTO_REINDEX", "0");
-        std::env::set_var(crate::ENV_TEST_SKIP_INFERENCE, "1");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
         let path = crate::workspace_locator::store_path(&root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut store = greppy_store::Store::open(&path).unwrap();
