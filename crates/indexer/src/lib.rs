@@ -6866,7 +6866,9 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .unwrap();
         assert!(
             usages.iter().all(|edge| edge.source_id != caller.id),
-            "obsolete struct field label must not resolve to a free function"
+            "obsolete struct field label must not resolve to a free function; usages={usages:?}; raw={:?}; mask={:?}",
+            overlay.list_raw_edges("test").unwrap(),
+            overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |row| row.get::<_, String>(0))
         );
         assert!(
             usages.iter().any(|edge| edge.source_id == valid.id),
