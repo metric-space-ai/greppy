@@ -2687,9 +2687,9 @@ fn rust_free_function_reference_inventory(
                 .collect::<Vec<_>>();
             if !selected_files.contains(&rel)
                 && unqualified
-                && unplanned
-                    .iter()
-                    .all(|site| rust_local_free_function_owns_site(&content, short_name, *site))
+                && unplanned.iter().all(|site| {
+                    rust_local_free_function_owns_site(&content, short_name, *site, true)
+                })
             {
                 continue;
             }
@@ -2707,6 +2707,7 @@ fn rust_local_free_function_owns_site(
     content: &[u8],
     short_name: &str,
     site: (usize, usize),
+    glob_import_shadows: bool,
 ) -> bool {
     let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
         return false;
@@ -2772,7 +2773,8 @@ fn rust_local_free_function_owns_site(
             if active_scope {
                 let mut declaration_stack = vec![node];
                 while let Some(part) = declaration_stack.pop() {
-                    if node.kind() == "use_declaration"
+                    if glob_import_shadows
+                        && node.kind() == "use_declaration"
                         && matches!(part.kind(), "use_wildcard" | "wildcard_import")
                     {
                         return false;
@@ -3262,7 +3264,10 @@ fn rust_selected_local_free_function_owns_site(
     definition_site: (usize, usize),
     reference_site: (usize, usize),
 ) -> bool {
-    if !rust_local_free_function_owns_site(content, short_name, reference_site) {
+    // A same-module item is resolved ahead of glob imports. Keep glob imports
+    // conservative when proving an unrelated local definition, but do not let
+    // them hide calls to the selected item in its own module.
+    if !rust_local_free_function_owns_site(content, short_name, reference_site, false) {
         return false;
     }
     let Ok(tree) = greppy_parser::parse(greppy_parser::Language::Rust, content) else {
@@ -3978,17 +3983,20 @@ mod patch_rollback_tests {
         assert!(rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            true
         ));
         assert!(rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[3]
+            sites[3],
+            true
         ));
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[4]
+            sites[4],
+            true
         ));
     }
 
@@ -4150,7 +4158,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[2]
+            sites[2],
+            true
         ));
     }
 
@@ -4168,7 +4177,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            true
         ));
     }
 
@@ -4186,7 +4196,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[2]
+            sites[2],
+            true
         ));
     }
 
@@ -4205,7 +4216,8 @@ mod patch_rollback_tests {
         assert!(!rust_local_free_function_owns_site(
             source,
             "get_lit_str",
-            sites[1]
+            sites[1],
+            true
         ));
     }
 
