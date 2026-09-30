@@ -2509,7 +2509,8 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Match production namespace anchors even when TMPDIR is a short alias.
+        dir.canonicalize().unwrap()
     }
 
     #[test]
