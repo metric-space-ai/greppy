@@ -2070,7 +2070,11 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             if old_lines.is_empty() {
                 return Err(EditRefusal::new(
                     "invalid_patch",
-                    format!("{path}: a hunk has no context line to anchor on"),
+                    if new_lines.is_empty() {
+                        format!("{path}: hunk {input_hunk_number} at patch input line {input_line} is empty; remove its @@ header or add hunk content with context — nothing written")
+                    } else {
+                        format!("{path}: hunk {input_hunk_number} at patch input line {input_line} contains only additions and has no existing line to anchor on; include an unchanged context line — nothing written")
+                    },
                     20,
                 ));
             }
@@ -2774,7 +2778,14 @@ fn rust_local_free_function_owns_site(
                 (active, module_scope)
             };
             if active_scope {
-                let mut declaration_stack = vec![node];
+                // Only the pattern binds a name. Calls in a let initializer
+                // and names in a parameter type cannot shadow the function.
+                let binding = if matches!(node.kind(), "let_declaration" | "parameter") {
+                    node.child_by_field_name("pattern").unwrap_or(node)
+                } else {
+                    node
+                };
+                let mut declaration_stack = vec![binding];
                 while let Some(part) = declaration_stack.pop() {
                     if node.kind() == "use_declaration"
                         && matches!(part.kind(), "use_wildcard" | "wildcard_import")
@@ -3884,13 +3895,32 @@ mod patch_rollback_tests {
     }
 
     #[test]
+    fn trailing_empty_hunk_reports_exact_header_and_recovery() {
+        let diff = b"--- a/patch-repro.txt\n+++ b/patch-repro.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n@@\n";
+        let refusal = match parse_trained_patch(diff) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("empty hunk must be refused"),
+        };
+        assert_eq!(refusal.code, "invalid_patch");
+        assert!(refusal
+            .message
+            .contains("hunk 2 at patch input line 7 is empty"));
+        assert!(refusal.message.contains("remove its @@ header"));
+        assert!(refusal.message.contains("nothing written"));
+        let recovered = &diff[..diff.len() - 3];
+        let files = parse_trained_patch(recovered).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks.len(), 1);
+    }
+
+    #[test]
     fn qualified_rust_free_function_rename_preserves_distinct_copy() {
         let dir = tempfile::tempdir().unwrap();
         let selected =
             b"fn get_lit_str() {}\nfn selected_caller() { get_lit_str(); get_lit_str(); }\n";
         // A module-level wildcard cannot shadow an explicit local function.
         // Serde's two independent attr.rs copies both import symbol::*.
-        let unrelated = b"mod symbols { pub const TAG: u8 = 0; }\nuse symbols::*;\nfn get_lit_str() {}\nfn unrelated_caller() { get_lit_str(); }\n";
+        let unrelated = b"mod symbols { pub const TAG: u8 = 0; }\nuse symbols::*;\nfn get_lit_str() {}\nfn unrelated_caller() { let Some(value) = Some(get_lit_str()) else { return; }; let _ = value; }\n";
         std::fs::write(dir.path().join("selected.rs"), selected).unwrap();
         std::fs::write(dir.path().join("unrelated.rs"), unrelated).unwrap();
         let sites = greppy_edit::verbs::rename_identifier_sites(
@@ -4003,6 +4033,36 @@ mod patch_rollback_tests {
             sites[4],
             true
         ));
+    }
+
+    #[test]
+    fn rust_local_binding_proof_ignores_initializer_references_and_parameter_types() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"fn get_lit_str() {}\nfn caller() { let value = get_lit_str(); }\n", true),
+            (b"fn get_lit_str() {}\nfn caller() { let Some(value) = Some(get_lit_str()) else { return; }; }\n", true),
+            (b"fn get_lit_str() {}\nfn caller() { let get_lit_str = || {}; get_lit_str(); }\n", false),
+            (b"type get_lit_str = ();\nfn get_lit_str() {}\nfn caller(arg: get_lit_str) { get_lit_str(); }\n", true),
+        ];
+        for (source, expected) in cases {
+            let sites = greppy_edit::verbs::rename_identifier_sites(
+                std::path::Path::new("bindings.rs"),
+                source,
+                &[(0, source.len())],
+                "get_lit_str",
+            )
+            .unwrap();
+            assert_eq!(
+                rust_local_free_function_owns_site(
+                    source,
+                    "get_lit_str",
+                    *sites.last().unwrap(),
+                    false
+                ),
+                *expected,
+                "{}",
+                String::from_utf8_lossy(source),
+            );
+        }
     }
 
     #[test]
