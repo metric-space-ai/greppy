@@ -413,7 +413,16 @@ pub(crate) fn dispatch_search_symbols(
     let root_path = resolve_root(root)?;
     let decision = freshness_serve_decision(&store, root, &project);
     if let FreshnessServe::Refuse(freshness) = &decision {
+        crate::context_status::invalidate(&root_path);
+        if let Ok(generation) = current_graph_generation(&store, root) {
+            crate::context_status::restricted(
+                &root_path,
+                generation.saturating_add(1),
+                crate::context_status::Capability::Graph,
+            );
+        }
         if json {
+
             search_symbols_json(
                 &store,
                 q,
@@ -433,8 +442,10 @@ pub(crate) fn dispatch_search_symbols(
         // resolves by itself, and a wrong answer is what follows.
         return Ok(freshness_refusal_exit(freshness));
     }
+    crate::context_status::acknowledge(&root_path, crate::context_status::Capability::Graph);
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
+
     if provider_policy_blocks_query(&incomplete_providers)? {
         if json {
             search_symbols_json(
