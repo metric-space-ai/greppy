@@ -2825,12 +2825,27 @@ fn client_for_endpoint(endpoint: &str, model: &str, api_key: Option<&str>) -> Cl
 }
 
 fn monitor_index_startup(
-    mut launch: crate::BackgroundJobLaunch,
+    launch: crate::BackgroundJobLaunch,
     worktree_path: &Path,
     bridge: &crate::agent_tui::EventBridge,
     cancel: &AtomicBool,
 ) -> Result<bool, String> {
-    let mut missing_ticks = 0usize;
+    monitor_index_startup_with_health(
+        launch,
+        worktree_path,
+        bridge,
+        cancel,
+        doctor_reports_embedding_complete,
+    )
+}
+
+fn monitor_index_startup_with_health(
+    mut launch: crate::BackgroundJobLaunch,
+    worktree_path: &Path,
+    bridge: &crate::agent_tui::EventBridge,
+    cancel: &AtomicBool,
+    health: impl FnOnce(&Path) -> bool,
+) -> Result<bool, String> {
     loop {
         if cancel.load(Ordering::Relaxed) {
             let owned = matches!(&launch, crate::BackgroundJobLaunch::Owned { .. });
@@ -2847,7 +2862,6 @@ fn monitor_index_startup(
         }
 
         if let Some(job) = crate::read_background_job(launch.path()) {
-            missing_ticks = 0;
             let state = job
                 .get("state")
                 .and_then(serde_json::Value::as_str)
@@ -2918,22 +2932,20 @@ fn monitor_index_startup(
                 rate_milli_per_second,
                 eta_seconds,
             });
-        } else if doctor_reports_embedding_complete(worktree_path) {
+        } else if !index_startup_job_is_running(&mut launch) {
+            // A removed journal is the terminal publication, not a reason to
+            // launch a full doctor process on every UI polling tick. Wait for
+            // the owned child (or attached writer) to finish, then prove the
+            // published snapshot once. Incomplete production indexes remain
+            // blocked; test-only inference skips are handled by the caller.
+            let ready = health(worktree_path);
             reap_owned_background_job(&mut launch);
-            return Ok(true);
-        } else {
-            if !owned_background_job_is_running(&mut launch) {
-                missing_ticks = missing_ticks.saturating_add(1);
+            if !ready && std::env::var_os("GREPPY_TEST_SKIP_INFERENCE").is_none() {
+                bridge.send_discrete(SessionEvent::Warning(
+                    "The index job ended before embeddings were complete.".into(),
+                ));
             }
-            if missing_ticks >= 20 {
-                if std::env::var_os("GREPPY_TEST_SKIP_INFERENCE").is_none() {
-                    bridge.send_discrete(SessionEvent::Warning(
-                        "The index job ended before embeddings were complete.".into(),
-                    ));
-                }
-                reap_owned_background_job(&mut launch);
-                return Ok(false);
-            }
+            return Ok(ready);
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -2967,12 +2979,14 @@ fn reap_owned_background_job(launch: &mut crate::BackgroundJobLaunch) {
     }
 }
 
-fn owned_background_job_is_running(launch: &mut crate::BackgroundJobLaunch) -> bool {
+fn index_startup_job_is_running(launch: &mut crate::BackgroundJobLaunch) -> bool {
     match launch {
         crate::BackgroundJobLaunch::Owned { child, .. } => {
             matches!(child.try_wait(), Ok(None) | Err(_))
         }
-        crate::BackgroundJobLaunch::Attached { .. } => false,
+        crate::BackgroundJobLaunch::Attached { root, .. } => {
+            crate::background_job_writer_active(root)
+        }
     }
 }
 
@@ -3875,6 +3889,34 @@ mod tests {
         let args = parse(&[]).expect("parse flagless interactive invocation");
         assert_eq!(validate_args(&args, true), Ok(()));
         assert_eq!(validate_args(&args, false), Err(EXIT_USAGE));
+    }
+
+    #[test]
+    fn finished_index_without_journal_checks_health_once_and_refuses_incomplete_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn completed indexer");
+        assert!(child.wait().expect("finish indexer").success());
+        let launch = crate::BackgroundJobLaunch::Owned {
+            child,
+            path: dir.path().join("removed-index-job.json"),
+            demand: None,
+        };
+        let (bridge, _intake) = crate::agent_tui::bounded_pair();
+        let cancel = AtomicBool::new(false);
+        let checks = std::cell::Cell::new(0);
+        let ready = monitor_index_startup_with_health(launch, dir.path(), &bridge, &cancel, |_| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .expect("terminal monitor");
+        assert_eq!(checks.get(), 1, "one proof after terminal publication");
+        assert!(
+            !ready,
+            "index exit 0 alone cannot prove embedding completeness"
+        );
     }
 
     #[test]
