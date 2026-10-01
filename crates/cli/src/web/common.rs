@@ -1038,7 +1038,9 @@ fn rpc_with_spawn_legacy(
     }
 }
 
-fn supervisor_for_session(
+/// Session creation and its first dependent request must select the same
+/// configured owner, including an explicit search endpoint or fixture.
+pub(super) fn supervisor_for_session(
     root: Option<&str>,
     spawn: &SupervisorSpawn,
     session: Option<&str>,

@@ -73,6 +73,8 @@ pub enum ResultsCommand {
     },
     /// Search the public web through the runtime.
     Search {
+        #[arg(value_name = "QUERY", conflicts_with = "query")]
+        positional_query: Option<String>,
         #[arg(long)]
         query: Option<String>,
         #[arg(long)]
@@ -93,6 +95,8 @@ pub enum ResultsCommand {
     Read(ReadArgs),
     /// Bounded research over the runtime.
     Research {
+        #[arg(value_name = "QUERY", conflicts_with = "query")]
+        positional_query: Option<String>,
         #[arg(long)]
         query: Option<String>,
         #[arg(long = "max-sources")]
@@ -275,6 +279,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             json,
         } => screenshot(root, session, output, render_complete, json),
         ResultsCommand::Search {
+            positional_query,
             query,
             domain,
             result_limit,
@@ -283,12 +288,21 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             search_endpoint,
             json,
         } => {
-            let Some(query) = query.filter(|query| !query.is_empty()) else {
-                return emit_error(json, invalid("web search requires --query QUERY"));
+            let Some(query) = query
+                .or(positional_query)
+                .filter(|query| !query.trim().is_empty())
+            else {
+                return emit_error(json, invalid("web search requires QUERY or --query QUERY"));
             };
-            let session = match resolve_session(root, session) {
+            let spawn = SupervisorSpawn {
+                fixture_url,
+                search_endpoint,
+            };
+            let session = match super::nav::resolve_or_create_session_with_spawn(
+                root, session, json, true, &spawn,
+            ) {
                 Ok(session) => session,
-                Err(error) => return emit_error(json, error),
+                Err(code) => return Ok(code),
             };
             rpc_with_spawn(
                 root,
@@ -301,10 +315,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                     "session_id": session
                 }),
                 Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
+                spawn,
             )
         }
         ResultsCommand::Read(ReadArgs {
@@ -319,9 +330,15 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             let Some(url) = url.or(positional_url).filter(|url| !url.is_empty()) else {
                 return emit_error(json, invalid("web read requires URL or --url URL"));
             };
-            let session = match resolve_session(root, session) {
+            let spawn = SupervisorSpawn {
+                fixture_url,
+                search_endpoint,
+            };
+            let session = match super::nav::resolve_or_create_session_with_spawn(
+                root, session, json, true, &spawn,
+            ) {
                 Ok(session) => session,
-                Err(error) => return emit_error(json, error),
+                Err(code) => return Ok(code),
             };
             rpc_with_spawn(
                 root,
@@ -329,13 +346,11 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 "web.read",
                 json!({ "url": url, "query": query, "session_id": session }),
                 Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
+                spawn,
             )
         }
         ResultsCommand::Research {
+            positional_query,
             query,
             max_sources,
             depth,
@@ -344,12 +359,24 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             search_endpoint,
             json,
         } => {
-            let Some(query) = query.filter(|query| !query.is_empty()) else {
-                return emit_error(json, invalid("web research requires --query QUERY"));
+            let Some(query) = query
+                .or(positional_query)
+                .filter(|query| !query.trim().is_empty())
+            else {
+                return emit_error(
+                    json,
+                    invalid("web research requires QUERY or --query QUERY"),
+                );
             };
-            let session = match resolve_session(root, session) {
+            let spawn = SupervisorSpawn {
+                fixture_url,
+                search_endpoint,
+            };
+            let session = match super::nav::resolve_or_create_session_with_spawn(
+                root, session, json, true, &spawn,
+            ) {
                 Ok(session) => session,
-                Err(error) => return emit_error(json, error),
+                Err(code) => return Ok(code),
             };
             rpc_with_spawn(
                 root,
@@ -362,10 +389,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                     "session_id": session
                 }),
                 Some(session),
-                SupervisorSpawn {
-                    fixture_url,
-                    search_endpoint,
-                },
+                spawn,
             )
         }
         ResultsCommand::Artifacts { session, json } => {

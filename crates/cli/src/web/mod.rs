@@ -391,6 +391,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_search_and_research_accept_positional_or_named_query() {
+        for verb in ["search", "research"] {
+            let cli = Cli::try_parse_from(["greppy", "web", verb, "gin rate limiting", "--json"])
+                .unwrap();
+            let query = match cli.command {
+                Some(Command::Web {
+                    command:
+                        WebCommand::Results(ResultsCommand::Search {
+                            positional_query: Some(query),
+                            query: None,
+                            json: true,
+                            ..
+                        }),
+                }) => query,
+                Some(Command::Web {
+                    command:
+                        WebCommand::Results(ResultsCommand::Research {
+                            positional_query: Some(query),
+                            query: None,
+                            json: true,
+                            ..
+                        }),
+                }) => query,
+                other => panic!("unexpected positional query parse: {other:?}"),
+            };
+            assert_eq!(query, "gin rate limiting");
+            let cli = Cli::try_parse_from([
+                "greppy",
+                "web",
+                verb,
+                "--query",
+                "gin rate limiting",
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Web {
+                    command: WebCommand::Results(ResultsCommand::Search {
+                        positional_query: None,
+                        query: Some(_),
+                        ..
+                    })
+                }) | Some(Command::Web {
+                    command: WebCommand::Results(ResultsCommand::Research {
+                        positional_query: None,
+                        query: Some(_),
+                        ..
+                    })
+                })
+            ));
+            assert!(Cli::try_parse_from([
+                "greppy",
+                "web",
+                verb,
+                "one query",
+                "--query",
+                "a different query"
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
     fn parse_web_observe_search_read_research_flags() {
         let cli = Cli::try_parse_from(["greppy", "web", "observe", "--session", "wrs_1", "--json"])
             .unwrap();

@@ -169,9 +169,19 @@ pub(super) fn resolve_or_create_session(
     json: bool,
     create: bool,
 ) -> std::result::Result<String, i32> {
+    resolve_or_create_session_with_spawn(root, session, json, create, &SupervisorSpawn::default())
+}
+
+pub(super) fn resolve_or_create_session_with_spawn(
+    root: Option<&str>,
+    session: Option<String>,
+    json: bool,
+    create: bool,
+    spawn: &SupervisorSpawn,
+) -> std::result::Result<String, i32> {
     match resolve_session(root, session) {
         Ok(session) => Ok(session),
-        Err(_) if create => create_session(root, json),
+        Err(_) if create => create_session(root, json, spawn),
         Err(error) => {
             let code = emit_error(json, error).unwrap_or(EXIT_WEB_INVALID);
             Err(code)
@@ -179,13 +189,20 @@ pub(super) fn resolve_or_create_session(
     }
 }
 
-fn create_session(root: Option<&str>, json: bool) -> std::result::Result<String, i32> {
-    match rpc_response(
-        root,
-        "web.session.create",
-        json!({ "profile": "project" }),
-        None,
-    ) {
+fn create_session(
+    root: Option<&str>,
+    json: bool,
+    spawn: &SupervisorSpawn,
+) -> std::result::Result<String, i32> {
+    let response = supervisor_for_session(root, spawn, None).and_then(|ctx| {
+        rpc_on_response(
+            &ctx,
+            "web.session.create",
+            json!({ "profile": "project" }),
+            None,
+        )
+    });
+    match response {
         Err(error) => {
             let code = emit_error(json, error).unwrap_or(EXIT_WEB_UNAVAILABLE);
             Err(code)
