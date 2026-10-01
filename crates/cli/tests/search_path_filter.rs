@@ -74,10 +74,11 @@ fn search_pattern_relative_filter_uses_selected_root_from_another_checkout() {
     .unwrap();
     std::fs::write(caller.join("src/lib.rs"), "fn foreign() {}\n").unwrap();
     let root_arg = repo.to_str().unwrap();
+    let nested = repo.join("src");
     for (cwd, filter) in [
         (caller.as_path(), "src"),
         (caller.as_path(), "src/lib.rs"),
-        (repo.join("src").as_path(), "lib.rs"),
+        (nested.as_path(), "lib.rs"),
     ] {
         let (code, out, err) = run(
             cwd,
