@@ -940,6 +940,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "windows-sys 0.61.2",
 ]
 

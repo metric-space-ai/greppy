@@ -299,7 +299,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 search_endpoint,
             };
             let session = match super::nav::resolve_or_create_session_with_spawn(
-                root, session, json, true, &spawn,
+                root, session, json, true, &spawn, super::nav::standalone_profile(&spawn, None),
             ) {
                 Ok(session) => session,
                 Err(code) => return Ok(code),
@@ -335,7 +335,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 search_endpoint,
             };
             let session = match super::nav::resolve_or_create_session_with_spawn(
-                root, session, json, true, &spawn,
+                root, session, json, true, &spawn, super::nav::standalone_profile(&spawn, Some(&url)),
             ) {
                 Ok(session) => session,
                 Err(code) => return Ok(code),
@@ -373,7 +373,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
                 search_endpoint,
             };
             let session = match super::nav::resolve_or_create_session_with_spawn(
-                root, session, json, true, &spawn,
+                root, session, json, true, &spawn, super::nav::standalone_profile(&spawn, None),
             ) {
                 Ok(session) => session,
                 Err(code) => return Ok(code),
