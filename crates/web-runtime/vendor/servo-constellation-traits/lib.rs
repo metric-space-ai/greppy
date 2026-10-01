@@ -100,6 +100,8 @@ pub enum EmbedderToConstellationMessage {
     /// Evaluate a JavaScript string in the context of a `WebView`. When execution is complete or an
     /// error is encountered, a correpsonding message will be sent to the embedding layer.
     EvaluateJavaScript(WebViewId, JavaScriptEvaluationId, String),
+    /// Evaluate an embedder-generated structured DOM query in a `WebView` and
+    /// return its result through the embedding layer.
     EvaluateStructuredDom(WebViewId, JavaScriptEvaluationId, String),
     /// Create a memory report and return it via the [`GenericCallback`]
     CreateMemoryReport(GenericCallback<MemoryReportResult>),

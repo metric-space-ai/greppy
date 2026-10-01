@@ -297,6 +297,8 @@ pub enum ScriptThreadMessage {
     /// Evaluate the given JavaScript and return a result via a corresponding message
     /// to the Constellation.
     EvaluateJavaScript(WebViewId, PipelineId, JavaScriptEvaluationId, String),
+    /// Evaluate an embedder-generated structured DOM query and return its result
+    /// to the Constellation, separately from ordinary page JavaScript evaluation.
     EvaluateStructuredDom(WebViewId, PipelineId, JavaScriptEvaluationId, String),
     /// A new batch of keys for the image cache for the specific pipeline.
     SendImageKeysBatch(PipelineId, Vec<ImageKey>),
