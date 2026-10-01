@@ -3252,9 +3252,24 @@ pub(crate) fn run_trained_rename(
         .first()
         .map(|operation| edit_operation_line_span(operation, root_path));
     let already = certificate.status == greppy_edit::Status::AlreadySatisfied;
+    // Preserve the planner's exact change witness for both previews and writes.
+    // Rename receipts need ranges/checksums, not another copy of function bodies.
+    let operations = certificate
+        .operations
+        .iter()
+        .map(|operation| EditOperation {
+            file: edit_operation_path(operation, root_path),
+            ranges: operation.changed_byte_ranges.clone(),
+            sha_before: Some(operation.file_sha256_before.clone()),
+            sha_after: operation.file_sha256_after.clone(),
+            diff: operation.unified_diff.clone(),
+            ..EditOperation::default()
+        })
+        .collect();
     let mut record = EditRecord {
         files,
         span,
+        operations,
         published: !dry_run,
         already_as_sent: already && !dry_run,
         ..EditRecord::default()

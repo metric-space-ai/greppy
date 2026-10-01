@@ -397,6 +397,47 @@ fn rename_identity_planner_subprocess_helper() {
             })
             .unwrap();
     }
+    let preview_before = [
+        "selected.rs",
+        "caller.rs",
+        "unrelated_a.rs",
+        "unrelated_b.rs",
+    ]
+    .map(|file| (file, std::fs::read(success_root.join(file)).unwrap()));
+    let preview = run_trained_rename(
+        &success_root,
+        success_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(!preview.published);
+    let preview_json = edit_record_json(&preview, false, None);
+    let operations = preview_json["operations"].as_array().unwrap();
+    assert!(!operations.is_empty());
+    assert!(
+        operations
+            .iter()
+            .map(|operation| operation["changed_byte_ranges"].as_array().unwrap().len())
+            .sum::<usize>()
+            >= 2
+    );
+    for (file, bytes) in &preview_before {
+        assert_eq!(std::fs::read(success_root.join(file)).unwrap(), *bytes);
+    }
+    for operation in operations {
+        let file = operation["file"].as_str().unwrap();
+        let before = preview_before
+            .iter()
+            .find(|(path, _)| *path == file)
+            .unwrap();
+        assert_eq!(operation["file_sha256_before"], edit_sha256_hex(&before.1));
+        assert!(operation.get("handle").is_none());
+        assert!(operation.get("result_span").is_none());
+    }
     let outcome = run_trained_rename(
         &success_root,
         success_root.to_str(),
@@ -408,6 +449,15 @@ fn rename_identity_planner_subprocess_helper() {
     .unwrap()
     .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
     assert!(outcome.published);
+    let applied_json = edit_record_json(&outcome, false, None);
+    assert!(!applied_json["operations"].as_array().unwrap().is_empty());
+    for operation in applied_json["operations"].as_array().unwrap() {
+        let file = operation["file"].as_str().unwrap();
+        assert_eq!(
+            operation["file_sha256_after"],
+            edit_sha256_hex(&std::fs::read(success_root.join(file)).unwrap())
+        );
+    }
     assert!(std::fs::read_to_string(success_root.join("selected.rs"))
         .unwrap()
         .contains("fn advance"));
