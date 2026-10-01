@@ -39,6 +39,10 @@ type AttachHold = Box<dyn Send>;
 type PrepareAttachFd = fn(&mut Command) -> io::Result<AttachHold>;
 pub static PREPARE_ATTACH_FD: OnceLock<PrepareAttachFd> = OnceLock::new();
 
+/// Host-provided contextual signal, appended to the captured tool envelope.
+/// The subprocess byte streams and its exit status remain unchanged.
+pub type ContextStatusHook = fn(&Path, &[String], &str) -> Option<String>;
+
 /// Credential / secret env vars stripped from every tool subprocess.
 ///
 /// This is a **blocklist**, not a sandbox: PATH, HOME, and everything else
@@ -68,6 +72,7 @@ pub struct GreppyEnv {
     greppy_timeout: Duration,
     max_output_bytes: usize,
     sandbox: SandboxMode,
+    context_status: Option<(String, ContextStatusHook)>,
 }
 
 impl GreppyEnv {
@@ -85,6 +90,7 @@ impl GreppyEnv {
             greppy_timeout: DEFAULT_GREPPY_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             sandbox: SandboxMode::Off,
+            context_status: None,
         })
     }
 
@@ -114,6 +120,19 @@ impl GreppyEnv {
     pub fn with_sandbox(mut self, mode: SandboxMode) -> Self {
         self.sandbox = mode;
         self
+    }
+
+    /// Attach the host contextual status engine for this agent session.
+    pub fn with_context_status(mut self, scope: String, hook: ContextStatusHook) -> Self {
+        self.context_status = Some((scope, hook));
+        self
+    }
+
+    /// Keep resumed sessions bound to their saved session identity.
+    pub fn set_context_scope(&mut self, scope: &str) {
+        if let Some((current, _)) = self.context_status.as_mut() {
+            *current = scope.to_owned();
+        }
     }
 
     /// Run the startup self-check through this env's production tool path.
@@ -182,6 +201,10 @@ impl GreppyEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_tool_env(&mut cmd);
+        if let Some((scope, _)) = self.context_status.as_ref() {
+            cmd.env("GREPPY_CONTEXT_SCOPE", scope)
+                .env("GREPPY_CONTEXT_ENVELOPE", "1");
+        }
         // Register attach pre_exec AFTER sandbox::apply so callbacks run
         // sandbox first, then child-local dup2 onto FD 4.
         let attach_hold = if args.first().map(String::as_str) == Some("web") {
@@ -215,6 +238,18 @@ impl GreppyEnv {
                     if let Some(data) = extract_png_base64(&outcome.content) {
                         outcome.image_png_base64 = Some(data);
                         outcome.content = "screenshot attached as image for the model".to_owned();
+                    }
+                }
+                if !outcome.is_error {
+                    if let Some((scope, hook)) = self.context_status.as_ref() {
+                        if let Some(notice) =
+                            hook(&self.root, &args, scope).filter(|notice| notice.len() <= 1024)
+                        {
+                            if !outcome.content.is_empty() && !outcome.content.ends_with('\n') {
+                                outcome.content.push('\n');
+                            }
+                            outcome.content.push_str(&notice);
+                        }
                     }
                 }
                 outcome

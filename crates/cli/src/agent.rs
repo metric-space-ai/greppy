@@ -921,7 +921,10 @@ fn run_agent(
     std::env::set_var("TEMP", &scratch_dir);
 
     let mut env = match GreppyEnv::new(workspace.worktree_path().to_path_buf()) {
-        Ok(env) => env.with_sandbox(sandbox_mode.clone()),
+        Ok(env) => env.with_sandbox(sandbox_mode.clone()).with_context_status(
+            workspace.run_id().to_owned(),
+            crate::context_status::agent_notice,
+        ),
         Err(e) => {
             let message = format!("greppy -p: cannot build greppy env: {e}");
             eprintln!("{message}");
@@ -1550,6 +1553,7 @@ fn run_headless_session(
     mut json: Option<&mut crate::agent_json::JsonEmitter>,
     json_session: &crate::agent_json::JsonSession,
 ) -> Result<SessionSummary, String> {
+    env.set_context_scope(&record.id);
     if resumed {
         if record.model != model {
             if let Err(error) = store.set_model(&record.id, model) {
@@ -2086,6 +2090,7 @@ fn run_interactive_session(
     bootstrap: Option<crate::agent_tui::BootstrapScreen>,
     launch: InteractiveLaunch,
 ) -> Result<(SessionSummary, bool), String> {
+    let mut env = env;
     let store = SessionStore::new(&launch.data_root, &launch.project);
     let mut record = if let Some(id) = launch.resume.as_deref() {
         store
@@ -2106,6 +2111,7 @@ fn run_interactive_session(
         record.source = "interactive".to_string();
         record
     };
+    env.set_context_scope(&record.id);
     record.model = launch.model.clone();
     record.run_id = launch.run_id.clone();
     // Same run_id for every greppy web subprocess in this interactive session

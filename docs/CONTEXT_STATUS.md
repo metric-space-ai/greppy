@@ -1,29 +1,42 @@
 # Contextual readiness notices
 
-Successful human `read-file` calls in a Codex thread may attach one readiness
-notice on stderr after a previous read observed a live workspace preparation job.
-Literal output and return codes remain unchanged. Calls outside Codex, machine
-output, ordinary reads with no preparation evidence, and grep/rg remain quiet.
+Greppy's built-in agent attaches useful readiness transitions to successful
+human `rg`, `grep`, and `read-file` tool outcomes. Its `GreppyEnv` captures the
+subprocess streams unchanged, then invokes the CLI status hook and appends a
+notice to the existing `ToolOutcome.content` envelope. Saved session identity
+is propagated to query subprocesses, including resumed interactive/headless
+sessions. Machine output and explicit other-root invocations are excluded.
+Direct grep/rg streams and exit codes remain byte-identical.
 
-`context_status` is a small shared transition decision engine, not a progress
-poller. Verified index publication records graph and semantic availability
-separately. A later read can consume the corresponding thread/workspace/generation
-restriction exactly once. Publication receipts bind to graph.db size and mtime;
-a changed snapshot, failed/cancelled journal, different generation, or unfinished
-semantic publication cannot authorize a notice. Readiness means the capability
-can be retried; its normal source freshness validation still applies.
+`context_status` is a bounded transition engine, not a progress poller. Actual
+query preparation and stale-refusal boundaries record per-session restrictions;
+literal calls do not infer restrictions from unrelated running jobs. Successful
+queries acknowledge availability, avoiding a redundant notice afterwards.
+Verified atomic publication records graph and semantic readiness separately.
+Publication revision must advance beyond the restriction, so a new session's
+pending semantic query cannot erase or consume an earlier shared-ready signal.
+Generation and graph.db metadata must still match, failed/cancelled preparation
+suppresses notices, and consumed state is persisted per session/capability.
+Known source-freshness refusals invalidate readiness until another publication.
 
-State reads are capped at 16 KiB. At most 32 scope/capability restrictions are
-retained per workspace; oldest entries are evicted. Nonblocking serialization,
-private atomic replacement, and best-effort failures keep literal reads usable.
-No status operation opens SQLite, loads models, indexes, or scans source.
+State reads/writes are capped at 16 KiB and 32 session/capability entries.
+Serialization is nonblocking and replacement is private and atomic. Failure to
+record status never fails the user's tool. No status operation opens SQLite,
+loads models, starts preparation, or scans source. Publication availability is
+an invitation to retry the capability; the query's normal freshness validation
+remains authoritative. Arbitrary source edits not yet observed by a query
+cannot be detected from the publication metadata alone.
 
-Grep/rg has a byte-identical stream contract and no existing contextual-result
-envelope consumer was identified in this package. Attaching notices there
-requires a supported caller envelope; this change leaves that integration open.
+A successful direct human `read-file` in a Codex thread can consume the same
+engine's restriction on stderr. External Codex shell/tool execution has no
+supported Greppy-owned result envelope for attaching rg metadata, so those rg
+callers are not covered. No system prompt was changed.
 
-Focused checks: `cargo test -p greppy --lib --features cpu-only,ci-test-assets
+Focused tests: `cargo test -p greppy --lib --features cpu-only,ci-test-assets
 context_status::tests -- --test-threads=2` through the shared heavy-job gate.
-The five tests cover required prior restriction, consumption/durable dedupe,
-semantic separation, failure/snapshot/generation suppression, bounded state and
-oversized metadata refusal. They do not establish installed CLI acceptance.
+Seven tests include the real injected-binary `GreppyEnv` consumer, session and
+capability isolation, graph-ready/embedding-running, persisted dedupe,
+cancellation and known-stale invalidation, machine/other-root exclusions,
+publication revision requirements, stale/new-generation metadata and bounds.
+These stub/metadata fixtures require neither a model nor an indexer. They do
+not establish installed CLI acceptance.

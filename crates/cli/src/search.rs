@@ -1370,6 +1370,14 @@ pub(crate) fn dispatch_semantic(
         let generation = current_graph_generation(&store, root)?;
         let candidate_limit = vector_exact_candidate_limit()?;
         if !freshness_json_is_fresh(&freshness) {
+            if let Ok(root_path) = resolve_root(root) {
+                crate::context_status::invalidate(&root_path);
+                crate::context_status::restricted(
+                    &root_path,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Semantic,
+                );
+            }
             let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
                 &project,
                 &cfg.model_id,
@@ -1432,6 +1440,14 @@ pub(crate) fn dispatch_semantic(
                 return Ok(1);
             }
             if !freshness_json_is_fresh(&freshness) {
+                if let Ok(root_path) = resolve_root(root) {
+                    crate::context_status::invalidate(&root_path);
+                    crate::context_status::restricted(
+                        &root_path,
+                        generation.saturating_add(1),
+                        crate::context_status::Capability::Semantic,
+                    );
+                }
                 if json {
                     semantic_vector_json(
                         &store,
@@ -1603,6 +1619,11 @@ fn wait_for_embedding_publication(
                 job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
             });
         if !announced {
+            crate::context_status::restricted(
+                effective_root,
+                requested_generation,
+                crate::context_status::Capability::Semantic,
+            );
             let progress = initial_job.unwrap_or_else(|| {
                 embedding_progress_value(effective_root, cfg, requested_generation)
             });
@@ -1646,7 +1667,13 @@ fn wait_for_embedding_publication(
             publication_complete,
             follow_attached_owner,
         ) {
-            BackgroundEmbeddingObservation::Published => return Ok(store),
+            BackgroundEmbeddingObservation::Published => {
+                crate::context_status::acknowledge(
+                    effective_root,
+                    crate::context_status::Capability::Semantic,
+                );
+                return Ok(store);
+            }
             BackgroundEmbeddingObservation::FollowIndex => {
                 drop(store);
                 continue;

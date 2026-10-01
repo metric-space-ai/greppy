@@ -51,6 +51,7 @@ struct Status {
 }
 #[derive(Serialize, Deserialize)]
 struct Publication {
+    revision: u64,
     generation: u64,
     graph: bool,
     semantic: bool,
@@ -62,6 +63,7 @@ struct Restriction {
     generation: u64,
     capability: Capability,
     announced: bool,
+    after_revision: u64,
 }
 impl Status {
     fn restrict(&mut self, scope: String, generation: u64, capability: Capability) {
@@ -83,16 +85,8 @@ impl Status {
             generation,
             capability,
             announced: false,
+            after_revision: self.publication.as_ref().map_or(0, |p| p.revision),
         });
-        if capability == Capability::Semantic {
-            if let Some(p) = self
-                .publication
-                .as_mut()
-                .filter(|p| p.generation == generation)
-            {
-                p.semantic = false;
-            }
-        }
     }
     fn take_notice(
         &mut self,
@@ -108,6 +102,7 @@ impl Status {
             !r.announced
                 && r.scope == scope
                 && r.generation == p.generation
+                && p.revision > r.after_revision
                 && match r.capability {
                     Capability::Graph => p.graph,
                     Capability::Semantic => p.semantic,
@@ -125,7 +120,9 @@ fn status_path(root: &Path) -> PathBuf {
     super::background_job_path(root).with_file_name("context-status.json")
 }
 fn scope() -> Option<String> {
-    let value = std::env::var("CODEX_THREAD_ID").ok()?;
+    let value = std::env::var("GREPPY_CONTEXT_SCOPE")
+        .or_else(|_| std::env::var("CODEX_THREAD_ID"))
+        .ok()?;
     (value.len() <= 128 && !value.is_empty()).then_some(value)
 }
 fn update<T>(root: &Path, action: impl FnOnce(&mut Status) -> T) -> Option<T> {
@@ -185,12 +182,42 @@ pub(crate) fn restricted(root: &Path, generation: u64, capability: Capability) {
     };
     let _ = update(root, |s| s.restrict(scope, generation, capability));
 }
+pub(crate) fn invalidate(root: &Path) {
+    if !status_path(root).is_file() {
+        return;
+    }
+    let _ = update(root, |s| {
+        if let Some(p) = s.publication.as_mut() {
+            p.graph = false;
+            p.semantic = false;
+        }
+    });
+}
+pub(crate) fn acknowledge(root: &Path, capability: Capability) {
+    let Some(scope) = scope() else {
+        return;
+    };
+    let _ = update(root, |s| {
+        for r in s
+            .restrictions
+            .iter_mut()
+            .filter(|r| r.scope == scope && r.capability == capability)
+        {
+            r.announced = true;
+        }
+    });
+}
 pub(crate) fn published(root: &Path, generation: u64, graph: bool, semantic: bool) {
     let Some(fingerprint) = fingerprint(&super::workspace_locator::store_path(root)) else {
         return;
     };
     let _ = update(root, |s| {
+        let revision = s
+            .publication
+            .as_ref()
+            .map_or(1, |p| p.revision.saturating_add(1));
         s.publication = Some(Publication {
+            revision,
             generation,
             graph,
             semantic,
@@ -208,13 +235,60 @@ pub(crate) fn semantic_published(root: &Path, generation: u64, complete: bool) {
             .as_mut()
             .filter(|p| p.generation == generation)
         {
+            p.revision = p.revision.saturating_add(1);
             p.fingerprint = fingerprint;
             p.semantic = p.graph && complete;
         }
     });
 }
+pub(crate) fn notice(root: &Path, scope: &str) -> Option<String> {
+    if !status_path(root).is_file() {
+        return None;
+    }
+    let current = fingerprint(&super::workspace_locator::store_path(root))?;
+    let job = bounded_read(&super::background_job_path(root))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let blocked = job.as_ref().is_some_and(|j| {
+        matches!(
+            j.get("state").and_then(serde_json::Value::as_str),
+            Some("failed" | "cancelled")
+        ) || j.get("kind").and_then(serde_json::Value::as_str) != Some("embedding")
+    });
+    update(root, |s| {
+        let mut lines = Vec::new();
+        while let Some(line) = s.take_notice(scope, &current, blocked) {
+            lines.push(line);
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    })?
+}
+pub(crate) fn agent_notice(root: &Path, args: &[String], scope: &str) -> Option<String> {
+    if args.iter().any(|a| a == "--json" || a == "--jsonl") {
+        return None;
+    }
+    let mut argv = vec![std::ffi::OsString::from("greppy")];
+    argv.extend(args.iter().map(std::ffi::OsString::from));
+    let tail = super::grep_passthrough_args(&argv);
+    if !matches!(
+        tail.first().and_then(|a| a.to_str()),
+        Some("rg" | "ripgrep" | "grep" | "read-file")
+    ) {
+        return None;
+    }
+    // Exclude explicit roots rather than attach another workspace's status.
+    if args
+        .iter()
+        .any(|a| a == "--root" || a.starts_with("--root="))
+    {
+        return None;
+    }
+    notice(
+        &super::workspace_locator::resolve_workspace_root(root),
+        scope,
+    )
+}
 pub(crate) fn attach_read_notice(root: Option<&str>) {
-    if super::cli_json_output() {
+    if super::cli_json_output() || std::env::var_os("GREPPY_CONTEXT_ENVELOPE").is_some() {
         return;
     }
     let Some(scope) = scope() else {
@@ -223,52 +297,7 @@ pub(crate) fn attach_read_notice(root: Option<&str>) {
     let Ok(root) = super::resolve_root(root) else {
         return;
     };
-    let job = bounded_read(&super::background_job_path(&root))
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let live = job
-        .as_ref()
-        .and_then(|j| j.get("pid").and_then(serde_json::Value::as_u64))
-        .and_then(|pid| u32::try_from(pid).ok())
-        .is_some_and(super::process_is_alive);
-    if live {
-        if let Some(j) = job.as_ref().filter(|j| {
-            !matches!(
-                j.get("state").and_then(serde_json::Value::as_str),
-                Some("failed" | "cancelled")
-            )
-        }) {
-            if j.get("kind").and_then(serde_json::Value::as_str) == Some("index") {
-                if let Some(generation) = j
-                    .get("target_generation")
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    restricted(&root, generation, Capability::Graph);
-                }
-            } else if j.get("kind").and_then(serde_json::Value::as_str) == Some("embedding") {
-                let _ = update(&root, |s| {
-                    if let Some(p) = s.publication.as_ref() {
-                        s.restrict(scope.clone(), p.generation, Capability::Semantic);
-                    }
-                });
-            }
-        }
-    }
-    // Missing state is the common path: do not create any status/lock files.
-    if !status_path(&root).is_file() {
-        return;
-    }
-    let Some(current) = fingerprint(&super::workspace_locator::store_path(&root)) else {
-        return;
-    };
-    let blocked = job.as_ref().is_some_and(|j| {
-        matches!(
-            j.get("state").and_then(serde_json::Value::as_str),
-            Some("failed" | "cancelled")
-        )
-    }) || job
-        .as_ref()
-        .is_some_and(|j| j.get("kind").and_then(serde_json::Value::as_str) != Some("embedding"));
-    if let Some(Some(line)) = update(&root, |s| s.take_notice(&scope, &current, blocked)) {
+    if let Some(line) = notice(&root, &scope) {
         eprintln!("{line}");
     }
 }
@@ -285,6 +314,7 @@ mod tests {
     fn transition_requires_restriction_and_is_consumed_once() {
         let mut s = Status::default();
         s.publication = Some(Publication {
+            revision: 1,
             generation: 4,
             graph: true,
             semantic: false,
@@ -292,6 +322,7 @@ mod tests {
         });
         assert!(s.take_notice("a", &fp(1), false).is_none());
         s.restrict("a".into(), 4, Capability::Graph);
+        s.publication.as_mut().unwrap().revision = 2;
         assert!(s.take_notice("b", &fp(1), false).is_none());
         assert!(s
             .take_notice("a", &fp(1), false)
@@ -304,6 +335,7 @@ mod tests {
         let mut s = Status::default();
         s.restrict("a".into(), 4, Capability::Semantic);
         s.publication = Some(Publication {
+            revision: 1,
             generation: 4,
             graph: true,
             semantic: false,
@@ -321,6 +353,7 @@ mod tests {
         let mut s = Status::default();
         s.restrict("a".into(), 4, Capability::Graph);
         s.publication = Some(Publication {
+            revision: 1,
             generation: 4,
             graph: true,
             semantic: true,
@@ -340,6 +373,7 @@ mod tests {
         let mut s = Status::default();
         s.restrict("a".into(), 4, Capability::Graph);
         s.publication = Some(Publication {
+            revision: 1,
             generation: 4,
             graph: true,
             semantic: false,
@@ -360,5 +394,126 @@ mod tests {
         assert_eq!(s.restrictions.len(), MAX_SCOPES);
         s.restrict("99".into(), 5, Capability::Graph);
         assert_eq!(s.restrictions.iter().filter(|r| r.scope == "99").count(), 1);
+    }
+    #[test]
+    fn a_session_restriction_does_not_erase_shared_readiness() {
+        let mut s = Status::default();
+        s.publication = Some(Publication {
+            revision: 1,
+            generation: 4,
+            graph: true,
+            semantic: true,
+            fingerprint: fp(1),
+        });
+        s.restrict("a".into(), 4, Capability::Semantic);
+        assert!(s.publication.as_ref().unwrap().semantic);
+        // A prior ready publication does not satisfy a later restriction.
+        assert!(s.take_notice("a", &fp(1), false).is_none());
+        s.publication.as_mut().unwrap().revision = 2;
+        assert!(s.take_notice("a", &fp(1), false).is_some());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn existing_agent_envelope_attaches_rg_and_read_once_per_session() {
+        use greppy_agent::ExecutionEnv;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("GREPPY_STORE_DIR");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+                    None => std::env::remove_var("GREPPY_STORE_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        std::env::set_var("GREPPY_STORE_DIR", temp.path().join("cache"));
+        let root = temp.path().join("source");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let db = super::super::workspace_locator::store_path(&root);
+        assert!(db.starts_with(temp.path()));
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, "test graph metadata; never opened as SQLite").unwrap();
+        update(&root, |s| {
+            s.restrict("session-a".into(), 4, Capability::Graph);
+            s.restrict("session-b".into(), 4, Capability::Semantic);
+        })
+        .unwrap();
+        published(&root, 4, true, false);
+        std::fs::write(super::super::background_job_path(&root), serde_json::to_vec(&serde_json::json!({"kind":"embedding", "state":"embedding", "pid":std::process::id()})).unwrap()).unwrap();
+        let binary = temp.path().join("tool-stub");
+        std::fs::write(&binary, "#!/bin/sh\nprintf 'literal:%s:%s\\n' \"$GREPPY_CONTEXT_SCOPE\" \"$GREPPY_CONTEXT_ENVELOPE\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut a = greppy_agent::GreppyEnv::with_binary(binary.clone(), root.clone())
+            .unwrap()
+            .with_context_status("session-a".into(), agent_notice);
+        let mut b = greppy_agent::GreppyEnv::with_binary(binary, root.clone())
+            .unwrap()
+            .with_context_status("session-b".into(), agent_notice);
+        let request = serde_json::json!({"args": ["rg", "needle", "file"]});
+        let first = a.call_tool("greppy", &request);
+        assert!(!first.is_error);
+        assert!(first.content.starts_with("literal:session-a:1\n"));
+        assert!(first.content.contains("graph preparation completed"));
+        assert!(!first
+            .content
+            .contains("semantic embedding preparation completed"));
+        assert_eq!(
+            a.call_tool("greppy", &request).content,
+            "literal:session-a:1\n"
+        );
+        assert_eq!(
+            b.call_tool("greppy", &request).content,
+            "literal:session-b:1\n"
+        );
+        semantic_published(&root, 4, true);
+        let read = serde_json::json!({"args": ["read-file", "file"]});
+        assert!(b
+            .call_tool("greppy", &read)
+            .content
+            .contains("semantic embedding preparation completed"));
+        assert_eq!(
+            b.call_tool("greppy", &read).content,
+            "literal:session-b:1\n"
+        );
+        // Machine/other-root calls do not consume a new session's signal.
+        update(&root, |s| {
+            s.restrict("session-c".into(), 4, Capability::Graph)
+        })
+        .unwrap();
+        published(&root, 4, true, true);
+        assert!(agent_notice(
+            &root,
+            &["rg".into(), "--json".into(), "needle".into()],
+            "session-c"
+        )
+        .is_none());
+        assert!(agent_notice(
+            &root,
+            &[
+                "--root".into(),
+                "other".into(),
+                "rg".into(),
+                "needle".into()
+            ],
+            "session-c"
+        )
+        .is_none());
+        std::fs::write(
+            super::super::background_job_path(&root),
+            serde_json::to_vec(&serde_json::json!({"kind":"embedding", "state":"cancelled"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_none());
+        std::fs::remove_file(super::super::background_job_path(&root)).unwrap();
+        invalidate(&root);
+        assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_none());
+        published(&root, 4, true, true);
+        assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_some());
     }
 }
