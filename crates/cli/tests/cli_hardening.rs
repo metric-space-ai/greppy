@@ -1587,6 +1587,26 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
     assert!(v["stats"]["nodes"].as_u64().unwrap_or(0) >= 1);
     assert!(v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(v["provider_failure_count"], 0);
+    let (compact_code, compact_out, compact_err) =
+        run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(compact_code, code, "{compact_err}");
+    let compact: serde_json::Value = serde_json::from_str(&compact_out).unwrap();
+    for key in [
+        "healthy",
+        "fresh",
+        "writer_active",
+        "startup_active",
+        "embedding_complete",
+        "provider_failure_count",
+    ] {
+        assert_eq!(compact[key], v[key], "health changed for {key}");
+    }
+    assert!(compact.get("providers").is_none(), "{compact}");
+    assert_eq!(
+        compact["diagnostics_command"],
+        "greppy index status --json --diagnostics"
+    );
+    assert!(!compact_err.contains("still running"), "{compact_err}");
     assert!(
         v["providers"]
             .as_array()

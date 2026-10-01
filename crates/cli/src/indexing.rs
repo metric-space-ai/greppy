@@ -34,10 +34,11 @@ fn progress_stall_threshold_seconds(phase: Option<&str>) -> u64 {
 
 pub(crate) fn dispatch_index_status(
     json: bool,
+    diagnostics: bool,
     root: Option<&str>,
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
-    dispatch_index_health("index-status", json, root, embedding_args)
+    dispatch_index_health_with_detail("index-status", json, root, embedding_args, diagnostics)
 }
 
 #[derive(Debug)]
@@ -340,6 +341,48 @@ pub(crate) fn dispatch_index_health(
     root: Option<&str>,
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
+    dispatch_index_health_with_detail(command, json, root, embedding_args, true)
+}
+
+fn index_health_output(mut value: serde_json::Value, detailed: bool) -> serde_json::Value {
+    if detailed {
+        return value;
+    }
+    let Some(fields) = value.as_object_mut() else {
+        return value;
+    };
+    // Health/ownership counts stay visible. The potentially unbounded provider,
+    // stale-path and overlay records are available explicitly, not in every poll.
+    for name in [
+        "providers",
+        "skip_counts_by_reason",
+        "integrity_messages",
+        "inference",
+    ] {
+        fields.remove(name);
+    }
+    for name in ["freshness", "dirty_overlay", "store_cow"] {
+        if let Some(summary) = fields
+            .get_mut(name)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            summary.retain(|_, value| !value.is_array() && !value.is_object());
+        }
+    }
+    fields.insert(
+        "diagnostics_command".into(),
+        "greppy index status --json --diagnostics".into(),
+    );
+    value
+}
+
+fn dispatch_index_health_with_detail(
+    command: &str,
+    json: bool,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+    detailed: bool,
+) -> Result<i32> {
     let effective_root = resolve_root(root)?;
     let project = workspace_locator::project_identity(&effective_root);
     let store_path = workspace_locator::store_path(&effective_root);
@@ -422,9 +465,10 @@ pub(crate) fn dispatch_index_health(
         if json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&status).map_err(|error| Error::Invalid(format!(
-                    "serialize {command} JSON: {error}"
-                )))?
+                serde_json::to_string_pretty(&index_health_output(status.clone(), detailed))
+                    .map_err(|error| Error::Invalid(format!(
+                        "serialize {command} JSON: {error}"
+                    )))?
             );
         } else {
             println!("status: indexing");
@@ -505,7 +549,7 @@ pub(crate) fn dispatch_index_health(
         if json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&status)
+                serde_json::to_string_pretty(&index_health_output(status.clone(), detailed))
                     .map_err(|e| Error::Invalid(format!("serialize {command} JSON: {e}")))?
             );
         } else {
@@ -581,9 +625,10 @@ pub(crate) fn dispatch_index_health(
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&status).map_err(|error| {
-                        Error::Invalid(format!("serialize {command} JSON: {error}"))
-                    })?
+                    serde_json::to_string_pretty(&index_health_output(status.clone(), detailed))
+                        .map_err(|error| {
+                            Error::Invalid(format!("serialize {command} JSON: {error}"))
+                        })?
                 );
             } else {
                 println!("status: unhealthy");
@@ -758,7 +803,7 @@ pub(crate) fn dispatch_index_health(
         });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value)
+            serde_json::to_string_pretty(&index_health_output(value, detailed))
                 .map_err(|e| Error::Invalid(format!("serialize {command} JSON: {e}")))?
         );
     } else {

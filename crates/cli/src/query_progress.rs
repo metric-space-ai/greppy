@@ -105,6 +105,9 @@ impl JobProgress {
     fn read(path: &std::path::Path) -> Option<Self> {
         let value = crate::read_background_job(path)?;
         let progress = Self::from_value(&value)?;
+        if is_terminal_state(&progress.state) {
+            return None;
+        }
         let owner = progress.pid.and_then(|pid| u32::try_from(pid).ok())?;
         crate::process_is_alive(owner).then_some(progress)
     }
@@ -377,7 +380,10 @@ impl ProgressReporter {
 }
 
 fn is_terminal_state(state: &str) -> bool {
-    matches!(state, "complete" | "completed" | "failed" | "degraded")
+    matches!(
+        state,
+        "complete" | "completed" | "failed" | "degraded" | "cancelled"
+    )
 }
 
 pub(crate) fn for_command(
@@ -392,7 +398,7 @@ pub(crate) fn for_command(
             ..
         } => {
             let operand = match path.as_deref() {
-                Some("status") => None,
+                Some("status") => return None,
                 Some("recover") => recovery_path.as_deref(),
                 path => path,
             };
@@ -785,6 +791,14 @@ mod tests {
     }
 
     #[test]
+    fn index_status_does_not_report_itself_as_indexing() {
+        let cli =
+            <crate::Cli as clap::Parser>::try_parse_from(["greppy", "index", "status", "--json"])
+                .unwrap();
+        assert!(for_command(cli.command.as_ref(), None).is_none());
+    }
+
+    #[test]
     fn job_progress_requires_a_live_owner() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("index.job");
@@ -801,6 +815,15 @@ mod tests {
 
         crate::start_background_job_record(&path, &value(std::process::id())).unwrap();
         assert!(JobProgress::read(&path).is_some());
+
+        // A terminal record may retain a still-live owner (or a reused PID).
+        // Neither case means the index job is still running.
+        for state in ["cancelled", "failed", "completed", "degraded"] {
+            let mut terminal = value(std::process::id());
+            terminal["state"] = state.into();
+            crate::start_background_job_record(&path, &terminal).unwrap();
+            assert!(JobProgress::read(&path).is_none(), "{state}");
+        }
 
         // u32::MAX is outside the process-id range supported by our target
         // platforms, so this record cannot identify a live job owner.

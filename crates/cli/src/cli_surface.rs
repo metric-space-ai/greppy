@@ -86,6 +86,9 @@ pub enum Command {
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+        /// With `index status --json`, retain full provider, path and overlay diagnostics.
+        #[arg(long)]
+        diagnostics: bool,
         /// Warm the worktree and shared Base Store `greppy -p` will use.
         ///
         /// The built-in agent works in a per-repository worktree with its own

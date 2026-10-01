@@ -2246,6 +2246,7 @@ fn dispatch_subcommand(
             path,
             recovery_path,
             json,
+            diagnostics,
             agent_worktree,
         } => {
             if path.as_deref() == Some("status") {
@@ -2254,7 +2255,11 @@ fn dispatch_subcommand(
                         "index status takes no repository path; use `--root PATH`".into(),
                     ));
                 }
-                dispatch_index_status(json, root, EmbeddingCliArgs { device, no_gpu })
+                dispatch_index_status(json, diagnostics, root, EmbeddingCliArgs { device, no_gpu })
+            } else if diagnostics {
+                Err(Error::Invalid(
+                    "--diagnostics requires `index status --json`".into(),
+                ))
             } else if path.as_deref() == Some("recover") {
                 if agent_worktree {
                     return Err(Error::Invalid(
