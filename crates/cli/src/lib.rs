@@ -9274,8 +9274,13 @@ fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> St
 }
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
+    let remediation = match freshness.get("state").and_then(serde_json::Value::as_str) {
+        Some("refreshing") => "index publication is in progress; inspect `greppy index status --json`, then retry this command after publication",
+        Some("unknown") => "freshness could not be verified; retry this command when host capacity is available",
+        _ => STALE_REMEDIATION,
+    };
     format!(
-        "{command}: {STALE_REMEDIATION} — indexed search skipped, \
+        "{command}: {remediation} — indexed search skipped, \
          no stale indexed hits emitted ({})",
         stale_freshness_reason(freshness)
     )
