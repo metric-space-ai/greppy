@@ -235,7 +235,8 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
                                 && content.get(start) == Some(&b'<')
                                 && content.get(end.wrapping_sub(1)) == Some(&b'>')
                                 && content[end..template.start_byte()]
-                                    .iter().all(u8::is_ascii_whitespace)
+                                    .iter()
+                                    .all(u8::is_ascii_whitespace)
                             {
                                 let output = normalized.get_or_insert_with(|| content.to_vec());
                                 for byte in &mut output[start..end] {
@@ -729,7 +730,10 @@ mod tests {
                 "const s = `sql<{ id: number }> SELECT id`;",
                 "const r = /sql<id>!/;",
             ] {
-                assert_eq!(syntax_validation_content(language, literal.as_bytes()).as_ref(), literal.as_bytes());
+                assert_eq!(
+                    syntax_validation_content(language, literal.as_bytes()).as_ref(),
+                    literal.as_bytes()
+                );
             }
         }
     }
