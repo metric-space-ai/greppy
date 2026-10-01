@@ -1642,7 +1642,7 @@ pub(crate) fn edit_resolve_new_path(
                 if !normalized.pop() {
                     return Err(EditRefusal::new(
                         "path_outside_repo",
-                        format!("{file} is outside {}", workspace.display()),
+                        format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
                         17,
                     ));
                 }
@@ -1653,7 +1653,7 @@ pub(crate) fn edit_resolve_new_path(
     let Ok(relative) = normalized.strip_prefix(&workspace) else {
         return Err(EditRefusal::new(
             "path_outside_repo",
-            format!("{file} is outside {}", workspace.display()),
+            format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
             17,
         ));
     };
@@ -1865,7 +1865,7 @@ pub(crate) fn run_trained_write(
         if !canonical.starts_with(&root) {
             return Err(EditRefusal::new(
                 "path_outside_repo",
-                format!("{path} is outside {}", root.display()),
+                format!("{path} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", root.display()),
                 17,
             ));
         }
