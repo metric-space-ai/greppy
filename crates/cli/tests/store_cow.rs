@@ -1270,6 +1270,67 @@ fn normal_query_recovers_missing_persisted_base_without_semantic_rebuild() {
 }
 
 #[test]
+fn first_linked_query_attaches_published_base_without_a_second_index() {
+    let scratch = tempfile::tempdir().unwrap();
+    let primary = scratch.path().join("primary");
+    let first = scratch.path().join("first");
+    let second = scratch.path().join("second");
+    let store = scratch.path().join("store");
+    std::fs::create_dir_all(primary.join("src")).unwrap();
+    std::fs::write(
+        primary.join("src/base.rs"),
+        "pub fn shared_first_use_base() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    git(&primary, &["init", "-q"]);
+    git(
+        &primary,
+        &["config", "user.email", "first-query@test.invalid"],
+    );
+    git(&primary, &["config", "user.name", "First Query"]);
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-qm", "base"]);
+    for (name, path) in [("first", &first), ("second", &second)] {
+        git(
+            &primary,
+            &["worktree", "add", "-qb", name, path.to_str().unwrap()],
+        );
+    }
+    // Establish one verified immutable Base, then leave the second worktree
+    // completely cold so its first ordinary query owns Delta publication.
+    index(&first, &store, None);
+    std::fs::write(
+        second.join("src/second.rs"),
+        "pub fn first_use_second_symbol() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(
+        &second,
+        &store,
+        &["search-symbol", "first_use_second_symbol"],
+        None,
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("first_use_second_symbol"));
+    assert!(query_text(
+        &second,
+        &store,
+        &["search-symbol", "shared_first_use_base"],
+        None
+    )
+    .contains("shared_first_use_base"));
+    let (code, out, err) = run(&second, &store, &["index", "status", "--json"], None);
+    assert!([0, 73].contains(&code), "{out} {err}");
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["fresh"], true, "{status:#}");
+    assert_eq!(status["store_cow"]["mode"], "overlay", "{status:#}");
+    assert_eq!(
+        status["graph_generation"], 1,
+        "first-use query must publish exactly once: {status:#}"
+    );
+}
+
+#[test]
 fn cold_linked_structural_query_uses_complete_private_graph_without_building_a_base() {
     let scratch = tempfile::tempdir().unwrap();
     let primary = scratch.path().join("primary");

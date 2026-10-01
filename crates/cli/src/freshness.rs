@@ -726,6 +726,11 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     if !path.exists() {
         if auto_reindex_enabled() {
             wait_for_first_use_index(root, &effective_root)?;
+            // First publication can establish a linked-worktree Base binding.
+            // Re-enter the normal open path so that binding is attached before
+            // freshness is checked; a bare Delta otherwise looks stale and
+            // starts a second index for the same unchanged workspace.
+            return open_default_store(root);
         } else {
             let shown_root = root.unwrap_or(".");
             eprintln!(
