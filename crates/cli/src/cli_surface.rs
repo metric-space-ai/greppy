@@ -329,11 +329,14 @@ pub enum Command {
         file: String,
         #[arg(value_name = "OLD", allow_hyphen_values = true)]
         old: String,
+        /// Replacement text (stdin when omitted). With --regex, use $$ for a literal $.
         #[arg(value_name = "NEW", allow_hyphen_values = true)]
         new: Option<String>,
         #[arg(long)]
         expect: Option<usize>,
-        /// Treat OLD as a regular expression.
+        /// Treat OLD as a regular expression and expand capture references in NEW:
+        /// $1 or ${name} insert captures; $$ inserts a literal $ (use $$ROOT to
+        /// preserve shell $ROOT). Unknown capture references expand to empty.
         #[arg(long)]
         regex: bool,
         #[arg(long = "dry-run")]
