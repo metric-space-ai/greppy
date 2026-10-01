@@ -173,15 +173,60 @@ fn web_runtime_is_a_subcommand() {
 
 #[test]
 fn web_runtime_status_does_not_spawn_and_reports_not_running() {
+    let dist = tempfile::Builder::new()
+        .prefix("web-status-")
+        .tempdir()
+        .unwrap();
+    std::fs::create_dir_all(dist.path().join("bin")).unwrap();
+    std::fs::write(
+        dist.path().join(".greppy-web-runtime-dist"),
+        "greppy.web-runtime.package.v1\n",
+    )
+    .unwrap();
+    let dummy = dist.path().join("bin/web-runtime");
+    std::fs::write(
+        &dummy,
+        "#!/bin/sh\necho started > \"$(dirname \"$0\")/started\"\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dummy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let started = Instant::now();
-    let (code, stdout, stderr) = run(&["web", "runtime", "status", "--json"]);
+    let output = Command::new(bin())
+        .args(["web", "runtime", "status", "--json"])
+        .env_remove("GREPPY_WEB_RUNTIME")
+        .env_remove("GREPPY_WEB_FIXTURE_URL")
+        .env("GREPPY_WEB_RUNTIME_DIST", dist.path())
+        .env("GREPPY_STORE_DIR", dist.path().join("store"))
+        .env(
+            "GREPPY_RUN_ID",
+            format!("status-no-spawn-{}", std::process::id()),
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("runtime status against installed dummy");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "runtime status must not hash/spawn the engine, elapsed={:?}",
+        "runtime status must not spawn the engine, elapsed={:?}",
         started.elapsed()
     );
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    assert!(stdout.contains("\"running\":false") || stdout.contains("\"running\": false"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(result["result"]["running"], false);
+    assert_eq!(result["result"]["owned"], false);
+    assert!(
+        !dist.path().join("bin/started").exists(),
+        "status executed the engine"
+    );
     assert!(stdout.contains("greppy.web-runtime.v1"));
 }
 
@@ -653,9 +698,12 @@ fn web_doctor_json_does_not_spawn_runtime() {
         stdout.contains("\"protocol_version\"") || stdout.contains("greppy.web-runtime.v1"),
         "doctor must report handshake schema, stdout={stdout}"
     );
-    assert!(
-        stdout.contains("web-runtime-0.1.0"),
-        "doctor must report runtime_build_id, stdout={stdout}"
+    use sha2::Digest as _;
+    let expected_image = format!("sha256:{:x}", sha2::Sha256::digest(b"#!/bin/sh\nexit 1\n"));
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        result["result"]["runtime_build_id"], expected_image,
+        "doctor must report the actual executable content image, stdout={stdout}"
     );
     assert!(
         !stdout.contains("process_health") && !stdout.contains("controller_alive"),
