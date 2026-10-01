@@ -591,7 +591,8 @@ fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
     (content[open] == b'{' && content[close] == b'}').then_some((open, close))
 }
 
-fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
+/// Keep a selected body's outer braces when the replacement supplies only inner content.
+pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
     if outer_brace_offsets(requested).is_some() {
         return requested.to_vec();
     }

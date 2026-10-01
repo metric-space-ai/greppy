@@ -3512,7 +3512,7 @@ pub(crate) fn dispatch_edit_grammar(
             verify,
         } => {
             let outcome = (|| -> EditResult<EditRecord> {
-                let new_bytes = edit_positional_payload(new, "NEW")?;
+                let mut new_bytes = edit_positional_payload(new, "NEW")?;
                 let spec = WhereSpec {
                     file: None,
                     old: None,
@@ -3525,6 +3525,14 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
+                if body {
+                    edit_check_cardinality(&located, 1)?;
+                    let (start, end) = located.ranges[0];
+                    new_bytes = greppy_edit::verbs::replacement_body_preserving_delimiters(
+                        &located.content[start..end],
+                        &new_bytes,
+                    );
+                }
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
