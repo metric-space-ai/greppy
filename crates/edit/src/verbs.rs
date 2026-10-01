@@ -1829,6 +1829,11 @@ fn plan_semantic_file(
     scope_matches: usize,
     options: &VerbOptions,
 ) -> Result<SemanticFilePlan> {
+    let language = if language == Language::C {
+        crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+    } else {
+        language
+    };
     let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
     let syntax_after = syntax_counts(language, &applied.content);
@@ -2435,6 +2440,13 @@ fn run_pipeline(
     {
         return Ok(certificate);
     }
+    let language = language.map(|language| {
+        if language == Language::C {
+            crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+        } else {
+            language
+        }
+    });
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;

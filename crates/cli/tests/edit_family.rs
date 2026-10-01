@@ -830,8 +830,33 @@ fn patch_deletion_and_contextless_edit_remain_explicit_refusals() {
     let output = fixture.run_with_stdin(&["patch"], insertion.as_bytes());
     let text = combined(&output);
     assert_eq!(output.status.code(), Some(20), "{text}");
-    assert!(text.contains("no context line to anchor on"), "{text}");
+    assert!(text.contains("no existing line to anchor on"), "{text}");
+    assert!(text.contains("include an unchanged context line"), "{text}");
+    assert!(text.contains("nothing written"), "{text}");
     assert_file(&fixture.repo.join("existing.txt"), "before\n");
+}
+
+#[test]
+fn cpp_header_patch_accepts_valid_member_and_refuses_malformed_edit_atomically() {
+    let fixture = Fixture::new("cpp-header");
+    let path = fixture.repo.join("layer.h");
+    let before = "#include <memory>\nnamespace KWin {\nclass GLFramebuffer;\nclass Layer {\n    std::unique_ptr<GLFramebuffer> buffer;\n};\n}\n";
+    std::fs::write(&path, before).unwrap();
+    let valid = "--- a/layer.h\n+++ b/layer.h\n@@\n class GLFramebuffer;\n+class GLRenderTimeQuery;\n@@\n     std::unique_ptr<GLFramebuffer> buffer;\n+    std::unique_ptr<GLRenderTimeQuery> query;\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], valid.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&path, before);
+    let applied = fixture.run_with_stdin(&["patch"], valid.as_bytes());
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let after = before
+        .replace("class GLFramebuffer;", "class GLFramebuffer;\nclass GLRenderTimeQuery;")
+        .replace("    std::unique_ptr<GLFramebuffer> buffer;", "    std::unique_ptr<GLFramebuffer> buffer;\n    std::unique_ptr<GLRenderTimeQuery> query;");
+    assert_file(&path, &after);
+    let invalid = "--- a/layer.h\n+++ b/layer.h\n@@\n-    std::unique_ptr<GLRenderTimeQuery> query;\n+    std::unique_ptr<GLRenderTimeQuery> query( ;\n";
+    let refused = fixture.run_with_stdin(&["patch"], invalid.as_bytes());
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert!(combined(&refused).contains("nothing written"));
+    assert_file(&path, &after);
 }
 
 #[test]
