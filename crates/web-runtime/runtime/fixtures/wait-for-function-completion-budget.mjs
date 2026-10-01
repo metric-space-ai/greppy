@@ -23,7 +23,7 @@ for (const expected of [true, { answer: 42, nested: { ok: true } }]) {
     });
     return value;
   }, expected, { timeout: 2000 });
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  if ((typeof expected === "boolean" ? actual !== expected : actual?.answer !== expected.answer || actual?.nested?.ok !== expected.nested.ok || Object.keys(actual).length !== 2 || Object.keys(actual.nested).length !== 1)) {
     throw new Error("waitForFunction lost completed value: " + JSON.stringify(actual));
   }
   const state = await page.evaluate(() => ({
