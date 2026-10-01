@@ -4381,12 +4381,17 @@ impl GraphIndex {
         }
 
         let suffix = format!("::{owner}::{name}");
-        note_edge_resolution_work(self.by_qname.len());
-        let mut matches = self
-            .by_qname
-            .iter()
-            .filter(|(qname, node)| node.label == "Method" && qname.ends_with(&suffix))
-            .map(|(_, node)| node.id);
+        // The name index already bounds candidates to this method name.
+        // Scanning every project node here made cross-file receiver calls
+        // proportional to the whole graph for every individual edge.
+        let candidates = self.defs_named(&["Method"], name);
+        let mut matches = candidates
+            .into_iter()
+            .filter(|node| {
+                self.qname_for_id(node.id)
+                    .is_some_and(|qname| qname.ends_with(&suffix))
+            })
+            .map(|node| node.id);
         let target = matches.next()?;
         matches.next().is_none().then_some(target)
     }
@@ -8901,6 +8906,105 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             ratio < 5.0,
             "edge resolution must scale ~linearly; 4x input took {ratio:.2}x work \
              (quadratic would be ~16x). w1={w1}, w4={w4}"
+        );
+    }
+
+    fn receiver_resolution_work(n: usize) -> usize {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(
+                store
+                    .insert_node(&NewNode {
+                        project: "p".into(),
+                        label: "Method".into(),
+                        name: format!("method{i}"),
+                        qualified_name: format!("src/m{i}.rs::Owner{i}::method{i}"),
+                        file_path: format!("src/m{i}.rs"),
+                        start_line: 1,
+                        end_line: 2,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap(),
+            );
+        }
+        let index = GraphIndex::load(&store, "p").unwrap();
+        reset_edge_resolution_work_counter();
+        for (i, id) in ids.into_iter().enumerate() {
+            assert_eq!(
+                index.resolve_receiver_method(
+                    "src/caller.rs",
+                    &format!("Owner{i}"),
+                    &format!("method{i}")
+                ),
+                Some(id)
+            );
+        }
+        edge_resolution_work_count()
+    }
+
+    #[test]
+    fn cross_file_receiver_resolution_avoids_project_wide_scans() {
+        let small = receiver_resolution_work(1000);
+        let large = receiver_resolution_work(4000);
+        assert!(large < small * 5, "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically");
+    }
+
+    #[test]
+    fn receiver_method_name_index_preserves_owner_and_ambiguity() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let mut ids = Vec::new();
+        for (file, owner, label) in [
+            ("src/a.rs", "Buffer", "Method"),
+            ("src/b.rs", "Buffer", "Method"),
+            ("src/c.rs", "Other", "Method"),
+            ("src/d.rs", "Buffer", "Function"),
+        ] {
+            ids.push(
+                store
+                    .insert_node(&NewNode {
+                        project: "p".into(),
+                        label: label.into(),
+                        name: "as_bytes".into(),
+                        qualified_name: format!("{file}::{owner}::as_bytes"),
+                        file_path: file.into(),
+                        start_line: 1,
+                        end_line: 2,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap(),
+            );
+        }
+        let index = GraphIndex::load(&store, "p").unwrap();
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Buffer", "as_bytes"),
+            None
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/a.rs", "Buffer", "as_bytes"),
+            Some(ids[0])
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Other", "as_bytes"),
+            Some(ids[2])
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Missing", "as_bytes"),
+            None
         );
     }
 
