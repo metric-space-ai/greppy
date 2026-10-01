@@ -6989,6 +6989,54 @@ window.waitDocumentLoad = loads;
 }
 
 #[test]
+fn native_boolean_completion_read_uses_remaining_deadline_without_replay() {
+    let fixture = serve_fixture("<!doctype html><title>Completion budget</title><body>ready</body>");
+    let socket = std::env::temp_dir().join(format!("greppy-wait-completion-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_wait_completion", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_wait_completion", method, payload), Duration::from_secs(30))
+            .expect("completion budget request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+    for (predicate, expected_error) in [("true", None), ("({holds:false})", Some("INVALID_WAIT_PREDICATE"))] {
+        // Delay ONLY the destructive completion read beyond its former 80ms
+        // cutoff. Predicate evaluation and the caller's 2000ms budget stay fixed.
+        let source = format!(r#"(() => {{
+            window.completionPredicateCalls = (window.completionPredicateCalls || 0) + 1;
+            var key = Object.keys(window).filter(k => k.indexOf('__greppyWait_') === 0).pop();
+            var slot = window[key], done = 0;
+            Object.defineProperty(slot, 'done', {{configurable:true,
+                get() {{ var end = Date.now() + 120; while (Date.now() < end) {{}} return done; }},
+                set(value) {{ done = value; }}
+            }});
+            return {predicate};
+        }})()"#);
+        let reset = call("web.evaluate", json!({"session_id":session,"source":"window.completionPredicateCalls=0"}));
+        assert_eq!(reset.status, "ok", "{reset:?}");
+        let response = call("web.wait", json!({"session_id":session,"source":source,"timeout_ms":2000}));
+        if let Some(code) = expected_error {
+            assert_eq!(response.status, "error", "{response:?}");
+            assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        } else {
+            assert_eq!(response.status, "ok", "{response:?}");
+            assert_eq!(response.result.as_ref().unwrap()["held"], true);
+        }
+        let after = call("web.evaluate", json!({"session_id":session,"source":
+            "({calls:window.completionPredicateCalls, slots:Object.keys(window).filter(k => k.indexOf('__greppyWait_')===0).length})"}));
+        assert_eq!(after.status, "ok", "{after:?}");
+        assert_eq!(after.result.as_ref().unwrap()["value"]["calls"].as_f64(), Some(1.0), "{after:?}");
+        assert_eq!(after.result.as_ref().unwrap()["value"]["slots"].as_f64(), Some(0.0), "{after:?}");
+    }
+}
+
+#[test]
 fn expired_boolean_wait_does_not_replace_another_sessions_worker_or_tab() {
     let fixture = serve_fixture(
         "<!doctype html><html><body><p id='witness'>survived</p></body></html>",
