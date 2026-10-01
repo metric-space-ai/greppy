@@ -2164,7 +2164,9 @@ fn stage_input_files(
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
+            let modified = input.metadata()?.modified()?;
             io::copy(&mut input, &mut output)?;
+            output.set_times(fs::FileTimes::new().set_modified(modified))?;
             staged.push(serde_json::Value::String(
                 path.to_string_lossy().into_owned(),
             ));
@@ -2217,11 +2219,13 @@ mod tests {
         }
         let mut params = serde_json::json!({"files":[root.path.join("a/sample.txt"),root.path.join("b/sample.txt")]});
         stage_input_files(&mut params, &root.path, &worker.path).unwrap();
-        for (value, expected) in params["files"].as_array().unwrap().iter().zip([b"first".as_slice(),b"second".as_slice()]) {
+        for (index, (value, expected)) in params["files"].as_array().unwrap().iter().zip([b"first".as_slice(),b"second".as_slice()]).enumerate() {
             let path = Path::new(value.as_str().unwrap());
             assert!(path.starts_with(&worker.path));
             assert_eq!(path.file_name().unwrap(), "sample.txt");
             assert_eq!(fs::read(path).unwrap(), expected);
+            let original = root.path.join(if index == 0 { "a/sample.txt" } else { "b/sample.txt" });
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), fs::metadata(original).unwrap().modified().unwrap());
         }
     }
 
