@@ -205,10 +205,69 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
         return Cow::Borrowed(content);
     }
 
+    let mut normalized: Option<Vec<u8>> = None;
+    // tree-sitter-typescript 0.23.2 omits type_arguments on template_call.
+    // Its exact recovery is a complete instantiation_expression followed by
+    // a fabricated missing `!` inside non_null_expression. Validate a view
+    // without those type arguments; never alter the proposed source bytes.
+    let mut cursor = raw_tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_missing() && node.kind() == "!" {
+            if let Some(non_null) = node.parent().filter(|p| p.kind() == "non_null_expression") {
+                if let Some(call) = non_null.parent().filter(|p| p.kind() == "call_expression") {
+                    let mut expression = non_null.named_child(0);
+                    if expression.is_some_and(|p| p.kind() == "yield_expression") {
+                        expression = expression.and_then(|p| p.named_child(0));
+                    }
+                    if let (Some(instance), Some(template)) = (
+                        expression.filter(|p| p.kind() == "instantiation_expression"),
+                        call.child_by_field_name("arguments")
+                            .filter(|p| p.kind() == "template_string" && !p.has_error()),
+                    ) {
+                        if let Some(types) = instance.child_by_field_name("type_arguments") {
+                            let start = types.start_byte();
+                            let end = types.end_byte();
+                            if !instance.has_error()
+                                && types.named_child_count() > 0
+                                && end == node.start_byte()
+                                && end <= template.start_byte()
+                                && content.get(start) == Some(&b'<')
+                                && content.get(end.wrapping_sub(1)) == Some(&b'>')
+                                && content[end..template.start_byte()]
+                                    .iter().all(u8::is_ascii_whitespace)
+                            {
+                                let output = normalized.get_or_insert_with(|| content.to_vec());
+                                for byte in &mut output[start..end] {
+                                    if !matches!(*byte, b'\n' | b'\r') {
+                                        *byte = b' ';
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break;
+            }
+        }
+        if cursor.node() == raw_tree.root_node() {
+            break;
+        }
+    }
+
     fn identifier_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
     }
-    let mut normalized: Option<Vec<u8>> = None;
     let mut scan = 0usize;
     while scan + b"typeof".len() <= content.len() {
         let Some(relative) = content[scan..]
@@ -635,6 +694,44 @@ mod tests {
             escaped_newline,
             "line continuations must not be rewritten because that would move diagnostics"
         );
+    }
+
+    #[test]
+    fn typescript_typed_tag_validation_preserves_real_failures() {
+        for tsx in [false, true] {
+            let language = Language::TypeScript { tsx };
+            for valid in [
+                "function* run() { const rows = yield* sql<{ readonly workspace_root: string | null }>`SELECT workspace_root`; return rows; }",
+                "const rows = db.sql<Array<{ id: number }>>`SELECT ${id}`;",
+                "const rows = sql<\n{ readonly id: number },\nstring\n>`SELECT id`;",
+            ] {
+                let counts = syntax_counts(language, valid.as_bytes()).unwrap();
+                assert_eq!((counts.errors, counts.missing), (0, 0), "{valid}");
+                assert!(first_syntax_diagnostic(language, valid.as_bytes()).is_none());
+                let view = syntax_validation_content(language, valid.as_bytes());
+                assert_eq!(view.len(), valid.len());
+                assert_eq!(view.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i).collect::<Vec<_>>(), valid.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i).collect::<Vec<_>>());
+            }
+            for invalid in [
+                "const rows = sql<{ id: }>`SELECT id`;",
+                "const rows = sql<{ id: number }>`SELECT id;",
+                "const rows = sql<{ id: number }>`SELECT ${}`;",
+                "const rows = sql<{ id: number }>`SELECT id`; const broken = ;",
+                "const rows = sql<{ id: number }>!`SELECT id`; const broken = ;",
+            ] {
+                let counts = syntax_counts(language, invalid.as_bytes()).unwrap();
+                assert!(counts.errors + counts.missing > 0, "{invalid}");
+                assert!(first_syntax_diagnostic(language, invalid.as_bytes()).is_some());
+            }
+            for literal in [
+                "const s = 'sql<{ id: number }>`SELECT id`';",
+                "// sql<{ id: number }>`SELECT id`\nconst x = 1;",
+                "const s = `sql<{ id: number }> SELECT id`;",
+                "const r = /sql<id>!/;",
+            ] {
+                assert_eq!(syntax_validation_content(language, literal.as_bytes()).as_ref(), literal.as_bytes());
+            }
+        }
     }
 
     #[test]
