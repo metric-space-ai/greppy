@@ -1445,6 +1445,12 @@ pub(crate) fn index_overlay_snapshot(
         publish_store_snapshot(&temp_path, active_path)?;
     }
     cleanup_stale_snapshot_artifacts(active_path, false)?;
+    crate::context_status::published(
+        &workspace_locator::resolve_workspace_root(target),
+        report.graph_generation,
+        report.is_clean(),
+        matches!(embedding.as_ref(), Some(EmbeddingBuildOutcome::Complete(_))),
+    );
 
     if announce {
         println!(
@@ -1636,6 +1642,14 @@ pub(crate) fn index_atomic_snapshot_attempt(
         publish_store_snapshot(&temp_path, active_path)?;
     }
     cleanup_stale_snapshot_artifacts(active_path, true)?;
+    crate::context_status::published(
+        &workspace_locator::resolve_workspace_root(target),
+        report.graph_generation,
+        report.is_clean()
+            && report.files_skipped_by_file_limit == 0
+            && report.files_skipped_by_time_budget == 0,
+        embedding_report.is_some() && embedding_degraded.is_none() && !embedding_deferred,
+    );
     Ok(Some(IndexSnapshotReport {
         index: report,
         embeddings: embedding_report,
@@ -1701,6 +1715,11 @@ fn complete_embeddings_from_published_graph(
         publish_store_snapshot(&temp_path, active_path)?;
     }
     cleanup_stale_snapshot_artifacts(active_path, true)?;
+    crate::context_status::semantic_published(
+        effective_root,
+        generation,
+        matches!(&outcome, EmbeddingBuildOutcome::Complete(_)),
+    );
     Ok(outcome)
 }
 

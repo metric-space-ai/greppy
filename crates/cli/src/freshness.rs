@@ -112,8 +112,26 @@ pub(crate) fn graph_stale_gate_for_edges(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
+            if let (Ok(effective_root), Ok(generation)) =
+                (resolve_root(root), current_graph_generation(store, root))
+            {
+                crate::context_status::invalidate(&effective_root);
+                crate::context_status::restricted(
+                    &effective_root,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Graph,
+                );
+            }
             if json {
                 let incomplete_providers =
                     graph_edge_incomplete_provider_json(store, project, edge_types)?;
@@ -146,8 +164,26 @@ pub(crate) fn graph_stale_gate(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
+            if let (Ok(effective_root), Ok(generation)) =
+                (resolve_root(root), current_graph_generation(store, root))
+            {
+                crate::context_status::invalidate(&effective_root);
+                crate::context_status::restricted(
+                    &effective_root,
+                    generation.saturating_add(1),
+                    crate::context_status::Capability::Graph,
+                );
+            }
             if json {
                 graph_stale_skip_json(
                     store,
@@ -891,6 +927,13 @@ fn wait_for_index_publication(
     cause: &str,
 ) -> Result<()> {
     let baseline_generation = published_graph_generation(effective_root);
+    // A rejected launch is also a real capability restriction. Successful
+    // launch repeats this after the initial store directory exists.
+    crate::context_status::restricted(
+        effective_root,
+        baseline_generation.unwrap_or(0).saturating_add(1),
+        crate::context_status::Capability::Graph,
+    );
     let mut launch = spawn_background_job_handle(root, cause, "index", None).ok_or_else(|| {
         let detail = read_background_job(&background_job_path(effective_root))
             .and_then(|job| {
@@ -904,6 +947,11 @@ fn wait_for_index_publication(
             effective_root.display()
         ))
     })?;
+    crate::context_status::restricted(
+        effective_root,
+        baseline_generation.unwrap_or(0).saturating_add(1),
+        crate::context_status::Capability::Graph,
+    );
     loop {
         let owner_active = launch.owner_is_active().map_err(|error| {
             Error::io(
@@ -928,6 +976,10 @@ fn wait_for_index_publication(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             FirstUseIndexObservation::Published => {
+                crate::context_status::acknowledge(
+                    effective_root,
+                    crate::context_status::Capability::Graph,
+                );
                 if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
                     let _ = child.wait();
                 }
