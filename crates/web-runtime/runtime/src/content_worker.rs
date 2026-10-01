@@ -3354,7 +3354,7 @@ impl ContentEngine {
                 let bytes = text.as_bytes();
                 if bytes.len() as u64 > max_bytes {
                     return Err(io::Error::other(format!(
-                        "artifact limit exceeded ({} > {max_bytes})",
+                        "resource_limit: artifact limit exceeded ({} > {max_bytes})",
                         bytes.len()
                     )));
                 }
