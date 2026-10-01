@@ -2249,6 +2249,11 @@ fn dispatch_subcommand(
             diagnostics,
             agent_worktree,
         } => {
+            if diagnostics && !json {
+                return Err(Error::Invalid(
+                    "--diagnostics requires `index status --json`".into(),
+                ));
+            }
             if path.as_deref() == Some("status") {
                 if recovery_path.is_some() {
                     return Err(Error::Invalid(

@@ -376,6 +376,25 @@ fn index_health_output(mut value: serde_json::Value, detailed: bool) -> serde_js
     value
 }
 
+#[cfg(test)]
+#[test]
+fn compact_health_keeps_failed_inference_reason() {
+    let detailed = serde_json::json!({
+        "healthy": false,
+        "fresh": true,
+        "embedding_complete": true,
+        "inference_healthy": false,
+        "inference": {"registry": {"satisfied": false}},
+        "providers": [{"name": "rust"}],
+        "provider_failure_count": 0,
+    });
+    let compact = index_health_output(detailed.clone(), false);
+    assert_eq!(compact["healthy"], false);
+    assert_eq!(compact["inference_healthy"], false);
+    assert!(compact.get("inference").is_none());
+    assert_eq!(index_health_output(detailed.clone(), true), detailed);
+}
+
 fn dispatch_index_health_with_detail(
     command: &str,
     json: bool,
@@ -797,6 +816,7 @@ fn dispatch_index_health_with_detail(
             "git_tracked_files": git_tracked,
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
+            "inference_healthy": inference_healthy,
             "dirty_overlay": dirty_overlay.to_json(),
             "store_cow": store_cow,
             "inference": inference_diagnostics,
