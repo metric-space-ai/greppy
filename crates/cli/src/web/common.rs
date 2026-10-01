@@ -177,7 +177,7 @@ fn persist_route(path: &Path, route: &SessionRoute) -> std::result::Result<(), E
         .and_then(|_| temporary.flush())
         .map_err(|error| unavailable(&format!("cannot persist session route: {error}")))?;
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| unavailable(&format!("cannot install session route: {}", error.error)))?;
     #[cfg(unix)]
     {
@@ -1000,12 +1000,10 @@ fn rpc_with_spawn_legacy(
                     // it here means this call still reports the failure honestly
                     // and the next one starts clean, without the caller having to
                     // know that a state file exists.
-                    if response.error.as_ref().is_some_and(is_missing_session) {
-                        if let Some(session) = rejected_session.as_deref() {
-                            forget_current_session(root, session);
-                            remove_session_route(root, session);
-                        }
-                    } else if operation == "web.session.close" || operation == "session.close" {
+                    if response.error.as_ref().is_some_and(is_missing_session)
+                        || operation == "web.session.close"
+                        || operation == "session.close"
+                    {
                         if let Some(session) = rejected_session.as_deref() {
                             forget_current_session(root, session);
                             remove_session_route(root, session);
