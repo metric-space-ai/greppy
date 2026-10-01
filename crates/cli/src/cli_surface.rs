@@ -336,7 +336,7 @@ pub enum Command {
         expect: Option<usize>,
         /// Treat OLD as a regular expression and expand capture references in NEW:
         /// $1 or ${name} insert captures; $$ inserts a literal $ (use $$ROOT to
-        /// preserve shell $ROOT). Unknown capture references expand to empty.
+        /// preserve shell $ROOT). Unknown capture references are refused before anything is written.
         #[arg(long)]
         regex: bool,
         #[arg(long = "dry-run")]
