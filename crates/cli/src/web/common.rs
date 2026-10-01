@@ -1661,10 +1661,6 @@ pub(super) fn not_owned(message: &str) -> ErrorObject {
     )
 }
 
-pub(super) fn socket_is_live(socket: &std::path::Path, run_id: &str, capability: &str) -> bool {
-    live_runtime_status(socket, run_id, capability).is_some()
-}
-
 fn live_runtime_status(
     socket: &std::path::Path,
     run_id: &str,

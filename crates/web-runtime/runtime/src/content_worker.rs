@@ -1902,11 +1902,11 @@ impl ContentEngine {
                 "timed out evaluating structured DOM query",
             ));
         }
-        saved
+        let result = saved
             .borrow_mut()
             .take()
-            .expect("evaluation completed")
-            .map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
+            .expect("evaluation completed");
+        result.map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
     }
 
     /// Playwright awaits a Promise returned by `page.evaluate`. Servo's
