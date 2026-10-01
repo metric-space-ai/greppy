@@ -231,6 +231,24 @@ fn alloc_wait_nonce() -> io::Result<String> {
     Ok(rnd.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// A destructive read may pump a navigation between dispatch and callback.
+/// Reject old-document results, but never retry a read which returned an error.
+fn take_wait_completion_in_document<T>(
+    generation: &Cell<u64>,
+    expected: u64,
+    take: impl FnOnce() -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
+    if generation.get() != expected {
+        return Ok(None);
+    }
+    let completed = take()?;
+    if generation.get() != expected {
+        Ok(None)
+    } else {
+        Ok(completed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WakePoll {
     Ready,
@@ -2207,6 +2225,8 @@ impl ContentEngine {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
+        // Cleanup keeps its legacy best-effort allowance. Destructive completion
+        // retrieval below always spends this caller deadline, including public PW.
         let io_deadline = strict_boolean.then_some(deadline);
         let wake = self.wake_for_webview(&webview);
         let mut token = alloc_wait_nonce()?;
@@ -2251,11 +2271,11 @@ impl ContentEngine {
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
             if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
             {
                 return result;
             }
-            if jsvalue_is_truthy(&first) {
+            if delegate.document_generation.get() == document_generation && jsvalue_is_truthy(&first) {
                 self.drop_wait_slot(&webview, &token, io_deadline);
                 if !strict_boolean {
                     self.settle_pump_tokens(&webview);
@@ -2298,11 +2318,11 @@ impl ContentEngine {
                 };
                 if delegate.document_generation.get() == document_generation {
                     if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
                     {
                         return result;
                     }
-                    if jsvalue_is_truthy(&first) {
+                    if delegate.document_generation.get() == document_generation && jsvalue_is_truthy(&first) {
                         self.drop_wait_slot(&webview, &token, io_deadline);
                         if !strict_boolean {
                             self.settle_pump_tokens(&webview);
@@ -2313,7 +2333,7 @@ impl ContentEngine {
                 continue;
             }
             if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
             {
                 return result;
             }
@@ -2346,9 +2366,12 @@ impl ContentEngine {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
                     if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, io_deadline)?
+                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
                     {
                         return result;
+                    }
+                    if delegate.document_generation.get() != document_generation {
+                        continue;
                     }
                     self.drop_wait_slot(&webview, &token, io_deadline);
                     return Err(io::Error::new(
@@ -2390,7 +2413,7 @@ impl ContentEngine {
         token: &str,
         deadline: Option<Instant>,
     ) -> io::Result<Option<(String, JSValue)>> {
-        let budget = crate::wait_contract::wait_io_budget(deadline, Duration::from_millis(80));
+        let budget = crate::wait_contract::wait_completion_budget(deadline);
         if budget.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -2430,12 +2453,18 @@ impl ContentEngine {
         webview: &WebView,
         delegate: &Delegate,
         token: &str,
+        document_generation: u64,
         deadline: Option<Instant>,
+        strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
         };
-        let Some((status, value)) = self.take_completed_wait_slot(webview, token, deadline)? else {
+        let Some((status, value)) = take_wait_completion_in_document(
+            &delegate.document_generation,
+            document_generation,
+            || self.take_completed_wait_slot(webview, token, deadline),
+        )? else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -2452,7 +2481,7 @@ impl ContentEngine {
                 }),
                 other => WaitOutcome::Error(other.to_owned()),
             },
-            deadline.is_some(),
+            strict_budget,
         )))
     }
 
@@ -5836,6 +5865,40 @@ mod serialize_tests {
         assert!(!jsvalue_is_truthy(&JSValue::String(String::new())));
         assert!(jsvalue_is_truthy(&JSValue::String("ok".into())));
         assert!(jsvalue_is_truthy(&JSValue::Object(Default::default())));
+    }
+
+    #[test]
+    fn completion_retrieval_rejects_navigation_without_repeating_the_read() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let old = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Ok(Some("old-document completion"))
+        }).unwrap();
+        assert_eq!(old, None);
+        assert_eq!(reads.get(), 1);
+        let stale = take_wait_completion_in_document(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            Ok(Some("must not read new document with old nonce"))
+        }).unwrap();
+        assert_eq!(stale, None);
+        assert_eq!(reads.get(), 1);
+        let current = take_wait_completion_in_document(&generation, 2, || Ok(Some("new document"))).unwrap();
+        assert_eq!(current, Some("new document"));
+    }
+
+    #[test]
+    fn consumed_completion_timeout_is_not_retried_or_hidden_by_navigation() {
+        let generation = Cell::new(1);
+        let reads = Cell::new(0);
+        let result = take_wait_completion_in_document::<()>(&generation, 1, || {
+            reads.set(reads.get() + 1);
+            generation.set(2);
+            Err(io::Error::new(io::ErrorKind::TimedOut, "consumed slot callback expired"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
