@@ -8374,15 +8374,17 @@ fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option
     let candidate = if supplied.is_absolute() {
         supplied.to_path_buf()
     } else {
-        let cwd = std::env::current_dir().ok();
+        // A caller in another checkout must not shadow a relative filter in
+        // the selected repository merely because its own path exists.
+        let cwd = std::env::current_dir()
+            .ok()
+            .filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root));
         let cwd_candidate = cwd.as_ref().map(|cwd| cwd.join(supplied));
         if let Some(path) = cwd_candidate.as_ref().filter(|path| path.exists()) {
             path.to_path_buf()
         } else if root_path.join(supplied).exists() {
             root_path.join(supplied)
-        } else if let Some(cwd) =
-            cwd.filter(|cwd| canonicalize_with_missing_suffix(cwd).starts_with(&normalized_root))
-        {
+        } else if let Some(cwd) = cwd {
             cwd.join(supplied)
         } else {
             root_path.join(supplied)
