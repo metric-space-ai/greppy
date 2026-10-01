@@ -219,7 +219,7 @@ fn passthrough_command_like_pattern_waits_for_delayed_producer() {
 fn passthrough_pattern_exception_preserves_command_diagnostics() {
     for args in [&["references"][..], &["research", "--json"][..]] {
         let output = run_with_stdin(
-            &mut greppy_command("command-diagnostics").args(args),
+            greppy_command("command-diagnostics").args(args),
             b"research\n",
         );
         assert_eq!(output.status.code(), Some(64));
@@ -228,7 +228,7 @@ fn passthrough_pattern_exception_preserves_command_diagnostics() {
     // report POLLIN without supporting FIONREAD on Linux, so its availability
     // is intentionally forwarded conservatively instead of guessed empty.
     let output = run_with_stdin(
-        &mut greppy_command("empty-command-like-stdin").arg("research"),
+        greppy_command("empty-command-like-stdin").arg("research"),
         b"",
     );
     assert_eq!(output.status.code(), Some(64));
