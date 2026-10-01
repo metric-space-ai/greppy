@@ -55,6 +55,16 @@ static ZERO_FAILURE_COUNT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
         .expect("bash-smart zero failure count regex")
 });
 
+// aapt `dump xmltree` uses E for an XML element, not an error. Exempt
+// only its complete element/name/numeric-line record; ordinary E: failures
+// (including appended diagnostic text) must still start an error block.
+static AAPT_XML_ELEMENT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*E:[\t ]+[A-Za-z_][A-Za-z0-9_.:-]*[\t ]+\(line=[0-9]+\)[\t ]*$",
+    )
+    .expect("bash-smart aapt XML element regex")
+});
+
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
         .expect("bash-smart warning marker regex")
@@ -720,6 +730,7 @@ fn detect_blocks(
             }
             let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
                 && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
+                && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content)
@@ -2580,6 +2591,25 @@ mod tests {
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn aapt_xml_elements_are_not_errors_but_diagnostics_remain() {
+        let xml = split_lines(b"E: manifest (line=1)\n  A: package=example\n  E: uses-sdk (line=2)\n    A: android:minSdkVersion=26\n\tE: ns:activity.name (line=12)\n");
+        assert!(detect_blocks(&xml, &[]).is_empty());
+        assert!(detect_blocks(&[], &xml).is_empty());
+        for diagnostic in [
+            "E: failed to load resource\n",
+            "E: manifest (line=1): invalid package\n",
+            "E: manifest (line=x)\n",
+            "E: manifest (line=1) trailing failure\n",
+        ] {
+            let lines = split_lines(diagnostic.as_bytes());
+            for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
+                assert_eq!(blocks.len(), 1, "{diagnostic}");
+                assert_eq!(blocks[0].kind, BlockKind::Error, "{diagnostic}");
+            }
+        }
     }
 
     #[test]

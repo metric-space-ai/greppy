@@ -283,6 +283,36 @@ fn node_zero_failure_summary_preserves_bytes_and_child_status() {
 }
 
 #[test]
+fn aapt_xml_tree_preserves_bytes_and_child_status_without_false_errors() {
+    let workspace = fresh_workspace("aapt-xml");
+    let xml = "E: manifest (line=1)\n  A: package=example\n  E: uses-sdk (line=2)\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{xml}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{xml}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, xml.as_bytes());
+            }
+        }
+    }
+    let failed = format!("printf '%s' '{xml}E: failed to load resource\n'; exit 7");
+    let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &failed]);
+    assert_eq!(output.status.code(), Some(7));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 7: 1 error, 0 warnings\n"));
+    assert!(text(&output.stdout).contains("E: failed to load resource"));
+}
+
+#[test]
 fn node_assertion_error_counts_and_keeps_the_original_failure() {
     let workspace = fresh_workspace("node-assertion-error");
     let diagnostic =
