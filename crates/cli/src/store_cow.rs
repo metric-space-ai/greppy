@@ -1623,7 +1623,7 @@ fn has_verified_previous_indexer_base(
     if current_identity.indexer_version != "greppy-indexer-v7" {
         return Ok(false);
     }
-    return has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity);
+    has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity)
 }
 
 fn has_verified_previous_indexer_base_for_identity(

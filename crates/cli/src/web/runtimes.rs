@@ -259,6 +259,22 @@ pub(super) fn evaluate(
     evaluate_on_tab(root, json_out, session, None, source)
 }
 
+pub(super) fn structured_dom(
+    root: Option<&str>,
+    json_out: bool,
+    session: Option<String>,
+    request: serde_json::Value,
+    legacy_source: &str,
+) -> Result<i32> {
+    let session = match resolve_session(root, session) {
+        Ok(session) => session,
+        Err(error) => return emit_error(json_out, error),
+    };
+    let mut payload = request;
+    payload["session_id"] = json!(session);
+    rpc_structured_dom(root, json_out, payload, session, legacy_source)
+}
+
 pub(super) fn evaluate_on_tab(
     root: Option<&str>,
     json_out: bool,

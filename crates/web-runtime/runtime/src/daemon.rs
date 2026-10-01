@@ -275,6 +275,7 @@ fn copy_granted_modules(
 pub struct DaemonConfig {
     pub socket: PathBuf,
     pub run_id: String,
+    pub runtime_image_id: String,
     pub fixture_url: Option<String>,
     pub search_endpoint: Option<String>,
     pub idle_ttl: Duration,
@@ -667,6 +668,7 @@ fn accept_loop(
 struct Daemon {
     socket: PathBuf,
     run_id: String,
+    runtime_image_id: String,
     fixture_url: String,
     search_endpoint: Option<String>,
     ever_had_session: bool,
@@ -794,6 +796,7 @@ impl Daemon {
         Ok(Self {
             socket: config.socket,
             run_id: config.run_id.clone(),
+            runtime_image_id: config.runtime_image_id,
             fixture_url: config.fixture_url.unwrap_or_default(),
             search_endpoint: config.search_endpoint,
             store: ArtifactStore::new(data_root)?,
@@ -1069,6 +1072,7 @@ impl Daemon {
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
             "web.reload" => self.web_history(&request, "page.reload", "web.reload"),
             "web.evaluate" => self.web_evaluate(&request),
+            "web.structured_dom" => self.web_structured_dom(&request),
             "web.wait" => self.web_wait(&request),
             "web.workflow" => self.web_workflow(&request),
             "web.tab.new" => self.web_tab(&request, "new"),
@@ -1106,18 +1110,21 @@ impl Daemon {
     }
 
     fn handshake(&self, request: &Request) -> Response {
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let mut response = Response::ok(
             request,
             serde_json::json!({
                 "label": "experimental web-runtime spike",
             }),
         );
-        response.handshake = Some(Handshake::runtime_facts());
+        response.handshake = Some(handshake);
         response
     }
 
     fn doctor(&self, request: &Request) -> Response {
-        let handshake = Handshake::runtime_facts();
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let executable = std::env::current_exe()
             .ok()
             .map(|path| path.display().to_string());
@@ -1163,7 +1170,7 @@ impl Daemon {
             serde_json::json!({
                 "label": "experimental web-runtime spike",
                 "runtime_version": "0.1.0",
-                "runtime_build_id": "web-runtime-0.1.0",
+                "runtime_build_id": self.runtime_image_id.clone(),
                 "playwright_compatibility_version": "1.62.1",
                 "compatibility_coverage_level": "unverified",
                 "process_health": {
@@ -3399,6 +3406,45 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn web_structured_dom(&mut self, request: &Request) -> Response {
+        match self.with_session_page(request, "web.structured_dom") {
+            Err(response) => response,
+            Ok((session_id, page)) => {
+                let mut structured = request.payload.clone();
+                if let Some(object) = structured.as_object_mut() { object.remove("session_id"); object.remove("tab_id"); object.remove("agent_id"); }
+                let response = match self.engine_call("page.structuredDom", json!({"page":page,"request":structured})) {
+                    Ok(value) => {
+                        let tagged=value.get("serialized").cloned().unwrap_or(json!(null));
+                        Self::structured_dom_response(request, &session_id, tagged)
+                    }
+                    Err(error) => engine_error(request,error,34),
+                };
+                self.finish_session(&session_id); response
+            }
+        }
+    }
+
+    fn structured_dom_response(
+        request: &Request,
+        session_id: &str,
+        tagged: serde_json::Value,
+    ) -> Response {
+        let value = Self::plain_value(&tagged);
+        let mut response = Response::ok(
+            request,
+            json!({
+                "session_id": session_id,
+                "value": value,
+                "serialized": tagged,
+                "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+            }),
+        );
+        // find/extract historically travel through web.evaluate. Keep that raw
+        // protocol contract while the engine uses a distinct trusted IPC route.
+        response.operation = "web.evaluate".into();
+        response
     }
 
     fn bind_condition_source(
@@ -5874,6 +5920,38 @@ mod script_stage_tests {
         assert!(super::parse_result_cursor("offset=12").is_err());
         assert!(super::parse_result_cursor("sha256:short:0").is_err());
         assert!(super::parse_result_cursor(&format!("sha256:{digest}:x")).is_err());
+    }
+
+    #[test]
+    fn structured_find_and_extract_preserve_raw_evaluate_envelope() {
+        let serialized = json!({
+            "o": [
+                {"k": "count", "v": {"n": 1.0}},
+                {"k": "nodes", "v": {"a": [{"o": [{"k": "text", "v": {"s": "match"}}]}]}},
+            ]
+        });
+        let expected = json!({
+            "session_id": "strict-csp",
+            "value": {"count": 1.0, "nodes": [{"text": "match"}]},
+            "serialized": serialized,
+            "untrusted_content_boundary": "UNTRUSTED_PAGE_CONTENT",
+        });
+
+        for operation in ["find", "extract"] {
+            let request = super::Request::new(
+                format!("structured-{operation}"),
+                "web.structured_dom",
+                json!({"op": operation}),
+            );
+            let response = super::Daemon::structured_dom_response(
+                &request,
+                "strict-csp",
+                expected["serialized"].clone(),
+            );
+
+            assert_eq!(response.operation, "web.evaluate");
+            assert_eq!(response.result, Some(expected.clone()));
+        }
     }
 
     #[test]

@@ -2256,6 +2256,12 @@ fn web_status_reports_observability_fields() {
             "missing web.status field {key}: {status:?}"
         );
     }
+    assert_eq!(
+        result["runtime_build_id"],
+        greppy_web_client::runtime_image_id(Path::new(env!("CARGO_BIN_EXE_web-runtime")))
+            .expect("runtime executable identity"),
+        "status must expose the image identity captured by the running supervisor"
+    );
     assert_eq!(result["playwright_compatibility_version"], "1.62.1");
     assert_eq!(result["inventory_entries"], 1354);
     assert_eq!(result["unsupported_capability_count"], 500);
@@ -6410,6 +6416,70 @@ fn explicit_observation_query_scopes_native_dom_and_preserves_ref_identity() {
     let whole = call("web.observe", json!({"session_id":session}));
     assert_eq!(whole.status, "ok", "{whole:?}");
     assert!(whole.result.unwrap()["text"].as_str().unwrap().contains("BACKGROUND_SENTINEL"));
+}
+
+#[test]
+fn structured_dom_queries_work_under_csp_without_trusting_page_javascript() {
+    let fixture = serve_fixture(r#"<!doctype html><html><head>
+      <meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'">
+      <title>Strict CSP fixture</title></head><body><div id="before"></div>
+      <span id="target" role="button" data-proof="projection">CSP_TEXT</span>
+      </body></html>"#);
+    let socket = std::env::temp_dir()
+        .join(format!("greppy-structured-csp-{}.sock", std::process::id()));
+    let _guard = Supervisor::spawn(&socket, "run_structured_csp", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(&socket, &Request::new("run_structured_csp", method, payload),
+            Duration::from_secs(30)).expect("strict CSP request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let went = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(went.status, "ok", "{went:?}");
+
+    // The typed read channel can inspect page content; ordinary caller source
+    // must retain CSP restrictions, even when it resembles a structured request.
+    for source in [
+        "document.querySelector('#target').textContent",
+        "({op:'find',query:'id=target',limit:10,fields:[]})",
+    ] {
+        let response = call("web.evaluate", json!({"session_id":session,"source":source}));
+        assert_eq!(response.status, "error", "caller source escaped CSP: {response:?}");
+    }
+    for query in ["css=#target", "div~span", "xpath=//span", "id=target", "tag=span", "role=button"] {
+        for op in ["find", "extract"] {
+            let response = call("web.structured_dom", json!({
+                "session_id":session,"op":op,"query":query,"limit":10,
+                "fields":if op=="find" { json!([]) } else { json!(["text","id","attr:data-proof"]) },
+            }));
+            assert_eq!(response.status, "ok", "{op}/{query}: {response:?}");
+            assert_eq!(response.operation, "web.evaluate");
+            let result = response.result.unwrap();
+            assert_eq!(result["session_id"], session);
+            assert_eq!(result["untrusted_content_boundary"], "UNTRUSTED_PAGE_CONTENT");
+            assert!(!result["serialized"].is_null(), "raw parity: {result}");
+            assert_eq!(result["value"]["count"].as_f64(), Some(1.0), "{result}");
+            let row = &result["value"][if op=="find" { "nodes" } else { "rows" }][0];
+            assert_eq!(row["id"], "target");
+            assert_eq!(row["text"], "CSP_TEXT");
+            if op=="extract" { assert_eq!(row["attr:data-proof"], "projection"); }
+        }
+    }
+    let invalid = call("web.structured_dom", json!({
+        "session_id":session,"op":"find","query":"id=target","limit":10,
+        "fields":[],"source":"document.title='injected'",
+    }));
+    assert_eq!(invalid.status, "error", "extra caller source was accepted: {invalid:?}");
+    let recovered = call("web.structured_dom", json!({
+        "session_id":session,"op":"extract","query":"id=target","limit":1,
+        "fields":["text"],
+    }));
+    assert_eq!(recovered.status, "ok", "invalid request poisoned the session: {recovered:?}");
+    assert_eq!(recovered.result.unwrap()["value"]["rows"][0]["text"], "CSP_TEXT");
 }
 
 #[test]
