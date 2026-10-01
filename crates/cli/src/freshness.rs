@@ -1041,10 +1041,24 @@ fn open_default_store_writer(
         return greppy_store::Store::open_overlay(&overlay.base_path, &path, &overlay.visibility)
             .map_err(Into::into);
     }
-    if require_existing_index && !path.exists() {
+    let needs_first_publication = require_existing_index
+        && (!path.exists()
+            || (auto_reindex_enabled() && {
+                let store =
+                    greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())?;
+                store
+                    .get_workspace_state(effective_root.to_string_lossy().as_ref())?
+                    .is_none()
+            }));
+    if needs_first_publication {
         // Reuse the normal query open to trigger the existing first-use
         // auto-index/error path, then reopen writable for the evidence write.
+        // A file handle or continuation pack can already have created the DB
+        // without publishing a graph. It must not suppress first-use indexing.
         drop(open_default_store(root)?);
+        // Publication can establish a linked-worktree Base binding. Re-evaluate
+        // the overlay before reopening writable, just as the reader does.
+        return open_default_store_writer(root, require_existing_index);
     }
     if let Some(parent) = path.parent() {
         let _ = workspace_locator::ensure_store_dir(parent);

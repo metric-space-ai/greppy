@@ -70,6 +70,114 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
 }
 
 #[test]
+fn cold_symbol_reads_bootstrap_after_file_handle_and_preserve_it() {
+    for command in ["read", "read-smart"] {
+        let (repo, store) = fresh_workspace(command);
+        let source = "pub fn schema_marker() -> i32 { 41 }\n";
+        std::fs::write(repo.join("lib.rs"), source).unwrap();
+        let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        let handle = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("handle: "))
+            .expect("file handle before graph publication");
+        let graph_db = only_graph_db_below(&store);
+        assert!(!graph_db.parent().unwrap().join("index.job").exists());
+
+        let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs::schema_marker"]);
+        assert_eq!(code, 0, "{command}: {stdout}\n{stderr}");
+        assert!(stdout.contains("schema_marker"), "{stdout}");
+        assert!(stdout.contains("41"), "{stdout}");
+
+        let (code, stdout, stderr) = run(
+            &repo,
+            &store,
+            &[
+                "replace-span",
+                handle,
+                "pub fn schema_marker() -> i32 { 42 }\n",
+                "--dry-run",
+            ],
+        );
+        assert_eq!(code, 0, "original handle lost: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+            source
+        );
+    }
+}
+
+#[test]
+fn cold_linked_symbol_read_after_file_handle_attaches_published_base() {
+    let (repo, store) = fresh_workspace("cold-linked-handle");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn schema_marker() -> i32 { 41 }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "lib.rs"]);
+    git(&[
+        "-c",
+        "user.name=Cold Read Test",
+        "-c",
+        "user.email=cold-read@test.invalid",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    let linked = repo.parent().unwrap().join("linked");
+    git(&["worktree", "add", "-qb", "linked", linked.to_str().unwrap()]);
+    let (code, stdout, stderr) = run(&linked, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let (code, stdout, stderr) = run(&linked, &store, &["read", "lib.rs::schema_marker"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("pub fn schema_marker"), "{stdout}");
+    let (code, stdout, stderr) = run(&linked, &store, &["index", "status", "--json"]);
+    assert!([0, 73].contains(&code), "{stdout}\n{stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["store_cow"]["mode"], "overlay", "{status}");
+    assert_eq!(status["graph_generation"], 1, "{status}");
+}
+
+#[test]
+fn cold_file_handle_symbol_read_respects_auto_index_opt_out() {
+    let (repo, store) = fresh_workspace("cold-handle-opt-out");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn schema_marker() -> i32 { 41 }\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let output = Command::new(bin())
+        .args(["read", "lib.rs::schema_marker"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_AUTO_REINDEX", "0")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(format!("{stdout}{stderr}").contains("cold"));
+    assert!(!only_graph_db_below(&store)
+        .parent()
+        .unwrap()
+        .join("index.job")
+        .exists());
+}
+
+#[test]
 fn symbol_reads_never_mix_stale_spans_with_shifted_source() {
     let (repo, store) = fresh_workspace("shifted-source");
     let original = "fn predecessor() {\n    let _ = 1;\n}\nfn target() {\n    let _ = 42;\n}\n";
