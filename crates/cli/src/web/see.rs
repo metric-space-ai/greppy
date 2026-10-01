@@ -139,9 +139,13 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                 return emit_error(json, invalid(&format!("web find: {message}")));
             }
             let take = if first { 1 } else { limit };
+            let legacy = query_expression(&query, &format!(
+                "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) {{ return describe(e, false); }}) }};"
+            ));
             super::runtimes::structured_dom(
                 root, json, session,
                 serde_json::json!({"op":"find","query":normalize_node_query(&query),"limit":take,"fields":[]}),
+                &legacy,
             )
         }
         SeeCommand::Extract {
@@ -190,9 +194,22 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                     );
                 }
             }
+            let fields_json = serde_json::Value::String(wanted.join(",")).to_string();
+            let legacy = query_expression(&query, &format!(
+                "var want = {fields_json}.split(','); \
+                 return {{ count: nodes.length, rows: nodes.slice(0, {limit}).map(function(e) {{ \
+                   var row = {{}}; want.forEach(function(f) {{ \
+                     if (f.indexOf('attr:') === 0) row[f] = e.getAttribute(f.slice(5)); \
+                     else if (f === 'text') row.text = String(e.textContent == null ? '' : e.textContent).replace(/\\s+/g, ' ').trim(); \
+                     else if (f === 'tag') row.tag = e.tagName.toLowerCase(); \
+                     else if (f === 'id') row.id = e.id || null; \
+                     else row[f] = e[f] === undefined ? null : e[f]; \
+                   }}); return row; }}) }};"
+            ));
             super::runtimes::structured_dom(
                 root, json, session,
                 serde_json::json!({"op":"extract","query":normalize_node_query(&query),"limit":limit,"fields":wanted}),
+                &legacy,
             )
         }
         SeeCommand::Inspect {

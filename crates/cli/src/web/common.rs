@@ -943,11 +943,42 @@ pub(super) fn rpc_with_spawn(
     session_id: Option<String>,
     spawn: SupervisorSpawn,
 ) -> Result<i32> {
+    rpc_with_spawn_legacy(root, json_out, operation, payload, session_id, spawn, None)
+}
+
+pub(super) fn rpc_structured_dom(
+    root: Option<&str>,
+    json_out: bool,
+    payload: serde_json::Value,
+    session_id: String,
+    legacy_source: &str,
+) -> Result<i32> {
+    rpc_with_spawn_legacy(root, json_out, "web.structured_dom", payload, Some(session_id), SupervisorSpawn::default(), Some(legacy_source))
+}
+
+fn rpc_with_spawn_legacy(
+    root: Option<&str>,
+    json_out: bool,
+    operation: &str,
+    payload: serde_json::Value,
+    session_id: Option<String>,
+    spawn: SupervisorSpawn,
+    legacy_source: Option<&str>,
+) -> Result<i32> {
     // Match the runtime's payload-first resolution, not a user-controlled
     // error message or an unrelated currently selected session.
     let rejected_session = requested_rpc_session(&payload, session_id.as_deref());
     match supervisor_for_session(root, &spawn, rejected_session.as_deref()) {
-        Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
+        Ok(ctx) => {
+            // Older live daemons predate the typed DOM channel. Preserve
+            // their existing query implementation, under their normal CSP
+            // enforcement. Never route caller JavaScript through the trusted
+            // channel or select legacy behavior for a new image generation.
+            let (operation, payload) = match legacy_source.filter(|_| ctx.legacy) {
+                Some(source) => ("web.evaluate", json!({"session_id": rejected_session, "source": source})),
+                None => (operation, payload),
+            };
+            match rpc_on_response(&ctx, operation, payload, session_id) {
             Ok(response) => {
                 // A remembered session that turns out to be gone or wedged
                 // would otherwise poison every later command too. Forgetting
@@ -987,6 +1018,7 @@ pub(super) fn rpc_with_spawn(
                     }
                 }
                 emit_error(json_out, error)
+            }
             }
         },
         Err(error) => emit_error(json_out, error),
