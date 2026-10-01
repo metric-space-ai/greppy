@@ -104,6 +104,57 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn regex_replacement_refuses_unknown_captures_and_preserves_literal_routes() {
+    let fixture = Fixture::new("regex-route");
+    let path = fixture.repo.join("route.ts");
+    let before = "export const route = \"before\";\n";
+    std::fs::write(&path, before).unwrap();
+    for replacement in ["/$environmentId/$threadId", "/${missing}/", "$1", "$1x"] {
+        let out = fixture.run(&["replace-text", "route.ts", "before", replacement, "--regex"]);
+        assert_eq!(out.status.code(), Some(17), "{}", combined(&out));
+        assert!(combined(&out).contains("capture"));
+        assert!(combined(&out).contains("$$"));
+        assert_file(&path, before);
+    }
+    let out = fixture.run(&[
+        "replace-text",
+        "route.ts",
+        "before",
+        "/$$environmentId/$$threadId",
+        "--regex",
+    ]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_file(
+        &path,
+        "export const route = \"/$environmentId/$threadId\";\n",
+    );
+    std::fs::write(&path, before).unwrap();
+    let out = fixture.run(&[
+        "replace-text",
+        "route.ts",
+        "(?P<part>before)",
+        "${part}-$1-$0",
+        "--regex",
+    ]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_file(&path, "export const route = \"before-before-before\";\n");
+}
+
+#[test]
+fn write_typed_template_accepts_valid_typescript_and_refuses_malformed_changes_atomically() {
+    let fixture = Fixture::new("typed-template");
+    let valid = "function* run() { const rows = yield* sql<{ readonly workspace_root: string | null }>`SELECT workspace_root`; return rows; }\n";
+    let out = fixture.run_with_stdin(&["write", "query.ts"], valid.as_bytes());
+    assert!(out.status.success(), "{}", combined(&out));
+    let path = fixture.repo.join("query.ts");
+    assert_file(&path, valid);
+    let invalid = valid.replace("string | null", "string |");
+    let out = fixture.run_with_stdin(&["write", "query.ts"], invalid.as_bytes());
+    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+    assert_file(&path, valid);
+}
+
+#[test]
 fn write_outside_workspace_refuses_nonzero_and_names_root_recovery() {
     let fixture = Fixture::new("write-outside");
     let other = fixture.base.join("other");

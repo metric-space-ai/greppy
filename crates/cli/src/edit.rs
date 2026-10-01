@@ -937,7 +937,64 @@ pub(crate) fn edit_publish(
     Ok(record)
 }
 
-pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditedContent {
+fn edit_check_regex_replacement(regex: &regex::bytes::Regex, replacement: &[u8]) -> EditResult<()> {
+    let mut at = 0;
+    while at < replacement.len() {
+        if replacement[at] != b'$' {
+            at += 1;
+            continue;
+        }
+        at += 1;
+        if replacement.get(at) == Some(&b'$') {
+            at += 1;
+            continue;
+        }
+        let start;
+        let end;
+        if replacement.get(at) == Some(&b'{') {
+            start = at + 1;
+            let Some(close) = replacement[start..].iter().position(|b| *b == b'}') else {
+                continue;
+            };
+            end = start + close;
+            at = end + 1;
+        } else {
+            start = at;
+            while replacement
+                .get(at)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                at += 1;
+            }
+            end = at;
+            if start == end {
+                continue;
+            }
+        }
+        let name = String::from_utf8_lossy(&replacement[start..end]);
+        let known = if let Ok(index) = name.parse::<usize>() {
+            index < regex.captures_len()
+        } else {
+            regex
+                .capture_names()
+                .flatten()
+                .any(|capture| capture == name)
+        };
+        if !known {
+            return Err(EditRefusal::new(
+                "unknown_replacement_capture",
+                format!("--regex expands captures in NEW, but capture '{name}' does not exist in OLD; nothing written. Use $$ for a literal dollar sign, or omit --regex for a literal OLD pattern."),
+                17,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditResult<EditedContent> {
+    if let Some(regex) = &located.regex {
+        edit_check_regex_replacement(regex, new_bytes)?;
+    }
     // A line-oriented span stops before the newline that ends its last line,
     // because that newline belongs to the file (see `SelectorKind::line_oriented`).
     // New text that carries one of its own would therefore add a blank line the
@@ -966,7 +1023,7 @@ pub(crate) fn edit_op_replace(located: &Located, new_bytes: &[u8]) -> EditedCont
         };
         edits.push((*start, *end, replacement));
     }
-    edit_splice(&located.content, &mut edits)
+    Ok(edit_splice(&located.content, &mut edits))
 }
 
 pub(crate) fn edit_op_delete(located: &Located) -> EditedContent {
@@ -3465,7 +3522,7 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3500,7 +3557,7 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, kind, root, root_path, file_base)?;
                 edit_check_cardinality(&located, expect)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3526,7 +3583,7 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Lines, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
@@ -3551,7 +3608,7 @@ pub(crate) fn dispatch_edit_grammar(
                     path: None,
                 };
                 let located = edit_locate(&spec, SelectorKind::Target, root, root_path, file_base)?;
-                let (new_content, changed) = edit_op_replace(&located, &new_bytes);
+                let (new_content, changed) = edit_op_replace(&located, &new_bytes)?;
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
             emit_edit_outcome(outcome, json, None, root_path)?
