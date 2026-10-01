@@ -911,6 +911,13 @@ fn wait_for_index_publication(
     cause: &str,
 ) -> Result<()> {
     let baseline_generation = published_graph_generation(effective_root);
+    // A rejected launch is also a real capability restriction. Successful
+    // launch repeats this after the initial store directory exists.
+    crate::context_status::restricted(
+        effective_root,
+        baseline_generation.unwrap_or(0).saturating_add(1),
+        crate::context_status::Capability::Graph,
+    );
     let mut launch = spawn_background_job_handle(root, cause, "index", None).ok_or_else(|| {
         let detail = read_background_job(&background_job_path(effective_root))
             .and_then(|job| {

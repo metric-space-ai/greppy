@@ -246,8 +246,12 @@ pub(crate) fn notice(root: &Path, scope: &str) -> Option<String> {
         return None;
     }
     let current = fingerprint(&super::workspace_locator::store_path(root))?;
-    let job = bounded_read(&super::background_job_path(root))
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let job_path = super::background_job_path(root);
+    let job = match std::fs::symlink_metadata(&job_path) {
+        Ok(_) => Some(serde_json::from_slice::<serde_json::Value>(&bounded_read(&job_path)?).ok()?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
     let blocked = job.as_ref().is_some_and(|j| {
         matches!(
             j.get("state").and_then(serde_json::Value::as_str),
@@ -507,6 +511,12 @@ mod tests {
             super::super::background_job_path(&root),
             serde_json::to_vec(&serde_json::json!({"kind":"embedding", "state":"cancelled"}))
                 .unwrap(),
+        )
+        .unwrap();
+        assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_none());
+        std::fs::write(
+            super::super::background_job_path(&root),
+            vec![0; MAX_BYTES as usize + 1],
         )
         .unwrap();
         assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_none());

@@ -1600,6 +1600,11 @@ fn wait_for_embedding_publication(
     cfg: &EmbeddingModelConfig,
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
+    crate::context_status::restricted(
+        effective_root,
+        requested_generation,
+        crate::context_status::Capability::Semantic,
+    );
     loop {
         let mut launch = spawn_background_embed_handle(root, cfg).ok_or_else(|| {
             let detail = background_embedding_failure(embedding_progress_value(
