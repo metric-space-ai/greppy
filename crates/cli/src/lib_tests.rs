@@ -763,6 +763,34 @@ fn embedding_eta_uses_backend_prior_then_measured_throughput() {
 }
 
 #[test]
+fn embedding_eta_does_not_treat_cached_documents_as_gpu_inference() {
+    // A fast cached prefix followed by uncached documents must not predict
+    // that the GPU processes documents at the cache-copy rate.
+    let (inferred, workload) = embedding_inference_workload(1_000, 2_000, 400, 500);
+    assert_eq!((inferred, workload), (100, 1_100));
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 10_000),
+        Some(100)
+    );
+    assert_eq!(
+        observed_embedding_rate_milli(inferred, 10_000),
+        Some(10_000)
+    );
+
+    let (inferred, workload) = embedding_inference_workload(900, 2_000, 400, 500);
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 1_000),
+        None
+    );
+    assert_eq!(observed_embedding_rate_milli(inferred, 1_000), None);
+    assert_eq!(embedding_inference_workload(100, 200, 150, 50), (0, 100));
+    assert_eq!(
+        embedding_inference_workload(2_000, 2_000, 400, 500),
+        (1_100, 1_100)
+    );
+}
+
+#[test]
 fn embedding_progress_message_names_backend_counts_and_eta() {
     let progress = serde_json::json!({
         "backend": "metal",
