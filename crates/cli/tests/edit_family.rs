@@ -154,6 +154,25 @@ fn regex_replacement_preserves_non_utf8_braced_literal_bytes() {
 }
 
 #[test]
+fn write_bash_readwrite_redirect_accepts_valid_shell_and_refuses_invalid_changes_atomically() {
+    let fixture = Fixture::new("bash-readwrite-redirect");
+    let valid = "#!/bin/bash\nexec 9<>/mnt/nvme1/.greppy-heavy.lock\n";
+    let out = fixture.run_with_stdin(&["write", "lock.sh"], valid.as_bytes());
+    assert!(out.status.success(), "{}", combined(&out));
+    let path = fixture.repo.join("lock.sh");
+    assert_file(&path, valid);
+    for invalid in [
+        "#!/bin/bash\nexec 9< >file\n",
+        "#!/bin/bash\nexec 9<>\n",
+        "#!/bin/bash\nexec 9<>file\nif then\n",
+    ] {
+        let out = fixture.run_with_stdin(&["write", "lock.sh"], invalid.as_bytes());
+        assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+        assert_file(&path, valid);
+    }
+}
+
+#[test]
 fn write_typed_template_accepts_valid_typescript_and_refuses_malformed_changes_atomically() {
     let fixture = Fixture::new("typed-template");
     let valid = "function* run() { const rows = yield* sql<{ readonly workspace_root: string | null }>`SELECT workspace_root`; return rows; }\n";

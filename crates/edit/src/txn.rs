@@ -161,6 +161,52 @@ pub fn syntax_language_for_path(path: &Path, before: &[u8]) -> Language {
     language
 }
 
+/// Validation-only recovery for Bash's read/write redirect omitted by the grammar.
+fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    let Ok(tree) = greppy_parser::parse(Language::Bash, content) else {
+        return Cow::Borrowed(content);
+    };
+    let mut normalized: Option<Vec<u8>> = None;
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() && content.get(node.start_byte()..node.end_byte()) == Some(b">") {
+            if let Some(redirect) = node.parent().filter(|p| p.kind() == "file_redirect") {
+                let start = node.start_byte();
+                let end = node.end_byte();
+                let destination = redirect.child_by_field_name("destination");
+                let exact_operator = (0..redirect.child_count())
+                    .filter_map(|i| redirect.child(i))
+                    .any(|child| {
+                        child.kind() == "<"
+                            && child.end_byte() == start
+                            && child.start_byte().checked_add(1) == Some(start)
+                    });
+                if exact_operator
+                    && destination.is_some_and(|d| !d.has_error() && d.start_byte() >= end)
+                {
+                    // tree-sitter-bash 0.25.1 omits Bash's read/write `<>`.
+                    // Validate an equally sized `>>` view of this exact recovered
+                    // redirect; proposed bytes and diagnostic positions stay intact.
+                    let output = normalized.get_or_insert_with(|| content.to_vec());
+                    output[start - 1] = b'>';
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return normalized.map_or(Cow::Borrowed(content), Cow::Owned);
+            }
+        }
+    }
+}
+
 /// Build a validation-only view for the exact import-type recovery shape
 /// emitted by the bundled TypeScript grammar.
 ///
@@ -173,6 +219,10 @@ pub fn syntax_language_for_path(path: &Path, before: &[u8]) -> Language {
 /// expressions, and unrelated malformed code cannot qualify. The substituted
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
+    if matches!(language, Language::Bash) {
+        return bash_validation_content(content);
+    }
+
     if !matches!(language, Language::TypeScript { .. }) {
         return Cow::Borrowed(content);
     }
@@ -735,6 +785,42 @@ mod tests {
                     literal.as_bytes()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bash_readwrite_redirect_validation_preserves_real_failures() {
+        for valid in [
+            "#!/bin/bash\nexec 9<>/mnt/nvme1/.greppy-heavy.lock\n",
+            "exec <> file",
+            "exec 9<>\"space name\"",
+            "exec 9<>$lock; echo ok",
+        ] {
+            let counts = syntax_counts(Language::Bash, valid.as_bytes()).unwrap();
+            assert_eq!((counts.errors, counts.missing), (0, 0), "{valid}");
+            assert!(first_syntax_diagnostic(Language::Bash, valid.as_bytes()).is_none());
+            assert_eq!(bash_validation_content(valid.as_bytes()).len(), valid.len());
+        }
+        for invalid in [
+            "exec 9< >file",
+            "exec 9<>\n",
+            "exec 9<>>file",
+            "exec 9<>file; if then",
+            "exec 9<>\"unclosed",
+        ] {
+            let counts = syntax_counts(Language::Bash, invalid.as_bytes()).unwrap();
+            assert!(counts.errors + counts.missing > 0, "{invalid}");
+            assert!(first_syntax_diagnostic(Language::Bash, invalid.as_bytes()).is_some());
+        }
+        for literal in [
+            "echo '9<>file'",
+            "# exec 9<>file\necho ok",
+            "cat <<EOF\n9<>file\nEOF\n",
+        ] {
+            assert_eq!(
+                bash_validation_content(literal.as_bytes()).as_ref(),
+                literal.as_bytes()
+            );
         }
     }
 
