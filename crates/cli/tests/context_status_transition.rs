@@ -37,7 +37,23 @@ fn stale_symbol_lookup_announces_published_graph_once_on_literal_read() {
     assert!(pending.stderr.is_empty(), "{pending:?}");
     let publication = run(&repo, &store, &["index", "."]);
     assert!(publication.status.success(), "{publication:?}");
+    // Failed provider-policy validation and a no-match lookup must not consume
+    // the pending hint merely because graph freshness was established.
+    let provider_refusal = Command::new(env!("CARGO_BIN_EXE_greppy"))
+        .args(["search-symbol", "second_value"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_CONTEXT_SCOPE", "context-transition-cli")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_PROVIDER_POLICY", "invalid-fixture-policy")
+        .output()
+        .unwrap();
+    assert!(!provider_refusal.status.success(), "{provider_refusal:?}");
+    assert!(String::from_utf8_lossy(&provider_refusal.stderr).contains("GREPPY_PROVIDER_POLICY"));
+    let missing = run(&repo, &store, &["search-symbol", "absent_fixture_symbol"]);
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
     let ready = run(&repo, &store, &["read-file", "value.rs"]);
+
     assert!(ready.status.success());
     let hint = String::from_utf8(ready.stderr).unwrap();
     assert_eq!(hint.matches("graph preparation completed").count(), 1);

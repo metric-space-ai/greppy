@@ -441,7 +441,6 @@ pub(crate) fn dispatch_search_symbols(
         // resolves by itself, and a wrong answer is what follows.
         return Ok(freshness_refusal_exit(freshness));
     }
-    crate::context_status::acknowledge(&root_path, crate::context_status::Capability::Graph);
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
 
@@ -512,11 +511,18 @@ pub(crate) fn dispatch_search_symbols(
             &path_filters,
             Some(total_filtered),
         )?;
+        if total_filtered > 0 {
+            crate::context_status::acknowledge(
+                &root_path,
+                crate::context_status::Capability::Graph,
+            );
+        }
         return Ok(if total_filtered == 0 { 1 } else { 0 });
     }
     if !contained.is_empty() {
         contained.truncate(cli_result_limit_unless_all(20, all));
         search_print_symbol_rows(&root_path, &contained, code);
+        crate::context_status::acknowledge(&root_path, crate::context_status::Capability::Graph);
         return Ok(0);
     }
 
