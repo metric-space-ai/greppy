@@ -61,6 +61,61 @@ fn indexed_two_tree_repo(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+fn search_pattern_relative_filter_uses_selected_root_from_another_checkout() {
+    let (repo, store) = fresh_workspace("external-cwd-filter");
+    let caller = repo.parent().unwrap().join("other-checkout");
+    for root in [&repo, &caller] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+    }
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "fn selected() { /* SELECTED_ONLY */ }\n",
+    )
+    .unwrap();
+    std::fs::write(caller.join("src/lib.rs"), "fn foreign() {}\n").unwrap();
+    let root_arg = repo.to_str().unwrap();
+    for (cwd, filter) in [
+        (caller.as_path(), "src"),
+        (caller.as_path(), "src/lib.rs"),
+        (repo.join("src").as_path(), "lib.rs"),
+    ] {
+        let (code, out, err) = run(
+            cwd,
+            &store,
+            &[
+                "search-pattern",
+                "SELECTED_ONLY",
+                "--fixed",
+                "--root",
+                root_arg,
+                "--path",
+                filter,
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "filter={filter}; stdout={out}; stderr={err}");
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(result["total_exact"], 1, "{out}");
+        assert_eq!(result["hits"][0]["file"], "src/lib.rs", "{out}");
+    }
+    let (code, out, err) = run(
+        &caller,
+        &store,
+        &[
+            "search-pattern",
+            "foreign",
+            "--root",
+            root_arg,
+            "--path",
+            "../other-checkout/src",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={out}; stderr={err}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn search_symbol_path_keeps_only_hits_under_the_filter() {
     let (repo, store) = indexed_two_tree_repo("symbol-keep");
 
