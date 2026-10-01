@@ -411,6 +411,14 @@ fn valid_runtime_image_id(runtime_image_id: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+fn valid_session_route_image(route: &SessionRoute) -> bool {
+    // Pre-generation daemons advertise their historical build tag, not a
+    // content SHA. It never selects a socket: legacy routes use only the
+    // workspace-derived legacy identity and that socket's own attach cookie.
+    // The authenticated live status must still match the saved build tag.
+    route.legacy || valid_runtime_image_id(&route.runtime_image_id)
+}
+
 pub(super) fn runtime_status(json: bool, root: Option<&str>) -> Result<i32> {
     let (run_id, identity) = runtime_run_id(root);
     let runtime = match resolve_runtime() {
@@ -995,7 +1003,7 @@ fn supervisor_for_session(
         .and_then(|runtime| greppy_web_client::runtime_image_id(&runtime.executable).ok());
     if let Some(session) = session {
         if let Some(route) = load_session_route(root, session) {
-            if !valid_runtime_image_id(&route.runtime_image_id) {
+            if !valid_session_route_image(&route) {
                 remove_session_route(root, session);
                 return Err(unavailable(
                     "saved session route has an invalid runtime image identity",
@@ -1039,7 +1047,7 @@ fn supervisor_for_session(
             remove_session_route(root, session);
         }
         for route in known_runtime_routes(root) {
-            if !valid_runtime_image_id(&route.runtime_image_id) {
+            if !valid_session_route_image(&route) {
                 continue;
             }
             let (route_run_id, route_identity) = runtime_run_id(root);
@@ -2391,6 +2399,17 @@ mod target_tests {
         assert_eq!(requested_rpc_session(&json!({}), Some("fallback")).as_deref(), Some("fallback"));
         assert_eq!(requested_rpc_session(&json!({"session_id":null}), Some("fallback")).as_deref(), Some("fallback"));
         assert_eq!(requested_rpc_session(&json!({}), None), None);
+    }
+
+    #[test]
+    fn legacy_build_tag_is_not_used_as_a_content_image_socket_identity() {
+        let mut route = SessionRoute { runtime_image_id: "historical-build-tag".into(), legacy: true };
+        assert!(valid_session_route_image(&route));
+        route.legacy = false;
+        assert!(!valid_session_route_image(&route));
+        route.runtime_image_id = format!("sha256:{}", "a".repeat(64));
+        assert!(valid_session_route_image(&route));
+        assert_eq!(select_route_capability(None, Some("current-token".into()), false), None);
     }
 
     #[test]
