@@ -716,6 +716,19 @@ pub(crate) fn visibility_for_open_connection(
         .unwrap_or_else(|| visibility_against(root, base_commit))
 }
 
+fn rust_repair_requires_source_refresh(
+    store: &greppy_store::Store,
+    root: &Path,
+    project: &str,
+) -> bool {
+    let root = root.to_string_lossy();
+    crate::freshness::freshness_is_reindexable_stale(&crate::nav_freshness_json_uncached(
+        store,
+        Some(root.as_ref()),
+        project,
+    ))
+}
+
 /// Repair a Delta from an older Rust path resolver whose workspace state already advertises v7 but
 /// whose resolved Rust caller edges were produced by the old resolver.
 ///
@@ -773,6 +786,11 @@ pub(crate) fn repair_persisted_v7_delta(
     }
     drop(current);
     let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
+    // Defer migration until the normal freshness refresh publishes edited sources.
+    // Keep the repair marker pending and never authorize a stale graph.
+    if rust_repair_requires_source_refresh(&overlay, root, project) {
+        return Ok(false);
+    }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
         let existing_edges: i64 = overlay
@@ -845,6 +863,9 @@ pub(crate) fn ensure_persisted_single_store_repaired(
     let mut store =
         greppy_store::Store::open_with(path, greppy_store::OpenOptions::query_writer())?;
     if persisted_v7_delta_needs_repair(&store, root)? {
+        if rust_repair_requires_source_refresh(&store, root, project) {
+            return Ok(());
+        }
         greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
     }
     Ok(())
@@ -866,6 +887,10 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
     let repaired =
         greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
     if persisted_v7_delta_needs_repair(&repaired, root)? {
+        let visible = repaired.attach_overlay(base_path, visibility)?;
+        if rust_repair_requires_source_refresh(&visible, root, project) {
+            return Ok(());
+        }
         return Err(Error::Lock(
             "persisted Delta repair did not publish its completion marker".into(),
         ));
@@ -2792,6 +2817,49 @@ mod tests {
             greppy_indexer::rust_caller_edges_repaired(&store).unwrap(),
             "a current Base makes sparse publication current without a Base pass"
         );
+    }
+
+    #[test]
+    fn persisted_rust_repair_defers_to_refresh_after_source_edits() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _env = EnvRestore::capture(&["GREPPY_STORE_DIR", "GREPPY_PROJECT_IDENTITY", "GREPPY_AUTO_REINDEX", "GREPPY_TEST_SKIP_INFERENCE", ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT]);
+                for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] { std::env::remove_var(name); }
+                let scratch = tempfile::tempdir().unwrap();
+                let repo = fixture();
+                let root = crate::resolving::resolve_root(Some(&repo.path().to_string_lossy())).unwrap();
+                let root_string = root.to_string_lossy().into_owned();
+                std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+                std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+                std::env::set_var("GREPPY_AUTO_REINDEX", "0");
+                std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+                let path = crate::workspace_locator::store_path(&root);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut store = greppy_store::Store::open(&path).unwrap();
+                greppy_indexer::index(&mut store, &root, "p").unwrap();
+                store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+                let original_states = format!("{:?}", store.list_file_states("p").unwrap());
+                drop(store);
+                std::fs::write(root.join("src/a.rs"), "pub fn refreshed_target() {}\npub fn refreshed_caller() { refreshed_target(); }\n").unwrap();
+                for store in [crate::freshness::open_default_store(Some(&root_string)).unwrap(), crate::freshness::open_default_store_query_writer(Some(&root_string)).unwrap()] {
+                    assert!(persisted_v7_delta_needs_repair(&store, &root).unwrap());
+                    assert_eq!(format!("{:?}", store.list_file_states("p").unwrap()), original_states);
+                    let proof = crate::nav_freshness_json_uncached(&store, Some(&root_string), "p");
+                    assert!(crate::freshness::freshness_is_reindexable_stale(&proof), "{proof:?}");
+                    assert!(matches!(crate::freshness::freshness_serve_decision(&store, Some(&root_string), "p"), crate::FreshnessServe::Refuse(_)), "deferred migration must not authorize a stale graph");
+                }
+                // Exercise the same atomic publication used by the automatic
+                // query refresh, without spawning the unit-test executable.
+                crate::indexing::index_atomic_snapshot(&path, &root, "p", None, &greppy_indexer::IndexOptions::default(), false, None).unwrap();
+                let store = crate::freshness::open_default_store(Some(&root_string)).unwrap();
+                assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+                let target = store.get_node_by_qname("p", "src/a.rs::Function::refreshed_target").unwrap().unwrap();
+                let caller = store.get_node_by_qname("p", "src/a.rs::Function::refreshed_caller").unwrap().unwrap();
+                assert!(store.incoming_edges(target.id, Some("CALLS"), 20).unwrap().iter().any(|edge| edge.source_id == caller.id));
+                assert!(store.get_node_by_qname("p", "src/a.rs::Function::a").unwrap().is_none());
+            }).unwrap().join().unwrap();
     }
 
     #[test]
