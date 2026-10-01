@@ -115,7 +115,7 @@ mod greppy_structured_dom_tests {
         ).unwrap();
         assert!(trusted);
         let script = structured_dom_script(valid).unwrap().unwrap();
-        assert!(script.contains("replace(/\s+/g,' ')") && script.contains("getBoundingClientRect"));
+        assert!(script.contains(r"replace(/\s+/g,' ')") && script.contains("getBoundingClientRect"));
         for query in ["css=a", "div~span", "xpath=//a", "id=main", "tag=h1", "role=link", "text=Hello", "text~/hello\\s+world/i"] {
             let request = serde_json::json!({"op":"find","query":query,"fields":[],"limit":3}).to_string();
             assert!(structured_dom_script(&request).unwrap().is_some(), "{query}");
