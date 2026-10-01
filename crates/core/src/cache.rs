@@ -724,7 +724,7 @@ fn ensure_workspace_manifest(dir: &Path, workspace_root: &Path) -> io::Result<()
         created_at_unix_secs: unix_now_secs(),
     };
     let manifest_path = dir.join(STORE_MANIFEST_FILE);
-    match read_store_manifest(&dir) {
+    match read_store_manifest(dir) {
         Ok(existing)
             if existing.format_version == expected.format_version
                 && existing.workspace_hash == expected.workspace_hash
