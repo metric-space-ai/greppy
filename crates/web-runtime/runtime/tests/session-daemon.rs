@@ -4492,6 +4492,14 @@ fn file_chooser_populates_dom_filelist_and_change_events() {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("sample.txt");
     std::fs::write(&file, b"upload-bytes").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+        ))
+        .unwrap();
     let socket =
         std::env::temp_dir().join(format!("greppy-web-filedom-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);

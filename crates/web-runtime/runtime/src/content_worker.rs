@@ -2541,10 +2541,18 @@ impl ContentEngine {
                 .and_then(|name| name.to_str())
                 .unwrap_or("upload.bin")
                 .to_owned();
+            let modified = std::fs::metadata(&path)?.modified()?;
+            let modified_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
+                Ok(elapsed) => i64::try_from(elapsed.as_millis()).map_err(io::Error::other)?,
+                Err(before_epoch) => {
+                    -i64::try_from(before_epoch.duration().as_millis()).map_err(io::Error::other)?
+                }
+            };
             payloads.push(json!({
                 "name": name,
                 "type": "application/octet-stream",
                 "b64": base64_encode(&bytes),
+                "lastModified": modified_ms,
             }));
         }
         let (webview, _) = self.page(page_id)?.clone();
@@ -2567,7 +2575,7 @@ impl ContentEngine {
       var raw = atob(file.b64);
       var buf = new Uint8Array(raw.length);
       for (var i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream" }}));
+      dt.items.add(new File([buf], file.name, {{ type: file.type || "application/octet-stream", lastModified: file.lastModified }}));
     }});
     input.files = dt.files;
     var changed = 0;

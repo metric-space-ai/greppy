@@ -18,11 +18,12 @@ const got = await page.evaluate(() => {
   return {
     count: el && el.files ? el.files.length : -1,
     name: el && el.files && el.files[0] ? el.files[0].name : "",
+    modified: el && el.files && el.files[0] ? el.files[0].lastModified : null,
     changed: window.changed,
     inputed: window.inputed,
   };
 });
-if (got.count < 1 || got.changed < 1) {
+if (got.count !== 1 || got.name !== "sample.txt" || got.modified !== 1600000000000 || got.changed !== 2 || got.inputed !== 2) {
   throw new Error(
     "DOM FileList/change not populated (Servo blocker): " +
       JSON.stringify({ result, got }),
