@@ -3780,9 +3780,10 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
         &[("GREPPY_HEAVY_GATE", gate.to_str().unwrap())],
     );
     assert_ne!(code, 0, "rejected launch unexpectedly served stale hits: {out} {err}");
-    assert!(err.contains("automatic index preparation did not start"), "{out} {err}");
+    assert!(err.contains("no index work started") || err.contains("automatic index preparation did not start"), "{out} {err}");
+    assert!(err.contains("Capacity gate") || err.contains("admission"), "{out} {err}");
     assert!(!err.contains("publication is in progress"), "{out} {err}");
-    assert!(err.contains("retry this command"), "{out} {err}");
+    assert!(err.contains("retry this command") || err.contains("Retry the original command"), "{out} {err}");
     let (code, out, err) = run_with_env(&["index", "status", "--json"], &repo, &store, &[]);
     assert_eq!(code, 0, "{out} {err}");
     let status: serde_json::Value = serde_json::from_str(&out).unwrap();

@@ -208,6 +208,24 @@ fn copy_granted_modules(
     files: &mut u32,
     bytes: &mut u64,
 ) -> Result<(), String> {
+    if !path_is_within_root(root, from) {
+        return Err("script walk escaped granted root".to_owned());
+    }
+    std::fs::create_dir_all(to).map_err(|error| format!("cannot stage script dir: {error}"))?;
+    let staging_root = to
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize staged root: {error}"))?;
+    copy_granted_modules_excluding_destination(root, from, to, &staging_root, files, bytes)
+}
+
+fn copy_granted_modules_excluding_destination(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    staging_root: &Path,
+    files: &mut u32,
+    bytes: &mut u64,
+) -> Result<(), String> {
     const MAX_FILES: u32 = 128;
     const MAX_BYTES: u64 = 4 * 1024 * 1024;
     let from_canon = from
@@ -237,7 +255,16 @@ fn copy_granted_modules(
             return Err("staged path escaped destination directory".to_owned());
         }
         if file_type.is_dir() {
-            copy_granted_modules(root, &entry.path(), &dest, files, bytes)?;
+            let source_dir = entry.path().canonicalize()
+                .map_err(|error| format!("cannot canonicalize script walk: {error}"))?;
+            // TMPDIR can be below the granted script root. Never traverse
+            // this request's output as input, including through its parents.
+            if source_dir == staging_root {
+                continue;
+            }
+            copy_granted_modules_excluding_destination(
+                root, &source_dir, &dest, staging_root, files, bytes,
+            )?;
             continue;
         }
         if !file_type.is_file() {
@@ -6055,6 +6082,23 @@ mod script_stage_tests {
         );
         remove_script_stage("run_stage", "wrs_stage1", Some("wrq_stage1"));
         assert!(!expected.exists(), "per-request stage must be cleaned up");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_granted_modules_excludes_only_its_nested_output() {
+        let root = unique_root("nested-output");
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::write(root.join("main.mjs"), "import './cache/old.mjs';\n").unwrap();
+        fs::write(root.join("cache/old.mjs"), "export const n = 7;\n").unwrap();
+        let dest = root.join("cache/request/stage");
+        let mut files = 0;
+        let mut bytes = 0;
+        copy_granted_modules(&root, &root, &dest, &mut files, &mut bytes).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(fs::read_to_string(dest.join("cache/old.mjs")).unwrap(), "export const n = 7;\n");
+        assert!(dest.join("main.mjs").is_file());
+        assert!(!dest.join("cache/request/stage").exists());
         let _ = fs::remove_dir_all(root);
     }
 

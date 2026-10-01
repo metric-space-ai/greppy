@@ -186,6 +186,27 @@ fn transient_freshness_states_never_trigger_reindex() {
 }
 
 #[test]
+fn rejected_background_admission_returns_no_live_launch() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_HEAVY_GATE", "GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let gate = scratch.path().join("reject.py");
+    std::fs::write(&gate, "import sys\nprint('Capacity gate: test rejection', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore these values.
+    unsafe {
+        std::env::set_var("GREPPY_HEAVY_GATE", &gate);
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+    }
+    assert!(spawn_background_job_handle(Some(root.to_str().unwrap()), "test", "index", None).is_none());
+    let job = read_background_job(&background_job_path(&root)).unwrap();
+    assert_eq!(job["state"], "failed", "{job}");
+    assert!(job["last_error"].as_str().unwrap().contains("Capacity gate"), "{job}");
+    assert!(!background_job_writer_active(&root));
+}
+
+#[test]
 fn indexed_refusal_recovery_matches_observed_freshness_state() {
     let refreshing = serde_json::json!({
         "state": "refreshing", "fresh": false,
