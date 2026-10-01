@@ -6114,7 +6114,7 @@ mod redirect_chain_tests {
         let error = response.error.unwrap();
         assert_eq!(error.code, "resource_limit");
         assert_eq!(error.exit_code, 37);
-        assert_eq!(error.message, "artifact limit exceeded (100 > 8)");
+        assert_eq!(error.message.as_ref(), "artifact limit exceeded (100 > 8)");
         assert!(!error.retryable);
         let unrelated = super::engine_error(
             &request, "page JavaScript raised Error: resource_limit: page data", 34,
