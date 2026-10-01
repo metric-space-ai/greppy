@@ -256,10 +256,104 @@ fn read_is_symbols_only_whole_and_doc_extended() {
     let (path_code, path_out, path_err) = run(&repo, &store, &["read", "lib.rs"]);
     assert_eq!(path_code, 0, "stdout={path_out}\nstderr={path_err}");
     assert!(
-        path_out.starts_with("note: `lib.rs` is a path; reading it as a file\nlib.rs:1-6\n"),
+        path_out.starts_with("`lib.rs` is a file — read a symbol:\n"),
         "{path_out}"
     );
-    assert!(path_out.contains("pub fn target()"), "{path_out}");
+    assert!(path_out.contains("target"), "{path_out}");
+    assert!(!path_out.contains("pub fn target()"), "{path_out}");
+}
+
+#[test]
+fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available() {
+    let (repo, store) = fresh_workspace("outline-large");
+    let source = format!(
+        "pub fn target() -> i32 {{ 731 }}\n{}",
+        "// private source content, not an outline\n".repeat(60)
+    );
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.starts_with("`lib.rs` is a file — read a symbol:"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("731"), "{stdout}");
+    assert!(!stdout.contains("private source content"), "{stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("handle: ")),
+        "{stdout}"
+    );
+    let selector = stdout
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let (code, stdout, stderr) = run(&repo, &store, &["read", selector]);
+    assert_eq!(
+        code, 0,
+        "outline selector does not resolve: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("pub fn target() -> i32 { 731 }"),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "lib.rs", "--lines", "1:1", "--handle"],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("731"), "{stdout}");
+    let handle = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .unwrap();
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &[
+            "replace-span",
+            handle,
+            "pub fn target() -> i32 { 732 }\n",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--all"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&source), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() {
+    let (repo, store) = fresh_workspace("outline-threshold");
+    let source = format!("pub fn target() {{}}\n{}", "// line\n".repeat(59));
+    std::fs::write(repo.join("lib.rs"), &source).unwrap();
+    index(&repo, &store);
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&source), "{stdout}");
+
+    let (cold_repo, cold_store) = fresh_workspace("outline-no-index");
+    let source = format!("pub fn cold_target() {{}}\n{}", "// cold line\n".repeat(79));
+    std::fs::write(cold_repo.join("lib.rs"), &source).unwrap();
+    for command in ["read-file", "read"] {
+        let (code, stdout, stderr) = run(&cold_repo, &cold_store, &[command, "lib.rs"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains(&source), "{stdout}");
+    }
+    assert!(
+        !cold_store.exists(),
+        "unindexed plain reads created a graph store"
+    );
 }
 
 #[test]

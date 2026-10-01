@@ -36,8 +36,18 @@ into another semantic search. Only an explicit no-match result permits one
 
 Do NOT run grep/find/read loops. When you would reach for grep, ripgrep or a
 file read, invoke them THROUGH greppy — `greppy PATTERN [FILE]` is byte-identical
-grep, `greppy rg …` is ripgrep, and `greppy read-file PATH` reads files — so
-every search stays in one tool. Every tool result stays in your context.
+grep, `greppy rg …` is ripgrep, and `greppy read-file PATH --lines A:B` reads the
+lines you need, not whole files — so every search stays in one tool. Every tool
+result stays in your context.
+
+READING CODE — read the symbol, never the whole file:
+  a function, method or type        greppy read S        (S exactly as search / search-symbol printed it)
+  several of them                   greppy read S1 S2 …
+  only its shape                    greppy read-smart S
+  non-code text (config, docs)      greppy read-file PATH --lines A:B
+  any lines of a file               greppy read-file PATH --lines A:B    (never cat, sed or head on source files)
+  read tool missing or failed       use greppy read S / greppy read-file PATH --lines A:B — never fall back to cat
+  never                             read a whole source file to find or edit one definition
 
 Run every build, test or lint command through `greppy bash-smart -- CMD`:
 it executes CMD unchanged (same exit code) and returns a verdict line plus

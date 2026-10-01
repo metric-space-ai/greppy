@@ -668,6 +668,21 @@ pub(crate) fn dispatch_read(
             println!();
         }
         let code = if is_file {
+            if let Some((shown, canonical)) =
+                read_resolve_file(&file_base, &canonical_root, subject)
+            {
+                let content = std::fs::read_to_string(&canonical).ok();
+                if let Some(outline) = content
+                    .as_deref()
+                    .and_then(|text| read_file_outline(&root_path, &shown, text))
+                {
+                    let filters = prepare_query_path_filters(root, "read", "", path_filters)?;
+                    if filters.matches(&shown) {
+                        print!("{outline}");
+                        continue;
+                    }
+                }
+            }
             println!("note: `{subject}` is a path; reading it as a file");
             dispatch_read_files(
                 std::slice::from_ref(subject),
@@ -1407,6 +1422,65 @@ fn read_render_file_page(
     Ok(out)
 }
 
+/// An unscoped file read may offer indexed definitions, but must not create an
+/// index, prewarm models, repair a graph or acquire a writer just to do so.
+/// Exact spans, explicit whole-file reads and cold/unindexed files remain plain
+/// filesystem operations even while another task is publishing the graph.
+fn read_file_outline(root: &std::path::Path, shown: &str, content: &str) -> Option<String> {
+    let path = greppy_core::cache::workspace_store_path(root);
+    if !path.is_file() {
+        return None;
+    }
+    let store =
+        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).ok()?;
+    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root).ok()? {
+        let visibility =
+            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn()).ok()?;
+        store.attach_overlay(&base, &visibility).ok()?
+    } else {
+        store
+    };
+    let project = workspace_locator::project_identity(root);
+    let mut nodes = store.list_nodes_for_file(&project, shown).ok()?;
+    let line_count = read_line_count(content) as i64;
+    nodes.retain(|node| {
+        matches!(
+            node.label.as_str(),
+            "Function" | "Method" | "Class" | "Struct" | "Enum" | "Trait"
+        ) && node.start_line > 0
+            && node.start_line <= line_count
+            && !node.qualified_name.is_empty()
+    });
+    nodes.sort_by_key(|node| (node.start_line, std::cmp::Reverse(node.end_line)));
+    let mut top_level = Vec::<greppy_store::Node>::new();
+    for node in nodes {
+        if !top_level
+            .iter()
+            .any(|parent| parent.start_line <= node.start_line && parent.end_line >= node.end_line)
+        {
+            top_level.push(node);
+        }
+    }
+    if top_level.is_empty() {
+        return None;
+    }
+    let mut outline = format!("`{shown}` is a file — read a symbol:\n");
+    for node in &top_level {
+        outline.push_str(&format!(
+            "{}:{}  {}  {}\n",
+            shown,
+            node.start_line,
+            node.qualified_name,
+            node.label.to_ascii_lowercase()
+        ));
+    }
+    outline.push_str(&format!(
+        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
+        top_level[0].qualified_name
+    ));
+    Some(outline)
+}
+
 pub(crate) fn dispatch_read_files(
     paths: &[String],
     lines: Option<&str>,
@@ -1462,6 +1536,19 @@ pub(crate) fn dispatch_read_files(
             continue;
         };
         let line_count = read_line_count(&content);
+        if lines.is_none() && !all && line_count > 60 {
+            if let Some(outline) = read_file_outline(&root_path, &shown, &content) {
+                read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                print!("{outline}");
+                if with_handle {
+                    println!(
+                        "note: for a handle, choose a symbol or an explicit --lines A:B span first"
+                    );
+                }
+                previous_ended_with_newline = true;
+                continue;
+            }
+        }
         let (start_line, end_line, continuation) = if let Some(raw) = lines {
             let (start, end) = read_parse_file_range(raw, line_count)?;
             (start, end, None)
