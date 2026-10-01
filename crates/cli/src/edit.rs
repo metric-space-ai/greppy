@@ -971,7 +971,10 @@ fn edit_check_regex_replacement(regex: &regex::bytes::Regex, replacement: &[u8])
                 continue;
             }
         }
-        let name = String::from_utf8_lossy(&replacement[start..end]);
+        let Ok(name) = std::str::from_utf8(&replacement[start..end]) else {
+            // The byte-regex engine treats invalid UTF-8 in ${...} literally.
+            continue;
+        };
         let known = if let Ok(index) = name.parse::<usize>() {
             index < regex.captures_len()
         } else {

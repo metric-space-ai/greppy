@@ -141,6 +141,19 @@ fn regex_replacement_refuses_unknown_captures_and_preserves_literal_routes() {
 }
 
 #[test]
+fn regex_replacement_preserves_non_utf8_braced_literal_bytes() {
+    let fixture = Fixture::new("regex-bytes");
+    let path = fixture.repo.join("value.txt");
+    std::fs::write(&path, b"before").unwrap();
+    let out = fixture.run_with_stdin(
+        &["replace-text", "value.txt", "before", "--regex"],
+        b"${\xff}",
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_eq!(std::fs::read(&path).unwrap(), b"${\xff}");
+}
+
+#[test]
 fn write_typed_template_accepts_valid_typescript_and_refuses_malformed_changes_atomically() {
     let fixture = Fixture::new("typed-template");
     let valid = "function* run() { const rows = yield* sql<{ readonly workspace_root: string | null }>`SELECT workspace_root`; return rows; }\n";
