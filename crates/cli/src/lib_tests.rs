@@ -211,6 +211,13 @@ fn indexed_refusal_recovery_matches_observed_freshness_state() {
     );
     assert!(message.contains("retry this command"), "{message}");
     assert!(!message.contains("publication is in progress"), "{message}");
+    let failed = serde_json::json!({
+        "state": "failed", "reasons": ["files modified since last index"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &failed);
+    assert!(message.contains("automatic index preparation did not start"), "{message}");
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
     let drift = serde_json::json!({
         "state": "drift", "reasons": ["files modified since last index"]
     });

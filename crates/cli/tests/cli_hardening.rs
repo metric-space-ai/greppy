@@ -3768,6 +3768,30 @@ fn first_use_query_ignores_stale_record_while_foreground_writer_publishes() {
 }
 
 #[test]
+fn rejected_refresh_admission_never_claims_publication_is_running() {
+    let (repo, store, _scratch) = make_repo("refresh-admission-rejected", "refresh_marker");
+    let (code, out, err) = run_with_env(&["index"], &repo, &store, &[]);
+    assert_eq!(code, 0, "{out} {err}");
+    std::fs::write(repo.join("lib.rs"), "pub fn refresh_marker() -> i32 { 8 }\n").unwrap();
+    let gate = repo.join("reject-index-admission.py");
+    std::fs::write(&gate, "import sys\nprint('Capacity gate: another thread owns the heavy-job lease', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "refresh_marker"], &repo, &store,
+        &[("GREPPY_HEAVY_GATE", gate.to_str().unwrap())],
+    );
+    assert_ne!(code, 0, "rejected launch unexpectedly served stale hits: {out} {err}");
+    assert!(err.contains("automatic index preparation did not start"), "{out} {err}");
+    assert!(!err.contains("publication is in progress"), "{out} {err}");
+    assert!(err.contains("retry this command"), "{out} {err}");
+    let (code, out, err) = run_with_env(&["index", "status", "--json"], &repo, &store, &[]);
+    assert_eq!(code, 0, "{out} {err}");
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["writer_active"], false, "{status}");
+    assert_eq!(status["background_job"]["state"], "failed", "{status}");
+    assert!(status["background_job"]["last_error"].as_str().unwrap().contains("Capacity gate"), "{status}");
+}
+
+#[test]
 fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
     let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
     let started = std::time::Instant::now();

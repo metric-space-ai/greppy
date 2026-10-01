@@ -5652,6 +5652,8 @@ fn spawn_background_job_handle(
                         );
                         let _ = write_background_job(&job_path, &value);
                     }
+                    // A rejected launch is completed, not a live publication.
+                    return None;
                 }
                 break;
             }
@@ -5660,7 +5662,9 @@ fn spawn_background_job_handle(
                 value["last_error"] =
                     serde_json::json!(format!("observe background {kind} startup: {error}"));
                 let _ = write_background_job(&job_path, &value);
-                break;
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
         }
     }
@@ -9283,6 +9287,7 @@ fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> S
     let remediation = match freshness.get("state").and_then(serde_json::Value::as_str) {
         Some("refreshing") => "index publication is in progress; inspect `greppy index status --json`, then retry this command after publication",
         Some("unknown") => "freshness could not be verified; retry this command when host capacity is available",
+        Some("failed") => "automatic index preparation did not start; inspect `greppy index status --json` for the admission or startup failure, then retry this command when host capacity is available",
         _ => STALE_REMEDIATION,
     };
     format!(
