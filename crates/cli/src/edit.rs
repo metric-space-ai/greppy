@@ -3526,7 +3526,7 @@ pub(crate) fn dispatch_edit_grammar(
                 };
                 let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
                 if body {
-                    edit_check_cardinality(&located, 1)?;
+                    edit_check_cardinality(&located, Some(1))?;
                     let (start, end) = located.ranges[0];
                     new_bytes = greppy_edit::verbs::replacement_body_preserving_delimiters(
                         &located.content[start..end],
