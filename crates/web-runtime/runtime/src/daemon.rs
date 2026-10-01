@@ -275,6 +275,7 @@ fn copy_granted_modules(
 pub struct DaemonConfig {
     pub socket: PathBuf,
     pub run_id: String,
+    pub runtime_image_id: String,
     pub fixture_url: Option<String>,
     pub search_endpoint: Option<String>,
     pub idle_ttl: Duration,
@@ -667,6 +668,7 @@ fn accept_loop(
 struct Daemon {
     socket: PathBuf,
     run_id: String,
+    runtime_image_id: String,
     fixture_url: String,
     search_endpoint: Option<String>,
     ever_had_session: bool,
@@ -794,6 +796,7 @@ impl Daemon {
         Ok(Self {
             socket: config.socket,
             run_id: config.run_id.clone(),
+            runtime_image_id: config.runtime_image_id,
             fixture_url: config.fixture_url.unwrap_or_default(),
             search_endpoint: config.search_endpoint,
             store: ArtifactStore::new(data_root)?,
@@ -1106,18 +1109,21 @@ impl Daemon {
     }
 
     fn handshake(&self, request: &Request) -> Response {
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let mut response = Response::ok(
             request,
             serde_json::json!({
                 "label": "experimental web-runtime spike",
             }),
         );
-        response.handshake = Some(Handshake::runtime_facts());
+        response.handshake = Some(handshake);
         response
     }
 
     fn doctor(&self, request: &Request) -> Response {
-        let handshake = Handshake::runtime_facts();
+        let mut handshake = Handshake::runtime_facts();
+        handshake.runtime_build_id = self.runtime_image_id.clone();
         let executable = std::env::current_exe()
             .ok()
             .map(|path| path.display().to_string());
@@ -1163,7 +1169,7 @@ impl Daemon {
             serde_json::json!({
                 "label": "experimental web-runtime spike",
                 "runtime_version": "0.1.0",
-                "runtime_build_id": "web-runtime-0.1.0",
+                "runtime_build_id": self.runtime_image_id.clone(),
                 "playwright_compatibility_version": "1.62.1",
                 "compatibility_coverage_level": "unverified",
                 "process_health": {
