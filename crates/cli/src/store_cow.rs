@@ -3909,6 +3909,8 @@ mod tests {
             "a verified v6 Base must force structural first-use migration"
         );
         let migrated_root = data_root.path().join("migrated-worktree");
+        std::fs::create_dir_all(&migrated_root).unwrap();
+        let migrated_root = migrated_root.canonicalize().unwrap();
         let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
         let staged_summary = seed_previous_indexer_base(
             data_root.path(),
