@@ -134,6 +134,11 @@ fn cold_linked_symbol_read_after_file_handle_attaches_published_base() {
         "-qm",
         "base",
     ]);
+    // Structural first use reuses a published immutable Base; it intentionally
+    // avoids building a new one inside a query. Establish that Base first.
+    let first = repo.parent().unwrap().join("first");
+    git(&["worktree", "add", "-qb", "first", first.to_str().unwrap()]);
+    index(&first, &store);
     let linked = repo.parent().unwrap().join("linked");
     git(&["worktree", "add", "-qb", "linked", linked.to_str().unwrap()]);
     let (code, stdout, stderr) = run(&linked, &store, &["read-file", "lib.rs", "--handle"]);
