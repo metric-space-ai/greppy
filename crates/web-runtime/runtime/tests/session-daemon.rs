@@ -2101,7 +2101,15 @@ fn greppy_cli_parent_survives_content_worker_kill() {
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let fixture = thread::spawn(move || {
+    struct OwnedFixture(Option<thread::JoinHandle<()>>);
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            if let Some(thread) = self.0.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let mut fixture = OwnedFixture(Some(thread::spawn(move || {
         use std::io::{Read, Write};
         let deadline = Instant::now() + Duration::from_secs(12);
         while Instant::now() < deadline {
@@ -2122,7 +2130,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
                 Err(error) => panic!("owned fixture accept failed: {error}"),
             }
         }
-    });
+    })));
     let mut child_cmd = Command::new(&greppy);
     child_cmd
         .args([
@@ -2143,7 +2151,27 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let _run_pass = give_child_attach_token(&mut child_cmd, &token).expect("run attach token");
-    let mut child = child_cmd.spawn().expect("greppy web run");
+    struct OwnedChild(std::process::Child);
+    impl std::ops::Deref for OwnedChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for OwnedChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(child_cmd.spawn().expect("greppy web run"));
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().expect("stdin");
@@ -2157,7 +2185,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
     armed_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("bound page armed");
-    fixture.join().unwrap();
+    fixture.0.take().unwrap().join().unwrap();
     assert!(
         child.try_wait().unwrap().is_none(),
         "run must still be active at kill"
@@ -2177,6 +2205,7 @@ fn greppy_cli_parent_survives_content_worker_kill() {
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 panic!("greppy parent did not exit after content kill");
             }
             Err(error) => panic!("{error}"),
