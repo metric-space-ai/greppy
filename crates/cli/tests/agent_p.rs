@@ -87,9 +87,10 @@ fn spawn_gateway_sequence(
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 16384];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let Ok(request) = read_gateway_request(&mut stream) else {
+                        continue;
+                    };
+                    let req = String::from_utf8_lossy(&request);
                     let first_line = req.lines().next().unwrap_or("");
                     if first_line.starts_with("GET /v1/models") {
                         let body = r#"{"data":[{"id":"test"}]}"#;
@@ -137,6 +138,75 @@ fn spawn_gateway_sequence(
     }
 
     (endpoint, stop, handle)
+}
+
+fn read_gateway_request(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    // Drain the complete HTTP request before replying. A partial read can leave
+    // unread request bytes and reset the connection, consuming a scripted turn
+    // that the agent never received.
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut expected = None;
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        request.extend_from_slice(&buf[..n]);
+        if request.len() > 1024 * 1024 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        if expected.is_none() {
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>())
+                    .transpose()
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?
+                    .unwrap_or(0);
+                expected = Some(end + 4 + length);
+            }
+        }
+        if expected.is_some_and(|length| request.len() >= length) {
+            return Ok(request);
+        }
+    }
+}
+
+#[test]
+fn gateway_reads_fragmented_request_before_consuming_scripted_response() {
+    struct Fragments(Vec<std::io::Cursor<Vec<u8>>>);
+    impl Read for Fragments {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let Some(first) = self.0.first_mut() else {
+                    return Ok(0);
+                };
+                let count = first.read(bytes)?;
+                if count != 0 {
+                    return Ok(count);
+                }
+                self.0.remove(0);
+            }
+        }
+    }
+    let body = vec![b'x'; 32768];
+    let headers = format!(
+        "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut fragments = Fragments(vec![
+        std::io::Cursor::new(headers.as_bytes()[..7].to_vec()),
+        std::io::Cursor::new(headers.as_bytes()[7..].to_vec()),
+        std::io::Cursor::new(body.clone()),
+    ]);
+    let request = read_gateway_request(&mut fragments).unwrap();
+    assert_eq!(request.len(), headers.len() + body.len());
+    assert_eq!(&request[headers.len()..], body);
+    assert!(read_gateway_request(&mut &headers.as_bytes()[..]).is_err());
 }
 
 fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
