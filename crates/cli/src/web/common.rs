@@ -1163,6 +1163,12 @@ fn supervisor_for_session(
     ensure_supervisor(root, spawn)
 }
 
+#[cfg(not(unix))]
+fn runtime_has_session(_socket: &Path, _run_id: &str, _capability: &str, _session: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn runtime_has_session(socket: &Path, run_id: &str, capability: &str, session: &str) -> bool {
     let agent = std::env::var("GREPPY_WEB_AGENT")
         .ok()
@@ -1649,6 +1655,7 @@ fn wait_runtime_status(socket: &Path, run_id: &str, capability: &str) -> Option<
     }
 }
 
+#[cfg(unix)]
 fn drain_stale_owned_runtime(
     socket: &Path,
     run_id: &str,
