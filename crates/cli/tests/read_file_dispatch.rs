@@ -71,9 +71,9 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
 
 #[test]
 fn cold_symbol_reads_bootstrap_after_file_handle_and_preserve_it() {
-    for command in ["read", "read-smart"] {
+    for command in ["read", "read-smart", "who-calls", "impact"] {
         let (repo, store) = fresh_workspace(command);
-        let source = "pub fn schema_marker() -> i32 { 41 }\n";
+        let source = "pub fn schema_marker() -> i32 { 41 }\npub fn use_marker() -> i32 { schema_marker() }\n";
         std::fs::write(repo.join("lib.rs"), source).unwrap();
         let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
@@ -86,8 +86,12 @@ fn cold_symbol_reads_bootstrap_after_file_handle_and_preserve_it() {
 
         let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs::schema_marker"]);
         assert_eq!(code, 0, "{command}: {stdout}\n{stderr}");
-        assert!(stdout.contains("schema_marker"), "{stdout}");
-        assert!(stdout.contains("41"), "{stdout}");
+        let expected = if matches!(command, "read" | "read-smart") {
+            "41"
+        } else {
+            "use_marker"
+        };
+        assert!(stdout.contains(expected), "{stdout}");
 
         let (code, stdout, stderr) = run(
             &repo,
