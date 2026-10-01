@@ -11056,6 +11056,11 @@ fn hydrated_spa_wait_for_function_sees_async_dom_update() {
 }
 
 #[test]
+fn public_wait_for_function_completion_read_uses_original_deadline() {
+    run_named_fixture("wait-for-function-completion-budget.mjs", "run_wff_completion");
+}
+
+#[test]
 fn wait_for_function_preserves_value_error_and_ignores_forged_nonce() {
     run_named_fixture("wait-for-function-value.mjs", "run_wff_value");
 }

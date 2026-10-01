@@ -2225,6 +2225,8 @@ impl ContentEngine {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid wait timeout"))?;
+        // Cleanup keeps its legacy best-effort allowance. Destructive completion
+        // retrieval below always spends this caller deadline, including public PW.
         let io_deadline = strict_boolean.then_some(deadline);
         let wake = self.wake_for_webview(&webview);
         let mut token = alloc_wait_nonce()?;
@@ -2269,7 +2271,7 @@ impl ContentEngine {
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
             if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, io_deadline)?
+                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
             {
                 return result;
             }
@@ -2316,7 +2318,7 @@ impl ContentEngine {
                 };
                 if delegate.document_generation.get() == document_generation {
                     if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, io_deadline)?
+                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
                     {
                         return result;
                     }
@@ -2331,7 +2333,7 @@ impl ContentEngine {
                 continue;
             }
             if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, io_deadline)?
+                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
             {
                 return result;
             }
@@ -2364,7 +2366,7 @@ impl ContentEngine {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
                     if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, io_deadline)?
+                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
                     {
                         return result;
                     }
@@ -2453,6 +2455,7 @@ impl ContentEngine {
         token: &str,
         document_generation: u64,
         deadline: Option<Instant>,
+        strict_budget: bool,
     ) -> io::Result<Option<io::Result<serde_json::Value>>> {
         let Some(notice) = delegate.wait_notice(token) else {
             return Ok(None);
@@ -2478,7 +2481,7 @@ impl ContentEngine {
                 }),
                 other => WaitOutcome::Error(other.to_owned()),
             },
-            deadline.is_some(),
+            strict_budget,
         )))
     }
 
