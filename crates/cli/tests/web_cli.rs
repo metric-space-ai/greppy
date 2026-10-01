@@ -392,24 +392,39 @@ fn web_research_requires_query() {
 }
 
 #[test]
-fn web_search_requires_session() {
+fn web_search_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "search", "--query", "greppy", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
-fn web_read_requires_session() {
+fn web_read_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "read", "--url", "https://example.com", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
-fn web_research_requires_session() {
+fn web_research_without_session_attempts_runtime_bootstrap() {
     let (code, stdout, _stderr) = run(&["web", "research", "--query", "greppy", "--json"]);
-    assert_eq!(code, 30, "stdout={stdout}");
-    assert!(stdout.contains("session"));
+    assert_eq!(code, 31, "stdout={stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "runtime_unavailable");
+    assert!(value["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("install"));
 }
 
 #[test]
