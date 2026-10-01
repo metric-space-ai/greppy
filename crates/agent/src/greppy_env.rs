@@ -227,6 +227,7 @@ impl GreppyEnv {
 
         match run_capture_held(&mut cmd, Some(timeout), attach_hold) {
             Ok(captured) => {
+                let actual_success = captured.success && !captured.timed_out;
                 let mut outcome = finalize_outcome(
                     captured,
                     self.max_output_bytes,
@@ -240,7 +241,7 @@ impl GreppyEnv {
                         outcome.content = "screenshot attached as image for the model".to_owned();
                     }
                 }
-                if !outcome.is_error {
+                if actual_success {
                     if let Some((scope, hook)) = self.context_status.as_ref() {
                         if let Some(notice) =
                             hook(&self.root, &args, scope).filter(|notice| notice.len() <= 1024)

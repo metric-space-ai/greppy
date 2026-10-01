@@ -112,7 +112,15 @@ pub(crate) fn graph_stale_gate_for_edges(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
             if let (Ok(effective_root), Ok(generation)) =
                 (resolve_root(root), current_graph_generation(store, root))
@@ -156,7 +164,15 @@ pub(crate) fn graph_stale_gate(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) => Ok(None),
+        FreshnessServe::Fresh(_) => {
+            if let Ok(effective_root) = resolve_root(root) {
+                crate::context_status::acknowledge(
+                    &effective_root,
+                    crate::context_status::Capability::Graph,
+                );
+            }
+            Ok(None)
+        }
         FreshnessServe::Refuse(freshness) => {
             if let (Ok(effective_root), Ok(generation)) =
                 (resolve_root(root), current_graph_generation(store, root))

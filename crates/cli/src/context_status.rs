@@ -67,11 +67,15 @@ struct Restriction {
 }
 impl Status {
     fn restrict(&mut self, scope: String, generation: u64, capability: Capability) {
-        if self
+        if let Some(r) = self
             .restrictions
-            .iter()
-            .any(|r| r.scope == scope && r.generation == generation && r.capability == capability)
+            .iter_mut()
+            .find(|r| r.scope == scope && r.generation == generation && r.capability == capability)
         {
+            if r.announced {
+                r.announced = false;
+                r.after_revision = self.publication.as_ref().map_or(0, |p| p.revision);
+            }
             return;
         }
         // A new generation invalidates old restrictions for this caller.
@@ -92,10 +96,10 @@ impl Status {
         &mut self,
         scope: &str,
         current: &Fingerprint,
-        blocked: bool,
+        blocked: [bool; 2],
     ) -> Option<&'static str> {
         let p = self.publication.as_ref()?;
-        if blocked || &p.fingerprint != current {
+        if &p.fingerprint != current {
             return None;
         }
         let index = self.restrictions.iter().position(|r| {
@@ -104,8 +108,8 @@ impl Status {
                 && r.generation == p.generation
                 && p.revision > r.after_revision
                 && match r.capability {
-                    Capability::Graph => p.graph,
-                    Capability::Semantic => p.semantic,
+                    Capability::Graph => p.graph && !blocked[0],
+                    Capability::Semantic => p.semantic && !blocked[1],
                 }
         })?;
         let r = &mut self.restrictions[index];
@@ -197,6 +201,9 @@ pub(crate) fn acknowledge(root: &Path, capability: Capability) {
     let Some(scope) = scope() else {
         return;
     };
+    acknowledge_scoped(root, &scope, capability);
+}
+fn acknowledge_scoped(root: &Path, scope: &str, capability: Capability) {
     let _ = update(root, |s| {
         for r in s
             .restrictions
@@ -252,12 +259,17 @@ pub(crate) fn notice(root: &Path, scope: &str) -> Option<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return None,
     };
-    let blocked = job.as_ref().is_some_and(|j| {
-        matches!(
-            j.get("state").and_then(serde_json::Value::as_str),
-            Some("failed" | "cancelled")
-        ) || j.get("kind").and_then(serde_json::Value::as_str) != Some("embedding")
-    });
+    let graph_blocked = job
+        .as_ref()
+        .is_some_and(|j| j.get("kind").and_then(serde_json::Value::as_str) != Some("embedding"));
+    let semantic_blocked = graph_blocked
+        || job.as_ref().is_some_and(|j| {
+            matches!(
+                j.get("state").and_then(serde_json::Value::as_str),
+                Some("failed" | "cancelled")
+            )
+        });
+    let blocked = [graph_blocked, semantic_blocked];
     update(root, |s| {
         let mut lines = Vec::new();
         while let Some(line) = s.take_notice(scope, &current, blocked) {
@@ -267,29 +279,39 @@ pub(crate) fn notice(root: &Path, scope: &str) -> Option<String> {
     })?
 }
 pub(crate) fn agent_notice(root: &Path, args: &[String], scope: &str) -> Option<String> {
-    if args.iter().any(|a| a == "--json" || a == "--jsonl") {
-        return None;
-    }
-    let mut argv = vec![std::ffi::OsString::from("greppy")];
-    argv.extend(args.iter().map(std::ffi::OsString::from));
-    let tail = super::grep_passthrough_args(&argv);
-    if !matches!(
-        tail.first().and_then(|a| a.to_str()),
-        Some("rg" | "ripgrep" | "grep" | "read-file")
-    ) {
-        return None;
-    }
-    // Exclude explicit roots rather than attach another workspace's status.
+    // Exclude explicit roots rather than acknowledge another workspace's status.
     if args
         .iter()
         .any(|a| a == "--root" || a.starts_with("--root="))
     {
         return None;
     }
-    notice(
-        &super::workspace_locator::resolve_workspace_root(root),
-        scope,
-    )
+    let root = super::workspace_locator::resolve_workspace_root(root);
+    let mut argv = vec![std::ffi::OsString::from("greppy")];
+    argv.extend(args.iter().map(std::ffi::OsString::from));
+    let tail = super::grep_passthrough_args(&argv);
+    let verb = tail.first().and_then(|a| a.to_str());
+    // This hook is called only for actual successful subprocess completion,
+    // never the envelope's special conversion of pending semantic exit-1.
+    let used = match verb {
+        Some(
+            "search-symbol" | "search-symbols" | "who-calls" | "callees" | "impact" | "brief"
+            | "path" | "read" | "read-smart",
+        ) => Some(Capability::Graph),
+        Some("search" | "semantic-search" | "semantic") => Some(Capability::Semantic),
+        _ => None,
+    };
+    if let Some(capability) = used {
+        acknowledge_scoped(&root, scope, capability);
+        return None;
+    }
+    if args.iter().any(|a| a == "--json" || a == "--jsonl") {
+        return None;
+    }
+    if !matches!(verb, Some("rg" | "ripgrep" | "grep" | "read-file")) {
+        return None;
+    }
+    notice(&root, scope)
 }
 pub(crate) fn attach_read_notice(root: Option<&str>) {
     if super::cli_json_output() || std::env::var_os("GREPPY_CONTEXT_ENVELOPE").is_some() {
@@ -324,15 +346,15 @@ mod tests {
             semantic: false,
             fingerprint: fp(1),
         });
-        assert!(s.take_notice("a", &fp(1), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
         s.restrict("a".into(), 4, Capability::Graph);
         s.publication.as_mut().unwrap().revision = 2;
-        assert!(s.take_notice("b", &fp(1), false).is_none());
+        assert!(s.take_notice("b", &fp(1), [false; 2]).is_none());
         assert!(s
-            .take_notice("a", &fp(1), false)
+            .take_notice("a", &fp(1), [false; 2])
             .unwrap()
             .contains("graph preparation"));
-        assert!(s.take_notice("a", &fp(1), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
     }
     #[test]
     fn graph_publication_never_claims_semantic_readiness() {
@@ -345,10 +367,10 @@ mod tests {
             semantic: false,
             fingerprint: fp(1),
         });
-        assert!(s.take_notice("a", &fp(1), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
         s.publication.as_mut().unwrap().semantic = true;
         assert!(s
-            .take_notice("a", &fp(1), false)
+            .take_notice("a", &fp(1), [false; 2])
             .unwrap()
             .contains("semantic embedding"));
     }
@@ -363,10 +385,10 @@ mod tests {
             semantic: true,
             fingerprint: fp(1),
         });
-        assert!(s.take_notice("a", &fp(1), true).is_none());
-        assert!(s.take_notice("a", &fp(2), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [true; 2]).is_none());
+        assert!(s.take_notice("a", &fp(2), [false; 2]).is_none());
         s.publication.as_mut().unwrap().generation = 5;
-        assert!(s.take_notice("a", &fp(1), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
     }
     #[test]
     fn bounded_metadata_refuses_oversize_and_roundtrips_dedupe() {
@@ -383,11 +405,11 @@ mod tests {
             semantic: false,
             fingerprint: fp(1),
         });
-        assert!(s.take_notice("a", &fp(1), false).is_some());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_some());
         std::fs::write(&path, serde_json::to_vec(&s).unwrap()).unwrap();
         let mut restored: Status = serde_json::from_slice(&bounded_read(&path).unwrap()).unwrap();
         restored.restrict("a".into(), 4, Capability::Graph);
-        assert!(restored.take_notice("a", &fp(1), false).is_none());
+        assert!(restored.take_notice("a", &fp(1), [false; 2]).is_none());
     }
     #[test]
     fn restriction_state_is_bounded() {
@@ -412,9 +434,9 @@ mod tests {
         s.restrict("a".into(), 4, Capability::Semantic);
         assert!(s.publication.as_ref().unwrap().semantic);
         // A prior ready publication does not satisfy a later restriction.
-        assert!(s.take_notice("a", &fp(1), false).is_none());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
         s.publication.as_mut().unwrap().revision = 2;
-        assert!(s.take_notice("a", &fp(1), false).is_some());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_some());
     }
     #[cfg(unix)]
     #[test]
@@ -486,7 +508,7 @@ mod tests {
         );
         // Machine/other-root calls do not consume a new session's signal.
         update(&root, |s| {
-            s.restrict("session-c".into(), 4, Capability::Graph)
+            s.restrict("session-c".into(), 4, Capability::Semantic)
         })
         .unwrap();
         published(&root, 4, true, true);
@@ -525,5 +547,95 @@ mod tests {
         assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_none());
         published(&root, 4, true, true);
         assert!(agent_notice(&root, &["rg".into(), "needle".into()], "session-c").is_some());
+        update(&root, |s| {
+            s.restrict("session-d".into(), 4, Capability::Graph);
+            s.restrict("session-d".into(), 4, Capability::Semantic);
+        })
+        .unwrap();
+        published(&root, 4, true, true);
+        std::fs::write(
+            super::super::background_job_path(&root),
+            serde_json::to_vec(&serde_json::json!({"kind":"embedding", "state":"failed"})).unwrap(),
+        )
+        .unwrap();
+        a.set_context_scope("session-d");
+        let failed_embedding = a.call_tool("greppy", &request);
+        assert!(failed_embedding
+            .content
+            .contains("graph preparation completed"));
+        assert!(!failed_embedding
+            .content
+            .contains("semantic embedding preparation completed"));
+        assert_eq!(
+            a.call_tool("greppy", &request).content,
+            "literal:session-d:1\n"
+        );
+        std::fs::remove_file(super::super::background_job_path(&root)).unwrap();
+        semantic_published(&root, 4, true);
+        assert!(a
+            .call_tool("greppy", &request)
+            .content
+            .contains("semantic embedding preparation completed"));
+
+        for (session, capability, query) in [
+            ("session-e", Capability::Graph, "who-calls"),
+            ("session-f", Capability::Semantic, "search"),
+        ] {
+            update(&root, |s| s.restrict(session.into(), 4, capability)).unwrap();
+            published(&root, 4, true, true);
+            a.set_context_scope(session);
+            let advanced = a.call_tool("greppy", &serde_json::json!({"args":[query,"target"]}));
+            assert_eq!(advanced.content, format!("literal:{session}:1\n"));
+            // A successful original capability means a following rg gets no
+            // redundant readiness hint, even when the original query was fresh
+            // already and never entered a preparation wait loop.
+            assert_eq!(
+                a.call_tool("greppy", &request).content,
+                format!("literal:{session}:1\n")
+            );
+        }
+    }
+    #[test]
+    fn a_new_preparation_cycle_rearms_after_announcement_only() {
+        let mut s = Status::default();
+        s.restrict("a".into(), 4, Capability::Semantic);
+        s.publication = Some(Publication {
+            revision: 1,
+            generation: 4,
+            graph: true,
+            semantic: true,
+            fingerprint: fp(1),
+        });
+        // Repeated pending boundaries do not move the original revision.
+        s.restrict("a".into(), 4, Capability::Semantic);
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_some());
+        s.restrict("a".into(), 4, Capability::Semantic);
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
+        s.publication.as_mut().unwrap().revision = 2;
+        s.restrict("a".into(), 4, Capability::Semantic);
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_some());
+        assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
+    }
+    #[test]
+    fn graph_readiness_survives_failed_embedding_preparation() {
+        let mut s = Status::default();
+        s.restrict("a".into(), 4, Capability::Graph);
+        s.restrict("a".into(), 4, Capability::Semantic);
+        s.publication = Some(Publication {
+            revision: 1,
+            generation: 4,
+            graph: true,
+            semantic: true,
+            fingerprint: fp(1),
+        });
+        assert!(s
+            .take_notice("a", &fp(1), [false, true])
+            .unwrap()
+            .contains("graph preparation completed"));
+        assert!(s.take_notice("a", &fp(1), [false, true]).is_none());
+        assert!(s
+            .take_notice("a", &fp(1), [false; 2])
+            .unwrap()
+            .contains("semantic embedding preparation completed"));
     }
 }
