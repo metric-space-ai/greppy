@@ -121,13 +121,13 @@ fn default_gate_lease_is_inherited(gate: &Path) -> bool {
 #[cfg(unix)]
 fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
     use std::os::unix::{fs::MetadataExt, io::AsRawFd};
-    let Ok(probe) = fs::File::open(&lock) else {
+    let Ok(probe) = fs::File::open(lock) else {
         return false;
     };
     let Ok(metadata) = probe.metadata() else {
         return false;
     };
-    let Ok(record) = fs::read(&lock) else {
+    let Ok(record) = fs::read(lock) else {
         return false;
     };
     if record.len() > 4096 {
@@ -176,7 +176,11 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
             continue;
         }
         let candidate = unsafe { candidate.assume_init() };
-        if candidate.st_dev as u64 != metadata.dev() || candidate.st_ino as u64 != metadata.ino() {
+        // libc stat field widths and signedness differ between macOS and Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let same_backing_file =
+            candidate.st_dev as u64 == metadata.dev() && candidate.st_ino as u64 == metadata.ino();
+        if !same_backing_file {
             continue;
         }
         unsafe {
