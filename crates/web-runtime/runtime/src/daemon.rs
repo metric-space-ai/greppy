@@ -4454,6 +4454,9 @@ impl Daemon {
                 "content worker crashed and was restarted; session pages were reset".into(),
             );
         }
+        self.content
+            .prepare_engine_params(method, &mut params)
+            .map_err(|error| error.to_string())?;
         let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         let stale = self.content.discard_stale_engine_results();
         if stale > 0 {

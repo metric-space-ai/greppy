@@ -516,6 +516,19 @@ pub(crate) fn route_until_script_complete_gated(
                     }
                     wait_point = format!("content:{method}");
                     phase!("web-runtime: phase run-wait point={wait_point}");
+                    let mut params = params;
+                    if let Err(error) = content.prepare_engine_params(&method, &mut params) {
+                        controller.send_timeout(
+                            &Message::engine_result(
+                                request_id,
+                                false,
+                                serde_json::Value::Null,
+                                Some(error.to_string()),
+                            ),
+                            remaining,
+                        )?;
+                        continue;
+                    }
                     pending.insert(request_id, (method.clone(), params.clone()));
                     content.send_timeout(
                         &Message::engine_call(request_id, method.clone(), params),
@@ -1745,6 +1758,20 @@ impl WorkerProcess {
         self.worker_temp_dir.as_ref().map(|dir| dir.path.as_path())
     }
 
+    pub(crate) fn prepare_engine_params(
+        &self,
+        method: &str,
+        params: &mut serde_json::Value,
+    ) -> io::Result<()> {
+        if method != "page.setInputFiles" {
+            return Ok(());
+        }
+        let worker_root = self.temp_dir().ok_or_else(|| {
+            io::Error::other("upload unavailable: content worker has no private temp directory")
+        })?;
+        stage_input_files(params, &std::env::temp_dir(), worker_root)
+    }
+
     pub(crate) fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(None) => true,
@@ -1998,9 +2025,223 @@ impl Drop for WorkerProcess {
     }
 }
 
+// Walk from pinned directory descriptors: O_NOFOLLOW on only the final path
+// component would still allow a swapped ancestor to escape the upload grant.
+#[cfg(unix)]
+fn open_granted_upload(granted_root: &Path, source: &Path) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let relative = source.strip_prefix(granted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "upload path outside granted temp directory",
+        )
+    })?;
+    let open_at = |directory: &File, name: &std::ffi::OsStr, is_directory: bool| {
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "upload path contains NUL"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if is_directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    };
+    let mut directory = File::open("/")?;
+    for component in granted_root.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => directory = open_at(&directory, name, true)?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid upload grant",
+                ))
+            }
+        }
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid relative upload path",
+            ));
+        };
+        let file = open_at(&directory, name, components.peek().is_some())?;
+        if components.peek().is_none() {
+            return Ok(file);
+        }
+        directory = file;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "upload requires a file",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_granted_upload(_granted_root: &Path, _source: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure upload staging requires Unix directory handles",
+    ))
+}
+
+// Keep the original supervisor-temp upload grant. Workers now use distinct
+// temporary roots, so the supervisor must transfer granted files instead of
+// asking the content worker to read outside its own sandbox.
+fn stage_input_files(
+    params: &mut serde_json::Value,
+    granted_root: &Path,
+    worker_root: &Path,
+) -> io::Result<()> {
+    let files = params
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setInputFiles requires a file list",
+            )
+        })?;
+    let granted_root = granted_root.canonicalize()?;
+    let mut sources = Vec::with_capacity(files.len());
+    for value in files {
+        let raw = value.as_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setInputFiles requires path strings",
+            )
+        })?;
+        let source = Path::new(raw);
+        let source = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            granted_root.join(source)
+        };
+        let source = source.canonicalize()?;
+        if !source.starts_with(&granted_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "upload path outside granted temp directory",
+            ));
+        }
+        let file = open_granted_upload(&granted_root, &source)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload requires a regular file",
+            ));
+        }
+        sources.push((source, file));
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+    static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+    let stage = worker_root.join(format!(
+        "upload-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&stage)?;
+    let result = (|| {
+        let mut staged = Vec::with_capacity(sources.len());
+        for (index, (source, mut input)) in sources.into_iter().enumerate() {
+            let dir = stage.join(index.to_string());
+            fs::create_dir(&dir)?;
+            let path = dir.join(
+                source
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("upload has no filename"))?,
+            );
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            io::copy(&mut input, &mut output)?;
+            staged.push(serde_json::Value::String(
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        Ok::<_, io::Error>(staged)
+    })();
+    match result {
+        Ok(staged) => {
+            // The content worker owns the entire ancestor root and removes all
+            // staged files when it exits. File objects may still need the bytes
+            // after setInputFiles returns, so do not delete them prematurely.
+            params["files"] = serde_json::Value::Array(staged);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage);
+            Err(error)
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_ancestor_swap_after_canonicalization_cannot_escape_grant() {
+        use std::os::unix::fs::symlink;
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let grant = root.path.join("grant");
+        let inside = grant.join("inside");
+        let outside = root.path.join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(inside.join("sample.txt"), b"allowed").unwrap();
+        fs::write(outside.join("sample.txt"), b"must-not-read").unwrap();
+        let checked = inside.join("sample.txt").canonicalize().unwrap();
+        fs::rename(&inside, grant.join("saved")).unwrap();
+        symlink(&outside, &inside).unwrap();
+        assert!(open_granted_upload(&grant, &checked).is_err());
+    }
+
+    #[test]
+    fn uploads_cross_private_worker_roots_without_losing_names_or_bytes() {
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let worker = OwnedTempDir::for_content_worker_in(&root.path).unwrap();
+        for (dir, bytes) in [("a", b"first".as_slice()), ("b", b"second".as_slice())] {
+            fs::create_dir(root.path.join(dir)).unwrap();
+            fs::write(root.path.join(dir).join("sample.txt"), bytes).unwrap();
+        }
+        let mut params = serde_json::json!({"files":[root.path.join("a/sample.txt"),root.path.join("b/sample.txt")]});
+        stage_input_files(&mut params, &root.path, &worker.path).unwrap();
+        for (value, expected) in params["files"].as_array().unwrap().iter().zip([b"first".as_slice(),b"second".as_slice()]) {
+            let path = Path::new(value.as_str().unwrap());
+            assert!(path.starts_with(&worker.path));
+            assert_eq!(path.file_name().unwrap(), "sample.txt");
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_symlink_escape_refuses_entire_batch_before_staging() {
+        use std::os::unix::fs::symlink;
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let grant = root.path.join("grant");
+        fs::create_dir(&grant).unwrap();
+        let worker = OwnedTempDir::for_content_worker_in(&root.path).unwrap();
+        fs::write(grant.join("allowed.txt"), b"allowed").unwrap();
+        fs::write(root.path.join("outside.txt"), b"outside").unwrap();
+        symlink(root.path.join("outside.txt"), grant.join("escape.txt")).unwrap();
+        let mut params = serde_json::json!({"files":[grant.join("allowed.txt"),grant.join("escape.txt")]});
+        let before = params.clone();
+        assert_eq!(stage_input_files(&mut params, &grant, &worker.path).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(params, before);
+        assert_eq!(fs::read_dir(&worker.path).unwrap().count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]
