@@ -6462,7 +6462,7 @@ fn structured_dom_queries_work_under_csp_without_trusting_page_javascript() {
             assert_eq!(result["session_id"], session);
             assert_eq!(result["untrusted_content_boundary"], "UNTRUSTED_PAGE_CONTENT");
             assert!(!result["serialized"].is_null(), "raw parity: {result}");
-            assert_eq!(result["value"]["count"], 1, "{result}");
+            assert_eq!(result["value"]["count"].as_f64(), Some(1.0), "{result}");
             let row = &result["value"][if op=="find" { "nodes" } else { "rows" }][0];
             assert_eq!(row["id"], "target");
             assert_eq!(row["text"], "CSP_TEXT");
