@@ -2048,7 +2048,10 @@ fn greppy_cli_parent_survives_content_worker_kill() {
             file.read_exact(&mut token_bytes)
         })
         .expect("urandom");
-    let token: String = token_bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let token: String = token_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let _shutdown = CliparentShutdown {
         run_id: run_id.clone(),
         token: token.clone(),
@@ -2074,6 +2077,52 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         .and_then(|rest| rest.split('"').next())
         .expect("session_id in create stdout")
         .to_owned();
+    let (parent, socket) =
+        web_runtime_supervisor_for_run(&run_id).expect("created session has a detached supervisor");
+    register_attach_token(&socket, token.clone());
+    let listed = unix_request(
+        &socket,
+        &Request::new(&run_id, "web.session.list", json!({})),
+        Duration::from_secs(5),
+    )
+    .expect("list before run");
+    let content = listed.result.as_ref().unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == session_id)
+        .and_then(|session| session["content_pid"].as_u64())
+        .filter(|pid| *pid > 1)
+        .expect("bound session content worker");
+    // The supervisor also owns a warm engine pair. Killing its first content
+    // child may leave the actual session untouched and falsely report success.
+    // Arm only once the bound page has made an owned fixture request.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let fixture = thread::spawn(move || {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = [0_u8; 1024];
+                    stream.read(&mut request).unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\narmed").unwrap();
+                    let _ = armed_tx.send(());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("owned fixture accept failed: {error}"),
+            }
+        }
+    });
     let mut child_cmd = Command::new(&greppy);
     child_cmd
         .args([
@@ -2100,28 +2149,27 @@ fn greppy_cli_parent_survives_content_worker_kill() {
         let stdin = child.stdin.as_mut().expect("stdin");
         stdin
             .write_all(
-                b"import { chromium } from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.waitForTimeout(15_000);\nawait browser.close();\n",
+                format!("import {{ chromium }} from \"playwright\";\nconst browser = await chromium.launch();\nconst page = await browser.newPage();\nawait page.goto({});\nawait page.waitForTimeout(15_000);\nawait browser.close();\n", serde_json::to_string(&url).unwrap()).as_bytes(),
             )
             .unwrap();
     }
     drop(child.stdin.take());
-    let deadline_pid = Instant::now() + Duration::from_secs(12);
-    let (parent, socket) = loop {
-        if let Some(found) = web_runtime_supervisor_for_run(&run_id) {
-            break found;
-        }
-        if Instant::now() >= deadline_pid {
-            let _ = child.kill();
-            panic!("detached web-runtime supervisor not found for {run_id}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-    register_attach_token(&socket, token.clone());
-    if let Some(content) = content_worker_pid(parent) {
-        let _ = Command::new("kill")
+    armed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bound page armed");
+    fixture.join().unwrap();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "run must still be active at kill"
+    );
+    assert!(
+        Command::new("kill")
             .args(["-KILL", &content.to_string()])
-            .status();
-    }
+            .status()
+            .unwrap()
+            .success(),
+        "kill bound content worker"
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         match child.try_wait() {
@@ -8735,6 +8783,51 @@ fn worker_sandbox_denies_host_secret_paths() {
 #[test]
 fn fail_closed_clock_coverage_request_and_handles() {
     run_named_fixture("fail-closed-surface.mjs", "run_failcl");
+}
+
+#[test]
+fn new_page_initial_document_settles_before_async_evaluation() {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-initial-page-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_initial_page", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_initial_page",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const value = await page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(7), 25)));
+if (value !== 7) throw new Error("initial-page Promise returned the wrong result");
+await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_initial_page",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(
+        response.result.as_ref().unwrap()["completed"],
+        true,
+        "{response:?}"
+    );
 }
 
 #[test]

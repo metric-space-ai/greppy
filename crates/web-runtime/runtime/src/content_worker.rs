@@ -2742,7 +2742,12 @@ impl ContentEngine {
                 webview.show();
                 webview.focus();
                 let created = webview.clone();
-                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || created.url().is_some())? {
+                // A URL can be visible before initial HeadParsed/Complete
+                // events settle. Publishing then makes the first async
+                // evaluation look interrupted by a navigation it never made.
+                if !self.spin_until_on(&wake, ACTION_TIMEOUT, move || {
+                    created.url().is_some() && created.load_status() == LoadStatus::Complete
+                })? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out creating page",
