@@ -3804,7 +3804,10 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
         "{out} {err}"
     );
     let (code, out, err) = run_with_env(&["index", "status", "--json"], &repo, &store, &[]);
-    assert_eq!(code, 73, "failed preparation makes index health unhealthy: {out} {err}");
+    assert_eq!(
+        code, 73,
+        "failed preparation makes index health unhealthy: {out} {err}"
+    );
     let status: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["writer_active"], false, "{status}");
     assert_eq!(status["background_job"]["state"], "failed", "{status}");
