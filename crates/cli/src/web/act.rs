@@ -375,14 +375,23 @@ pub(super) fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         let target = dir.join(&name);
-        std::fs::copy(&canonical, &target)
+        // Keep the writable destination handle until timestamps are set.
+        // fs::copy restores readonly source permissions too early on Windows.
+        let mut source_file = std::fs::File::open(&canonical)
+            .map_err(|error| format!("cannot open {path}: {error}"))?;
+        let mut target_file = std::fs::File::create(&target)
+            .map_err(|error| format!("cannot stage {path}: {error}"))?;
+        std::io::copy(&mut source_file, &mut target_file)
             .map_err(|error| format!("cannot stage {path}: {error}"))?;
         let modified = meta
             .modified()
             .map_err(|error| format!("cannot read modification time for {path}: {error}"))?;
-        std::fs::File::open(&target)
-            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
+        target_file
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
             .map_err(|error| format!("cannot preserve modification time for {path}: {error}"))?;
+        target_file
+            .set_permissions(meta.permissions())
+            .map_err(|error| format!("cannot preserve permissions for {path}: {error}"))?;
         staged.push(target.display().to_string());
     }
     Ok(staged)
