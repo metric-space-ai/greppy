@@ -1472,6 +1472,55 @@ impl TemporaryBaseWorktree {
     }
 }
 
+fn create_base_build_staging(
+    worktree_path: &Path,
+) -> Result<(
+    tempfile::TempDir,
+    greppy_core::cache::FileLock,
+    std::ffi::OsString,
+)> {
+    let scratch_root = temporary_base_checkout_root()?;
+    let _ = greppy_core::cache::reap_stale_base_build_dirs(
+        &scratch_root,
+        greppy_core::cache::BASE_BUILD_STAGING_TTL,
+    );
+    let staging = tempfile::Builder::new()
+        .prefix("greppy-base-build-")
+        .tempdir_in(&scratch_root)
+        .map_err(|error| Error::io("create Base build staging directory", error))?;
+    let staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
+        .map_err(|error| Error::io("lease Base build staging directory", error))?;
+    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
+        .map_err(|error| Error::io("resolve Base staging lease", error))?];
+    // Git may return the canonical /private/... spelling while the configured
+    // scratch root uses /tmp/... (or another directory alias). Compare the same
+    // namespace so the child's checkout lease is not silently omitted.
+    let canonical_scratch = std::fs::canonicalize(&scratch_root)
+        .map_err(|error| Error::io("resolve Base scratch staging root", error))?;
+    let canonical_worktree = std::fs::canonicalize(worktree_path)
+        .map_err(|error| Error::io("resolve Base staging worktree", error))?;
+    if let Some(checkout) = canonical_worktree.ancestors().find(|ancestor| {
+        ancestor.parent() == Some(canonical_scratch.as_path())
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("greppy-linked-base-checkout-"))
+    }) {
+        lease_roots.push(
+            std::fs::canonicalize(checkout)
+                .map_err(|error| Error::io("resolve Base checkout lease", error))?,
+        );
+    }
+    if let Some(inherited) = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES) {
+        lease_roots.extend(std::env::split_paths(&inherited));
+    }
+    lease_roots.sort();
+    lease_roots.dedup();
+    let child_leases = std::env::join_paths(&lease_roots)
+        .map_err(|error| Error::Invalid(format!("cannot pass Base staging leases: {error}")))?;
+    Ok((staging, staging_lease, child_leases))
+}
+
 fn temporary_base_checkout_root() -> Result<PathBuf> {
     // Honor TMPDIR consistently on every platform. Rust's Windows
     // `temp_dir()` follows GetTempPath and would otherwise ignore an explicit
@@ -1815,40 +1864,7 @@ fn prepare_base_store_paths(
         shared_data_root,
         greppy_core::cache::BASE_BUILD_STAGING_TTL,
     );
-    let staging = tempfile::Builder::new()
-        .prefix("greppy-base-build-")
-        .tempdir_in(shared_data_root)
-        .map_err(|error| Error::io("create Base build staging directory", error))?;
-    let _staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
-        .map_err(|error| Error::io("lease Base build staging directory", error))?;
-    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
-        .map_err(|error| Error::io("resolve Base staging lease", error))?];
-    // Git may return the canonical /private/... spelling while the configured
-    // shared root uses /tmp/... (or another directory alias). Compare the same
-    // namespace so the child's checkout lease is not silently omitted.
-    let canonical_shared = std::fs::canonicalize(shared_data_root)
-        .map_err(|error| Error::io("resolve shared Base staging root", error))?;
-    let canonical_worktree = std::fs::canonicalize(worktree_path)
-        .map_err(|error| Error::io("resolve Base staging worktree", error))?;
-    if let Some(checkout) = canonical_worktree.ancestors().find(|ancestor| {
-        ancestor.parent() == Some(canonical_shared.as_path())
-            && ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("greppy-linked-base-checkout-"))
-    }) {
-        lease_roots.push(
-            std::fs::canonicalize(checkout)
-                .map_err(|error| Error::io("resolve Base checkout lease", error))?,
-        );
-    }
-    if let Some(inherited) = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES) {
-        lease_roots.extend(std::env::split_paths(&inherited));
-    }
-    lease_roots.sort();
-    lease_roots.dedup();
-    let child_leases = std::env::join_paths(&lease_roots)
-        .map_err(|error| Error::Invalid(format!("cannot pass Base staging leases: {error}")))?;
+    let (staging, _staging_lease, child_leases) = create_base_build_staging(worktree_path)?;
     let staging_data = staging.path().join("data");
     std::fs::create_dir_all(&staging_data)
         .map_err(|error| Error::io("create Base build data directory", error))?;
@@ -4023,6 +4039,92 @@ mod tests {
             error.contains("does not identify a primary checkout"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn base_graph_staging_uses_scratch_and_hands_off_checkout_lease() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outer = tempfile::tempdir().unwrap();
+        let scratch = outer.path().join("scratch");
+        let shared = outer.path().join("shared");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let _restore = TmpdirRestore::set(&scratch);
+        let checkout = tempfile::Builder::new()
+            .prefix("greppy-linked-base-checkout-")
+            .tempdir_in(&scratch)
+            .unwrap();
+        let checkout_lease =
+            greppy_core::cache::create_base_build_staging_lease(checkout.path()).unwrap();
+        let worktree = checkout.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let (staging, staging_lease, inherited) = create_base_build_staging(&worktree).unwrap();
+        let canonical_scratch = std::fs::canonicalize(&scratch).unwrap();
+        let roots = std::env::split_paths(&inherited).collect::<Vec<_>>();
+        assert!(roots.contains(&std::fs::canonicalize(staging.path()).unwrap()));
+        assert!(roots.contains(&std::fs::canonicalize(checkout.path()).unwrap()));
+        assert!(roots
+            .iter()
+            .all(|path| path.starts_with(&canonical_scratch)));
+        assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
+        let staged_graph = staging.path().join("graph.db");
+        drop(greppy_store::Store::open(&staged_graph).unwrap());
+        let staged_summary = staging.path().join("summary.json");
+        std::fs::write(&staged_summary, b"[]").unwrap();
+        let identity = BaseStoreIdentity {
+            format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+            canonical_repository_identity: "scratch-publication-fixture".into(),
+            git_object_format: "sha1".into(),
+            base_tree_oid: "1111111111111111111111111111111111111111".into(),
+            store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+            indexer_version: "fixture-indexer".into(),
+            parser_and_extractor_versions: "fixture-parser".into(),
+            summary_model_and_prompt_version: "fixture-summary".into(),
+            embedding_model: "fixture-embedding".into(),
+            embedding_prompt_version: "fixture-prompt".into(),
+            embedding_dimensions: 2,
+            embedding_encoding: "f32+i8-v1".into(),
+        };
+        let layout = BaseStoreLayout::new(&shared, &identity).unwrap();
+        let _builder = layout.acquire_builder(false).unwrap().unwrap();
+        layout
+            .publish_graph_with_summary(identity, &staged_graph, &staged_summary)
+            .unwrap();
+        layout.read_verified_manifest().unwrap();
+        assert!(layout.graph.starts_with(&shared));
+        assert_eq!(
+            std::fs::read(&layout.graph).unwrap(),
+            std::fs::read(&staged_graph).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&layout.summary_cache).unwrap(),
+            std::fs::read(&staged_summary).unwrap()
+        );
+        let previous = std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES);
+        std::env::set_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES, inherited);
+        let retained = greppy_core::cache::retain_base_build_staging_leases_from_env();
+        match previous {
+            Some(value) => {
+                std::env::set_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES, value)
+            }
+            None => std::env::remove_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES),
+        }
+        let retained = retained.unwrap();
+        assert!(retained.len() >= 2);
+        drop(staging_lease);
+        drop(checkout_lease);
+        // Independently retained child leases prevent reclamation after parent loss.
+        assert_eq!(
+            greppy_core::cache::reap_stale_base_build_dirs(&scratch, std::time::Duration::ZERO)
+                .unwrap(),
+            0
+        );
+        drop(retained);
+        let staging_path = staging.path().to_path_buf();
+        drop(staging);
+        assert!(!staging_path.exists());
     }
 
     #[test]
