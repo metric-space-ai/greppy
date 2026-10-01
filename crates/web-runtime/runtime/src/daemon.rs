@@ -5084,6 +5084,12 @@ fn policy_recovery(reason: &str) -> &'static str {
 
 fn engine_error(request: &Request, message: impl Into<String>, exit_code: i32) -> Response {
     let message = message.into();
+    // Worker-owned transfer/session budget refusals carry the same explicit
+    // prefix as controller relay refusals. Keep that reason instead of turning
+    // an enforced artifact bound into an opaque engine failure.
+    if let Some(reason) = message.strip_prefix("resource_limit: ") {
+        return limit_error(request, reason);
+    }
     if let Some(reason) = message.strip_prefix("policy_denied:") {
         let mut error = ErrorObject::new(
             "policy_denied",
@@ -6097,6 +6103,26 @@ mod script_stage_tests {
 mod redirect_chain_tests {
     use super::redirect_chain;
     use serde_json::json;
+
+    #[test]
+    fn trusted_transfer_limit_preserves_resource_error_and_exit_contract() {
+        let request = super::Request::new("artifact-limit", "web.read", json!({}));
+        let response = super::engine_error(
+            &request, "resource_limit: artifact limit exceeded (100 > 8)", 34,
+        );
+        assert_eq!(response.status, "error");
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "resource_limit");
+        assert_eq!(error.exit_code, 37);
+        assert_eq!(error.message, "artifact limit exceeded (100 > 8)");
+        assert!(!error.retryable);
+        let unrelated = super::engine_error(
+            &request, "page JavaScript raised Error: resource_limit: page data", 34,
+        );
+        let error = unrelated.error.unwrap();
+        assert_eq!(error.code, "engine_error");
+        assert_eq!(error.exit_code, 34);
+    }
 
     #[test]
     fn missing_target_guidance_differs_from_ambiguous_target_guidance() {
