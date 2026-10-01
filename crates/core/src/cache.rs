@@ -1799,9 +1799,17 @@ fn ensure_owned_namespace(dir: &Path) -> io::Result<()> {
 fn ensure_one_directory(dir: &Path) -> io::Result<()> {
     if let Ok(md) = fs::symlink_metadata(dir) {
         if md.file_type().is_symlink() || !md.is_dir() {
+            let reason = if md.file_type().is_symlink() {
+                "symlink namespace entries are not allowed; for relocated workspace stores, set GREPPY_STORE_DIR to the real store base directory rather than linking an individual namespace"
+            } else {
+                "this entry is not a directory; choose a directory for the cache namespace"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("refusing non-directory cache namespace {}", dir.display()),
+                format!(
+                    "refusing non-directory cache namespace {}: {reason}",
+                    dir.display()
+                ),
             ));
         }
     } else {
@@ -2556,6 +2564,14 @@ mod tests {
         assert!(error
             .to_string()
             .contains("refusing non-directory cache namespace"));
+        assert!(error
+            .to_string()
+            .contains("symlink namespace entries are not allowed"));
+        assert!(error.to_string().contains("GREPPY_STORE_DIR"));
+        assert!(
+            !external.join("blocked").exists(),
+            "refused symlink target was modified"
+        );
         let _ = fs::remove_dir_all(base);
     }
 
