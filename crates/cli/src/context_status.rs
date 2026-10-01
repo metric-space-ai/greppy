@@ -115,8 +115,10 @@ impl Status {
         let r = &mut self.restrictions[index];
         r.announced = true;
         Some(match r.capability {
-            Capability::Graph => "greppy: graph preparation completed; search-symbol, who-calls and impact are available again. These commands validate source freshness before answering.",
-            Capability::Semantic => "greppy: semantic embedding preparation completed; search is available again. It validates source freshness before answering.",
+            Capability::Graph => {
+                "greppy: graph preparation completed; use search-symbol, who-calls or impact."
+            }
+            Capability::Semantic => "greppy: semantic embedding preparation completed; use search.",
         })
     }
 }
