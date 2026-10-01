@@ -1,7 +1,7 @@
-use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
+use crate::policy::{NetworkProfile, SharedProfile, UrlDecision, decide_url};
 use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
-    read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
+    MAX_FRAME_BYTES, Message, WorkerKind, read_message, timeout_ms_from_json, write_message,
 };
 use crate::selector_runtime::SELECTOR_RUNTIME;
 use crate::web_api_shims::shim_source;
@@ -1902,10 +1902,7 @@ impl ContentEngine {
                 "timed out evaluating structured DOM query",
             ));
         }
-        let result = saved
-            .borrow_mut()
-            .take()
-            .expect("evaluation completed");
+        let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
     }
 
@@ -1938,7 +1935,10 @@ impl ContentEngine {
         let source_js = serde_json::to_string(script).map_err(io::Error::other)?;
         let wrapper = format!(
             r#"(function(key, source) {{
-  var value = eval(source);
+  var value;
+  try {{ value = eval(source); }} catch (error) {{
+    return [-1, {{ name: String(error && error.name || "Error"), message: String(error && error.message || error) }}];
+  }}
   if (!value || typeof value.then !== "function") return [0, value];
   var slot = {{ done: 0, status: "", value: undefined }};
   window[key] = slot;
@@ -1976,7 +1976,38 @@ impl ContentEngine {
             ));
         }
         let value = parts.remove(1);
-        let pending = match parts.remove(0) {
+        let status = parts.remove(0);
+        if matches!(status, JSValue::Number(number) if number == -1.0) {
+            let JSValue::Object(error) = value else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an invalid error envelope",
+                ));
+            };
+            let Some(JSValue::String(name)) = error.get("name") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            let Some(JSValue::String(message)) = error.get("message") else {
+                return Err(io::Error::other(
+                    "page.evaluate returned an incomplete error envelope",
+                ));
+            };
+            // eval(source) compiles inside a valid wrapper: Servo therefore
+            // reports its SyntaxError as EvaluationFailure, not CompilationFailure.
+            // Preserve the actual exception class rather than guessing from text.
+            // A script may also deliberately throw SyntaxError at runtime, so do
+            // not claim that every such exception proves compilation failed.
+            let diagnostic = if name == "SyntaxError" {
+                format!(
+                    "page JavaScript raised SyntaxError: {message}; check its syntax and the runtime-supported ECMAScript features, or retry with a simpler expression"
+                )
+            } else {
+                format!("page JavaScript raised {name}: {message}")
+            };
+            return Err(io::Error::other(diagnostic));
+        }
+        let pending = match status {
             JSValue::Number(value) => value != 0.0,
             JSValue::Boolean(value) => value,
             _ => false,
@@ -2346,7 +2377,9 @@ impl ContentEngine {
         let Ok(key_js) = serde_json::to_string(&Self::wait_slot_key(token)) else {
             return;
         };
-        let mut script = String::from("(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return 0; })(");
+        let mut script = String::from(
+            "(function(key) { var slot = window[key]; if (slot && typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return 0; })(",
+        );
         script.push_str(&key_js);
         script.push_str(")");
         let _ = self.evaluate_until(webview.clone(), &script, budget);
@@ -2367,7 +2400,9 @@ impl ContentEngine {
         }
         let key_js =
             serde_json::to_string(&Self::wait_slot_key(token)).map_err(io::Error::other)?;
-        let mut script = String::from("(function(key) { var slot = window[key]; if (!slot || !slot.done) return [0, '', null]; var status = String(slot.status || ''); var value = slot.value; if (typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return [1, status, value]; })(");
+        let mut script = String::from(
+            "(function(key) { var slot = window[key]; if (!slot || !slot.done) return [0, '', null]; var status = String(slot.status || ''); var value = slot.value; if (typeof slot.cleanup === 'function') { try { slot.cleanup(); } catch (_e) {} } try { delete window[key]; } catch (_e) {} return [1, status, value]; })(",
+        );
         script.push_str(&key_js);
         script.push_str(")");
         match self.evaluate_until(webview.clone(), &script, budget)? {
@@ -5149,13 +5184,14 @@ impl NavTrace {
     fn finish(&mut self, webview: &WebView) {
         let Some(started) = self.started else { return };
         if crate::supervisor::phase_trace_enabled() {
-            eprintln!("web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
-            self.settled_ms,
-            self.head_parsed_ms,
-            self.complete_ms,
-            started.elapsed().as_millis(),
-            webview.url().map(|u| u.to_string()),
-        );
+            eprintln!(
+                "web-runtime: nav-trace settled_ms={:?} head_parsed_ms={:?} complete_ms={:?} commit_ms={} url={:?}",
+                self.settled_ms,
+                self.head_parsed_ms,
+                self.complete_ms,
+                started.elapsed().as_millis(),
+                webview.url().map(|u| u.to_string()),
+            );
         }
     }
 
@@ -5931,9 +5967,11 @@ mod serialize_tests {
         let second = alloc_wait_nonce().unwrap();
         assert_eq!(first.len(), 32);
         assert_eq!(second.len(), 32);
-        assert!(first
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
         assert_ne!(first, second);
     }
 
