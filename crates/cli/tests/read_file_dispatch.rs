@@ -333,6 +333,35 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
 }
 
 #[test]
+fn changed_source_never_offers_stale_outline_selectors_or_starts_refresh() {
+    let (repo, store) = fresh_workspace("outline-stale");
+    let before = format!(
+        "pub fn old_name() {{}}\n{}",
+        "// same-length source\n".repeat(65)
+    );
+    std::fs::write(repo.join("lib.rs"), &before).unwrap();
+    index(&repo, &store);
+    let database = only_graph_db_below(&store);
+    let job = database.parent().unwrap().join("index.job");
+    let old_job = std::fs::read(&job).ok();
+    let after = before.replace("old_name", "new_name");
+    assert_eq!(before.len(), after.len());
+    std::fs::write(repo.join("lib.rs"), &after).unwrap();
+    for command in ["read", "read-file"] {
+        let (code, stdout, stderr) = run(&repo, &store, &[command, "lib.rs"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains(&after), "{stdout}");
+        assert!(!stdout.contains("is a file — read a symbol:"), "{stdout}");
+        assert!(!stdout.contains("old_name"), "{stdout}");
+    }
+    assert_eq!(
+        std::fs::read(&job).ok(),
+        old_job,
+        "passive outline started a refresh"
+    );
+}
+
+#[test]
 fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() {
     let (repo, store) = fresh_workspace("outline-threshold");
     let source = format!("pub fn target() {{}}\n{}", "// line\n".repeat(59));

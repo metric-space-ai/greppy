@@ -1441,6 +1441,14 @@ fn read_file_outline(root: &std::path::Path, shown: &str, content: &str) -> Opti
         store
     };
     let project = workspace_locator::project_identity(root);
+    // Same-length edits can leave obsolete indexed spans in bounds. Unknown
+    // or changed fingerprints fall back without index or repair work.
+    let indexed = store.get_file_state(&project, shown).ok()??;
+    use sha2::Digest;
+    let content_hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    if indexed.sha256 != content_hash {
+        return None;
+    }
     let mut nodes = store.list_nodes_for_file(&project, shown).ok()?;
     let line_count = read_line_count(content) as i64;
     nodes.retain(|node| {
