@@ -141,6 +141,26 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
+/// Select the syntax grammar from the immutable pre-edit snapshot. A `.h`
+/// header can contain either C or C++; prefer C++ only when it explains the
+/// existing bytes strictly better without adding either kind of diagnostic.
+/// The same selected grammar must validate both sides of the transaction.
+pub fn syntax_language_for_path(path: &Path, before: &[u8]) -> Language {
+    let language = greppy_parser::language_for_path(path);
+    if language != Language::C || path.extension().and_then(|value| value.to_str()) != Some("h") {
+        return language;
+    }
+    if let (Some(c), Some(cpp)) = (
+        syntax_counts(Language::C, before),
+        syntax_counts(Language::Cpp, before),
+    ) {
+        if cpp.errors <= c.errors && cpp.missing <= c.missing && cpp != c {
+            return Language::Cpp;
+        }
+    }
+    language
+}
+
 /// Build a validation-only view for the exact import-type recovery shape
 /// emitted by the bundled TypeScript grammar.
 ///
@@ -447,6 +467,32 @@ mod tests {
             range,
             replacement: replacement.to_vec(),
         }
+    }
+
+    #[test]
+    fn ambiguous_cpp_header_uses_baseline_grammar_without_weakening_c_errors() {
+        let before = b"#include <memory>\nnamespace KWin { class GLFramebuffer; class Layer { std::unique_ptr<GLFramebuffer> buffer; }; }\n";
+        let after = b"#include <memory>\nnamespace KWin { class GLFramebuffer; class GLRenderTimeQuery; class Layer { std::unique_ptr<GLFramebuffer> buffer; std::unique_ptr<GLRenderTimeQuery> query; }; }\n";
+        let language = syntax_language_for_path(Path::new("layer.h"), before);
+        assert_eq!(language, Language::Cpp);
+        let baseline = syntax_counts(language, before).unwrap();
+        assert_eq!(syntax_counts(language, after).unwrap(), baseline);
+        let malformed =
+            b"namespace KWin { class Layer { std::unique_ptr<GLFramebuffer> query( ; }; }\n";
+        let invalid = syntax_counts(language, malformed).unwrap();
+        assert!(invalid.errors > baseline.errors || invalid.missing > baseline.missing);
+
+        let c = b"struct AtomicState { _Atomic(int) value; };\n";
+        let c_language = syntax_language_for_path(Path::new("state.h"), c);
+        assert_eq!(c_language, Language::C);
+        assert_eq!(
+            syntax_language_for_path(Path::new("state.c"), before),
+            Language::C
+        );
+        let invalid_c =
+            syntax_counts(c_language, b"struct AtomicState { _Atomic(int value; };\n").unwrap();
+        let valid_c = syntax_counts(c_language, c).unwrap();
+        assert!(invalid_c.errors > valid_c.errors || invalid_c.missing > valid_c.missing);
     }
 
     #[test]

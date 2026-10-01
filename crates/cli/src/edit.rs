@@ -816,7 +816,7 @@ pub(crate) fn edit_positional_payload(
 /// Validate a candidate without writing it. Parser locations refer to the
 /// proposed content, which may have different line numbers from the live file.
 fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<()> {
-    let language = greppy_edit::language_for_path(std::path::Path::new(path));
+    let language = greppy_edit::txn::syntax_language_for_path(std::path::Path::new(path), before);
     if !language.is_supported() {
         return Ok(());
     }
