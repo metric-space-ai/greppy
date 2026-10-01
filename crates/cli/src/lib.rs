@@ -5046,14 +5046,19 @@ impl BackgroundJobGuard {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
-            self.eta_seconds = observed_embedding_eta_seconds(
+            // Cache copies are not measurements of GPU inference throughput.
+            // Treat unvisited documents as uncached until their reuse is proven.
+            let (inferred, inference_workload) = embedding_inference_workload(
                 self.completed_documents,
                 self.total_documents,
-                elapsed_ms,
-            )
-            .or(self.eta_seconds);
+                self.local_store_reuse,
+                self.global_cache_hits,
+            );
+            self.eta_seconds =
+                observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms)
+                    .or(self.eta_seconds);
             self.rate_milli_documents_per_second =
-                observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+                observed_embedding_rate_milli(inferred, elapsed_ms);
         }
         let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
@@ -5341,6 +5346,19 @@ fn initial_embedding_eta_seconds(total_documents: usize, backend: &str) -> Optio
     let total = u64::try_from(total_documents).ok()?;
     let rate = initial_embedding_rate(backend).max(1);
     Some(total.saturating_add(rate - 1) / rate)
+}
+
+fn embedding_inference_workload(
+    completed_documents: usize,
+    total_documents: usize,
+    local_store_reuse: usize,
+    global_cache_hits: usize,
+) -> (usize, usize) {
+    let inferred = completed_documents
+        .saturating_sub(local_store_reuse)
+        .saturating_sub(global_cache_hits);
+    let remaining = total_documents.saturating_sub(completed_documents);
+    (inferred, inferred.saturating_add(remaining))
 }
 
 fn observed_embedding_eta_seconds(
