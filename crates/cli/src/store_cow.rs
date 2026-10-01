@@ -786,10 +786,8 @@ pub(crate) fn repair_persisted_v7_delta(
     }
     drop(current);
     let mut overlay = greppy_store::Store::open_overlay(base_path, delta_path, visibility)?;
-    // Migration consumes the indexed source bytes. Ordinary workspace edits
-    // must first use the query's freshness refresh, not fail that migration's
-    // fingerprint validation. Leave the marker pending and the stale gate in
-    // force; only a fresh publication may certify the repaired caller graph.
+    // Defer migration until the normal freshness refresh publishes edited sources.
+    // Keep the repair marker pending and never authorize a stale graph.
     if rust_repair_requires_source_refresh(&overlay, root, project) {
         return Ok(false);
     }
@@ -914,7 +912,7 @@ pub(crate) fn persisted_v7_delta_needs_repair(
         Err(error) => {
             return Err(Error::Store(format!(
                 "read Rust caller-edge repair marker: {error}"
-            )));
+            )))
         }
     };
     Ok(delta
@@ -944,7 +942,7 @@ pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Re
             Err(error) => {
                 return Err(Error::Store(format!(
                     "read Base Rust repair marker: {error}"
-                )));
+                )))
             }
         };
         if !base_current {
@@ -1823,10 +1821,8 @@ fn prepare_base_store_paths(
         .map_err(|error| Error::io("create Base build staging directory", error))?;
     let _staging_lease = greppy_core::cache::create_base_build_staging_lease(staging.path())
         .map_err(|error| Error::io("lease Base build staging directory", error))?;
-    let mut lease_roots = vec![
-        std::fs::canonicalize(staging.path())
-            .map_err(|error| Error::io("resolve Base staging lease", error))?,
-    ];
+    let mut lease_roots = vec![std::fs::canonicalize(staging.path())
+        .map_err(|error| Error::io("resolve Base staging lease", error))?];
     // Git may return the canonical /private/... spelling while the configured
     // shared root uses /tmp/... (or another directory alias). Compare the same
     // namespace so the child's checkout lease is not silently omitted.
@@ -2575,7 +2571,7 @@ pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<Visib
             _ => {
                 return Err(Error::Invalid(format!(
                     "unsupported git diff status `{status}` for Store Delta"
-                )));
+                )))
             }
         }
     }
@@ -3057,27 +3053,21 @@ mod tests {
             .unwrap();
         drop(store);
         let store = crate::freshness::open_default_store(Some(&root_string)).unwrap();
-        assert!(
-            store
-                .incoming_edges(target.id, Some("CALLS"), 20)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == caller.id)
-        );
-        assert!(
-            store
-                .outgoing_edges(caller.id, Some("CALLS"), 20)
-                .unwrap()
-                .iter()
-                .all(|edge| edge.target_id != caller.id)
-        );
-        assert!(
-            store
-                .incoming_edges(constructor.id, Some("USAGE"), 20)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == decode.id)
-        );
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(store
+            .outgoing_edges(caller.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .all(|edge| edge.target_id != caller.id));
+        assert!(store
+            .incoming_edges(constructor.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == decode.id));
         let amount_usages = store.incoming_edges(amount.id, Some("USAGE"), 20).unwrap();
         assert!(amount_usages.iter().all(|edge| edge.source_id != decode.id));
         assert!(amount_usages.iter().any(|edge| edge.source_id == valid.id));
@@ -3513,12 +3503,10 @@ mod tests {
             .get_node_by_qname("p", "src/alias_chain/sub.rs::Function::target")
             .unwrap()
             .unwrap();
-        assert!(
-            legacy
-                .incoming_edges(legacy_target.id, Some("USAGE"), 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(legacy
+            .incoming_edges(legacy_target.id, Some("USAGE"), 10)
+            .unwrap()
+            .is_empty());
         let legacy_base_caller = legacy
             .get_node_by_qname("p", "src/base.rs::Function::base_caller")
             .unwrap()
@@ -3590,35 +3578,29 @@ mod tests {
             .get_node_by_qname("p", "src/caller.rs::Function::caller")
             .unwrap()
             .unwrap();
-        assert!(
-            repaired
-                .incoming_edges(target.id, Some("USAGE"), 10)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == caller.id)
-        );
+        assert!(repaired
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
         let base_caller = repaired
             .get_node_by_qname("p", "src/base.rs::Function::base_caller")
             .unwrap()
             .unwrap();
-        assert!(
-            repaired
-                .incoming_edges(target.id, Some("CALLS"), 10)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == base_caller.id)
-        );
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller.id));
         let stable_caller = repaired
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(
-            repaired
-                .incoming_edges(target.id, Some("CALLS"), 10)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == stable_caller.id)
-        );
+        assert!(repaired
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller.id));
         assert_eq!(
             repaired
                 .conn()
@@ -3803,24 +3785,20 @@ mod tests {
             .get_node_by_qname("p", "src/base.rs::Function::base_caller")
             .unwrap()
             .unwrap();
-        assert!(
-            after_dirty
-                .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == base_caller_after_dirty.id)
-        );
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == base_caller_after_dirty.id));
         let stable_caller_after_dirty = after_dirty
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(
-            after_dirty
-                .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.source_id == stable_caller_after_dirty.id)
-        );
+        assert!(after_dirty
+            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == stable_caller_after_dirty.id));
         let later_relations = overlay_relations(&after_dirty);
         assert!(
             later_relations
@@ -4062,11 +4040,9 @@ mod tests {
 
         drop(checkout);
         assert!(!checkout_parent.exists());
-        assert!(
-            git(repo.path(), &["worktree", "list", "--porcelain"])
-                .lines()
-                .all(|line| !line.contains("greppy-linked-base-checkout-"))
-        );
+        assert!(git(repo.path(), &["worktree", "list", "--porcelain"])
+            .lines()
+            .all(|line| !line.contains("greppy-linked-base-checkout-")));
     }
 
     #[test]
@@ -4169,15 +4145,13 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("deadline reached while waiting for immutable Base"));
         assert!(message.contains(&identity_hash));
-        assert!(
-            message.contains(
-                layout
-                    .builder_lock_path()
-                    .unwrap()
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
+        assert!(message.contains(
+            layout
+                .builder_lock_path()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ));
         let progress = crate::read_background_job(&progress_path).unwrap();
         assert_eq!(progress["state"], "waiting_for_base_builder");
         assert_eq!(progress["progress_unit"], "steps");
@@ -4189,11 +4163,9 @@ mod tests {
                 Ok(_) => panic!("expired caller acquired a free Base builder lease"),
                 Err(error) => error,
             };
-        assert!(
-            free_error
-                .to_string()
-                .contains("deadline reached while waiting for immutable Base")
-        );
+        assert!(free_error
+            .to_string()
+            .contains("deadline reached while waiting for immutable Base"));
     }
 
     #[test]
@@ -4220,11 +4192,9 @@ mod tests {
                 Ok(_) => panic!("cancelled consumer acquired a free Base builder lease"),
                 Err(error) => error,
             };
-        assert!(
-            free_error
-                .to_string()
-                .contains("cancelled while waiting for immutable Base")
-        );
+        assert!(free_error
+            .to_string()
+            .contains("cancelled while waiting for immutable Base"));
     }
 
     #[test]
@@ -4247,11 +4217,9 @@ mod tests {
             sent.send((lease, waiting_publication.is_file())).unwrap();
         });
 
-        assert!(
-            received
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err()
-        );
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
         std::fs::create_dir_all(&layout.directory).unwrap();
         std::fs::write(&publication, b"published").unwrap();
         drop(owner);
@@ -4349,17 +4317,15 @@ mod tests {
 
         // An absent/mismatched stat identity forces the content fallback.
         // The unchanged bytes must still prove the Delta snapshot fresh.
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                ".github/workflows/ci.yml",
-                &std::collections::HashMap::new(),
-                &std::collections::HashMap::new(),
-            )
-            .unwrap()
-        );
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            ".github/workflows/ci.yml",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -4392,12 +4358,10 @@ mod tests {
             ..greppy_indexer::IndexOptions::default()
         };
         greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
-        assert!(
-            store
-                .get_file_state("p", "docs/added.rs")
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_file_state("p", "docs/added.rs")
+            .unwrap()
+            .is_some());
         assert_eq!(
             store
                 .get_index_skip("p", ".github/workflows/ci.yml")
@@ -4406,12 +4370,10 @@ mod tests {
                 .reason,
             "discovery_filtered"
         );
-        assert!(
-            store
-                .get_file_state("p", "docs/[literal].rs")
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_file_state("p", "docs/[literal].rs")
+            .unwrap()
+            .is_some());
 
         git(repo.path(), &["sparse-checkout", "init", "--cone"]);
         git(repo.path(), &["sparse-checkout", "set", "src"]);
@@ -4428,39 +4390,33 @@ mod tests {
             ".github/workflows/ci.yml".to_string(),
         ]);
         let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "docs/added.rs",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                ".github/workflows/ci.yml",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "docs/[literal].rs",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            ".github/workflows/ci.yml",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
 
         let replacement = repo.path().join("replacement.rs");
         std::fs::write(&replacement, "fn replacement() {}\n").unwrap();
@@ -4475,45 +4431,39 @@ mod tests {
             &["update-index", "--skip-worktree", "docs/added.rs"],
         );
         let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
-        assert!(
-            !persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "docs/added.rs",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "docs/[literal].rs",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
 
         git(
             repo.path(),
             &["update-index", "--force-remove", "docs/added.rs"],
         );
         let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
-        assert!(
-            !persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "docs/added.rs",
-                &store.list_file_identities("p").unwrap(),
-                &sparse_blobs,
-            )
-            .unwrap()
-        );
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
     }
 
     #[cfg(unix)]
@@ -4539,45 +4489,39 @@ mod tests {
         // Target content is not the identity of the tracked link.
         std::fs::write(repo.path().join("AGENTS.md"), "different target content\n").unwrap();
 
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "CLAUDE.md",
-                &std::collections::HashMap::new(),
-                &std::collections::HashMap::new(),
-            )
-            .unwrap()
-        );
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
 
         std::fs::remove_file(repo.path().join("CLAUDE.md")).unwrap();
         symlink("MISSING.md", repo.path().join("CLAUDE.md")).unwrap();
-        assert!(
-            !persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "CLAUDE.md",
-                &std::collections::HashMap::new(),
-                &std::collections::HashMap::new(),
-            )
-            .unwrap()
-        );
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
         // A broken link is also a valid filtered entry after refresh.
         greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
         assert!(store.get_file_state("p", "CLAUDE.md").unwrap().is_none());
-        assert!(
-            persisted_delta_path_matches(
-                repo.path(),
-                &store,
-                "p",
-                "CLAUDE.md",
-                &std::collections::HashMap::new(),
-                &std::collections::HashMap::new(),
-            )
-            .unwrap()
-        );
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
     }
 
     #[test]
