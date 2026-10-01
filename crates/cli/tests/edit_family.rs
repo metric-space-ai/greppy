@@ -180,10 +180,12 @@ fn write_typed_template_accepts_valid_typescript_and_refuses_malformed_changes_a
     assert!(out.status.success(), "{}", combined(&out));
     let path = fixture.repo.join("query.ts");
     assert_file(&path, valid);
-    let invalid = valid.replace("string | null", "string |");
-    let out = fixture.run_with_stdin(&["write", "query.ts"], invalid.as_bytes());
-    assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
-    assert_file(&path, valid);
+    for bad_type in ["string |", "string|", "string&"] {
+        let invalid = valid.replace("string | null", bad_type);
+        let out = fixture.run_with_stdin(&["write", "query.ts"], invalid.as_bytes());
+        assert_eq!(out.status.code(), Some(13), "{}", combined(&out));
+        assert_file(&path, valid);
+    }
 }
 
 #[test]

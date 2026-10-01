@@ -256,7 +256,12 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
     }
 
     let mut normalized: Option<Vec<u8>> = None;
+    // The shared grammar also accepts Flow's exact-object `{| ... |}`
+    // delimiters. A compact malformed TypeScript union such as `string|}`
+    // can be recovered as that delimiter without an ERROR. Never erase
+    // those non-TypeScript type arguments while repairing a typed tag.
     // tree-sitter-typescript 0.23.2 omits type_arguments on template_call.
+
     // Its exact recovery is a complete instantiation_expression followed by
     // a fabricated missing `!` inside non_null_expression. Validate a view
     // without those type arguments; never alter the proposed source bytes.
@@ -276,10 +281,31 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
                             .filter(|p| p.kind() == "template_string" && !p.has_error()),
                     ) {
                         if let Some(types) = instance.child_by_field_name("type_arguments") {
+                            let has_flow_object_delimiter = || {
+                                let mut cursor = types.walk();
+                                loop {
+                                    if matches!(cursor.node().kind(), "{|" | "|}") {
+                                        return true;
+                                    }
+                                    if cursor.goto_first_child() {
+                                        continue;
+                                    }
+                                    loop {
+                                        if cursor.goto_next_sibling() {
+                                            break;
+                                        }
+                                        if !cursor.goto_parent() {
+                                            return false;
+                                        }
+                                    }
+                                }
+                            };
                             let start = types.start_byte();
+
                             let end = types.end_byte();
                             if !instance.has_error()
                                 && types.named_child_count() > 0
+                                && !has_flow_object_delimiter()
                                 && end == node.start_byte()
                                 && end <= template.start_byte()
                                 && content.get(start) == Some(&b'<')
@@ -754,6 +780,10 @@ mod tests {
             for valid in [
                 "function* run() { const rows = yield* sql<{ readonly workspace_root: string | null }>`SELECT workspace_root`; return rows; }",
                 "const rows = db.sql<Array<{ id: number }>>`SELECT ${id}`;",
+                "const rows = sql<{id: | string | null}>`SELECT id`;",
+                "const rows = sql<{id: \"|}\"}>`SELECT id`;",
+                "const rows = sql<{id: string /* |} */}>`SELECT id`;",
+
                 "const rows = sql<\n{ readonly id: number },\nstring\n>`SELECT id`;",
             ] {
                 let counts = syntax_counts(language, valid.as_bytes()).unwrap();
@@ -765,6 +795,12 @@ mod tests {
             }
             for invalid in [
                 "const rows = sql<{ id: }>`SELECT id`;",
+                "const rows = sql<{id:string|}>`SELECT id`;",
+                "const rows = sql<{|id:string|}>`SELECT id`;",
+
+                "const rows = sql<{id:string&}>`SELECT id`;",
+                "function* run() {const rows=yield* sql<{readonly workspace_root:string|}>`SELECT workspace_root`;return rows;}",
+
                 "const rows = sql<{ id: number }>`SELECT id;",
                 "const rows = sql<{ id: number }>`SELECT ${}`;",
                 "const rows = sql<{ id: number }>`SELECT id`; const broken = ;",
