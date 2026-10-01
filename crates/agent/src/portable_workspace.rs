@@ -3614,7 +3614,7 @@ fn recover_ordinary_cleanup_journals(
             verify_ordinary_identity(&root, &journal.run_id, &journal.git_id, &journal.identity)?;
             let mut first_error = None;
             for (kind, owned_path) in &paths {
-                if let Err(error) = remove_ordinary_cleanup_path(kind, &owned_path) {
+                if let Err(error) = remove_ordinary_cleanup_path(kind, owned_path) {
                     first_error.get_or_insert(error);
                 }
             }
