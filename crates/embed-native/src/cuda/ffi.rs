@@ -15,13 +15,13 @@ const CUDA_BACKEND_ABI_VERSION: u32 = 1;
     any(target_os = "linux", target_os = "windows"),
     embed_native_has_cuda_dylib
 ))]
-const CUDA_DYLIB_BLOB: &[u8] = include_bytes!(env!("GREPPY_EMBED_NATIVE_CUDA_DYLIB"));
+static CUDA_DYLIB_BLOB: &[u8] = include_bytes!(env!("GREPPY_EMBED_NATIVE_CUDA_DYLIB"));
 
 #[cfg(not(all(
     any(target_os = "linux", target_os = "windows"),
     embed_native_has_cuda_dylib
 )))]
-const CUDA_DYLIB_BLOB: &[u8] = &[];
+static CUDA_DYLIB_BLOB: &[u8] = &[];
 
 type GpCudaErrorString = unsafe extern "C" fn(i32) -> *const c_char;
 type GpBackendAbiVersion = unsafe extern "C" fn() -> u32;
