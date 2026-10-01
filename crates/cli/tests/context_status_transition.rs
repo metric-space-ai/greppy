@@ -49,9 +49,16 @@ fn stale_symbol_lookup_announces_published_graph_once_on_literal_read() {
 
     // Successful symbol use acknowledges the next cycle without a redundant hint.
     std::fs::write(&file, "pub fn third_value() -> i32 { 3 }\n").unwrap();
-    assert_eq!(run(&repo, &store, &["search-symbol", "third_value"]).status.code(), Some(75));
+    assert_eq!(
+        run(&repo, &store, &["search-symbol", "third_value"])
+            .status
+            .code(),
+        Some(75)
+    );
     assert!(run(&repo, &store, &["index", "."]).status.success());
-    assert!(run(&repo, &store, &["search-symbol", "third_value"]).status.success());
+    assert!(run(&repo, &store, &["search-symbol", "third_value"])
+        .status
+        .success());
     let already_used = run(&repo, &store, &["read-file", "value.rs"]);
     assert!(already_used.status.success());
     assert!(already_used.stderr.is_empty(), "{already_used:?}");

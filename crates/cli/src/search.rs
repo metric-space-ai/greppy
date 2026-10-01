@@ -422,7 +422,6 @@ pub(crate) fn dispatch_search_symbols(
             );
         }
         if json {
-
             search_symbols_json(
                 &store,
                 q,
