@@ -377,6 +377,12 @@ pub(super) fn stage_uploads(paths: &[String]) -> std::result::Result<Vec<String>
         let target = dir.join(&name);
         std::fs::copy(&canonical, &target)
             .map_err(|error| format!("cannot stage {path}: {error}"))?;
+        let modified = meta
+            .modified()
+            .map_err(|error| format!("cannot read modification time for {path}: {error}"))?;
+        std::fs::File::open(&target)
+            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
+            .map_err(|error| format!("cannot preserve modification time for {path}: {error}"))?;
         staged.push(target.display().to_string());
     }
     Ok(staged)
