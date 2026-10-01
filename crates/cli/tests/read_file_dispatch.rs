@@ -379,9 +379,26 @@ fn source_read_outline_threshold_and_unindexed_fallback_do_not_start_indexing() 
         assert_eq!(code, 0, "{stdout}\n{stderr}");
         assert!(stdout.contains(&source), "{stdout}");
     }
+    fn has_graph_or_index_job(path: &Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        std::fs::read_dir(path).unwrap().any(|entry| {
+            let child = entry.unwrap().path();
+            if child.is_dir() {
+                has_graph_or_index_job(&child)
+            } else {
+                child
+                    .file_name()
+                    .is_some_and(|name| name == "graph.db" || name == "index.job")
+            }
+        })
+    }
+    // CLI startup may create gc.state/global.gc without graph preparation.
+    // The contract is no graph publication or index job, not no cache folder.
     assert!(
-        !cold_store.exists(),
-        "unindexed plain reads created a graph store"
+        !has_graph_or_index_job(&cold_store),
+        "plain reads prepared a graph"
     );
 }
 
