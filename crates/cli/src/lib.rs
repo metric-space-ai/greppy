@@ -74,6 +74,7 @@ mod nav;
 use nav::*;
 mod inference;
 use inference::*;
+mod context_status;
 mod freshness;
 mod index_admission;
 mod query_progress;
@@ -2387,7 +2388,12 @@ fn dispatch_subcommand(
             path_opts,
         } => {
             validate_path_filters(root, &path_opts, "--path")?;
-            dispatch_read_files(&paths, lines.as_deref(), all, handle, &path_opts, root)
+            let result =
+                dispatch_read_files(&paths, lines.as_deref(), all, handle, &path_opts, root);
+            if matches!(result, Ok(0)) {
+                context_status::attach_read_notice(root);
+            }
+            result
         }
         Command::Replace {
             symbol,
