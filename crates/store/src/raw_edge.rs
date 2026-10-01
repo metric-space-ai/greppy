@@ -467,7 +467,9 @@ mod tests {
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         overlay.conn().execute_batch("CREATE TRIGGER main.reject_raw BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'fixture raw failure'); END;").unwrap();
         let edge = new_raw_edge("p", "base.rs", "p.source", "p.target", "USAGE");
-        assert!(overlay.insert_raw_edges(&[edge.clone()]).is_err());
+        assert!(overlay
+            .insert_raw_edges(std::slice::from_ref(&edge))
+            .is_err());
         let private_projects: i64 = overlay
             .conn()
             .query_row("SELECT COUNT(*) FROM main.projects", [], |row| row.get(0))

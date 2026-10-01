@@ -722,9 +722,9 @@ fn detect_blocks(
                 && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
-            } else if WARNING_MARKER_RE.is_match(lines[index].content) {
-                Some(BlockKind::Warning)
-            } else if PYTHON_WARNING_RE.is_match(lines[index].content) {
+            } else if WARNING_MARKER_RE.is_match(lines[index].content)
+                || PYTHON_WARNING_RE.is_match(lines[index].content)
+            {
                 Some(BlockKind::Warning)
             } else {
                 TYPESCRIPT_DIAGNOSTIC_RE
@@ -1951,7 +1951,7 @@ fn novelty_lifts(
         let Some(cfg) = embedding_config_if_daemon_ready_with(
             args,
             embedding_config_for_daemon_probe,
-            |probe_cfg, key| embed_daemon::status(probe_cfg, key),
+            embed_daemon::status,
             || embedding_config_optional(args),
         ) else {
             return Vec::new();

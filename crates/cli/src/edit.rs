@@ -4359,8 +4359,7 @@ mod patch_rollback_tests {
             "get_lit_str",
             "selected.rs::get_lit_str",
         )
-        .err()
-        .expect("live call omitted from graph plan must refuse");
+        .expect_err("live call omitted from graph plan must refuse");
         assert_eq!(refusal.code, "unresolved_reference_identity");
         assert!(refusal.message.contains("glob_call.rs"));
     }

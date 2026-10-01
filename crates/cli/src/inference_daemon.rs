@@ -634,10 +634,11 @@ pub(crate) fn seal_detached_child_fds(command: &mut std::process::Command) -> st
             }
             for fd in 3..maximum {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-                    if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                if flags >= 0
+                    && flags & libc::FD_CLOEXEC == 0
+                    && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
             }
             Ok(())
