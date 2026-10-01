@@ -932,7 +932,11 @@ pub(super) fn rpc(
 
 fn requested_rpc_session(payload: &serde_json::Value, fallback: Option<&str>) -> Option<String> {
     // The runtime gives the payload priority over the envelope session.
-    payload.get("session_id").and_then(|value| value.as_str()).or(fallback).map(str::to_owned)
+    payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .or(fallback)
+        .map(str::to_owned)
 }
 
 pub(super) fn rpc_with_spawn(
@@ -953,7 +957,15 @@ pub(super) fn rpc_structured_dom(
     session_id: String,
     legacy_source: &str,
 ) -> Result<i32> {
-    rpc_with_spawn_legacy(root, json_out, "web.structured_dom", payload, Some(session_id), SupervisorSpawn::default(), Some(legacy_source))
+    rpc_with_spawn_legacy(
+        root,
+        json_out,
+        "web.structured_dom",
+        payload,
+        Some(session_id),
+        SupervisorSpawn::default(),
+        Some(legacy_source),
+    )
 }
 
 fn rpc_with_spawn_legacy(
@@ -975,52 +987,55 @@ fn rpc_with_spawn_legacy(
             // enforcement. Never route caller JavaScript through the trusted
             // channel or select legacy behavior for a new image generation.
             let (operation, payload) = match legacy_source.filter(|_| ctx.legacy) {
-                Some(source) => ("web.evaluate", json!({"session_id": rejected_session, "source": source})),
+                Some(source) => (
+                    "web.evaluate",
+                    json!({"session_id": rejected_session, "source": source}),
+                ),
                 None => (operation, payload),
             };
             match rpc_on_response(&ctx, operation, payload, session_id) {
-            Ok(response) => {
-                // A remembered session that turns out to be gone or wedged
-                // would otherwise poison every later command too. Forgetting
-                // it here means this call still reports the failure honestly
-                // and the next one starts clean, without the caller having to
-                // know that a state file exists.
-                if response.error.as_ref().is_some_and(is_missing_session) {
-                    if let Some(session) = rejected_session.as_deref() {
-                        forget_current_session(root, session);
-                        remove_session_route(root, session);
-                    }
-                } else if operation == "web.session.close" || operation == "session.close" {
-                    if let Some(session) = rejected_session.as_deref() {
-                        forget_current_session(root, session);
-                        remove_session_route(root, session);
-                    }
-                } else {
-                    let routed_session = response
-                        .result
-                        .as_ref()
-                        .and_then(|value| value.get("session_id"))
-                        .and_then(|value| value.as_str())
-                        .or(rejected_session.as_deref());
-                    if let Some(session) = routed_session {
-                        if let Err(error) = save_session_route(root, session, &ctx) {
-                            return emit_error(json_out, error);
+                Ok(response) => {
+                    // A remembered session that turns out to be gone or wedged
+                    // would otherwise poison every later command too. Forgetting
+                    // it here means this call still reports the failure honestly
+                    // and the next one starts clean, without the caller having to
+                    // know that a state file exists.
+                    if response.error.as_ref().is_some_and(is_missing_session) {
+                        if let Some(session) = rejected_session.as_deref() {
+                            forget_current_session(root, session);
+                            remove_session_route(root, session);
+                        }
+                    } else if operation == "web.session.close" || operation == "session.close" {
+                        if let Some(session) = rejected_session.as_deref() {
+                            forget_current_session(root, session);
+                            remove_session_route(root, session);
+                        }
+                    } else {
+                        let routed_session = response
+                            .result
+                            .as_ref()
+                            .and_then(|value| value.get("session_id"))
+                            .and_then(|value| value.as_str())
+                            .or(rejected_session.as_deref());
+                        if let Some(session) = routed_session {
+                            if let Err(error) = save_session_route(root, session, &ctx) {
+                                return emit_error(json_out, error);
+                            }
                         }
                     }
+                    emit_response(json_out, response)
                 }
-                emit_response(json_out, response)
-            }
-            Err(error) => {
-                if is_missing_session(&error) {
-                    if let Some(session) = rejected_session.as_deref() {
-                        forget_current_session(root, session);
-                        remove_session_route(root, session);
+                Err(error) => {
+                    if is_missing_session(&error) {
+                        if let Some(session) = rejected_session.as_deref() {
+                            forget_current_session(root, session);
+                            remove_session_route(root, session);
+                        }
                     }
+                    emit_error(json_out, error)
                 }
-                emit_error(json_out, error)
             }
-            }
-        },
+        }
         Err(error) => emit_error(json_out, error),
     }
 }
@@ -1261,7 +1276,11 @@ pub(super) fn rpc_response(
     session_id: Option<String>,
 ) -> std::result::Result<Response, ErrorObject> {
     let requested_session = requested_rpc_session(&payload, session_id.as_deref());
-    match supervisor_for_session(root, &SupervisorSpawn::default(), requested_session.as_deref()) {
+    match supervisor_for_session(
+        root,
+        &SupervisorSpawn::default(),
+        requested_session.as_deref(),
+    ) {
         Ok(ctx) => rpc_on_response(&ctx, operation, payload, session_id),
         Err(error) => Err(error),
     }
@@ -2427,21 +2446,36 @@ mod target_tests {
 
     #[test]
     fn raw_response_and_emitted_rpc_share_payload_first_session_selection() {
-        assert_eq!(requested_rpc_session(&json!({"session_id":"payload"}), Some("fallback")).as_deref(), Some("payload"));
-        assert_eq!(requested_rpc_session(&json!({}), Some("fallback")).as_deref(), Some("fallback"));
-        assert_eq!(requested_rpc_session(&json!({"session_id":null}), Some("fallback")).as_deref(), Some("fallback"));
+        assert_eq!(
+            requested_rpc_session(&json!({"session_id":"payload"}), Some("fallback")).as_deref(),
+            Some("payload")
+        );
+        assert_eq!(
+            requested_rpc_session(&json!({}), Some("fallback")).as_deref(),
+            Some("fallback")
+        );
+        assert_eq!(
+            requested_rpc_session(&json!({"session_id":null}), Some("fallback")).as_deref(),
+            Some("fallback")
+        );
         assert_eq!(requested_rpc_session(&json!({}), None), None);
     }
 
     #[test]
     fn legacy_build_tag_is_not_used_as_a_content_image_socket_identity() {
-        let mut route = SessionRoute { runtime_image_id: "historical-build-tag".into(), legacy: true };
+        let mut route = SessionRoute {
+            runtime_image_id: "historical-build-tag".into(),
+            legacy: true,
+        };
         assert!(valid_session_route_image(&route));
         route.legacy = false;
         assert!(!valid_session_route_image(&route));
         route.runtime_image_id = format!("sha256:{}", "a".repeat(64));
         assert!(valid_session_route_image(&route));
-        assert_eq!(select_route_capability(None, Some("current-token".into()), false), None);
+        assert_eq!(
+            select_route_capability(None, Some("current-token".into()), false),
+            None
+        );
     }
 
     #[test]

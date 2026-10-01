@@ -143,7 +143,9 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                 "return {{ count: nodes.length, nodes: nodes.slice(0, {take}).map(function(e) {{ return describe(e, false); }}) }};"
             ));
             super::runtimes::structured_dom(
-                root, json, session,
+                root,
+                json,
+                session,
                 serde_json::json!({"op":"find","query":normalize_node_query(&query),"limit":take,"fields":[]}),
                 &legacy,
             )
@@ -207,7 +209,9 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
                    }}); return row; }}) }};"
             ));
             super::runtimes::structured_dom(
-                root, json, session,
+                root,
+                json,
+                session,
                 serde_json::json!({"op":"extract","query":normalize_node_query(&query),"limit":limit,"fields":wanted}),
                 &legacy,
             )
