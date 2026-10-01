@@ -922,6 +922,11 @@ pub(super) fn rpc(
     )
 }
 
+fn requested_rpc_session(payload: &serde_json::Value, fallback: Option<&str>) -> Option<String> {
+    // The runtime gives the payload priority over the envelope session.
+    payload.get("session_id").and_then(|value| value.as_str()).or(fallback).map(str::to_owned)
+}
+
 pub(super) fn rpc_with_spawn(
     root: Option<&str>,
     json_out: bool,
@@ -932,11 +937,7 @@ pub(super) fn rpc_with_spawn(
 ) -> Result<i32> {
     // Match the runtime's payload-first resolution, not a user-controlled
     // error message or an unrelated currently selected session.
-    let rejected_session = payload
-        .get("session_id")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or_else(|| session_id.clone());
+    let rejected_session = requested_rpc_session(&payload, session_id.as_deref());
     match supervisor_for_session(root, &spawn, rejected_session.as_deref()) {
         Ok(ctx) => match rpc_on_response(&ctx, operation, payload, session_id) {
             Ok(response) => {
@@ -1219,7 +1220,8 @@ pub(super) fn rpc_response(
     payload: serde_json::Value,
     session_id: Option<String>,
 ) -> std::result::Result<Response, ErrorObject> {
-    match ensure_supervisor(root, &SupervisorSpawn::default()) {
+    let requested_session = requested_rpc_session(&payload, session_id.as_deref());
+    match supervisor_for_session(root, &SupervisorSpawn::default(), requested_session.as_deref()) {
         Ok(ctx) => rpc_on_response(&ctx, operation, payload, session_id),
         Err(error) => Err(error),
     }
@@ -2381,6 +2383,14 @@ mod target_tests {
             "wrs_plain",
             None
         ));
+    }
+
+    #[test]
+    fn raw_response_and_emitted_rpc_share_payload_first_session_selection() {
+        assert_eq!(requested_rpc_session(&json!({"session_id":"payload"}), Some("fallback")).as_deref(), Some("payload"));
+        assert_eq!(requested_rpc_session(&json!({}), Some("fallback")).as_deref(), Some("fallback"));
+        assert_eq!(requested_rpc_session(&json!({"session_id":null}), Some("fallback")).as_deref(), Some("fallback"));
+        assert_eq!(requested_rpc_session(&json!({}), None), None);
     }
 
     #[test]
