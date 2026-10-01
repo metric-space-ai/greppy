@@ -3840,6 +3840,41 @@ fn foreground_index_publishes_observable_progress_while_building() {
 
 #[cfg(unix)]
 #[test]
+fn refreshing_query_refusal_reports_publication_and_original_command_recovery() {
+    let (repo, store, _scratch) = make_repo("refreshing-recovery", "old_refresh_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out} {err}");
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn new_refresh_marker() -> i32 { 9 }\n",
+    )
+    .unwrap();
+    let mut writer = hold_index_before_publish(&repo, &store, "refreshing-recovery");
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "refresh_marker", "--code"],
+        &repo,
+        &store,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    assert_eq!(code, 75, "{out} {err}");
+    assert!(out.contains("publication is in progress"), "{out} {err}");
+    assert!(out.contains("greppy index status --json"), "{out} {err}");
+    assert!(out.contains("retry this command"), "{out} {err}");
+    assert!(!out.contains("run `greppy index .` first"), "{out} {err}");
+    assert!(!out.contains("pub fn old_refresh_marker"), "{out} {err}");
+    let output = query_after_releasing_writer(
+        &["search-symbol", "refresh_marker", "--code"],
+        &repo,
+        &store,
+        &mut writer,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("pub fn new_refresh_marker"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn query_wait_for_active_refresh_returns_fresh_results_without_retry() {
     let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);

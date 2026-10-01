@@ -186,6 +186,38 @@ fn transient_freshness_states_never_trigger_reindex() {
 }
 
 #[test]
+fn indexed_refusal_recovery_matches_observed_freshness_state() {
+    let refreshing = serde_json::json!({
+        "state": "refreshing", "fresh": false,
+        "reasons": ["head_oid changed", "index signature changed", "files modified since last index"]
+    });
+    assert_eq!(freshness_refusal_exit(&refreshing), 75);
+    let message = indexed_stale_skip_message("search-symbol", &refreshing);
+    assert!(message.contains("publication is in progress"), "{message}");
+    assert!(message.contains("greppy index status --json"), "{message}");
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("run `greppy index .` first"), "{message}");
+    assert!(
+        message.contains("files modified since last index"),
+        "{message}"
+    );
+    let unknown = serde_json::json!({
+        "state": "unknown", "reasons": ["inventory budget exhausted"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &unknown);
+    assert!(
+        message.contains("freshness could not be verified"),
+        "{message}"
+    );
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
+    let drift = serde_json::json!({
+        "state": "drift", "reasons": ["files modified since last index"]
+    });
+    assert!(indexed_stale_skip_message("search-symbol", &drift).contains(STALE_REMEDIATION));
+}
+
+#[test]
 fn inline_auto_reindex_never_hides_model_loading_or_large_full_rebuilds() {
     assert!(auto_reindex_inline_allowed(false, 128, false));
     assert!(!auto_reindex_inline_allowed(false, 129, false));

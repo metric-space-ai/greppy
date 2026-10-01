@@ -621,6 +621,7 @@ fn semantic_preparation_stderr(stderr: &[u8]) -> bool {
         line.is_empty()
             || semantic_preparation_line(line)
             || line == "greppy: search still running; no detailed progress is available"
+            || line == "greppy: search still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state"
     })
 }
 
@@ -1285,6 +1286,18 @@ exit 2
             "must tell the model to retry; content={}",
             out.content
         );
+    }
+
+    #[test]
+    fn missing_progress_recovery_hint_is_nonfatal_but_other_diagnostics_are_not_hidden() {
+        let progress = "greppy: search still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state";
+        assert!(semantic_preparation_stderr(progress.as_bytes()));
+        assert!(!semantic_preparation_stderr(
+            format!("{progress}\nfailed to open index").as_bytes()
+        ));
+        assert!(!semantic_preparation_stderr(
+            format!("{progress} failed").as_bytes()
+        ));
     }
 
     #[test]

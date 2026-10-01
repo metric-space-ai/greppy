@@ -227,10 +227,9 @@ impl ProgressReporter {
             }
             self.missing_reported = true;
             return Some(format!(
-                "greppy: {command} still running; no detailed progress is available"
+                "greppy: {command} still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state"
             ));
         };
-        self.missing_reported = false;
 
         let reset = self.state.as_deref() != Some(job.state.as_str())
             || self.pid != job.pid
@@ -676,6 +675,18 @@ mod tests {
         assert!(reporter
             .observe("search", None, Duration::from_secs(30))
             .is_none());
+        // An observed snapshot between gaps must not re-arm the fallback.
+        assert!(reporter
+            .observe(
+                "search",
+                Some(job("writing_graph", 1, 2)),
+                Duration::from_secs(31),
+            )
+            .is_some());
+        assert!(reporter
+            .observe("search", None, Duration::from_secs(32))
+            .is_none());
+        assert!(first.contains("greppy index status --json"), "{first}");
     }
 
     #[test]
