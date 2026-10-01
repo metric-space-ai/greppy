@@ -275,10 +275,16 @@ fn indexed_large_source_outline_keeps_explicit_spans_all_and_handles_available()
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "lib.rs", "--handle"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        stdout.starts_with("`lib.rs` is a file — read a symbol:"),
+        stdout.starts_with(
+            "Source outline for `lib.rs` — large indexed source; text: --lines A:B or --all:"
+        ),
         "{stdout}"
     );
     assert!(!stdout.contains("731"), "{stdout}");
+    assert!(
+        stdout.contains("full text: greppy read-file lib.rs --all"),
+        "{stdout}"
+    );
     assert!(!stdout.contains("private source content"), "{stdout}");
     assert!(
         !stdout.lines().any(|line| line.starts_with("handle: ")),

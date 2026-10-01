@@ -674,7 +674,7 @@ pub(crate) fn dispatch_read(
                 let content = std::fs::read_to_string(&canonical).ok();
                 if let Some(outline) = content
                     .as_deref()
-                    .and_then(|text| read_file_outline(&root_path, &shown, text))
+                    .and_then(|text| read_file_outline(&root_path, &shown, text, true))
                 {
                     let filters = prepare_query_path_filters(root, "read", "", path_filters)?;
                     if filters.matches(&shown) {
@@ -1426,7 +1426,12 @@ fn read_render_file_page(
 /// index, prewarm models, repair a graph or acquire a writer just to do so.
 /// Exact spans, explicit whole-file reads and cold/unindexed files remain plain
 /// filesystem operations even while another task is publishing the graph.
-fn read_file_outline(root: &std::path::Path, shown: &str, content: &str) -> Option<String> {
+fn read_file_outline(
+    root: &std::path::Path,
+    shown: &str,
+    content: &str,
+    symbol_read: bool,
+) -> Option<String> {
     let path = greppy_core::cache::workspace_store_path(root);
     if !path.is_file() {
         return None;
@@ -1472,7 +1477,13 @@ fn read_file_outline(root: &std::path::Path, shown: &str, content: &str) -> Opti
     if top_level.is_empty() {
         return None;
     }
-    let mut outline = format!("`{shown}` is a file — read a symbol:\n");
+    let mut outline = if symbol_read {
+        format!("`{shown}` is a file — read a symbol:\n")
+    } else {
+        format!(
+            "Source outline for `{shown}` — large indexed source; text: --lines A:B or --all:\n"
+        )
+    };
     for node in &top_level {
         outline.push_str(&format!(
             "{}:{}  {}  {}\n",
@@ -1483,7 +1494,7 @@ fn read_file_outline(root: &std::path::Path, shown: &str, content: &str) -> Opti
         ));
     }
     outline.push_str(&format!(
-        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B\n",
+        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B · full text: greppy read-file {shown} --all\n",
         top_level[0].qualified_name
     ));
     Some(outline)
@@ -1545,7 +1556,7 @@ pub(crate) fn dispatch_read_files(
         };
         let line_count = read_line_count(&content);
         if lines.is_none() && !all && line_count > 60 {
-            if let Some(outline) = read_file_outline(&root_path, &shown, &content) {
+            if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
                 read_begin_group(&mut printed, &mut previous_ended_with_newline);
                 print!("{outline}");
                 if with_handle {
