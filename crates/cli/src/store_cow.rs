@@ -1749,10 +1749,6 @@ pub(crate) fn prepare_base_store(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Base preparation needs distinct immutable path identities, progress, deadline and cancellation inputs"
-)]
 fn prepare_base_store_paths(
     repo_root: &Path,
     source_path: &Path,
