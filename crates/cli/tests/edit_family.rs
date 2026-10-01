@@ -104,6 +104,43 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn write_outside_workspace_refuses_nonzero_and_names_root_recovery() {
+    let fixture = Fixture::new("write-outside");
+    let other = fixture.base.join("other");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let file = other.join("note.md");
+    std::fs::write(&file, "preserve\n").unwrap();
+    let path = file.to_str().unwrap();
+    for flags in [vec![], vec!["--dry-run"], vec!["--json"]] {
+        let mut args = vec!["write", path];
+        args.extend(flags);
+        let output = fixture.run_with_stdin(&args, b"replacement\n");
+        assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+        assert_file(&file, "preserve\n");
+        let message = if args.contains(&"--json") {
+            let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(record["status"], "refused");
+            assert_eq!(record["exit_code"], 17);
+            assert_eq!(record["published"], false);
+            record["error"]["message"].as_str().unwrap().to_owned()
+        } else {
+            assert!(output.stdout.is_empty(), "{}", combined(&output));
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(
+            message.contains("nothing written") && message.contains("--root DIR"),
+            "{message}"
+        );
+    }
+    let recovery = fixture.run_with_stdin(
+        &["write", "note.md", "--root", other.to_str().unwrap()],
+        b"replacement\n",
+    );
+    assert_eq!(recovery.status.code(), Some(0), "{}", combined(&recovery));
+    assert_file(&file, "replacement\n");
+}
+
+#[test]
 fn symbol_edit_repairs_metadata_only_drift_without_rebuilding_graph() {
     let fixture = Fixture::new("metadata-symbol-refresh");
     let source = fixture.repo.join("lib.rs");
