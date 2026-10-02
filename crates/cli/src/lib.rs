@@ -1022,6 +1022,21 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 println!("usage: greppy expand ID [--json] [--root DIR]");
                 return 64;
             }
+            // read-file can open multiple files and return large payloads.
+            // Dropping an unknown option can turn its value into another path
+            // and read the preceding file without the requested bound.
+            if sub == "read-file" {
+                if let Some(unknown) = unknown_flag_name(first) {
+                    println!("invalid read-file option `{unknown}`; no files were read");
+                    if matches!(unknown.as_str(), "--head" | "--tail") {
+                        println!("`--head` and `--tail` select symbol source with `greppy read SYMBOL`. For file lines, use `greppy read-file PATH --lines A:B`.");
+                    }
+                    println!(
+                        "usage: greppy read-file PATH [PATH …] [--lines A:B] [--all] [--json]"
+                    );
+                    return 64;
+                }
+            }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
                 first,

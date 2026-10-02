@@ -145,6 +145,31 @@ pub(crate) fn read_span_with_meta(
 }
 
 const READ_FILE_PAGE_LINES: usize = 400;
+const READ_FILE_PAGE_BYTES: usize = 64 * 1024;
+
+// Probe only one byte beyond the preview budget. UTF-8 errors inside the
+// shown prefix are errors; an incomplete character at its edge is omitted.
+// The unobserved tail is neither allocated nor validated.
+fn read_file_preview(path: &std::path::Path) -> std::io::Result<(String, Option<u64>)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut bytes = Vec::with_capacity(READ_FILE_PAGE_BYTES + 1);
+    file.take((READ_FILE_PAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > READ_FILE_PAGE_BYTES;
+    if truncated {
+        bytes.truncate(READ_FILE_PAGE_BYTES);
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) if truncated && error.error_len().is_none() => {
+            String::from_utf8(bytes[..error.valid_up_to()].to_vec()).expect("validated prefix")
+        }
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    };
+    Ok((text, truncated.then_some(size)))
+}
 const READ_PACK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const READ_SMART_PACK_KIND: &str = "greppy.read-smart.span.v1";
 const READ_FILE_PACK_KIND: &str = "greppy.read-file.page.v1";
@@ -1725,8 +1750,13 @@ pub(crate) fn dispatch_read_files(
             previous_ended_with_newline = group.ends_with('\n');
             continue;
         }
-        let content = match std::fs::read_to_string(&canonical) {
-            Ok(content) => content,
+        let preview = if lines.is_none() && !all {
+            read_file_preview(&canonical)
+        } else {
+            std::fs::read_to_string(&canonical).map(|text| (text, None))
+        };
+        let (content, truncated_size) = match preview {
+            Ok(preview) => preview,
             Err(error) => {
                 read_begin_group(&mut printed, &mut previous_ended_with_newline);
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -1740,6 +1770,47 @@ pub(crate) fn dispatch_read_files(
             }
         };
         let line_count = read_line_count(&content);
+        // A line page is not a byte budget: generated JSON/NDJSON can put
+        // megabytes on one line. Bound only implicit reads; explicit ranges
+        // and --all remain exact. Do this before outlines and pack creation
+        // so a partial line never acquires a misleading editable handle.
+        if let Some(size_at_open) = truncated_size {
+            let page = read_line_slice(&content, 1, line_count.min(READ_FILE_PAGE_LINES));
+            let prefix = page;
+            let end = prefix.len();
+            let complete_lines = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let partial = !prefix.ends_with('\n');
+            let shown_end = complete_lines + usize::from(partial);
+            let resume = complete_lines + 1;
+            // Absolute operands keep this recovery command exact even
+            // when --root selected a nested directory or an external file.
+            let operand = format!("'{}'", canonical.to_string_lossy().replace('\'', "'\\''"));
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!(
+                "{shown}:1-{shown_end}{}",
+                if partial { " (last line partial)" } else { "" }
+            );
+            print!("{prefix}");
+            if partial {
+                println!();
+            }
+            println!(
+                    "truncated at {end} source bytes (default limit {READ_FILE_PAGE_BYTES}); total line count unknown"
+                );
+            if let Some(omitted) = size_at_open.checked_sub(end as u64) {
+                println!("{omitted} source bytes omitted according to file size at open ({size_at_open} bytes)");
+            }
+            println!("next line: greppy read-file {operand} --lines {resume}:{resume}");
+            if partial {
+                println!("note: the next command rereads the partial line in full");
+            }
+            println!("full file: greppy read-file {operand} --all");
+            if with_handle {
+                println!("note: no handle for a byte-truncated page; request an explicit --lines A:B span");
+            }
+            previous_ended_with_newline = true;
+            continue;
+        }
         if lines.is_none() && !all && line_count > 60 {
             if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
                 read_begin_group(&mut printed, &mut previous_ended_with_newline);

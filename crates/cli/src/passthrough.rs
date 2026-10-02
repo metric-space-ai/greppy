@@ -30,6 +30,7 @@ pub(crate) fn grep_passthrough_args(argv: &[OsString]) -> &[OsString] {
             || token_lossy.starts_with("--offset=")
             || token == "--no-gpu"
             || token == "--no-summaries"
+            || token == "--diagnostics"
         {
             index += 1;
             continue;
