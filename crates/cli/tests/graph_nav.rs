@@ -3044,7 +3044,7 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
         .as_str()
         .unwrap()
         .contains("--root"));
-    for path in ["src/lib.rs", "browser-runtime/src/missing.wgsl"] {
+    for path in ["src/lib.rs"] {
         let (code, out, err) = run(&["read", "road_structure", "--path", path], &repo, &store);
         assert_eq!(code, 1, "filtered miss: {out} {err}");
         assert!(
@@ -3065,6 +3065,22 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
         );
         assert!(value.get("source_recovery").is_none(), "{out}");
     }
+    let (code, out, err) = run(
+        &[
+            "read",
+            "road_structure",
+            "--path",
+            "browser-runtime/src/missing.wgsl",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 64, "invalid nonexistent path: {out} {err}");
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(
+        !out.contains("definition extraction is unsupported"),
+        "{out}"
+    );
     let (code, out, err) = run(
         &[
             "read",
