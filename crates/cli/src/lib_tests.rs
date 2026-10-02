@@ -833,6 +833,12 @@ fn embedding_eta_uses_backend_prior_then_measured_throughput() {
     assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
     assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));
     assert_eq!(initial_embedding_eta_seconds(1_200, "cuda"), Some(100));
+    assert_eq!(
+        initial_embedding_eta_seconds(19_786, "shared-daemon:auto"),
+        None
+    );
+    assert_eq!(initial_embedding_eta_seconds(19_786, "unknown"), None);
+    assert_eq!(initial_embedding_eta_seconds(0, "unknown"), Some(0));
     assert_eq!(observed_embedding_eta_seconds(10, 100, 5_000), Some(45));
     assert_eq!(observed_embedding_rate_milli(10, 5_000), Some(2_000));
 }
@@ -863,6 +869,78 @@ fn embedding_eta_does_not_treat_cached_documents_as_gpu_inference() {
         embedding_inference_workload(2_000, 2_000, 400, 500),
         (1_100, 1_100)
     );
+}
+
+#[test]
+fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[
+        "GREPPY_STORE_DIR",
+        "GREPPY_BACKGROUND_JOB",
+        ENV_DELEGATED_BACKGROUND_JOB,
+    ]);
+    let scratch = tempfile::tempdir().unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+    let path = scratch.path().join("index.job");
+    let mut job = BackgroundJobGuard::from_env();
+    job.attach_foreground(path.clone());
+    job.device = Some("metal:0".into());
+    job.embedding_started("metal", 19_786);
+    let initial = read_background_job(&path).unwrap();
+    assert_eq!(initial["eta_seconds"], 2_474);
+    assert_eq!(initial["eta_basis"], "backend_prior");
+
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 2_249,
+        total_documents: 19_786,
+        local_store_reuse: 2_249,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let cached = read_background_job(&path).unwrap();
+    assert_eq!(cached["state"], "embedding");
+    assert_eq!(cached["backend"], "metal");
+    assert_eq!(cached["device"], "metal:0");
+    assert_eq!(cached["eta_seconds"], 2_193);
+    assert_eq!(cached["eta_basis"], "backend_prior");
+    assert!(cached["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 19_786,
+        total_documents: 19_786,
+        local_store_reuse: 19_786,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let finished = read_background_job(&path).unwrap();
+    assert_eq!(finished["eta_seconds"], 0);
+    assert_eq!(finished["eta_basis"], "completed_embedding_work");
+    assert!(finished["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_started("metal", 20);
+    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 1,
+        total_documents: 20,
+        local_store_reuse: 0,
+        global_cache_hits: 0,
+        global_cache_misses: 1,
+        current_symbol: None,
+    });
+    let slow = read_background_job(&path).unwrap();
+    assert_eq!(slow["rate_milli_spans_per_second"], 0);
+    assert_eq!(slow["eta_basis"], "observed_inference");
+    assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
+    job.complete();
 }
 
 #[test]
