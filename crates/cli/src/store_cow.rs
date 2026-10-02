@@ -1735,9 +1735,6 @@ fn has_verified_previous_indexer_base(
     shared_data_root: &Path,
 ) -> Result<bool> {
     let current_identity = base_identity_parts(repo_root, base_commit)?;
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(false);
-    }
     has_verified_previous_indexer_base_for_identity(shared_data_root, &current_identity)
 }
 
@@ -1745,16 +1742,33 @@ fn has_verified_previous_indexer_base_for_identity(
     shared_data_root: &Path,
     current_identity: &BaseStoreIdentity,
 ) -> Result<bool> {
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(false);
+    Ok(verified_previous_indexer_base_layout(shared_data_root, current_identity)?.is_some())
+}
+
+/// Only reviewed structural migrations may retain a previous Base. All other
+/// identity fields (source tree, parser/model/prompts and encoding) stay exact.
+fn verified_previous_indexer_base_layout(
+    shared_data_root: &Path,
+    current_identity: &BaseStoreIdentity,
+) -> Result<Option<BaseStoreLayout>> {
+    let versions: &[&str] = match current_identity.indexer_version.as_str() {
+        "greppy-indexer-v7" => &["greppy-indexer-v6"],
+        "greppy-indexer-v8" => &["greppy-indexer-v7", "greppy-indexer-v6"],
+        _ => &[],
+    };
+    for version in versions {
+        let mut previous_identity = current_identity.clone();
+        previous_identity.indexer_version = (*version).into();
+        let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+            .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+        if layout
+            .read_verified_manifest()
+            .is_ok_and(|manifest| manifest.identity == previous_identity)
+        {
+            return Ok(Some(layout));
+        }
     }
-    let mut previous_identity = current_identity.clone();
-    previous_identity.indexer_version = "greppy-indexer-v6".into();
-    let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
-        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
-    Ok(layout
-        .read_verified_manifest()
-        .is_ok_and(|manifest| manifest.identity == previous_identity))
+    Ok(None)
 }
 
 impl Drop for TemporaryBaseWorktree {
@@ -2130,19 +2144,22 @@ fn seed_previous_indexer_base(
     worktree_path: &Path,
     staged_graph: &Path,
 ) -> Result<Option<PathBuf>> {
-    if current_identity.indexer_version != "greppy-indexer-v7" {
-        return Ok(None);
-    }
-    let mut previous_identity = current_identity.clone();
-    previous_identity.indexer_version = "greppy-indexer-v6".into();
-    let previous_layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
-        .map_err(|error| Error::io("construct previous Base Store layout", error))?;
-    let Ok(previous_manifest) = previous_layout.read_verified_manifest() else {
+    let Some(previous_layout) =
+        verified_previous_indexer_base_layout(shared_data_root, current_identity)?
+    else {
         return Ok(None);
     };
-    if previous_manifest.identity != previous_identity {
-        return Ok(None);
-    }
+    // Keep the immutable generation and its summary file alive through both
+    // copies. A completed graph must not be evicted midway through seeding.
+    let _previous_reader = previous_layout
+        .acquire_reader(true)
+        .map_err(|error| Error::io("lease previous Base for structural migration", error))?
+        .ok_or_else(|| {
+            Error::Lock(
+                "previous Base is being published or reclaimed; retain the pending migration"
+                    .into(),
+            )
+        })?;
     let parent = staged_graph
         .parent()
         .ok_or_else(|| Error::Invalid("staged Base graph has no parent directory".into()))?;
@@ -4072,104 +4089,189 @@ mod tests {
     }
 
     #[test]
-    fn v7_base_seed_copies_verified_v6_graph_and_summary() {
-        let data_root = tempfile::tempdir().unwrap();
-        let sources = tempfile::tempdir().unwrap();
-        let graph = sources.path().join("graph.db");
-        let summary_dir = sources.path().join("summary");
-        let summary = {
-            let cache = greppy_store::SummaryCache::open(&summary_dir).unwrap();
-            drop(cache);
-            summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
-        };
-        let root = "/old/base/root";
-        {
-            let mut store = greppy_store::Store::open(&graph).unwrap();
-            store
-                .upsert_project(&greppy_store::Project {
-                    name: "fixture".into(),
-                    indexed_at: "2026-09-27T00:00:00Z".into(),
-                    root_path: root.into(),
-                })
+    fn compatible_base_seed_copies_verified_graph_vectors_and_summary() {
+        for (previous_version, current_version) in [
+            ("greppy-indexer-v6", "greppy-indexer-v7"),
+            ("greppy-indexer-v7", "greppy-indexer-v8"),
+            ("greppy-indexer-v6", "greppy-indexer-v8"),
+        ] {
+            let data_root = tempfile::tempdir().unwrap();
+            let sources = tempfile::tempdir().unwrap();
+            let graph = sources.path().join("graph.db");
+            let summary_dir = sources.path().join("summary");
+            let summary = {
+                let cache = greppy_store::SummaryCache::open(&summary_dir).unwrap();
+                drop(cache);
+                summary_dir.join(greppy_store::SUMMARY_CACHE_DB_FILE)
+            };
+            let root = "/old/base/root";
+            let retained_id;
+            {
+                let mut store = greppy_store::Store::open(&graph).unwrap();
+                store
+                    .upsert_project(&greppy_store::Project {
+                        name: "fixture".into(),
+                        indexed_at: "2026-09-27T00:00:00Z".into(),
+                        root_path: root.into(),
+                    })
+                    .unwrap();
+                store
+                    .upsert_workspace_state(&greppy_store::WorkspaceState {
+                        root_path: root.into(),
+                        git_dir: None,
+                        git_common_dir: None,
+                        head_oid: None,
+                        index_signature: None,
+                        schema_version: store.schema_version().unwrap(),
+                        indexer_version: previous_version.into(),
+                        graph_generation: 1,
+                        updated_at: "2026-09-27T00:00:00Z".into(),
+                    })
+                    .unwrap();
+                retained_id = store
+                    .insert_node(&greppy_store::NewNode {
+                        project: "fixture".into(),
+                        label: "Function".into(),
+                        name: "retained".into(),
+                        qualified_name: "fixture.rs::Function::retained".into(),
+                        file_path: "fixture.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap();
+                store
+                    .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                        project: "fixture".into(),
+                        model_id: "fixture-embedding".into(),
+                        prompt_version: "fixture-prompt".into(),
+                        task: "definition".into(),
+                        node_id: Some(retained_id),
+                        chunk_idx: 0,
+                        qualified_name: "fixture.rs::Function::retained".into(),
+                        file_path: "fixture.rs".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        content_sha256: "retained-content".into(),
+                        graph_generation: 1,
+                        vector: vec![1.0, 0.0],
+                    })
+                    .unwrap();
+            }
+            let previous_identity = BaseStoreIdentity {
+                format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
+                canonical_repository_identity: "fixture-repository".into(),
+                git_object_format: "sha1".into(),
+                base_tree_oid: "1111111111111111111111111111111111111111".into(),
+                store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+                indexer_version: previous_version.into(),
+                parser_and_extractor_versions: "fixture-parser".into(),
+                summary_model_and_prompt_version: "fixture-summary".into(),
+                embedding_model: "fixture-embedding".into(),
+                embedding_prompt_version: "fixture-prompt".into(),
+                embedding_dimensions: 2,
+                embedding_encoding: "f32+i8-v1".into(),
+            };
+            let previous_layout =
+                BaseStoreLayout::new(data_root.path(), &previous_identity).unwrap();
+            previous_layout
+                .publish_graph_with_summary(previous_identity.clone(), &graph, &summary)
                 .unwrap();
-            store
-                .upsert_workspace_state(&greppy_store::WorkspaceState {
-                    root_path: root.into(),
-                    git_dir: None,
-                    git_common_dir: None,
-                    head_oid: None,
-                    index_signature: None,
-                    schema_version: store.schema_version().unwrap(),
-                    indexer_version: "greppy-indexer-v6".into(),
-                    graph_generation: 1,
-                    updated_at: "2026-09-27T00:00:00Z".into(),
-                })
-                .unwrap();
-        }
-        let previous_identity = BaseStoreIdentity {
-            format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
-            canonical_repository_identity: "fixture-repository".into(),
-            git_object_format: "sha1".into(),
-            base_tree_oid: "1111111111111111111111111111111111111111".into(),
-            store_schema_version: greppy_store::migrate::CURRENT_VERSION,
-            indexer_version: "greppy-indexer-v6".into(),
-            parser_and_extractor_versions: "fixture-parser".into(),
-            summary_model_and_prompt_version: "fixture-summary".into(),
-            embedding_model: "fixture-embedding".into(),
-            embedding_prompt_version: "fixture-prompt".into(),
-            embedding_dimensions: 2,
-            embedding_encoding: "f32+i8-v1".into(),
-        };
-        let previous_layout = BaseStoreLayout::new(data_root.path(), &previous_identity).unwrap();
-        previous_layout
-            .publish_graph_with_summary(previous_identity.clone(), &graph, &summary)
-            .unwrap();
-        let previous_summary_hash = greppy_store::file_state::sha256_hex(
-            &std::fs::read(&previous_layout.summary_cache).unwrap(),
-        );
+            let previous_summary_hash = greppy_store::file_state::sha256_hex(
+                &std::fs::read(&previous_layout.summary_cache).unwrap(),
+            );
 
-        let mut current_identity = previous_identity;
-        current_identity.indexer_version = "greppy-indexer-v7".into();
-        assert!(
-            has_verified_previous_indexer_base_for_identity(data_root.path(), &current_identity)
+            let mut current_identity = previous_identity;
+            current_identity.indexer_version = current_version.into();
+            let immutable_graph_hash = greppy_store::file_state::sha256_hex(
+                &std::fs::read(&previous_layout.graph).unwrap(),
+            );
+            let mut different_model = current_identity.clone();
+            different_model.embedding_model.push_str("-different");
+            assert!(
+                !has_verified_previous_indexer_base_for_identity(
+                    data_root.path(),
+                    &different_model
+                )
                 .unwrap(),
-            "a verified v6 Base must force structural first-use migration"
-        );
-        let migrated_root = data_root.path().join("migrated-worktree");
-        std::fs::create_dir_all(&migrated_root).unwrap();
-        let migrated_root = migrated_root.canonicalize().unwrap();
-        let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
-        let staged_summary = seed_previous_indexer_base(
-            data_root.path(),
-            &current_identity,
-            &migrated_root,
-            &staged_graph,
-        )
-        .unwrap()
-        .expect("verified v6 Base should seed v7 staging");
+                "different model must never reuse embeddings"
+            );
+            let mut unknown_upgrade = current_identity.clone();
+            unknown_upgrade.indexer_version = "greppy-indexer-v99".into();
+            assert!(!has_verified_previous_indexer_base_for_identity(
+                data_root.path(),
+                &unknown_upgrade
+            )
+            .unwrap());
 
-        assert_eq!(
-            greppy_store::file_state::sha256_hex(&std::fs::read(&staged_summary).unwrap()),
-            previous_summary_hash
-        );
-        let migrated =
-            greppy_store::Store::open_with(&staged_graph, greppy_store::OpenOptions::read_only())
+            assert!(
+                has_verified_previous_indexer_base_for_identity(
+                    data_root.path(),
+                    &current_identity
+                )
+                .unwrap(),
+                "a verified v6 Base must force structural first-use migration"
+            );
+            let migrated_root = data_root.path().join("migrated-worktree");
+            std::fs::create_dir_all(&migrated_root).unwrap();
+            let migrated_root = migrated_root.canonicalize().unwrap();
+            let staged_graph = data_root.path().join("staging/workspaces/fixture/graph.db");
+            let staged_summary = seed_previous_indexer_base(
+                data_root.path(),
+                &current_identity,
+                &migrated_root,
+                &staged_graph,
+            )
+            .unwrap()
+            .expect("verified v6 Base should seed v7 staging");
+
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(&std::fs::read(&staged_summary).unwrap()),
+                previous_summary_hash
+            );
+            let migrated = greppy_store::Store::open_with(
+                &staged_graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            let retained = migrated
+                .get_node_by_qname("fixture", "fixture.rs::Function::retained")
+                .unwrap()
                 .unwrap();
-        assert_eq!(
-            migrated.list_projects().unwrap()[0].root_path,
-            migrated_root.to_string_lossy()
-        );
-        assert_eq!(
-            migrated.list_workspace_states().unwrap()[0].root_path,
-            migrated_root.to_string_lossy()
-        );
-        assert_eq!(
-            greppy_store::file_state::sha256_hex(
-                &std::fs::read(&previous_layout.summary_cache).unwrap()
-            ),
-            previous_summary_hash,
-            "published v6 summary cache remains immutable"
-        );
+            assert_eq!(retained.id, retained_id);
+            let retained_vector: (i64, String, i64, Vec<u8>) = migrated.conn().query_row("SELECT node_id,content_sha256,graph_generation,vector FROM vector_embeddings WHERE qualified_name='fixture.rs::Function::retained'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+            assert_eq!(retained_vector.0, retained_id);
+            assert_eq!(retained_vector.1, "retained-content");
+            assert_eq!(retained_vector.2, 1);
+            let previous = greppy_store::Store::open_with(
+                &previous_layout.graph,
+                greppy_store::OpenOptions::read_only(),
+            )
+            .unwrap();
+            let previous_vector: Vec<u8> = previous.conn().query_row("SELECT vector FROM vector_embeddings WHERE qualified_name='fixture.rs::Function::retained'", [], |row| row.get(0)).unwrap();
+            assert_eq!(retained_vector.3, previous_vector);
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(
+                    &std::fs::read(&previous_layout.graph).unwrap()
+                ),
+                immutable_graph_hash
+            );
+            assert_eq!(
+                migrated.list_projects().unwrap()[0].root_path,
+                migrated_root.to_string_lossy()
+            );
+            assert_eq!(
+                migrated.list_workspace_states().unwrap()[0].root_path,
+                migrated_root.to_string_lossy()
+            );
+            assert_eq!(
+                greppy_store::file_state::sha256_hex(
+                    &std::fs::read(&previous_layout.summary_cache).unwrap()
+                ),
+                previous_summary_hash,
+                "published v6 summary cache remains immutable"
+            );
+        }
     }
 
     #[test]
