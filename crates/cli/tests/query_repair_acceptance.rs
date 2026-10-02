@@ -3,8 +3,26 @@
 #![cfg(all(unix, debug_assertions))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
+// Reporting is limited to synthetic fixture data and 8 KiB per owned file.
+// Test-run stderr retains this snapshot even after TempDir cleanup.
+fn diagnostic_file(path: &Path) -> String {
+    let mut bytes = Vec::new();
+    let result = std::fs::File::open(path).and_then(|file| file.take(8193).read_to_end(&mut bytes));
+    match result {
+        Ok(_) => {
+            let truncated = bytes.len() > 8192;
+            bytes.truncate(8192);
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if truncated {
+                text.push_str("\n[truncated at 8192 bytes]");
+            }
+            text
+        }
+        Err(error) => format!("[unavailable: {error}]"),
+    }
+}
 
 struct OwnedChild(Child);
 fn bounded_exit(child: &mut OwnedChild) -> std::process::ExitStatus {
@@ -97,6 +115,8 @@ impl Fixture {
     }
     fn query(&self) -> String {
         let out = bounded_output(self.command(&["who-calls", "target", "--json"]));
+        std::fs::write(self._scratch.path().join("query.out"), &out.stdout).unwrap();
+        std::fs::write(self._scratch.path().join("query.err"), &out.stderr).unwrap();
         assert!(
             out.status.success(),
             "public query failed: {}\n{}",
@@ -295,6 +315,51 @@ sys.exit(status)
     }
 }
 impl Fixture {
+    fn diagnostics(&self, reaped: bool) -> serde_json::Value {
+        let parent = self.delta.parent().unwrap_or(self._scratch.path());
+        // Never probe a live writer during failure reporting. A failed read is
+        // evidence too; diagnostics must not replace the original panic.
+        let active = if reaped && self.delta.is_file() {
+            match greppy_store::Store::open_with(
+                &self.delta,
+                greppy_store::OpenOptions::read_only(),
+            ) {
+                Ok(store) => {
+                    let _ = store.conn().busy_timeout(Duration::from_millis(100));
+                    let root = self
+                        .root
+                        .canonicalize()
+                        .unwrap_or_else(|_| self.root.clone());
+                    let generation = store
+                        .get_workspace_state(root.to_string_lossy().as_ref())
+                        .map(|state| state.map(|state| state.graph_generation));
+                    let marker = store.conn().query_row(
+                        "SELECT value FROM schema_meta WHERE key=?1",
+                        [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
+                        |row| row.get::<_, String>(0),
+                    );
+                    serde_json::json!({
+                        "generation": format!("{generation:?}"),
+                        "repair_marker": format!("{marker:?}")
+                    })
+                }
+                Err(error) => serde_json::json!({"read_error": error.to_string()}),
+            }
+        } else {
+            serde_json::json!({"unavailable": "writer reap not confirmed or active fixture DB absent"})
+        };
+        serde_json::json!({
+            "fixture_root": self._scratch.path().display().to_string(),
+            "gate_reaped": reaped,
+            "active_store": active,
+            "job": diagnostic_file(&parent.join("index.job")),
+            "admission": diagnostic_file(&self.record),
+            "gate_terminal": diagnostic_file(&self.terminal),
+            "admission_stderr": diagnostic_file(&parent.join("index.admission-stderr")),
+            "query_stdout": diagnostic_file(&self._scratch.path().join("query.out")),
+            "query_stderr": diagnostic_file(&self._scratch.path().join("query.err"))
+        })
+    }
     fn cancel_and_reap(&self) -> bool {
         if !self.record.exists() {
             return true;
@@ -312,8 +377,15 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         // The gate alone owns its Popen; cancellation never signals a stored PID.
-        if !self.cancel_and_reap() {
+        let reaped = self.cancel_and_reap();
+        if !reaped {
             eprintln!("fixture gate cleanup receipt missing; gate has its own 45s deadline");
+        }
+        if std::thread::panicking() {
+            eprintln!(
+                "OWNED_REPAIR_FIXTURE_DIAGNOSTICS {}",
+                self.diagnostics(reaped)
+            );
         }
     }
 }
@@ -336,6 +408,7 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
     let ready = f._scratch.path().join("repair-ready");
     let release = f._scratch.path().join("release");
     let output = std::fs::File::create(f._scratch.path().join("query.out")).unwrap();
+    let errors = std::fs::File::create(f._scratch.path().join("query.err")).unwrap();
     let mut child = OwnedChild(
         f.command(&["who-calls", "target", "--json"])
             .env("GREPPY_TEST_INDEX_FAILPOINT", "before-rust-repair")
@@ -343,7 +416,7 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
             .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
             .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "30000")
             .stdout(output)
-            .stderr(Stdio::null())
+            .stderr(errors)
             .spawn()
             .unwrap(),
     );
@@ -376,9 +449,12 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
     assert!(candidate.exists());
     assert_eq!(std::fs::read(&f.base).unwrap(), base_before);
     std::fs::write(&release, "release").unwrap();
+    let status = bounded_exit(&mut child);
     assert!(
-        bounded_exit(&mut child).success(),
-        "first public query failed after repair"
+        status.success(),
+        "first public query failed after repair: {status}\nstdout={}\nstderr={}",
+        diagnostic_file(&f._scratch.path().join("query.out")),
+        diagnostic_file(&f._scratch.path().join("query.err"))
     );
 
     let first = std::fs::read_to_string(f._scratch.path().join("query.out")).unwrap();
@@ -418,13 +494,15 @@ fn public_query_cancelled_overlay_preserves_active_and_retries_under_admission()
     let active_before = std::fs::read(&f.delta).unwrap();
     let base_before = std::fs::read(&f.base).unwrap();
     let ready = f._scratch.path().join("candidate-ready");
+    let output = std::fs::File::create(f._scratch.path().join("query.out")).unwrap();
+    let errors = std::fs::File::create(f._scratch.path().join("query.err")).unwrap();
     let mut query = OwnedChild(
         f.command(&["who-calls", "target", "--json"])
             .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
             .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
             .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "30000")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(output)
+            .stderr(errors)
             .spawn()
             .unwrap(),
     );
