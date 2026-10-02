@@ -3278,6 +3278,7 @@ pub(crate) fn print_nav_rows(
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct UnresolvedReceiver {
     pub file: String,
     pub line: u32,
@@ -3293,7 +3294,10 @@ pub(crate) fn unresolved_option_receivers(
     limit: usize,
 ) -> Result<Vec<UnresolvedReceiver>> {
     let mut lines = Vec::new();
-    let fetch = limit.max(1);
+    // Fetch the indexed endpoint before filtering and paging: a display cap
+    // must not hide matching paths beyond an unrelated prefix.
+    let fetch = i64::MAX as usize;
+    let _ = limit;
     for id in target_ids {
         for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), fetch)? {
             let Some(node) = store.get_node(edge.source_id)? else {
@@ -3392,10 +3396,7 @@ impl UnresolvedReceiverReport {
 
 pub(crate) fn unresolved_receiver_fetch_limit(code: bool, all: bool) -> usize {
     let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    if all {
-        return default.saturating_add(1);
-    }
-    let limit = crate::cli_result_limit_raw().unwrap_or(default);
+    let limit = crate::cli_result_limit_raw().unwrap_or(if all { usize::MAX } else { default });
     let offset = crate::cli_result_offset();
     offset.saturating_add(limit).saturating_add(1).max(1)
 }
@@ -3404,27 +3405,21 @@ pub(crate) fn unresolved_receiver_page(
     items: &[UnresolvedReceiver],
     code: bool,
     all: bool,
-    fetch_saturated: bool,
+    resolved_count: usize,
 ) -> UnresolvedReceiverPage {
     let known = items.len();
     let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    let (offset, limit) = if all {
-        (0, default)
-    } else {
-        (
-            crate::cli_result_offset(),
-            crate::cli_result_limit_raw().unwrap_or(default),
-        )
-    };
-    let start = offset.min(known);
-    let end = start.saturating_add(limit).min(known);
+    let offset = crate::cli_result_offset();
+    let limit = crate::cli_result_limit_raw().unwrap_or(if all { usize::MAX } else { default });
+    // One response budget: resolved caller rows precede uncertain diagnostics.
+    let resolved_shown = resolved_count.saturating_sub(offset).min(limit);
+    let start = offset.saturating_sub(resolved_count).min(known);
+    let end = start
+        .saturating_add(limit.saturating_sub(resolved_shown))
+        .min(known);
     let shown = end - start;
-    let mut omitted = known - shown;
-    let mut truncated = omitted > 0;
-    if fetch_saturated {
-        truncated = true;
-        omitted = omitted.max(1);
-    }
+    let omitted = known - shown;
+    let truncated = omitted > 0;
     UnresolvedReceiverPage {
         rows: items[start..end].to_vec(),
         total: known,
@@ -3472,14 +3467,14 @@ mod unresolved_receiver_budget {
     fn unresolved_rows_honor_limit_offset_and_keep_incompleteness() {
         let rows = (1..=5).map(row).collect::<Vec<_>>();
         crate::set_cli_result_window(Some(2), 1);
-        let page = unresolved_receiver_page(&rows, false, false, false);
+        let page = unresolved_receiver_page(&rows, false, false, 0);
         assert_eq!(page.rows.len(), 2);
         assert_eq!(page.rows[0].line, 2);
         assert_eq!(page.total, 5);
         assert_eq!(page.omitted, 3);
         assert!(page.truncated);
         crate::set_cli_result_window(Some(2), 10);
-        let skipped = unresolved_receiver_page(&rows, false, false, false);
+        let skipped = unresolved_receiver_page(&rows, false, false, 0);
         assert!(skipped.rows.is_empty());
         assert!(skipped.truncated);
         assert!(skipped.omitted > 0);
@@ -3594,9 +3589,8 @@ pub(crate) fn dispatch_who_calls(
     }
     let fetch_limit = unresolved_receiver_fetch_limit(code, all);
     let mut unresolved = unresolved_option_receivers(&store, &targets, fetch_limit)?;
-    let fetch_saturated = unresolved.len() >= fetch_limit;
     unresolved.retain(|item| path_filters.matches(&item.file));
-    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, fetch_saturated);
+    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, 0);
     let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
     if edges.is_empty() {
         // The symbol IS a defined graph node but has no callers — that is a
@@ -3717,6 +3711,8 @@ pub(crate) fn dispatch_who_calls(
         return Ok(0);
     }
     let total = nodes.len();
+    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, total);
+    let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
     let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let shown = total.min(cap);
     let preferred_site_lines =

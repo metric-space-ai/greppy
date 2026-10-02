@@ -7384,14 +7384,15 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         if req.kind == NavKind::WhoCalls {
             let fetch_limit = unresolved_receiver_fetch_limit(req.code, req.all);
             let mut unresolved = unresolved_option_receivers(&store, ids, fetch_limit)?;
-            let fetch_saturated = unresolved.len() >= fetch_limit;
             unresolved.retain(|item| path_filters.matches(&item.file));
-            unresolved_by_target.push(unresolved_receiver_page(
-                &unresolved,
-                req.code,
-                req.all,
-                fetch_saturated,
-            ));
+            // Keep each filtered candidate set intact until the shared
+            // response window can be applied after resolved callers.
+            unresolved_by_target.push(UnresolvedReceiverPage {
+                total: unresolved.len(),
+                rows: unresolved,
+                omitted: 0,
+                truncated: false,
+            });
         } else {
             unresolved_by_target.push(UnresolvedReceiverPage {
                 rows: Vec::new(),
@@ -7417,6 +7418,19 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
     // convention every other greppy command follows.
     let total = rows.len();
     let default_cap = if req.code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let offset = cli_result_offset();
+    let limit = cli_result_limit_raw().unwrap_or(if req.all { usize::MAX } else { default_cap });
+    let mut diagnostic_skip = offset.saturating_sub(total);
+    let mut diagnostic_budget = limit.saturating_sub(total.saturating_sub(offset).min(limit));
+    for page in &mut unresolved_by_target {
+        let start = diagnostic_skip.min(page.total);
+        diagnostic_skip = diagnostic_skip.saturating_sub(page.total);
+        let count = diagnostic_budget.min(page.total - start);
+        diagnostic_budget = diagnostic_budget.saturating_sub(count);
+        page.rows = page.rows[start..start + count].to_vec();
+        page.omitted = page.total - count;
+        page.truncated = page.omitted > 0;
+    }
     let end = cli_result_limit_unless_all(default_cap, req.all).min(total);
     let window = &rows[..end];
     let shown = window.len();
