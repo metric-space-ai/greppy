@@ -43,7 +43,7 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|[0-9]+:[0-9]+[\t ]+error[\t ]+|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -66,8 +66,10 @@ static AAPT_XML_ELEMENT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
 });
 
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-    regex::bytes::Regex::new(r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:)")
-        .expect("bash-smart warning marker regex")
+    regex::bytes::Regex::new(
+        r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
+    )
+    .expect("bash-smart warning marker regex")
 });
 // Cargo follows emitted warning diagnostics with a crate-level recap. It is
 // useful when the underlying diagnostics are absent, but counting both makes

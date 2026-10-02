@@ -364,6 +364,31 @@ fn node_assertion_error_counts_and_keeps_the_original_failure() {
 }
 
 #[test]
+fn eslint_stylish_locations_count_and_preserve_child_streams() {
+    let workspace = fresh_workspace("eslint-stylish");
+    let cases = [
+        ("\n/project/e2e/mcp-crm-flow.mjs\n  148:49  error  Unsafe usage of ThrowStatement  no-unsafe-finally\n\n✖ 1 problem (1 error, 0 warnings)\n", 1, "FAILED — exit 1: 1 error, 0 warnings\n"),
+        ("\n/project/probe.mjs\n  2:1  warning  Unused variable  no-unused-vars\n\n✖ 1 problem (0 errors, 1 warning)\n", 0, "ok — exit 0, 1 warning\n"),
+        ("\n/project/probe.mjs\n  2:1  error  Unsafe finally  no-unsafe-finally\n  3:2  warning  Unused variable  no-unused-vars\n  4:1  error  Undefined name  no-undef\n\n✖ 3 problems (2 errors, 1 warning)\n", 1, "FAILED — exit 1: 2 errors, 1 warning\n"),
+        ("148:49 error_count: 7\n148:49 warning_count: 8\n148:x error prose\n", 0, "ok — exit 0\n"),
+    ];
+    for (diagnostic, exit, verdict) in cases {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{diagnostic}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, diagnostic.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn lint_help_error_prose_preserves_bytes_and_child_status() {
     let workspace = fresh_workspace("lint-help-error-prose");
     let help = "Usage: vp lint [OPTIONS]\n  --max-warnings <COUNT>\n      error status if there are too many warning-level rule violations in\n      the checked files\n";
