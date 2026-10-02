@@ -599,7 +599,12 @@ fn read_unsupported_definition_coverage(
         .filter(|provider| {
             provider.status == "unsupported"
                 && provider.files_seen > 0
-                && !is_noncode_provider(&provider.status, &provider.language)
+                // Unlike call-graph completeness, a read miss must retain
+                // recognized unsupported source. WGSL is currently registered
+                // only as an extension; generic snapshot/log noise stays out.
+                && (provider.language == "file extension .wgsl"
+                    || (!provider.language.starts_with("file extension .")
+                        && provider.language != "no file extension"))
         })
         .collect::<Vec<_>>();
     if !path_filters.is_empty() {

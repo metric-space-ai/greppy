@@ -3008,7 +3008,9 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
         assert_eq!(code, 1, "unsupported graph lookup: {out} {err}");
         assert!(out.contains("no indexed symbol `road_structure`"), "{out}");
         assert!(
-            out.to_ascii_lowercase().contains("unsupported for wgsl"),
+            out.to_ascii_lowercase()
+                .contains("definition extraction is unsupported")
+                && out.to_ascii_lowercase().contains("wgsl"),
             "{out}"
         );
         assert!(out.contains("cannot rule out a definition"), "{out}");
@@ -3035,7 +3037,8 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
         .any(|provider| provider["language"]
             .as_str()
             .unwrap()
-            .eq_ignore_ascii_case("wgsl")
+            .to_ascii_lowercase()
+            .contains("wgsl")
             && provider["status"] == "unsupported"));
     assert!(value["source_recovery"]
         .as_str()
@@ -3061,7 +3064,9 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
     );
     assert_eq!(code, 1, "actual unsupported file: {out} {err}");
     assert!(
-        out.to_ascii_lowercase().contains("unsupported for wgsl"),
+        out.to_ascii_lowercase()
+            .contains("definition extraction is unsupported")
+            && out.to_ascii_lowercase().contains("wgsl"),
         "{out}"
     );
 }
