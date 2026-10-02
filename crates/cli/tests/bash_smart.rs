@@ -639,6 +639,29 @@ fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
         .collect::<String>();
     assert_eq!(expanded.stdout, expected_expanded.as_bytes());
     assert_eq!(text(&expanded.stdout).lines().count(), 149);
+
+    // Handles are scoped to the source repository even when the store base is
+    // shared. A root mistake must offer recovery without claiming expiry.
+    let wrong_root = fresh_workspace("expand-wrong-root");
+    let missing = command(&workspace)
+        .current_dir(&wrong_root.repo)
+        .args(["expand", id])
+        .output()
+        .expect("expand from another root");
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(text(&missing.stdout).contains("--root ORIGINAL_PROJECT"));
+    let recovered = command(&workspace)
+        .current_dir(&wrong_root.repo)
+        .args([
+            "expand",
+            id,
+            "--root",
+            workspace.repo.to_str().expect("UTF-8 root"),
+        ])
+        .output()
+        .expect("recover expand with original root");
+    assert_eq!(recovered.status.code(), Some(0));
+    assert_eq!(recovered.stdout, expected_expanded.as_bytes());
 }
 
 #[test]
