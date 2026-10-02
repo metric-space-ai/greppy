@@ -1500,7 +1500,8 @@ pub(crate) fn index_overlay_snapshot(
             // waiting queries cannot distinguish it from their old snapshot.
             let prior_states =
                 greppy_store::Store::open_with(active_path, greppy_store::OpenOptions::read_only())
-                    .and_then(|active| active.list_private_workspace_states());
+                    .and_then(|active| active.list_private_workspace_states())
+                    .map_err(Error::from);
             match prior_states {
                 Ok(states) => {
                     for state in states {
