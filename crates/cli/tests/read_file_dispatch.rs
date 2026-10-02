@@ -23,6 +23,19 @@ fn read_file_unknown_options_refuse_before_opening_any_file() {
         );
         assert!(out.len() + err.len() < 2048);
     }
+    for leading in ["--diagnostics", "--max-bytes=128", "--limit=1"] {
+        for option in ["--head=5", "--invented-read-window=5"] {
+            let (code, out, err) = run(
+                &repo,
+                &store,
+                &[leading, "read-file", path.to_str().unwrap(), option],
+            );
+            assert_eq!(code, 64, "{out}\n{err}");
+            assert!(out.contains("no files were read"), "{out}\n{err}");
+            assert!(!out.contains("SECRET_PAYLOAD_"));
+            assert!(out.len() + err.len() < 2048);
+        }
+    }
     let absent = repo.join("missing.txt");
     let (code, out, err) = run(
         &repo,
