@@ -1888,7 +1888,10 @@ fn resolve_edges_with_replacement(
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
 
-        let Some(target_id) = target_id else { continue };
+        let Some(target_id) = target_id else {
+            clear_option_field_unresolved();
+            continue;
+        };
 
         // An edge must connect two DISTINCT nodes; a self-loop here is
         // almost always a same-file guess qname accidentally matching the
@@ -1896,6 +1899,7 @@ fn resolve_edges_with_replacement(
         // keeps self-loops (direct recursion is legitimate); the others
         // drop them.
         if target_id == src_id && edge.edge_type != "CALLS" {
+            clear_option_field_unresolved();
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
@@ -2092,7 +2096,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v8";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v9";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -2207,11 +2211,33 @@ pub fn recover_persisted_rust_usages(
         // absent or differ from the fingerprint-validated source extraction.
         for field in extraction.nodes.iter().filter(|node| node.label == "Field") {
             let cached = store.get_node_by_qname(project, &field.qualified_name)?;
-            if cached.as_ref().is_none_or(|node| node.label != "Field"
-                || node.properties.get("return_type") != field.properties.get("return_type")) {
+            if cached.as_ref().is_none_or(|node| {
+                node.label != "Field"
+                    || node.properties.get("return_type") != field.properties.get("return_type")
+                    || node.properties.get("generic_payload")
+                        != field.properties.get("generic_payload")
+            }) {
                 return Err(greppy_core::Error::Invalid(format!(
                     "Rust reference repair source {} has unavailable or stale declared field facts for {}; re-extract declared field nodes from source before caller repair",
                     state.rel_path, field.qualified_name
+                )));
+            }
+        }
+        for trait_node in extraction
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Interface")
+        {
+            let cached = store.get_node_by_qname(project, &trait_node.qualified_name)?;
+            if cached.as_ref().is_none_or(|node| {
+                node.label != "Interface"
+                    || node.properties.get("has_bounds") != trait_node.properties.get("has_bounds")
+                    || node.properties.get("as_ref_receiver")
+                        != trait_node.properties.get("as_ref_receiver")
+            }) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust reference repair source {} has unavailable or stale trait receiver facts for {}; re-extract trait nodes from source before caller repair",
+                    state.rel_path, trait_node.qualified_name
                 )));
             }
         }
@@ -2226,8 +2252,15 @@ pub fn recover_persisted_rust_usages(
     }
     // All source fingerprints validate before any persisted write. Replace
     // USAGE and CALLS contributions, retaining imports, nodes and cached data.
-    let usages = replacements.iter().filter(|edge| edge.edge_type == "USAGE").cloned().collect::<Vec<_>>();
-    let calls = replacements.into_iter().filter(|edge| edge.edge_type == "CALLS").collect::<Vec<_>>();
+    let usages = replacements
+        .iter()
+        .filter(|edge| edge.edge_type == "USAGE")
+        .cloned()
+        .collect::<Vec<_>>();
+    let calls = replacements
+        .into_iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .collect::<Vec<_>>();
     let changed = store.replace_validated_rust_usages(project, &files, &usages)?;
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
@@ -2468,7 +2501,8 @@ fn note_edge_resolution_work(_n: usize) {}
 
 /// The project's **definition fingerprint**: the sorted set of node
 /// identity tuples that cross-file edge resolution actually consults —
-/// `qualified_name`, `name`, `label`, `file_path`, and Field declared types. Edge resolution is a
+/// `qualified_name`, `name`, `label`, `file_path`, Field declared types and
+/// `generic_payload`, and Interface `has_bounds` / `as_ref_receiver`. Edge resolution is a
 /// pure function of this set (plus the per-edge raw data): `by_qname`
 /// targets, `by_name` candidate sets, the same-file preference, and IMPORTS
 /// disambiguation and typed field receivers consult these facts. Node `id`s are
@@ -2497,7 +2531,17 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
     let mut stmt = conn
         .prepare_cached(
             "SELECT qualified_name, name, label, file_path,
-                    CASE WHEN label = 'Field' THEN json_extract(properties, '$.return_type') END
+                    CASE
+                        WHEN label = 'Field' THEN
+                            COALESCE(json_extract(properties, '$.return_type'), '')
+                            || char(31)
+                            || COALESCE(json_extract(properties, '$.generic_payload'), '')
+                        WHEN label = 'Interface' THEN
+                            COALESCE(json_extract(properties, '$.has_bounds'), '')
+                            || char(31)
+                            || COALESCE(json_extract(properties, '$.as_ref_receiver'), '')
+                        ELSE ''
+                    END
              FROM nodes WHERE project = ?1
                AND label NOT IN ('Project', 'Folder', 'File')",
         )
@@ -2729,8 +2773,12 @@ fn resolve_edges_incremental(
             "USAGE" => index.resolve_usage_target(edge, src_id),
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
-        let Some(target_id) = target_id else { continue };
+        let Some(target_id) = target_id else {
+            clear_option_field_unresolved();
+            continue;
+        };
         if target_id == src_id && edge.edge_type != "CALLS" {
+            clear_option_field_unresolved();
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
@@ -2772,12 +2820,33 @@ fn edge_references_name(edge: &ExtractedEdge, names: &std::collections::HashSet<
         .unwrap_or(false)
 }
 
-/// Reasons from the Option-field receiver resolved immediately before
-/// `new_edge`. The two resolution loops are sequential and single-threaded;
-/// each `resolve_call_target` clears the slot, and only a `CALLS` edge
-/// consumes it. This keeps `new_edge`'s signature stable for every other edge.
+/// Reasons for one Option-field `CALLS` edge. The slot is keyed by that edge
+/// and cleared when resolution is skipped, fails, or persists a different
+/// edge. A later `CALLS` row must not inherit it.
+struct OptionFieldUnresolved {
+    source_qualified_name: String,
+    file_path: String,
+    line: u32,
+    callee_name: String,
+    reasons: Vec<String>,
+}
+
+fn option_edge_callee_name(edge: &ExtractedEdge) -> &str {
+    edge.properties
+        .get("callee_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+fn option_unresolved_matches(pending: &OptionFieldUnresolved, edge: &ExtractedEdge) -> bool {
+    pending.source_qualified_name == edge.source_qualified_name
+        && pending.file_path == edge.file_path
+        && pending.line == edge.line
+        && pending.callee_name == option_edge_callee_name(edge)
+}
+
 std::thread_local! {
-    static OPTION_FIELD_UNRESOLVED_REASONS: std::cell::RefCell<Option<Vec<String>>> =
+    static OPTION_FIELD_UNRESOLVED_REASONS: std::cell::RefCell<Option<OptionFieldUnresolved>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2785,12 +2854,30 @@ fn clear_option_field_unresolved() {
     OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| *slot.borrow_mut() = None);
 }
 
-fn set_option_field_unresolved(reasons: Vec<String>) {
-    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| *slot.borrow_mut() = Some(reasons));
+fn set_option_field_unresolved(edge: &ExtractedEdge, reasons: Vec<String>) {
+    let pending = OptionFieldUnresolved {
+        source_qualified_name: edge.source_qualified_name.clone(),
+        file_path: edge.file_path.clone(),
+        line: edge.line,
+        callee_name: option_edge_callee_name(edge).to_string(),
+        reasons,
+    };
+    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| *slot.borrow_mut() = Some(pending));
 }
 
-fn take_option_field_unresolved() -> Option<Vec<String>> {
-    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| slot.borrow_mut().take())
+fn take_option_field_unresolved_for(edge: &ExtractedEdge) -> Option<Vec<String>> {
+    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| {
+        let mut pending = slot.borrow_mut();
+        if pending
+            .as_ref()
+            .is_some_and(|item| option_unresolved_matches(item, edge))
+        {
+            pending.take().map(|item| item.reasons)
+        } else {
+            *pending = None;
+            None
+        }
+    })
 }
 
 /// Build a [`NewEdge`] from a resolved source/target pair, cloning the
@@ -2801,12 +2888,16 @@ fn new_edge(project: &str, source_id: i64, target_id: i64, edge: &ExtractedEdge)
     let mut edge_type = persisted_edge_label(edge).to_string();
     let mut props = edge.properties.clone();
     if edge_type == "CALLS" {
-        if let Some(reasons) = take_option_field_unresolved() {
+        if let Some(reasons) = take_option_field_unresolved_for(edge) {
             edge_type = "UNRESOLVED_CALLS".to_string();
             if let Some(map) = props.as_object_mut() {
                 map.insert("unresolved_reasons".into(), serde_json::json!(reasons));
             }
         }
+    } else {
+        // An import or other edge persisted out of order must not leave a
+        // pending Option reason for the next CALLS row.
+        clear_option_field_unresolved();
     }
     // Fold the reference-site line into the resolved edge too (P4):
     // nav commands print it grep-shaped so one answer carries the
@@ -4237,13 +4328,18 @@ impl GraphIndex {
             == Some("receiver")
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
-                return self.resolve_option_field_receiver(src_id, fact, name);
+                return self.resolve_option_field_receiver(src_id, edge, fact, name);
             }
             let owner = edge
                 .properties
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())?;
-            if edge.properties.get("receiver_option_pattern").and_then(|value| value.as_bool()) == Some(true) {
+            if edge
+                .properties
+                .get("receiver_option_pattern")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
                 let id = self.resolve_rust_type_path(&edge.file_path, owner)?;
                 let owner_file = self.file_of(id)?;
                 let owner_name = self.qname_for_id(id)?.rsplit("::").next()?;
@@ -4435,24 +4531,41 @@ impl GraphIndex {
     /// uniqueness does not establish that a type is bound in this scope.
     fn resolve_rust_type_path(&self, file: &str, path: &str) -> Option<i64> {
         let path = path.trim();
-        if path.is_empty() || !path.split("::").all(|part| {
-            !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
-        }) { return None; }
+        if path.is_empty()
+            || !path.split("::").all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+            })
+        {
+            return None;
+        }
         let name = path.rsplit("::").next()?;
         if !path.contains("::") {
             return self.resolve_bare_rust_type_name(file, name);
         }
         let files = {
             let first = path.split("::").next()?;
-            self.rust_namespaces_by_file.get(file).and_then(|aliases| aliases.get(first))
-                .map(|files| rust_module_files_below_alias(files, path, name, self.rust_crate_roots.as_ref()))
+            self.rust_namespaces_by_file
+                .get(file)
+                .and_then(|aliases| aliases.get(first))
+                .map(|files| {
+                    rust_module_files_below_alias(files, path, name, self.rust_crate_roots.as_ref())
+                })
                 .unwrap_or_else(|| self.rust_module_files_for_path(file, path, name))
         };
         let owners = self.rust_module_export_targets(&files, name, &["Class", "Struct", "Enum"]);
-        match owners.as_slice() { [id] => Some(*id), _ => None }
+        match owners.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
     }
 
-    fn resolve_option_field_receiver(&self, src_id: i64, fact: &serde_json::Value, name: &str) -> Option<i64> {
+    fn resolve_option_field_receiver(
+        &self,
+        src_id: i64,
+        edge: &ExtractedEdge,
+        fact: &serde_json::Value,
+        name: &str,
+    ) -> Option<i64> {
         if fact.get("adapter")?.as_str()? != "as_ref" || fact.get("pattern")?.as_str()? != "Some" {
             return None;
         }
@@ -4461,7 +4574,9 @@ impl GraphIndex {
         let owner_qname = self.qname_for_id(base)?;
         let field_name = fact.get("field")?.as_str()?;
         let field = self.by_qname(&format!("{owner_qname}::{field_name}"))?;
-        if field.label != "Field" { return None; }
+        if field.label != "Field" {
+            return None;
+        }
         let declared = field.declared_type.as_deref()?.trim();
         let (option, payload) = declared.split_once('<')?;
         let payload = payload.strip_suffix('>')?.trim();
@@ -4469,22 +4584,49 @@ impl GraphIndex {
         // generics, aliases and arbitrary adapters remain unresolved.
         match option.trim() {
             "std::option::Option" | "core::option::Option" => {
-                let files = self.rust_module_files_for_path(&field.file_path, option.trim(), "Option");
+                let files =
+                    self.rust_module_files_for_path(&field.file_path, option.trim(), "Option");
                 let first = option.trim().split("::").next()?;
-                if !self.rust_module_export_targets(&files, "Option", &CONSTRUCTABLE_LABELS).is_empty()
-                    || self.rust_namespaces_by_file.get(&field.file_path).is_some_and(|aliases| aliases.contains_key(first))
-                { return None; }
+                if !self
+                    .rust_module_export_targets(&files, "Option", &CONSTRUCTABLE_LABELS)
+                    .is_empty()
+                    || self
+                        .rust_namespaces_by_file
+                        .get(&field.file_path)
+                        .is_some_and(|aliases| aliases.contains_key(first))
+                {
+                    return None;
+                }
             }
             "Option" => {
-                if !self.rust_module_export_targets(&[field.file_path.clone()], "Option", &CONSTRUCTABLE_LABELS).is_empty()
-                    || self.import_globs_by_file.get(&field.file_path).is_some_and(|globs| !globs.is_empty())
-                { return None; }
-                if let Some(sources) = self.import_alias_sources_by_file.get(&field.file_path)
+                if !self
+                    .rust_module_export_targets(
+                        &[field.file_path.clone()],
+                        "Option",
+                        &CONSTRUCTABLE_LABELS,
+                    )
+                    .is_empty()
+                    || self
+                        .import_globs_by_file
+                        .get(&field.file_path)
+                        .is_some_and(|globs| !globs.is_empty())
+                {
+                    return None;
+                }
+                if let Some(sources) = self
+                    .import_alias_sources_by_file
+                    .get(&field.file_path)
                     .and_then(|aliases| aliases.get("Option"))
                 {
                     if sources.iter().any(|(path, original)| {
-                        original != "Option" || !matches!(path.as_str(), "std::option::Option" | "core::option::Option")
-                    }) { return None; }
+                        original != "Option"
+                            || !matches!(
+                                path.as_str(),
+                                "std::option::Option" | "core::option::Option"
+                            )
+                    }) {
+                        return None;
+                    }
                 }
             }
             _ => return None,
@@ -4495,10 +4637,12 @@ impl GraphIndex {
         let method = self.by_qname(&format!("{payload_file}::{payload_name}::{name}"))?;
         let reasons = self.option_receiver_limits(file, fact)?;
         let id = (method.label == "Method").then_some(method.id)?;
-        if !reasons.is_empty() {
-            // The matching `new_edge` for this CALLS row stores the diagnostic
-            // edge. A later call clears the slot before it can leak.
-            set_option_field_unresolved(reasons);
+        if reasons.is_empty() {
+            clear_option_field_unresolved();
+        } else {
+            // `new_edge` applies these reasons only when the persisted row is
+            // this same CALLS edge. A skipped resolution clears the slot.
+            set_option_field_unresolved(edge, reasons);
         }
         Some(id)
     }
@@ -4526,9 +4670,9 @@ impl GraphIndex {
             .iter()
             .copied()
             .filter(|id| {
-                self.by_id.get(id).is_some_and(|node| {
-                    matches!(node.label.as_str(), "Class" | "Struct" | "Enum")
-                })
+                self.by_id
+                    .get(id)
+                    .is_some_and(|node| matches!(node.label.as_str(), "Class" | "Struct" | "Enum"))
             })
             .collect::<Vec<_>>();
         if ids.len() != typed.len() || typed.len() > 1 {
@@ -4551,10 +4695,10 @@ impl GraphIndex {
     /// method the declared field type already identified.
     fn option_receiver_limits(&self, file: &str, fact: &serde_json::Value) -> Option<Vec<String>> {
         let Some(limits) = fact.get("limits") else {
-            // Facts extracted before scope limits existed stay proven until
-            // the v8 re-extract replaces them. A missing object is not a
-            // wildcard.
-            return Some(Vec::new());
+            // A cached fact with no scope record is not proof that the
+            // receiver is Option::as_ref. Drop the candidate. Fresh
+            // extraction writes `limits` and can prove or leave it unresolved.
+            return None;
         };
         if !limits.is_object() {
             return Some(vec!["unparsed import".to_string()]);
@@ -4597,8 +4741,14 @@ impl GraphIndex {
         }
         if let Some(values) = limits.get("imports").and_then(|value| value.as_array()) {
             for item in values {
-                let path = item.get("path").and_then(|value| value.as_str()).unwrap_or("");
-                let name = item.get("name").and_then(|value| value.as_str()).unwrap_or("");
+                let path = item
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 if path.starts_with("extern crate") || name.is_empty() {
                     reasons.push(format!("extern crate {path}"));
                     continue;
@@ -4606,7 +4756,7 @@ impl GraphIndex {
                 if matches!(name, "Some" | "Option") {
                     return None;
                 }
-                if rust_standard_import(path) {
+                if self.rust_standard_import(file, path) {
                     continue;
                 }
                 match self.classify_rust_import(file, path, name) {
@@ -4850,22 +5000,59 @@ impl GraphIndex {
             None
         }
     }
+
+    /// Named `std`/`core`/`alloc` imports are safe only when that path is the
+    /// standard library. A local module, namespace alias, or import that binds
+    /// the same name is not that crate, so classification continues.
+    fn rust_standard_import(&self, file: &str, path: &str) -> bool {
+        let trimmed = path.trim();
+        let absolute = trimmed.starts_with("::");
+        let first = trimmed
+            .trim_start_matches("::")
+            .split("::")
+            .find(|part| !part.is_empty())
+            .unwrap_or("");
+        if !matches!(first, "std" | "core" | "alloc") {
+            return false;
+        }
+        !self.standard_namespace_is_shadowed(file, first, absolute)
+    }
+
+    fn standard_namespace_is_shadowed(&self, file: &str, name: &str, absolute: bool) -> bool {
+        if self
+            .rust_namespaces_by_file
+            .get(file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return true;
+        }
+        if self
+            .import_alias_sources_by_file
+            .get(file)
+            .is_some_and(|aliases| aliases.get(name).is_some_and(|sources| !sources.is_empty()))
+        {
+            return true;
+        }
+        if absolute {
+            return false;
+        }
+        let classified = self.rust_module_files_for_module_path(file, name);
+        if classified
+            .iter()
+            .any(|candidate| self.known_files.contains(candidate))
+        {
+            return true;
+        }
+        self.by_name
+            .get(name)
+            .is_some_and(|nodes| nodes.iter().any(|node| node.file_path == file))
+    }
 }
 
 enum RustImportClass {
     Safe,
     Reject,
     Unresolved(String),
-}
-
-fn rust_standard_import(path: &str) -> bool {
-    // Named std/core/alloc imports are treated like the always-in-scope
-    // prelude: they are not probed for a by-value Option::as_ref override.
-    // A wildcard from those crates stays unresolved.
-    matches!(
-        path.trim().trim_start_matches("::").split("::").next(),
-        Some("std" | "core" | "alloc")
-    )
 }
 
 fn push_unique_glob(out: &mut Vec<String>, path: &str) {
@@ -9369,10 +9556,20 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
 "#;
 
     fn assert_option_field_caller(store: &Store, target: &str, present: bool) {
-        let caller = store.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+            .unwrap()
+            .unwrap();
         let method = store.get_node_by_qname("test", target).unwrap().unwrap();
-        assert_eq!(store.incoming_edges(method.id, Some("CALLS"), 100).unwrap().iter()
-            .any(|edge| edge.source_id == caller.id), present, "{target}");
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 100)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id),
+            present,
+            "{target}"
+        );
     }
 
     #[test]
@@ -9386,8 +9583,14 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
         assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
         // Same Field identity but different payload: unchanged caller facts must
         // be re-resolved, not incorrectly retained by the body-edit fast path.
-        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE.replace(
-            "Option<crate::scene::IrradianceField>", "Option<crate::scene::Other>")).unwrap();
+        fs::write(
+            repo.join("src/scene.rs"),
+            OPTION_FIELD_SCENE.replace(
+                "Option<crate::scene::IrradianceField>",
+                "Option<crate::scene::Other>",
+            ),
+        )
+        .unwrap();
         index(&mut store, &repo, "test").unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
         assert_option_field_caller(&store, "src/scene.rs::Other::uniform", true);
@@ -9443,9 +9646,17 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
         store.conn().execute("UPDATE nodes SET properties=json_remove(properties,'$.return_type') WHERE label='Field'", []).unwrap();
-        store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
         let before = store.list_raw_edges("test").unwrap();
-        let error = recover_persisted_rust_usages(&mut store, "test", &repo).unwrap_err().to_string();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("declared field facts"), "{error}");
         assert_eq!(store.list_raw_edges("test").unwrap(), before);
         assert!(!rust_caller_edges_repaired(&store).unwrap());
@@ -9462,8 +9673,15 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, &repo, "test").unwrap();
             base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
-            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS'", []).unwrap();
-            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
             base.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')", []).unwrap();
             // The single-store upgrade also re-extracts, not merely re-resolves
             // the stale receiver facts, and does not accept a v6 completion.
@@ -9471,15 +9689,35 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
             rebuild_single_store_rust_edges(&mut base, "test").unwrap();
             assert_option_field_caller(&base, "src/scene.rs::IrradianceField::uniform", true);
             base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
-            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS'", []).unwrap();
-            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
-            let caller = base.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
-            let wrong = base.get_node_by_qname("test", "src/scene.rs::Other::uniform").unwrap().unwrap();
-            base.insert_edge(&NewEdge { project: "test".into(), source_id: caller.id,
-                target_id: wrong.id, edge_type: "CALLS".into(), properties: serde_json::json!({}) }).unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            let caller = base
+                .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+                .unwrap()
+                .unwrap();
+            let wrong = base
+                .get_node_by_qname("test", "src/scene.rs::Other::uniform")
+                .unwrap()
+                .unwrap();
+            base.insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: caller.id,
+                target_id: wrong.id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
         }
         let base_before = fs::read(&base_path).unwrap();
-        let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         let original = fs::read(repo.join("src/scene.rs")).unwrap();
         fs::write(repo.join("src/scene.rs"), "// drift\n").unwrap();
@@ -9558,18 +9796,34 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
 
     fn option_edge_names(store: &Store, caller: &str, edge_type: &str) -> Vec<String> {
         let caller = store.get_node_by_qname("test", caller).unwrap().unwrap();
-        let mut names = store.outgoing_edges(caller.id, Some(edge_type), 100).unwrap().into_iter().map(|edge| {
-            store.get_node(edge.target_id).unwrap().unwrap().name
-        }).collect::<Vec<_>>();
+        let mut names = store
+            .outgoing_edges(caller.id, Some(edge_type), 100)
+            .unwrap()
+            .into_iter()
+            .map(|edge| store.get_node(edge.target_id).unwrap().unwrap().name)
+            .collect::<Vec<_>>();
         names.sort();
         names
     }
 
     fn option_unresolved_reasons(store: &Store) -> String {
-        let caller = store.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
-        store.outgoing_edges(caller.id, Some("UNRESOLVED_CALLS"), 100).unwrap().into_iter().map(|edge| {
-            edge.properties.get("unresolved_reasons").cloned().unwrap_or(serde_json::Value::Null).to_string()
-        }).collect::<Vec<_>>().join("\n")
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+            .unwrap()
+            .unwrap();
+        store
+            .outgoing_edges(caller.id, Some("UNRESOLVED_CALLS"), 100)
+            .unwrap()
+            .into_iter()
+            .map(|edge| {
+                edge.properties
+                    .get("unresolved_reasons")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -9597,20 +9851,32 @@ pub fn load_scene() {
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
         assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
-        assert!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS").is_empty());
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .is_empty());
         fs::remove_dir_all(repo).unwrap();
 
-        let alias = proven.replace(
-            "use crate::scene::Manifest;",
-            "use crate::scene::Manifest as SceneManifest;",
-        ).replace("let manifest: Manifest", "let manifest: SceneManifest");
+        let alias = proven
+            .replace(
+                "use crate::scene::Manifest;",
+                "use crate::scene::Manifest as SceneManifest;",
+            )
+            .replace("let manifest: Manifest", "let manifest: SceneManifest");
         let repo = setup_repo("option-field-alias", &alias);
         fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
-        assert!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS").is_empty());
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .is_empty());
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -9645,17 +9911,46 @@ pub async fn load_scene() {
         {
             let mut store = Store::open(&db).unwrap();
             index(&mut store, &repo, "test").unwrap();
-            assert_eq!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS").into_iter().filter(|name| name == "uniform" || name == "storage").count(), 0);
-            assert_eq!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS"), vec!["storage".to_string(), "uniform".to_string()]);
+            assert_eq!(
+                option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .into_iter()
+                    .filter(|name| name == "uniform" || name == "storage")
+                    .count(),
+                0
+            );
+            assert_eq!(
+                option_edge_names(
+                    &store,
+                    "src/lib.rs::Function::load_scene",
+                    "UNRESOLVED_CALLS"
+                ),
+                vec!["storage".to_string(), "uniform".to_string()]
+            );
             let reasons = option_unresolved_reasons(&store);
-            assert!(reasons.contains("wildcard import wasm_bindgen::prelude"), "{reasons}");
+            assert!(
+                reasons.contains("wildcard import wasm_bindgen::prelude"),
+                "{reasons}"
+            );
             assert!(reasons.contains("attribute wasm_bindgen"), "{reasons}");
-            assert!(reasons.contains("external import sha2::Digest"), "{reasons}");
-            assert!(reasons.contains("external import wgpu::util::DeviceExt"), "{reasons}");
+            assert!(
+                reasons.contains("external import sha2::Digest"),
+                "{reasons}"
+            );
+            assert!(
+                reasons.contains("external import wgpu::util::DeviceExt"),
+                "{reasons}"
+            );
             assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
         }
         let store = Store::open(&db).unwrap();
-        assert_eq!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS"), vec!["storage".to_string(), "uniform".to_string()]);
+        assert_eq!(
+            option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            ),
+            vec!["storage".to_string(), "uniform".to_string()]
+        );
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
         fs::remove_dir_all(repo).unwrap();
     }
@@ -9675,9 +9970,24 @@ pub fn load_scene() {
 }
 "#;
         let cases = [
-            ("consuming-import", "pub trait Consume { fn as_ref(self) -> Option<crate::scene::Other>; }\n", "use crate::adapter::Consume;\n", false),
-            ("ref-trait-import", "pub trait View { fn as_ref(&self); }\n", "use crate::adapter::View;\n", true),
-            ("open-trait-import", "pub trait Open: core::fmt::Debug {}\n", "use crate::adapter::Open;\n", false),
+            (
+                "consuming-import",
+                "pub trait Consume { fn as_ref(self) -> Option<crate::scene::Other>; }\n",
+                "use crate::adapter::Consume;\n",
+                false,
+            ),
+            (
+                "ref-trait-import",
+                "pub trait View { fn as_ref(&self); }\n",
+                "use crate::adapter::View;\n",
+                true,
+            ),
+            (
+                "open-trait-import",
+                "pub trait Open: core::fmt::Debug {}\n",
+                "use crate::adapter::Open;\n",
+                false,
+            ),
             ("generic-payload", "", "", false),
         ];
         for (label, adapter, import, proven) in cases {
@@ -9695,11 +10005,25 @@ pub fn load_scene() {
             fs::write(repo.join("src/adapter.rs"), adapter).unwrap();
             let mut store = Store::open_memory().unwrap();
             index(&mut store, &repo, "test").unwrap();
-            assert_eq!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS").contains(&"uniform".to_string()), proven, "{label}");
-            let unresolved = option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS").contains(&"uniform".to_string());
+            assert_eq!(
+                option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .contains(&"uniform".to_string()),
+                proven,
+                "{label}"
+            );
+            let unresolved = option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS",
+            )
+            .contains(&"uniform".to_string());
             if label == "open-trait-import" {
                 assert!(unresolved, "{label}");
-                assert!(option_unresolved_reasons(&store).contains("trait import Open has supertraits"), "{}", option_unresolved_reasons(&store));
+                assert!(
+                    option_unresolved_reasons(&store).contains("trait import Open has supertraits"),
+                    "{}",
+                    option_unresolved_reasons(&store)
+                );
             } else {
                 assert!(!unresolved, "{label}");
             }
@@ -9722,9 +10046,304 @@ pub fn load_scene() {
         fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
-        assert!(!option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS").contains(&"uniform".to_string()));
-        assert!(option_edge_names(&store, "src/lib.rs::Function::load_scene", "UNRESOLVED_CALLS").contains(&"uniform".to_string()));
-        assert!(option_unresolved_reasons(&store).contains("wildcard import custom"), "{}", option_unresolved_reasons(&store));
+        assert!(
+            !option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                .contains(&"uniform".to_string())
+        );
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        assert!(
+            option_unresolved_reasons(&store).contains("wildcard import custom"),
+            "{}",
+            option_unresolved_reasons(&store)
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_unresolved_reasons_do_not_attach_to_a_different_edge() {
+        let option_edge = greppy_parser::ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: "src/lib.rs::Function::load_scene".into(),
+            target_qualified_name: "src/lib.rs::Function::uniform".into(),
+            file_path: "src/lib.rs".into(),
+            line: 10,
+            properties: serde_json::json!({"callee_name": "uniform"}),
+        };
+        let other = greppy_parser::ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: "src/lib.rs::Function::load_scene".into(),
+            target_qualified_name: "src/lib.rs::Function::helper".into(),
+            file_path: "src/lib.rs".into(),
+            line: 11,
+            properties: serde_json::json!({"callee_name": "helper"}),
+        };
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let leaked = new_edge("p", 1, 2, &other);
+        assert_eq!(leaked.edge_type, "CALLS");
+        assert!(leaked.properties.get("unresolved_reasons").is_none());
+        let dropped = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(dropped.edge_type, "CALLS");
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let matched = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(matched.edge_type, "UNRESOLVED_CALLS");
+        assert!(matched.properties["unresolved_reasons"]
+            .to_string()
+            .contains("wildcard import custom"));
+        clear_option_field_unresolved();
+        let cleared = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(cleared.edge_type, "CALLS");
+        let import = greppy_parser::ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: "src/lib.rs::__file__".into(),
+            target_qualified_name: "src/lib.rs::Function::Manifest".into(),
+            file_path: "src/lib.rs".into(),
+            line: 1,
+            properties: serde_json::json!({}),
+        };
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let imported = new_edge("p", 1, 4, &import);
+        assert_eq!(imported.edge_type, "IMPORTS");
+        let after_import = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(after_import.edge_type, "CALLS");
+    }
+
+    #[test]
+    fn option_field_name_resemblance_and_shadowed_std_stay_unresolved() {
+        let proven = r#"
+mod scene;
+use crate::scene::Manifest;
+use std::collections::BTreeMap;
+#[allow(unused)]
+pub fn load_scene() {
+    println!("load");
+    let manifest: Manifest = opaque();
+    let _table: BTreeMap<String, u8> = BTreeMap::new();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let cases = [
+            (
+                "qualified-macro",
+                proven.replace("#[allow(unused)]", "helper::assert!();\n#[custom::allow]"),
+                "pub struct LocalStd;\n",
+                false,
+            ),
+            (
+                "user-println",
+                proven.replace(
+                    "pub fn load_scene()",
+                    "macro_rules! println { () => {}; }\npub fn load_scene()",
+                ),
+                "pub struct LocalStd;\n",
+                false,
+            ),
+            (
+                "shadowed-std",
+                "mod std;\n".to_string() + proven,
+                "pub struct LocalStd;\n",
+                false,
+            ),
+        ];
+        for (label, caller, std_src, _proven) in cases {
+            let repo = setup_repo(&format!("option-field-{label}"), &caller);
+            fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+            if label == "shadowed-std" {
+                fs::write(repo.join("src/std.rs"), std_src).unwrap();
+            }
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            assert!(
+                !option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .contains(&"uniform".to_string()),
+                "{label}",
+            );
+            assert!(
+                option_edge_names(
+                    &store,
+                    "src/lib.rs::Function::load_scene",
+                    "UNRESOLVED_CALLS"
+                )
+                .contains(&"uniform".to_string()),
+                "{label}",
+            );
+            let reasons = option_unresolved_reasons(&store);
+            match label {
+                "qualified-macro" => {
+                    assert!(reasons.contains("macro helper::assert"), "{reasons}");
+                    assert!(reasons.contains("attribute custom::allow"), "{reasons}");
+                }
+                "user-println" => assert!(reasons.contains("macro println"), "{reasons}"),
+                "shadowed-std" => assert!(
+                    reasons.contains("std::collections::BTreeMap") || reasons.contains("import"),
+                    "{reasons}",
+                ),
+                _ => {}
+            }
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn option_field_missing_limits_and_trait_facts_do_not_keep_stale_callers() {
+        let caller = r#"
+mod scene;
+use crate::scene::Manifest;
+use std::collections::BTreeMap;
+#[allow(unused)]
+pub fn load_scene() {
+    println!("load");
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-missing-limits", caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        store.conn().execute(
+            "UPDATE raw_edges SET properties=json_remove(properties, '$.receiver_provenance.limits') WHERE edge_type='CALLS'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type IN ('CALLS', 'UNRESOLVED_CALLS')",
+                [],
+            )
+            .unwrap();
+        let raw = load_all_raw_edges(&store, "test").unwrap();
+        resolve_edges_with_replacement(&mut store, "test", &raw, &mut |_| {}, &[], true).unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        store.conn().execute(
+            "UPDATE nodes SET properties=json_set(properties, '$.generic_payload', 1) WHERE label='Field' AND name='remaster_irradiance'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared field facts"), "{error}");
+        fs::remove_dir_all(repo).unwrap();
+
+        let trait_caller = r#"
+mod scene;
+mod adapter;
+use crate::scene::Manifest;
+use crate::adapter::View;
+pub fn load_scene() {
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-trait-facts", trait_caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View: core::fmt::Debug { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(
+            option_unresolved_reasons(&store).contains("trait import View has supertraits"),
+            "{}",
+            option_unresolved_reasons(&store)
+        );
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        store.conn().execute(
+            "UPDATE nodes SET properties=json_set(properties, '$.has_bounds', 1) WHERE label='Interface' AND name='View'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trait receiver facts"), "{error}");
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::remove_dir_all(repo).unwrap();
+
+        let repo = setup_repo("option-field-generic-edit", trait_caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE.replace(
+            "pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }",
+            "pub struct Manifest<T> { pub remaster_irradiance: Option<T> }",
+        )).unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -9733,6 +10352,10 @@ pub fn load_scene() {
         let mut store = Store::open_memory().unwrap();
         store.conn().execute(
             "INSERT INTO schema_meta(key, value) VALUES('greppy.rust_caller_edges_repair.v7', 'complete')",
+            [],
+        ).unwrap();
+        store.conn().execute(
+            "INSERT INTO schema_meta(key, value) VALUES('greppy.rust_caller_edges_repair.v8', 'complete')",
             [],
         ).unwrap();
         assert!(!rust_caller_edges_repaired(&store).unwrap());

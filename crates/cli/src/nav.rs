@@ -3290,10 +3290,12 @@ pub(crate) struct UnresolvedReceiver {
 pub(crate) fn unresolved_option_receivers(
     store: &greppy_store::Store,
     target_ids: &[i64],
+    limit: usize,
 ) -> Result<Vec<UnresolvedReceiver>> {
     let mut lines = Vec::new();
+    let fetch = limit.max(1);
     for id in target_ids {
-        for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), 1024)? {
+        for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), fetch)? {
             let Some(node) = store.get_node(edge.source_id)? else {
                 continue;
             };
@@ -3356,6 +3358,132 @@ pub(crate) fn unresolved_receiver_line(item: &UnresolvedReceiver) -> String {
             item.caller,
             item.reasons.join(", ")
         )
+    }
+}
+
+pub(crate) struct UnresolvedReceiverPage {
+    pub rows: Vec<UnresolvedReceiver>,
+    pub total: usize,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+
+pub(crate) struct UnresolvedReceiverReport {
+    pub rows: Vec<serde_json::Value>,
+    pub total: usize,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+
+impl UnresolvedReceiverReport {
+    pub(crate) fn none() -> Self {
+        Self {
+            rows: Vec::new(),
+            total: 0,
+            omitted: 0,
+            truncated: false,
+        }
+    }
+
+    pub(crate) fn incomplete(&self) -> bool {
+        self.total > 0 || self.omitted > 0 || self.truncated
+    }
+}
+
+pub(crate) fn unresolved_receiver_fetch_limit(code: bool, all: bool) -> usize {
+    let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    if all {
+        return default.saturating_add(1);
+    }
+    let limit = crate::cli_result_limit_raw().unwrap_or(default);
+    let offset = crate::cli_result_offset();
+    offset.saturating_add(limit).saturating_add(1).max(1)
+}
+
+pub(crate) fn unresolved_receiver_page(
+    items: &[UnresolvedReceiver],
+    code: bool,
+    all: bool,
+    fetch_saturated: bool,
+) -> UnresolvedReceiverPage {
+    let known = items.len();
+    let default = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let (offset, limit) = if all {
+        (0, default)
+    } else {
+        (
+            crate::cli_result_offset(),
+            crate::cli_result_limit_raw().unwrap_or(default),
+        )
+    };
+    let start = offset.min(known);
+    let end = start.saturating_add(limit).min(known);
+    let shown = end - start;
+    let mut omitted = known - shown;
+    let mut truncated = omitted > 0;
+    if fetch_saturated {
+        truncated = true;
+        omitted = omitted.max(1);
+    }
+    UnresolvedReceiverPage {
+        rows: items[start..end].to_vec(),
+        total: known,
+        omitted,
+        truncated,
+    }
+}
+
+fn unresolved_page_report(page: &UnresolvedReceiverPage, target: &str) -> UnresolvedReceiverReport {
+    UnresolvedReceiverReport {
+        rows: page
+            .rows
+            .iter()
+            .map(|item| unresolved_receiver_json(item, target))
+            .collect(),
+        total: page.total,
+        omitted: page.omitted,
+        truncated: page.truncated,
+    }
+}
+
+pub(crate) fn print_unresolved_receivers(page: &UnresolvedReceiverPage) {
+    for item in &page.rows {
+        println!("{}", unresolved_receiver_line(item));
+    }
+    if page.truncated {
+        println!("… {} unresolved receivers omitted", page.omitted.max(1));
+    }
+}
+
+#[cfg(test)]
+mod unresolved_receiver_budget {
+    use super::{unresolved_receiver_page, UnresolvedReceiver};
+
+    fn row(line: u32) -> UnresolvedReceiver {
+        UnresolvedReceiver {
+            file: "src/gpu.rs".into(),
+            line,
+            caller: "load_scene".into(),
+            reasons: vec!["attribute wasm_bindgen".into()],
+        }
+    }
+
+    #[test]
+    fn unresolved_rows_honor_limit_offset_and_keep_incompleteness() {
+        let rows = (1..=5).map(row).collect::<Vec<_>>();
+        crate::set_cli_result_window(Some(2), 1);
+        let page = unresolved_receiver_page(&rows, false, false, false);
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].line, 2);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.omitted, 3);
+        assert!(page.truncated);
+        crate::set_cli_result_window(Some(2), 10);
+        let skipped = unresolved_receiver_page(&rows, false, false, false);
+        assert!(skipped.rows.is_empty());
+        assert!(skipped.truncated);
+        assert!(skipped.omitted > 0);
+        crate::set_cli_result_window(None, 0);
     }
 }
 
@@ -3464,12 +3592,12 @@ pub(crate) fn dispatch_who_calls(
             edges.extend(store.incoming_edges(*target, Some(edge_type), 1024)?);
         }
     }
-    let mut unresolved = unresolved_option_receivers(&store, &targets)?;
+    let fetch_limit = unresolved_receiver_fetch_limit(code, all);
+    let mut unresolved = unresolved_option_receivers(&store, &targets, fetch_limit)?;
+    let fetch_saturated = unresolved.len() >= fetch_limit;
     unresolved.retain(|item| path_filters.matches(&item.file));
-    let unresolved_json = unresolved
-        .iter()
-        .map(|item| unresolved_receiver_json(item, query_symbol))
-        .collect::<Vec<_>>();
+    let unresolved_page = unresolved_receiver_page(&unresolved, code, all, fetch_saturated);
+    let unresolved_report = unresolved_page_report(&unresolved_page, query_symbol);
     if edges.is_empty() {
         // The symbol IS a defined graph node but has no callers — that is a
         // valid, useful answer, not a failure. Do not fall back to content
@@ -3488,14 +3616,14 @@ pub(crate) fn dispatch_who_calls(
                 all,
                 Vec::new(),
                 None,
-                &unresolved_json,
+                &unresolved_report,
             )?;
             return Ok(0);
         }
         // Nobody calls it. That is an answer, and it needs no packaging and no
         // textual consolation prize. An unresolved Option receiver is a
         // different answer: the call exists, but its payload was not proven.
-        if unresolved.is_empty() {
+        if !unresolved_report.incomplete() {
             if path_filters.is_empty() {
                 println!("no callers");
             } else {
@@ -3503,14 +3631,13 @@ pub(crate) fn dispatch_who_calls(
             }
         } else if path_filters.is_empty() {
             println!("no resolved callers");
-            for item in &unresolved {
-                println!("{}", unresolved_receiver_line(item));
-            }
+            print_unresolved_receivers(&unresolved_page);
         } else {
-            println!("no resolved callers under path filter: {}", path_filters.shown());
-            for item in &unresolved {
-                println!("{}", unresolved_receiver_line(item));
-            }
+            println!(
+                "no resolved callers under path filter: {}",
+                path_filters.shown()
+            );
+            print_unresolved_receivers(&unresolved_page);
         }
         return Ok(0);
     }
@@ -3567,11 +3694,11 @@ pub(crate) fn dispatch_who_calls(
                 all,
                 Vec::new(),
                 None,
-                &unresolved_json,
+                &unresolved_report,
             )?;
             return Ok(0);
         }
-        if unresolved.is_empty() {
+        if !unresolved_report.incomplete() {
             if path_filters.is_empty() {
                 println!("no callers");
             } else {
@@ -3579,14 +3706,13 @@ pub(crate) fn dispatch_who_calls(
             }
         } else if path_filters.is_empty() {
             println!("no resolved callers");
-            for item in &unresolved {
-                println!("{}", unresolved_receiver_line(item));
-            }
+            print_unresolved_receivers(&unresolved_page);
         } else {
-            println!("no resolved callers under path filter: {}", path_filters.shown());
-            for item in &unresolved {
-                println!("{}", unresolved_receiver_line(item));
-            }
+            println!(
+                "no resolved callers under path filter: {}",
+                path_filters.shown()
+            );
+            print_unresolved_receivers(&unresolved_page);
         }
         return Ok(0);
     }
@@ -3679,7 +3805,7 @@ pub(crate) fn dispatch_who_calls(
             all,
             hits,
             expand.as_ref(),
-            &unresolved_json,
+            &unresolved_report,
         )?;
         return Ok(0);
     }
@@ -3706,8 +3832,8 @@ pub(crate) fn dispatch_who_calls(
         });
     }
     print_nav_rows(&repo_root, "callers", &mut rows, code, all);
-    for item in &unresolved {
-        println!("{}", unresolved_receiver_line(item));
+    if unresolved_report.incomplete() {
+        print_unresolved_receivers(&unresolved_page);
     }
     Ok(0)
 }
@@ -3885,7 +4011,7 @@ pub(crate) fn dispatch_callees(
             all,
             hits,
             expand.as_ref(),
-            &[],
+            &UnresolvedReceiverReport::none(),
         )?;
         return Ok(0);
     }
