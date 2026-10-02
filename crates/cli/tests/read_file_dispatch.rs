@@ -81,11 +81,21 @@ fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
     let (code, out, err) = run(
         &repo,
         &store,
-        &["read-file", path.to_str().unwrap(), "--lines", "1:3", "--max-bytes", "1200"],
+        &[
+            "read-file",
+            path.to_str().unwrap(),
+            "--lines",
+            "1:3",
+            "--max-bytes",
+            "1200",
+        ],
     );
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("dump.txt:1-3\nalpha\nbeta\ngamma\n"), "{out}");
-    assert!(!store.exists(), "plain bounded reads must not create a graph");
+    assert!(
+        !store.exists(),
+        "plain bounded reads must not create a graph"
+    );
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
 
@@ -96,7 +106,10 @@ fn invalid_selected_or_whole_file_text_is_never_reported_missing() {
     std::fs::write(&path, b"alpha\n\xff\n").unwrap();
     let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--lines", "1:2"]);
     assert_eq!(code, 1);
-    assert!(out.contains("requested lines 1:2") && out.contains("UTF-8"), "{out} {err}");
+    assert!(
+        out.contains("requested lines 1:2") && out.contains("UTF-8"),
+        "{out} {err}"
+    );
     assert!(!out.contains("no such file") && !err.contains("no such file"));
     let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--all"]);
     assert_eq!(code, 1, "{out} {err}");

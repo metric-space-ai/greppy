@@ -31,7 +31,11 @@ fn bounded_file_span_rejects_selected_encoding_and_reports_actual_eof() {
     for raw in ["0:1", "3:1", "1", "a:2"] {
         let mut reader = std::io::Cursor::new(b"alpha\n");
         assert!(read_bounded_file_range(&mut reader, raw, "dump").is_err());
-        assert_eq!(reader.position(), 0, "invalid ranges must not consume input");
+        assert_eq!(
+            reader.position(),
+            0,
+            "invalid ranges must not consume input"
+        );
     }
 }
 
