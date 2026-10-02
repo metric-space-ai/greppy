@@ -16424,6 +16424,7 @@ pub(crate) fn node_text<'a>(source: &'a [u8], node: Node<'_>) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    use super::OPTION_FIELD_ROOT_CHECKS;
     use crate::extract;
     use crate::language::Language;
 
