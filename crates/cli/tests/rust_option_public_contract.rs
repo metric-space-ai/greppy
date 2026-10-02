@@ -375,7 +375,13 @@ fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
             .map(|row| {
                 (
                     row["target"].as_str().unwrap().to_owned(),
-                    row["name"].as_str().unwrap().to_owned(),
+                    row["name"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit("::")
+                        .next()
+                        .unwrap()
+                        .to_owned(),
                     false,
                 )
             })
@@ -406,7 +412,7 @@ fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
                 word.starts_with("src/safe.rs:") || word.starts_with("src/uncertain.rs:")
             }) {
                 assert!(words.len() >= 2, "malformed caller: {line}");
-                Some((words[1], false))
+                Some((words[1].rsplit("::").next().unwrap(), false))
             } else {
                 None
             };

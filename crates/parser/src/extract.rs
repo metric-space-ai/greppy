@@ -893,6 +893,7 @@ struct RustOptionScopeLimits {
     imports: Vec<serde_json::Value>,
     macros: Vec<String>,
     attributes: Vec<String>,
+    standard_namespace_bindings: Vec<String>,
 }
 
 fn rust_record_macro(source: &[u8], node: Node<'_>, limits: &mut RustOptionScopeLimits) {
@@ -913,6 +914,7 @@ fn rust_option_scope_limits(source: &[u8], callee: Node<'_>) -> Option<RustOptio
         imports: Vec::new(),
         macros: Vec::new(),
         attributes: Vec::new(),
+        standard_namespace_bindings: Vec::new(),
     };
     let mut ancestor = callee.parent();
     while let Some(scope) = ancestor {
@@ -947,6 +949,17 @@ fn rust_option_scope_limits(source: &[u8], callee: Node<'_>) -> Option<RustOptio
                 pending_attributes.clear();
                 if item.kind() == "trait_item" && rust_trait_has_consuming_as_ref(source, item) {
                     return None;
+                }
+                if item.kind() == "mod_item" {
+                    if let Some(name) = item.child_by_field_name("name") {
+                        let name = node_text(source, name);
+                        if matches!(name, "std" | "core" | "alloc") {
+                            rust_push_unique(
+                                &mut limits.standard_namespace_bindings,
+                                name.to_string(),
+                            );
+                        }
+                    }
                 }
                 if item.kind() == "use_declaration" {
                     let Some(argument) = item
@@ -1250,6 +1263,7 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
                         "imports": limits.imports,
                         "macros": limits.macros,
                         "attributes": limits.attributes,
+                        "standard_namespace_bindings": limits.standard_namespace_bindings,
                     },
                 }));
             }
