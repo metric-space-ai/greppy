@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use super::inference_daemon::{
-    self, Endpoint, PROTOCOL_VERSION, RequestOutcome, ServerPolicy, SpawnOutcome,
+    self, Endpoint, RequestOutcome, ServerPolicy, SpawnOutcome, PROTOCOL_VERSION,
 };
 
 const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";

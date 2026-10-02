@@ -68,7 +68,7 @@ mod cli_surface;
 mod web;
 mod web_attach;
 pub use cli_surface::*;
-pub use web::{NavCommand, ResultsCommand, SessionsCommand, WebCommand, web_runtime_socket};
+pub use web::{web_runtime_socket, NavCommand, ResultsCommand, SessionsCommand, WebCommand};
 pub use web_attach::{generate_attach_token, give_child_attach_token};
 mod nav;
 use nav::*;
@@ -1190,9 +1190,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         match greppy_core::cache::retain_base_build_staging_leases_from_env() {
             Ok(leases) => leases,
             Err(error) => {
-                eprintln!(
-                    "greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command"
-                );
+                eprintln!("greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command");
                 return 73;
             }
         };
@@ -1331,9 +1329,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy read SYMBOL|FILE [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
-        "replace-text" => {
-            "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]"
-        }
+        "replace-text" => "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]",
         "replace-lines" => "greppy replace-lines F A:B [NEW] [--dry-run] [--verify]",
         "replace-span" => "greppy replace-span H [NEW] [--dry-run] [--verify]",
         "write" => "greppy write PATH [NEW] [--dry-run] [--verify]",
@@ -2058,11 +2054,7 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
                 println!(
                     "agent workspace ready ({} backend; provider {}); {} workspace(s), {} chunks, {} physical bytes",
                     status.backend,
-                    if status.provider_ready {
-                        "ready"
-                    } else {
-                        "inactive"
-                    },
+                    if status.provider_ready { "ready" } else { "inactive" },
                     status.workspaces.len(),
                     status.chunks.chunk_count,
                     status.chunks.segment_bytes
@@ -2140,8 +2132,8 @@ fn agent_workspace_status(
 mod optional_workspace_status_tests {
     use super::*;
     use greppy_workspace_core::{
-        AdapterKind, PROVIDER_PROTOCOL_VERSION, ProviderCapabilities, ProviderManifest,
-        ProviderState,
+        AdapterKind, ProviderCapabilities, ProviderManifest, ProviderState,
+        PROVIDER_PROTOCOL_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4519,86 +4511,82 @@ fn start_background_demand_monitor(
     let monitor_path = job_path.clone();
     let spawned = std::thread::Builder::new()
         .name("greppy-query-demand".into())
-        .spawn(move || {
-            loop {
-                match greppy_core::cache::acquire_named_lock(
-                    &lock_name,
-                    greppy_core::cache::LockMode::Exclusive,
-                    true,
-                ) {
-                    Ok(Some(_exclusive)) => {
-                        let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
-                        if *terminal {
-                            return;
-                        }
-                        let job = read_background_job(&job_path);
-                        if !background_demand_may_cancel(
-                            job.as_ref(),
-                            *terminal,
-                            expected_pid,
-                            expected_generation,
-                        ) {
-                            return;
-                        }
-                        if delegated_base_owner_starting() {
-                            drop(terminal);
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        if cancel_delegated_base_owner(true) {
-                            if let Some(mut job) = job {
-                                job["state"] = serde_json::json!("cancelled");
-                                job["updated_at_unix_secs"] =
-                                    serde_json::json!(unix_now_secs_cli());
-                                job["last_error"] = serde_json::json!(
-                                    "automatic index stopped after its last query waiter exited"
-                                );
-                                let _ = write_background_job(&job_path, &job);
-                            }
-                            return;
-                        }
-                        finish_background_demand_monitor(
-                            &job_path,
-                            "cancelled",
-                            "automatic index stopped after its last query waiter exited",
-                            130,
-                        );
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
                     }
-                    Ok(None) => {
-                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
                     }
-                    Err(error) => {
-                        let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
-                        if *terminal {
-                            return;
-                        }
-                        let job = read_background_job(&job_path);
-                        if !background_demand_may_cancel(
-                            job.as_ref(),
-                            *terminal,
-                            expected_pid,
-                            expected_generation,
-                        ) {
-                            return;
-                        }
-                        if delegated_base_owner_starting() {
-                            drop(terminal);
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        let message = format!("automatic index demand monitor failed: {error}");
-                        if cancel_delegated_base_owner(false) {
-                            if let Some(mut job) = job {
-                                job["state"] = serde_json::json!("failed");
-                                job["updated_at_unix_secs"] =
-                                    serde_json::json!(unix_now_secs_cli());
-                                job["last_error"] = serde_json::json!(message.clone());
-                                let _ = write_background_job(&job_path, &job);
-                            }
-                            return;
-                        }
-                        finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
                     }
+                    if cancel_delegated_base_owner(true) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner(false) {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
                 }
             }
         });
@@ -4812,7 +4800,7 @@ fn replace_background_job_file(
 ) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     let source = source
@@ -6465,12 +6453,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     maybe_reindex_stale(&mut store, root)?;
     let Some(pack) = store.get_expand_pack(&lookup_id)? else {
         println!("expand: id not found in this project or expired: {id}");
-        println!(
-            "next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT"
-        );
-        println!(
-            "next: if it is missing in the original project too, rerun the original command to obtain a new handle"
-        );
+        println!("next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT");
+        println!("next: if it is missing in the original project too, rerun the original command to obtain a new handle");
         return Ok(1);
     };
     if pack.command == "read-smart" {
@@ -8413,12 +8397,11 @@ impl QueryPathFilters {
     }
 
     fn json_value(&self) -> serde_json::Value {
-        serde_json::json!(
-            self.filters
-                .iter()
-                .map(|filter| filter.shown.as_str())
-                .collect::<Vec<_>>()
-        )
+        serde_json::json!(self
+            .filters
+            .iter()
+            .map(|filter| filter.shown.as_str())
+            .collect::<Vec<_>>())
     }
 
     fn repo_prefixes(&self) -> Vec<String> {
@@ -8813,15 +8796,13 @@ mod debug_repo_model_asset_guards {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("bogus.bin");
         std::fs::write(&src, b"not a model").unwrap();
-        assert!(
-            super::extract_repo_model_asset(
-                std::path::Path::new("debug-asset-mismatch"),
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                "asset.bin",
-                src.to_str().unwrap(),
-            )
-            .is_none()
-        );
+        assert!(super::extract_repo_model_asset(
+            std::path::Path::new("debug-asset-mismatch"),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "asset.bin",
+            src.to_str().unwrap(),
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9341,15 +9322,9 @@ fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> St
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     let remediation = match freshness.get("state").and_then(serde_json::Value::as_str) {
-        Some("refreshing") => {
-            "index publication is in progress; inspect `greppy index status --json`, then retry this command after publication"
-        }
-        Some("unknown") => {
-            "freshness could not be verified; retry this command when host capacity is available"
-        }
-        Some("failed") => {
-            "automatic index preparation did not start; inspect `greppy index status --json` for the admission or startup failure, then retry this command when host capacity is available"
-        }
+        Some("refreshing") => "index publication is in progress; inspect `greppy index status --json`, then retry this command after publication",
+        Some("unknown") => "freshness could not be verified; retry this command when host capacity is available",
+        Some("failed") => "automatic index preparation did not start; inspect `greppy index status --json` for the admission or startup failure, then retry this command when host capacity is available",
         _ => STALE_REMEDIATION,
     };
     format!(
@@ -10221,10 +10196,7 @@ fn checkpoint_store_path(path: &std::path::Path) -> Result<(i64, i64, i64)> {
     if result.0 != 0 {
         return Err(Error::Store(format!(
             "checkpoint {} remained busy after 15s (busy={}, log_frames={}, checkpointed_frames={}); no snapshot was published; retry `greppy index` after the competing reader exits",
-            path.display(),
-            result.0,
-            result.1,
-            result.2
+            path.display(), result.0, result.1, result.2
         )));
     }
     Ok(result)
