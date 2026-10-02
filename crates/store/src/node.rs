@@ -67,7 +67,7 @@ fn fts_tokens(name: &str, qualified_name: &str) -> (String, String) {
 /// columns BEFORE the upsert and, when it exists, issue the FTS `'delete'`
 /// with those exact (old) values; then we upsert and insert the fresh
 /// posting. On a plain insert there is no prior row, so no delete runs.
-fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64> {
+fn insert_node_in_tx(tx: &rusqlite::Connection, n: &NewNode) -> Result<i64> {
     // Prune the prior posting for an in-place upsert using the row's
     // existing (old) column values — the only values that match what was
     // last inserted into the contentless index for this rowid.
@@ -465,6 +465,24 @@ impl Store {
     /// Immutable Base identities receive a private override; their old node and
     /// kind-dependent embedding become invisible without mutating the Base.
     pub fn update_node_identity(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
+        self.conn()
+            .execute_batch("SAVEPOINT greppy_node_identity")?;
+        let result = self.update_node_identity_inner(id, label, qname);
+        match result {
+            Ok(()) => {
+                self.conn().execute_batch("RELEASE greppy_node_identity")?;
+                Ok(())
+            }
+            Err(error) => {
+                self.conn().execute_batch(
+                    "ROLLBACK TO greppy_node_identity; RELEASE greppy_node_identity",
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn update_node_identity_inner(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
         if id < 0 && self.is_overlay() {
             let old = self
                 .get_node(id)?
@@ -479,14 +497,7 @@ impl Store {
                 end_line: old.end_line,
                 properties: old.properties,
             })?;
-            self.conn().execute(
-                "INSERT INTO main.schema_meta(key,value) VALUES(?1,json_array(?2))
-                ON CONFLICT(key) DO UPDATE SET value=json_insert(value,'$[#]',?2)",
-                params![
-                    format!("greppy.definition_identity_overrides.{}", old.project),
-                    old.qualified_name
-                ],
-            )?;
+            self.conn().execute("INSERT OR IGNORE INTO main.definition_identity_overrides(project,qualified_name) VALUES(?1,?2)", params![old.project, old.qualified_name])?;
             return Ok(());
         }
         let tx = self.transaction()?;

@@ -636,6 +636,9 @@ pub fn index_with_options_and_progress(
     }
 
     report.graph_generation = generation;
+    if store.is_overlay() {
+        recover_visible_effect_fn_bindings(store, project_name, &abs_root)?;
+    }
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
@@ -2254,6 +2257,36 @@ pub fn recover_visible_effect_fn_bindings(
     project: &str,
     root: &Path,
 ) -> Result<bool> {
+    store
+        .conn()
+        .execute_batch("SAVEPOINT greppy_effect_fn_repair")
+        .map_err(sqlite_err)?;
+    let result = recover_visible_effect_fn_bindings_inner(store, project, root);
+    match result {
+        Ok(repaired) => {
+            store
+                .conn()
+                .execute_batch("RELEASE greppy_effect_fn_repair")
+                .map_err(sqlite_err)?;
+            Ok(repaired)
+        }
+        Err(error) => {
+            store
+                .conn()
+                .execute_batch(
+                    "ROLLBACK TO greppy_effect_fn_repair; RELEASE greppy_effect_fn_repair",
+                )
+                .map_err(sqlite_err)?;
+            Err(error)
+        }
+    }
+}
+
+fn recover_visible_effect_fn_bindings_inner(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
     if !store.is_overlay() {
         return Ok(false);
     }
@@ -2334,9 +2367,9 @@ pub fn recover_visible_effect_fn_bindings(
         }
         persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
     }
-    let paths: Vec<_> = prepared.iter().map(|(path, _)| path).collect();
-    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        rusqlite::params![format!("greppy.js_ts_override_files.{project}"), serde_json::to_string(&paths).map_err(|error| greppy_core::Error::Store(format!("serialize Effect.fn repair paths: {error}")))?]).map_err(sqlite_err)?;
+    for (path, _) in &prepared {
+        store.conn().execute("INSERT OR IGNORE INTO main.js_ts_reference_override_files(project,file_path) VALUES(?1,?2)", rusqlite::params![project,path]).map_err(sqlite_err)?;
+    }
     rebuild_visible_overlay_edges(store, project)?;
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [marker]).map_err(sqlite_err)?;
     Ok(true)
@@ -6225,6 +6258,26 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 "source mismatch must reject before identity writes"
             );
             fs::write(&routing, original).unwrap();
+            overlay.conn().execute_batch("CREATE TEMP TRIGGER fail_effect_repair BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'injected repair failure'); END;").unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            for table in [
+                "main.nodes",
+                "main.definition_identity_overrides",
+                "main.js_ts_reference_override_files",
+                "main.raw_edges",
+            ] {
+                let rows: i64 = overlay
+                    .conn()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0, "failed repair must roll back {table}");
+            }
+            let markers: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.schema_meta WHERE key LIKE 'greppy.effect_fn_repair%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(markers, 0);
+            overlay
+                .conn()
+                .execute_batch("DROP TRIGGER fail_effect_repair;")
+                .unwrap();
             assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
             let target = overlay
                 .get_node_by_qname("test", "routing.ts::Function::target")

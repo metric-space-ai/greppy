@@ -276,6 +276,21 @@ impl Store {
         base_path: &Path,
         visibility: &crate::VisibilityIndex,
     ) -> Result<Self> {
+        // Pre-v17 read-only Delta readers have no override rows yet. Empty
+        // indexed TEMP tables preserve reads until the next writer migrates.
+        for (table, column) in [
+            ("definition_identity_overrides", "qualified_name"),
+            ("js_ts_reference_override_files", "file_path"),
+        ] {
+            let present: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                self.conn.execute_batch(&format!("CREATE TEMP TABLE {table}(project TEXT NOT NULL, {column} TEXT NOT NULL, PRIMARY KEY(project,{column}));"))?;
+            }
+        }
         let base_uri = sqlite_read_only_uri(base_path)?;
         self.conn
             .execute("ATTACH DATABASE ?1 AS greppy_base", [base_uri])?;
@@ -312,7 +327,11 @@ impl Store {
     /// Begin a write transaction. Rolls back on drop if neither
     /// `commit()` nor `rollback()` is called explicitly.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
-        let tx = self.conn.transaction()?;
+        let tx = if self.conn.is_autocommit() {
+            WriteScope::Transaction(self.conn.transaction()?)
+        } else {
+            WriteScope::Savepoint(self.conn.savepoint()?)
+        };
         Ok(Transaction { tx })
     }
 }
@@ -357,8 +376,8 @@ SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
        b.file_path, b.start_line, b.end_line, b.properties
 FROM greppy_base.nodes b
 WHERE NOT EXISTS (
-    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) q
-    WHERE m.key = 'greppy.definition_identity_overrides.' || b.project AND q.value = b.qualified_name
+    SELECT 1 FROM definition_identity_overrides q
+    WHERE q.project = b.project AND q.qualified_name = b.qualified_name
 )
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
@@ -375,8 +394,8 @@ SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
        b.target_qname, b.edge_type, b.properties
 FROM greppy_base.raw_edges b
 WHERE NOT EXISTS (
-    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
-    WHERE m.key = 'greppy.js_ts_override_files.' || b.project AND f.value = b.file_path
+    SELECT 1 FROM js_ts_reference_override_files f
+    WHERE f.project = b.project AND f.file_path = b.file_path
 )
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
@@ -423,8 +442,8 @@ JOIN nodes visible_target
   ON visible_target.project = base_target.project
  AND visible_target.qualified_name = base_target.qualified_name
 WHERE NOT EXISTS (
-    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
-    WHERE m.key = 'greppy.js_ts_override_files.' || e.project AND f.value = base_source.file_path
+    SELECT 1 FROM js_ts_reference_override_files f
+    WHERE f.project = e.project AND f.file_path = base_source.file_path
 )
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
@@ -468,8 +487,8 @@ SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
        b.vector, b.created_at, b.vector_i8, b.i8_scale
 FROM greppy_base.vector_embeddings b
 WHERE NOT EXISTS (
-    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) q
-    WHERE m.key = 'greppy.definition_identity_overrides.' || b.project AND q.value = b.qualified_name
+    SELECT 1 FROM definition_identity_overrides q
+    WHERE q.project = b.project AND q.qualified_name = b.qualified_name
 )
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
@@ -539,21 +558,37 @@ fn workspace_lifecycle_for_path(
 
 /// A write transaction. Use `Store::transaction()` to acquire.
 pub struct Transaction<'a> {
-    tx: rusqlite::Transaction<'a>,
+    tx: WriteScope<'a>,
+}
+
+enum WriteScope<'a> {
+    Transaction(rusqlite::Transaction<'a>),
+    Savepoint(rusqlite::Savepoint<'a>),
 }
 
 impl<'a> Transaction<'a> {
     pub fn commit(self) -> Result<()> {
-        self.tx.commit().map_err(Error::Sqlite)
+        match self.tx {
+            WriteScope::Transaction(tx) => tx.commit(),
+            WriteScope::Savepoint(tx) => tx.commit(),
+        }
+        .map_err(Error::Sqlite)
     }
 
     pub fn rollback(self) -> Result<()> {
-        self.tx.rollback().map_err(Error::Sqlite)
+        match self.tx {
+            WriteScope::Transaction(tx) => tx.rollback(),
+            WriteScope::Savepoint(mut tx) => tx.rollback(),
+        }
+        .map_err(Error::Sqlite)
     }
 
     /// Borrow the underlying rusqlite transaction. Crate-internal.
-    pub(crate) fn raw(&self) -> &rusqlite::Transaction<'a> {
-        &self.tx
+    pub(crate) fn raw(&self) -> &rusqlite::Connection {
+        match &self.tx {
+            WriteScope::Transaction(tx) => tx,
+            WriteScope::Savepoint(tx) => tx,
+        }
     }
 }
 
@@ -581,6 +616,32 @@ mod tests {
         drop(exclusive);
         drop(Store::open_with(&path, OpenOptions::read_only()).unwrap());
         std::fs::remove_dir_all(store_dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_pre_override_schema_overlay_stays_readable_until_writer_upgrade() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        drop(Store::open(&base_path).unwrap());
+        {
+            let delta = Store::open(&delta_path).unwrap();
+            delta.conn().execute_batch("DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+        }
+        let overlay = Store::open_overlay_read_only(
+            &base_path,
+            &delta_path,
+            &crate::VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(overlay.list_nodes("p", "", "", 0, 10).unwrap().is_empty());
+        assert_eq!(overlay.schema_version().unwrap(), 16);
+        drop(overlay);
+        let upgraded = Store::open(&delta_path).unwrap();
+        assert_eq!(
+            upgraded.schema_version().unwrap(),
+            crate::migrate::CURRENT_VERSION
+        );
     }
 
     #[test]
