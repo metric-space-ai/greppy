@@ -723,10 +723,17 @@ fn symbol_miss_names_unsupported_indexed_html_without_reindex_loop() {
         &store,
     );
     assert_eq!(code, 1, "HTML provider is not supported: {out} {err}");
-    assert!(out.contains("definition extraction is unsupported for indexed file public/crm/index.html"));
-    assert!(out.contains("search-pattern dispatchAction --fixed --path public/crm/index.html --root"));
+    assert!(
+        out.contains("definition extraction is unsupported for indexed file public/crm/index.html")
+    );
+    assert!(
+        out.contains("search-pattern dispatchAction --fixed --path public/crm/index.html --root")
+    );
     assert!(out.contains("reindexing does not add symbol coverage"));
-    assert!(!out.contains("next: refresh definitions") && !out.contains("retry without the path filter"));
+    assert!(
+        !out.contains("next: refresh definitions")
+            && !out.contains("retry without the path filter")
+    );
 
     // A guessed HTML suffix is not evidence that a nonexistent path was
     // indexed and skipped, nor that supported Rust definitions were omitted.
@@ -740,11 +747,20 @@ fn symbol_miss_names_unsupported_indexed_html_without_reindex_loop() {
         assert!(!out.contains("definition extraction is unsupported"));
     }
     let (code, out, err) = run(
-        &["search-pattern", "dispatchAction", "--fixed", "--path", "public/crm/index.html"],
+        &[
+            "search-pattern",
+            "dispatchAction",
+            "--fixed",
+            "--path",
+            "public/crm/index.html",
+        ],
         &repo,
         &store,
     );
-    assert_eq!(code, 0, "literal recovery must still find the source: {out} {err}");
+    assert_eq!(
+        code, 0,
+        "literal recovery must still find the source: {out} {err}"
+    );
     assert!(out.contains("public/crm/index.html"));
 }
 
