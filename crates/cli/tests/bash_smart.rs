@@ -56,6 +56,44 @@ fn run(workspace: &Workspace, args: &[&str]) -> Output {
 }
 
 #[test]
+fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
+    let workspace = fresh_workspace("node-diagnostics");
+    let cases = [
+        (
+            "Error [ERR_MODULE_NOT_FOUND]: Cannot find package playwright-core\n    at packageResolve (node:internal/modules/esm/resolve:1:2)\n",
+            "1",
+            "FAILED — exit 1: 1 error, 0 warnings",
+        ),
+        (
+            "(node:42) [MODULE_TYPELESS_PACKAGE_JSON] Warning: first\n(node:43) [MODULE_TYPELESS_PACKAGE_JSON] Warning: second\n(node:44) [MODULE_TYPELESS_PACKAGE_JSON] Warning: third\n(node:45) [MODULE_TYPELESS_PACKAGE_JSON] Warning: fourth\n",
+            "0",
+            "ok — exit 0, 4 warnings",
+        ),
+    ];
+    for (payload, exit, verdict) in cases {
+        let script = format!("printf '%s' \"$1\" >&2; exit {exit}");
+        let output = run(
+            &workspace,
+            &[
+                "bash-smart",
+                "--",
+                "sh",
+                "-c",
+                &script,
+                "node-diagnostic-fixture",
+                payload,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(exit.parse::<i32>().unwrap()));
+        let shown = text(&output.stdout);
+        assert!(shown.starts_with(verdict), "{shown}");
+        for line in payload.lines() {
+            assert!(shown.contains(line), "diagnostic lost: {line}: {shown}");
+        }
+    }
+}
+
+#[test]
 fn cold_unavailable_daemon_does_not_materialize_embedded_model() {
     let workspace = fresh_workspace("cold-no-daemon");
     let fixture = workspace.repo.join("failed-output.txt");
