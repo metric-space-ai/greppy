@@ -1,4 +1,41 @@
-//! ACP boundary regressions without a model, real tools, or user data.
+#[test]
+fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    let prepared = {
+        let state = lock_state(&server.state);
+        let session = &state.sessions[&id];
+        PreparedPrompt {
+            session_id: id,
+            cwd: session.cwd.clone(),
+            project: session.project.clone(),
+            model: session.model.clone(),
+            history: vec![],
+            cancel: Arc::clone(&session.cancel),
+            perms: Arc::clone(&session.perms),
+        }
+    };
+    let data_root = server.config.data_root.as_ref().unwrap();
+    std::fs::remove_dir_all(data_root).unwrap();
+    std::fs::write(data_root, b"fixture blocks persistence").unwrap();
+    let done = PromptDone {
+        messages: vec![Message {
+            role: greppy_agent::Role::User,
+            content: vec![greppy_agent::ContentPart::Text {
+                text: "fixture".into(),
+            }],
+        }],
+        usage: greppy_agent::Usage::default(),
+        stop_reason: "end_turn",
+    };
+    assert!(persist_turn(&prepared, &server.config, &done)
+        .unwrap_err()
+        .contains("cannot persist session history"));
+}
+
+// ACP boundary regressions without a model, real tools, or user data.
 use super::*;
 use greppy_agent::ToolDefinition;
 use std::sync::atomic::AtomicUsize;

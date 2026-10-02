@@ -787,7 +787,11 @@ impl Server {
             }));
             let reply = match result {
                 Ok(Ok(done)) => {
-                    persist_turn(&prepared, &config, &done);
+                    if let Err(error) = persist_turn(&prepared, &config, &done) {
+                        drop(busy);
+                        let _ = out.send(&rpc_error(&request_id, -32603, &error));
+                        return;
+                    }
                     {
                         let mut state = lock_state(&state);
                         if let Some(session) = state.sessions.get_mut(&prepared.session_id) {
@@ -1003,7 +1007,11 @@ impl ModelStream for CancelModel {
     }
 }
 
-fn persist_turn(prepared: &PreparedPrompt, config: &AcpConfig, done: &PromptDone) {
+fn persist_turn(
+    prepared: &PreparedPrompt,
+    config: &AcpConfig,
+    done: &PromptDone,
+) -> Result<(), String> {
     let (data_root, project) = agent_session_store_identity(&prepared.cwd);
     let data_root = config.data_root.clone().unwrap_or(data_root);
     let store = SessionStore::new(data_root.as_path(), project.as_str());
@@ -1011,8 +1019,12 @@ fn persist_turn(prepared: &PreparedPrompt, config: &AcpConfig, done: &PromptDone
         .messages
         .get(prepared.history.len()..)
         .unwrap_or(&done.messages);
-    let _ = store.append_messages(&prepared.session_id, &messages_from_protocol(new_messages));
-    let _ = store.append_usage(&prepared.session_id, &done.usage, 1, done.stop_reason);
+    store
+        .append_messages(&prepared.session_id, &messages_from_protocol(new_messages))
+        .map_err(|error| format!("cannot persist session history: {error}"))?;
+    store
+        .append_usage(&prepared.session_id, &done.usage, 1, done.stop_reason)
+        .map_err(|error| format!("cannot persist session usage: {error}"))?;
     if prepared.history.is_empty() {
         let title: String = new_messages
             .iter()
@@ -1022,9 +1034,11 @@ fn persist_turn(prepared: &PreparedPrompt, config: &AcpConfig, done: &PromptDone
                 _ => None,
             })
             .unwrap_or_else(|| "untitled".to_string());
-        let _ = store.set_title(&prepared.session_id, &title);
+        store
+            .set_title(&prepared.session_id, &title)
+            .map_err(|error| format!("cannot persist session title: {error}"))?;
     }
-    let _ = prepared.project;
+    Ok(())
 }
 
 struct GatingEnv {
