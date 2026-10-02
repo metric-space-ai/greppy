@@ -298,11 +298,13 @@ fn cold_file_handle_symbol_read_respects_auto_index_opt_out() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(format!("{stdout}{stderr}").contains("cold"));
-    assert!(!only_graph_db_below(&store)
-        .parent()
-        .unwrap()
-        .join("index.job")
-        .exists());
+    assert!(
+        !only_graph_db_below(&store)
+            .parent()
+            .unwrap()
+            .join("index.job")
+            .exists()
+    );
 }
 
 #[test]
@@ -966,6 +968,41 @@ fn read_file_range_and_all_bypass_pagination() {
     let (all_code, all_out, all_err) = run(&repo, &store, &["read-file", "config.json", "--all"]);
     assert_eq!(all_code, 0, "stdout={all_out}\nstderr={all_err}");
     assert_eq!(all_out, "config.json:1-4\na\nb\nc\nd\n");
+}
+
+#[test]
+fn read_file_missing_target_and_exact_range_skip_global_cache_writes() {
+    let (repo, store) = fresh_workspace("no-global-gc");
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "missing.rs", "--lines", "1:250"],
+    );
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("no such file: missing.rs"),
+        "{stdout} {stderr}"
+    );
+    assert!(
+        !store.join("gc.state").exists(),
+        "a refused file read must not run global maintenance"
+    );
+    std::fs::write(repo.join("config.json"), "first\nsecond\n").unwrap();
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "config.json", "--lines", "1:2"],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(stdout, "config.json:1-2\nfirst\nsecond\n");
+    assert!(
+        !store.join("gc.state").exists(),
+        "exact file reads must not run global maintenance"
+    );
+    assert!(
+        !store.exists(),
+        "file reads must not create a graph cache namespace"
+    );
 }
 
 #[test]

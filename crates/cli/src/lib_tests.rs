@@ -1,6 +1,57 @@
 use super::*;
 use clap::Parser;
 
+#[test]
+fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
+    let root = test_tempdir("output-cleanup-no-migration");
+    let graph = root.join("graph.db");
+    let mut store = greppy_store::Store::open(&graph).unwrap();
+    store
+        .upsert_project(&greppy_store::Project {
+            name: "fixture".into(),
+            indexed_at: "2026-10-03T00:00:00Z".into(),
+            root_path: root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    store.conn().execute_batch("INSERT INTO expand_packs(id,project,command,query,graph_generation,created_at,expires_at,summary_json,payload_text) VALUES ('expired','fixture','bash-smart','',0,1,2,'{}','expired'),('live','fixture','bash-smart','',0,1,999999999999,'{}','live'); DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+    drop(store);
+    let held = rusqlite::Connection::open(&graph).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 0);
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    held.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 1);
+    let schema: String = held
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema, "16");
+    let overrides: i64 = held
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='definition_identity_overrides'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(overrides, 0, "output cleanup must not migrate the graph");
+    let remaining: String = held
+        .query_row("SELECT id FROM expand_packs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, "live");
+    drop(held);
+    let missing = root.join("missing.db");
+    assert_eq!(
+        prune_expired_evidence_packs_in_existing_store(&missing, 3),
+        0
+    );
+    assert!(!missing.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn disposable_initializers_use_ensured_path_after_late_durable_store() {
@@ -401,49 +452,49 @@ fn edit_symbol_subprocess_helper() {
     assert_eq!(std::env::var_os("GREPPY_STORE_DIR"), Some(store_root));
 
     for (label, extension, source, replacement) in [
-            (
-                "typescript",
-                "ts",
-                "export function computeTotal(items:number[]):number{ return items.reduce((a,b)=>a+b,0); }\n",
-                "{ return Math.max(...items); }\n",
-            ),
-            (
-                "kotlin",
-                "kt",
-                "fun computeTotal(items:IntArray):Int{ return items.sum() }\n",
-                "{ return items.maxOrNull() ?: 0 }\n",
-            ),
-        ] {
-            let root = test_tempdir(&format!("edit-symbol-{label}"));
-            std::fs::create_dir(root.join(".git")).unwrap();
-            std::fs::write(root.join(format!("a.{extension}")), source).unwrap();
-            let replacement_path = root.join("new-body.txt");
-            std::fs::write(&replacement_path, replacement).unwrap();
+        (
+            "typescript",
+            "ts",
+            "export function computeTotal(items:number[]):number{ return items.reduce((a,b)=>a+b,0); }\n",
+            "{ return Math.max(...items); }\n",
+        ),
+        (
+            "kotlin",
+            "kt",
+            "fun computeTotal(items:IntArray):Int{ return items.sum() }\n",
+            "{ return items.maxOrNull() ?: 0 }\n",
+        ),
+    ] {
+        let root = test_tempdir(&format!("edit-symbol-{label}"));
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(format!("a.{extension}")), source).unwrap();
+        let replacement_path = root.join("new-body.txt");
+        std::fs::write(&replacement_path, replacement).unwrap();
 
-            let store_path = workspace_locator::store_path(&root);
-            std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
-            let mut store = greppy_store::Store::open(&store_path).unwrap();
-            let project = workspace_locator::project_identity(&root);
-            let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
-            assert!(report.is_clean(), "{label} index report: {report:?}");
-            drop(store);
+        let store_path = workspace_locator::store_path(&root);
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let project = workspace_locator::project_identity(&root);
+        let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
+        assert!(report.is_clean(), "{label} index report: {report:?}");
+        drop(store);
 
-            let code = dispatch_edit(
-                EditCommand::Replace {
-                    symbol: "computeTotal".into(),
-                    new: Some(std::fs::read_to_string(&replacement_path).unwrap()),
-                    body: true,
-                    dry_run: true,
-                    verify: false,
-                },
-                false,
-                root.to_str(),
-            )
-            .unwrap();
-            assert_eq!(code, 0, "indexed {label} edit --symbol must apply");
+        let code = dispatch_edit(
+            EditCommand::Replace {
+                symbol: "computeTotal".into(),
+                new: Some(std::fs::read_to_string(&replacement_path).unwrap()),
+                body: true,
+                dry_run: true,
+                verify: false,
+            },
+            false,
+            root.to_str(),
+        )
+        .unwrap();
+        assert_eq!(code, 0, "indexed {label} edit --symbol must apply");
 
-            std::fs::remove_dir_all(root).unwrap();
-        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -610,18 +661,26 @@ fn rename_identity_planner_subprocess_helper() {
             edit_sha256_hex(&std::fs::read(success_root.join(file)).unwrap())
         );
     }
-    assert!(std::fs::read_to_string(success_root.join("selected.rs"))
-        .unwrap()
-        .contains("fn advance"));
-    assert!(std::fs::read_to_string(success_root.join("caller.rs"))
-        .unwrap()
-        .contains("value.advance()"));
-    assert!(std::fs::read_to_string(success_root.join("unrelated_a.rs"))
-        .unwrap()
-        .contains("fn next"));
-    assert!(std::fs::read_to_string(success_root.join("unrelated_b.rs"))
-        .unwrap()
-        .contains("value.next()"));
+    assert!(
+        std::fs::read_to_string(success_root.join("selected.rs"))
+            .unwrap()
+            .contains("fn advance")
+    );
+    assert!(
+        std::fs::read_to_string(success_root.join("caller.rs"))
+            .unwrap()
+            .contains("value.advance()")
+    );
+    assert!(
+        std::fs::read_to_string(success_root.join("unrelated_a.rs"))
+            .unwrap()
+            .contains("fn next")
+    );
+    assert!(
+        std::fs::read_to_string(success_root.join("unrelated_b.rs"))
+            .unwrap()
+            .contains("value.next()")
+    );
 
     let omitted_root = test_tempdir("rename-identity-omitted");
     let (_project, _store_path) = index_rename_fixture(&omitted_root);
@@ -648,9 +707,11 @@ fn rename_identity_planner_subprocess_helper() {
     .err()
     .expect("omitted caller edge must refuse");
     assert_eq!(omitted.code, "unresolved_reference");
-    assert!(omitted
-        .message
-        .contains("absent from the graph rename plan"));
+    assert!(
+        omitted
+            .message
+            .contains("absent from the graph rename plan")
+    );
     for (path, expected) in omitted_before {
         assert_eq!(std::fs::read(omitted_root.join(path)).unwrap(), expected);
     }
@@ -825,7 +886,10 @@ fn rename_identity_planner_subprocess_helper() {
             refusal.code,
             refusal.message
         );
-        assert_eq!(std::fs::read(root.join("selected_free.rs")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.join("selected_free.rs")).unwrap(),
+            before
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1045,12 +1109,14 @@ fn semantic_embedding_wait_propagates_recorded_failure() {
         background_embedding_failure(failure).as_deref(),
         Some("GPU inference stopped")
     );
-    assert!(background_embedding_failure(serde_json::json!({
-        "kind": "embedding",
-        "state": "embedding",
-        "last_error": null,
-    }))
-    .is_none());
+    assert!(
+        background_embedding_failure(serde_json::json!({
+            "kind": "embedding",
+            "state": "embedding",
+            "last_error": null,
+        }))
+        .is_none()
+    );
 }
 
 #[test]
@@ -1549,30 +1615,34 @@ fn parse_path_disambiguation_and_hyphen_values() {
     assert!(Cli::try_parse_from(["greppy", "read-file", "a/mod.py"]).is_ok());
 
     // Selector and content values may begin with '-' (real diff/RST lines).
-    assert!(Cli::try_parse_from([
-        "greppy",
-        "edit",
-        "replace",
-        "--file",
-        "CHANGES.rst",
-        "--old",
-        "-   Fix how",
-        "--content",
-        "-   Fix what",
-    ])
-    .is_ok());
-    assert!(Cli::try_parse_from([
-        "greppy",
-        "edit",
-        "replace",
-        "--file",
-        "f.py",
-        "--pattern",
-        "-x",
-        "--content",
-        "-y",
-    ])
-    .is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "greppy",
+            "edit",
+            "replace",
+            "--file",
+            "CHANGES.rst",
+            "--old",
+            "-   Fix how",
+            "--content",
+            "-   Fix what",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "greppy",
+            "edit",
+            "replace",
+            "--file",
+            "f.py",
+            "--pattern",
+            "-x",
+            "--content",
+            "-y",
+        ])
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1615,14 +1685,16 @@ fn parse_plus_uses_vectors_without_a_public_flag() {
     }
 
     assert!(Cli::try_parse_from(["greppy", "plus", "--vectors", "refund workflow"]).is_err());
-    assert!(Cli::try_parse_from([
-        "greppy",
-        "plus",
-        "--embedding-gguf",
-        "model.gguf",
-        "refund workflow"
-    ])
-    .is_err());
+    assert!(
+        Cli::try_parse_from([
+            "greppy",
+            "plus",
+            "--embedding-gguf",
+            "model.gguf",
+            "refund workflow"
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -1655,15 +1727,17 @@ fn cli_device_flags_parse_on_embedding_commands() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
-    assert!(Cli::try_parse_from([
-        "grep",
-        "search",
-        "--device",
-        "cuda",
-        "--no-gpu",
-        "refund workflow",
-    ])
-    .is_err());
+    assert!(
+        Cli::try_parse_from([
+            "grep",
+            "search",
+            "--device",
+            "cuda",
+            "--no-gpu",
+            "refund workflow",
+        ])
+        .is_err()
+    );
 }
 
 #[cfg(any(unix, windows))]
@@ -2090,20 +2164,20 @@ where
     let signature = semantic_signature_from_span(code).unwrap();
 
     assert_eq!(
-            signature,
-            "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
-        );
+        signature,
+        "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
+    );
 }
 
 #[test]
 fn semantic_signature_from_span_stops_at_python_body_colon() {
     let source = "async def load_value(\n    key: str,\n    *,\n    default: dict[str, int] | None = None,\n) -> dict[str, int]:\n    value = await fetch(key)\n    return value or default or {}\n";
     assert_eq!(
-            semantic_signature_from_span(source).as_deref(),
-            Some(
-                "async def load_value( key: str, *, default: dict[str, int] | None = None, ) -> dict[str, int]"
-            )
-        );
+        semantic_signature_from_span(source).as_deref(),
+        Some(
+            "async def load_value( key: str, *, default: dict[str, int] | None = None, ) -> dict[str, int]"
+        )
+    );
 }
 
 #[test]
@@ -2783,8 +2857,10 @@ fn navigation_commands_parse_positional_symbol() {
 
     // `references` was where find-usages went to keep living after it was
     // supposedly removed. It parses as nothing now.
-    assert!(Cli::try_parse_from(["greppy", "references", "Widget"])
-        .is_ok_and(|cli| !matches!(cli.command, Some(Command::WhoCalls { .. }))));
+    assert!(
+        Cli::try_parse_from(["greppy", "references", "Widget"])
+            .is_ok_and(|cli| !matches!(cli.command, Some(Command::WhoCalls { .. })))
+    );
 
     let cli = Cli::try_parse_from([
         "greppy", "fan-in", "--edge", "USAGE", "--limit", "7", "--json",
@@ -3170,9 +3246,11 @@ fn file_qualified_single_and_multi_resolvers_agree() {
         );
     }
     for selector in ["missing.rs::run", "src/first.rs::missing"] {
-        assert!(resolve_symbol_nodes(&store, Some(selector))
-            .unwrap()
-            .is_empty());
+        assert!(
+            resolve_symbol_nodes(&store, Some(selector))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
     }
 }
