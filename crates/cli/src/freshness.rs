@@ -934,6 +934,31 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
     wait_for_index_publication(root, effective_root, "first-use")
 }
 
+fn index_publication_failure(effective_root: &std::path::Path, detail: String) -> Error {
+    // This field is recorded from the admission runner's exit status, not
+    // guessed from arbitrary error text. Match the detail too: a historical
+    // denial record must not classify a different current observation.
+    let deferred = read_background_job(&background_job_path(effective_root)).is_some_and(|job| {
+        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+            && job
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred")
+            && job.get("last_error").and_then(serde_json::Value::as_str) == Some(detail.as_str())
+    });
+    if deferred {
+        Error::AdmissionDeferred {
+            root: effective_root.to_path_buf(),
+            detail,
+        }
+    } else {
+        Error::Index(format!(
+            "structural index failed for {}: {detail}",
+            effective_root.display()
+        ))
+    }
+}
+
 pub(crate) fn wait_for_index_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
@@ -955,10 +980,7 @@ pub(crate) fn wait_for_index_publication(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "the index process could not be started".into());
-        Error::Index(format!(
-            "structural index failed for {}: {detail}",
-            effective_root.display()
-        ))
+        index_publication_failure(effective_root, detail)
     })?;
     crate::context_status::restricted(
         effective_root,
@@ -999,10 +1021,7 @@ pub(crate) fn wait_for_index_publication(
                 return Ok(());
             }
             FirstUseIndexObservation::Failed(detail) => {
-                return Err(Error::Index(format!(
-                    "structural index failed for {}: {detail}",
-                    effective_root.display()
-                )));
+                return Err(index_publication_failure(effective_root, detail));
             }
         }
     }
