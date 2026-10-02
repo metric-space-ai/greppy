@@ -1068,9 +1068,6 @@ pub(crate) fn dispatch_impact(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    // The tree's per-node hints reach the Qwen daemon; start its async model
-    // load now so the walk below overlaps the cold start.
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "impact", symbol.unwrap_or(""), paths)?;
     let dir = match direction.to_ascii_lowercase().as_str() {
         "incoming" | "in" | "callers" => greppy_search::ReachDirection::Incoming,
@@ -1233,6 +1230,8 @@ pub(crate) fn dispatch_impact(
         println!("{what}");
         return Ok(0);
     }
+    // Preparation admission and target resolution precede model work.
+    prewarm_summary_daemon();
     let total = reached.len();
     // `--all` lifts the print cap so the full transitive set is inspectable
     // in one call (the footer's "T total" was previously unreachable — clap
@@ -1532,7 +1531,6 @@ pub(crate) fn dispatch_briefs(
         return Ok(exit);
     }
 
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "brief", "", paths)?;
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
@@ -1578,6 +1576,7 @@ pub(crate) fn dispatch_briefs(
         ensure_unambiguous_target(&store, symbol, ids)?;
     }
 
+    prewarm_summary_daemon();
     let semantic_backend_unavailable = embedding_config_for_required_use(EmbeddingCliArgs {
         device: None,
         no_gpu: false,
@@ -1624,9 +1623,6 @@ pub(crate) fn dispatch_brief(
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
-    // brief summarizes its definition span and its callees'; overlap the
-    // model load with resolution and store open.
-    prewarm_summary_daemon();
     let query_symbol = symbol.unwrap_or("");
     let path_filters = prepare_query_path_filters(root, "brief", query_symbol, paths)?;
     let mut store = open_default_store_query_writer(root)?;
@@ -1691,6 +1687,7 @@ pub(crate) fn dispatch_brief(
             );
             return Ok(1);
         }
+        prewarm_summary_daemon();
         let root_path = resolve_root(root)?;
         return dispatch_brief_json(
             &store,
@@ -1749,6 +1746,9 @@ pub(crate) fn dispatch_brief(
         }
         if printed > 0 {
             println!();
+        }
+        if printed == 0 {
+            prewarm_summary_daemon();
         }
         printed += 1;
         brief.print_brief(&node);

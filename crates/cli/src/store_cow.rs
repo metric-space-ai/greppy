@@ -4016,17 +4016,24 @@ mod tests {
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(after_dirty
-            .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == stable_caller_after_dirty.id));
+        assert_eq!(
+            after_dirty
+                .incoming_edges(target_after_dirty.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .filter(|edge| edge.source_id == stable_caller_after_dirty.id)
+                .count(),
+            1,
+            "sparse publication keeps exactly one validated stable caller"
+        );
         let later_relations = overlay_relations(&after_dirty);
-        assert!(
+        assert_eq!(
             later_relations
                 .iter()
-                .all(|row| row.0 != "src/stable.rs::Function::stable_caller"),
-            "ordinary bounded publication must prune the temporary Base shadow"
+                .filter(|row| row.0 == "src/stable.rs::Function::stable_caller" && row.3 == 1)
+                .count(),
+            1,
+            "ordinary bounded publication must retain the validated masked Base caller"
         );
         assert_eq!(
             later_relations
@@ -4037,7 +4044,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.3 == 1)
                 .collect::<Vec<_>>(),
-            "both missing Base relations must survive ordinary Delta publication"
+            "missing and validated masked Base relations must survive ordinary Delta publication"
         );
         let caller_after_dirty = after_dirty
             .get_node_by_qname("p", "src/caller.rs::Function::caller")
