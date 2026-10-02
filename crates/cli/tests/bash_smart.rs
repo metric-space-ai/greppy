@@ -624,7 +624,7 @@ fn disjoint_array_values_have_gap_markers_before_each_retained_jump() {
     for (label, base) in [("first", 100), ("second", 200), ("third", 300)] {
         raw.push_str(&format!("  \"{label}\": [\n"));
         for n in 1..=10 {
-            raw.push_str(&format!("    0.{},\n", base + n));
+            raw.push_str(&format!("    0.{:018},\n", base + n));
         }
         raw.push_str("  ],\n");
     }
@@ -632,9 +632,15 @@ fn disjoint_array_values_have_gap_markers_before_each_retained_jump() {
     let output = run(&workspace, &["bash-smart", "--", "printf", "%s", &raw]);
     assert_eq!(output.status.code(), Some(0));
     let stdout = text(&output.stdout);
-    let first = stdout.find("0.101,").expect("first representative");
-    let second = stdout.find("0.201,").expect("second representative");
-    let third = stdout.find("0.301,").expect("third representative");
+    let first = stdout
+        .find("0.000000000000000101,")
+        .expect("first representative");
+    let second = stdout
+        .find("0.000000000000000201,")
+        .expect("second representative");
+    let third = stdout
+        .find("0.000000000000000301,")
+        .expect("third representative");
     assert!(first < second && second < third, "{stdout}");
     assert!(
         stdout[first..second].contains("… lines "),
