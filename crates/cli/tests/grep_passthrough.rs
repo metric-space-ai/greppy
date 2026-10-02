@@ -231,8 +231,34 @@ fn passthrough_pattern_exception_preserves_command_diagnostics() {
         greppy_command("empty-command-like-stdin").arg("research"),
         b"",
     );
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("did you mean"));
+    let expected = run_with_stdin(Command::new(real_grep_path()).arg("research"), b"");
+    diff_outputs("empty-command-like-stdin", &output, &expected);
+}
+
+#[test]
+fn passthrough_closed_empty_stream_keeps_grep_eof_contract() {
+    for args in [
+        &["alpha"][..],
+        &["-E", "^n.*(target|cache|tmp)"][..],
+        &["-q", "alpha"][..],
+        &["-v", "alpha"][..],
+        &[""][..],
+    ] {
+        for explicit in [false, true] {
+            let mut ours = greppy_command("closed-empty-stdin");
+            let mut real = Command::new(real_grep_path());
+            ours.args(args);
+            real.args(args);
+            if explicit {
+                ours.arg("-");
+                real.arg("-");
+            }
+            let actual = run_with_stdin(&mut ours, b"");
+            let expected = run_with_stdin(&mut real, b"");
+            diff_outputs("closed-empty-stdin", &actual, &expected);
+            assert_eq!(actual.status.code(), Some(1), "{args:?}");
+        }
+    }
 }
 
 #[test]
