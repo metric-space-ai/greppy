@@ -1746,6 +1746,12 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        if !self.controller.is_running() {
+            if let Err(error) = self.recover_controller("controller worker exited") {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 33);
+            }
+        }
         let Some(controller_root) = self.controller.temp_dir().map(Path::to_path_buf) else {
             self.finish_session(&session_id);
             return engine_error(
@@ -1832,12 +1838,6 @@ impl Daemon {
         } else {
             None
         };
-        if !self.controller.is_running() {
-            if let Err(error) = self.recover_controller("controller worker exited") {
-                self.finish_session(&session_id);
-                return engine_error(request, error, 33);
-            }
-        }
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
         let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
