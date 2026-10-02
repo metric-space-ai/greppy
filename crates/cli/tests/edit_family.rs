@@ -1315,3 +1315,58 @@ fn omitted_root_keeps_repo_relative_file_operands() {
     assert_file(&nested.join("probe.conf"), "SUBDIR_SENTINEL\n");
     assert_file(&fixture.base.join("probe.conf"), "CWD_SENTINEL\n");
 }
+
+#[test]
+fn replace_rust_attributes_roundtrip_and_refusal_are_atomic() {
+    let fixture = Fixture::new("rust-outer-attributes");
+    let file = fixture.repo.join("probe.rs");
+    let suffix = "\n\nfn neighbor() { let _ = 99; }\n";
+    let original = format!("#[inline]\n#[allow(dead_code)]\nfn probe() {{ let _ = 1; }}{suffix}");
+    std::fs::write(&file, &original).unwrap();
+    let read = fixture.run(&["read", "probe"]);
+    assert_eq!(read.status.code(), Some(0), "{}", combined(&read));
+    let replacement = "#[inline]\n#[allow(dead_code)]\nfn probe() { let _ = 2; }";
+    let replaced = fixture.run(&["replace", "probe", replacement]);
+    assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
+    assert_file(&file, &format!("{replacement}{suffix}"));
+
+    let plain = "fn probe() { let _ = 3; }";
+    let replaced = fixture.run(&["replace", "probe", plain]);
+    assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
+    assert_file(
+        &file,
+        &format!("#[inline]\n#[allow(dead_code)]\n{plain}{suffix}"),
+    );
+
+    let changed_attributes = "#[cold]\nfn probe() { let _ = 4; }";
+    let replaced = fixture.run(&["replace", "probe", changed_attributes]);
+    assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
+    let expected = format!("{changed_attributes}{suffix}");
+    assert_file(&file, &expected);
+
+    let refused = fixture.run(&["replace", "probe", "#[cold]\nfn probe( {"]);
+    assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+    assert_file(&file, &expected);
+}
+
+#[test]
+fn replace_rust_attributed_method_keeps_indentation_and_body_edits() {
+    let fixture = Fixture::new("rust-method-attributes");
+    let file = fixture.repo.join("probe.rs");
+    let before =
+        "struct Counter;\nimpl Counter {\n    #[inline]\n    fn probe(&self) { let _ = 1; }\n}\n";
+    std::fs::write(&file, before).unwrap();
+    let replacement = "    #[cold]\n    fn probe(&self) { let _ = 2; }";
+    let replaced = fixture.run(&["replace", "probe", replacement]);
+    assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
+    assert_file(
+        &file,
+        &format!("struct Counter;\nimpl Counter {{\n{replacement}\n}}\n"),
+    );
+    let body = fixture.run(&["replace", "probe", "{ let _ = 3; }", "--body"]);
+    assert_eq!(body.status.code(), Some(0), "{}", combined(&body));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text.matches("#[cold]").count(), 1, "{text}");
+    assert!(!text.contains("#[inline]"), "{text}");
+    assert!(text.contains("let _ = 3;"), "{text}");
+}
