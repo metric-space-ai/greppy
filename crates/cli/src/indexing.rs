@@ -725,7 +725,15 @@ fn dispatch_index_health_with_detail(
                 .ok()
         })
         .unwrap_or(0);
-    let configured_embedding_model = embedding_config_optional(embedding_args).ok().flatten();
+    // Health polling only needs the configured identity. Resolving inference
+    // assets here extracts and hashes the entire embedded model on first use.
+    let configured_embedding_model = if test_inference_skipped() {
+        None
+    } else {
+        embedding_config_for_daemon_probe(embedding_args)
+            .ok()
+            .flatten()
+    };
     let embedding_complete = graph_generation.is_some_and(|generation| {
         let Some(model) = configured_embedding_model.as_ref() else {
             return false;

@@ -1637,6 +1637,38 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 }
 
 #[test]
+fn index_status_does_not_materialize_inference_assets() {
+    let (repo, store, _scratch) = make_repo("status-no-assets", "status_identity_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let inference_root = store.parent().unwrap().join("cold-inference");
+    let inference_path = inference_root.to_str().unwrap();
+    for args in [
+        vec!["index", "status", "--json"],
+        vec!["index", "status", "--json", "--diagnostics"],
+    ] {
+        let (code, out, err) = run_with_env(
+            &args,
+            &repo,
+            &store,
+            &[
+                ("GREPPY_TEST_SKIP_INFERENCE", "0"),
+                ("GREPPY_SHARED_INFERENCE_ROOT", inference_path),
+            ],
+        );
+        assert_eq!(code, 73, "missing embeddings must remain unhealthy: {out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["fresh"], true);
+        assert_eq!(value["embedding_complete"], false);
+        assert_eq!(value["vectors_missing_with_model"], true);
+        assert!(
+            !inference_root.join("models/v1/embeddinggemma-300m-q4k").exists(),
+            "status must not extract or verify model assets"
+        );
+    }
+}
+
+#[test]
 fn index_status_is_unhealthy_for_real_provider_file_failures() {
     let (repo, store, _scratch) =
         make_repo("index-status-provider-failure", "provider_failure_marker");
