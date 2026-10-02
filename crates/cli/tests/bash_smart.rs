@@ -87,9 +87,7 @@ fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
         assert_eq!(output.status.code(), Some(exit.parse::<i32>().unwrap()));
         let shown = text(&output.stdout);
         assert!(shown.starts_with(verdict), "{shown}");
-        for line in payload.lines() {
-            assert!(shown.contains(line), "diagnostic lost: {line}: {shown}");
-        }
+        assert_eq!(output.stderr, payload.as_bytes(), "child stderr changed");
     }
 }
 
