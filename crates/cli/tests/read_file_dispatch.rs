@@ -95,13 +95,30 @@ fn invalid_selected_or_whole_file_text_is_never_reported_missing() {
     let path = repo.join("dump.txt");
     std::fs::write(&path, b"alpha\n\xff\n").unwrap();
     let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--lines", "1:2"]);
-    assert_ne!(code, 0);
-    assert!(err.contains("requested lines 1:2") && err.contains("UTF-8"), "{out} {err}");
+    assert_eq!(code, 1);
+    assert!(out.contains("requested lines 1:2") && out.contains("UTF-8"), "{out} {err}");
     assert!(!out.contains("no such file") && !err.contains("no such file"));
     let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--all"]);
     assert_eq!(code, 1, "{out} {err}");
     assert!(out.contains("cannot read file dump.txt:"), "{out} {err}");
     assert!(!out.contains("no such file"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn invalid_selected_text_does_not_hide_later_file_spans() {
+    let (repo, store) = fresh_workspace("invalid-first-file");
+    std::fs::write(repo.join("invalid.txt"), b"alpha\n\xff\n").unwrap();
+    std::fs::write(repo.join("valid.txt"), b"beta\r\ngamma\nignored\n").unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "invalid.txt", "valid.txt", "--lines", "1:2"],
+    );
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(out.contains("cannot read file invalid.txt:"), "{out}");
+    assert!(out.contains("valid.txt:1-2\nbeta\r\ngamma\n"), "{out}");
+    assert!(!out.contains("no such file") && !out.contains("ignored"));
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
 

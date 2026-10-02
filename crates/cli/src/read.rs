@@ -1375,9 +1375,10 @@ fn read_bounded_file_range(
         line_count += 1;
     }
     let text = String::from_utf8(selected).map_err(|error| {
-        Error::Invalid(format!(
-            "read-file cannot decode requested lines {start}:{end} in {path} as UTF-8: {error}"
-        ))
+        Error::io(
+            format!("read-file cannot decode requested lines {start}:{end} in {path} as UTF-8"),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
     })?;
     Ok((text, start, end))
 }
@@ -1581,10 +1582,22 @@ pub(crate) fn dispatch_read_files(
             continue;
         }
         if let Some(raw) = lines.filter(|_| !with_handle) {
-            let file = std::fs::File::open(&canonical)
-                .map_err(|error| Error::io(format!("open read-file {path}"), error))?;
-            let mut reader = std::io::BufReader::new(file);
-            let (text, start, end) = read_bounded_file_range(&mut reader, raw, path)?;
+            let span = std::fs::File::open(&canonical)
+                .map_err(|error| Error::io(format!("open read-file {path}"), error))
+                .and_then(|file| {
+                    read_bounded_file_range(&mut std::io::BufReader::new(file), raw, path)
+                });
+            let (text, start, end) = match span {
+                Ok(span) => span,
+                Err(error @ Error::Io { .. }) => {
+                    read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                    println!("cannot read file {path}: {error}");
+                    previous_ended_with_newline = true;
+                    failed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let group = format!("{shown}:{start}-{end}\n{text}");
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             let stdout = std::io::stdout();
