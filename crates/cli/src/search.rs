@@ -1364,9 +1364,6 @@ pub(crate) fn dispatch_semantic(
             "search requires a plain-English query".into(),
         ));
     }
-    // Result purposes reach the Qwen daemon; overlap its model load with the
-    // embedding query and vector search.
-    prewarm_summary_daemon();
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
 
     // Stale/unknown snapshots are never served. Semantic search is always
@@ -1398,25 +1395,10 @@ pub(crate) fn dispatch_semantic(
         return Ok(1);
     }
 
-    let cfg = match embedding_config_for_required_use(embedding_args) {
-        Ok(cfg) => cfg,
-        Err(error) if embedding_asset_missing_error(&error) => {
-            if json {
-                emit_semantic_backend_unavailable(
-                    &project,
-                    q,
-                    paths,
-                    root,
-                    true,
-                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
-                )?;
-            } else {
-                println!("semantic index unavailable — embedding assets could not be resolved");
-            }
-            return Ok(1);
-        }
-        Err(error) => return Err(error),
-    };
+    // Freshness and admission need model identity, not materialized assets.
+    // A cold/refused query must not extract or load either model first.
+    let cfg = embedding_config_for_daemon_probe(embedding_args)?
+        .ok_or_else(|| Error::Config("embedding model identity is unavailable".into()))?;
     {
         let generation = current_graph_generation(&store, root)?;
         let candidate_limit = vector_exact_candidate_limit()?;
@@ -1571,6 +1553,28 @@ pub(crate) fn dispatch_semantic(
             return Ok(1);
         }
 
+        let cfg = match embedding_config_for_required_use(embedding_args) {
+            Ok(cfg) => cfg,
+            Err(error) if embedding_asset_missing_error(&error) => {
+                if json {
+                    emit_semantic_backend_unavailable(
+                    &project,
+                    q,
+                    paths,
+                    root,
+                    true,
+                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
+                )?;
+                } else {
+                    println!("semantic index unavailable — embedding assets could not be resolved");
+                }
+                return Ok(1);
+            }
+            Err(error) => return Err(error),
+        };
+        // Only a query with a current published vector snapshot will emit
+        // purposes. Overlap summary loading with its actual embedding work.
+        prewarm_summary_daemon();
         match embed_query_cached(&cfg, root, q) {
             Ok(query_vector) => {
                 scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
