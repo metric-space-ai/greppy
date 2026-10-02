@@ -1007,8 +1007,9 @@ fn read_file_missing_target_and_exact_range_skip_global_cache_writes() {
 fn index_status_skips_global_cache_writes() {
     let (repo, store) = fresh_workspace("status-no-global-gc");
     let (code, stdout, stderr) = run(&repo, &store, &["index", "status", "--json"]);
-    assert_eq!(code, 0, "{stdout} {stderr}");
-    let _: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["status"], "no_index");
     assert!(
         !store.join("gc.state").exists(),
         "a read-only status request must not run global maintenance"
