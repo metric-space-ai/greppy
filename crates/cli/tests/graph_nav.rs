@@ -689,8 +689,16 @@ fn expand_missing_id_reports_clear_message() {
     let (code, out, err) = run(&["expand", "does-not-exist"], &repo, &store);
     assert_eq!(code, 1, "missing expand id should exit 1; stderr={err}");
     assert!(
-        out.contains("expand: id not found or expired: does-not-exist"),
+        out.contains("expand: id not found in this project or expired: does-not-exist"),
         "missing expand id must be visible on stdout; got: {out:?}"
+    );
+    assert!(
+        out.contains("--root ORIGINAL_PROJECT"),
+        "cross-project recovery missing: {out:?}"
+    );
+    assert!(
+        out.contains("rerun the original command"),
+        "expired handle recovery missing: {out:?}"
     );
 }
 

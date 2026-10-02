@@ -6432,7 +6432,9 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
     let Some(pack) = store.get_expand_pack(&lookup_id)? else {
-        println!("expand: id not found or expired: {id}");
+        println!("expand: id not found in this project or expired: {id}");
+        println!("next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT");
+        println!("next: if it is missing in the original project too, rerun the original command to obtain a new handle");
         return Ok(1);
     };
     if pack.command == "read-smart" {
@@ -7408,7 +7410,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         std::collections::HashMap::new();
     let empty_word = match req.kind {
         NavKind::WhoCalls => "no callers",
-        NavKind::Callees => "no resolved indexed callees; external, unresolved or filtered calls may still exist",
+        NavKind::Callees => {
+            "no resolved indexed callees; external, unresolved or filtered calls may still exist"
+        }
     };
     for (index, symbol) in req.targets.iter().enumerate() {
         if index > 0 {

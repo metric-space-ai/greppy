@@ -3704,7 +3704,10 @@ pub(crate) fn dispatch_callees(
             println!("no resolved indexed callees; external or unresolved calls may still exist");
             println!("inspect source with: greppy read {query_symbol}");
         } else {
-            println!("no resolved indexed callees under path filter: {}", path_filters.shown());
+            println!(
+                "no resolved indexed callees under path filter: {}",
+                path_filters.shown()
+            );
             println!("external, unresolved or filtered calls may still exist; inspect source with: greppy read {query_symbol}");
         }
         return Ok(0);
