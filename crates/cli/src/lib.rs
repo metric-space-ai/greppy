@@ -11284,6 +11284,37 @@ fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> 
             .get("unresolved_omitted")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
+    let uncertain_by_target: Vec<(String, usize)> = value
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|target| {
+            let symbol = target.get("symbol")?.as_str()?;
+            if target
+                .get("callers_incomplete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
+            }
+            let returned = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|row| row.get("target").and_then(serde_json::Value::as_str) == Some(symbol))
+                .count();
+            Some((
+                symbol.to_owned(),
+                returned
+                    + target
+                        .get("unresolved_omitted")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as usize,
+            ))
+        })
+        .collect();
     let total = confirmed_total.saturating_add(uncertain_total);
     // Navigation producers already select the uncertain page at this offset;
     // only their retained confirmed prefix is skipped here.
@@ -11302,6 +11333,31 @@ fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> 
                 .unwrap_or(0);
             value["unresolved_omitted"] = uncertain_total.saturating_sub(retained).into();
             value["unresolved_truncated"] = (retained < uncertain_total).into();
+        }
+        for (symbol, initial_total) in &uncertain_by_target {
+            let retained = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row.get("target").and_then(serde_json::Value::as_str) == Some(symbol.as_str())
+                })
+                .count();
+            if let Some(targets) = value
+                .get_mut("targets")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for target in targets {
+                    if target.get("symbol").and_then(serde_json::Value::as_str)
+                        == Some(symbol.as_str())
+                    {
+                        target["unresolved_omitted"] =
+                            initial_total.saturating_sub(retained).into();
+                        target["unresolved_truncated"] = (retained < *initial_total).into();
+                    }
+                }
+            }
         }
         let shown = result_item_count(&value);
         let end = spec.offset.saturating_add(shown).min(total);

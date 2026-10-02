@@ -491,6 +491,33 @@ fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
             expected,
             "byte budget offset={offset}\n{text}"
         );
+        let page = f.query(&[
+            "who-calls",
+            TARGET,
+            SECOND,
+            "--all",
+            "--limit",
+            "3",
+            "--offset",
+            &offset_arg,
+            "--max-bytes",
+            "1",
+            "--json",
+        ]);
+        assert_eq!(
+            json_rows(&page),
+            expected,
+            "byte budget offset={offset}\n{page}"
+        );
+        for target in page["targets"].as_array().unwrap() {
+            let symbol = target["symbol"].as_str().unwrap();
+            let retained = unresolved(&page)
+                .iter()
+                .filter(|row| row["target"] == symbol)
+                .count();
+            assert_eq!(target["unresolved_omitted"], 2 - retained, "{page}");
+            assert_eq!(target["unresolved_truncated"], retained < 2, "{page}");
+        }
         if offset < canonical.len() - 1 {
             assert!(text.contains(&format!("--offset {}", offset + 1)), "{text}");
         } else {
