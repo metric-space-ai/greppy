@@ -1493,6 +1493,24 @@ pub(crate) fn index_overlay_snapshot(
     }
     {
         let mut delta = greppy_store::Store::open(&temp_path)?;
+        if overlay.visibility.changed_count() == 0 && active_path.exists() {
+            // A clean overlay starts with an empty private graph, but its
+            // publication counter must continue from the active Delta. Without
+            // this metadata, each repair/revert republishes generation one and
+            // waiting queries cannot distinguish it from their old snapshot.
+            let prior_states =
+                greppy_store::Store::open_with(active_path, greppy_store::OpenOptions::read_only())
+                    .and_then(|active| active.list_private_workspace_states());
+            match prior_states {
+                Ok(states) => {
+                    for state in states {
+                        delta.upsert_workspace_state(&state)?;
+                    }
+                }
+                Err(error) if active_snapshot_is_recoverable(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         // A Delta generation contains only paths that still differ from the
         // pinned Base. Exact reverts and removed untracked files therefore
         // discard their former private contributions before the next overlay
