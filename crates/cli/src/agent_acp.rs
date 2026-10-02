@@ -136,7 +136,7 @@ where
 struct Server {
     out: Out,
     state: Arc<Mutex<State>>,
-    pending: Arc<Mutex<HashMap<String, Sender<Value>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
     next_request_id: Arc<AtomicU64>,
     config: AcpConfig,
 }
@@ -163,6 +163,13 @@ struct Session {
 struct PermMemory {
     allow: HashSet<String>,
     reject: HashSet<String>,
+}
+
+/// One in-flight `session/request_permission`. Dropping `sender` unblocks the
+/// tool gate with a denial, which is how cancel clears a pending decision.
+struct PendingPermission {
+    session_id: String,
+    sender: Sender<Value>,
 }
 
 struct Out {
@@ -226,7 +233,9 @@ impl Server {
             let line = match std::str::from_utf8(&buf) {
                 Ok(line) => line.to_string(),
                 Err(_) => {
-                    let _ = self.out.send(&rpc_error(&Value::Null, -32700, "Parse error"));
+                    let _ = self
+                        .out
+                        .send(&rpc_error(&Value::Null, -32700, "Parse error"));
                     continue;
                 }
             };
@@ -238,7 +247,11 @@ impl Server {
         loop {
             let busy = match self.state.lock() {
                 Ok(state) => state.sessions.values().any(|session| session.busy),
-                Err(poisoned) => poisoned.into_inner().sessions.values().any(|session| session.busy),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .sessions
+                    .values()
+                    .any(|session| session.busy),
             };
             if !busy {
                 break;
@@ -251,12 +264,16 @@ impl Server {
         let message: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(_) => {
-                let _ = self.out.send(&rpc_error(&Value::Null, -32700, "Parse error"));
+                let _ = self
+                    .out
+                    .send(&rpc_error(&Value::Null, -32700, "Parse error"));
                 return;
             }
         };
         if !message.is_object() {
-            let _ = self.out.send(&rpc_error(&Value::Null, -32600, "Invalid request"));
+            let _ = self
+                .out
+                .send(&rpc_error(&Value::Null, -32600, "Invalid request"));
             return;
         }
         if message.get("method").is_none() {
@@ -272,7 +289,10 @@ impl Server {
             return;
         }
         if is_notification(&message) {
-            self.handle_notification(&method, message.get("params").cloned().unwrap_or(Value::Null));
+            self.handle_notification(
+                &method,
+                message.get("params").cloned().unwrap_or(Value::Null),
+            );
             return;
         }
         let id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -291,8 +311,8 @@ impl Server {
             Ok(mut pending) => pending.remove(&key),
             Err(poisoned) => poisoned.into_inner().remove(&key),
         };
-        if let Some(sender) = sender {
-            let _ = sender.send(message.clone());
+        if let Some(pending) = sender {
+            let _ = pending.sender.send(message.clone());
         }
     }
 
@@ -315,6 +335,11 @@ impl Server {
         if let Some(flag) = flag {
             flag.store(true, Ordering::Relaxed);
         }
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.retain(|_, permission| permission.session_id != session_id);
     }
 
     /// Returns a response frame, or `None` when the request stays open
@@ -336,11 +361,7 @@ impl Server {
                 self.session_prompt(id, params);
                 None
             }
-            other => Some(rpc_error(
-                id,
-                -32601,
-                &format!("Method not found: {other}"),
-            )),
+            other => Some(rpc_error(id, -32601, &format!("Method not found: {other}"))),
         }
     }
 
@@ -461,13 +482,7 @@ impl Server {
         let store = SessionStore::new(data_root.as_path(), project.as_str());
         let record = match store.load(session_id) {
             Ok(record) => record,
-            Err(_) => {
-                return rpc_error(
-                    id,
-                    -32002,
-                    &format!("session not found: {session_id}"),
-                )
-            }
+            Err(_) => return rpc_error(id, -32002, &format!("session not found: {session_id}")),
         };
         {
             let state = lock_state(&self.state);
@@ -521,7 +536,11 @@ impl Server {
                         "sessionUpdate": "agent_thought_chunk",
                         "content": {"type": "text", "text": text}
                     }),
-                    greppy_agent::ContentPart::ToolCall { id, name, arguments } => json!({
+                    greppy_agent::ContentPart::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": id,
                         "title": tool_title(name, arguments),
@@ -544,14 +563,14 @@ impl Server {
     }
 
     fn session_list(&self, id: &Value, params: &Value) -> Value {
-        if params.get("cursor").and_then(Value::as_str).is_some_and(|cursor| !cursor.is_empty())
+        if params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .is_some_and(|cursor| !cursor.is_empty())
         {
             return rpc_error(id, -32602, "pagination cursor is not supported");
         }
-        let cwd_filter = params
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from);
+        let cwd_filter = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
         let (data_root, project) = match &cwd_filter {
             Some(cwd) => self.store_identity(cwd),
             None => {
@@ -562,9 +581,7 @@ impl Server {
         let store = SessionStore::new(data_root.as_path(), project.as_str());
         let records = match store.list() {
             Ok(records) => records,
-            Err(error) => {
-                return rpc_error(id, -32603, &format!("cannot list sessions: {error}"))
-            }
+            Err(error) => return rpc_error(id, -32603, &format!("cannot list sessions: {error}")),
         };
         let sessions: Vec<Value> = records
             .into_iter()
@@ -678,7 +695,9 @@ impl Server {
         let blocks = match params.get("prompt").and_then(Value::as_array) {
             Some(blocks) => blocks,
             None => {
-                let _ = self.out.send(&rpc_error(id, -32602, "prompt must be an array"));
+                let _ = self
+                    .out
+                    .send(&rpc_error(id, -32602, "prompt must be an array"));
                 return;
             }
         };
@@ -707,9 +726,7 @@ impl Server {
             }
             if session.busy {
                 drop(state);
-                let _ = self
-                    .out
-                    .send(&rpc_error(id, -32600, "session is busy"));
+                let _ = self.out.send(&rpc_error(id, -32600, "session is busy"));
                 return;
             }
             if session.model.trim().is_empty() {
@@ -762,12 +779,10 @@ impl Server {
                         let mut state = lock_state(&state);
                         if let Some(session) = state.sessions.get_mut(&prepared.session_id) {
                             session.messages = done.messages;
-                            session.usage_in = session
-                                .usage_in
-                                .saturating_add(done.usage.input_tokens);
-                            session.usage_out = session
-                                .usage_out
-                                .saturating_add(done.usage.output_tokens);
+                            session.usage_in =
+                                session.usage_in.saturating_add(done.usage.input_tokens);
+                            session.usage_out =
+                                session.usage_out.saturating_add(done.usage.output_tokens);
                         }
                     }
                     let mut response = json!({
@@ -788,11 +803,7 @@ impl Server {
                     rpc_ok(&request_id, response)
                 }
                 Ok(Err(error)) => rpc_error(&request_id, -32603, &error),
-                Err(_) => rpc_error(
-                    &request_id,
-                    -32603,
-                    "agent prompt failed unexpectedly",
-                ),
+                Err(_) => rpc_error(&request_id, -32603, "agent prompt failed unexpectedly"),
             };
             drop(busy);
             let _ = out.send(&reply);
@@ -811,10 +822,7 @@ impl Server {
 
     fn store_identity(&self, cwd: &Path) -> (PathBuf, String) {
         let (data_root, project) = agent_session_store_identity(cwd);
-        (
-            self.config.data_root.clone().unwrap_or(data_root),
-            project,
-        )
+        (self.config.data_root.clone().unwrap_or(data_root), project)
     }
 }
 
@@ -861,13 +869,14 @@ fn run_prompt(
     prompt: &str,
     config: &AcpConfig,
     out: &Out,
-    pending: &Arc<Mutex<HashMap<String, Sender<Value>>>>,
+    pending: &Arc<Mutex<HashMap<String, PendingPermission>>>,
     next_request_id: &Arc<AtomicU64>,
 ) -> Result<PromptDone, String> {
     let mut client = Client::new(&config.endpoint, &prepared.model);
     if let Some(key) = &config.api_key {
         client = client.with_api_key(key);
     }
+
     let inner: Box<dyn ExecutionEnv + Send> = if let Some(factory) = &config.tool_env {
         factory(&prepared.cwd)
     } else {
@@ -940,9 +949,7 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
             "rawInput": arguments
         }),
         LoopEvent::ToolFinish {
-            call_id,
-            outcome,
-            ..
+            call_id, outcome, ..
         } => json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": call_id,
@@ -972,12 +979,7 @@ fn persist_turn(prepared: &PreparedPrompt, config: &AcpConfig, done: &PromptDone
         .get(prepared.history.len()..)
         .unwrap_or(&done.messages);
     let _ = store.append_messages(&prepared.session_id, &messages_from_protocol(new_messages));
-    let _ = store.append_usage(
-        &prepared.session_id,
-        &done.usage,
-        1,
-        done.stop_reason,
-    );
+    let _ = store.append_usage(&prepared.session_id, &done.usage, 1, done.stop_reason);
     if prepared.history.is_empty() {
         let title: String = new_messages
             .iter()
@@ -998,7 +1000,7 @@ struct GatingEnv {
     perms: Arc<Mutex<PermMemory>>,
     cancel: Arc<AtomicBool>,
     out: Out,
-    pending: Arc<Mutex<HashMap<String, Sender<Value>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -1061,7 +1063,13 @@ impl GatingEnv {
                 Ok(pending) => pending,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            pending.insert(id_key(&request_id), tx);
+            pending.insert(
+                id_key(&request_id),
+                PendingPermission {
+                    session_id: self.session_id.clone(),
+                    sender: tx,
+                },
+            );
         }
         let tool_call_id = active_tool_call_id(request_number);
         let request = json!({
@@ -1128,7 +1136,12 @@ fn wait_permission(rx: &Receiver<Value>, cancel: &AtomicBool) -> Option<Value> {
             return None;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(value) => return Some(value),
+            Ok(value) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                return Some(value);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return None,
         }
@@ -1215,8 +1228,8 @@ fn require_cwd(params: &Value) -> Result<PathBuf, String> {
     }
     let mut path = PathBuf::from(raw);
     if path.is_relative() {
-        let current = std::env::current_dir()
-            .map_err(|error| format!("cannot resolve cwd: {error}"))?;
+        let current =
+            std::env::current_dir().map_err(|error| format!("cannot resolve cwd: {error}"))?;
         path = current.join(path);
     }
     if !path.is_dir() {
@@ -1230,9 +1243,9 @@ fn require_empty_mcp(params: &Value, required: bool) -> Result<(), String> {
         None if required => Err("mcpServers is required".to_string()),
         None => Ok(()),
         Some(Value::Array(items)) if items.is_empty() => Ok(()),
-        Some(Value::Array(_)) => Err(
-            "MCP servers are not supported; send an empty mcpServers array".to_string(),
-        ),
+        Some(Value::Array(_)) => {
+            Err("MCP servers are not supported; send an empty mcpServers array".to_string())
+        }
         Some(_) => Err("mcpServers must be an array".to_string()),
     }
 }
@@ -1395,7 +1408,10 @@ fn loop_error_message(error: &LoopError) -> String {
     match error {
         LoopError::Transport(message) => format!("model transport failed: {message}"),
         LoopError::Http { status, body } => {
-            format!("model gateway returned HTTP {status}: {}", truncate_chars(body, 400))
+            format!(
+                "model gateway returned HTTP {status}: {}",
+                truncate_chars(body, 400)
+            )
         }
         LoopError::Stream(message) => format!("model stream failed: {message}"),
         LoopError::Incomplete(message) => format!("model stream incomplete: {message}"),
