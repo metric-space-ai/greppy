@@ -683,8 +683,11 @@ fn read_file_default_bounds_one_long_utf8_line_without_a_false_handle() {
     assert!(out.contains(&"€".repeat(21_845)));
     assert!(!out.contains('\u{fffd}'));
     assert!(out.contains(
-        "truncated at 65535 source bytes (default limit 65536); 234465 source bytes omitted"
+        "truncated at 65535 source bytes (default limit 65536); total line count unknown"
     ));
+    assert!(
+        out.contains("234465 source bytes omitted according to file size at open (300000 bytes)")
+    );
     assert!(out.contains("--lines 1:1\n"));
     assert!(out.contains("rereads the partial line in full"));
     assert!(!out.contains("handle: geh"));
@@ -708,11 +711,49 @@ fn read_file_byte_budget_continues_after_a_complete_line() {
     assert_eq!(code, 0, "{err}");
     assert!(out.starts_with("large.txt:1-1\n"));
     assert!(!out.contains("last line partial"));
-    assert!(out.contains("5 source bytes omitted from this file"));
+    assert!(out.contains("5 source bytes omitted according to file size at open"));
     assert!(out.contains("--lines 2:2\n"));
     let (code, out, err) = run(&repo, &store, &["read-file", "large.txt", "--lines", "2:2"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "large.txt:2-2\ntail\n");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() {
+    use std::io::{Seek, SeekFrom, Write};
+    let (repo, store) = fresh_workspace("byte-budget-sparse");
+    let path = repo.join("huge.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&vec![b'x'; 65_537]).unwrap();
+    file.seek(SeekFrom::Start(8 * 1024 * 1024 * 1024)).unwrap();
+    file.write_all(b"\xff").unwrap();
+    drop(file);
+    let (code, out, err) = run(&repo, &store, &["read-file", "huge.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.len() < 66_500);
+    assert!(out.contains("total line count unknown"));
+    assert!(out.contains("8589869057 source bytes omitted according to file size at open"));
+    assert!(out.contains("--lines 1:1\n"));
+    assert!(!store.exists(), "preview must not initialize a store");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_default_rejects_invalid_utf8_inside_observed_prefix() {
+    let (repo, store) = fresh_workspace("byte-budget-invalid-prefix");
+    let mut bytes = vec![b'x'; 100_000];
+    bytes[12] = 0xff;
+    std::fs::write(repo.join("invalid.txt"), bytes).unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "invalid.txt"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(out.contains("cannot read file invalid.txt"));
+    assert!(!out.contains("truncated at"));
+    // EOF is not a truncation boundary: an incomplete final character is invalid.
+    std::fs::write(repo.join("invalid.txt"), b"abc\xe2\x82").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "invalid.txt"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(out.contains("cannot read file invalid.txt"));
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
 
