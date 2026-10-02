@@ -212,11 +212,8 @@ impl<'a> DaemonCodeEmbeddingProvider<'a> {
         }
     }
 
-    pub(super) fn backend_name(&self) -> String {
-        format!(
-            "shared-daemon:{}",
-            super::inference_device_identity(&self.cfg.device)
-        )
+    pub(super) fn backend_plan(&self) -> (String, Option<String>) {
+        super::embedding_backend_plan(self.cfg)
     }
 
     pub(super) fn last_error(&self) -> Option<&str> {

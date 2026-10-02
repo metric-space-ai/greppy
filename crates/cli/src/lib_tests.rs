@@ -833,6 +833,9 @@ fn embedding_eta_uses_backend_prior_then_measured_throughput() {
     assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
     assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));
     assert_eq!(initial_embedding_eta_seconds(1_200, "cuda"), Some(100));
+    assert_eq!(initial_embedding_eta_seconds(19_786, "shared-daemon:auto"), None);
+    assert_eq!(initial_embedding_eta_seconds(19_786, "unknown"), None);
+    assert_eq!(initial_embedding_eta_seconds(0, "unknown"), Some(0));
     assert_eq!(observed_embedding_eta_seconds(10, 100, 5_000), Some(45));
     assert_eq!(observed_embedding_rate_milli(10, 5_000), Some(2_000));
 }

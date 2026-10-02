@@ -5072,7 +5072,11 @@ impl BackgroundJobGuard {
             );
             self.eta_seconds =
                 observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms)
-                    .or(self.eta_seconds);
+                    .or_else(|| {
+                        self.backend.as_deref().and_then(|backend| {
+                            initial_embedding_eta_seconds(inference_workload, backend)
+                        })
+                    });
             self.rate_milli_documents_per_second =
                 observed_embedding_rate_milli(inferred, elapsed_ms);
         }
@@ -5114,6 +5118,12 @@ impl BackgroundJobGuard {
             Some(_) => Some("steps"),
             None => None,
         };
+        let eta_basis = match (self.eta_seconds, self.rate_milli_documents_per_second) {
+            (Some(0), _) => Some("completed_embedding_work"),
+            (Some(_), Some(rate)) if rate > 0 => Some("observed_inference"),
+            (Some(_), _) => Some("backend_prior"),
+            (None, _) => None,
+        };
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
@@ -5135,6 +5145,7 @@ impl BackgroundJobGuard {
             "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
+            "eta_basis": eta_basis,
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
             "current_detail": self.current_detail,
@@ -5350,17 +5361,21 @@ impl Drop for BackgroundJobGuard {
     }
 }
 
-fn initial_embedding_rate(backend: &str) -> u64 {
+fn initial_embedding_rate(backend: &str) -> Option<u64> {
     match backend {
-        "cuda" => 12,
-        "metal" => 8,
-        _ => 1,
+        "cuda" => Some(12),
+        "metal" => Some(8),
+        "cpu" => Some(1),
+        _ => None,
     }
 }
 
 fn initial_embedding_eta_seconds(total_documents: usize, backend: &str) -> Option<u64> {
     let total = u64::try_from(total_documents).ok()?;
-    let rate = initial_embedding_rate(backend).max(1);
+    if total == 0 {
+        return Some(0);
+    }
+    let rate = initial_embedding_rate(backend)?;
     Some(total.saturating_add(rate - 1) / rate)
 }
 

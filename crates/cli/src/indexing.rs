@@ -1906,7 +1906,9 @@ pub(crate) fn index_embeddings_into_temp_store(
         let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
             store, target, project, &provider, options,
         )?;
-        job.embedding_started(&provider.backend_name(), total_documents);
+        let (backend, device) = provider.backend_plan();
+        job.device = device;
+        job.embedding_started(&backend, total_documents);
         let mut progress = |value| job.embedding_progress(value);
         greppy_indexer::index_code_embeddings_for_project_with_progress(
             store,
