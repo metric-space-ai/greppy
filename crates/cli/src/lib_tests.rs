@@ -249,7 +249,7 @@ fn indexed_refusal_recovery_matches_observed_freshness_state() {
     });
     let message = indexed_stale_skip_message("search-symbol", &failed);
     assert!(
-        message.contains("automatic index preparation did not start"),
+        message.contains("automatic index preparation failed"),
         "{message}"
     );
     assert!(message.contains("retry this command"), "{message}");
@@ -258,6 +258,83 @@ fn indexed_refusal_recovery_matches_observed_freshness_state() {
         "state": "drift", "reasons": ["files modified since last index"]
     });
     assert!(indexed_stale_skip_message("search-symbol", &drift).contains(STALE_REMEDIATION));
+}
+
+#[test]
+fn semantic_refusal_preserves_admission_reason_and_selected_root() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("selected repo's root");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let store = scratch.path().join("selected store");
+    // SAFETY: this test holds TEST_ENV_LOCK and restores the environment.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &store);
+    }
+    let error = "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another thread owns the heavy-job lease";
+    write_background_job(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": error}),
+    )
+    .unwrap();
+    let freshness = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false, "reasons": ["head_oid changed"]}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&freshness), 75);
+    assert_eq!(freshness["preparation_failure_kind"], "admission_deferred");
+    assert_eq!(freshness["preparation_error"], error);
+    let diagnostics = freshness["diagnostics_command"].as_str().unwrap();
+    assert!(
+        diagnostics.contains(&format!(
+            "--root {}",
+            shell_quote_cli(&root.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.starts_with(&format!(
+            "GREPPY_STORE_DIR={}",
+            shell_quote_cli(&store.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    for message in [
+        vector_stale_skip_message("semantic-search", &freshness),
+        indexed_stale_skip_message("who-calls", &freshness),
+    ] {
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains(diagnostics), "{message}");
+        assert!(!message.contains(STALE_REMEDIATION), "{message}");
+        assert!(!message.contains("publication is in progress"), "{message}");
+    }
+    let refreshing = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "refreshing", "fresh": false}),
+        root.to_str(),
+    );
+    assert!(
+        refreshing.get("preparation_error").is_none(),
+        "{refreshing}"
+    );
+    let fresh = serde_json::json!({"state": "fresh", "fresh": true});
+    assert_eq!(
+        preparation_refusal_diagnostics(fresh.clone(), root.to_str()),
+        fresh
+    );
+    write_background_job(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": "fixture extraction error"}),
+    )
+    .unwrap();
+    let broken = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&broken), EXIT_IO as i32);
+    assert!(
+        vector_stale_skip_message("semantic-search", &broken).contains("fixture extraction error")
+    );
 }
 
 #[test]
