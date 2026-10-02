@@ -2189,7 +2189,7 @@ fn js_ts_effect_fn_binding(decl: Node<'_>, source: &[u8]) -> bool {
     let Some(callee) = factory.child_by_field_name("function") else {
         return false;
     };
-    if node_text(source, callee) != "Effect.fn" {
+    if node_text(source, callee) != "Effect.fn" || !js_ts_has_effect_import(decl, source) {
         return false;
     }
     let Some(arguments) = value.child_by_field_name("arguments") else {
@@ -2203,6 +2203,70 @@ fn js_ts_effect_fn_binding(decl: Node<'_>, source: &[u8]) -> bool {
         )
     });
     callable
+}
+
+/// Require the named package import, and conservatively reject any local binding
+/// of Effect in this file. Unknown factories must remain ordinary Variables.
+fn js_ts_has_effect_import(node: Node<'_>, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut imported = false;
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "import_statement" {
+            let from_effect = !node_text(source, current)
+                .trim_start()
+                .starts_with("import type ")
+                && current.child_by_field_name("source").is_some_and(|path| {
+                    matches!(node_text(source, path), "\"effect\"" | "'effect'")
+                });
+            if from_effect {
+                let mut imports = vec![current];
+                while let Some(part) = imports.pop() {
+                    if part.kind() == "import_specifier" {
+                        let name = part
+                            .child_by_field_name("name")
+                            .map(|n| node_text(source, n));
+                        let alias = part
+                            .child_by_field_name("alias")
+                            .map(|n| node_text(source, n));
+                        imported |=
+                            name == Some("Effect") && alias.is_none_or(|name| name == "Effect");
+                    }
+                    let mut cursor = part.walk();
+                    imports.extend(part.named_children(&mut cursor));
+                }
+            }
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "variable_declarator" | "function_declaration" | "class_declaration"
+        ) && current
+            .child_by_field_name("name")
+            .is_some_and(|n| node_text(source, n) == "Effect")
+        {
+            return false;
+        }
+        if matches!(
+            current.kind(),
+            "formal_parameters" | "required_parameter" | "optional_parameter"
+        ) {
+            let mut parameters = vec![current];
+            while let Some(parameter) = parameters.pop() {
+                if parameter.kind() == "identifier" && node_text(source, parameter) == "Effect" {
+                    return false;
+                }
+                let mut cursor = parameter.walk();
+                parameters.extend(parameter.named_children(&mut cursor));
+            }
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.named_children(&mut cursor));
+    }
+    imported
 }
 
 /// First direct child of `node` whose kind is `kind`, if any.
@@ -17825,6 +17889,7 @@ export const make = Effect.gen(function* () {
     fn ts_effect_fn_generator_call_keeps_exported_binding_owner() {
         let r = ts(
             r#"
+import { Effect } from "effect";
 const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
     function* (input: { model: string }) { return input.model; },
 );
@@ -17859,6 +17924,30 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "expected exactly one direct helper call: {calls:?}"
         );
         assert_eq!(calls[0].source_qualified_name, owner);
+    }
+
+    #[test]
+    fn ts_effect_fn_requires_package_import_without_shadowing() {
+        for prefix in [
+            "",
+            "const Effect = { fn: () => () => 42 };",
+            "import { Effect } from 'effect'; function unrelated(Effect: unknown) {}",
+            "import { Effect } from 'elsewhere';",
+        ] {
+            let source = format!("{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}");
+            let result = ts(&source, "shadow.ts");
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .any(|node| node.name == "value" && node.label == "Variable"),
+                "unproven or shadowed factory must remain a Variable: {prefix}"
+            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|node| node.name == "value" && node.label == "Function"));
+        }
     }
 
     #[test]

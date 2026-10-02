@@ -452,6 +452,9 @@ pub fn index_with_options_and_progress(
             project_name,
             &entries,
             worker_count,
+            prior_indexer_version
+                .as_deref()
+                .is_some_and(|version| version.starts_with("greppy-indexer-v6")),
             &mut report,
             progress,
         )?;
@@ -684,8 +687,9 @@ fn indexer_version_for_options(options: &IndexOptions) -> String {
 fn is_rust_reexport_migration(prior: &str, current: &str) -> bool {
     let (prior_base, prior_scope) = prior.split_once(';').unwrap_or((prior, ""));
     let (current_base, current_scope) = current.split_once(';').unwrap_or((current, ""));
-    prior_base == "greppy-indexer-v6"
-        && current_base == "greppy-indexer-v7"
+    ((prior_base == "greppy-indexer-v6" && current_base == "greppy-indexer-v7")
+        || (matches!(prior_base, "greppy-indexer-v6" | "greppy-indexer-v7")
+            && current_base == "greppy-indexer-v8"))
         && prior_scope == current_scope
 }
 
@@ -1057,13 +1061,16 @@ fn run_incremental(
     Ok(changed_files)
 }
 
-/// Re-extract only raw edges for byte-identical Rust files during the v6→v7
-/// migration. Nodes, file state, content, and vectors deliberately stay put.
+/// Refresh byte-identical files affected by structural migrations: Rust raw
+/// edges for v6 upgrades, JS/TS raw edges and proven Effect.fn binding kinds
+/// for v8. Unaffected nodes, content and vectors stay put; changed definition
+/// identities lose their own vectors so embedding hashes remain authoritative.
 fn refresh_unchanged_rust_raw_edges(
     store: &mut Store,
     project_name: &str,
     entries: &[InventoryEntry],
     worker_count: usize,
+    refresh_rust: bool,
     report: &mut IndexReport,
     progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<std::collections::HashSet<String>> {
@@ -1091,9 +1098,11 @@ fn refresh_unchanged_rust_raw_edges(
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
+            let language = greppy_parser::language_for_path(&entry.abs_path);
             (!changed_paths.contains(entry.rel_path.as_str())
-                && greppy_parser::language_for_path(&entry.abs_path) == Language::Rust)
-                .then_some((idx, entry, Language::Rust))
+                && ((refresh_rust && language == Language::Rust)
+                    || matches!(language, Language::JavaScript | Language::TypeScript { .. })))
+            .then_some((idx, entry, language))
         })
         .collect::<Vec<_>>();
     let mut extraction_progress = |completed, total| {
@@ -1109,8 +1118,31 @@ fn refresh_unchanged_rust_raw_edges(
     for outcome in extractions {
         match outcome {
             FileOutcome::Extracted {
-                rel_path, edges, ..
+                rel_path,
+                nodes,
+                edges,
+                ..
             } => {
+                // v8 changes only proven Effect.fn Variables into Functions.
+                // Keep unaffected node IDs/content/vectors; retire embeddings
+                // for the changed identity rather than reuse an unverified hash.
+                for node in nodes.iter().filter(|node| node.label == "Function") {
+                    let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+                    if let Some(old) = store.get_node_by_qname(project_name, &old_qname)? {
+                        if old.label == "Variable"
+                            && old.name == node.name
+                            && old.start_line == i64::from(node.start_line)
+                            && old.end_line == i64::from(node.end_line)
+                        {
+                            store.conn().execute(
+                                "DELETE FROM main.vector_embeddings WHERE node_id = ?1",
+                                [old.id],
+                            )?;
+                            store.conn().execute("UPDATE main.nodes SET label = ?2, qualified_name = ?3 WHERE id = ?1",
+                                rusqlite::params![old.id, node.label, node.qualified_name])?;
+                        }
+                    }
+                }
                 persist_raw_edges_for_file(store, project_name, &rel_path, &edges)?;
                 report.files_indexed += 1;
             }
@@ -5909,6 +5941,7 @@ fn caller(value: Buffer) -> &'static [u8] {
         fs::write(
             repo.path().join("routing.ts"),
             r#"
+import { Effect } from "effect";
 const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
     function* (input: { model: string }) { return input.model; },
 );
@@ -5949,6 +5982,65 @@ export function invalidCalls() { plainValue(); effectValue(); }
             "expected one persisted direct caller: {incoming:?}"
         );
         assert_eq!(incoming[0].source_id, caller.id);
+        fs::write(repo.path().join("unrelated.py"), "def retained(): pass\n").unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let retained = store
+            .get_node_by_qname("test", "unrelated.py::Function::retained")
+            .unwrap()
+            .unwrap();
+        // Recreate the v7 binding identities while keeping identical file bytes.
+        store
+            .conn()
+            .execute("DELETE FROM main.edges WHERE source_id = ?1", [caller.id])
+            .unwrap();
+        for node in [&target, &caller] {
+            store
+                .conn()
+                .execute(
+                    "UPDATE main.nodes SET label = 'Variable', qualified_name = ?2 WHERE id = ?1",
+                    rusqlite::params![
+                        node.id,
+                        node.qualified_name.replace("::Function::", "::Variable::")
+                    ],
+                )
+                .unwrap();
+        }
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version = "greppy-indexer-v7".into();
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let repaired = index(&mut store, repo.path(), "test").unwrap();
+        assert_eq!(
+            repaired.files_indexed, 1,
+            "only affected-language unchanged file is refreshed"
+        );
+        let restored = store
+            .get_node_by_qname("test", &target.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.id, target.id, "migration preserves node identity");
+        assert_eq!(
+            store
+                .get_node_by_qname("test", &retained.qualified_name)
+                .unwrap()
+                .unwrap()
+                .id,
+            retained.id,
+            "unaffected language nodes stay in place"
+        );
+        let incoming = store
+            .incoming_edges(restored.id, Some("CALLS"), 10)
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_id, caller.id);
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            0,
+            "migration must run once, without manual full reindex"
+        );
+
         for name in ["plainValue", "effectValue"] {
             let value = store
                 .get_node_by_qname("test", &format!("routing.ts::Variable::{name}"))
