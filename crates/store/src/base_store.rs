@@ -558,8 +558,52 @@ fn hex_sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DigestFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+fn digest_file_identity(file: &fs::File) -> io::Result<DigestFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid_data("Base digest requires a regular file"));
+    }
+    Ok(DigestFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+#[cfg(unix)]
+static VERIFIED_FILE_DIGESTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<DigestFileIdentity, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+// Only memoize inside this process, never trust a persistent checksum sidecar.
+// Every process performs its first full digest. File replacement or mutation
+// invalidates reuse even when length and modification time are restored.
 fn file_sha256(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
+    #[cfg(unix)]
+    let before = digest_file_identity(&file)?;
+    #[cfg(unix)]
+    if let Some(digest) = VERIFIED_FILE_DIGESTS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&before).cloned())
+    {
+        return Ok(digest);
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -569,11 +613,25 @@ fn file_sha256(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher
+    let digest: String = hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect();
+    #[cfg(unix)]
+    {
+        if digest_file_identity(&file)? != before {
+            return Err(invalid_data("Base file changed during digest verification"));
+        }
+        if let Ok(mut cache) = VERIFIED_FILE_DIGESTS.lock() {
+            // Bound memory across long-lived query/agent processes.
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(before, digest.clone());
+        }
+    }
+    Ok(digest)
 }
 
 fn write_new_synced(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
@@ -610,6 +668,53 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_digest_cache_invalidates_same_length_tamper_with_restored_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("graph.db");
+        fs::write(&path, b"original").unwrap();
+        let original_time = fs::metadata(&path).unwrap().modified().unwrap();
+        let original = file_sha256(&path).unwrap();
+        let stamp = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            VERIFIED_FILE_DIGESTS.lock().unwrap().get(&stamp),
+            Some(&original)
+        );
+        assert_eq!(file_sha256(&path).unwrap(), original);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&path, b"tampered").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_time))
+            .unwrap();
+        let changed = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(changed.size, stamp.size);
+        assert_eq!(changed.modified, stamp.modified);
+        assert_ne!(changed.changed, stamp.changed);
+        assert_eq!(file_sha256(&path).unwrap(), hex_sha256(b"tampered"));
+        assert_ne!(file_sha256(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_digest_cache_invalidates_replaced_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("summary.db");
+        fs::write(&path, b"original").unwrap();
+        let before = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
+        let original = file_sha256(&path).unwrap();
+        let replacement = tmp.path().join("replacement");
+        fs::write(&replacement, b"replaced").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let after = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
+        assert_ne!(before.inode, after.inode);
+        assert_eq!(file_sha256(&path).unwrap(), hex_sha256(b"replaced"));
+        assert_ne!(file_sha256(&path).unwrap(), original);
+    }
 
     fn identity() -> BaseStoreIdentity {
         BaseStoreIdentity {
