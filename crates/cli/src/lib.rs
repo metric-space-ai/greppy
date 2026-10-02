@@ -6569,24 +6569,41 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     // store and do not depend on graph completeness. Serve them before opening
     // a linked-worktree overlay, whose immutable Base may have been cleaned up.
     let pack_store = open_default_store_pack_writer(root)?;
-    if let Some(pack) = pack_store.get_expand_pack(&lookup_id)? {
-        #[cfg(feature = "bash-smart")]
-        if pack.command == "bash-smart" {
-            return bash_smart::expand(&pack_store, pack, json);
+    let Some(pack) = pack_store.get_expand_pack(&lookup_id)? else {
+        // A missing/expired handle cannot be recovered by rebuilding a graph.
+        // Report the selected pack store before any structural preparation.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "expand_handle_not_found",
+                    "id": id,
+                    "root_path": resolve_root(root)?,
+                    "store_path": workspace_locator::store_path(&resolve_root(root)?),
+                    "next": {
+                        "action": "use_original_project",
+                        "command": format!("greppy expand {id} --root ORIGINAL_PROJECT"),
+                        "message": "Use the project and store that produced this handle. If it is absent there too, rerun the original command to obtain a new handle; rebuilding a code index cannot recover stored output.",
+                    },
+                })
+            );
+        } else {
+            println!("expand: id not found in this project or expired: {id}");
+            println!("next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT");
+            println!("next: if it is missing in the original project too, rerun the original command to obtain a new handle");
         }
-        if pack.command == "read-file" {
-            return dispatch_read_expand(&pack_store, &pack, json, root);
-        }
+        return Ok(1);
+    };
+    #[cfg(feature = "bash-smart")]
+    if pack.command == "bash-smart" {
+        return bash_smart::expand(&pack_store, pack, json);
+    }
+    if pack.command == "read-file" {
+        return dispatch_read_expand(&pack_store, &pack, json, root);
     }
     drop(pack_store);
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let Some(pack) = store.get_expand_pack(&lookup_id)? else {
-        println!("expand: id not found in this project or expired: {id}");
-        println!("next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT");
-        println!("next: if it is missing in the original project too, rerun the original command to obtain a new handle");
-        return Ok(1);
-    };
     if pack.command == "read-smart" {
         return dispatch_read_expand(&store, &pack, json, root);
     }
@@ -11213,7 +11230,10 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     // Preparation refusals have no answer rows to compact. Preserve their
     // typed failure and exact root/store recovery even without --diagnostics.
-    if value.get("status").and_then(serde_json::Value::as_str) == Some("preparation_deferred") {
+    if matches!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("preparation_deferred" | "expand_handle_not_found")
+    ) {
         let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
         rendered.push(b'\n');
         return Some(rendered);
@@ -11292,7 +11312,10 @@ fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> 
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     // A refused preparation has no result total or continuation to budget.
     // Never manufacture an exact empty answer from its absent result rows.
-    if value.get("status").and_then(serde_json::Value::as_str) == Some("preparation_deferred") {
+    if matches!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("preparation_deferred" | "expand_handle_not_found")
+    ) {
         return Some(bytes.to_vec());
     }
     let available = result_item_count(&value);

@@ -143,6 +143,94 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
+fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
+    let workspace = fresh_workspace("expand-no-index");
+    let marker = workspace.base.join("gate-was-called");
+    let gate = workspace.base.join("deny-heavy.py");
+    std::fs::write(&gate, format!("import pathlib, sys\npathlib.Path({:?}).write_text('called')\nprint('Capacity gate: expand fixture denied', file=sys.stderr)\nsys.exit(75)\n", marker.to_str().unwrap())).unwrap();
+    let raw = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1300); do echo line $i; done",
+        ],
+    );
+    assert_eq!(raw.status.code(), Some(0));
+    let mut id = expand_id(&text(&raw.stdout)).to_string();
+    std::fs::write(workspace.repo.join("source.rs"), "fn changed() {}\n").unwrap();
+    let mut lines = Vec::new();
+    let mut pages = 0;
+    loop {
+        let output = command(&workspace)
+            .args(["expand", &id, "--json"])
+            .env("GREPPY_AUTO_REINDEX", "1")
+            .env("GREPPY_HEAVY_GATE", &gate)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let page: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(page["kind"], "bash-smart");
+        for raw in page["raw_line_hex"].as_array().unwrap() {
+            let hex = raw.as_str().unwrap();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            lines.push(String::from_utf8(bytes).unwrap());
+        }
+        pages += 1;
+        match page["next"]["id"].as_str() {
+            Some(next) => {
+                assert_ne!(next, id);
+                id = next.to_string();
+            }
+            None => break,
+        }
+        assert!(pages < 10, "continuation did not advance");
+    }
+    assert!(pages >= 3);
+    assert_eq!(
+        lines.concat(),
+        (22..=1270)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>()
+    );
+    for json in [false, true] {
+        let mut cmd = command(&workspace);
+        cmd.args(["expand", "0000000000000000"])
+            .env("GREPPY_AUTO_REINDEX", "1")
+            .env("GREPPY_HEAVY_GATE", &gate);
+        if json {
+            cmd.args(["--json", "--max-bytes", "128"]);
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["status"], "expand_handle_not_found");
+            assert!(value["next"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--root ORIGINAL_PROJECT"));
+            assert!(value["store_path"]
+                .as_str()
+                .unwrap()
+                .contains(workspace.store.to_str().unwrap()));
+            assert!(value.get("total_exact").is_none() && value.get("results").is_none());
+        } else {
+            assert!(text(&output.stdout).contains("--root ORIGINAL_PROJECT"));
+        }
+    }
+    assert!(
+        !marker.exists(),
+        "saved logs and missing handles must never invoke indexing admission"
+    );
+}
+
+#[test]
 fn javascript_exception_headers_preserve_exit_count_and_stream_bytes() {
     for class in [
         "SyntaxError",
