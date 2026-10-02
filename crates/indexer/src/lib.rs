@@ -6233,7 +6233,7 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 file_path: retained.file_path,
                 start_line: retained.start_line,
                 end_line: retained.end_line,
-                content_sha256: "same-source".into(),
+                content_sha256: file_state::sha256_hex(b"def retained(): pass\n"),
                 graph_generation: report.graph_generation,
                 vector: vec![1.0, 0.0],
             })
@@ -6259,8 +6259,14 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
             );
             fs::write(&routing, original).unwrap();
             overlay.conn().execute_batch("CREATE TEMP TRIGGER fail_effect_repair BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'injected repair failure'); END;").unwrap();
-            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            let injected =
+                recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap_err();
+            assert!(
+                injected.to_string().contains("injected repair failure"),
+                "must reach the injected raw-edge failure after node promotion: {injected}"
+            );
             for table in [
+                "main.projects",
                 "main.nodes",
                 "main.definition_identity_overrides",
                 "main.js_ts_reference_override_files",
@@ -6305,7 +6311,13 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 -retained_id
             );
             let vector: (String, i64) = overlay.conn().query_row("SELECT content_sha256,node_id FROM vector_embeddings WHERE file_path='retained.py'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert_eq!(vector, ("same-source".into(), -retained_id));
+            assert_eq!(
+                vector,
+                (
+                    file_state::sha256_hex(b"def retained(): pass\n"),
+                    -retained_id
+                )
+            );
             assert!(overlay.list_private_file_states("test").unwrap().is_empty());
             assert!(
                 !recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap()
