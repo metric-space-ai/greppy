@@ -384,6 +384,10 @@ mod tests {
             ])
             .unwrap();
         }
+        let original_base = Store::open(&base_path)
+            .unwrap()
+            .list_raw_edges("p")
+            .unwrap();
         let visibility =
             crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
@@ -436,7 +440,7 @@ mod tests {
                 .unwrap()
                 .list_raw_edges("p")
                 .unwrap(),
-            original
+            original_base
         );
     }
 
