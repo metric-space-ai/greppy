@@ -56,8 +56,13 @@ mod network_record_tests {
     }
 }
 
-fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<PathBuf, String> {
-    Ok(std::env::temp_dir()
+fn script_stage_dir(
+    controller_root: &Path,
+    run_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Result<PathBuf, String> {
+    Ok(controller_root
         .join("greppy-web-runtime")
         .join(isolated_id(run_id)?)
         .join("sessions")
@@ -66,14 +71,19 @@ fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<
         .join(isolated_id(request_id)?))
 }
 
-fn remove_script_stage(run_id: &str, session_id: &str, request_id: Option<&str>) {
+fn remove_script_stage(
+    controller_root: &Path,
+    run_id: &str,
+    session_id: &str,
+    request_id: Option<&str>,
+) {
     let Ok(run_id) = isolated_id(run_id) else {
         return;
     };
     let Ok(session_id) = isolated_id(session_id) else {
         return;
     };
-    let mut path = std::env::temp_dir()
+    let mut path = controller_root
         .join("greppy-web-runtime")
         .join(run_id)
         .join("sessions")
@@ -89,6 +99,7 @@ fn remove_script_stage(run_id: &str, session_id: &str, request_id: Option<&str>)
 }
 
 struct ScriptStageGuard {
+    controller_root: PathBuf,
     run_id: String,
     session_id: String,
     request_id: String,
@@ -96,7 +107,12 @@ struct ScriptStageGuard {
 
 impl Drop for ScriptStageGuard {
     fn drop(&mut self) {
-        remove_script_stage(&self.run_id, &self.session_id, Some(&self.request_id));
+        remove_script_stage(
+            &self.controller_root,
+            &self.run_id,
+            &self.session_id,
+            Some(&self.request_id),
+        );
     }
 }
 
@@ -153,6 +169,7 @@ fn path_is_within_root(root: &Path, candidate: &Path) -> bool {
     candidate.starts_with(root)
 }
 fn stage_script_for_controller(
+    controller_root: &Path,
     script_file: &str,
     run_id: &str,
     session_id: &str,
@@ -168,7 +185,7 @@ fn stage_script_for_controller(
         .parent()
         .ok_or_else(|| "script file has no parent directory".to_owned())?;
     refuse_unbounded_script_root(root)?;
-    let dest = script_stage_dir(run_id, session_id, request_id)?;
+    let dest = script_stage_dir(controller_root, run_id, session_id, request_id)?;
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&dest);
     }
@@ -1729,6 +1746,20 @@ impl Daemon {
             .get("script_file")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+        if !self.controller.is_running() {
+            if let Err(error) = self.recover_controller("controller worker exited") {
+                self.finish_session(&session_id);
+                return engine_error(request, error, 33);
+            }
+        }
+        let Some(controller_root) = self.controller.temp_dir().map(Path::to_path_buf) else {
+            self.finish_session(&session_id);
+            return engine_error(
+                request,
+                "controller has no isolated script staging root",
+                33,
+            );
+        };
         let (specifier, mut source) = match (file, source) {
             (Some(path), maybe_text) => {
                 let text = match maybe_text {
@@ -1751,6 +1782,7 @@ impl Daemon {
                     },
                 };
                 match stage_script_for_controller(
+                    &controller_root,
                     &path,
                     &self.run_id,
                     &session_id,
@@ -1798,6 +1830,7 @@ impl Daemon {
         }
         let _stage_guard = if specifier != "greppy:stdin" {
             Some(ScriptStageGuard {
+                controller_root,
                 run_id: self.run_id.clone(),
                 session_id: session_id.clone(),
                 request_id: request.request_id.clone(),
@@ -1805,12 +1838,6 @@ impl Daemon {
         } else {
             None
         };
-        if !self.controller.is_running() {
-            if let Err(error) = self.recover_controller("controller worker exited") {
-                self.finish_session(&session_id);
-                return engine_error(request, error, 33);
-            }
-        }
         let content_pid = self.content.pid();
         let controller_pid = self.controller.pid();
         let content_cpu_baseline_ns = sample_cpu_ns(content_pid);
@@ -1896,7 +1923,9 @@ impl Daemon {
             Err(_) => "run.failed",
         };
         self.journal(&session_id, &request.request_id, run_event, json!({}));
-        remove_script_stage(&self.run_id, &session_id, Some(&request.request_id));
+        if let Some(root) = self.controller.temp_dir() {
+            remove_script_stage(root, &self.run_id, &session_id, Some(&request.request_id));
+        }
         let had_inflight_engine = self
             .sessions
             .get(&session_id)
@@ -4782,7 +4811,9 @@ impl Daemon {
     }
 
     fn remove_ephemeral_session_dir(&self, session_id: &str) {
-        remove_script_stage(&self.run_id, session_id, None);
+        if let Some(root) = self.controller.temp_dir() {
+            remove_script_stage(root, &self.run_id, session_id, None);
+        }
         let path = self.store.root().join("sessions").join(session_id);
         let _ = std::fs::remove_dir_all(path);
     }
@@ -5551,6 +5582,10 @@ fn cpu_ms_since(pid: u32, baseline_ns: u64) -> u64 {
 }
 
 fn sample_cpu_ns(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = sample_cpu_ns_proc(pid) {
+        return ns;
+    }
     #[cfg(target_os = "macos")]
     {
         if let Some(ns) = sample_cpu_ns_rusage(pid) {
@@ -5566,6 +5601,34 @@ fn sample_cpu_ns(pid: u32) -> u64 {
         return 0;
     };
     parse_ps_time(String::from_utf8_lossy(&output.stdout).trim()).saturating_mul(1_000_000)
+}
+
+// Linux ps time= rounds to whole seconds, hiding short controller work.
+// proc stat reports user and system CPU in scheduler ticks (usually 10ms).
+#[cfg(target_os = "linux")]
+fn proc_stat_cpu_ns(stat: &str, ticks_per_second: u64) -> Option<u64> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+    // comm (field 2) can contain spaces and parentheses. Fields after its
+    // final closing parenthesis begin at state (field 3).
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let user = fields.nth(11)?.parse::<u64>().ok()?;
+    let system = fields.next()?.parse::<u64>().ok()?;
+    let ticks = u128::from(user) + u128::from(system);
+    Some((ticks * 1_000_000_000 / u128::from(ticks_per_second)).min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_cpu_ns_proc(pid: u32) -> Option<u64> {
+    static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ticks = (*TICKS.get_or_init(|| {
+        let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (value > 0).then_some(value as u64)
+    }))?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    proc_stat_cpu_ns(&stat, ticks)
 }
 
 #[cfg(target_os = "macos")]
@@ -6061,7 +6124,9 @@ mod script_stage_tests {
         let _ = fs::remove_file(&secret);
         symlink("/etc/passwd", &secret).unwrap();
 
+        let controller_root = unique_root("controller-stage");
         let staged = stage_script_for_controller(
+            &controller_root,
             root.join("entry.mjs").to_str().unwrap(),
             "run_stage",
             "wrs_stage1",
@@ -6069,7 +6134,9 @@ mod script_stage_tests {
         )
         .expect("stage");
         let staged = PathBuf::from(staged);
-        let expected = script_stage_dir("run_stage", "wrs_stage1", "wrq_stage1").unwrap();
+        let expected =
+            script_stage_dir(&controller_root, "run_stage", "wrs_stage1", "wrq_stage1").unwrap();
+        assert!(expected.starts_with(&controller_root));
         assert!(
             path_is_within_root(&expected, &staged.canonicalize().unwrap()),
             "{}",
@@ -6080,8 +6147,14 @@ mod script_stage_tests {
             !expected.join("secret.mjs").exists(),
             "symlink escape must not be staged"
         );
-        remove_script_stage("run_stage", "wrs_stage1", Some("wrq_stage1"));
+        remove_script_stage(
+            &controller_root,
+            "run_stage",
+            "wrs_stage1",
+            Some("wrq_stage1"),
+        );
         assert!(!expected.exists(), "per-request stage must be cleaned up");
+        let _ = fs::remove_dir_all(controller_root);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6246,6 +6319,19 @@ mod redirect_chain_tests {
         assert_eq!(super::parse_ps_time("2:26.50"), 146_500);
         assert_eq!(super::parse_ps_time("1:02:03"), 3_723_000);
         assert_eq!(super::parse_ps_time(""), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_cpu_keeps_subsecond_ticks_and_handles_parenthesized_names() {
+        let stat = "123 (controller ) worker) R 1 2 3 4 5 6 7 8 9 10 7 3 99 88";
+        assert_eq!(super::proc_stat_cpu_ns(stat, 100), Some(100_000_000));
+        assert_eq!(super::proc_stat_cpu_ns(stat, 1000), Some(10_000_000));
+        assert_eq!(super::proc_stat_cpu_ns(stat, 0), None);
+        assert_eq!(super::proc_stat_cpu_ns("123 (worker) R 1", 100), None);
+        assert_eq!(super::proc_stat_cpu_ns("123 worker R 1", 100), None);
+        let invalid = stat.replace("7 3 99", "oops 3 99");
+        assert_eq!(super::proc_stat_cpu_ns(&invalid, 100), None);
     }
 
     #[test]

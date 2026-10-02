@@ -10029,6 +10029,40 @@ fn relative_esm_inside_script_root_is_granted() {
 }
 
 #[test]
+fn controller_recovery_stages_sibling_import_in_replacement_sandbox() {
+    let run_id = "run_controller_import_recovery";
+    let socket = std::env::temp_dir().join(format!("greppy-web-controller-import-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let supervisor = Supervisor::spawn(&socket, run_id, |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new(run_id, "web.session.create", json!({ "profile": "project" })), Duration::from_secs(10)).expect("create");
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session_id = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let controller = child_pids(supervisor.child.id()).into_iter()
+        .find(|pid| worker_comm(*pid).contains("--internal-role controller"))
+        .expect("owned controller worker");
+    assert!(Command::new("kill").args(["-KILL", &controller.to_string()]).status().unwrap().success());
+    // kill(2) returns before the victim necessarily exits. Wait for actual
+    // termination so this tests recovery of a dead controller, not death
+    // racing an already starting request.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = Command::new("ps").args(["-p", &controller.to_string(), "-o", "stat="]).output().expect("owned controller status");
+        let state = String::from_utf8_lossy(&status.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') { break; }
+        assert!(Instant::now() < deadline, "killed controller did not exit: {state}");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (path, _) = fixture_source("relative-mod.mjs");
+    let recovered = unix_request(&socket, &Request::new(run_id, "web.run", json!({ "session_id": session_id, "script_file": path })), Duration::from_secs(60)).expect("run after controller crash");
+    assert_eq!(recovered.status, "ok", "sibling import must run in the replacement controller: {recovered:?}");
+    let closed = unix_request(&socket, &Request::new(run_id, "web.session.close", json!({ "session_id": session_id })), Duration::from_secs(10)).expect("close");
+    assert_eq!(closed.status, "ok", "{closed:?}");
+    drop(supervisor);
+    assert_no_leftover_web_runtime_processes(run_id);
+}
+
+#[test]
 fn cjs_require_playwright_is_granted_and_fs_is_denied() {
     run_named_fixture("cjs-playwright.cjs", "run_cjspw");
 }
