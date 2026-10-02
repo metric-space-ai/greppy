@@ -7408,7 +7408,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         std::collections::HashMap::new();
     let empty_word = match req.kind {
         NavKind::WhoCalls => "no callers",
-        NavKind::Callees => "no callees",
+        NavKind::Callees => "no resolved indexed callees; external, unresolved or filtered calls may still exist",
     };
     for (index, symbol) in req.targets.iter().enumerate() {
         if index > 0 {
@@ -7417,6 +7417,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         println!("{symbol}");
         if totals[index] == 0 {
             println!("{empty_word}");
+            if matches!(req.kind, NavKind::Callees) {
+                println!("inspect source with: greppy read {symbol}");
+            }
             continue;
         }
         // A group whose rows all fell behind the cap must not look like an

@@ -508,10 +508,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// What `S` calls — direct outgoing CALLS edges (the callees of `S`),
-    /// printed as `qualified_name file:line`. Backed by the search
-    /// `callees_of` helper. With `--code`, also prints each callee's
-    /// source span.
+    /// Resolved indexed definitions called by `S` — direct outgoing CALLS
+    /// edges, printed as `qualified_name file:line`. External or unresolved
+    /// calls are not included; an empty answer does not prove the source has
+    /// no calls. Use `greppy read S` for source. With `--code`, also prints
+    /// each resolved callee's source span.
     Callees {
         /// The symbols to answer for. Several are answered in one call:
         /// `greppy callees A B C`. `-` reads them from the pipe.
