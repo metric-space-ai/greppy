@@ -4391,6 +4391,11 @@ mod tests {
                 migrated_root.to_string_lossy()
             );
             assert_eq!(
+                migrated.list_workspace_states().unwrap()[0].schema_version,
+                greppy_store::migrate::CURRENT_VERSION,
+                "migrated workspace metadata must not force a second full rebuild"
+            );
+            assert_eq!(
                 greppy_store::file_state::sha256_hex(
                     &std::fs::read(&previous_layout.summary_cache).unwrap()
                 ),
