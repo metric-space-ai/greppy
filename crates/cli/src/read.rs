@@ -1349,6 +1349,40 @@ fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)>
     Ok((start, end))
 }
 
+/// A plain explicit span needs neither the whole file nor a graph/handle.
+/// Skip preceding bytes without decoding and stop after the requested lines;
+/// invalid data elsewhere must not hide a readable diagnostic prefix.
+fn read_bounded_file_range(
+    reader: &mut impl std::io::BufRead,
+    raw: &str,
+    path: &str,
+) -> Result<(String, usize, usize)> {
+    let (start, end) = read_parse_file_range(raw, usize::MAX)?;
+    let mut selected = Vec::new();
+    let mut line_count = 0usize;
+    while line_count < end {
+        let count = if line_count + 1 < start {
+            reader.skip_until(b'\n')
+        } else {
+            reader.read_until(b'\n', &mut selected)
+        }
+        .map_err(|error| Error::io(format!("read-file requested lines in {path}"), error))?;
+        if count == 0 {
+            return Err(Error::Invalid(format!(
+                "read-file --lines ends at {end}, but the file has {line_count} lines"
+            )));
+        }
+        line_count += 1;
+    }
+    let text = String::from_utf8(selected).map_err(|error| {
+        Error::io(
+            format!("read-file cannot decode requested lines {start}:{end} in {path} as UTF-8"),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    Ok((text, start, end))
+}
+
 fn read_count(value: usize) -> String {
     let digits = value.to_string();
     let mut out = String::new();
@@ -1547,12 +1581,47 @@ pub(crate) fn dispatch_read_files(
             failed = true;
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&canonical) else {
+        if let Some(raw) = lines.filter(|_| !with_handle) {
+            let span = std::fs::File::open(&canonical)
+                .map_err(|error| Error::io(format!("open read-file {path}"), error))
+                .and_then(|file| {
+                    read_bounded_file_range(&mut std::io::BufReader::new(file), raw, path)
+                });
+            let (text, start, end) = match span {
+                Ok(span) => span,
+                Err(error @ Error::Io { .. }) => {
+                    read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                    println!("cannot read file {path}: {error}");
+                    previous_ended_with_newline = true;
+                    failed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let group = format!("{shown}:{start}-{end}\n{text}");
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
-            println!("no such file: {path}");
-            previous_ended_with_newline = true;
-            failed = true;
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            std::io::Write::write_all(&mut output, group.as_bytes())
+                .map_err(|error| Error::Store(format!("write read-file output: {error}")))?;
+            std::io::Write::flush(&mut output)
+                .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
+            previous_ended_with_newline = group.ends_with('\n');
             continue;
+        }
+        let content = match std::fs::read_to_string(&canonical) {
+            Ok(content) => content,
+            Err(error) => {
+                read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    println!("no such file: {path}");
+                } else {
+                    println!("cannot read file {path}: {error}");
+                }
+                previous_ended_with_newline = true;
+                failed = true;
+                continue;
+            }
         };
         let line_count = read_line_count(&content);
         if lines.is_none() && !all && line_count > 60 {
