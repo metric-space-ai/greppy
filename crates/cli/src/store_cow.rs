@@ -1590,12 +1590,10 @@ fn create_base_build_staging(
 }
 
 fn temporary_base_checkout_root() -> Result<PathBuf> {
-    // Honor TMPDIR consistently on every platform. Rust's Windows
-    // `temp_dir()` follows GetTempPath and would otherwise ignore an explicit
-    // scratch directory supplied by the caller.
-    let root = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // Default Mac staging uses the designated mounted disposable volume.
+    // Explicit isolated stores retain their caller-supplied TMPDIR.
+    let root = greppy_core::cache::base_build_scratch_root()
+        .map_err(|error| Error::io("prepare disposable Base staging root", error))?;
     if !root.is_absolute() {
         return Err(Error::Invalid(format!(
             "temporary Base checkout directory must be absolute: {}",
