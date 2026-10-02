@@ -329,12 +329,6 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
     None
 }
 
-/// Resolve the owner type of an unambiguous Rust receiver call when the AST
-/// carries enough local type evidence. `self.method()` inherits the enclosing
-/// impl owner; named receivers are accepted for explicitly typed parameters or
-/// locals and for locals initialized directly from a struct literal. Other
-/// inferred values deliberately return `None` so the graph resolver cannot
-/// attach the call to an unrelated same-named method.
 /// Resolve an explicit binding type without inferring expression return types.
 /// Any nearer lexical binding, including destructuring/control-flow bindings,
 /// blocks parameter fallback even when its type is unknown.
@@ -356,6 +350,20 @@ fn rust_visible_binding_type<'tree>(
     let mut ancestor = callee.parent();
     while let Some(node) = ancestor {
         if node.kind() == "block" {
+            // Value items are visible throughout their lexical block, including
+            // before their declaration. They can shadow a slice parameter.
+            for i in 0..node.named_child_count() {
+                let item = node.named_child(i)?;
+                if matches!(
+                    item.kind(),
+                    "const_item" | "static_item" | "function_item" | "struct_item" | "enum_item"
+                ) && item
+                    .child_by_field_name("name")
+                    .is_some_and(|item_name| node_text(source, item_name) == name)
+                {
+                    return None;
+                }
+            }
             for i in (0..node.named_child_count()).rev() {
                 let binding = node.named_child(i)?;
                 if binding.kind() != "let_declaration" || binding.end_byte() > callee.start_byte() {
@@ -464,7 +472,7 @@ fn rust_slice_iterator_owner(
     receiver: Node<'_>,
     callee: Node<'_>,
 ) -> Option<&'static str> {
-    if receiver.kind() != "call_expression" || !rust_slice_iter_lookup_is_transparent(callee) {
+    if receiver.kind() != "call_expression" {
         return None;
     }
     let arguments = receiver.child_by_field_name("arguments")?;
@@ -485,9 +493,18 @@ fn rust_slice_iterator_owner(
     if ty.kind() != "reference_type" || ty.child_by_field_name("type")?.kind() != "slice_type" {
         return None;
     }
+    if !rust_slice_iter_lookup_is_transparent(callee) {
+        return None;
+    }
     Some("core::slice::Iter")
 }
 
+/// Resolve the owner type of an unambiguous Rust receiver call when the AST
+/// carries enough local type evidence. `self.method()` inherits the enclosing
+/// impl owner; named receivers are accepted for explicitly typed parameters or
+/// locals and for locals initialized directly from a struct literal. Other
+/// inferred values deliberately return `None` so the graph resolver cannot
+/// attach the call to an unrelated same-named method.
 fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str> {
     let field = callee.parent()?;
     if field.kind() != "field_expression" {
@@ -15794,6 +15811,10 @@ mod tests {
     #[test]
     fn rust_slice_iterator_receiver_requires_transparent_typed_binding() {
         let cases = [
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
             ("fn f(items: &[i32]) { items.iter().next(); }", true),
             ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
             ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
