@@ -1750,7 +1750,7 @@ fn has_verified_previous_indexer_base_for_identity(
 fn verified_previous_indexer_base_layout(
     shared_data_root: &Path,
     current_identity: &BaseStoreIdentity,
-) -> Result<Option<BaseStoreLayout>> {
+) -> Result<Option<(BaseStoreLayout, BaseStoreIdentity)>> {
     let versions: &[&str] = match current_identity.indexer_version.as_str() {
         "greppy-indexer-v7" => &["greppy-indexer-v6"],
         "greppy-indexer-v8" => &["greppy-indexer-v7", "greppy-indexer-v6"],
@@ -1765,7 +1765,7 @@ fn verified_previous_indexer_base_layout(
             .read_verified_manifest()
             .is_ok_and(|manifest| manifest.identity == previous_identity)
         {
-            return Ok(Some(layout));
+            return Ok(Some((layout, previous_identity)));
         }
     }
     Ok(None)
@@ -2144,7 +2144,7 @@ fn seed_previous_indexer_base(
     worktree_path: &Path,
     staged_graph: &Path,
 ) -> Result<Option<PathBuf>> {
-    let Some(previous_layout) =
+    let Some((previous_layout, previous_identity)) =
         verified_previous_indexer_base_layout(shared_data_root, current_identity)?
     else {
         return Ok(None);
@@ -2160,6 +2160,16 @@ fn seed_previous_indexer_base(
                     .into(),
             )
         })?;
+    // Selection may race with lease acquisition. Reverify the exact generation
+    // and both digests while eviction/publication are excluded, before staging.
+    let manifest = previous_layout
+        .read_verified_manifest()
+        .map_err(|error| Error::io("reverify leased previous Base generation", error))?;
+    if manifest.identity != previous_identity {
+        return Err(Error::Invalid(
+            "previous Base identity changed before migration lease".into(),
+        ));
+    }
     let parent = staged_graph
         .parent()
         .ok_or_else(|| Error::Invalid("staged Base graph has no parent directory".into()))?;
