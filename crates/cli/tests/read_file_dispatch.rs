@@ -788,7 +788,18 @@ fn read_file_default_sparse_preview_does_not_validate_or_allocate_unseen_tail() 
     assert!(out.contains("total line count unknown"));
     assert!(out.contains("8589869057 source bytes omitted according to file size at open"));
     assert!(out.contains("--lines 1:1\n"));
-    assert!(!store.exists(), "preview must not initialize a store");
+    // Ordinary successful commands may maintain the cache GC receipt/lock.
+    // That is not an initialized graph or an indexing/model job.
+    assert!(
+        !store.exists()
+            || std::fs::read_dir(&store).unwrap().all(|entry| {
+                matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some("gc.state" | "locks")
+                )
+            }),
+        "preview must not initialize a graph store"
+    );
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
 }
 
