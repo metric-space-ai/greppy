@@ -296,11 +296,7 @@ fn browser_observe_rejects_invalid_query_before_resolving_a_session() {
         ("unknown=dialog", "unknown query kind"),
         ("role~dialog", "needs a text query"),
     ] {
-        let (code, out, err) = run(
-            &["web", "observe", query, "--json", "--diagnostics"],
-            &repo,
-            &store,
-        );
+        let (code, out, err) = run(&["web", "observe", query, "--json"], &repo, &store);
         assert_ne!(code, 0, "invalid query must fail: {out}\n{err}");
         assert!(
             out.contains(expected) || err.contains(expected),
@@ -1682,11 +1678,8 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
     assert!(v["stats"]["nodes"].as_u64().unwrap_or(0) >= 1);
     assert!(v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(v["provider_failure_count"], 0);
-    let (compact_code, compact_out, compact_err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (compact_code, compact_out, compact_err) =
+        run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(compact_code, code, "{compact_err}");
     let compact: serde_json::Value = serde_json::from_str(&compact_out).unwrap();
     for key in [
@@ -1722,7 +1715,7 @@ fn index_status_does_not_materialize_inference_assets() {
     let inference_root = store.parent().unwrap().join("cold-inference");
     let inference_path = inference_root.to_str().unwrap();
     for args in [
-        vec!["index", "status", "--json", "--diagnostics"],
+        vec!["index", "status", "--json"],
         vec!["index", "status", "--json", "--diagnostics"],
     ] {
         let output = Command::new(bin())
@@ -2491,11 +2484,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         "SIGKILL simulation should leave stale graph.db.next.* files before recovery"
     );
 
-    let (code, out, err) = run(
-        &["index", "recover", ".", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "index recover should acquire the crash-released lock, validate and publish the completed snapshot; stdout={out} stderr={err}"
@@ -2578,11 +2567,7 @@ fn index_recover_skips_newest_invalid_completed_candidate() {
         .set_times(std::fs::FileTimes::new().set_modified(new))
         .unwrap();
 
-    let (code, out, err) = run(
-        &["index", "recover", ".", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
         code, 0,
         "newest invalid completed artifact must not block the older valid snapshot: {out}\n{err}"
@@ -2626,11 +2611,7 @@ fn index_recover_rejects_when_no_completed_candidate_is_valid() {
     let invalid = db.with_file_name(format!("graph.db.next.{dead_pid}.invalid"));
     std::fs::write(&invalid, b"not a sqlite database").unwrap();
 
-    let (code, out, err) = run(
-        &["index", "recover", ".", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(code, 73, "invalid-only recovery must fail: {out}\n{err}");
     let recovery: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(recovery["status"], "rejected", "{out}");
@@ -2679,11 +2660,7 @@ fn index_recover_never_publishes_around_a_live_candidate_owner() {
         .set_times(std::fs::FileTimes::new().set_modified(new))
         .unwrap();
 
-    let (code, out, err) = run(
-        &["index", "recover", ".", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
         code, 73,
         "live owner must block all publication: {out}\n{err}"
@@ -2948,11 +2925,8 @@ fn large_drift_semantic_query_waits_for_vector_complete_publication() {
         "large drift must publish a new graph generation"
     );
     drop(refreshed);
-    let (status_code, status_out, status_err) = run_with_inference(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (status_code, status_out, status_err) =
+        run_with_inference(&["index", "status", "--json"], &repo, &store);
     assert_eq!(status_code, 0, "{status_out}\n{status_err}");
     let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
     assert_eq!(status["healthy"], true, "{status}");
@@ -3048,11 +3022,7 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     let live_lock = hold_exclusive_lock(&lock_path);
 
     let started = std::time::Instant::now();
-    let (code, out, err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(code, 75, "an active refresh is temporary; stderr={err}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
@@ -3077,11 +3047,7 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
         .unwrap(),
     )
     .unwrap();
-    let (code, out, err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(
         code, 75,
         "stalled progress is still retryable; stderr={err}"
@@ -3100,11 +3066,7 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 
     std::fs::remove_file(&db).expect("remove published snapshot for first-index simulation");
 
-    let (code, out, err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(code, 75, "an active first index is temporary; stderr={err}");
     assert!(err.is_empty(), "JSON status should not write stderr: {err}");
     let status: serde_json::Value =
@@ -3125,11 +3087,7 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
     );
 
     drop(live_lock);
-    let (code, out, err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(
         code, 1,
         "without a writer the missing store is no_index; stderr={err}"
@@ -3804,11 +3762,7 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
     )
     .unwrap();
 
-    let (status_code, status_out, status_err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (status_code, status_out, status_err) = run(&["index", "status", "--json"], &repo, &store);
     assert_ne!(
         status_code, 75,
         "reused PID without writer ownership is not active: {status_out}\n{status_err}"
@@ -4000,12 +3954,7 @@ fn rejected_refresh_admission_never_claims_publication_is_running() {
         err.contains("retry this command") || err.contains("Retry the original command"),
         "{out} {err}"
     );
-    let (code, out, err) = run_with_env(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-        &[],
-    );
+    let (code, out, err) = run_with_env(&["index", "status", "--json"], &repo, &store, &[]);
     assert_eq!(
         code, 73,
         "failed preparation makes index health unhealthy: {out} {err}"
@@ -4066,11 +4015,7 @@ fn foreground_index_publishes_observable_progress_while_building() {
     let _writer = hold_index_before_publish(&repo, &store, "foreground-progress");
 
     let started = std::time::Instant::now();
-    let (code, out, err) = run(
-        &["index", "status", "--json", "--diagnostics"],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(
         code, 75,
         "an in-progress foreground index is retryable; stderr={err}"
@@ -4320,12 +4265,7 @@ fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
     // Actual source changes still must not be represented as fresh graph data.
     std::fs::write(repo.join("src/lib.rs"), "pub fn changed_marker() {}\n").unwrap();
     let output = query_after_releasing_writer(
-        &[
-            "search-symbol",
-            "clean_committed_marker",
-            "--json",
-            "--diagnostics",
-        ],
+        &["search-symbol", "clean_committed_marker", "--json"],
         &repo,
         &store,
         &mut writer,
