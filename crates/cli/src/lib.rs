@@ -1029,9 +1029,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 if let Some(unknown) = unknown_flag_name(first) {
                     println!("invalid read-file option `{unknown}`; no files were read");
                     if matches!(unknown.as_str(), "--head" | "--tail") {
-                        println!(
-                            "`--head` and `--tail` select symbol source with `greppy read SYMBOL`. For file lines, use `greppy read-file PATH --lines A:B`."
-                        );
+                        println!("`--head` and `--tail` select symbol source with `greppy read SYMBOL`. For file lines, use `greppy read-file PATH --lines A:B`.");
                     }
                     println!(
                         "usage: greppy read-file PATH [PATH …] [--lines A:B] [--all] [--json]"
@@ -1213,9 +1211,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         match greppy_core::cache::retain_base_build_staging_leases_from_env() {
             Ok(leases) => leases,
             Err(error) => {
-                eprintln!(
-                    "greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command"
-                );
+                eprintln!("greppy: cannot retain Base build staging: {error}; retry the Base build from its parent command");
                 return 73;
             }
         };
@@ -1355,9 +1351,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy read SYMBOL|FILE [--head M] [--tail N] [--handle] [--code] [--path PATH] [--root DIR]"
         }
         "replace" => "greppy replace S [NEW] [--body] [--dry-run] [--verify]",
-        "replace-text" => {
-            "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]"
-        }
+        "replace-text" => "greppy replace-text F OLD [NEW] [--expect N] [--regex] [--dry-run] [--verify]",
         "replace-lines" => "greppy replace-lines F A:B [NEW] [--dry-run] [--verify]",
         "replace-span" => "greppy replace-span H [NEW] [--dry-run] [--verify]",
         "write" => "greppy write PATH [NEW] [--dry-run] [--verify]",
@@ -2120,11 +2114,7 @@ fn dispatch_workspace_admin(command: WorkspaceCommand) -> Result<i32> {
                 println!(
                     "agent workspace ready ({} backend; provider {}); {} workspace(s), {} chunks, {} physical bytes",
                     status.backend,
-                    if status.provider_ready {
-                        "ready"
-                    } else {
-                        "inactive"
-                    },
+                    if status.provider_ready { "ready" } else { "inactive" },
                     status.workspaces.len(),
                     status.chunks.chunk_count,
                     status.chunks.segment_bytes
@@ -6638,12 +6628,8 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
             );
         } else {
             println!("expand: id not found in this project or expired: {id}");
-            println!(
-                "next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT"
-            );
-            println!(
-                "next: if it is missing in the original project too, rerun the original command to obtain a new handle"
-            );
+            println!("next: for a handle saved in another project, run greppy expand {id} --root ORIGINAL_PROJECT");
+            println!("next: if it is missing in the original project too, rerun the original command to obtain a new handle");
         }
         return Ok(1);
     };
@@ -9621,22 +9607,11 @@ fn preparation_recovery_message(freshness: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("greppy index status --json");
     match freshness.get("state").and_then(serde_json::Value::as_str) {
-        Some("refreshing") => format!(
-            "index publication is in progress; inspect `{diagnostics}`, then retry this command after publication"
-        ),
-        Some("unknown") => format!(
-            "freshness could not be verified; inspect `{diagnostics}`, then retry this command when host capacity is available"
-        ),
-        Some("failed") => match freshness
-            .get("preparation_error")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some(error) => format!(
-                "{error} Inspect `{diagnostics}`; retry the original command after resolving this preparation failure"
-            ),
-            None => format!(
-                "automatic index preparation failed; inspect `{diagnostics}` for the admission or startup failure, then retry this command when host capacity is available"
-            ),
+        Some("refreshing") => format!("index publication is in progress; inspect `{diagnostics}`, then retry this command after publication"),
+        Some("unknown") => format!("freshness could not be verified; inspect `{diagnostics}`, then retry this command when host capacity is available"),
+        Some("failed") => match freshness.get("preparation_error").and_then(serde_json::Value::as_str) {
+            Some(error) => format!("{error} Inspect `{diagnostics}`; retry the original command after resolving this preparation failure"),
+            None => format!("automatic index preparation failed; inspect `{diagnostics}` for the admission or startup failure, then retry this command when host capacity is available"),
         },
         _ => STALE_REMEDIATION.into(),
     }
@@ -10521,10 +10496,7 @@ fn checkpoint_store_path(path: &std::path::Path) -> Result<(i64, i64, i64)> {
     if result.0 != 0 {
         return Err(Error::Store(format!(
             "checkpoint {} remained busy after 15s (busy={}, log_frames={}, checkpointed_frames={}); no snapshot was published; retry `greppy index` after the competing reader exits",
-            path.display(),
-            result.0,
-            result.1,
-            result.2
+            path.display(), result.0, result.1, result.2
         )));
     }
     Ok(result)

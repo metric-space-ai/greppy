@@ -52,6 +52,7 @@ fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+
 #[cfg(target_os = "macos")]
 #[test]
 fn disposable_initializers_use_ensured_path_after_late_durable_store() {
@@ -452,49 +453,49 @@ fn edit_symbol_subprocess_helper() {
     assert_eq!(std::env::var_os("GREPPY_STORE_DIR"), Some(store_root));
 
     for (label, extension, source, replacement) in [
-        (
-            "typescript",
-            "ts",
-            "export function computeTotal(items:number[]):number{ return items.reduce((a,b)=>a+b,0); }\n",
-            "{ return Math.max(...items); }\n",
-        ),
-        (
-            "kotlin",
-            "kt",
-            "fun computeTotal(items:IntArray):Int{ return items.sum() }\n",
-            "{ return items.maxOrNull() ?: 0 }\n",
-        ),
-    ] {
-        let root = test_tempdir(&format!("edit-symbol-{label}"));
-        std::fs::create_dir(root.join(".git")).unwrap();
-        std::fs::write(root.join(format!("a.{extension}")), source).unwrap();
-        let replacement_path = root.join("new-body.txt");
-        std::fs::write(&replacement_path, replacement).unwrap();
+            (
+                "typescript",
+                "ts",
+                "export function computeTotal(items:number[]):number{ return items.reduce((a,b)=>a+b,0); }\n",
+                "{ return Math.max(...items); }\n",
+            ),
+            (
+                "kotlin",
+                "kt",
+                "fun computeTotal(items:IntArray):Int{ return items.sum() }\n",
+                "{ return items.maxOrNull() ?: 0 }\n",
+            ),
+        ] {
+            let root = test_tempdir(&format!("edit-symbol-{label}"));
+            std::fs::create_dir(root.join(".git")).unwrap();
+            std::fs::write(root.join(format!("a.{extension}")), source).unwrap();
+            let replacement_path = root.join("new-body.txt");
+            std::fs::write(&replacement_path, replacement).unwrap();
 
-        let store_path = workspace_locator::store_path(&root);
-        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
-        let mut store = greppy_store::Store::open(&store_path).unwrap();
-        let project = workspace_locator::project_identity(&root);
-        let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
-        assert!(report.is_clean(), "{label} index report: {report:?}");
-        drop(store);
+            let store_path = workspace_locator::store_path(&root);
+            std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+            let mut store = greppy_store::Store::open(&store_path).unwrap();
+            let project = workspace_locator::project_identity(&root);
+            let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
+            assert!(report.is_clean(), "{label} index report: {report:?}");
+            drop(store);
 
-        let code = dispatch_edit(
-            EditCommand::Replace {
-                symbol: "computeTotal".into(),
-                new: Some(std::fs::read_to_string(&replacement_path).unwrap()),
-                body: true,
-                dry_run: true,
-                verify: false,
-            },
-            false,
-            root.to_str(),
-        )
-        .unwrap();
-        assert_eq!(code, 0, "indexed {label} edit --symbol must apply");
+            let code = dispatch_edit(
+                EditCommand::Replace {
+                    symbol: "computeTotal".into(),
+                    new: Some(std::fs::read_to_string(&replacement_path).unwrap()),
+                    body: true,
+                    dry_run: true,
+                    verify: false,
+                },
+                false,
+                root.to_str(),
+            )
+            .unwrap();
+            assert_eq!(code, 0, "indexed {label} edit --symbol must apply");
 
-        std::fs::remove_dir_all(root).unwrap();
-    }
+            std::fs::remove_dir_all(root).unwrap();
+        }
 }
 
 #[test]
@@ -876,10 +877,7 @@ fn rename_identity_planner_subprocess_helper() {
             refusal.code,
             refusal.message
         );
-        assert_eq!(
-            std::fs::read(root.join("selected_free.rs")).unwrap(),
-            before
-        );
+        assert_eq!(std::fs::read(root.join("selected_free.rs")).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2144,20 +2142,20 @@ where
     let signature = semantic_signature_from_span(code).unwrap();
 
     assert_eq!(
-        signature,
-        "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
-    );
+            signature,
+            "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
+        );
 }
 
 #[test]
 fn semantic_signature_from_span_stops_at_python_body_colon() {
     let source = "async def load_value(\n    key: str,\n    *,\n    default: dict[str, int] | None = None,\n) -> dict[str, int]:\n    value = await fetch(key)\n    return value or default or {}\n";
     assert_eq!(
-        semantic_signature_from_span(source).as_deref(),
-        Some(
-            "async def load_value( key: str, *, default: dict[str, int] | None = None, ) -> dict[str, int]"
-        )
-    );
+            semantic_signature_from_span(source).as_deref(),
+            Some(
+                "async def load_value( key: str, *, default: dict[str, int] | None = None, ) -> dict[str, int]"
+            )
+        );
 }
 
 #[test]
