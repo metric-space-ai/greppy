@@ -3812,11 +3812,16 @@ mod tests {
             .get_node_by_qname("p", "src/stable.rs::Function::stable_caller")
             .unwrap()
             .unwrap();
-        assert!(repaired
-            .incoming_edges(target.id, Some("CALLS"), 10)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == stable_caller.id));
+        assert_eq!(
+            repaired
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .filter(|edge| edge.source_id == stable_caller.id)
+                .count(),
+            1,
+            "validated migration preserves exactly one stable logical caller"
+        );
         assert_eq!(
             repaired
                 .conn()
@@ -3844,8 +3849,8 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0,
-            "an unchanged Base relation is not copied into the repair set"
+            1,
+            "one validated overlay preserves the masked legacy Base caller"
         );
         assert_eq!(
             repaired
@@ -3891,14 +3896,15 @@ mod tests {
         };
         // The one-shot composed rebuild shadows an existing Base relation too.
         // Store visibility suppresses the matching Base row, so this is one
-        // visible relation, not two. Only missing Base edges carry repair markers.
+        // visible relation, not two. Validated CALLS also carry repair markers
+        // because the legacy Base caller projection is masked during migration.
         // Exact reexport resolution also retains the caller's import of outer.
         let expected_relations = [
             ("src/alias_chain/mod.rs::__file__", "IMPORTS", 1),
             ("src/base.rs::Function::base_caller", "CALLS", 1),
             ("src/caller.rs::Function::caller", "USAGE", 0),
             ("src/caller.rs::__file__", "IMPORTS", 0),
-            ("src/stable.rs::Function::stable_caller", "CALLS", 0),
+            ("src/stable.rs::Function::stable_caller", "CALLS", 1),
         ]
         .into_iter()
         .map(|(source, kind, repaired)| {

@@ -17,11 +17,6 @@ pub(crate) fn inference_device_identity(device: &greppy_embed_native::DevicePref
     device.as_str().to_string()
 }
 
-pub(crate) fn embedding_model_source_exists(source: &EmbeddingModelSource) -> bool {
-    let EmbeddingModelSource::Gguf { gguf, tokenizer } = source;
-    gguf.is_file() && tokenizer.is_file()
-}
-
 pub(crate) fn embedding_backend_plan(cfg: &EmbeddingModelConfig) -> (String, Option<String>) {
     let EmbeddingModelSource::Gguf { gguf, .. } = &cfg.source;
     let model_bytes = std::fs::metadata(gguf)
