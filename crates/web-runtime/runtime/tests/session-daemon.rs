@@ -10155,21 +10155,46 @@ fn idle_supervisor_workers_are_not_cpu_hot() {
     let supervisor = Supervisor::spawn(&socket, "run_idlecpu", |_| {});
     wait_for_socket(&socket, Duration::from_secs(30));
     thread::sleep(Duration::from_millis(1500));
-    let parent = supervisor.child.id();
-    let workers = child_pids(parent);
+    let workers = child_pids(supervisor.child.id());
     assert!(workers.len() >= 2, "workers {workers:?}");
-    for pid in workers {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "%cpu="])
-            .output()
-            .expect("ps cpu");
-        let cpu: f64 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(100.0);
+    let cpu_seconds = |pid: u32| -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .expect("read live worker CPU counters");
+            let (_, fields) = stat.rsplit_once(") ").expect("worker proc stat fields");
+            let fields: Vec<_> = fields.split_whitespace().collect();
+            let user: u64 = fields[11].parse().expect("worker user CPU ticks");
+            let system: u64 = fields[12].parse().expect("worker system CPU ticks");
+            let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            assert!(ticks > 0, "scheduler CPU clock is unavailable");
+            (user as f64 + system as f64) / ticks as f64
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "time="])
+                .output()
+                .expect("read live worker CPU time");
+            assert!(output.status.success(), "worker CPU time query failed");
+            let value = String::from_utf8_lossy(&output.stdout);
+            assert!(!value.trim().is_empty(), "worker exited during CPU sampling");
+            value.trim().split(':').fold(0.0, |total, field| {
+                total * 60.0 + field.parse::<f64>().expect("worker CPU time field")
+            })
+        }
+    };
+    let before: Vec<_> = workers.iter().map(|&pid| (pid, cpu_seconds(pid))).collect();
+    let started = std::time::Instant::now();
+    thread::sleep(Duration::from_secs(3));
+    let elapsed = started.elapsed().as_secs_f64();
+    for (pid, before) in before {
+        let after = cpu_seconds(pid);
+        assert!(after >= before, "worker {pid} CPU counters moved backwards");
+        let cpu = (after - before) / elapsed * 100.0;
         assert!(
             cpu < 25.0,
-            "worker {pid} cpu {cpu} after idle; expected a quiet event loop"
+            "worker {pid} CPU {cpu:.2}% over {elapsed:.2}s idle; expected a quiet event loop"
         );
     }
 }
