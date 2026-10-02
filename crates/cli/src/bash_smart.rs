@@ -43,7 +43,7 @@ static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -2621,6 +2621,30 @@ mod tests {
                 assert_eq!(blocks[0].kind, BlockKind::Error, "{diagnostic}");
             }
         }
+    }
+
+    #[test]
+    fn javascript_exception_headers_are_errors_but_prose_and_source_are_not() {
+        for class in [
+            "SyntaxError",
+            "TypeError",
+            "ReferenceError",
+            "RangeError",
+            "URIError",
+            "EvalError",
+            "AggregateError",
+            "InternalError",
+        ] {
+            let text = format!("{class}: diagnostic probe\n    at fixture.js:1:7\n");
+            let lines = split_lines(text.as_bytes());
+            for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
+                assert_eq!(blocks.len(), 1, "{class}");
+                assert_eq!(blocks[0].kind, BlockKind::Error);
+            }
+        }
+        let prose = split_lines(b"SyntaxError handling is documented\nthrow new SyntaxError('source code')\n{\"SyntaxError\": \"data\"}\nSyntaxError:without-separator\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
+        assert!(detect_blocks(&[], &prose).is_empty());
     }
 
     #[test]

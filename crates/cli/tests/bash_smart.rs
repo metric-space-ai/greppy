@@ -107,6 +107,37 @@ fn expand_id(stdout: &str) -> &str {
 }
 
 #[test]
+fn javascript_exception_headers_preserve_exit_count_and_stream_bytes() {
+    for class in [
+        "SyntaxError",
+        "TypeError",
+        "ReferenceError",
+        "RangeError",
+        "URIError",
+        "EvalError",
+        "AggregateError",
+        "InternalError",
+    ] {
+        for stream in ["stdout", "stderr"] {
+            let workspace = fresh_workspace("javascript-exception");
+            let diagnostic = format!("{class}: diagnostic probe\n    at fixture.js:1:7\n");
+            let redirect = if stream == "stderr" { " >&2" } else { "" };
+            let script = format!("printf '%s' '{diagnostic}'{redirect}; exit 1");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(1));
+            let verdict = "FAILED — exit 1: 1 errors, 0 warnings\n";
+            if stream == "stdout" {
+                assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, diagnostic.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn oversized_single_line_keeps_failure_and_exact_raw_log_recovery() {
     for stream in ["stdout", "stderr"] {
         let workspace = fresh_workspace(&format!("long-line-{stream}"));
