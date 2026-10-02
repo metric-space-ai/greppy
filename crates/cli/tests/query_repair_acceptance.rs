@@ -1,31 +1,12 @@
-//! Public CLI repair acceptance. Run under the real host admission gate; the
-//! fixture gate records and waits for the actual index child, never replaces it.
+//! Public CLI repair acceptance, run under the real host admission gate.
+//! The fixture gate owns, cancels and reaps the actual index child.
 #![cfg(all(unix, debug_assertions))]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 struct OwnedChild(Child);
-struct OwnedIndexer(Option<i32>);
-impl OwnedIndexer {
-    fn from_record(record: &serde_json::Value) -> Self {
-        Self(Some(
-            record["child_pid"].as_i64().expect("owned index pid") as i32
-        ))
-    }
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-impl Drop for OwnedIndexer {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
 fn bounded_exit(child: &mut OwnedChild) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -34,23 +15,46 @@ fn bounded_exit(child: &mut OwnedChild) -> std::process::ExitStatus {
         }
         assert!(
             Instant::now() < deadline,
-            "public query did not reach terminal state within 30s"
+            "owned CLI process did not terminate within 30s"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        // Child::kill uses this still-owned unreaped process, never a recorded PID.
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
+fn bounded_output(mut command: Command) -> Output {
+    // Files avoid pipe backpressure while polling and keep all process waits bounded.
+    let mut stdout = tempfile::tempfile().unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
+    let mut child = OwnedChild(
+        command
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let status = bounded_exit(&mut child);
+    stdout.seek(SeekFrom::Start(0)).unwrap();
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout.read_to_end(&mut out).unwrap();
+    stderr.read_to_end(&mut err).unwrap();
+    Output {
+        status,
+        stdout: out,
+        stderr: err,
+    }
+}
 fn git(root: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
+    let mut command = Command::new("git");
+    command.args(args).current_dir(root);
+    let out = bounded_output(command);
     assert!(
         out.status.success(),
         "fixture git: {}",
@@ -67,6 +71,8 @@ struct Fixture {
     commit: String,
     gate: PathBuf,
     record: PathBuf,
+    cancel: PathBuf,
+    terminal: PathBuf,
 }
 impl Fixture {
     fn command(&self, args: &[&str]) -> Command {
@@ -82,16 +88,15 @@ impl Fixture {
             .env("GREPPY_AUTO_REINDEX", "1")
             .env("GREPPY_HEAVY_GATE", &self.gate)
             .env("REPAIR_GATE_RECORD", &self.record)
+            .env("REPAIR_GATE_CANCEL", &self.cancel)
+            .env("REPAIR_GATE_TERMINAL", &self.terminal)
             .env_remove("GREPPY_DELEGATED_BACKGROUND_JOB")
             .env_remove("GREPPY_DISCOVER_INCLUDE")
             .env_remove("GREPPY_DISCOVER_EXCLUDE");
         cmd
     }
     fn query(&self) -> String {
-        let out = self
-            .command(&["who-calls", "target", "--json"])
-            .output()
-            .unwrap();
+        let out = bounded_output(self.command(&["who-calls", "target", "--json"]));
         assert!(
             out.status.success(),
             "public query failed: {}\n{}",
@@ -169,12 +174,24 @@ impl Fixture {
         let record = scratch.path().join("gate.jsonl");
         std::fs::write(
             &gate,
-            r#"import json, os, subprocess, sys
+            r#"import json, os, subprocess, sys, time
 args=sys.argv[sys.argv.index('--')+1:]
 child=subprocess.Popen(args)
 with open(os.environ['REPAIR_GATE_RECORD'], 'a') as f:
     f.write(json.dumps({'gate_pid':os.getpid(),'child_pid':child.pid,'argv':args})+'\n')
-sys.exit(child.wait())
+deadline=time.monotonic()+45
+try:
+    while child.poll() is None:
+        if os.path.exists(os.environ['REPAIR_GATE_CANCEL']) or time.monotonic() >= deadline:
+            # The unreaped Popen child cannot have its PID reused here.
+            child.kill()
+            break
+        time.sleep(0.02)
+finally:
+    status=child.wait(timeout=5)
+    with open(os.environ['REPAIR_GATE_TERMINAL'], 'w') as f:
+        json.dump({'status':status,'reaped':True},f)
+sys.exit(status)
 "#,
         )
         .unwrap();
@@ -186,9 +203,11 @@ sys.exit(child.wait())
             commit,
             gate,
             record,
+            cancel: scratch.path().join("gate-cancel"),
+            terminal: scratch.path().join("gate-terminal"),
             _scratch: scratch,
         };
-        let out = fixture.command(&["index", "."]).output().unwrap();
+        let out = bounded_output(fixture.command(&["index", "."]));
         assert!(
             out.status.success(),
             "fixture initial Delta: {}",
@@ -217,11 +236,49 @@ sys.exit(child.wait())
                 [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
             )
             .unwrap();
+        let contribution_count: i64 = delta
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM overlay_edges WHERE project='p' AND edge_type='USAGE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            contribution_count > 0,
+            "fixture initial repair did not create a resolved Base reference"
+        );
+        delta
+            .conn()
+            .execute(
+                "DELETE FROM overlay_edges WHERE project='p' AND edge_type='USAGE'",
+                [],
+            )
+            .unwrap();
         delta
             .conn()
             .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
             .unwrap();
         drop(delta);
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let visible =
+            greppy_store::Store::open_with(&fixture.delta, greppy_store::OpenOptions::read_only())
+                .unwrap()
+                .attach_overlay(&fixture.base, &visibility)
+                .unwrap();
+        let target = visible
+            .get_node_by_qname("p", "src/lib.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        assert!(
+            visible
+                .incoming_edges(target.id, Some("USAGE"), 10)
+                .unwrap()
+                .is_empty(),
+            "fixture still exposes a caller before repair"
+        );
+        drop(visible);
         fixture
     }
     fn job(&self) -> serde_json::Value {
@@ -235,6 +292,29 @@ sys.exit(child.wait())
             greppy_store::Store::open_with(&self.delta, greppy_store::OpenOptions::read_only())
                 .unwrap();
         assert!(greppy_indexer::rust_caller_edges_repaired(&delta).unwrap());
+    }
+}
+impl Fixture {
+    fn cancel_and_reap(&self) -> bool {
+        if !self.record.exists() {
+            return true;
+        }
+        if std::fs::write(&self.cancel, "cancel owned Popen child").is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.terminal.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.terminal.exists()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // The gate alone owns its Popen; cancellation never signals a stored PID.
+        if !self.cancel_and_reap() {
+            eprintln!("fixture gate cleanup receipt missing; gate has its own 45s deadline");
+        }
     }
 }
 fn wait_ready(ready: &Path, child: &mut OwnedChild) {
@@ -271,7 +351,7 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
     let record = std::fs::read_to_string(&f.record).unwrap();
     let admission: serde_json::Value =
         serde_json::from_str(record.lines().next().unwrap()).unwrap();
-    let mut indexer = OwnedIndexer::from_record(&admission);
+
     assert!(
         admission["argv"]
             .as_array()
@@ -300,7 +380,7 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
         bounded_exit(&mut child).success(),
         "first public query failed after repair"
     );
-    indexer.disarm();
+
     let first = std::fs::read_to_string(f._scratch.path().join("query.out")).unwrap();
     assert!(
         first.contains("caller"),
@@ -330,10 +410,10 @@ fn public_query_admits_repairs_publishes_and_reopens_uncertified_base() {
     );
 }
 
-/// Killing only the real index child lets its gate reap it and release ownership.
-/// The query retains demand until that failure is observed; it cannot publish.
+/// Overlay staging is deliberately outside the standalone recovery contract.
+/// Cancellation must preserve active bytes; a later query safely rebuilds.
 #[test]
-fn public_query_cancelled_before_publication_recovers_only_certified_candidate() {
+fn public_query_cancelled_overlay_preserves_active_and_retries_under_admission() {
     let f = Fixture::new();
     let active_before = std::fs::read(&f.delta).unwrap();
     let base_before = std::fs::read(&f.base).unwrap();
@@ -350,105 +430,61 @@ fn public_query_cancelled_before_publication_recovers_only_certified_candidate()
     );
     wait_ready(&ready, &mut query);
     let candidate = PathBuf::from(std::fs::read_to_string(&ready).unwrap());
-    let record = std::fs::read_to_string(&f.record).unwrap();
-    let admission: serde_json::Value =
-        serde_json::from_str(record.lines().next().unwrap()).unwrap();
-    let mut indexer = OwnedIndexer::from_record(&admission);
-    let child_pid = admission["child_pid"].as_i64().unwrap() as i32;
-    assert_eq!(
-        std::fs::read(&f.delta).unwrap(),
-        active_before,
-        "unpublished repair changed active Delta"
-    );
-    let out = f
-        .command(&["index", "recover", ".", "--json"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "live writer recovery must fail");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("index writer is still active"),
-        "unexpected recovery refusal: {}",
-        String::from_utf8_lossy(&out.stderr)
+        candidate
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("graph.db.delta-building."),
+        "unexpected overlay staging name: {}",
+        candidate.display()
     );
     assert_eq!(std::fs::read(&f.delta).unwrap(), active_before);
-    // Only a test-owned child from the admission record can be cancelled.
-    assert_eq!(unsafe { libc::kill(child_pid, libc::SIGKILL) }, 0);
+    let live = bounded_output(f.command(&["index", "recover", ".", "--json"]));
+    assert!(!live.status.success(), "live writer recovery must fail");
+    assert!(
+        String::from_utf8_lossy(&live.stderr).contains("index writer is still active"),
+        "{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    assert!(
+        f.cancel_and_reap(),
+        "gate must cancel and reap its own actual child"
+    );
     assert!(
         !bounded_exit(&mut query).success(),
         "cancelled query claimed success"
     );
-    indexer.disarm();
-    assert!(
-        candidate.exists(),
-        "crash candidate must survive for explicit recovery"
-    );
-    assert_eq!(std::fs::read(&f.delta).unwrap(), active_before);
-    // A recovered candidate cannot acquire certification merely by reopening.
-    let marker = {
-        let db = greppy_store::Store::open(&candidate).unwrap();
-        let marker: String = db
-            .conn()
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key=?1",
-                [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
-                |row| row.get(0),
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "DELETE FROM schema_meta WHERE key=?1",
-                [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
-            )
-            .unwrap();
-        marker
-    };
-    let rejected = f
-        .command(&["index", "recover", ".", "--json"])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    let refusal: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
-    assert_eq!(refusal["status"], "rejected");
-    assert!(
-        refusal["reason"]
-            .as_str()
-            .unwrap()
-            .contains("compatibility preparation"),
-        "{refusal}"
-    );
+    let terminal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&f.terminal).unwrap()).unwrap();
+    assert_eq!(terminal["reaped"], true);
     assert!(candidate.exists());
     assert_eq!(std::fs::read(&f.delta).unwrap(), active_before);
-    {
-        let db = greppy_store::Store::open(&candidate).unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO schema_meta(key,value) VALUES(?1,?2)",
-                [
-                    greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY,
-                    marker.as_str(),
-                ],
-            )
-            .unwrap();
-    }
-    let out = f
-        .command(&["index", "recover", ".", "--json"])
-        .output()
-        .unwrap();
+    let recovery = bounded_output(f.command(&["index", "recover", ".", "--json"]));
     assert!(
-        out.status.success(),
-        "completed candidate recovery failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
     );
-    let recovery: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(recovery["status"], "published", "{recovery}");
-    assert_eq!(recovery["candidate"], candidate.to_string_lossy().as_ref());
-    assert!(!candidate.exists());
-    f.assert_certified();
-    f.query();
+    let report: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&f.record).unwrap(),
-        record,
-        "recovered snapshot must not need a second repair"
+        report["status"], "no-candidate",
+        "standalone recovery must not silently adopt an overlay: {report}"
+    );
+    assert!(
+        candidate.exists(),
+        "recovery must not delete an unrecognized overlay candidate"
+    );
+    assert_eq!(std::fs::read(&f.delta).unwrap(), active_before);
+    // Start a fresh admitted index; do not rename staging or bypass recovery guards.
+    std::fs::remove_file(&f.cancel).unwrap();
+    std::fs::remove_file(&f.terminal).unwrap();
+    f.query();
+    f.assert_certified();
+    assert_eq!(
+        std::fs::read_to_string(&f.record).unwrap().lines().count(),
+        2,
+        "retry must acquire admission anew"
     );
     assert_eq!(std::fs::read(&f.base).unwrap(), base_before);
 }
