@@ -670,6 +670,53 @@ fn read_refuses_same_file_field_function_collision_until_exactly_qualified() {
 }
 
 #[test]
+fn read_file_default_bounds_one_long_utf8_line_without_a_false_handle() {
+    let (repo, store) = fresh_workspace("byte-budget-utf8");
+    let content = "€".repeat(100_000);
+    std::fs::write(repo.join("huge.ndjson"), &content).unwrap();
+    // Implicit byte previews need neither handles nor a continuation store.
+    std::fs::write(&store, "not a store directory").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "huge.ndjson", "--handle"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.len() < 66_500, "unbounded output: {} bytes", out.len());
+    assert!(out.starts_with("huge.ndjson:1-1 (last line partial)\n"));
+    assert!(out.contains(&"€".repeat(21_845)));
+    assert!(!out.contains('\u{fffd}'));
+    assert!(out.contains(
+        "truncated at 65535 source bytes (default limit 65536); 234465 source bytes omitted"
+    ));
+    assert!(out.contains("--lines 1:1\n"));
+    assert!(out.contains("rereads the partial line in full"));
+    assert!(!out.contains("handle: geh"));
+
+    for tail in [&["--all"][..], &["--lines", "1:1"][..]] {
+        let mut args = vec!["read-file", "huge.ndjson"];
+        args.extend_from_slice(tail);
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, format!("huge.ndjson:1-1\n{content}"));
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_byte_budget_continues_after_a_complete_line() {
+    let (repo, store) = fresh_workspace("byte-budget-boundary");
+    let content = format!("{}\ntail\n", "x".repeat(65_535));
+    std::fs::write(repo.join("large.txt"), &content).unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "large.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("large.txt:1-1\n"));
+    assert!(!out.contains("last line partial"));
+    assert!(out.contains("5 source bytes omitted from this file"));
+    assert!(out.contains("--lines 2:2\n"));
+    let (code, out, err) = run(&repo, &store, &["read-file", "large.txt", "--lines", "2:2"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "large.txt:2-2\ntail\n");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)
