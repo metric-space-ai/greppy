@@ -1832,56 +1832,67 @@ fn render_folded(
     }
     ensure_newline_after_raw(&mut writer, lines, head_end.checked_sub(1));
 
-    for group in groups.iter().filter(|group| group.count() > 1) {
-        let _ = preview::write_stream(&mut writer, &group.representative);
-        if !group.representative.ends_with(b"\n") {
-            let _ = writer.write_all(b"\n");
-        }
-    }
-    for line in lifted
-        .iter()
-        .filter(|line| line.line > head_end && line.line <= tail_start)
-    {
-        let _ = write!(writer, "{}:", line.line);
-        let _ = preview::write_line(&mut writer, &line.bytes);
-        let _ = writer.write_all(b"\n");
-    }
-
     let displayed = displayed_middle_lines(lines, exit_code, groups, lifted);
     let hidden_ranges = hidden_middle_ranges(head_end, tail_start, &displayed);
-    if !hidden_ranges.is_empty() {
-        let hidden_count = hidden_ranges
-            .iter()
-            .map(|(start, end)| end - start + 1)
-            .sum::<usize>();
-        let range_text = display_line_ranges(&hidden_ranges);
-        if groups.len() == 1
-            && groups[0].count() > 1
-            && !preview::oversized(groups[0].template.as_bytes())
-        {
-            let noun = if hidden_count == 1 {
-                "repeat"
-            } else {
-                "repeats"
-            };
-            let _ = writeln!(
-                writer,
-                "… {range_text} ({hidden_count} collapsed `{}` {noun}) — {recovery}",
-                groups[0].template
-            );
-        } else {
-            let noun = if hidden_count == 1 { "line" } else { "lines" };
-            let _ = writeln!(
-                writer,
-                "… {range_text} ({hidden_count} collapsed {noun}) — {recovery}"
-            );
+    let mut next_line = head_end + 1;
+    // Mark each omission BEFORE the next retained value, in source order.
+    // Otherwise unrelated JSON arrays can appear stitched into one array.
+    for &number in &displayed {
+        if next_line < number {
+            render_hidden_gap(&mut writer, next_line, number - 1, recovery, groups);
         }
-    } else {
+        if let Some(line) = lifted.iter().find(|line| line.line == number) {
+            let _ = write!(writer, "{}:", line.line);
+            let _ = preview::write_line(&mut writer, &line.bytes);
+            if !line.bytes.ends_with(b"\n") {
+                let _ = writer.write_all(b"\n");
+            }
+        } else {
+            let _ = preview::write_line(&mut writer, lines[number - 1].raw);
+            ensure_newline_after_raw(&mut writer, lines, Some(number - 1));
+        }
+        next_line = number + 1;
+    }
+    if next_line <= tail_start {
+        render_hidden_gap(&mut writer, next_line, tail_start, recovery, groups);
+    }
+    if hidden_ranges.is_empty() {
         let _ = writeln!(writer, "… partial output — {recovery}");
     }
-
     for line in &lines[tail_start..] {
         let _ = preview::write_line(&mut writer, line.raw);
+    }
+}
+
+fn render_hidden_gap(
+    writer: &mut dyn Write,
+    start: usize,
+    end: usize,
+    recovery: &str,
+    groups: &[CollapseGroup],
+) {
+    let hidden_count = end - start + 1;
+    let range_text = display_line_ranges(&[(start, end)]);
+    if groups.len() == 1
+        && groups[0].count() > 1
+        && !preview::oversized(groups[0].template.as_bytes())
+    {
+        let noun = if hidden_count == 1 {
+            "repeat"
+        } else {
+            "repeats"
+        };
+        let _ = writeln!(
+            writer,
+            "… {range_text} ({hidden_count} collapsed `{}` {noun}) — {recovery}",
+            groups[0].template
+        );
+    } else {
+        let noun = if hidden_count == 1 { "line" } else { "lines" };
+        let _ = writeln!(
+            writer,
+            "… {range_text} ({hidden_count} collapsed {noun}) — {recovery}"
+        );
     }
 }
 
