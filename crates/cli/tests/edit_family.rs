@@ -1323,15 +1323,15 @@ fn replace_rust_attributes_roundtrip_and_refusal_are_atomic() {
     let suffix = "\n\nfn neighbor() { let _ = 99; }\n";
     let original = format!("#[inline]\n#[allow(dead_code)]\nfn probe() {{ let _ = 1; }}{suffix}");
     std::fs::write(&file, &original).unwrap();
-    let read = fixture.run(&["read", "probe"]);
+    let read = fixture.run(&["read", "probe.rs::Function::probe"]);
     assert_eq!(read.status.code(), Some(0), "{}", combined(&read));
     let replacement = "#[inline]\n#[allow(dead_code)]\nfn probe() { let _ = 2; }";
-    let replaced = fixture.run(&["replace", "probe", replacement]);
+    let replaced = fixture.run(&["replace", "probe.rs::Function::probe", replacement]);
     assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
     assert_file(&file, &format!("{replacement}{suffix}"));
 
     let plain = "fn probe() { let _ = 3; }";
-    let replaced = fixture.run(&["replace", "probe", plain]);
+    let replaced = fixture.run(&["replace", "probe.rs::Function::probe", plain]);
     assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
     assert_file(
         &file,
@@ -1339,12 +1339,16 @@ fn replace_rust_attributes_roundtrip_and_refusal_are_atomic() {
     );
 
     let changed_attributes = "#[cold]\nfn probe() { let _ = 4; }";
-    let replaced = fixture.run(&["replace", "probe", changed_attributes]);
+    let replaced = fixture.run(&["replace", "probe.rs::Function::probe", changed_attributes]);
     assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
     let expected = format!("{changed_attributes}{suffix}");
     assert_file(&file, &expected);
 
-    let refused = fixture.run(&["replace", "probe", "#[cold]\nfn probe( {"]);
+    let refused = fixture.run(&[
+        "replace",
+        "probe.rs::Function::probe",
+        "#[cold]\nfn probe( {",
+    ]);
     assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
     assert_file(&file, &expected);
 }
@@ -1357,13 +1361,18 @@ fn replace_rust_attributed_method_keeps_indentation_and_body_edits() {
         "struct Counter;\nimpl Counter {\n    #[inline]\n    fn probe(&self) { let _ = 1; }\n}\n";
     std::fs::write(&file, before).unwrap();
     let replacement = "    #[cold]\n    fn probe(&self) { let _ = 2; }";
-    let replaced = fixture.run(&["replace", "probe", replacement]);
+    let replaced = fixture.run(&["replace", "probe.rs::Function::probe", replacement]);
     assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
     assert_file(
         &file,
         &format!("struct Counter;\nimpl Counter {{\n{replacement}\n}}\n"),
     );
-    let body = fixture.run(&["replace", "probe", "{ let _ = 3; }", "--body"]);
+    let body = fixture.run(&[
+        "replace",
+        "probe.rs::Function::probe",
+        "{ let _ = 3; }",
+        "--body",
+    ]);
     assert_eq!(body.status.code(), Some(0), "{}", combined(&body));
     let text = std::fs::read_to_string(&file).unwrap();
     assert_eq!(text.matches("#[cold]").count(), 1, "{text}");
