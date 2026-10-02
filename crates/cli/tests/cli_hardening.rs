@@ -1637,6 +1637,7 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 }
 
 #[test]
+#[cfg(not(feature = "ci-test-assets"))]
 fn index_status_does_not_materialize_inference_assets() {
     let (repo, store, _scratch) = make_repo("status-no-assets", "status_identity_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
@@ -1647,15 +1648,17 @@ fn index_status_does_not_materialize_inference_assets() {
         vec!["index", "status", "--json"],
         vec!["index", "status", "--json", "--diagnostics"],
     ] {
-        let (code, out, err) = run_with_env(
-            &args,
-            &repo,
-            &store,
-            &[
-                ("GREPPY_TEST_SKIP_INFERENCE", "0"),
-                ("GREPPY_SHARED_INFERENCE_ROOT", inference_path),
-            ],
-        );
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_SHARED_INFERENCE_ROOT", inference_path)
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .output()
+            .expect("spawn inference-enabled status");
+        let code = output.status.code().unwrap_or(-1);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             code, 73,
             "missing embeddings must remain unhealthy: {out}\n{err}"
