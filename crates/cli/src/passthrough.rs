@@ -604,11 +604,15 @@ fn stdin_availability_nonterminal() -> StdinAvailability {
 
 /// Distinguish a command-like grep pattern from a typo without consuming stdin.
 /// Explicit `-` retains grep's unbounded producer wait; implicit input uses the
-/// same bounded producer grace and empty-input policy as normal passthrough.
+/// same bounded producer grace as normal passthrough; closed streams retain
+/// grep's ordinary EOF/no-match semantics.
 pub(crate) fn stdin_supplies_grep_pattern(args: &[OsString]) -> bool {
     match grep_stdin_demand(args) {
         StdinDemand::Explicit(_) => true,
-        StdinDemand::WhenNonTerminal(_) => stdin_availability() == StdinAvailability::Data,
+        StdinDemand::WhenNonTerminal(_) => matches!(
+            stdin_availability(),
+            StdinAvailability::Data | StdinAvailability::Empty
+        ),
         StdinDemand::None | StdinDemand::Unknown => false,
     }
 }
@@ -622,7 +626,9 @@ pub(crate) fn missing_stdin_message(demand: StdinDemand<'_>, tool: &str) -> Opti
             let _ = pattern;
             return None;
         }
-        (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::Empty) => pattern,
+        // A producer that closed its stream supplied valid empty input.
+        // Forward EOF unchanged so grep/rg own the no-match exit status.
+        (StdinDemand::WhenNonTerminal(_), StdinAvailability::Empty) => return None,
         (StdinDemand::WhenNonTerminal(pattern), StdinAvailability::IdleTimeout) => pattern,
         (_, StdinAvailability::Unknown) => return None,
     };
