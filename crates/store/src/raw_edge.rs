@@ -118,9 +118,27 @@ impl Store {
         files: &[String],
         edges: &[NewRawEdge],
     ) -> Result<usize> {
+        self.replace_validated_rust_edge_kind(project, files, edges, "USAGE")
+    }
+
+    /// Refresh caller facts without claiming ownership of immutable Base files.
+    pub fn replace_validated_rust_calls(
+        &mut self, project: &str, files: &[String], edges: &[NewRawEdge],
+    ) -> Result<usize> {
+        self.replace_validated_rust_edge_kind(project, files, edges, "CALLS")
+    }
+
+    fn replace_validated_rust_edge_kind(
+        &mut self, project: &str, files: &[String], edges: &[NewRawEdge], kind: &str,
+    ) -> Result<usize> {
+        if edges.iter().any(|edge| edge.edge_type != kind || edge.project != project
+            || !files.contains(&edge.file_path)) {
+            return Err(Error::Invalid("Rust repair rows do not match the validated edge scope".into()));
+        }
         let overlay = self.is_overlay();
         let old = self.list_raw_edges(project)?;
-        let key = format!("greppy.rust_usage_override_files.{project}");
+        let prefix = if kind == "CALLS" { "caller" } else { "usage" };
+        let key = format!("greppy.rust_{prefix}_override_files.{project}");
         let signature = |file: &str, source: &str, target: &str, properties: &serde_json::Value| {
             (
                 file.to_owned(),
@@ -135,7 +153,7 @@ impl Store {
             .collect::<std::collections::HashSet<_>>();
         let previous = old
             .iter()
-            .filter(|edge| edge.edge_type == "USAGE" && file_set.contains(edge.file_path.as_str()))
+            .filter(|edge| edge.edge_type == kind && file_set.contains(edge.file_path.as_str()))
             .map(|edge| {
                 signature(
                     &edge.file_path,
@@ -174,7 +192,7 @@ impl Store {
             )?;
         }
         for file in files {
-            tx.raw().execute("DELETE FROM main.raw_edges WHERE project=?1 AND file_path=?2 AND edge_type='USAGE'", params![project, file])?;
+            tx.raw().execute("DELETE FROM main.raw_edges WHERE project=?1 AND file_path=?2 AND edge_type=?3", params![project, file, kind])?;
         }
         let mut base_replacements = Vec::new();
         for edge in edges {
@@ -191,7 +209,7 @@ impl Store {
                 }));
             } else {
                 tx.raw().execute("INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
-                    VALUES(?1,?2,?3,?4,'USAGE',?5)", params![project, edge.file_path, edge.source_qname, edge.target_qname, serde_json::to_string(&edge.properties)?])?;
+                    VALUES(?1,?2,?3,?4,?5,?6)", params![project, edge.file_path, edge.source_qname, edge.target_qname, kind, serde_json::to_string(&edge.properties)?])?;
             }
         }
         if overlay {
@@ -199,7 +217,7 @@ impl Store {
                 "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![
-                    format!("greppy.rust_usage_override_rows.{project}"),
+                    format!("greppy.rust_{prefix}_override_rows.{project}"),
                     serde_json::to_string(&base_replacements)?
                 ],
             )?;
@@ -332,6 +350,44 @@ mod tests {
             edge_type: ty.into(),
             properties: serde_json::json!({"line": 1}),
         }
+    }
+
+    #[test]
+    fn validated_caller_replacement_is_atomic_and_keeps_usage_overrides_separate() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project { name: "p".into(), indexed_at: "cached".into(), root_path: "/root".into() }).unwrap();
+            base.insert_raw_edges(&[
+                new_raw_edge("p", "base.rs", "source", "obsolete", "CALLS"),
+                new_raw_edge("p", "base.rs", "source", "keep_usage", "USAGE"),
+            ]).unwrap();
+        }
+        let visibility = crate::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = overlay.list_raw_edges("p").unwrap();
+        overlay.conn().execute_batch("CREATE TRIGGER reject_caller_override BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.rust_caller_override_rows.p' BEGIN SELECT RAISE(ABORT,'fixture caller failure'); END;").unwrap();
+        let files = vec!["base.rs".to_string()];
+        let replacements = vec![new_raw_edge("p", "base.rs", "source", "correct", "CALLS")];
+        assert!(overlay.replace_validated_rust_calls("p", &files, &replacements).is_err());
+        assert_eq!(overlay.list_raw_edges("p").unwrap(), original);
+        let masks: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.schema_meta WHERE key LIKE 'greppy.rust_caller_override_%'", [], |row| row.get(0)).unwrap();
+        assert_eq!(masks, 0);
+        overlay.conn().execute_batch("DROP TRIGGER reject_caller_override").unwrap();
+        overlay.replace_validated_rust_calls("p", &files, &replacements).unwrap();
+        let rows = overlay.list_raw_edges("p").unwrap();
+        assert!(rows.iter().any(|edge| edge.edge_type == "CALLS" && edge.target_qname == "correct"));
+        assert!(rows.iter().any(|edge| edge.edge_type == "USAGE" && edge.target_qname == "keep_usage"));
+        assert!(rows.iter().all(|edge| edge.target_qname != "obsolete"));
+        assert!(overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        assert!(overlay.list_private_file_states("p").unwrap().is_empty());
+        let repaired_ids = rows.iter().filter(|edge| edge.edge_type == "CALLS").map(|edge| edge.id).collect::<Vec<_>>();
+        drop(overlay);
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert_eq!(reopened.list_raw_edges("p").unwrap().iter().filter(|edge| edge.edge_type == "CALLS").map(|edge| edge.id).collect::<Vec<_>>(), repaired_ids);
+        assert_eq!(Store::open(&base_path).unwrap().list_raw_edges("p").unwrap(), original);
     }
 
     #[test]

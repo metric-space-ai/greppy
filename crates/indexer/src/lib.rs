@@ -2123,7 +2123,7 @@ pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Recover references omitted by older Rust extractors without rebuilding nodes
+/// Recover references and caller provenance omitted by older Rust extractors without rebuilding nodes
 /// or embeddings. Validate every visible Rust source before writing anything.
 /// Private usage overrides also work for immutable Base files: no file-state ownership
 /// is copied into Delta, and ordinary sparse publication remains Delta-bounded.
@@ -2202,18 +2202,34 @@ pub fn recover_persisted_rust_usages(
                 state.rel_path
             )));
         }
+        // Receiver provenance depends on persisted Field declarations as well
+        // as raw calls. Never certify an older Base whose field facts are
+        // absent or differ from the fingerprint-validated source extraction.
+        for field in extraction.nodes.iter().filter(|node| node.label == "Field") {
+            let cached = store.get_node_by_qname(project, &field.qualified_name)?;
+            if cached.as_ref().is_none_or(|node| node.label != "Field"
+                || node.properties.get("return_type") != field.properties.get("return_type")) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust reference repair source {} has unavailable or stale declared field facts for {}; re-extract declared field nodes from source before caller repair",
+                    state.rel_path, field.qualified_name
+                )));
+            }
+        }
         files.push(state.rel_path.clone());
         replacements.extend(
             extraction
                 .edges
                 .iter()
-                .filter(|edge| edge.edge_type == "USAGE")
+                .filter(|edge| matches!(edge.edge_type.as_str(), "USAGE" | "CALLS"))
                 .map(|edge| new_raw_edge_for(project, &state.rel_path, edge)),
         );
     }
     // All source fingerprints validate before any persisted write. Replace
-    // exactly the USAGE contribution, retaining imports/calls and cached data.
-    Ok(store.replace_validated_rust_usages(project, &files, &replacements)?)
+    // USAGE and CALLS contributions, retaining imports, nodes and cached data.
+    let usages = replacements.iter().filter(|edge| edge.edge_type == "USAGE").cloned().collect::<Vec<_>>();
+    let calls = replacements.into_iter().filter(|edge| edge.edge_type == "CALLS").collect::<Vec<_>>();
+    let changed = store.replace_validated_rust_usages(project, &files, &usages)?;
+    Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
 /// One-shot single-store compatibility repair. Replace only Rust-owned
@@ -2321,7 +2337,7 @@ fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()
                          WHERE h.path = s.file_path
                      )
                )
-               AND (d.edge_type = 'USAGE' OR NOT EXISTS (
+               AND (d.edge_type IN ('USAGE', 'CALLS') OR NOT EXISTS (
                    SELECT 1
                    FROM greppy_base.nodes bs
                    JOIN greppy_base.edges e
@@ -2452,10 +2468,10 @@ fn note_edge_resolution_work(_n: usize) {}
 
 /// The project's **definition fingerprint**: the sorted set of node
 /// identity tuples that cross-file edge resolution actually consults —
-/// `qualified_name`, `name`, `label`, `file_path`. Edge resolution is a
+/// `qualified_name`, `name`, `label`, `file_path`, and Field declared types. Edge resolution is a
 /// pure function of this set (plus the per-edge raw data): `by_qname`
 /// targets, `by_name` candidate sets, the same-file preference, and IMPORTS
-/// disambiguation all read only these four columns. Node `id`s are
+/// disambiguation and typed field receivers consult these facts. Node `id`s are
 /// deliberately excluded — they are autoincrement and change on
 /// re-extraction even for byte-identical content, but a changed id never
 /// changes *which* definition a name resolves to.
@@ -2480,7 +2496,8 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
     // correctness.
     let mut stmt = conn
         .prepare_cached(
-            "SELECT qualified_name, name, label, file_path
+            "SELECT qualified_name, name, label, file_path,
+                    CASE WHEN label = 'Field' THEN json_extract(properties, '$.return_type') END
              FROM nodes WHERE project = ?1
                AND label NOT IN ('Project', 'Folder', 'File')",
         )
@@ -2488,11 +2505,12 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
     let rows = stmt
         .query_map(rusqlite::params![project], |r| {
             Ok(format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
             ))
         })
         .map_err(sqlite_err)?;
@@ -3049,6 +3067,7 @@ struct NodeLite {
     id: i64,
     label: String,
     file_path: String,
+    declared_type: Option<String>,
 }
 
 /// Rank graph labels exactly like CLI symbol navigation. When one source symbol
@@ -3650,7 +3669,8 @@ impl GraphIndex {
             let conn = store.conn();
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, name, qualified_name, label, file_path
+                    "SELECT id, name, qualified_name, label, file_path,
+                            CASE WHEN label = 'Field' THEN json_extract(properties, '$.return_type') END
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -3662,11 +3682,12 @@ impl GraphIndex {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
             for row in rows {
-                let (id, name, qname, label, file_path) = row.map_err(sqlite_err)?;
+                let (id, name, qname, label, file_path, declared_type) = row.map_err(sqlite_err)?;
                 note_edge_resolution_work(1);
                 if label == "File" {
                     let base = file_path.rsplit('/').next().unwrap_or(&file_path);
@@ -3677,6 +3698,7 @@ impl GraphIndex {
                     id,
                     label,
                     file_path: file_path.clone(),
+                    declared_type,
                 };
                 known_files.insert(file_path.clone());
                 id_to_file.insert(id, file_path);
@@ -4138,10 +4160,20 @@ impl GraphIndex {
             .and_then(|value| value.as_str())
             == Some("receiver")
         {
+            if let Some(fact) = edge.properties.get("receiver_provenance") {
+                return self.resolve_option_field_receiver(src_id, fact, name);
+            }
             let owner = edge
                 .properties
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())?;
+            if edge.properties.get("receiver_option_pattern").and_then(|value| value.as_bool()) == Some(true) {
+                let id = self.resolve_rust_type_path(&edge.file_path, owner)?;
+                let owner_file = self.file_of(id)?;
+                let owner_name = self.qname_for_id(id)?.rsplit("::").next()?;
+                let method = self.by_qname(&format!("{owner_file}::{owner_name}::{name}"))?;
+                return (method.label == "Method").then_some(method.id);
+            }
             return self.resolve_receiver_method(&edge.file_path, owner, name);
         }
         // A module-qualified Rust call names its complete module path. Resolve
@@ -4321,6 +4353,70 @@ impl GraphIndex {
             [id] => Some(*id),
             _ => None,
         }
+    }
+
+    /// Resolve a type only in its lexical module/import scope. Project-wide
+    /// uniqueness does not establish that a type is bound in this scope.
+    fn resolve_rust_type_path(&self, file: &str, path: &str) -> Option<i64> {
+        let path = path.trim();
+        if path.is_empty() || !path.split("::").all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+        }) { return None; }
+        let name = path.rsplit("::").next()?;
+        let files = if !path.contains("::") {
+            vec![file.to_string()]
+        } else {
+            let first = path.split("::").next()?;
+            self.rust_namespaces_by_file.get(file).and_then(|aliases| aliases.get(first))
+                .map(|files| rust_module_files_below_alias(files, path, name, self.rust_crate_roots.as_ref()))
+                .unwrap_or_else(|| self.rust_module_files_for_path(file, path, name))
+        };
+        let owners = self.rust_module_export_targets(&files, name, &["Class", "Struct", "Enum"]);
+        match owners.as_slice() { [id] => Some(*id), _ => None }
+    }
+
+    fn resolve_option_field_receiver(&self, src_id: i64, fact: &serde_json::Value, name: &str) -> Option<i64> {
+        if fact.get("adapter")?.as_str()? != "as_ref" || fact.get("pattern")?.as_str()? != "Some" {
+            return None;
+        }
+        let file = self.file_of(src_id)?;
+        let base = self.resolve_rust_type_path(file, fact.get("base_type")?.as_str()?)?;
+        let owner_qname = self.qname_for_id(base)?;
+        let field_name = fact.get("field")?.as_str()?;
+        let field = self.by_qname(&format!("{owner_qname}::{field_name}"))?;
+        if field.label != "Field" { return None; }
+        let declared = field.declared_type.as_deref()?.trim();
+        let (option, payload) = declared.split_once('<')?;
+        let payload = payload.strip_suffix('>')?.trim();
+        // Only a simple explicit Option payload is represented. References,
+        // generics, aliases and arbitrary adapters remain unresolved.
+        match option.trim() {
+            "std::option::Option" | "core::option::Option" => {
+                let files = self.rust_module_files_for_path(&field.file_path, option.trim(), "Option");
+                let first = option.trim().split("::").next()?;
+                if !self.rust_module_export_targets(&files, "Option", &CONSTRUCTABLE_LABELS).is_empty()
+                    || self.rust_namespaces_by_file.get(&field.file_path).is_some_and(|aliases| aliases.contains_key(first))
+                { return None; }
+            }
+            "Option" => {
+                if !self.rust_module_export_targets(&[field.file_path.clone()], "Option", &CONSTRUCTABLE_LABELS).is_empty()
+                    || self.import_globs_by_file.get(&field.file_path).is_some_and(|globs| !globs.is_empty())
+                { return None; }
+                if let Some(sources) = self.import_alias_sources_by_file.get(&field.file_path)
+                    .and_then(|aliases| aliases.get("Option"))
+                {
+                    if sources.iter().any(|(path, original)| {
+                        original != "Option" || !matches!(path.as_str(), "std::option::Option" | "core::option::Option")
+                    }) { return None; }
+                }
+            }
+            _ => return None,
+        }
+        let payload_id = self.resolve_rust_type_path(&field.file_path, payload)?;
+        let payload_file = self.file_of(payload_id)?;
+        let payload_name = self.qname_for_id(payload_id)?.rsplit("::").next()?;
+        let method = self.by_qname(&format!("{payload_file}::{payload_name}::{name}"))?;
+        (method.label == "Method").then_some(method.id)
     }
 
     fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
@@ -8955,6 +9051,155 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         let small = receiver_resolution_work(1000);
         let large = receiver_resolution_work(4000);
         assert!(large < small * 5, "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically");
+    }
+
+    const OPTION_FIELD_CALLER: &str = r#"
+mod scene;
+use crate::scene::Manifest;
+use wasm_bindgen::prelude::*;
+pub fn load_scene() {
+    let manifest: Manifest = opaque();
+    let gi_matrix: Option<[f32;16]> = None;
+    match (manifest.remaster_irradiance.as_ref(), gi_matrix) {
+        (Some(field), Some(matrix)) => { field.storage(); field.uniform(matrix); },
+        _ => (),
+    }
+}
+"#;
+    const OPTION_FIELD_SCENE: &str = r#"
+pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }
+pub struct IrradianceField;
+impl IrradianceField {
+    pub fn storage(&self) {}
+    pub fn uniform(&self, matrix: [f32;16]) {}
+}
+pub struct Other;
+impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
+"#;
+
+    fn assert_option_field_caller(store: &Store, target: &str, present: bool) {
+        let caller = store.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
+        let method = store.get_node_by_qname("test", target).unwrap().unwrap();
+        assert_eq!(store.incoming_edges(method.id, Some("CALLS"), 100).unwrap().iter()
+            .any(|edge| edge.source_id == caller.id), present, "{target}");
+    }
+
+    #[test]
+    fn option_field_tuple_receiver_resolves_across_files_and_tracks_declared_type_changes() {
+        let repo = setup_repo("option-field-tuple", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
+        assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
+        // Same Field identity but different payload: unchanged caller facts must
+        // be re-resolved, not incorrectly retained by the body-edit fast path.
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE.replace(
+            "Option<crate::scene::IrradianceField>", "Option<crate::scene::Other>")).unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert_option_field_caller(&store, "src/scene.rs::Other::uniform", true);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_receiver_preserves_owner_ambiguity_and_shadowing() {
+        for (label, caller, scene) in [
+            ("shadowed-base", OPTION_FIELD_CALLER.replace(
+                "let gi_matrix:", "let manifest = opaque(); let gi_matrix:"), OPTION_FIELD_SCENE.to_string()),
+            ("generic-base", OPTION_FIELD_CALLER.replace(
+                "pub fn load_scene()", "pub fn load_scene<Manifest>()"), OPTION_FIELD_SCENE.to_string()),
+            ("ambiguous-owner", OPTION_FIELD_CALLER.replace(
+                "use crate::scene::Manifest;", "use crate::scene::Manifest; use crate::other::Manifest; mod other;"), OPTION_FIELD_SCENE.to_string()),
+            ("ambiguous-payload", OPTION_FIELD_CALLER.to_string(), OPTION_FIELD_SCENE.replace(
+                "IrradianceField", "LocalField").replace(
+                "pub struct Manifest", "use crate::other::IrradianceField; use crate::foreign::IrradianceField; pub struct Manifest").replace(
+                "Option<crate::scene::LocalField>", "Option<IrradianceField>")),
+            ("custom-option", OPTION_FIELD_CALLER.to_string(), OPTION_FIELD_SCENE.replace(
+                "pub struct Manifest", "pub enum Option<T> { Some(T), None } pub struct Manifest")),
+        ] {
+            let repo = setup_repo(label, &caller);
+            fs::write(repo.join("src/scene.rs"), scene).unwrap();
+            fs::write(repo.join("src/other.rs"), "pub struct Manifest { pub remaster_irradiance: Option<IrradianceField> } pub struct IrradianceField; impl IrradianceField { pub fn uniform(&self) {} }").unwrap();
+            fs::write(repo.join("src/foreign.rs"), "pub struct IrradianceField; impl IrradianceField { pub fn uniform(&self) {} }").unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let caller = store.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
+            assert!(store.outgoing_edges(caller.id, Some("CALLS"), 100).unwrap().iter().all(|edge| {
+                store.get_node(edge.target_id).unwrap().unwrap().name != "uniform"
+            }), "{label}: ownership must remain unresolved");
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn option_field_recovery_rejects_stale_declared_facts_without_certifying_base() {
+        let repo = setup_repo("option-field-stale-facts", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        store.conn().execute("UPDATE nodes SET properties=json_remove(properties,'$.return_type') WHERE label='Field'", []).unwrap();
+        store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        let before = store.list_raw_edges("test").unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo).unwrap_err().to_string();
+        assert!(error.contains("declared field facts"), "{error}");
+        assert_eq!(store.list_raw_edges("test").unwrap(), before);
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_caller_recovery_refreshes_old_raw_facts_without_base_ownership() {
+        let repo = setup_repo("option-field-cache", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS'", []).unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            base.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')", []).unwrap();
+            // The single-store upgrade also re-extracts, not merely re-resolves
+            // the stale receiver facts, and does not accept a v6 completion.
+            assert!(!rust_caller_edges_repaired(&base).unwrap());
+            rebuild_single_store_rust_edges(&mut base, "test").unwrap();
+            assert_option_field_caller(&base, "src/scene.rs::IrradianceField::uniform", true);
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS'", []).unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            let caller = base.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
+            let wrong = base.get_node_by_qname("test", "src/scene.rs::Other::uniform").unwrap().unwrap();
+            base.insert_edge(&NewEdge { project: "test".into(), source_id: caller.id,
+                target_id: wrong.id, edge_type: "CALLS".into(), properties: serde_json::json!({}) }).unwrap();
+        }
+        let base_before = fs::read(&base_path).unwrap();
+        let visibility = greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = fs::read(repo.join("src/scene.rs")).unwrap();
+        fs::write(repo.join("src/scene.rs"), "// drift\n").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::write(repo.join("src/scene.rs"), original).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        assert_option_field_caller(&overlay, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&overlay, "src/scene.rs::Other::uniform", false);
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        drop(overlay);
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        let mut reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert_option_field_caller(&reopened, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&reopened, "src/scene.rs::Other::uniform", false);
+        rebuild_overlay_edges(&mut reopened, "test").unwrap();
+        assert_option_field_caller(&reopened, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&reopened, "src/scene.rs::Other::uniform", false);
+        assert!(recover_persisted_rust_usages(&mut reopened, "test", &repo).unwrap() == 0);
+        drop(reopened);
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

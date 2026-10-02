@@ -561,9 +561,16 @@ fn rust_option_pattern_owner<'a>(
         if !matches!(inner.kind(), "type_identifier" | "scoped_type_identifier") {
             return None;
         }
-        let mut names = Vec::new();
-        type_identifiers_in(source, inner, &mut names);
-        (names.len() == 1).then(|| names[0])
+        let path = node_text(source, inner);
+        fn generic_shadow(source: &[u8], node: Node<'_>, path: &str) -> bool {
+            (node.kind() == "type_parameter" && node.child_by_field_name("name")
+                .is_some_and(|name| node_text(source, name) == path))
+                || (0..node.named_child_count()).filter_map(|i| node.named_child(i))
+                    .any(|child| generic_shadow(source, child, path))
+        }
+        let mut root = value;
+        while let Some(parent) = root.parent() { root = parent; }
+        (!generic_shadow(source, root, path)).then_some(path)
     }
     let mut ancestor = callee.parent();
     while let Some(node) = ancestor {
@@ -634,6 +641,125 @@ fn rust_option_pattern_owner<'a>(
         if node.kind() == "function_item" {
             break;
         }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// Preserve field provenance for a Some binding over an Option field's
+/// inherent as_ref adapter. No return type or field ownership is guessed here.
+fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        (pattern.kind() == "identifier" && node_text(source, pattern) == name)
+            || (0..pattern.named_child_count()).filter_map(|i| pattern.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    fn selected<'t>(source: &[u8], pattern: Node<'t>, value: Node<'t>, name: &str) -> Option<Node<'t>> {
+        if pattern.kind() == "match_pattern" {
+            return selected(source, pattern.named_child(0)?, value, name);
+        }
+        if pattern.kind() == "tuple_pattern" && value.kind() == "tuple_expression" {
+            if pattern.named_child_count() != value.named_child_count() { return None; }
+            for i in 0..pattern.named_child_count() {
+                let child = pattern.named_child(i)?;
+                if binds(source, child, name) {
+                    return selected(source, child, value.named_child(i)?, name);
+                }
+            }
+            return None;
+        }
+        if pattern.kind() != "tuple_struct_pattern" || pattern.named_child_count() != 2
+            || node_text(source, pattern.child_by_field_name("type").or_else(|| pattern.named_child(0))?) != "Some"
+            || node_text(source, pattern.named_child(1)?) != name
+            || pattern.named_child(1)?.kind() != "identifier"
+        { return None; }
+        Some(value)
+    }
+    fn shadows(source: &[u8], node: Node<'_>) -> bool {
+        if matches!(node.kind(), "struct_item" | "enum_item" | "type_item"
+            | "type_parameter" | "function_item" | "const_item" | "static_item"
+            | "enum_variant" | "mod_item")
+            && node.child_by_field_name("name").is_some_and(|ident| {
+                matches!(node_text(source, ident), "Option" | "Some")
+            })
+        { return true; }
+        if node.kind() == "use_declaration"
+            && node_text(source, node).split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|part| matches!(part, "Option" | "Some"))
+        { return true; }
+        (0..node.named_child_count()).filter_map(|i| node.named_child(i))
+            .any(|child| shadows(source, child))
+    }
+    let field = callee.parent()?;
+    if field.kind() != "field_expression" { return None; }
+    let receiver = field.child_by_field_name("value")?;
+    if receiver.kind() != "identifier" { return None; }
+    let name = node_text(source, receiver);
+    let mut root = callee;
+    while let Some(parent) = root.parent() { root = parent; }
+    if shadows(source, root) { return None; }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() == "let_declaration" && binding.end_byte() <= callee.start_byte()
+                    && binding.child_by_field_name("pattern").is_some_and(|pattern| binds(source, pattern, name))
+                { return None; }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression") {
+            if node.child_by_field_name("pattern").or_else(|| node.child_by_field_name("parameters"))
+                .is_some_and(|pattern| binds(source, pattern, name)) { return None; }
+        }
+        let pair = if node.kind() == "match_arm" {
+            node.child_by_field_name("pattern").zip(node.parent().and_then(|body| body.parent())
+                .and_then(|expression| expression.child_by_field_name("value")))
+        } else if matches!(node.kind(), "if_expression" | "while_expression") {
+            node.child_by_field_name("condition").and_then(|condition| {
+                let body = node.child_by_field_name("consequence").or_else(|| node.child_by_field_name("body"))?;
+                if body.start_byte() > callee.start_byte() || callee.end_byte() > body.end_byte() { return None; }
+                (condition.kind() == "let_condition").then(|| {
+                    condition.child_by_field_name("pattern").zip(condition.child_by_field_name("value"))
+                }).flatten()
+            })
+        } else { None };
+        if let Some((pattern, value)) = pair {
+            if binds(source, pattern, name) {
+                let value = selected(source, pattern, value, name)?;
+                if value.kind() != "call_expression" { return None; }
+                let function = value.child_by_field_name("function")?;
+                let arguments = value.child_by_field_name("arguments")?;
+                if function.kind() != "field_expression" || arguments.named_child_count() != 0
+                    || node_text(source, function.child_by_field_name("field")?) != "as_ref"
+                { return None; }
+                let access = function.child_by_field_name("value")?;
+                if access.kind() != "field_expression" { return None; }
+                let base = access.child_by_field_name("value")?;
+                if base.kind() != "identifier" { return None; }
+                let mut ty = rust_visible_binding_type(source, base, node_text(source, base))?;
+                while ty.kind() == "reference_type" { ty = ty.child_by_field_name("type")?; }
+                if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") { return None; }
+                let base_type = node_text(source, ty);
+                // A generic type parameter is not a concrete owner.
+                fn is_parameter(source: &[u8], node: Node<'_>, name: &str) -> bool {
+                    (node.kind() == "type_parameter"
+                        && node.child_by_field_name("name").is_some_and(|ident| node_text(source, ident) == name))
+                        || (0..node.named_child_count()).filter_map(|i| node.named_child(i))
+                            .any(|child| is_parameter(source, child, name))
+                }
+                if is_parameter(source, root, base_type) { return None; }
+                let member = access.child_by_field_name("field")?;
+                if member.kind() != "field_identifier" { return None; }
+                return Some(serde_json::json!({
+                    "base_type": base_type,
+                    "field": node_text(source, member),
+                    "adapter": "as_ref",
+                    "pattern": "Some",
+                }));
+            }
+        }
+        if node.kind() == "function_item" { break; }
         ancestor = node.parent();
     }
     None
@@ -3145,7 +3271,13 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 } else {
                     "direct"
                 };
+                let receiver_option_pattern = node.parent()
+                    .and_then(|field| field.child_by_field_name("value"))
+                    .filter(|receiver| receiver.kind() == "identifier")
+                    .is_some_and(|receiver| rust_option_pattern_owner(source, node, node_text(source, receiver)).is_some());
                 let receiver_owner = rust_receiver_owner(source, node);
+                let receiver_provenance = (callee_form == "receiver" && receiver_owner.is_none())
+                    .then(|| rust_option_field_receiver(source, node)).flatten();
                 // The scoped path a direct call names (`store::f` for
                 // `store::f()`), so the indexer can honour an explicit module
                 // over a same-named function in the caller's own file.
@@ -3181,6 +3313,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             "callee_name": text,
                             "callee_form": callee_form,
                             });
+                            if receiver_option_pattern {
+                                properties.as_object_mut().unwrap().insert("receiver_option_pattern".into(), serde_json::json!(true));
+                            }
                             if let (Some(owner), Some(object)) =
                                 (receiver_owner, properties.as_object_mut())
                             {
@@ -3188,6 +3323,11 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                                     "receiver_owner".into(),
                                     serde_json::Value::String(owner.to_string()),
                                 );
+                            }
+                            if let (Some(fact), Some(object)) =
+                                (receiver_provenance, properties.as_object_mut())
+                            {
+                                object.insert("receiver_provenance".into(), fact);
                             }
                             if let (Some(path), Some(object)) =
                                 (callee_path, properties.as_object_mut())
@@ -15999,10 +16139,38 @@ mod tests {
     }
 
     #[test]
+    fn rust_option_field_patterns_preserve_only_explicit_provenance() {
+        let cases = [
+            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
+            ("use crate::scene::Manifest; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
+            ("fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { field.uniform(); } }", true),
+            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", false),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", false),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", false),
+            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
+            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
+        ];
+        for (source, expected) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/gpu.rs").unwrap();
+            let edge = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                && edge.properties.get("callee_name").and_then(|value| value.as_str()) == Some("uniform")).unwrap();
+            assert_eq!(edge.properties.get("receiver_provenance").is_some(), expected, "{source}");
+            assert!(edge.properties.get("receiver_owner").is_none(), "{source}");
+            if expected {
+                let fact = &edge.properties["receiver_provenance"];
+                assert_eq!(fact["field"], "remaster_irradiance");
+                assert_eq!(fact["adapter"], "as_ref");
+                assert_eq!(fact["pattern"], "Some");
+            }
+        }
+    }
+
+    #[test]
     fn rust_option_patterns_require_explicit_unshadowed_type_evidence() {
         let cases = [
             ("fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
-            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("crate::lighting::Field")),
             ("fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }", Some("Field")),
             ("fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
             ("fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }", None),
@@ -16014,6 +16182,7 @@ mod tests {
             ("enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
             ("use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
             ("fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
             ("fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }", Some("Wrong")),
         ];
         for (source, expected) in cases {
