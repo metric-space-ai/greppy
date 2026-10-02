@@ -1,6 +1,59 @@
 //! Contract coverage for read, read-smart, and read-file.
 
 use std::path::{Path, PathBuf};
+#[test]
+fn read_file_unknown_options_refuse_before_opening_any_file() {
+    let (repo, store) = fresh_workspace("unknown-option-no-read");
+    let path = repo.join("long.jsonl");
+    std::fs::write(&path, format!("SECRET_PAYLOAD_{}\n", "x".repeat(2_000_000))).unwrap();
+    for option in ["--head", "--tail", "--invented-read-window"] {
+        let (code, out, err) = run(
+            &repo,
+            &store,
+            &["read-file", path.to_str().unwrap(), option, "5"],
+        );
+        assert_eq!(code, 64, "{out}\n{err}");
+        assert!(
+            out.contains("no files were read") && out.contains("--lines A:B"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("SECRET_PAYLOAD_") && !out.contains("no such file: 5"),
+            "{out}"
+        );
+        assert!(out.len() + err.len() < 2048);
+    }
+    for leading in ["--diagnostics", "--max-bytes=128", "--limit=1"] {
+        for option in ["--head=5", "--invented-read-window=5"] {
+            let (code, out, err) = run(
+                &repo,
+                &store,
+                &[leading, "read-file", path.to_str().unwrap(), option],
+            );
+            assert_eq!(code, 64, "{out}\n{err}");
+            assert!(out.contains("no files were read"), "{out}\n{err}");
+            assert!(!out.contains("SECRET_PAYLOAD_"));
+            assert!(out.len() + err.len() < 2048);
+        }
+    }
+    let absent = repo.join("missing.txt");
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", absent.to_str().unwrap(), "--head", "5"],
+    );
+    assert_eq!(code, 64, "{out}\n{err}");
+    assert!(
+        !out.contains("no such file"),
+        "argument validation must precede file IO: {out}"
+    );
+    assert!(
+        !store.exists(),
+        "invalid file arguments must not open a graph store"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
