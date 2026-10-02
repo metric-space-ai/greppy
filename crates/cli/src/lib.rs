@@ -322,6 +322,10 @@ fn cli_result_limit(default: usize) -> usize {
 }
 
 fn cli_result_limit_unless_all(default: usize, all: bool) -> usize {
+    // --all lifts the implicit display cap, never an explicit user budget.
+    if let Some(limit) = CLI_RESULT_LIMIT.with(std::cell::Cell::get) {
+        return limit.saturating_add(cli_result_offset());
+    }
     if all {
         usize::MAX
     } else {
