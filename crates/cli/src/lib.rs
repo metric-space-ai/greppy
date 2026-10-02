@@ -4839,6 +4839,7 @@ struct BackgroundJobGuard {
     global_cache_hits: usize,
     global_cache_misses: usize,
     eta_seconds: Option<u64>,
+    eta_basis: Option<&'static str>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
@@ -4957,6 +4958,7 @@ impl BackgroundJobGuard {
                 .as_ref()
                 .and_then(|job| job.get("eta_seconds"))
                 .and_then(serde_json::Value::as_u64),
+            eta_basis: None,
             rate_milli_documents_per_second: None,
             embedding_started: None,
             last_progress_write: None,
@@ -5004,6 +5006,11 @@ impl BackgroundJobGuard {
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
         self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
+        self.eta_basis = match self.eta_seconds {
+            Some(0) => Some("completed_embedding_work"),
+            Some(_) => Some("backend_prior"),
+            None => None,
+        };
         self.write_state("embedding", None);
         self.last_progress_write = Some(now);
     }
@@ -5019,6 +5026,7 @@ impl BackgroundJobGuard {
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
+        self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
 
@@ -5045,6 +5053,7 @@ impl BackgroundJobGuard {
         self.backend = None;
         self.device = None;
         self.eta_seconds = None;
+        self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
         self.write_state(phase, None);
@@ -5070,14 +5079,18 @@ impl BackgroundJobGuard {
                 self.local_store_reuse,
                 self.global_cache_hits,
             );
-            self.eta_seconds =
-                observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms).or_else(
-                    || {
-                        self.backend.as_deref().and_then(|backend| {
-                            initial_embedding_eta_seconds(inference_workload, backend)
-                        })
-                    },
-                );
+            let observed = observed_embedding_eta_seconds(inferred, inference_workload, elapsed_ms);
+            self.eta_seconds = observed.or_else(|| {
+                self.backend
+                    .as_deref()
+                    .and_then(|backend| initial_embedding_eta_seconds(inference_workload, backend))
+            });
+            self.eta_basis = match (self.eta_seconds, observed) {
+                (Some(0), _) => Some("completed_embedding_work"),
+                (Some(_), Some(_)) => Some("observed_inference"),
+                (Some(_), None) => Some("backend_prior"),
+                (None, _) => None,
+            };
             self.rate_milli_documents_per_second =
                 observed_embedding_rate_milli(inferred, elapsed_ms);
         }
@@ -5119,12 +5132,6 @@ impl BackgroundJobGuard {
             Some(_) => Some("steps"),
             None => None,
         };
-        let eta_basis = match (self.eta_seconds, self.rate_milli_documents_per_second) {
-            (Some(0), _) => Some("completed_embedding_work"),
-            (Some(_), Some(rate)) if rate > 0 => Some("observed_inference"),
-            (Some(_), _) => Some("backend_prior"),
-            (None, _) => None,
-        };
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
@@ -5146,7 +5153,7 @@ impl BackgroundJobGuard {
             "progress_unit": progress_unit,
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
-            "eta_basis": eta_basis,
+            "eta_basis": self.eta_basis,
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
             "current_detail": self.current_detail,

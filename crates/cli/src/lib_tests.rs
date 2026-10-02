@@ -924,6 +924,22 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     assert_eq!(finished["eta_seconds"], 0);
     assert_eq!(finished["eta_basis"], "completed_embedding_work");
     assert!(finished["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_started("metal", 20);
+    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 1,
+        total_documents: 20,
+        local_store_reuse: 0,
+        global_cache_hits: 0,
+        global_cache_misses: 1,
+        current_symbol: None,
+    });
+    let slow = read_background_job(&path).unwrap();
+    assert_eq!(slow["rate_milli_spans_per_second"], 0);
+    assert_eq!(slow["eta_basis"], "observed_inference");
+    assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
     job.complete();
 }
 
