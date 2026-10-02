@@ -322,6 +322,10 @@ fn cli_result_limit(default: usize) -> usize {
 }
 
 fn cli_result_limit_unless_all(default: usize, all: bool) -> usize {
+    // --all lifts the implicit display cap, never an explicit user budget.
+    if let Some(limit) = CLI_RESULT_LIMIT.with(std::cell::Cell::get) {
+        return limit.saturating_add(cli_result_offset());
+    }
     if all {
         usize::MAX
     } else {
@@ -4414,7 +4418,70 @@ fn metadata_only_fingerprint_drift(freshness: &serde_json::Value) -> bool {
         })
 }
 
-fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json::Value {
+fn index_status_command_for_root(root: &std::path::Path) -> String {
+    let command = format!(
+        "greppy --root {} index status --json",
+        shell_quote_cli(&root.to_string_lossy())
+    );
+    match std::env::var("GREPPY_STORE_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        Some(store) => format!("GREPPY_STORE_DIR={} {command}", shell_quote_cli(&store)),
+        None => command,
+    }
+}
+
+fn preparation_refusal_diagnostics(
+    mut freshness: serde_json::Value,
+    root: Option<&str>,
+) -> serde_json::Value {
+    if freshness_json_is_fresh(&freshness) {
+        return freshness;
+    }
+    let Ok(effective_root) = resolve_root(root) else {
+        return freshness;
+    };
+    let failure = if freshness.get("state").and_then(serde_json::Value::as_str) == Some("failed") {
+        read_background_job(&background_job_path(&effective_root))
+            .filter(|job| job.get("state").and_then(serde_json::Value::as_str) == Some("failed"))
+            .and_then(|job| {
+                job.get("last_error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    };
+    if let Some(object) = freshness.as_object_mut() {
+        object.insert("root_path".into(), serde_json::json!(effective_root));
+        object.insert(
+            "diagnostics_command".into(),
+            serde_json::json!(index_status_command_for_root(&effective_root)),
+        );
+        if let Some(error) = failure {
+            let deferred = error.starts_with(
+                "Automatic indexing deferred by shared host admission; no index work started.",
+            );
+            object.insert(
+                "preparation_failure_kind".into(),
+                serde_json::json!(if deferred {
+                    "admission_deferred"
+                } else {
+                    "preparation_failed"
+                }),
+            );
+            object.insert("preparation_error".into(), serde_json::json!(error));
+        }
+    }
+    freshness
+}
+
+fn refresh_state_for_query(
+    root: Option<&str>,
+    mut freshness: serde_json::Value,
+    started: bool,
+) -> serde_json::Value {
     if let Some(object) = freshness.as_object_mut() {
         object.insert(
             "state".into(),
@@ -4422,7 +4489,7 @@ fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json:
         );
         object.insert("fresh".into(), serde_json::json!(false));
     }
-    freshness
+    preparation_refusal_diagnostics(freshness, root)
 }
 
 /// Whether the vector query path may self-heal a stale index via the
@@ -9423,20 +9490,32 @@ fn vector_exact_scan_skip_message(command: &str, total: i64, limit: i64) -> Stri
     )
 }
 
+fn preparation_recovery_message(freshness: &serde_json::Value) -> String {
+    let diagnostics = freshness
+        .get("diagnostics_command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("greppy index status --json");
+    match freshness.get("state").and_then(serde_json::Value::as_str) {
+        Some("refreshing") => format!("index publication is in progress; inspect `{diagnostics}`, then retry this command after publication"),
+        Some("unknown") => format!("freshness could not be verified; inspect `{diagnostics}`, then retry this command when host capacity is available"),
+        Some("failed") => match freshness.get("preparation_error").and_then(serde_json::Value::as_str) {
+            Some(error) => format!("{error} Inspect `{diagnostics}`; retry the original command after resolving this preparation failure"),
+            None => format!("automatic index preparation failed; inspect `{diagnostics}` for the admission or startup failure, then retry this command when host capacity is available"),
+        },
+        _ => STALE_REMEDIATION.into(),
+    }
+}
+
 fn vector_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
     format!(
-        "{command}: {STALE_REMEDIATION} — vector search skipped ({})",
+        "{command}: {} — vector search skipped ({})",
+        preparation_recovery_message(freshness),
         stale_freshness_reason(freshness)
     )
 }
 
 fn indexed_stale_skip_message(command: &str, freshness: &serde_json::Value) -> String {
-    let remediation = match freshness.get("state").and_then(serde_json::Value::as_str) {
-        Some("refreshing") => "index publication is in progress; inspect `greppy index status --json`, then retry this command after publication",
-        Some("unknown") => "freshness could not be verified; retry this command when host capacity is available",
-        Some("failed") => "automatic index preparation did not start; inspect `greppy index status --json` for the admission or startup failure, then retry this command when host capacity is available",
-        _ => STALE_REMEDIATION,
-    };
+    let remediation = preparation_recovery_message(freshness);
     format!(
         "{command}: {remediation} — indexed search skipped, \
          no stale indexed hits emitted ({})",
@@ -10997,6 +11076,23 @@ fn compact_read_json(value: &mut serde_json::Value) {
     ] {
         if let Some(field) = value.get(key).filter(|value| !value.is_null()).cloned() {
             compact.insert(key.into(), field);
+        }
+    }
+    // A proven coverage limitation is part of the answer, not bulk diagnostics.
+    // Ordinary misses retain their existing compact payload.
+    if value
+        .get("unsupported_definition_coverage")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|coverage| !coverage.is_empty())
+    {
+        for key in [
+            "lookup_scope",
+            "unsupported_definition_coverage",
+            "source_recovery",
+        ] {
+            if let Some(field) = value.get(key).filter(|value| !value.is_null()).cloned() {
+                compact.insert(key.into(), field);
+            }
         }
     }
     *value = serde_json::Value::Object(compact);

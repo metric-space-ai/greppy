@@ -214,6 +214,7 @@ struct ProgressReporter {
     reported_remaining: Option<Duration>,
     stalled: bool,
     missing_reported: bool,
+    diagnostics_command: Option<String>,
 }
 
 impl ProgressReporter {
@@ -229,8 +230,12 @@ impl ProgressReporter {
                 return None;
             }
             self.missing_reported = true;
+            let diagnostics = self
+                .diagnostics_command
+                .as_deref()
+                .unwrap_or("greppy index status --json");
             return Some(format!(
-                "greppy: {command} still running; no detailed progress is available; inspect `greppy index status --json` for index ownership and publication state"
+                "greppy: {command} is pending; no detailed progress is available; inspect `{diagnostics}` for index ownership and publication state; this message does not confirm a live index job"
             ));
         };
 
@@ -349,7 +354,14 @@ impl ProgressReporter {
             .unwrap_or_default();
         let workers = job
             .worker_count
-            .map(|workers| format!("; workers {workers}; details: greppy index status --json"))
+            .map(|workers| {
+                format!(
+                    "; workers {workers}; details: {}",
+                    self.diagnostics_command
+                        .as_deref()
+                        .unwrap_or("greppy index status --json")
+                )
+            })
             .unwrap_or_default();
         Some(format!(
             "greppy: {command} — {}: {progress}; {prognosis}{pid}{workers}",
@@ -419,10 +431,14 @@ pub(crate) fn for_command(
         Command::WhereAmI { .. } => ("where-am-i", configured_root),
         _ => return None,
     };
-    let job_path = crate::resolve_root(root_hint)
-        .ok()
-        .map(|root| crate::background_job_path(&root));
-    let mut reporter = ProgressReporter::default();
+    let effective_root = crate::resolve_root(root_hint).ok();
+    let job_path = effective_root.as_deref().map(crate::background_job_path);
+    let mut reporter = ProgressReporter {
+        diagnostics_command: effective_root
+            .as_deref()
+            .map(crate::index_status_command_for_root),
+        ..ProgressReporter::default()
+    };
     Some(QueryProgress::start(INITIAL_DELAY, move |elapsed| {
         let job = job_path.as_deref().and_then(JobProgress::read);
         if let Some(line) = reporter.observe_at(name, job, elapsed, crate::unix_now_secs_cli()) {
@@ -693,6 +709,26 @@ mod tests {
             .observe("search", None, Duration::from_secs(32))
             .is_none());
         assert!(first.contains("greppy index status --json"), "{first}");
+    }
+
+    #[test]
+    fn missing_progress_retains_selected_diagnostics_without_claiming_an_index() {
+        let diagnostics =
+            "GREPPY_STORE_DIR='/selected store' greppy --root '/selected root' index status --json";
+        let mut reporter = ProgressReporter {
+            diagnostics_command: Some(diagnostics.into()),
+            ..ProgressReporter::default()
+        };
+        let message = reporter.observe("search", None, Duration::ZERO).unwrap();
+        assert!(message.contains(diagnostics), "{message}");
+        assert!(message.contains("is pending"), "{message}");
+        assert!(
+            message.contains("does not confirm a live index job"),
+            "{message}"
+        );
+        assert!(reporter
+            .observe("search", None, Duration::from_secs(30))
+            .is_none());
     }
 
     #[test]

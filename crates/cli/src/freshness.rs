@@ -460,11 +460,12 @@ pub(crate) fn freshness_serve_decision_with_policy(
     } else {
         nav_freshness_json(store, root, project)
     };
+    let freshness = preparation_refusal_diagnostics(freshness, root);
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
     }
     if writer_active {
-        return FreshnessServe::Refuse(refresh_state(freshness, true));
+        return FreshnessServe::Refuse(refresh_state_for_query(root, freshness, true));
     }
     let state = freshness
         .get("state")
@@ -488,7 +489,8 @@ pub(crate) fn freshness_serve_decision_with_policy(
         if allow_auto_reindex && auto_reindex_enabled() && version_drift_is_scope_stable(&freshness)
         {
             let started = spawn_background_index(root, refresh_cause);
-            return FreshnessServe::Refuse(refresh_state(
+            return FreshnessServe::Refuse(refresh_state_for_query(
+                root,
                 freshness,
                 started || workspace_writer_active(root),
             ));
@@ -523,14 +525,16 @@ pub(crate) fn freshness_serve_decision_with_policy(
         } else {
             spawn_background_index(root, refresh_cause)
         };
-        return FreshnessServe::Refuse(refresh_state(
+        return FreshnessServe::Refuse(refresh_state_for_query(
+            root,
             freshness,
             rebuilt || started || writer_active || workspace_writer_active(root),
         ));
     }
     if allow_auto_reindex && auto_reindex_enabled() {
         let started = spawn_background_index(root, refresh_cause);
-        return FreshnessServe::Refuse(refresh_state(
+        return FreshnessServe::Refuse(refresh_state_for_query(
+            root,
             freshness,
             started || workspace_writer_active(root),
         ));
@@ -563,6 +567,15 @@ pub(crate) fn freshness_refusal_exit(freshness: &serde_json::Value) -> i32 {
         .unwrap_or("unknown")
     {
         "refreshing" | "drift" | "unknown" => EXIT_TEMPFAIL as i32,
+        "failed"
+            if freshness
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred") =>
+        {
+            EXIT_TEMPFAIL as i32
+        }
+        "failed" => EXIT_IO as i32,
         _ => 1,
     }
 }
