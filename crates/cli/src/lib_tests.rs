@@ -273,7 +273,7 @@ fn semantic_refusal_preserves_admission_reason_and_selected_root() {
         std::env::set_var("GREPPY_STORE_DIR", &store);
     }
     let error = "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another thread owns the heavy-job lease";
-    write_background_job(
+    start_background_job_record(
         &background_job_path(&root),
         &serde_json::json!({"state": "failed", "last_error": error}),
     )
@@ -322,7 +322,7 @@ fn semantic_refusal_preserves_admission_reason_and_selected_root() {
         preparation_refusal_diagnostics(fresh.clone(), root.to_str()),
         fresh
     );
-    write_background_job(
+    start_background_job_record(
         &background_job_path(&root),
         &serde_json::json!({"state": "failed", "last_error": "fixture extraction error"}),
     )
