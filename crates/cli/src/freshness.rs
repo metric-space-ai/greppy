@@ -921,7 +921,7 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
     wait_for_index_publication(root, effective_root, "first-use")
 }
 
-fn wait_for_index_publication(
+pub(crate) fn wait_for_index_publication(
     root: Option<&str>,
     effective_root: &std::path::Path,
     cause: &str,

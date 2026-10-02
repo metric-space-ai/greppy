@@ -1490,6 +1490,12 @@ pub(crate) fn index_overlay_snapshot(
     }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     crate::store_cow::mark_rust_caller_edges_repaired(&store)?;
+    if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+        if let Some(job) = progress.as_deref_mut() {
+            job.finalization_phase("repairing_graph");
+        }
+        crate::store_cow::complete_visible_overlay_rust_repair(&mut store, target, project)?;
+    }
     // The persisted Delta binding is authoritative when structural first use
     // deliberately skips Base preparation. In that path the command-scoped
     // environment has no pinned commit even though the existing overlay does.

@@ -5586,7 +5586,7 @@ fn spawn_background_job_handle(
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     debug_assert_eq!(Some(configured_workers), worker_count);
-    if matches!(cause, "first-use" | "structural-workspace-drift") && kind == "index" {
+    if matches!(cause, "first-use" | "structural-workspace-drift" | "rust-graph-repair") && kind == "index" {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
     #[cfg(debug_assertions)]

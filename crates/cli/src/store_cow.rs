@@ -791,6 +791,32 @@ pub(crate) fn repair_persisted_v7_delta(
     if rust_repair_requires_source_refresh(&overlay, root, project) {
         return Ok(false);
     }
+    let mut progress = crate::BackgroundJobGuard::from_env();
+    progress.attach_foreground(crate::background_job_path(root));
+    progress.finalization_phase("repairing_graph");
+    match complete_visible_overlay_rust_repair(&mut overlay, root, project) {
+        Ok(_) => progress.complete(),
+        Err(error) => {
+            progress.fail(&error);
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
+/// Complete compatibility work before a snapshot is announced ready. The
+/// caller owns the writer/admission lifetime; an uncertified Base still needs
+/// actual visible-source recovery and resolution, never a blind marker.
+pub(crate) fn complete_visible_overlay_rust_repair(
+    overlay: &mut greppy_store::Store,
+    root: &Path,
+    project: &str,
+) -> Result<bool> {
+    if greppy_indexer::rust_caller_edges_repaired(overlay)?
+        || rust_repair_requires_source_refresh(overlay, root, project)
+    {
+        return Ok(false);
+    }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
         let existing_edges: i64 = overlay
@@ -808,8 +834,9 @@ pub(crate) fn repair_persisted_v7_delta(
             ));
         }
     }
-    greppy_indexer::recover_persisted_rust_usages(&mut overlay, project, root)?;
-    greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, project)?;
+    drop(raw_edges);
+    greppy_indexer::recover_persisted_rust_usages(overlay, project, root)?;
+    greppy_indexer::rebuild_visible_overlay_edges(overlay, project)?;
     overlay
         .conn()
         .execute(
@@ -838,7 +865,13 @@ pub(crate) fn ensure_persisted_single_store_repaired(
     if !persisted_v7_delta_needs_repair(&observed, root)? {
         return Ok(());
     }
+    if rust_repair_requires_source_refresh(&observed, root, project) {
+        return Ok(());
+    }
     drop(observed);
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        return refresh_persisted_graph_under_admission(path, root);
+    }
     let deadline = std::time::Instant::now() + crate::NAV_FRESHNESS_BUDGET;
     let _lock = loop {
         match greppy_freshness::try_acquire(path) {
@@ -866,7 +899,16 @@ pub(crate) fn ensure_persisted_single_store_repaired(
         if rust_repair_requires_source_refresh(&store, root, project) {
             return Ok(());
         }
-        greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
+        let mut progress = crate::BackgroundJobGuard::from_env();
+        progress.attach_foreground(crate::background_job_path(root));
+        progress.finalization_phase("repairing_graph");
+        match greppy_indexer::rebuild_single_store_rust_edges(&mut store, project) {
+            Ok(_) => progress.complete(),
+            Err(error) => {
+                progress.fail(&error);
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }
@@ -883,6 +925,18 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
         return Ok(());
     }
     drop(delta);
+    if !crate::index_admission::inline_refresh_is_admitted() {
+        let visible = greppy_store::Store::open_with(
+            delta_path,
+            greppy_store::OpenOptions::read_only(),
+        )?
+        .attach_overlay(base_path, visibility)?;
+        if rust_repair_requires_source_refresh(&visible, root, project) {
+            return Ok(());
+        }
+        drop(visible);
+        return refresh_persisted_graph_under_admission(delta_path, root);
+    }
     repair_persisted_v7_delta(delta_path, base_path, visibility, root, project)?;
     let repaired =
         greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
@@ -893,6 +947,22 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
         }
         return Err(Error::Lock(
             "persisted Delta repair did not publish its completion marker".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_persisted_graph_under_admission(path: &Path, root: &Path) -> Result<()> {
+    let root_string = root.to_string_lossy();
+    crate::freshness::wait_for_index_publication(
+        Some(root_string.as_ref()),
+        root,
+        "rust-graph-repair",
+    )?;
+    let published = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    if persisted_v7_delta_needs_repair(&published, root)? {
+        return Err(Error::Index(
+            "admitted graph preparation did not publish the Rust compatibility repair".into(),
         ));
     }
     Ok(())
@@ -2794,6 +2864,72 @@ mod tests {
             return Err("repaired caller edge is missing".into());
         }
         Ok(())
+    }
+
+    #[test]
+    fn rejected_admission_does_not_run_hidden_single_store_repair() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::capture(&[
+            "GREPPY_STORE_DIR", "GREPPY_PROJECT_IDENTITY", "GREPPY_HEAVY_GATE",
+            "GREPPY_AUTO_REINDEX", "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT,
+        ]);
+        for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] {
+            std::env::remove_var(name);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let root = repo.path().canonicalize().unwrap();
+        let gate = scratch.path().join("reject-gate.py");
+        std::fs::write(&gate, "import sys\nprint('another owner holds the lease', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
+        std::env::set_var("GREPPY_HEAVY_GATE", &gate);
+        std::env::set_var("GREPPY_AUTO_REINDEX", "1");
+        std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
+        let path = crate::workspace_locator::store_path(&root);
+        let mut store = greppy_store::Store::open(&path).unwrap();
+        greppy_indexer::index(&mut store, &root, "p").unwrap();
+        store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+        let generation = store.get_workspace_state(root.to_string_lossy().as_ref()).unwrap().unwrap().graph_generation;
+        drop(store);
+        let error = ensure_persisted_single_store_repaired(&path, &root, "p").unwrap_err();
+        assert!(error.to_string().contains("shared host admission"), "{error}");
+        let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).unwrap();
+        assert!(persisted_v7_delta_needs_repair(&store, &root).unwrap());
+        assert_eq!(store.get_workspace_state(root.to_string_lossy().as_ref()).unwrap().unwrap().graph_generation, generation);
+        let job = crate::read_background_job(&crate::background_job_path(&root)).unwrap();
+        assert_eq!(job["state"], "failed");
+        assert!(job["last_error"].as_str().unwrap().contains("another owner holds the lease"));
+        assert!(greppy_freshness::try_acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn visible_overlay_repair_certifies_actual_base_references_once() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(repo.path().join("src/a.rs"), "pub fn target() {}\npub fn caller() { let _ = target; }\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "reference base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='USAGE'", []).unwrap();
+        }
+        let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let target = store.get_node_by_qname("p", "src/a.rs::Function::target").unwrap().unwrap();
+        let caller = store.get_node_by_qname("p", "src/a.rs::Function::caller").unwrap().unwrap();
+        assert!(store.incoming_edges(target.id, Some("USAGE"), 10).unwrap().is_empty());
+        assert!(complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
+        assert!(store.incoming_edges(target.id, Some("USAGE"), 10).unwrap().iter().any(|edge| edge.source_id==caller.id));
+        assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
+        assert!(!complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
+        let base = greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::read_only()).unwrap();
+        assert!(!greppy_indexer::rust_caller_edges_repaired(&base).unwrap(), "immutable Base is not falsely certified");
     }
 
     #[test]
