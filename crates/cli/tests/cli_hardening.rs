@@ -105,6 +105,104 @@ fn semantic_admission_refusal_precedes_model_asset_materialization() {
     }
 }
 
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn cold_first_use_json_admission_denial_is_structured_for_each_command() {
+    for (n, args) in [
+        vec!["search", "returns a sample integer", "--json"],
+        vec!["impact", "sample", "--json"],
+        vec!["brief", "sample", "--json"],
+        vec!["brief", "sample", "other", "--json"],
+        vec!["impact", "sample", "--json", "--diagnostics"],
+        vec!["impact", "sample", "--json", "--max-bytes", "256"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (repo, store, _scratch) = make_repo(&format!("cold-json-denial-{n}"), "sample");
+        let models = store.with_file_name("isolated-inference");
+        let gate = repo.join("deny-heavy.py");
+        std::fs::write(&gate, "import sys\nprint('Capacity gate: cold fixture denied', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+        assert!(
+            !store.exists(),
+            "each command must start without any graph store"
+        );
+        let output = Command::new(bin())
+            .args(&args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_HEAVY_GATE", &gate)
+            .env("GREPPY_SHARED_INFERENCE_ROOT", &models)
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .env_remove("GREPPY_AUTO_REINDEX")
+            .env("GREPPY_TEST_EMBED_ASSET_MISSING", "1")
+            .output()
+            .unwrap();
+        let out = String::from_utf8(output.stdout).unwrap();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(75),
+            "args={args:?}\n{out}\n{err}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "preparation_deferred", "{value}");
+        assert_eq!(value["fresh"], false, "{value}");
+        assert_eq!(
+            value["freshness"]["preparation_failure_kind"],
+            "admission_deferred"
+        );
+        assert_eq!(
+            value["freshness"]["root_path"],
+            repo.canonicalize().unwrap().to_str().unwrap()
+        );
+        let diagnostic = value["freshness"]["diagnostics_command"].as_str().unwrap();
+        assert!(
+            diagnostic.contains(store.to_str().unwrap())
+                && diagnostic.contains("index status --json")
+        );
+        assert!(value["freshness"]["preparation_error"]
+            .as_str()
+            .unwrap()
+            .contains("cold fixture denied"));
+        assert!(
+            value.get("results").is_none()
+                && value.get("hits").is_none()
+                && value.get("total_exact").is_none(),
+            "refusal must not masquerade as an empty answer: {value}"
+        );
+        assert!(
+            !models.join("models").exists(),
+            "no model materialization before admission"
+        );
+    }
+}
+
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
+#[test]
+fn cold_first_use_runner_failure_is_not_reclassified_from_error_text() {
+    let (repo, store, _scratch) = make_repo("cold-json-runner-failure", "sample");
+    let gate = repo.join("broken-heavy.py");
+    std::fs::write(&gate, "import sys\nprint('Automatic indexing deferred by shared host admission; no index work started. misleading text', file=sys.stderr)\nsys.exit(1)\n").unwrap();
+    let output = Command::new(bin())
+        .args(["impact", "sample", "--json"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_HEAVY_GATE", &gate)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_AUTO_REINDEX")
+        .output()
+        .unwrap();
+    let out = String::from_utf8(output.stdout).unwrap();
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(73), "{out}\n{err}");
+    assert!(!out.contains("preparation_deferred"), "{out}");
+    assert!(
+        err.contains("admission runner exited") && err.contains("misleading text"),
+        "{err}"
+    );
+}
+
 /// Path to the binary under test (provided by cargo for integration tests).
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")

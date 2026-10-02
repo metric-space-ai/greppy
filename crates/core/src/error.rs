@@ -52,6 +52,11 @@ pub enum Error {
     #[error("index error: {0}")]
     Index(String),
 
+    /// Shared host admission refused preparation before index work started.
+    /// Distinct from an index/store failure so callers can retry safely.
+    #[error("index preparation deferred for {root}: {detail}")]
+    AdmissionDeferred { root: PathBuf, detail: String },
+
     /// Workspace fingerprint / lock / freshness failure.
     #[error("workspace error: {0}")]
     Workspace(String),

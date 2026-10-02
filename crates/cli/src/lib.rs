@@ -5793,6 +5793,17 @@ fn spawn_background_job_handle(
                     });
                     if !recorded_failure {
                         value["state"] = serde_json::json!("failed");
+                        // Only the admitted runner's known EX_TEMPFAIL means
+                        // capacity denial. An index child's own failure record
+                        // or an ungated child must never be relabeled.
+                        value["preparation_failure_kind"] = serde_json::json!(if admission_stderr
+                            .is_some()
+                            && status.code() == Some(75)
+                        {
+                            "admission_deferred"
+                        } else {
+                            "preparation_failed"
+                        });
                         value["last_error"] = serde_json::json!(
                             index_admission::failure_detail(admission_stderr.as_deref(), status)
                                 .unwrap_or_else(|| format!(
@@ -11200,6 +11211,13 @@ fn compact_read_json(value: &mut serde_json::Value) {
 
 fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // Preparation refusals have no answer rows to compact. Preserve their
+    // typed failure and exact root/store recovery even without --diagnostics.
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("preparation_deferred") {
+        let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
+        rendered.push(b'\n');
+        return Some(rendered);
+    }
     let command = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -11272,6 +11290,11 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
 
 fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // A refused preparation has no result total or continuation to budget.
+    // Never manufacture an exact empty answer from its absent result rows.
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("preparation_deferred") {
+        return Some(bytes.to_vec());
+    }
     let available = result_item_count(&value);
     let confirmed_total = exact_result_total(&value, available, spec.offset);
     let uncertain_initial = value
@@ -11553,6 +11576,7 @@ fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
 /// hint before returning `Err`; the summary line here may then repeat the
 /// message — acceptable redundancy versus silent failure.)
 pub fn dispatch_to_code(cli: Cli) -> u8 {
+    let preparation_json = command_requests_json(cli.command.as_ref());
     let _web_output_budget = match cli.command.as_ref() {
         Some(Command::Web { .. }) => Some(web::human_output_budget(cli.max_bytes)),
         _ => None,
@@ -11564,6 +11588,31 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     }
     let code = match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
+        Err(Error::AdmissionDeferred { root, detail }) if preparation_json => {
+            let diagnostics = index_status_command_for_root(&root);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "preparation_deferred",
+                    "fresh": false,
+                    "complete": false,
+                    "freshness": {
+                        "state": "failed",
+                        "fresh": false,
+                        "root_path": root,
+                        "preparation_failure_kind": "admission_deferred",
+                        "preparation_error": detail,
+                        "diagnostics_command": diagnostics,
+                    },
+                    "next": {
+                        "action": "retry_original_command",
+                        "message": "Retry the original command when host capacity is available; no index work started and no query results were served.",
+                        "diagnostics_command": diagnostics,
+                    },
+                })
+            );
+            EXIT_TEMPFAIL
+        }
         Err(e) => {
             eprintln!("greppy: {e}");
             let mut source = std::error::Error::source(&e);
@@ -11584,7 +11633,7 @@ fn error_exit_code(error: &Error) -> u8 {
     match error {
         Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
         Error::Invalid(_) => EXIT_USAGE,
-        Error::Lock(_) => EXIT_TEMPFAIL,
+        Error::Lock(_) | Error::AdmissionDeferred { .. } => EXIT_TEMPFAIL,
         _ => EXIT_IO,
     }
 }
