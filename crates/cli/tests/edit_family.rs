@@ -749,6 +749,74 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_deleted_lua_comment_is_payload_and_roundtrips() {
+    let fixture = Fixture::new("patch-lua-comment");
+    let path = fixture.repo.join("comment.lua");
+    let before = "-- original comment\nlocal value = 1\n";
+    std::fs::write(&path, before).unwrap();
+    let diff = "--- a/comment.lua\n+++ b/comment.lua\n@@ -80,2 +80,2 @@\n--- original comment\n+-- revised comment\n local value = 1\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], diff.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&path, before);
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&path, "-- revised comment\nlocal value = 1\n");
+    let undone = fixture.run(&["undo"]);
+    assert!(undone.status.success(), "{}", combined(&undone));
+    assert_file(&path, before);
+}
+
+#[test]
+fn patch_header_shaped_payload_does_not_create_a_phantom_file() {
+    let fixture = Fixture::new("patch-header-payload");
+    std::fs::write(
+        fixture.repo.join("one.txt"),
+        "anchor\n-- a/phantom.txt\ntail\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let diff = "--- a/one.txt\n+++ b/one.txt\n@@ -1,3 +1,3 @@\n anchor\n--- a/phantom.txt\n+++ b/phantom.txt\n tail\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-two\n+TWO\n";
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(
+        &fixture.repo.join("one.txt"),
+        "anchor\n++ b/phantom.txt\ntail\n",
+    );
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+    assert!(!fixture.repo.join("phantom.txt").exists());
+}
+
+#[test]
+fn patch_bad_counts_and_count_free_header_ambiguity_are_atomic() {
+    let fixture = Fixture::new("patch-header-atomic");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let first = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
+    for (suffix, diagnostic) in [
+        (
+            "--- a/two.txt\n+++ b/two.txt\n@@ -1,2 +1 @@\n-two\n+TWO\n",
+            "declares 2 old and 1 new lines",
+        ),
+        (
+            "--- a/two.txt\n+++ b/two.txt\n@@\n-two\n+TWO\n--- a/phantom.txt\n+++ b/phantom.txt\n@@\n-missing\n+new\n",
+            "ambiguous in a count-free hunk",
+        ),
+    ] {
+        let diff = format!("{first}{suffix}");
+        let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+        assert_eq!(output.status.code(), Some(20), "{}", combined(&output));
+        assert!(
+            combined(&output).contains(diagnostic),
+            "{}",
+            combined(&output)
+        );
+        assert_file(&fixture.repo.join("one.txt"), "one\n");
+        assert_file(&fixture.repo.join("two.txt"), "two\n");
+        assert!(!fixture.repo.join("phantom.txt").exists());
+    }
+}
+
+#[test]
 fn patch_ambiguity_identifies_late_input_hunk_and_bounded_source_candidates() {
     let fixture = Fixture::new("patch-late-ambiguity");
     let original = "first\nsecond\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nrepeat\nlast\n";
