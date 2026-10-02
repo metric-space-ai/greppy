@@ -3278,6 +3278,100 @@ pub(crate) fn print_nav_rows(
     }
 }
 
+pub(crate) struct UnresolvedReceiver {
+    pub file: String,
+    pub line: u32,
+    pub caller: String,
+    pub reasons: Vec<String>,
+}
+
+/// Incoming `UNRESOLVED_CALLS` are not callers. They are the Option `as_ref`
+/// candidates whose receiver identity was not proven.
+pub(crate) fn unresolved_option_receivers(
+    store: &greppy_store::Store,
+    target_ids: &[i64],
+) -> Result<Vec<UnresolvedReceiver>> {
+    let mut lines = Vec::new();
+    for id in target_ids {
+        for edge in store.incoming_edges(*id, Some("UNRESOLVED_CALLS"), 1024)? {
+            let Some(node) = store.get_node(edge.source_id)? else {
+                continue;
+            };
+            if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+                continue;
+            }
+            let line = edge
+                .properties
+                .get("line")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32)
+                .unwrap_or_else(|| node.start_line.max(1) as u32);
+            let reasons = edge
+                .properties
+                .get("unresolved_reasons")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            lines.push(UnresolvedReceiver {
+                file: node.file_path.clone(),
+                line,
+                caller: nav_short_name(&node),
+                reasons,
+            });
+        }
+    }
+    lines.sort_by(|left, right| {
+        (&left.file, left.line, &left.caller, &left.reasons).cmp(&(
+            &right.file,
+            right.line,
+            &right.caller,
+            &right.reasons,
+        ))
+    });
+    lines.dedup_by(|left, right| {
+        left.file == right.file
+            && left.line == right.line
+            && left.caller == right.caller
+            && left.reasons == right.reasons
+    });
+    Ok(lines)
+}
+
+pub(crate) fn unresolved_receiver_line(item: &UnresolvedReceiver) -> String {
+    if item.reasons.is_empty() {
+        format!(
+            "unresolved receiver: {}:{} {} — Option as_ref receiver was not proven",
+            item.file, item.line, item.caller
+        )
+    } else {
+        format!(
+            "unresolved receiver: {}:{} {} — Option as_ref receiver was not proven ({})",
+            item.file,
+            item.line,
+            item.caller,
+            item.reasons.join(", ")
+        )
+    }
+}
+
+pub(crate) fn unresolved_receiver_json(
+    item: &UnresolvedReceiver,
+    target: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "target": target,
+        "file": item.file,
+        "line": item.line,
+        "caller": item.caller,
+        "reasons": item.reasons,
+    })
+}
+
 pub(crate) fn dispatch_who_calls(
     symbol: Option<&str>,
     paths: &[String],
@@ -3370,13 +3464,19 @@ pub(crate) fn dispatch_who_calls(
             edges.extend(store.incoming_edges(*target, Some(edge_type), 1024)?);
         }
     }
+    let mut unresolved = unresolved_option_receivers(&store, &targets)?;
+    unresolved.retain(|item| path_filters.matches(&item.file));
+    let unresolved_json = unresolved
+        .iter()
+        .map(|item| unresolved_receiver_json(item, query_symbol))
+        .collect::<Vec<_>>();
     if edges.is_empty() {
         // The symbol IS a defined graph node but has no callers — that is a
         // valid, useful answer, not a failure. Do not fall back to content
         // search (it would just echo the definition as noise).
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "who-calls",
@@ -3387,15 +3487,30 @@ pub(crate) fn dispatch_who_calls(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &unresolved_json,
             )?;
             return Ok(0);
         }
         // Nobody calls it. That is an answer, and it needs no packaging and no
-        // textual consolation prize.
-        if path_filters.is_empty() {
-            println!("no callers");
+        // textual consolation prize. An unresolved Option receiver is a
+        // different answer: the call exists, but its payload was not proven.
+        if unresolved.is_empty() {
+            if path_filters.is_empty() {
+                println!("no callers");
+            } else {
+                println!("no callers under path filter: {}", path_filters.shown());
+            }
+        } else if path_filters.is_empty() {
+            println!("no resolved callers");
+            for item in &unresolved {
+                println!("{}", unresolved_receiver_line(item));
+            }
         } else {
-            println!("no callers under path filter: {}", path_filters.shown());
+            println!("no resolved callers under path filter: {}", path_filters.shown());
+            for item in &unresolved {
+                println!("{}", unresolved_receiver_line(item));
+            }
         }
         return Ok(0);
     }
@@ -3440,7 +3555,7 @@ pub(crate) fn dispatch_who_calls(
     if nodes.is_empty() {
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "who-calls",
@@ -3451,13 +3566,27 @@ pub(crate) fn dispatch_who_calls(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &unresolved_json,
             )?;
             return Ok(0);
         }
-        if path_filters.is_empty() {
-            println!("no callers");
+        if unresolved.is_empty() {
+            if path_filters.is_empty() {
+                println!("no callers");
+            } else {
+                println!("no callers under path filter: {}", path_filters.shown());
+            }
+        } else if path_filters.is_empty() {
+            println!("no resolved callers");
+            for item in &unresolved {
+                println!("{}", unresolved_receiver_line(item));
+            }
         } else {
-            println!("no callers under path filter: {}", path_filters.shown());
+            println!("no resolved callers under path filter: {}", path_filters.shown());
+            for item in &unresolved {
+                println!("{}", unresolved_receiver_line(item));
+            }
         }
         return Ok(0);
     }
@@ -3550,6 +3679,7 @@ pub(crate) fn dispatch_who_calls(
             all,
             hits,
             expand.as_ref(),
+            &unresolved_json,
         )?;
         return Ok(0);
     }
@@ -3576,6 +3706,9 @@ pub(crate) fn dispatch_who_calls(
         });
     }
     print_nav_rows(&repo_root, "callers", &mut rows, code, all);
+    for item in &unresolved {
+        println!("{}", unresolved_receiver_line(item));
+    }
     Ok(0)
 }
 /// `greppy callees S` — what `S` calls: every node reached by a direct
@@ -3752,6 +3885,7 @@ pub(crate) fn dispatch_callees(
             all,
             hits,
             expand.as_ref(),
+            &[],
         )?;
         return Ok(0);
     }

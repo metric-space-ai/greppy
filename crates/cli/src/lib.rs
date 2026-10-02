@@ -3442,6 +3442,7 @@ fn nav_counts_json(
         all,
         hits,
         None,
+        &[],
     )
 }
 
@@ -3458,6 +3459,7 @@ fn nav_counts_json_with_expand(
     all: bool,
     hits: Vec<serde_json::Value>,
     expand: Option<&ExpandHandle>,
+    unresolved_receivers: &[serde_json::Value],
 ) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
     let freshness = nav_freshness_json(store, root, project);
@@ -3504,6 +3506,17 @@ fn nav_counts_json_with_expand(
     }
     if let Some(expand) = expand {
         v["expand"] = expand.json_value();
+    }
+    if !unresolved_receivers.is_empty() {
+        v["unresolved_receivers"] = serde_json::json!(unresolved_receivers);
+        v["callers_incomplete"] = serde_json::json!(true);
+        if let Some(targets) = v.get_mut("targets").and_then(|value| value.as_array_mut()) {
+            for target in targets {
+                if let Some(entry) = target.as_object_mut() {
+                    entry.insert("callers_incomplete".into(), serde_json::json!(true));
+                }
+            }
+        }
     }
     println!(
         "{}",
@@ -7354,7 +7367,15 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
     let mut tests: Vec<Vec<serde_json::Value>> = vec![Vec::new(); req.targets.len()];
+    let mut unresolved_by_target = Vec::with_capacity(req.targets.len());
     for (index, ids) in resolved.iter().enumerate() {
+        if req.kind == NavKind::WhoCalls {
+            let mut unresolved = unresolved_option_receivers(&store, ids)?;
+            unresolved.retain(|item| path_filters.matches(&item.file));
+            unresolved_by_target.push(unresolved);
+        } else {
+            unresolved_by_target.push(Vec::new());
+        }
         let mut collected = nav_rows_for_target(&store, &project, ids, index, req.kind)?;
         collected.retain(|row| path_filters.matches(&row.node.file_path));
         totals[index] = collected.len();
@@ -7393,6 +7414,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                     "total_exact": totals[index],
                 });
                 entry["tests"] = serde_json::json!(tests[index]);
+                if !unresolved_by_target[index].is_empty() {
+                    entry["callers_incomplete"] = serde_json::json!(true);
+                }
                 entry
             })
             .collect();
@@ -7403,7 +7427,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             .unwrap_or(false);
         let incomplete_providers = query_incomplete_provider_json(&store, &project, req.command)?;
         let omitted = total.saturating_sub(shown);
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "command": req.command,
             "symbol": req.targets.join(" "),
             "targets": targets_json,
@@ -7421,6 +7445,19 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             "all": req.all,
             "hits": hits,
         });
+        let unresolved_json = unresolved_by_target
+            .iter()
+            .enumerate()
+            .flat_map(|(index, items)| {
+                items.iter().map(move |item| {
+                    unresolved_receiver_json(item, &req.targets[index])
+                })
+            })
+            .collect::<Vec<_>>();
+        if !unresolved_json.is_empty() {
+            value["unresolved_receivers"] = serde_json::json!(unresolved_json);
+            value["callers_incomplete"] = serde_json::json!(true);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&value)
@@ -7447,9 +7484,16 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         }
         println!("{symbol}");
         if totals[index] == 0 {
-            println!("{empty_word}");
-            if matches!(req.kind, NavKind::Callees) {
-                println!("inspect source with: greppy read {symbol}");
+            if unresolved_by_target[index].is_empty() {
+                println!("{empty_word}");
+                if matches!(req.kind, NavKind::Callees) {
+                    println!("inspect source with: greppy read {symbol}");
+                }
+            } else {
+                println!("no resolved callers");
+                for item in &unresolved_by_target[index] {
+                    println!("{}", unresolved_receiver_line(item));
+                }
             }
             continue;
         }
@@ -7457,6 +7501,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         // empty answer: count what is missing.
         if !window.iter().any(|row| row.target == index) {
             println!("… {} below the cut", totals[index]);
+            for item in &unresolved_by_target[index] {
+                println!("{}", unresolved_receiver_line(item));
+            }
             continue;
         }
         for row in window.iter().filter(|row| row.target == index) {
@@ -7483,6 +7530,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                     println!("handle: {handle}");
                 }
             }
+        }
+        for item in &unresolved_by_target[index] {
+            println!("{}", unresolved_receiver_line(item));
         }
     }
     if !req.all && cli_result_offset() == 0 && end < total {

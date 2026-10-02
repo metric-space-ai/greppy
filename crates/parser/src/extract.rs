@@ -662,8 +662,261 @@ std::thread_local! {
     static OPTION_FIELD_ROOT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+fn rust_push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+        out.push(value);
+    }
+}
+
+fn rust_attribute_is_inert(name: &str) -> bool {
+    // These attributes do not invent trait methods or rewrite the receiver
+    // expression. Unknown attributes, including `#[wasm_bindgen]`, stay opaque.
+    matches!(
+        name,
+        "allow"
+            | "deny"
+            | "warn"
+            | "forbid"
+            | "cfg"
+            | "must_use"
+            | "doc"
+            | "inline"
+            | "cold"
+            | "test"
+            | "bench"
+            | "should_panic"
+            | "ignore"
+            | "rustfmt"
+            | "clippy"
+            | "diagnostic"
+            | "track_caller"
+            | "non_exhaustive"
+            | "repr"
+            | "automatically_derived"
+    )
+}
+
+fn rust_macro_is_expression_only(name: &str) -> bool {
+    matches!(
+        name,
+        "println"
+            | "eprintln"
+            | "format"
+            | "format_args"
+            | "write"
+            | "writeln"
+            | "vec"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "todo"
+            | "unimplemented"
+            | "unreachable"
+            | "dbg"
+            | "concat"
+            | "env"
+            | "option_env"
+            | "include_str"
+            | "include_bytes"
+            | "stringify"
+            | "module_path"
+            | "line"
+            | "column"
+            | "file"
+            | "matches"
+            | "panic"
+            | "cfg"
+            | "compile_error"
+            | "pin"
+            | "try"
+            | "concat_idents"
+    )
+}
+
+fn rust_first_identifier<'a>(source: &'a [u8], node: Node<'_>) -> Option<&'a str> {
+    if matches!(node.kind(), "identifier" | "scoped_identifier" | "type_identifier") {
+        let text = node_text(source, node);
+        return Some(text.rsplit("::").next().unwrap_or(text));
+    }
+    (0..node.named_child_count()).filter_map(|index| node.named_child(index)).find_map(|child| rust_first_identifier(source, child))
+}
+
+fn rust_macro_name(source: &[u8], node: Node<'_>) -> String {
+    node.child_by_field_name("macro")
+        .and_then(|name| rust_first_identifier(source, name))
+        .or_else(|| rust_first_identifier(source, node))
+        .unwrap_or("")
+        .trim_end_matches('!')
+        .to_string()
+}
+
+fn rust_attribute_name(source: &[u8], node: Node<'_>) -> String {
+    rust_first_identifier(source, node).unwrap_or("unknown").to_string()
+}
+
+fn rust_trait_as_ref_receiver(source: &[u8], trait_item: Node<'_>) -> Option<String> {
+    let body = trait_item.child_by_field_name("body")?;
+    let item = (0..body.named_child_count())
+        .filter_map(|index| body.named_child(index))
+        .find(|item| {
+            matches!(item.kind(), "function_item" | "function_signature_item")
+                && item.child_by_field_name("name").is_some_and(|name| node_text(source, name) == "as_ref")
+        })?;
+    let parameters = item.child_by_field_name("parameters")?;
+    let receiver = parameters.named_child(0)?;
+    Some(node_text(source, receiver).trim().to_string())
+}
+
+fn rust_trait_has_consuming_as_ref(source: &[u8], trait_item: Node<'_>) -> bool {
+    let Some(body) = trait_item.child_by_field_name("body") else {
+        return false;
+    };
+    (0..body.named_child_count()).filter_map(|index| body.named_child(index)).any(|item| {
+        matches!(item.kind(), "function_item" | "function_signature_item")
+            && item.child_by_field_name("name").is_some_and(|name| node_text(source, name) == "as_ref")
+            && item.child_by_field_name("parameters").is_some_and(|parameters| {
+                parameters.named_child_count() == 1
+                    && parameters.named_child(0).is_some_and(|receiver| {
+                        receiver.kind() == "self_parameter"
+                            && matches!(node_text(source, receiver).trim(), "self" | "mut self")
+                    })
+            })
+    })
+}
+
+struct RustOptionScopeLimits {
+    globs: Vec<String>,
+    imports: Vec<serde_json::Value>,
+    macros: Vec<String>,
+    attributes: Vec<String>,
+}
+
+fn rust_record_macro(source: &[u8], node: Node<'_>, limits: &mut RustOptionScopeLimits) {
+    let name = rust_macro_name(source, node);
+    if !rust_macro_is_expression_only(&name) {
+        rust_push_unique(&mut limits.macros, name);
+    }
+}
+
+/// Scope facts that can change `Some` or `Option::as_ref`. A by-value trait
+/// method visible in this file is a hard rejection (`None`): it can replace
+/// the payload, so the declared field type is not a candidate. Wildcards,
+/// item macros, unknown attributes and named imports are recorded for the
+/// indexer; they do not by themselves invent a caller edge.
+fn rust_option_scope_limits(source: &[u8], callee: Node<'_>) -> Option<RustOptionScopeLimits> {
+    let mut limits = RustOptionScopeLimits {
+        globs: Vec::new(),
+        imports: Vec::new(),
+        macros: Vec::new(),
+        attributes: Vec::new(),
+    };
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            let mut pending_attributes = Vec::new();
+            for index in 0..scope.named_child_count() {
+                let Some(item) = scope.named_child(index) else {
+                    continue;
+                };
+                if item.kind() == "attribute_item" {
+                    pending_attributes.push(item);
+                    continue;
+                }
+                if item.kind() == "inner_attribute_item" {
+                    let name = rust_attribute_name(source, item);
+                    if !rust_attribute_is_inert(&name) {
+                        rust_push_unique(&mut limits.attributes, name);
+                    }
+                    pending_attributes.clear();
+                    continue;
+                }
+                let encloses = item.start_byte() <= callee.start_byte() && callee.end_byte() <= item.end_byte();
+                if encloses {
+                    for attribute in &pending_attributes {
+                        let name = rust_attribute_name(source, *attribute);
+                        if !rust_attribute_is_inert(&name) {
+                            rust_push_unique(&mut limits.attributes, name);
+                        }
+                    }
+                }
+                pending_attributes.clear();
+                if item.kind() == "trait_item" && rust_trait_has_consuming_as_ref(source, item) {
+                    return None;
+                }
+                if item.kind() == "use_declaration" {
+                    let Some(argument) = item.child_by_field_name("argument").or_else(|| item.named_child(0)) else {
+                        rust_push_unique(&mut limits.macros, "unparsed import".to_string());
+                        continue;
+                    };
+                    let imported = expand_use_tree(source, argument, "");
+                    if imported.is_empty() {
+                        rust_push_unique(&mut limits.macros, "unparsed import".to_string());
+                        continue;
+                    }
+                    for item in imported {
+                        if item.is_glob {
+                            rust_push_unique(
+                                &mut limits.globs,
+                                item.path.trim_end_matches('*').trim_end_matches("::").to_string(),
+                            );
+                        } else {
+                            limits.imports.push(serde_json::json!({
+                                "path": item.path,
+                                "name": item.imported_name,
+                            }));
+                        }
+                    }
+                } else if item.kind() == "extern_crate_declaration" {
+                    limits.imports.push(serde_json::json!({
+                        "path": node_text(source, item).trim(),
+                        "name": "",
+                    }));
+                } else if item.kind() == "macro_invocation" {
+                    rust_record_macro(source, item, &mut limits);
+                } else if item.kind() == "expression_statement" {
+                    for child_index in 0..item.named_child_count() {
+                        if let Some(child) = item.named_child(child_index) {
+                            if child.kind() == "macro_invocation" {
+                                rust_record_macro(source, child, &mut limits);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    Some(limits)
+}
+
+fn field_option_payload_is_generic(source: &[u8], field_name: Node<'_>, declared: &str) -> bool {
+    let payload = declared.trim().strip_prefix("Option<")?.strip_suffix('>')?.trim();
+    if payload.contains(['<', '&', ' ', ':']) {
+        return false;
+    }
+    let mut ancestor = field_name.parent();
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "struct_item" | "enum_item" | "union_item") {
+            let Some(parameters) = node.child_by_field_name("type_parameters") else {
+                return false;
+            };
+            return (0..parameters.named_child_count()).filter_map(|index| parameters.named_child(index)).any(|parameter| {
+                parameter.kind() == "type_parameter"
+                    && parameter.child_by_field_name("name").is_some_and(|name| node_text(source, name) == payload)
+            });
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
 /// Preserve field provenance for a Some binding over an Option field's
-/// inherent as_ref adapter. No return type or field ownership is guessed here.
+/// inherent as_ref adapter. A named import is not proof; the indexer accepts
+/// it only when the imported item cannot override Option::as_ref. Wildcard
+/// scopes, item macros and unknown attributes remain unresolved candidates.
 fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
     fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
         (pattern.kind() == "identifier" && node_text(source, pattern) == name)
@@ -755,9 +1008,10 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
                 while ty.kind() == "reference_type" { ty = ty.child_by_field_name("type")?; }
                 if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") { return None; }
                 let base_type = node_text(source, ty);
-                // A consuming trait adapter or opaque Some binding can change
-                // the payload. Retain Unknown unless lookup is transparent.
-                if !rust_slice_iter_lookup_is_transparent(callee) { return None; }
+                // A same-file by-value as_ref trait can change the payload.
+                // Named imports, wildcards, macros and attributes are limits,
+                // not a guessed caller, and are classified by the indexer.
+                let limits = rust_option_scope_limits(source, callee)?;
                 // Expensive whole-source checks belong only to an applicable
                 // typed Option pattern, never every unresolved receiver call.
                 let mut root = callee;
@@ -780,6 +1034,12 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
                     "field": node_text(source, member),
                     "adapter": "as_ref",
                     "pattern": "Some",
+                    "limits": {
+                        "globs": limits.globs,
+                        "imports": limits.imports,
+                        "macros": limits.macros,
+                        "attributes": limits.attributes,
+                    },
                 }));
             }
         }
@@ -2986,6 +3246,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     let mut properties = serde_json::Map::new();
                     if let Some(ty) = field_declared_type(source, decl) {
                         properties.insert("return_type".into(), serde_json::Value::String(ty));
+                        if field_option_payload_is_generic(source, node, &ty) {
+                            // A generic payload is not a concrete method owner.
+                            properties.insert("generic_payload".into(), serde_json::json!(1));
+                        }
                     }
                     result.nodes.push(ExtractedNode {
                         label: "Field".into(),
@@ -3179,6 +3443,21 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                                 "type_param": gb.type_param,
                             }),
                         });
+                    }
+                }
+
+                if label == "Interface" {
+                    let head = node_text(source, def_node);
+                    let signature = head.split('{').next().unwrap_or(head);
+                    if signature.contains(':') {
+                        // Supertraits can contribute as_ref without naming it here.
+                        properties.insert("has_bounds".into(), serde_json::json!(1));
+                    }
+                    // Signature-only trait methods are not Method nodes. Record
+                    // as_ref's receiver on the trait so an import can still reject
+                    // a by-value adapter.
+                    if let Some(receiver) = rust_trait_as_ref_receiver(source, def_node) {
+                        properties.insert("as_ref_receiver".into(), serde_json::Value::String(receiver));
                     }
                 }
 
@@ -16171,6 +16450,10 @@ mod tests {
         let source = "fn f(manifest: crate::scene::Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }";
         extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
         assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 1);
+        OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(0));
+        let source = "use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }";
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 1);
     }
 
     #[test]
@@ -16216,46 +16499,60 @@ fn f(manifest: Manifest) {
                 }
             }
         }
-        for opaque in [
-            "use custom::*;",
-            "trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }",
-            "inject_some_and_adapter!();",
-            "#[unknown_attribute]",
-            "use custom::Some;",
+        for (opaque, provenance) in [
+            ("use custom::*;", Some("custom")),
+            ("trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }", None),
+            ("inject_some_and_adapter!();", Some("inject_some_and_adapter")),
+            ("#[unknown_attribute]", Some("unknown_attribute")),
+            ("use custom::Some;", None),
         ] {
             let source = format!("{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}");
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
             let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
                 && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
-            assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
+            let fact = call.properties.get("receiver_provenance");
+            assert_eq!(fact.is_some(), provenance.is_some(), "{source}");
+            if let Some(marker) = provenance {
+                let rendered = fact.unwrap().to_string();
+                assert!(rendered.contains(marker), "{source}: {rendered}");
+            }
         }
     }
 
     #[test]
     fn rust_option_field_patterns_preserve_only_explicit_provenance() {
         let cases = [
-            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", false),
-            ("use crate::scene::Manifest; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", false),
-            ("fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { field.uniform(); } }", true),
-            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
-            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", false),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", false),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", false),
-            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
-            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
+            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("wasm_bindgen::prelude")),
+            ("use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("crate::scene::Manifest")),
+            ("#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { field.uniform(); } }", Some("")),
+            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("")),
+            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
         ];
-        for (source, expected) in cases {
+        for (source, marker) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/gpu.rs").unwrap();
             let edge = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
                 && edge.properties.get("callee_name").and_then(|value| value.as_str()) == Some("uniform")).unwrap();
-            assert_eq!(edge.properties.get("receiver_provenance").is_some(), expected, "{source}");
+            assert_eq!(edge.properties.get("receiver_provenance").is_some(), marker.is_some(), "{source}");
             assert!(edge.properties.get("receiver_owner").is_none(), "{source}");
-            if expected {
+            if let Some(marker) = marker {
                 let fact = &edge.properties["receiver_provenance"];
                 assert_eq!(fact["field"], "remaster_irradiance");
                 assert_eq!(fact["adapter"], "as_ref");
                 assert_eq!(fact["pattern"], "Some");
+                let limits = fact["limits"].to_string();
+                if marker.is_empty() {
+                    assert_eq!(fact["limits"]["globs"].as_array().map(Vec::len), Some(0), "{source}");
+                    assert_eq!(fact["limits"]["imports"].as_array().map(Vec::len), Some(0), "{source}");
+                    assert_eq!(fact["limits"]["macros"].as_array().map(Vec::len), Some(0), "{source}");
+                    assert_eq!(fact["limits"]["attributes"].as_array().map(Vec::len), Some(0), "{source}");
+                } else {
+                    assert!(limits.contains(marker), "{source}: {limits}");
+                }
             }
         }
     }
