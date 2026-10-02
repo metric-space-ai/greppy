@@ -460,6 +460,67 @@ impl Store {
         Ok(n)
     }
 
+    /// Change an owned definition identity without dropping its graph node ID.
+    /// Updates contentless FTS postings and retires kind-dependent embeddings.
+    /// Immutable Base identities receive a private override; their old node and
+    /// kind-dependent embedding become invisible without mutating the Base.
+    pub fn update_node_identity(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
+        if id < 0 && self.is_overlay() {
+            let old = self
+                .get_node(id)?
+                .ok_or_else(|| Error::Store(format!("missing Base definition {id}")))?;
+            self.insert_node(&NewNode {
+                project: old.project.clone(),
+                label: label.into(),
+                name: old.name,
+                qualified_name: qname.into(),
+                file_path: old.file_path,
+                start_line: old.start_line,
+                end_line: old.end_line,
+                properties: old.properties,
+            })?;
+            self.conn().execute(
+                "INSERT INTO main.schema_meta(key,value) VALUES(?1,json_array(?2))
+                ON CONFLICT(key) DO UPDATE SET value=json_insert(value,'$[#]',?2)",
+                params![
+                    format!("greppy.definition_identity_overrides.{}", old.project),
+                    old.qualified_name
+                ],
+            )?;
+            return Ok(());
+        }
+        let tx = self.transaction()?;
+        let row: Option<(String, String, String, String)> = tx
+            .raw()
+            .query_row(
+                "SELECT name, qualified_name, label, file_path FROM main.nodes WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((name, old_qname, old_label, file_path)) = row else {
+            return Err(Error::Store(format!(
+                "definition identity migration requires an owned node: {id}"
+            )));
+        };
+        let (old_name_col, old_qname_col) = fts_tokens(&name, &old_qname);
+        tx.raw().execute("INSERT INTO main.nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path) VALUES('delete', ?1, ?2, ?3, ?4, ?5)",
+            params![id, old_name_col, old_qname_col, old_label, file_path])?;
+        tx.raw().execute(
+            "DELETE FROM main.vector_embeddings WHERE node_id = ?1",
+            [id],
+        )?;
+        tx.raw().execute(
+            "UPDATE main.nodes SET label = ?2, qualified_name = ?3 WHERE id = ?1",
+            params![id, label, qname],
+        )?;
+        let (name_col, qname_col) = fts_tokens(&name, qname);
+        tx.raw().execute("INSERT INTO main.nodes_fts(rowid, name, qualified_name, label, file_path) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, name_col, qname_col, label, file_path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Delete a node by id. Cascades to edges via the FK constraint.
     pub fn delete_node(&mut self, id: i64) -> Result<()> {
         let tx = self.transaction()?;

@@ -357,6 +357,10 @@ SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
        b.file_path, b.start_line, b.end_line, b.properties
 FROM greppy_base.nodes b
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) q
+    WHERE m.key = 'greppy.definition_identity_overrides.' || b.project AND q.value = b.qualified_name
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 )
 AND NOT EXISTS (
@@ -371,6 +375,10 @@ SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
        b.target_qname, b.edge_type, b.properties
 FROM greppy_base.raw_edges b
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = 'greppy.js_ts_override_files.' || b.project AND f.value = b.file_path
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 )
 AND NOT (b.edge_type = 'USAGE' AND EXISTS (
@@ -415,6 +423,10 @@ JOIN nodes visible_target
   ON visible_target.project = base_target.project
  AND visible_target.qualified_name = base_target.qualified_name
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = 'greppy.js_ts_override_files.' || e.project AND f.value = base_source.file_path
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
 )
 AND NOT (e.edge_type = 'USAGE' AND EXISTS (
@@ -456,6 +468,10 @@ SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
        b.vector, b.created_at, b.vector_i8, b.i8_scale
 FROM greppy_base.vector_embeddings b
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) q
+    WHERE m.key = 'greppy.definition_identity_overrides.' || b.project AND q.value = b.qualified_name
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 );
 

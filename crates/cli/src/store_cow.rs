@@ -812,10 +812,12 @@ pub(crate) fn complete_visible_overlay_rust_repair(
     root: &Path,
     project: &str,
 ) -> Result<bool> {
+    let effect_repaired =
+        greppy_indexer::recover_visible_effect_fn_bindings(overlay, project, root)?;
     if greppy_indexer::rust_caller_edges_repaired(overlay)?
         || rust_repair_requires_source_refresh(overlay, root, project)
     {
-        return Ok(false);
+        return Ok(effect_repaired);
     }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {

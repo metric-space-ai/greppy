@@ -1134,12 +1134,11 @@ fn refresh_unchanged_rust_raw_edges(
                             && old.start_line == i64::from(node.start_line)
                             && old.end_line == i64::from(node.end_line)
                         {
-                            store.conn().execute(
-                                "DELETE FROM main.vector_embeddings WHERE node_id = ?1",
-                                [old.id],
+                            store.update_node_identity(
+                                old.id,
+                                &node.label,
+                                &node.qualified_name,
                             )?;
-                            store.conn().execute("UPDATE main.nodes SET label = ?2, qualified_name = ?3 WHERE id = ?1",
-                                rusqlite::params![old.id, node.label, node.qualified_name])?;
                         }
                     }
                 }
@@ -2248,7 +2247,103 @@ pub fn recover_persisted_rust_usages(
     Ok(store.replace_validated_rust_usages(project, &files, &replacements)?)
 }
 
+/// Repair Effect.fn identities in a private overlay without mutating its Base
+/// or copying Base file-state/content/vector ownership into Delta.
+pub fn recover_visible_effect_fn_bindings(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    if !store.is_overlay() {
+        return Ok(false);
+    }
+    let marker = format!("greppy.effect_fn_repair_v8.{project}");
+    let completed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM main.schema_meta WHERE key=?1 AND value='complete'",
+            [&marker],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if completed != 0 {
+        return Ok(false);
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| {
+        greppy_core::Error::Invalid(format!("Effect.fn repair root unavailable: {e}"))
+    })?;
+    let mut prepared = Vec::new();
+    for state in store.list_file_states(project)? {
+        let language = greppy_parser::language_for_path(Path::new(&state.rel_path));
+        if !matches!(language, Language::JavaScript | Language::TypeScript { .. }) {
+            continue;
+        }
+        let relative = Path::new(&state.rel_path);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Effect.fn repair path".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unavailable: {e}"))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unreadable: {e}"))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Effect.fn source {} changed since indexing",
+                state.rel_path
+            )));
+        }
+        let extraction = parser_extract(language, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) =
+            validate_or_degrade(language, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn extraction validation failed".into(),
+            ));
+        }
+        prepared.push((state.rel_path, extraction));
+    }
+    // Validate every visible source fingerprint before changing any identity.
+    for (path, extraction) in &prepared {
+        for node in extraction
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Function")
+        {
+            let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+            if let Some(old) = store.get_node_by_qname(project, &old_qname)? {
+                if old.label == "Variable"
+                    && old.name == node.name
+                    && old.start_line == i64::from(node.start_line)
+                    && old.end_line == i64::from(node.end_line)
+                {
+                    store.update_node_identity(old.id, &node.label, &node.qualified_name)?;
+                }
+            }
+        }
+        persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
+    }
+    let paths: Vec<_> = prepared.iter().map(|(path, _)| path).collect();
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        rusqlite::params![format!("greppy.js_ts_override_files.{project}"), serde_json::to_string(&paths).map_err(|error| greppy_core::Error::Store(format!("serialize Effect.fn repair paths: {error}")))?]).map_err(sqlite_err)?;
+    rebuild_visible_overlay_edges(store, project)?;
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [marker]).map_err(sqlite_err)?;
+    Ok(true)
+}
+
 /// One-shot single-store compatibility repair. Replace only Rust-owned
+
 /// non-structural relations from persisted raw edges; nodes, file identity,
 /// graph generation, content, embeddings and non-Rust edges remain untouched.
 /// Edge replacement and completion marker commit in the same transaction.
@@ -5995,13 +6090,10 @@ export function invalidCalls() { plainValue(); effectValue(); }
             .unwrap();
         for node in [&target, &caller] {
             store
-                .conn()
-                .execute(
-                    "UPDATE main.nodes SET label = 'Variable', qualified_name = ?2 WHERE id = ?1",
-                    rusqlite::params![
-                        node.id,
-                        node.qualified_name.replace("::Function::", "::Variable::")
-                    ],
+                .update_node_identity(
+                    node.id,
+                    "Variable",
+                    &node.qualified_name.replace("::Function::", "::Variable::"),
                 )
                 .unwrap();
         }
@@ -6054,6 +6146,131 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    #[test]
+    fn effect_fn_overlay_upgrade_keeps_immutable_base_and_unaffected_vector() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("routing.ts"),
+            r#"
+import { Effect } from 'effect';
+const target = Effect.fn('target')(function* () { return 1; });
+export const caller = Effect.fn('caller')(function* () { return yield* target(); });
+"#,
+        )
+        .unwrap();
+        fs::write(repo.path().join("retained.py"), "def retained(): pass\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let base_path = stores.path().join("base.db");
+        let delta_path = stores.path().join("delta.db");
+        let retained_id;
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            let report = index(&mut base, repo.path(), "test").unwrap();
+            for name in ["target", "caller"] {
+                let node = base
+                    .get_node_by_qname("test", &format!("routing.ts::Function::{name}"))
+                    .unwrap()
+                    .unwrap();
+                base.update_node_identity(
+                    node.id,
+                    "Variable",
+                    &format!("routing.ts::Variable::{name}"),
+                )
+                .unwrap();
+            }
+            base.conn().execute("UPDATE main.raw_edges SET source_qname=replace(source_qname,'::Function::','::Variable::') WHERE file_path='routing.ts'", []).unwrap();
+            base.conn()
+                .execute("DELETE FROM main.edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            let retained = base
+                .get_node_by_qname("test", "retained.py::Function::retained")
+                .unwrap()
+                .unwrap();
+            retained_id = retained.id;
+            base.upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "test-model".into(),
+                prompt_version: "v1".into(),
+                task: "definition".into(),
+                node_id: Some(retained.id),
+                chunk_idx: 0,
+                qualified_name: retained.qualified_name,
+                file_path: retained.file_path,
+                start_line: retained.start_line,
+                end_line: retained.end_line,
+                content_sha256: "same-source".into(),
+                graph_generation: report.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        }
+        let base_hash = file_state::sha256_hex(&fs::read(&base_path).unwrap());
+        let visibility = greppy_store::VisibilityIndex::default();
+        {
+            let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let routing = repo.path().join("routing.ts");
+            let original = fs::read(&routing).unwrap();
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"\n// changed since indexing\n");
+            fs::write(&routing, changed).unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            let writes: i64 = overlay
+                .conn()
+                .query_row("SELECT COUNT(*) FROM main.nodes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                writes, 0,
+                "source mismatch must reject before identity writes"
+            );
+            fs::write(&routing, original).unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+            let target = overlay
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .unwrap();
+            let caller = overlay
+                .get_node_by_qname("test", "routing.ts::Function::caller")
+                .unwrap()
+                .unwrap();
+            assert!(overlay
+                .get_node_by_qname("test", "routing.ts::Variable::target")
+                .unwrap()
+                .is_none());
+            assert!(overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|e| e.source_id == caller.id));
+            assert_eq!(
+                overlay
+                    .get_node_by_qname("test", "retained.py::Function::retained")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                -retained_id
+            );
+            let vector: (String, i64) = overlay.conn().query_row("SELECT content_sha256,node_id FROM vector_embeddings WHERE file_path='retained.py'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(vector, ("same-source".into(), -retained_id));
+            assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+            assert!(
+                !recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap()
+            );
+        }
+        assert_eq!(
+            file_state::sha256_hex(&fs::read(&base_path).unwrap()),
+            base_hash
+        );
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Variable::target")
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Function::target")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
