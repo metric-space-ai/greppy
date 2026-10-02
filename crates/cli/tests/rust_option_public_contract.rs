@@ -543,7 +543,12 @@ fn v9_inline_namespace_proof_is_reextracted_on_normal_query() {
         ),
     );
     f.index();
-    let db = f.store.join("graph.db");
+    let status = f.query(&["index", "status", "--json", "--diagnostics"]);
+    let db = PathBuf::from(status["store_path"].as_str().expect("status store path"));
+    assert!(
+        db.starts_with(&f.store),
+        "fixture must own the migrated database"
+    );
     assert!(db.exists(), "fixture graph missing: {}", db.display());
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch("DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v10'; INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v9','complete'); UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance.limits.standard_namespace_bindings') WHERE edge_type='CALLS'; UPDATE edges SET edge_type='CALLS' WHERE edge_type='UNRESOLVED_CALLS';").unwrap();
