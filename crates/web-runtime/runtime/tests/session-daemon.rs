@@ -10148,7 +10148,6 @@ fn web_run_deadline_is_enforced_externally() {
 }
 
 #[test]
-#[test]
 fn idle_supervisor_workers_are_not_cpu_hot() {
     let socket =
         std::env::temp_dir().join(format!("greppy-web-idlecpu-{}.sock", std::process::id()));
