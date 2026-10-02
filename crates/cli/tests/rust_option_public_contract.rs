@@ -531,3 +531,44 @@ fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
         }
     }
 }
+
+#[test]
+fn v9_inline_namespace_proof_is_reextracted_on_normal_query() {
+    let f = Fixture::new();
+    f.write(
+        "src/lib.rs",
+        &caller(
+            "inline_std",
+            "mod scene; use crate::scene::Manifest; mod std {} use std::collections::BTreeMap;",
+        ),
+    );
+    f.index();
+    let db = f.store.join("graph.db");
+    assert!(db.exists(), "fixture graph missing: {}", db.display());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v10'; INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v9','complete'); UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance.limits.standard_namespace_bindings') WHERE edge_type='CALLS'; UPDATE edges SET edge_type='CALLS' WHERE edge_type='UNRESOLVED_CALLS';").unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT count(*) FROM edges WHERE edge_type='CALLS'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap()
+            > 0
+    );
+    drop(conn);
+    for _ in 0..2 {
+        assert_unproven(&f, "inline_std");
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v10'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "complete"
+    );
+    assert!(conn.query_row("SELECT count(*) FROM raw_edges WHERE properties LIKE '%standard_namespace_bindings%std%'", [], |row| row.get::<_, i64>(0)).unwrap() > 0);
+}
