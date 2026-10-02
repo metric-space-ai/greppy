@@ -1418,6 +1418,7 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
         // These commands do not need a graph. In particular, a missing file
         // must be diagnosed before unrelated cache maintenance can do writes.
         Some(Command::ReadFile { .. } | Command::Cache { .. }) => true,
+        Some(Command::Index { path, .. }) if path.as_deref() == Some("status") => true,
         #[cfg(feature = "bash-smart")]
         Some(Command::BashSmart { .. }) => true,
         _ => false,
