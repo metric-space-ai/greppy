@@ -1759,16 +1759,27 @@ fn verified_previous_indexer_base_layout(
         "greppy-indexer-v8" => &["greppy-indexer-v7", "greppy-indexer-v6"],
         _ => &[],
     };
+    // Schema17 only adds private override tables. A copied schema16 graph
+    // upgrades in staging and keeps unchanged definitions/vectors; the
+    // published schema16 Base stays immutable.
+    let schemas: Vec<u32> = if current_identity.store_schema_version == 17 {
+        vec![17, 16]
+    } else {
+        vec![current_identity.store_schema_version]
+    };
     for version in versions {
-        let mut previous_identity = current_identity.clone();
-        previous_identity.indexer_version = (*version).into();
-        let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
-            .map_err(|error| Error::io("construct previous Base Store layout", error))?;
-        if layout
-            .read_verified_manifest()
-            .is_ok_and(|manifest| manifest.identity == previous_identity)
-        {
-            return Ok(Some((layout, previous_identity)));
+        for schema in &schemas {
+            let mut previous_identity = current_identity.clone();
+            previous_identity.indexer_version = (*version).into();
+            previous_identity.store_schema_version = *schema;
+            let layout = BaseStoreLayout::new(shared_data_root, &previous_identity)
+                .map_err(|error| Error::io("construct previous Base Store layout", error))?;
+            if layout
+                .read_verified_manifest()
+                .is_ok_and(|manifest| manifest.identity == previous_identity)
+            {
+                return Ok(Some((layout, previous_identity)));
+            }
         }
     }
     Ok(None)
@@ -2208,8 +2219,8 @@ fn seed_previous_indexer_base(
     store
         .conn()
         .execute(
-            "UPDATE main.workspace_state SET root_path = ?1",
-            rusqlite::params![root.as_ref()],
+            "UPDATE main.workspace_state SET root_path = ?1, schema_version = ?2",
+            rusqlite::params![root.as_ref(), store.schema_version()?],
         )
         .map_err(|error| Error::Store(format!("retarget migrated Base workspace: {error}")))?;
     let staged_summary_cache = parent
@@ -4192,10 +4203,11 @@ mod tests {
 
     #[test]
     fn compatible_base_seed_copies_verified_graph_vectors_and_summary() {
-        for (previous_version, current_version) in [
-            ("greppy-indexer-v6", "greppy-indexer-v7"),
-            ("greppy-indexer-v7", "greppy-indexer-v8"),
-            ("greppy-indexer-v6", "greppy-indexer-v8"),
+        for (previous_version, current_version, previous_schema) in [
+            ("greppy-indexer-v6", "greppy-indexer-v7", 17),
+            ("greppy-indexer-v7", "greppy-indexer-v8", 17),
+            ("greppy-indexer-v7", "greppy-indexer-v8", 16),
+            ("greppy-indexer-v6", "greppy-indexer-v8", 17),
         ] {
             let data_root = tempfile::tempdir().unwrap();
             let sources = tempfile::tempdir().unwrap();
@@ -4224,7 +4236,7 @@ mod tests {
                         git_common_dir: None,
                         head_oid: None,
                         index_signature: None,
-                        schema_version: store.schema_version().unwrap(),
+                        schema_version: previous_schema,
                         indexer_version: previous_version.into(),
                         graph_generation: 1,
                         updated_at: "2026-09-27T00:00:00Z".into(),
@@ -4260,12 +4272,16 @@ mod tests {
                     })
                     .unwrap();
             }
+            if previous_schema == 16 {
+                let conn = rusqlite::Connection::open(&graph).unwrap();
+                conn.execute_batch("DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+            }
             let previous_identity = BaseStoreIdentity {
                 format_version: greppy_store::BASE_STORE_FORMAT_VERSION,
                 canonical_repository_identity: "fixture-repository".into(),
                 git_object_format: "sha1".into(),
                 base_tree_oid: "1111111111111111111111111111111111111111".into(),
-                store_schema_version: greppy_store::migrate::CURRENT_VERSION,
+                store_schema_version: previous_schema,
                 indexer_version: previous_version.into(),
                 parser_and_extractor_versions: "fixture-parser".into(),
                 summary_model_and_prompt_version: "fixture-summary".into(),
@@ -4285,6 +4301,7 @@ mod tests {
 
             let mut current_identity = previous_identity;
             current_identity.indexer_version = current_version.into();
+            current_identity.store_schema_version = greppy_store::migrate::CURRENT_VERSION;
             let immutable_graph_hash = greppy_store::file_state::sha256_hex(
                 &std::fs::read(&previous_layout.graph).unwrap(),
             );
@@ -4336,6 +4353,10 @@ mod tests {
                 greppy_store::OpenOptions::read_only(),
             )
             .unwrap();
+            assert_eq!(
+                migrated.schema_version().unwrap(),
+                greppy_store::migrate::CURRENT_VERSION
+            );
             let retained = migrated
                 .get_node_by_qname("fixture", "fixture.rs::Function::retained")
                 .unwrap()
