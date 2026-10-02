@@ -18798,6 +18798,46 @@ export const make = Effect.gen(function* () {
     }
 
     #[test]
+    fn ts_effect_fn_generator_call_keeps_exported_binding_owner() {
+        let r = ts(
+            r#"
+const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
+    function* (input: { model: string }) { return input.model; },
+);
+export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEnvironment")(
+    function* (input: { model: string }) {
+        const gatewayProvider = input.model.length > 0
+            ? yield* resolveGatewayProviderForModel({ model: input.model })
+            : undefined;
+        return gatewayProvider;
+    },
+);
+"#,
+            "src/routing.ts",
+        );
+        let owner = "src/routing.ts::Variable::resolveGatewayRoutedEnvironment";
+        assert!(r.nodes.iter().any(|node| node.qualified_name == owner));
+        let calls: Vec<_> = r
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge
+                        .properties
+                        .get("callee_name")
+                        .and_then(|value| value.as_str())
+                        == Some("resolveGatewayProviderForModel")
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one direct helper call: {calls:?}"
+        );
+        assert_eq!(calls[0].source_qualified_name, owner);
+    }
+
+    #[test]
     fn js_imports_named_default_namespace_alias_and_require() {
         let r = js(JS_SRC, "src/a.js");
         // imported_name -> (path, original_name) for IMPORTS edges.
