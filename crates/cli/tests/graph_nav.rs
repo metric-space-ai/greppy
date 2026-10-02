@@ -1519,6 +1519,114 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
 }
 
 #[test]
+fn explicit_cap_pattern_all_preserves_budget_and_offset() {
+    let (repo, store) = make_graph_repo("pattern-explicit-all-cap");
+    let content = (0..80)
+        .map(|i| format!("EXPLICIT_CAP_{i:03}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("matches.txt"), content).unwrap();
+    for offset in [0, 30] {
+        let offset_arg = offset.to_string();
+        let args = [
+            "search-pattern",
+            "EXPLICIT_CAP_",
+            "--fixed",
+            "--path",
+            "matches.txt",
+            "--all",
+            "--limit",
+            "30",
+            "--offset",
+            &offset_arg,
+        ];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        let rows = text
+            .lines()
+            .filter(|line| line.starts_with("matches.txt:"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 30, "{text}");
+        assert!(
+            rows[0].starts_with(&format!("matches.txt:{}", offset + 1)),
+            "{text}"
+        );
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, json, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{json}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["total_exact"], 80, "{json}");
+        assert_eq!(value["shown"], 30, "{json}");
+        assert_eq!(value["hits"].as_array().unwrap().len(), 30, "{json}");
+        assert_eq!(value["hits"][0]["matches"][0]["line"], offset + 1, "{json}");
+    }
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "EXPLICIT_CAP_",
+            "--fixed",
+            "--all",
+            "--path",
+            "matches.txt",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["shown"], 80, "{json}");
+    assert_eq!(value["hits"].as_array().unwrap().len(), 80, "{json}");
+    assert!(
+        find_graph_db(&store).is_none(),
+        "literal cap controls must not start indexing"
+    );
+    let (code, help, err) = run(&["search-pattern", "--help"], &repo, &store);
+    assert_eq!(code, 0, "{help}\n{err}");
+    assert!(help.contains("preserves an explicit --limit"), "{help}");
+}
+
+#[test]
+fn explicit_cap_symbol_all_preserves_budget_and_max_alias() {
+    let (repo, store) = make_graph_repo("symbol-explicit-all-cap");
+    let content = (0..40)
+        .map(|i| format!("pub fn explicit_cap_symbol_{i:03}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("src/cap.rs"), content).unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    for limit_flag in ["--limit", "--max"] {
+        let (code, json, err) = run(
+            &[
+                "search-symbol",
+                "explicit_cap_symbol_",
+                "--all",
+                limit_flag,
+                "3",
+                "--offset",
+                "2",
+                "--json",
+            ],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{json}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["total_exact"], 40, "{json}");
+        assert_eq!(value["shown"], 3, "{json}");
+        assert_eq!(value["hits"].as_array().unwrap().len(), 3, "{json}");
+    }
+    let (code, json, err) = run(
+        &["search-symbol", "explicit_cap_symbol_", "--all", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["shown"], 40, "{json}");
+}
+
+#[test]
 fn search_pattern_limited_summary_does_not_expand_omitted_files() {
     let (repo, store) = make_graph_repo("pattern-limited-summary");
     for index in 0..30 {

@@ -41,7 +41,7 @@ pub struct Cli {
     pub no_gpu: bool,
 
     /// Cap the number of rows returned by navigation and search commands.
-    /// `--max` is accepted as a Postel-style alias; `--all` still lifts caps.
+    /// `--max` is an alias; `--all` lifts default caps but preserves an explicit --limit.
     #[arg(long, alias = "max", global = true, value_name = "N")]
     pub limit: Option<usize>,
 
