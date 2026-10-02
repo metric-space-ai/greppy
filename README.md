@@ -74,6 +74,7 @@ greppy web open https://example.com            # open, observe, interact and ver
 greppy -p --json "TASK"                        # newline-delimited session/tool/result events
 greppy agent sessions list --json              # persisted sessions and greppy:// handles
 greppy agent serve                             # headless session on a per-user Unix socket
+greppy agent stdio --model MODEL               # ACP host integration (Workjet and other clients)
 ```
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
@@ -476,6 +477,11 @@ client event rendering) strip terminal control sequences from remote text;
 200 ms until SIGINT (exit 0). `path` prints the absolute JSONL path. Session
 ids may be unique prefixes; unknown or ambiguous ids exit 2. These commands
 never write the store.
+
+`greppy agent stdio` provides framed ACP sessions, text/tool streams, client
+permissions, model selection, restart recovery, and cancellation for a host
+application. See [ACP host integration](docs/acp.md) for configuration,
+capabilities, and current validation limits.
 
 A live `greppy agent serve` session can also be driven from another shell
 over its control socket:
