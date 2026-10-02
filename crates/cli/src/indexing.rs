@@ -419,9 +419,14 @@ fn index_health_output(mut value: serde_json::Value, detailed: bool) -> serde_js
             summary.retain(|_, value| !value.is_array() && !value.is_object());
         }
     }
+    let diagnostics = fields
+        .get("root_path")
+        .and_then(serde_json::Value::as_str)
+        .map(|root| index_status_command_for_root(std::path::Path::new(root)))
+        .unwrap_or_else(|| "greppy index status --json".into());
     fields.insert(
         "diagnostics_command".into(),
-        "greppy index status --json --diagnostics".into(),
+        format!("{diagnostics} --diagnostics").into(),
     );
     value
 }
