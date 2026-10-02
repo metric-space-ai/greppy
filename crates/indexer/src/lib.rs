@@ -6849,8 +6849,14 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
             );
             fs::write(&routing, original).unwrap();
             overlay.conn().execute_batch("CREATE TEMP TRIGGER fail_effect_repair BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'injected repair failure'); END;").unwrap();
-            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            let injected =
+                recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap_err();
+            assert!(
+                injected.to_string().contains("injected repair failure"),
+                "must reach the injected raw-edge failure after node promotion: {injected}"
+            );
             for table in [
+                "main.projects",
                 "main.nodes",
                 "main.definition_identity_overrides",
                 "main.js_ts_reference_override_files",

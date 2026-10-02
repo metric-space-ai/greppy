@@ -487,6 +487,13 @@ impl Store {
             let old = self
                 .get_node(id)?
                 .ok_or_else(|| Error::Store(format!("missing Base definition {id}")))?;
+            // Node FKs refer to main.projects, while this additive override
+            // may be the first Delta write for a Base-only project. Copy only
+            // project metadata inside the same savepoint, never file ownership.
+            let project = self
+                .get_project(&old.project)?
+                .ok_or_else(|| Error::Store(format!("missing Base project {}", old.project)))?;
+            self.upsert_project(&project)?;
             self.insert_node(&NewNode {
                 project: old.project.clone(),
                 label: label.into(),
