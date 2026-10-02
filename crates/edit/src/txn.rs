@@ -219,6 +219,9 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// expressions, and unrelated malformed code cannot qualify. The substituted
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
+    if language.name() == "json" {
+        return json_validation_content(content);
+    }
     if matches!(language, Language::Bash) {
         return bash_validation_content(content);
     }
@@ -467,6 +470,44 @@ fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
 
+/// The bundled JSON grammar omits `+` in numeric exponents. Only normalize
+/// strict JSON accepted independently, outside strings, in a same-length view.
+/// This cannot turn malformed JSON into an accepted edit or alter written bytes.
+fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    let mut parser = serde_json::Deserializer::from_slice(content);
+    if <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut parser).is_err()
+        || parser.end().is_err()
+    {
+        return Cow::Borrowed(content);
+    }
+    let mut normalized = None;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, &byte) in content.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b'+'
+            && i >= 2
+            && matches!(content[i - 1], b'e' | b'E')
+            && content[i - 2].is_ascii_digit()
+            && content.get(i + 1).is_some_and(u8::is_ascii_digit)
+        {
+            // `2.84e+18` and `2.84e018` have identical numeric meaning and
+            // AST boundaries. The original bytes remain the edit payload.
+            normalized.get_or_insert_with(|| content.to_vec())[i] = b'0';
+        }
+    }
+    normalized.map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
@@ -588,6 +629,48 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_positive_exponents_are_valid_without_mutating_payloads() {
+        let language = syntax_language_for_path(Path::new("evidence.json"), b"{}");
+        assert_eq!(language.name(), "json");
+        for source in [
+            r#"{"finite_max_error": 2.842105616405627e+18}"#,
+            r#"[-1E+3, 0e+0, 2.5e-18, "2e+18", "escaped\"2e+18"]"#,
+            "1e+9999",
+        ] {
+            let original = source.as_bytes().to_vec();
+            let counts = syntax_counts(language, &original).unwrap();
+            assert_eq!(
+                counts,
+                SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                },
+                "{source}"
+            );
+            assert!(first_syntax_diagnostic(language, &original).is_none());
+            assert_eq!(original, source.as_bytes());
+        }
+        let quoted = br#"{"text":"2e+18"}"#;
+        assert_eq!(json_validation_content(quoted).as_ref(), quoted);
+        for source in [
+            "{\"x\":2e+}",
+            "{\"x\":+2}",
+            "{\"x\":2e++18}",
+            "{\"x\":2e+18,}",
+        ] {
+            assert!(matches!(
+                json_validation_content(source.as_bytes()),
+                Cow::Borrowed(_)
+            ));
+            assert!(
+                syntax_counts(language, source.as_bytes()).unwrap().errors > 0,
+                "{source}"
+            );
+            assert!(first_syntax_diagnostic(language, source.as_bytes()).is_some());
+        }
+    }
 
     fn snap(content: &[u8]) -> Snapshot {
         Snapshot {

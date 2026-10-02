@@ -14,6 +14,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+#[test]
+fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomically() {
+    let (repo, store, _scratch) = make_repo("json-exponent", "marker");
+    let payload = r#"{"finite_max_error": 2.842105616405627e+18}"#;
+    let (exit, stdout, stderr) = run(&["write", "repro.json", payload], &repo, &store);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("repro.json")).unwrap(),
+        payload
+    );
+    for invalid in [r#"{"x":2e+}"#, r#"{"x":+2}"#, r#"{"x":2e++18}"#] {
+        let (exit, stdout, stderr) = run(&["write", "repro.json", invalid], &repo, &store);
+        assert_eq!(exit, 13, "{stdout}\n{stderr}");
+        assert!(stderr.contains("syntax validation failed"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("repro.json")).unwrap(),
+            payload
+        );
+    }
+}
+
 /// Path to the binary under test (provided by cargo for integration tests).
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
