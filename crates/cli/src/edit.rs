@@ -2106,8 +2106,12 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                     count(header_fields.get(2)?, '+')?,
                 ))
             })();
-            let counted_header = header_fields.get(1).is_some_and(|field| field.starts_with('-'))
-                || header_fields.get(2).is_some_and(|field| field.starts_with('+'));
+            let counted_header = header_fields
+                .get(1)
+                .is_some_and(|field| field.starts_with('-'))
+                || header_fields
+                    .get(2)
+                    .is_some_and(|field| field.starts_with('+'));
             if counted_header && declared_counts.is_none() {
                 return Err(EditRefusal::new(
                     "invalid_patch",
