@@ -26,6 +26,10 @@ use greppy_agent::{
 };
 use serde_json::{json, Value};
 
+#[cfg(test)]
+#[path = "agent_acp_tests.rs"]
+mod tests;
+
 use crate::agent::{agent_session_store_identity, EXIT_OK, EXIT_USAGE};
 use crate::agent_tui::{
     messages_from_protocol, new_session_id, protocol_from_persisted, SessionRecord, SessionStore,
@@ -1015,6 +1019,9 @@ impl ExecutionEnv for GatingEnv {
         }
         match self.authorize(name, arguments) {
             Ok(()) => {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return ToolOutcome::err("cancelled before execution");
+                }
                 let tool_call_id = active_tool_call_id(0);
                 let _ = self.out.send(&json!({
                     "jsonrpc": "2.0",
