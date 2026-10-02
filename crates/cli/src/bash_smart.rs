@@ -2629,9 +2629,15 @@ mod tests {
         let warnings = split_lines(b"(node:42) [MODULE_TYPELESS_PACKAGE_JSON] Warning: reparsing as ES module\n(Use node --trace-warnings to show where the warning was created)\n(node:43) [DEP0040] DeprecationWarning: deprecated module\n(node:44) ExperimentalWarning: experimental API\n(node:45) [MODULE_TYPELESS_PACKAGE_JSON] Warning: another process\n");
         for (stdout, stderr) in [(&errors[..], &warnings[..]), (&warnings[..], &errors[..])] {
             let blocks = detect_blocks(stdout, stderr);
-            assert_eq!(blocks.iter().filter(|b| b.kind == BlockKind::Error).count(), 2);
             assert_eq!(
-                blocks.iter().filter(|b| b.kind == BlockKind::Warning).count(),
+                blocks.iter().filter(|b| b.kind == BlockKind::Error).count(),
+                2
+            );
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|b| b.kind == BlockKind::Warning)
+                    .count(),
                 4
             );
             assert!(blocks
