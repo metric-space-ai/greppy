@@ -10798,7 +10798,7 @@ pub fn load_scene() {
 
     #[test]
     fn rust_caller_repair_v7_marker_is_not_current() {
-        let mut store = Store::open_memory().unwrap();
+        let store = Store::open_memory().unwrap();
         store.conn().execute(
             "INSERT INTO schema_meta(key, value) VALUES('greppy.rust_caller_edges_repair.v7', 'complete')",
             [],
