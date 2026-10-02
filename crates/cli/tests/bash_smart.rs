@@ -125,7 +125,7 @@ fn javascript_exception_headers_preserve_exit_count_and_stream_bytes() {
             let script = format!("printf '%s' '{diagnostic}'{redirect}; exit 1");
             let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
             assert_eq!(output.status.code(), Some(1));
-            let verdict = "FAILED — exit 1: 1 errors, 0 warnings\n";
+            let verdict = "FAILED — exit 1: 1 error, 0 warnings\n";
             if stream == "stdout" {
                 assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
                 assert!(output.stderr.is_empty());
