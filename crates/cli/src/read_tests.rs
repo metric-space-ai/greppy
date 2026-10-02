@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn bounded_file_span_stops_before_invalid_tail() {
+    let prefix = b"alpha\nbeta\ngamma\n";
+    let data = [prefix.as_slice(), b"\xff"].concat();
+    let mut reader = std::io::Cursor::new(data);
+    let (text, start, end) = read_bounded_file_range(&mut reader, "1:3", "dump").unwrap();
+    assert_eq!(text.as_bytes(), prefix);
+    assert_eq!((start, end), (1, 3));
+    assert_eq!(reader.position(), prefix.len() as u64);
+}
+
+#[test]
+fn bounded_file_span_skips_unselected_encoding_and_preserves_crlf() {
+    let mut reader = std::io::Cursor::new(b"\xff\nbeta\r\ngamma\n\xff");
+    let (text, start, end) = read_bounded_file_range(&mut reader, "2:3", "dump").unwrap();
+    assert_eq!(text, "beta\r\ngamma\n");
+    assert_eq!((start, end), (2, 3));
+}
+
+#[test]
+fn bounded_file_span_rejects_selected_encoding_and_reports_actual_eof() {
+    let mut reader = std::io::Cursor::new(b"alpha\n\xff\n");
+    let error = read_bounded_file_range(&mut reader, "1:2", "dump").unwrap_err();
+    assert!(error.to_string().contains("requested lines 1:2"));
+    assert!(error.to_string().contains("UTF-8"));
+    let mut reader = std::io::Cursor::new(b"alpha\nbeta");
+    let error = read_bounded_file_range(&mut reader, "1:3", "dump").unwrap_err();
+    assert!(error.to_string().contains("file has 2 lines"));
+    for raw in ["0:1", "3:1", "1", "a:2"] {
+        let mut reader = std::io::Cursor::new(b"alpha\n");
+        assert!(read_bounded_file_range(&mut reader, raw, "dump").is_err());
+        assert_eq!(reader.position(), 0, "invalid ranges must not consume input");
+    }
+}
+
+#[test]
 fn definition_read_rechecks_bytes_after_freshness_gate() {
     let root = tempfile::tempdir().unwrap();
     let mut store = greppy_store::Store::open_memory().unwrap();

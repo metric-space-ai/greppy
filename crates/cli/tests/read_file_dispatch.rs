@@ -70,6 +70,42 @@ fn only_graph_db_below(root: &Path) -> PathBuf {
 }
 
 #[test]
+fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
+    use std::io::Write;
+    let (repo, store) = fresh_workspace("large-bounded-prefix");
+    let path = repo.join("dump.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"alpha\nbeta\ngamma\n\xff").unwrap();
+    file.set_len(635_837_957).unwrap();
+    drop(file);
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", path.to_str().unwrap(), "--lines", "1:3", "--max-bytes", "1200"],
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("dump.txt:1-3\nalpha\nbeta\ngamma\n"), "{out}");
+    assert!(!store.exists(), "plain bounded reads must not create a graph");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn invalid_selected_or_whole_file_text_is_never_reported_missing() {
+    let (repo, store) = fresh_workspace("invalid-file-text");
+    let path = repo.join("dump.txt");
+    std::fs::write(&path, b"alpha\n\xff\n").unwrap();
+    let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--lines", "1:2"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("requested lines 1:2") && err.contains("UTF-8"), "{out} {err}");
+    assert!(!out.contains("no such file") && !err.contains("no such file"));
+    let (code, out, err) = run(&repo, &store, &["read-file", "dump.txt", "--all"]);
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(out.contains("cannot read file dump.txt:"), "{out} {err}");
+    assert!(!out.contains("no such file"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn cold_symbol_reads_bootstrap_after_file_handle_and_preserve_it() {
     for command in ["read", "read-smart", "who-calls", "impact"] {
         let (repo, store) = fresh_workspace(command);
