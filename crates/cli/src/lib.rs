@@ -7410,7 +7410,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         std::collections::HashMap::new();
     let empty_word = match req.kind {
         NavKind::WhoCalls => "no callers",
-        NavKind::Callees => "no resolved indexed callees; external, unresolved or filtered calls may still exist",
+        NavKind::Callees => {
+            "no resolved indexed callees; external, unresolved or filtered calls may still exist"
+        }
     };
     for (index, symbol) in req.targets.iter().enumerate() {
         if index > 0 {
