@@ -479,6 +479,74 @@ fn reap_base_build_staging(
     Ok(report)
 }
 
+/// Select a physical Base namespace without moving published legacy identities.
+/// Existing legacy paths remain authoritative: live readers and CoW descriptors
+/// can keep their original graph path and advisory-lock identity.
+pub fn agent_base_directory(data: &Path, relative_identity: &Path) -> io::Result<PathBuf> {
+    agent_base_directory_for(
+        data,
+        relative_identity,
+        cfg!(target_os = "macos")
+            && std::env::var_os("GREPPY_STORE_DIR").is_none()
+            && data == data_root(),
+        Path::new("/Volumes/tmp"),
+    )
+}
+
+fn agent_base_directory_for(
+    data: &Path,
+    identity: &Path,
+    disposable: bool,
+    volume: &Path,
+) -> io::Result<PathBuf> {
+    if identity.as_os_str().is_empty()
+        || identity
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid relative Base identity",
+        ));
+    }
+    let legacy = data
+        .join("agent-base-stores")
+        .join(format!("v{AGENT_BASE_FORMAT_VERSION}"))
+        .join(identity);
+    if !disposable {
+        return Ok(legacy);
+    }
+    // Any retained legacy entry wins, including an incomplete builder directory.
+    // Never split old and new writers by silently relocating its identity.
+    match fs::symlink_metadata(&legacy) {
+        Ok(_) => return Ok(legacy),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let root = disposable_agent_bases_root(volume);
+    ensure_disposable_namespace(&root, volume)?;
+    Ok(root.join(identity))
+}
+
+fn disposable_agent_bases_root(volume: &Path) -> PathBuf {
+    volume
+        .join("dev-artifacts/greppy/agent-base-stores")
+        .join(format!("v{AGENT_BASE_FORMAT_VERSION}"))
+}
+
+/// Base build staging is disposable even when durable model assets live elsewhere.
+pub fn base_build_scratch_root() -> io::Result<PathBuf> {
+    if cfg!(target_os = "macos") && std::env::var_os("GREPPY_STORE_DIR").is_none() {
+        let volume = Path::new("/Volumes/tmp");
+        let root = volume.join("dev-artifacts/greppy/base-build-staging");
+        ensure_disposable_namespace(&root, volume)?;
+        return Ok(root);
+    }
+    Ok(std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir))
+}
+
 pub fn agent_base_stores_root() -> PathBuf {
     data_root()
         .join("agent-base-stores")
@@ -1221,58 +1289,67 @@ fn scan_entries(mark_new_orphans: bool) -> io::Result<(Vec<ManagedEntry>, Vec<Pa
     } else if models.exists() {
         unmanaged_paths.push(models.clone());
     }
-    let agent_bases = agent_base_stores_root();
-    if namespace_chain_is_safe(&agent_bases) {
-        let repository_dirs = fs::read_dir(&agent_bases)?;
-        for repository_dir in repository_dirs.flatten() {
-            let repository_path = repository_dir.path();
-            let repository_id = repository_dir.file_name().to_string_lossy().into_owned();
-            if !repository_dir
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false)
-                || !is_hex_id(&repository_id, 64)
-            {
-                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
-                unmanaged_paths.push(repository_path);
-                continue;
-            }
-            let Ok(generations) = fs::read_dir(&repository_path) else {
-                unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
-                unmanaged_paths.push(repository_path);
-                continue;
-            };
-            for generation in generations.flatten() {
-                let path = generation.path();
-                let Ok(manifest) = read_agent_base_manifest(&path) else {
-                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
-                    unmanaged_paths.push(path);
+    let mut base_roots = vec![(agent_base_stores_root(), data_root())];
+    let volume = Path::new("/Volumes/tmp");
+    if cfg!(target_os = "macos")
+        && std::env::var_os("GREPPY_STORE_DIR").is_none()
+        && validate_disposable_volume(volume).is_ok()
+    {
+        base_roots.push((disposable_agent_bases_root(volume), volume.to_path_buf()));
+    }
+    for (agent_bases, anchor) in base_roots {
+        if namespace_chain_is_safe_in(&agent_bases, &anchor) {
+            let repository_dirs = fs::read_dir(&agent_bases)?;
+            for repository_dir in repository_dirs.flatten() {
+                let repository_path = repository_dir.path();
+                let repository_id = repository_dir.file_name().to_string_lossy().into_owned();
+                if !repository_dir
+                    .file_type()
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false)
+                    || !is_hex_id(&repository_id, 64)
+                {
+                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
+                    unmanaged_paths.push(repository_path);
+                    continue;
+                }
+                let Ok(generations) = fs::read_dir(&repository_path) else {
+                    unmanaged = unmanaged.saturating_add(path_size_no_symlink(&repository_path));
+                    unmanaged_paths.push(repository_path);
                     continue;
                 };
-                let complete = fs::read_to_string(path.join("COMPLETE"))
-                    .ok()
-                    .is_some_and(|value| value.trim() == manifest.identity_hash);
-                let published = complete && path.join("graph.db").is_file();
-                let last_used = read_last_used(&path).unwrap_or_else(|| {
-                    fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .unwrap_or(UNIX_EPOCH)
-                });
-                let orphaned_since = update_orphan_marker(&path, !published, mark_new_orphans);
-                entries.push(ManagedEntry {
-                    kind: ManagedKind::AgentBase,
-                    id: manifest.identity_hash,
-                    path: path.clone(),
-                    workspace_root: None,
-                    bytes: path_size_no_symlink(&path),
-                    last_used,
-                    orphaned: !published,
-                    orphaned_since,
-                });
+                for generation in generations.flatten() {
+                    let path = generation.path();
+                    let Ok(manifest) = read_agent_base_manifest(&path) else {
+                        unmanaged = unmanaged.saturating_add(path_size_no_symlink(&path));
+                        unmanaged_paths.push(path);
+                        continue;
+                    };
+                    let complete = fs::read_to_string(path.join("COMPLETE"))
+                        .ok()
+                        .is_some_and(|value| value.trim() == manifest.identity_hash);
+                    let published = complete && path.join("graph.db").is_file();
+                    let last_used = read_last_used(&path).unwrap_or_else(|| {
+                        fs::metadata(&path)
+                            .and_then(|metadata| metadata.modified())
+                            .unwrap_or(UNIX_EPOCH)
+                    });
+                    let orphaned_since = update_orphan_marker(&path, !published, mark_new_orphans);
+                    entries.push(ManagedEntry {
+                        kind: ManagedKind::AgentBase,
+                        id: manifest.identity_hash,
+                        path: path.clone(),
+                        workspace_root: None,
+                        bytes: path_size_no_symlink(&path),
+                        last_used,
+                        orphaned: !published,
+                        orphaned_since,
+                    });
+                }
             }
+        } else if agent_bases.exists() {
+            unmanaged_paths.push(agent_bases.clone());
         }
-    } else if agent_bases.exists() {
-        unmanaged_paths.push(agent_bases.clone());
     }
     // Legacy model layout was `<data>/models/<model>/<digest>`. It is safe to
     // manage only digest directories carrying Greppy's matching marker; every
@@ -1448,7 +1525,21 @@ fn cache_trash_roots() -> Vec<(PathBuf, PathBuf)> {
 fn move_to_trash(entry: &ManagedEntry) -> io::Result<PathBuf> {
     let volume = Path::new("/Volumes/tmp");
     let disposable = disposable_workspaces_root(volume);
-    let root = if entry.kind == ManagedKind::Workspace
+    let root = if entry.kind == ManagedKind::AgentBase
+        && entry.path.starts_with(disposable_agent_bases_root(volume))
+    {
+        validate_disposable_volume(volume)?;
+        if !namespace_chain_is_safe_in(&entry.path, volume)
+            || read_agent_base_manifest(&entry.path)?.identity_hash != entry.id
+        {
+            return Err(io::Error::other(
+                "unsafe disposable Base cache during removal",
+            ));
+        }
+        let root = disposable_trash_root(volume);
+        ensure_disposable_namespace(&root, volume)?;
+        root
+    } else if entry.kind == ManagedKind::Workspace
         && entry.path.parent() == Some(disposable.as_path())
     {
         validate_disposable_volume(volume)?;
@@ -2107,6 +2198,90 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_routing_preserves_isolation_and_live_legacy_identity() {
+        let base = tempdir("base-routing");
+        let data = base.join("durable");
+        let volume = base.join("missing-volume");
+        let identity = Path::new("repository/generation");
+        let legacy = data.join("agent-base-stores/v1").join(identity);
+        assert_eq!(
+            agent_base_directory_for(&data, identity, false, &volume).unwrap(),
+            legacy
+        );
+        assert!(agent_base_directory_for(&data, identity, true, &volume).is_err());
+        assert!(
+            !volume.exists(),
+            "must not create a mountpoint on the system disk"
+        );
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("graph.db"), b"retained graph and vectors").unwrap();
+        let lease = acquire_named_lock_in(
+            &data,
+            "agent-base-generation.builder",
+            LockMode::Shared,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            agent_base_directory_for(&data, identity, true, &volume).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            fs::read(legacy.join("graph.db")).unwrap(),
+            b"retained graph and vectors"
+        );
+        assert!(acquire_named_lock_in(
+            &data,
+            "agent-base-generation.builder",
+            LockMode::Exclusive,
+            true
+        )
+        .unwrap()
+        .is_none());
+        drop(lease);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn base_routing_rejects_unmounted_volume_without_fallback() {
+        let base = tempdir("base-unmounted");
+        let volume = base.join("volume");
+        fs::create_dir_all(&volume).unwrap();
+        let issue = agent_base_directory_for(
+            &base.join("durable"),
+            Path::new("repo/generation"),
+            true,
+            &volume,
+        )
+        .unwrap_err();
+        assert!(issue.to_string().contains("not mounted"));
+        assert!(!volume.join("dev-artifacts").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn base_routing_new_identity_uses_designated_physical_volume() {
+        let base = tempdir("base-mounted");
+        let volume = Path::new("/Volumes/tmp");
+        let selected =
+            agent_base_directory_for(&base, Path::new("repo/generation"), true, volume).unwrap();
+        assert_eq!(
+            selected,
+            disposable_agent_bases_root(volume).join("repo/generation")
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(selected.parent().unwrap().parent().unwrap())
+                .unwrap()
+                .dev(),
+            fs::metadata(volume).unwrap().dev()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn disposable_store_routing_preserves_retained_data_and_overrides() {

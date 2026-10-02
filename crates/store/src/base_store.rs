@@ -163,11 +163,10 @@ impl BaseStoreLayout {
     pub fn new(data_root: &Path, identity: &BaseStoreIdentity) -> io::Result<Self> {
         let identity_hash = identity.hash()?;
         let repo_hash = hex_sha256(identity.canonical_repository_identity.as_bytes());
-        let directory = data_root
-            .join("agent-base-stores")
-            .join(format!("v{BASE_STORE_FORMAT_VERSION}"))
-            .join(repo_hash)
-            .join(identity_hash);
+        let directory = greppy_core::cache::agent_base_directory(
+            data_root,
+            &PathBuf::from(repo_hash).join(identity_hash),
+        )?;
         Ok(Self {
             manifest: directory.join(BASE_STORE_MANIFEST_FILE),
             graph: directory.join("graph.db"),
