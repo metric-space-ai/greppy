@@ -298,13 +298,11 @@ fn cold_file_handle_symbol_read_respects_auto_index_opt_out() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(format!("{stdout}{stderr}").contains("cold"));
-    assert!(
-        !only_graph_db_below(&store)
-            .parent()
-            .unwrap()
-            .join("index.job")
-            .exists()
-    );
+    assert!(!only_graph_db_below(&store)
+        .parent()
+        .unwrap()
+        .join("index.job")
+        .exists());
 }
 
 #[test]

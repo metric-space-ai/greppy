@@ -661,26 +661,18 @@ fn rename_identity_planner_subprocess_helper() {
             edit_sha256_hex(&std::fs::read(success_root.join(file)).unwrap())
         );
     }
-    assert!(
-        std::fs::read_to_string(success_root.join("selected.rs"))
-            .unwrap()
-            .contains("fn advance")
-    );
-    assert!(
-        std::fs::read_to_string(success_root.join("caller.rs"))
-            .unwrap()
-            .contains("value.advance()")
-    );
-    assert!(
-        std::fs::read_to_string(success_root.join("unrelated_a.rs"))
-            .unwrap()
-            .contains("fn next")
-    );
-    assert!(
-        std::fs::read_to_string(success_root.join("unrelated_b.rs"))
-            .unwrap()
-            .contains("value.next()")
-    );
+    assert!(std::fs::read_to_string(success_root.join("selected.rs"))
+        .unwrap()
+        .contains("fn advance"));
+    assert!(std::fs::read_to_string(success_root.join("caller.rs"))
+        .unwrap()
+        .contains("value.advance()"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_a.rs"))
+        .unwrap()
+        .contains("fn next"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_b.rs"))
+        .unwrap()
+        .contains("value.next()"));
 
     let omitted_root = test_tempdir("rename-identity-omitted");
     let (_project, _store_path) = index_rename_fixture(&omitted_root);
@@ -707,11 +699,9 @@ fn rename_identity_planner_subprocess_helper() {
     .err()
     .expect("omitted caller edge must refuse");
     assert_eq!(omitted.code, "unresolved_reference");
-    assert!(
-        omitted
-            .message
-            .contains("absent from the graph rename plan")
-    );
+    assert!(omitted
+        .message
+        .contains("absent from the graph rename plan"));
     for (path, expected) in omitted_before {
         assert_eq!(std::fs::read(omitted_root.join(path)).unwrap(), expected);
     }
@@ -1109,14 +1099,12 @@ fn semantic_embedding_wait_propagates_recorded_failure() {
         background_embedding_failure(failure).as_deref(),
         Some("GPU inference stopped")
     );
-    assert!(
-        background_embedding_failure(serde_json::json!({
-            "kind": "embedding",
-            "state": "embedding",
-            "last_error": null,
-        }))
-        .is_none()
-    );
+    assert!(background_embedding_failure(serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding",
+        "last_error": null,
+    }))
+    .is_none());
 }
 
 #[test]
@@ -1615,34 +1603,30 @@ fn parse_path_disambiguation_and_hyphen_values() {
     assert!(Cli::try_parse_from(["greppy", "read-file", "a/mod.py"]).is_ok());
 
     // Selector and content values may begin with '-' (real diff/RST lines).
-    assert!(
-        Cli::try_parse_from([
-            "greppy",
-            "edit",
-            "replace",
-            "--file",
-            "CHANGES.rst",
-            "--old",
-            "-   Fix how",
-            "--content",
-            "-   Fix what",
-        ])
-        .is_ok()
-    );
-    assert!(
-        Cli::try_parse_from([
-            "greppy",
-            "edit",
-            "replace",
-            "--file",
-            "f.py",
-            "--pattern",
-            "-x",
-            "--content",
-            "-y",
-        ])
-        .is_ok()
-    );
+    assert!(Cli::try_parse_from([
+        "greppy",
+        "edit",
+        "replace",
+        "--file",
+        "CHANGES.rst",
+        "--old",
+        "-   Fix how",
+        "--content",
+        "-   Fix what",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "greppy",
+        "edit",
+        "replace",
+        "--file",
+        "f.py",
+        "--pattern",
+        "-x",
+        "--content",
+        "-y",
+    ])
+    .is_ok());
 }
 
 #[test]
@@ -1685,16 +1669,14 @@ fn parse_plus_uses_vectors_without_a_public_flag() {
     }
 
     assert!(Cli::try_parse_from(["greppy", "plus", "--vectors", "refund workflow"]).is_err());
-    assert!(
-        Cli::try_parse_from([
-            "greppy",
-            "plus",
-            "--embedding-gguf",
-            "model.gguf",
-            "refund workflow"
-        ])
-        .is_err()
-    );
+    assert!(Cli::try_parse_from([
+        "greppy",
+        "plus",
+        "--embedding-gguf",
+        "model.gguf",
+        "refund workflow"
+    ])
+    .is_err());
 }
 
 #[test]
@@ -1727,17 +1709,15 @@ fn cli_device_flags_parse_on_embedding_commands() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
-    assert!(
-        Cli::try_parse_from([
-            "grep",
-            "search",
-            "--device",
-            "cuda",
-            "--no-gpu",
-            "refund workflow",
-        ])
-        .is_err()
-    );
+    assert!(Cli::try_parse_from([
+        "grep",
+        "search",
+        "--device",
+        "cuda",
+        "--no-gpu",
+        "refund workflow",
+    ])
+    .is_err());
 }
 
 #[cfg(any(unix, windows))]
@@ -2857,10 +2837,8 @@ fn navigation_commands_parse_positional_symbol() {
 
     // `references` was where find-usages went to keep living after it was
     // supposedly removed. It parses as nothing now.
-    assert!(
-        Cli::try_parse_from(["greppy", "references", "Widget"])
-            .is_ok_and(|cli| !matches!(cli.command, Some(Command::WhoCalls { .. })))
-    );
+    assert!(Cli::try_parse_from(["greppy", "references", "Widget"])
+        .is_ok_and(|cli| !matches!(cli.command, Some(Command::WhoCalls { .. }))));
 
     let cli = Cli::try_parse_from([
         "greppy", "fan-in", "--edge", "USAGE", "--limit", "7", "--json",
@@ -3246,11 +3224,9 @@ fn file_qualified_single_and_multi_resolvers_agree() {
         );
     }
     for selector in ["missing.rs::run", "src/first.rs::missing"] {
-        assert!(
-            resolve_symbol_nodes(&store, Some(selector))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(resolve_symbol_nodes(&store, Some(selector))
+            .unwrap()
+            .is_empty());
         assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
     }
 }
