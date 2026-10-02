@@ -801,6 +801,8 @@ fn patch_bad_counts_and_count_free_header_ambiguity_are_atomic() {
             "--- a/two.txt\n+++ b/two.txt\n@@\n-two\n+TWO\n--- a/phantom.txt\n+++ b/phantom.txt\n@@\n-missing\n+new\n",
             "ambiguous in a count-free hunk",
         ),
+        ("--- a/two.txt\n+++ b/two.txt\n@@ -1,x +1,1 @@\n-two\n+TWO\n", "has invalid unified-diff ranges"),
+        ("--- a/two.txt\n+++ b/two.txt\n@@ -184467440737095516160 +1,1 @@\n-two\n+TWO\n", "has invalid unified-diff ranges"),
     ] {
         let diff = format!("{first}{suffix}");
         let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
