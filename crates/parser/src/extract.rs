@@ -490,7 +490,12 @@ fn rust_slice_iterator_owner(
         return None;
     }
     let ty = rust_visible_binding_type(source, callee, node_text(source, binding))?;
-    if ty.kind() != "reference_type" || ty.child_by_field_name("type")?.kind() != "slice_type" {
+    if ty.kind() != "reference_type" {
+        return None;
+    }
+    // tree-sitter-rust represents slices as array_type without a length.
+    let slice = ty.child_by_field_name("type")?;
+    if slice.kind() != "array_type" || slice.child_by_field_name("length").is_some() {
         return None;
     }
     if !rust_slice_iter_lookup_is_transparent(callee) {
@@ -15816,6 +15821,8 @@ mod tests {
             ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
             ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
             ("fn f(items: &[i32]) { items.iter().next(); }", true),
+            ("fn f(items: &[i32; 2]) { items.iter().next(); }", false),
+
             ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
             ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
             ("fn f(items: &[i32]) { let items = custom(); items.iter().next(); }", false),
