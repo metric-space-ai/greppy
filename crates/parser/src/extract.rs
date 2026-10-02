@@ -504,6 +504,141 @@ fn rust_slice_iterator_owner(
     Some("core::slice::Iter")
 }
 
+/// Resolve only a transparent prelude Option pattern over an explicitly typed
+/// identifier. The outer Option records shadowing even when ownership is unknown.
+/// Field access, adapters (including as_ref), return-type inference and custom
+/// variants remain unresolved rather than borrowing a same-named method.
+fn rust_option_pattern_owner<'a>(
+    source: &'a [u8],
+    callee: Node<'_>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        (node.kind() == "identifier" && node_text(source, node) == name)
+            || (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    fn owner<'a>(source: &'a [u8], pattern: Node<'_>, value: Node<'_>, name: &str) -> Option<&'a str> {
+        if pattern.kind() == "match_pattern" {
+            return owner(source, pattern.named_child(0)?, value, name);
+        }
+        if pattern.kind() == "tuple_pattern" && value.kind() == "tuple_expression" {
+            if pattern.named_child_count() != value.named_child_count() {
+                return None;
+            }
+            for i in 0..pattern.named_child_count() {
+                let child = pattern.named_child(i)?;
+                if binds(source, child, name) {
+                    return owner(source, child, value.named_child(i)?, name);
+                }
+            }
+            return None;
+        }
+        if pattern.kind() != "tuple_struct_pattern" || value.kind() != "identifier" {
+            return None;
+        }
+        let constructor = pattern.child_by_field_name("type").or_else(|| pattern.named_child(0))?;
+        if node_text(source, constructor) != "Some" || pattern.named_child_count() != 2 {
+            return None;
+        }
+        let binding = pattern.named_child(1)?;
+        if binding.kind() != "identifier" || node_text(source, binding) != name {
+            return None;
+        }
+        // Lookup at the scrutinee, outside the new pattern's scope.
+        let ty = rust_visible_binding_type(source, value, node_text(source, value))?;
+        if ty.kind() != "generic_type"
+            || node_text(source, ty.child_by_field_name("type")?) != "Option"
+        {
+            return None;
+        }
+        let arguments = ty.child_by_field_name("type_arguments")?;
+        if arguments.named_child_count() != 1 {
+            return None;
+        }
+        let inner = arguments.named_child(0)?;
+        if !matches!(inner.kind(), "type_identifier" | "scoped_type_identifier") {
+            return None;
+        }
+        let mut names = Vec::new();
+        type_identifiers_in(source, inner, &mut names);
+        (names.len() == 1).then(|| names[0])
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() == "let_declaration" && binding.end_byte() <= callee.start_byte() {
+                    if let Some(pattern) = binding.child_by_field_name("pattern") {
+                        if binds(source, pattern, name) {
+                            return (node_text(source, pattern).trim() != name).then_some(None);
+                            // The existing local resolver owns a direct nearest binding.
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression") {
+            let pattern = node.child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return Some(None);
+            }
+        }
+        let pair = if node.kind() == "match_arm" {
+            node.child_by_field_name("pattern").zip(
+                node.parent().and_then(|body| body.parent())
+                    .and_then(|expression| expression.child_by_field_name("value"))
+            )
+        } else if matches!(node.kind(), "if_expression" | "while_expression") {
+            node.child_by_field_name("condition").and_then(|condition| {
+                // Do not expose an if-let binding to the else branch.
+                let body = node.child_by_field_name("consequence").or_else(|| node.child_by_field_name("body"))?;
+                if !(body.start_byte() <= callee.start_byte() && callee.end_byte() <= body.end_byte()) {
+                    return None;
+                }
+                (condition.kind() == "let_condition").then(|| {
+                    condition.child_by_field_name("pattern").zip(condition.child_by_field_name("value"))
+                }).flatten()
+            })
+        } else {
+            None
+        };
+        if let Some((pattern, value)) = pair {
+            if binds(source, pattern, name) {
+                // Prelude names can be shadowed by imports, local items or macros.
+                fn shadows_prelude(source: &[u8], node: Node<'_>) -> bool {
+                    if matches!(node.kind(), "struct_item" | "enum_item" | "type_item"
+                        | "type_parameter" | "function_item" | "const_item" | "static_item"
+                        | "enum_variant" | "mod_item")
+                        && node.child_by_field_name("name").is_some_and(|ident| {
+                            matches!(node_text(source, ident), "Option" | "Some")
+                        })
+                    {
+                        return true;
+                    }
+                    (0..node.named_child_count()).filter_map(|i| node.named_child(i))
+                        .any(|child| shadows_prelude(source, child))
+                }
+                let mut root = node;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                let transparent = rust_slice_iter_lookup_is_transparent(callee)
+                    && !shadows_prelude(source, root);
+                return Some(if transparent { owner(source, pattern, value, name) } else { None });
+            }
+        }
+        if node.kind() == "function_item" {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 /// Resolve the owner type of an unambiguous Rust receiver call when the AST
 /// carries enough local type evidence. `self.method()` inherits the enclosing
 /// impl owner; named receivers are accepted for explicitly typed parameters or
@@ -524,6 +659,9 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
         return rust_slice_iterator_owner(source, receiver, callee);
     }
 
+    if let Some(owner) = rust_option_pattern_owner(source, callee, receiver_text) {
+        return owner;
+    }
     let mut ancestor = field.parent();
     while let Some(node) = ancestor {
         if node.kind() == "function_item" {
@@ -15857,6 +15995,32 @@ mod tests {
                 .get("receiver_owner")
                 .and_then(|v| v.as_str());
             assert_eq!(owner, proven.then_some("core::slice::Iter"), "{source}");
+        }
+    }
+
+    #[test]
+    fn rust_option_patterns_require_explicit_unshadowed_type_evidence() {
+        let cases = [
+            ("fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }", Some("Field")),
+            ("fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", None),
+            ("enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }", Some("Wrong")),
+        ];
+        for (source, expected) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+            assert_eq!(call.properties.get("receiver_owner").and_then(|v| v.as_str()), expected, "{source}");
         }
     }
 
