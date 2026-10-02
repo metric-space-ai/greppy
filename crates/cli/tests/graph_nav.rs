@@ -2991,3 +2991,77 @@ fn impact_outgoing_from_a_caller_reaches_the_hub() {
         "outgoing impact from caller_0_0 must reach hub; got: {out}"
     );
 }
+
+#[test]
+fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
+    let (repo, store) = index_fixture("wgsl-read-coverage");
+    std::fs::create_dir_all(repo.join("browser-runtime/src")).unwrap();
+    std::fs::write(
+        repo.join("browser-runtime/src/scene.wgsl"),
+        "fn road_structure(value: f32) -> f32 { return value; }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "fixture index: {out} {err}");
+    for command in ["read", "read-smart"] {
+        let (code, out, err) = run(&[command, "road_structure"], &repo, &store);
+        assert_eq!(code, 1, "unsupported graph lookup: {out} {err}");
+        assert!(out.contains("no indexed symbol `road_structure`"), "{out}");
+        assert!(
+            out.to_ascii_lowercase().contains("unsupported for wgsl"),
+            "{out}"
+        );
+        assert!(out.contains("cannot rule out a definition"), "{out}");
+        assert!(
+            out.contains("reindexing does not add symbol coverage"),
+            "{out}"
+        );
+        assert!(
+            out.contains("search-pattern road_structure --fixed --root"),
+            "{out}"
+        );
+        assert!(out.contains("greppy read-file PATH --root"), "{out}");
+        assert!(!out.contains("greppy index ."), "{out}");
+    }
+    let (code, out, err) = run(&["read", "road_structure", "--json"], &repo, &store);
+    assert_eq!(code, 1, "JSON lookup: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "not-found");
+    assert_eq!(value["lookup_scope"], "indexed-definitions");
+    assert!(value["unsupported_definition_coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provider| provider["language"]
+            .as_str()
+            .unwrap()
+            .eq_ignore_ascii_case("wgsl")
+            && provider["status"] == "unsupported"));
+    assert!(value["source_recovery"]
+        .as_str()
+        .unwrap()
+        .contains("--root"));
+    for path in ["src/lib.rs", "browser-runtime/src/missing.wgsl"] {
+        let (code, out, err) = run(&["read", "road_structure", "--path", path], &repo, &store);
+        assert_eq!(code, 1, "filtered miss: {out} {err}");
+        assert!(
+            !out.contains("definition extraction is unsupported"),
+            "{out}"
+        );
+    }
+    let (code, out, err) = run(
+        &[
+            "read",
+            "road_structure",
+            "--path",
+            "browser-runtime/src/scene.wgsl",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "actual unsupported file: {out} {err}");
+    assert!(
+        out.to_ascii_lowercase().contains("unsupported for wgsl"),
+        "{out}"
+    );
+}

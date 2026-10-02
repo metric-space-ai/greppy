@@ -586,7 +586,97 @@ fn read_text_segments(
     }
 }
 
-fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> serde_json::Value {
+// A graph miss cannot rule out definitions in a discovered language without
+// a definition provider. Consult existing metadata only: no source scan or index.
+fn read_unsupported_definition_coverage(
+    store: &greppy_store::Store,
+    project: &str,
+    path_filters: &QueryPathFilters,
+) -> Result<Vec<serde_json::Value>> {
+    let mut providers = store
+        .list_provider_states(project)?
+        .into_iter()
+        .filter(|provider| {
+            provider.status == "unsupported"
+                && provider.files_seen > 0
+                && !is_noncode_provider(&provider.status, &provider.language)
+        })
+        .collect::<Vec<_>>();
+    if !path_filters.is_empty() {
+        // An exact indexed file can establish coverage for a filtered lookup.
+        // Never infer a missing file or directory's language from its suffix.
+        let mut languages = std::collections::BTreeSet::new();
+        for path in path_filters.repo_prefixes() {
+            let language = greppy_parser::language_for_path(std::path::Path::new(&path));
+            if !language.is_supported() {
+                if let Some(state) = store.get_file_state(project, &path)? {
+                    if state.language == language.name() {
+                        languages.insert(state.language);
+                    }
+                }
+            }
+        }
+        providers.retain(|provider| languages.contains(&provider.language));
+    }
+    providers.sort_by(|left, right| left.language.cmp(&right.language));
+    Ok(providers
+        .into_iter()
+        .map(|provider| {
+            serde_json::json!({
+                "language": provider.language,
+                "status": provider.status,
+                "files_seen": provider.files_seen,
+            })
+        })
+        .collect())
+}
+
+fn read_report_missing(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    path_filters: &QueryPathFilters,
+) -> Result<()> {
+    let coverage = read_unsupported_definition_coverage(store, project, path_filters)?;
+    if coverage.is_empty() {
+        nav_report_missing(store, project, query);
+        return Ok(());
+    }
+    println!("no indexed symbol `{query}`");
+    for provider in coverage.iter().take(3) {
+        println!(
+            "coverage: definition extraction is unsupported for {} ({} discovered files)",
+            provider["language"].as_str().unwrap_or("unknown"),
+            provider["files_seen"]
+        );
+    }
+    if coverage.len() > 3 {
+        println!(
+            "coverage: {} more unsupported languages",
+            coverage.len() - 3
+        );
+    }
+    println!("message: this graph lookup cannot rule out a definition in unsupported source; reindexing does not add symbol coverage");
+    println!(
+        "next: locate it in source: greppy search-pattern {} --fixed --root {}",
+        shell_example_arg(query),
+        shell_example_arg(&root_path.to_string_lossy())
+    );
+    println!(
+        "next: read a matching file with greppy read-file PATH --root {}",
+        shell_example_arg(&root_path.to_string_lossy())
+    );
+    Ok(())
+}
+
+fn read_json_miss(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    path_filters: &QueryPathFilters,
+) -> Result<serde_json::Value> {
     let candidates = symbol_miss_suggestions(store, project, query)
         .into_iter()
         .filter_map(|name| {
@@ -604,13 +694,21 @@ fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> se
         })
         .take(5)
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let coverage = read_unsupported_definition_coverage(store, project, path_filters)?;
+    Ok(serde_json::json!({
         "schema_version": "greppy.read.v1",
         "command": "read",
         "status": "not-found",
         "query": query,
         "candidates": candidates,
-    })
+        "lookup_scope": "indexed-definitions",
+        "unsupported_definition_coverage": coverage,
+        "source_recovery": format!(
+            "greppy search-pattern {} --fixed --root {}",
+            shell_example_arg(query),
+            shell_example_arg(&root_path.to_string_lossy())
+        ),
+    }))
 }
 
 #[expect(
@@ -815,8 +913,14 @@ pub(crate) fn dispatch_read_symbols(
         if nodes.is_empty() {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&read_json_miss(&store, &project, query))
-                    .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
+                serde_json::to_string_pretty(&read_json_miss(
+                    &store,
+                    &project,
+                    query,
+                    &root_path,
+                    &path_filters
+                )?)
+                .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
             );
             return Ok(1);
         }
@@ -848,7 +952,14 @@ pub(crate) fn dispatch_read_symbols(
         let Some(definition) = read_definition(&store, &root_path, nodes[0].clone())? else {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&read_json_miss(&store, &project, query)).unwrap()
+                serde_json::to_string_pretty(&read_json_miss(
+                    &store,
+                    &project,
+                    query,
+                    &root_path,
+                    &path_filters
+                )?)
+                .unwrap()
             );
             return Ok(1);
         };
@@ -917,13 +1028,13 @@ pub(crate) fn dispatch_read_symbols(
             continue;
         }
         let Some(node) = nodes.first().cloned() else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
@@ -1211,13 +1322,13 @@ pub(crate) fn dispatch_read_smart(
             continue;
         }
         let Some(node) = nodes.first().cloned() else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
