@@ -4513,10 +4513,13 @@ fn refresh_state_for_query(
 /// atomic auto-reindex: only when the embedding model is resolvable, because
 /// an existing vector generation must be rebuilt as part of the snapshot.
 fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
-    match embedding_config_optional(args) {
-        Ok(Some(cfg)) => embedding_model_source_exists(&cfg.source),
-        Ok(None) | Err(_) => false,
-    }
+    // Product assets are embedded. Admission and the index child own their
+    // extraction; probing a cold query must not write models on this thread.
+    !test_inference_skipped()
+        && embedding_config_for_daemon_probe(args)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 /// Atomically published status for the one allowed background index job.

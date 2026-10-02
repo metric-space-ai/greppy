@@ -35,6 +35,49 @@ fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomical
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn semantic_admission_refusal_precedes_model_asset_materialization() {
+    let (repo, store, _scratch) = make_repo("semantic-no-assets-before-admission", "sample");
+    let gate = repo.join("deny-heavy.py");
+    std::fs::write(
+        &gate,
+        "import sys\nprint('Capacity gate: fixture denied', file=sys.stderr)\nsys.exit(75)\n",
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args(["search", "returns a sample integer", "--json"])
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_HEAVY_GATE", &gate)
+        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+        .env_remove("GREPPY_AUTO_REINDEX")
+        // If the request gets as far as materialization, this independent
+        // debug failpoint produces the wrong backend error instead of denial.
+        .env("GREPPY_TEST_EMBED_ASSET_MISSING", "1")
+        .output()
+        .unwrap();
+    let out = String::from_utf8(output.stdout).unwrap();
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(75), "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["freshness"]["preparation_failure_kind"], "admission_deferred",
+        "{value}"
+    );
+    assert!(
+        value["freshness"]["preparation_error"]
+            .as_str()
+            .unwrap()
+            .contains("fixture denied"),
+        "{value}"
+    );
+    assert!(
+        !store.join("models").exists(),
+        "refused search must not materialize either model"
+    );
+}
+
 /// Path to the binary under test (provided by cargo for integration tests).
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
