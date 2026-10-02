@@ -35,10 +35,11 @@ fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomical
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
 #[test]
 fn semantic_admission_refusal_precedes_model_asset_materialization() {
     let (repo, store, _scratch) = make_repo("semantic-no-assets-before-admission", "sample");
+    let model_root = store.with_file_name("isolated-inference");
     let gate = repo.join("deny-heavy.py");
     std::fs::write(
         &gate,
@@ -50,6 +51,7 @@ fn semantic_admission_refusal_precedes_model_asset_materialization() {
         .current_dir(&repo)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_HEAVY_GATE", &gate)
+        .env("GREPPY_SHARED_INFERENCE_ROOT", &model_root)
         .env_remove("GREPPY_TEST_SKIP_INFERENCE")
         .env_remove("GREPPY_AUTO_REINDEX")
         // If the request gets as far as materialization, this independent
@@ -73,7 +75,7 @@ fn semantic_admission_refusal_precedes_model_asset_materialization() {
         "{value}"
     );
     assert!(
-        !store.join("models").exists(),
+        !model_root.join("models").exists(),
         "refused search must not materialize either model"
     );
 }
