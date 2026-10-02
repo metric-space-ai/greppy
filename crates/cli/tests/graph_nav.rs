@@ -703,6 +703,68 @@ fn expand_missing_id_reports_clear_message() {
 }
 
 #[test]
+fn symbol_miss_names_unsupported_indexed_html_without_reindex_loop() {
+    let (repo, store) = index_fixture("html-symbol-coverage");
+    std::fs::create_dir_all(repo.join("public/crm")).unwrap();
+    std::fs::write(
+        repo.join("public/crm/index.html"),
+        "<script>async function dispatchAction() {} async function refreshCrmData() { return dispatchAction(); }</script>",
+    )
+    .unwrap();
+    let (code, out, err) = run(
+        &[
+            "search-symbol",
+            "dispatchAction",
+            "--code",
+            "--path",
+            "public/crm/index.html",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "HTML provider is not supported: {out} {err}");
+    assert!(
+        out.contains("definition extraction is unsupported for indexed file public/crm/index.html")
+    );
+    assert!(
+        out.contains("search-pattern dispatchAction --fixed --path public/crm/index.html --root")
+    );
+    assert!(out.contains("reindexing does not add symbol coverage"));
+    assert!(
+        !out.contains("next: refresh definitions")
+            && !out.contains("retry without the path filter")
+    );
+
+    // A guessed HTML suffix is not evidence that a nonexistent path was
+    // indexed and skipped, nor that supported Rust definitions were omitted.
+    for path in ["public/crm/missing.html", "src/lib.rs"] {
+        let (code, out, err) = run(
+            &["search-symbol", "dispatchAction", "--path", path],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 1, "unexpected symbol match: {out} {err}");
+        assert!(!out.contains("definition extraction is unsupported"));
+    }
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "dispatchAction",
+            "--fixed",
+            "--path",
+            "public/crm/index.html",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "literal recovery must still find the source: {out} {err}"
+    );
+    assert!(out.contains("public/crm/index.html"));
+}
+
+#[test]
 fn who_calls_lists_usage_references_into_a_struct() {
     let (repo, store) = index_fixture("whocalls-struct-usage");
 
