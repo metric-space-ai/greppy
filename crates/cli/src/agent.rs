@@ -73,6 +73,7 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy agent [\"INITIAL TASK\"]
+  greppy agent stdio [--model M] [--endpoint URL]
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
@@ -292,6 +293,9 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 /// Parse and run `greppy agent …` in the full-screen interactive UI.
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
     let rest = super::grep_passthrough_args(argv);
+    if rest.get(1).is_some_and(|token| token == "stdio") {
+        return crate::agent_acp::run(rest);
+    }
     if rest.get(1).is_some_and(|token| token == "serve") {
         return run_agent_serve_invocation(rest);
     }
