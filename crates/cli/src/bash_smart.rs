@@ -110,6 +110,21 @@ static PYTHON_WARNING_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     .expect("bash-smart Python warning regex")
 });
 
+// Node adds a space before bracketed error codes and prefixes warnings with
+// its PID. Require those complete headers rather than arbitrary Node prose.
+static NODE_ERROR_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"^[\t ]*(?:Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError|InternalError)[\t ]+\[ERR_[A-Z0-9_]+\]:(?:[\t ]|$)",
+    )
+    .expect("bash-smart Node error regex")
+});
+static NODE_WARNING_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"^[\t ]*\(node:[0-9]+\)[\t ]+(?:\[[A-Z][A-Z0-9_]*\][\t ]+)?[A-Za-z]*Warning:(?:[\t ]|$)",
+    )
+    .expect("bash-smart Node warning regex")
+});
+
 fn heartbeat_tail(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -730,13 +745,15 @@ fn detect_blocks(
                 }
                 formatting_diff = false;
             }
-            let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
+            let kind = if (ERROR_MARKER_RE.is_match(lines[index].content)
+                || NODE_ERROR_RE.is_match(lines[index].content))
                 && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
                 && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content)
                 || PYTHON_WARNING_RE.is_match(lines[index].content)
+                || NODE_WARNING_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Warning)
             } else {
@@ -2604,6 +2621,37 @@ mod tests {
     fn stderr_origin_alone_does_not_create_a_block() {
         let stderr = split_lines(b"compiler stopped here\n");
         assert!(detect_blocks(&[], &stderr).is_empty());
+    }
+
+    #[test]
+    fn node_coded_errors_and_pid_warnings_keep_severity_and_details() {
+        let errors = split_lines(b"Error [ERR_MODULE_NOT_FOUND]: Cannot find package playwright-core\n    at packageResolve (node:internal/modules/esm/resolve:1:2)\nTypeError [ERR_INVALID_ARG_TYPE]: invalid input\n    at fixture.js:3:4\n");
+        let warnings = split_lines(b"(node:42) [MODULE_TYPELESS_PACKAGE_JSON] Warning: reparsing as ES module\n(Use node --trace-warnings to show where the warning was created)\n(node:43) [DEP0040] DeprecationWarning: deprecated module\n(node:44) ExperimentalWarning: experimental API\n(node:45) [MODULE_TYPELESS_PACKAGE_JSON] Warning: another process\n");
+        for (stdout, stderr) in [(&errors[..], &warnings[..]), (&warnings[..], &errors[..])] {
+            let blocks = detect_blocks(stdout, stderr);
+            assert_eq!(
+                blocks.iter().filter(|b| b.kind == BlockKind::Error).count(),
+                2
+            );
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|b| b.kind == BlockKind::Warning)
+                    .count(),
+                4
+            );
+            assert!(blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Error)
+                .all(|b| b.lines.len() == 2));
+        }
+    }
+
+    #[test]
+    fn node_header_lookalikes_are_not_diagnostics() {
+        let prose = split_lines(b"Error [ERR_MODULE_NOT_FOUND] is documented\nError [ERR_MODULE_NOT_FOUND]:without-separator\n(node:pid) [DEP0040] Warning: prose\n(node:42) [DEP0040] Warning handling\nconsole.warn('(node:42) [DEP0040] Warning: source')\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
+        assert!(detect_blocks(&[], &prose).is_empty());
     }
 
     #[test]
