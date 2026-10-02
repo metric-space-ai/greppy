@@ -100,7 +100,7 @@ pub(crate) fn failure_detail(
     let detail = String::from_utf8_lossy(&bytes).trim().to_string();
     Some(if status.code() == Some(75) {
         format!(
-            "Automatic indexing deferred by shared host admission; no index work started. {detail} Retry the original command when host capacity is available. For an immediate bounded source read, use greppy read-file PATH --lines A:B."
+            "Automatic indexing deferred by shared host admission; no index work started. {detail} Retry the original command when host capacity is available. For an immediate bounded source read, use greppy read-file PATH --lines A:B. For an edit without a graph refresh, use greppy replace-text PATH OLD NEW; it refuses missing or non-unique matches."
         )
     } else {
         format!("Automatic index admission runner exited {status}: {detail}")
@@ -271,6 +271,8 @@ mod tests {
         assert!(detail.contains("no index work started"));
         assert!(detail.contains("tmp below 20 GiB"));
         assert!(detail.contains("Retry the original command"));
+        assert!(detail.contains("greppy replace-text PATH OLD NEW"));
+        assert!(detail.contains("refuses missing or non-unique matches"));
     }
     #[test]
     fn admitted_gate_receives_literal_child_arguments() {
