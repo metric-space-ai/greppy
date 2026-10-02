@@ -5904,6 +5904,51 @@ fn caller(value: Buffer) -> &'static [u8] {
     }
 
     #[test]
+    fn effect_fn_generator_call_persists_incoming_edge_from_exported_binding() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("routing.ts"),
+            r#"
+const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
+    function* (input: { model: string }) { return input.model; },
+);
+export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEnvironment")(
+    function* (input: { model: string }) {
+        const gatewayProvider = input.model.length > 0
+            ? yield* resolveGatewayProviderForModel({ model: input.model })
+            : undefined;
+        return gatewayProvider;
+    },
+);
+"#,
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let target = store
+            .get_node_by_qname(
+                "test",
+                "routing.ts::Variable::resolveGatewayProviderForModel",
+            )
+            .unwrap()
+            .expect("private Effect.fn binding must exist");
+        let caller = store
+            .get_node_by_qname(
+                "test",
+                "routing.ts::Variable::resolveGatewayRoutedEnvironment",
+            )
+            .unwrap()
+            .expect("exported Effect.fn binding must exist");
+        let incoming = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(
+            incoming.len(),
+            1,
+            "expected one persisted direct caller: {incoming:?}"
+        );
+        assert_eq!(incoming[0].source_id, caller.id);
+    }
+
+    #[test]
     fn class_construction_persists_calls_edge_to_class() {
         const APP_PY: &str = r#"
 class RunnerFilter:
