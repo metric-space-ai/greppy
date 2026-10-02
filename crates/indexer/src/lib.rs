@@ -5920,6 +5920,9 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
         return gatewayProvider;
     },
 );
+const plainValue = 42;
+const effectValue = Effect.gen(function* () { return 42; });
+export function invalidCalls() { plainValue(); effectValue(); }
 "#,
         )
         .unwrap();
@@ -5928,14 +5931,14 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
         let target = store
             .get_node_by_qname(
                 "test",
-                "routing.ts::Variable::resolveGatewayProviderForModel",
+                "routing.ts::Function::resolveGatewayProviderForModel",
             )
             .unwrap()
             .expect("private Effect.fn binding must exist");
         let caller = store
             .get_node_by_qname(
                 "test",
-                "routing.ts::Variable::resolveGatewayRoutedEnvironment",
+                "routing.ts::Function::resolveGatewayRoutedEnvironment",
             )
             .unwrap()
             .expect("exported Effect.fn binding must exist");
@@ -5946,6 +5949,19 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "expected one persisted direct caller: {incoming:?}"
         );
         assert_eq!(incoming[0].source_id, caller.id);
+        for name in ["plainValue", "effectValue"] {
+            let value = store
+                .get_node_by_qname("test", &format!("routing.ts::Variable::{name}"))
+                .unwrap()
+                .expect("ordinary value must remain a Variable");
+            assert!(
+                store
+                    .incoming_edges(value.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "noncallable values must not resolve as call targets"
+            );
+        }
     }
 
     #[test]

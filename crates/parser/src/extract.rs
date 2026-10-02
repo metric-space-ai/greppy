@@ -1676,13 +1676,18 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // to `__file__` below.
         }
         if module_variable.is_none() && cur.kind() == "variable_declarator" {
-            module_variable = js_ts_module_variable_name(cur, source);
+            module_variable = js_ts_module_variable_name(cur, source).map(|name| {
+                let label = if js_ts_effect_fn_binding(cur, source) {
+                    "Function"
+                } else {
+                    "Variable"
+                };
+                format!("{file_path}::{label}::{name}")
+            });
         }
         p = cur.parent();
     }
-    module_variable
-        .map(|name| format!("{file_path}::Variable::{name}"))
-        .unwrap_or(file_qname)
+    module_variable.unwrap_or(file_qname)
 }
 
 /// Return the binding name when `declarator` is one of the module Variables
@@ -2051,7 +2056,7 @@ fn emit_js_ts_declarators(
                 emit_js_ts_destructured(name_node, vd, source, file_path, result);
             }
             _ => {
-                push_js_ts_variable(node_text(source, name_node), vd, file_path, result);
+                push_js_ts_variable(node_text(source, name_node), vd, source, file_path, result);
             }
         }
     }
@@ -2084,7 +2089,7 @@ fn emit_js_ts_destructured(
             _ => {
                 let text = node_text(source, ident);
                 if !text.is_empty() {
-                    push_js_ts_variable(text, decl, file_path, result);
+                    push_js_ts_variable(text, decl, source, file_path, result);
                 }
             }
         }
@@ -2140,14 +2145,25 @@ fn emit_js_ts_enum_members(
 
 /// Push a single `Variable` node (`decl` supplies the line span, recording the
 /// declarator's position).
-fn push_js_ts_variable(name: &str, decl: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
+fn push_js_ts_variable(
+    name: &str,
+    decl: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
     if name.is_empty() {
         return;
     }
+    let label = if js_ts_effect_fn_binding(decl, source) {
+        "Function"
+    } else {
+        "Variable"
+    };
     result.nodes.push(ExtractedNode {
-        label: "Variable".into(),
+        label: label.into(),
         name: name.to_string(),
-        qualified_name: format!("{file_path}::Variable::{name}"),
+        qualified_name: format!("{file_path}::{label}::{name}"),
         file_path: file_path.to_string(),
         start_line: decl.start_position().row as u32 + 1,
         end_line: decl.end_position().row as u32 + 1,
@@ -2155,7 +2171,42 @@ fn push_js_ts_variable(name: &str, decl: Node<'_>, file_path: &str, result: &mut
     });
 }
 
+/// Effect.fn(name)(callback) creates a callable binding; Effect.gen and
+/// arbitrary callback-consuming factories may produce ordinary values instead.
+fn js_ts_effect_fn_binding(decl: Node<'_>, source: &[u8]) -> bool {
+    let Some(value) = decl.child_by_field_name("value") else {
+        return false;
+    };
+    if value.kind() != "call_expression" {
+        return false;
+    }
+    let Some(factory) = value.child_by_field_name("function") else {
+        return false;
+    };
+    if factory.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = factory.child_by_field_name("function") else {
+        return false;
+    };
+    if node_text(source, callee) != "Effect.fn" {
+        return false;
+    }
+    let Some(arguments) = value.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let callable = arguments.named_children(&mut cursor).any(|argument| {
+        matches!(
+            argument.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    });
+    callable
+}
+
 /// First direct child of `node` whose kind is `kind`, if any.
+
 fn find_child_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let found = node.children(&mut cursor).find(|c| c.kind() == kind);
@@ -17788,7 +17839,7 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
 "#,
             "src/routing.ts",
         );
-        let owner = "src/routing.ts::Variable::resolveGatewayRoutedEnvironment";
+        let owner = "src/routing.ts::Function::resolveGatewayRoutedEnvironment";
         assert!(r.nodes.iter().any(|node| node.qualified_name == owner));
         let calls: Vec<_> = r
             .edges
