@@ -1656,13 +1656,18 @@ fn index_status_does_not_materialize_inference_assets() {
                 ("GREPPY_SHARED_INFERENCE_ROOT", inference_path),
             ],
         );
-        assert_eq!(code, 73, "missing embeddings must remain unhealthy: {out}\n{err}");
+        assert_eq!(
+            code, 73,
+            "missing embeddings must remain unhealthy: {out}\n{err}"
+        );
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["fresh"], true);
         assert_eq!(value["embedding_complete"], false);
         assert_eq!(value["vectors_missing_with_model"], true);
         assert!(
-            !inference_root.join("models/v1/embeddinggemma-300m-q4k").exists(),
+            !inference_root
+                .join("models/v1/embeddinggemma-300m-q4k")
+                .exists(),
             "status must not extract or verify model assets"
         );
     }
