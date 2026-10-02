@@ -2107,12 +2107,12 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 ))
             })();
             let counted_header = header_fields
-                .get(1)
-                .is_some_and(|field| field.starts_with('-'))
-                || header_fields
-                    .get(2)
-                    .is_some_and(|field| field.starts_with('+'));
-            if counted_header && declared_counts.is_none() {
+                .iter()
+                .skip(1)
+                .take(2)
+                .any(|field| field.starts_with('-') || field.starts_with('+'));
+            if counted_header && (declared_counts.is_none() || header_fields.get(3) != Some(&"@@"))
+            {
                 return Err(EditRefusal::new(
                     "invalid_patch",
                     format!("{path}: hunk {input_hunk_number} at patch input line {input_line} has invalid unified-diff ranges; use @@ -OLD,COUNT +NEW,COUNT @@ with non-negative integers — nothing written"),
