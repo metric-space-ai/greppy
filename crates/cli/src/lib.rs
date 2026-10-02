@@ -10843,6 +10843,11 @@ fn result_item_count(value: &serde_json::Value) -> usize {
         .map(Vec::len)
         .sum::<usize>()
         + value
+            .get("unresolved_receivers")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+        + value
             .get("source")
             .and_then(serde_json::Value::as_str)
             .map(|source| source.lines().count())
@@ -10875,6 +10880,15 @@ fn skip_result_items(value: &mut serde_json::Value, mut count: usize) {
 }
 
 fn pop_result_item(value: &mut serde_json::Value) -> bool {
+    // Caller windows are ordered confirmed first, uncertain candidates last.
+    if let Some(rows) = value
+        .get_mut("unresolved_receivers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if rows.pop().is_some() {
+            return true;
+        }
+    }
     if let Some(source) = value.get_mut("source") {
         if let Some(text) = source.as_str() {
             let mut lines = text.lines().collect::<Vec<_>>();
@@ -11042,7 +11056,16 @@ fn compact_nav_json(value: &mut serde_json::Value) {
             compact.insert("targets".into(), targets);
         }
     }
-    for key in ["suggestions", "next", "warning", "hits"] {
+    for key in [
+        "suggestions",
+        "next",
+        "warning",
+        "hits",
+        "unresolved_receivers",
+        "callers_incomplete",
+        "unresolved_omitted",
+        "unresolved_truncated",
+    ] {
         if let Some(field) = value.get(key).cloned() {
             compact.insert(key.into(), field);
         }
@@ -11250,10 +11273,36 @@ fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
 fn budget_json_output(bytes: &[u8], spec: &OutputBudgetSpec) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let available = result_item_count(&value);
-    let total = exact_result_total(&value, available, spec.offset);
+    let confirmed_total = exact_result_total(&value, available, spec.offset);
+    let uncertain_initial = value
+        .get("unresolved_receivers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let uncertain_total = uncertain_initial
+        + value
+            .get("unresolved_omitted")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+    let total = confirmed_total.saturating_add(uncertain_total);
+    // Navigation producers already select the uncertain page at this offset;
+    // only their retained confirmed prefix is skipped here.
     skip_result_items(&mut value, spec.offset);
 
     loop {
+        if value
+            .get("callers_incomplete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let retained = value
+                .get("unresolved_receivers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            value["unresolved_omitted"] = uncertain_total.saturating_sub(retained).into();
+            value["unresolved_truncated"] = (retained < uncertain_total).into();
+        }
         let shown = result_item_count(&value);
         let end = spec.offset.saturating_add(shown).min(total);
         let truncated = end < total;
