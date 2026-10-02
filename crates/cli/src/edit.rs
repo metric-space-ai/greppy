@@ -2091,6 +2091,34 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             }
             input_hunk_number += 1;
             let input_line = index + 1;
+            // Positions remain advisory; counts disambiguate actual file
+            // headers from removed/added content beginning with ---/+++.
+            let header_fields: Vec<&str> = lines[index].split_whitespace().collect();
+            let declared_counts = (|| {
+                let count = |field: &str, prefix| {
+                    let range = field.strip_prefix(prefix)?;
+                    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+                    start.parse::<usize>().ok()?;
+                    count.parse::<usize>().ok()
+                };
+                Some((
+                    count(header_fields.get(1)?, '-')?,
+                    count(header_fields.get(2)?, '+')?,
+                ))
+            })();
+            let counted_header = header_fields
+                .iter()
+                .skip(1)
+                .take(2)
+                .any(|field| field.starts_with('-') || field.starts_with('+'));
+            if counted_header && (declared_counts.is_none() || header_fields.get(3) != Some(&"@@"))
+            {
+                return Err(EditRefusal::new(
+                    "invalid_patch",
+                    format!("{path}: hunk {input_hunk_number} at patch input line {input_line} has invalid unified-diff ranges; use @@ -OLD,COUNT +NEW,COUNT @@ with non-negative integers — nothing written"),
+                    20,
+                ));
+            }
             let declared_old_line = lines[index]
                 .split_whitespace()
                 .find(|field| field.starts_with('-'))
@@ -2102,10 +2130,32 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             let mut new_lines = Vec::new();
             while index < lines.len()
                 && !lines[index].starts_with("@@")
-                && !lines[index].starts_with("--- ")
                 && !lines[index].starts_with("diff --git ")
             {
                 let line = lines[index];
+                let header_pair = line.starts_with("--- ")
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.starts_with("+++ "));
+                if header_pair {
+                    match declared_counts {
+                        Some((old, new)) if old_lines.len() == old && new_lines.len() == new => {
+                            break;
+                        }
+                        Some(_) => {} // Still inside the declared hunk: these are payload lines.
+                        None if old_lines.is_empty() && new_lines.is_empty() => {}
+                        None => {
+                            return Err(EditRefusal::new(
+                                "invalid_patch",
+                                format!(
+                                    "{path}: ---/+++ at patch input line {} is ambiguous in a count-free hunk; supply an explicit @@ -OLD,COUNT +NEW,COUNT @@ header to distinguish file headers from content — nothing written",
+                                    index + 1
+                                ),
+                                20,
+                            ));
+                        }
+                    }
+                }
                 match line.as_bytes().first() {
                     Some(b' ') => {
                         old_lines.push(line[1..].to_string());
@@ -2122,7 +2172,7 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                                 index + 1
                             ),
                             20,
-                        ))
+                        ));
                     }
                 }
                 index += 1;
@@ -2131,12 +2181,29 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 return Err(EditRefusal::new(
                     "invalid_patch",
                     if new_lines.is_empty() {
-                        format!("{path}: hunk {input_hunk_number} at patch input line {input_line} is empty; remove its @@ header or add hunk content with context — nothing written")
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} is empty; remove its @@ header or add hunk content with context — nothing written"
+                        )
                     } else {
-                        format!("{path}: hunk {input_hunk_number} at patch input line {input_line} contains only additions and has no existing line to anchor on; include an unchanged context line — nothing written")
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} contains only additions and has no existing line to anchor on; include an unchanged context line — nothing written"
+                        )
                     },
                     20,
                 ));
+            }
+            if let Some((old, new)) = declared_counts {
+                if old_lines.len() != old || new_lines.len() != new {
+                    return Err(EditRefusal::new(
+                        "invalid_patch",
+                        format!(
+                            "{path}: hunk {input_hunk_number} at patch input line {input_line} declares {old} old and {new} new lines, but contains {} old and {} new lines; regenerate the unified diff with correct counts — nothing written",
+                            old_lines.len(),
+                            new_lines.len()
+                        ),
+                        20,
+                    ));
+                }
             }
             hunks.push(TrainedPatchHunk {
                 input_hunk_number,
