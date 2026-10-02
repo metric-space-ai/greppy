@@ -272,6 +272,50 @@ fn recover_completed_index_snapshot(
     })
 }
 
+#[cfg(test)]
+mod rust_repair_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_requires_actual_rust_repair_certification() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        let candidate = scratch.path().join("candidate.db");
+        {
+            let mut store = greppy_store::Store::open(&candidate).unwrap();
+            greppy_indexer::index(&mut store, &root, "p").unwrap();
+        }
+        let options = greppy_indexer::IndexOptions::default();
+        validate_index_recovery_candidate(&candidate, &root, "p", &options).unwrap();
+        {
+            let store = greppy_store::Store::open_with(
+                &candidate,
+                greppy_store::OpenOptions::query_writer(),
+            )
+            .unwrap();
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+        }
+        let error =
+            validate_index_recovery_candidate(&candidate, &root, "p", &options).unwrap_err();
+        assert!(
+            error.to_string().contains("compatibility preparation"),
+            "{error}"
+        );
+        assert!(
+            candidate.exists(),
+            "rejected candidate is not silently deleted"
+        );
+    }
+}
+
 fn validate_index_recovery_candidate(
     candidate: &std::path::Path,
     target: &std::path::Path,
@@ -296,6 +340,12 @@ fn validate_index_recovery_candidate(
     let project_row = store
         .get_project(project)?
         .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
+    if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+        return Err(Error::Store(
+            "recovery candidate requires Rust graph compatibility preparation before publication"
+                .into(),
+        ));
+    }
     let expected_target = absolutize_path(target);
     if absolutize_path(std::path::Path::new(&project_row.root_path)) != expected_target {
         return Err(Error::Store(format!(
@@ -1443,6 +1493,25 @@ pub(crate) fn index_overlay_snapshot(
     }
     {
         let mut delta = greppy_store::Store::open(&temp_path)?;
+        if overlay.visibility.changed_count() == 0 && active_path.exists() {
+            // A clean overlay starts with an empty private graph, but its
+            // publication counter must continue from the active Delta. Without
+            // this metadata, each repair/revert republishes generation one and
+            // waiting queries cannot distinguish it from their old snapshot.
+            let prior_states =
+                greppy_store::Store::open_with(active_path, greppy_store::OpenOptions::read_only())
+                    .and_then(|active| active.list_private_workspace_states())
+                    .map_err(Error::from);
+            match prior_states {
+                Ok(states) => {
+                    for state in states {
+                        delta.upsert_workspace_state(&state)?;
+                    }
+                }
+                Err(error) if active_snapshot_is_recoverable(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         // A Delta generation contains only paths that still differ from the
         // pinned Base. Exact reverts and removed untracked files therefore
         // discard their former private contributions before the next overlay
@@ -1490,6 +1559,13 @@ pub(crate) fn index_overlay_snapshot(
     }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     crate::store_cow::mark_rust_caller_edges_repaired(&store)?;
+    if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+        if let Some(job) = progress.as_deref_mut() {
+            job.finalization_phase("repairing_graph");
+            maybe_index_test_failpoint("before-rust-repair", &temp_path)?;
+        }
+        crate::store_cow::complete_visible_overlay_rust_repair(&mut store, target, project)?;
+    }
     // The persisted Delta binding is authoritative when structural first use
     // deliberately skips Base preparation. In that path the command-scoped
     // environment has no pinned commit even though the existing overlay does.
@@ -1850,7 +1926,9 @@ pub(crate) fn index_embeddings_into_temp_store(
         let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
             store, target, project, &provider, options,
         )?;
-        job.embedding_started(&provider.backend_name(), total_documents);
+        let (backend, device) = provider.backend_plan();
+        job.device = device;
+        job.embedding_started(&backend, total_documents);
         let mut progress = |value| job.embedding_progress(value);
         greppy_indexer::index_code_embeddings_for_project_with_progress(
             store,
