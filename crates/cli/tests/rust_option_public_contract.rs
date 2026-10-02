@@ -1,0 +1,350 @@
+//! Public Rust Option-field caller contracts. Every query starts a fresh CLI
+//! process, exercising persisted graphs rather than private resolver helpers.
+use serde_json::Value;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const TARGET: &str = "src/scene.rs::IrradianceField::uniform";
+const SECOND: &str = "src/scene.rs::IrradianceField::storage";
+const SCENE: &str = r#"
+pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }
+pub struct IrradianceField;
+impl IrradianceField {
+    pub fn uniform(&self, matrix: [f32;16]) {}
+    pub fn storage(&self) {}
+}
+"#;
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+struct Fixture {
+    base: PathBuf,
+    repo: PathBuf,
+    store: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let base = std::env::temp_dir().join(format!(
+            "greppy-rust-public-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let fixture = Self {
+            store: base.join("store"),
+            base,
+            repo,
+        };
+        fixture.write("src/scene.rs", SCENE);
+        fixture
+    }
+    fn write(&self, path: &str, source: &str) {
+        std::fs::write(self.repo.join(path), source).unwrap();
+    }
+    fn run(&self, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_greppy"))
+            .args(args)
+            .current_dir(&self.repo)
+            .env("GREPPY_STORE_DIR", &self.store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "args={args:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    fn index(&self) {
+        self.run(&["index", "."]);
+    }
+    fn query(&self, args: &[&str]) -> Value {
+        serde_json::from_str(&self.run(args)).unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+fn caller(name: &str, prefix: &str) -> String {
+    format!("{prefix}\npub fn {name}() {{ let manifest: Manifest = opaque(); let matrix: Option<[f32;16]> = None; match (manifest.remaster_irradiance.as_ref(), matrix) {{ (Some(field), Some(matrix)) => {{ field.uniform(matrix); field.storage(); }}, _ => () }} }}\n")
+}
+fn unresolved(value: &Value) -> Vec<Value> {
+    value["unresolved_receivers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+fn hits(value: &Value) -> usize {
+    value["hits"]
+        .as_array()
+        .expect("public hits envelope")
+        .len()
+}
+fn assert_unproven(f: &Fixture, name: &str) {
+    let value = f.query(&["who-calls", TARGET, "--all", "--json"]);
+    assert_eq!(hits(&value), 0, "{value}");
+    let rows = unresolved(&value);
+    assert!(rows.iter().any(|row| row["caller"] == name), "{value}");
+    assert_eq!(value["callers_incomplete"], true, "{value}");
+    let text = f.run(&["who-calls", TARGET, "--all"]);
+    assert!(
+        text.contains("no resolved callers") && text.contains("unresolved receiver:"),
+        "{text}"
+    );
+    assert!(
+        !text.lines().any(|line| line.trim() == "no callers"),
+        "{text}"
+    );
+}
+
+#[test]
+fn named_imports_are_proven_and_opaque_gpu_shape_remains_unresolved_after_reopen() {
+    let f = Fixture::new();
+    f.write(
+        "src/lib.rs",
+        &caller(
+            "safe_named",
+            "mod scene; use crate::scene::Manifest; use std::collections::BTreeMap;",
+        ),
+    );
+    f.index();
+    for _ in 0..2 {
+        let value = f.query(&["who-calls", TARGET, "--all", "--json"]);
+        assert_eq!(hits(&value), 1, "{value}");
+        assert!(unresolved(&value).is_empty(), "{value}");
+        assert!(f
+            .run(&["who-calls", TARGET, "--all"])
+            .contains("safe_named"));
+    }
+    f.write("src/lib.rs", &caller("gpu_shape", "mod scene; use crate::scene::Manifest; use sha2::{Digest, Sha256}; use wasm_bindgen::{JsCast, prelude::*}; use wgpu::util::DeviceExt;"));
+    f.index();
+    assert_unproven(&f, "gpu_shape");
+    f.write("src/unrelated.rs", "pub fn unrelated() {}\n");
+    f.index();
+    assert_unproven(&f, "gpu_shape");
+}
+
+#[test]
+fn qualified_and_shadowed_macros_do_not_certify_receivers() {
+    for prefix in [
+        "mod scene; use crate::scene::Manifest; fn noise() { helper::assert!(true); }",
+        "mod scene; use crate::scene::Manifest; macro_rules! println { ($($x:tt)*) => {} }",
+        "mod scene; use crate::scene::Manifest; mod std {} use std::collections::BTreeMap;",
+    ] {
+        let f = Fixture::new();
+        // Place the qualified macro in the caller's scope, where it can alter lookup.
+        let source = if prefix.contains("helper::assert") {
+            caller("opaque_macro", prefix)
+                .replace("let manifest:", "helper::assert!(true); let manifest:")
+        } else {
+            caller("opaque_macro", prefix)
+        };
+        f.write("src/lib.rs", &source);
+        f.index();
+        assert_unproven(&f, "opaque_macro");
+    }
+}
+
+#[test]
+fn sparse_generic_and_consuming_trait_edits_remove_persisted_proof() {
+    let f = Fixture::new();
+    let source = caller("load_scene", "mod scene; use crate::scene::Manifest;");
+    f.write("src/lib.rs", &source);
+    f.index();
+    assert_eq!(hits(&f.query(&["who-calls", TARGET, "--json"])), 1);
+    f.write(
+        "src/scene.rs",
+        &SCENE
+            .replace("struct Manifest", "struct Manifest<T>")
+            .replace("Option<crate::scene::IrradianceField>", "Option<T>"),
+    );
+    f.index();
+    assert_eq!(hits(&f.query(&["who-calls", TARGET, "--json"])), 0);
+    f.write("src/scene.rs", SCENE);
+    f.index();
+    assert_eq!(hits(&f.query(&["who-calls", TARGET, "--json"])), 1);
+    f.write("src/lib.rs", &source.replace("mod scene;", "mod scene; trait Consume { fn as_ref(self) -> Option<crate::scene::IrradianceField>; }"));
+    f.index();
+    for _ in 0..2 {
+        assert_eq!(hits(&f.query(&["who-calls", TARGET, "--json"])), 0);
+    }
+}
+
+#[test]
+fn unresolved_single_and_multi_target_windows_and_late_path_filter() {
+    let f = Fixture::new();
+    f.write("src/lib.rs", "mod scene; mod early; mod later;\n");
+    let prefix = "use crate::scene::Manifest; use external::Unknown;";
+    let mut early = format!("{prefix}\n");
+    for index in 0..24 {
+        early.push_str(&caller(&format!("early_{index:02}"), ""));
+    }
+    f.write("src/early.rs", &early);
+    f.write("src/later.rs", &caller("late_match", prefix));
+    f.index();
+    let all = f.query(&["who-calls", TARGET, "--all", "--json"]);
+    let rows = unresolved(&all);
+    assert_eq!(
+        rows.len(),
+        25,
+        "plain --all must return every unresolved candidate: {all}"
+    );
+    for flag in ["--limit", "--max"] {
+        for all_flag in [false, true] {
+            for offset in [0usize, 2, 24] {
+                let offset_arg = offset.to_string();
+                let mut args = vec!["who-calls", TARGET, flag, "1", "--offset", &offset_arg];
+                if all_flag {
+                    args.push("--all");
+                }
+                let text = f.run(&args);
+                args.push("--json");
+                let page = f.query(&args);
+                assert_eq!(
+                    unresolved(&page),
+                    rows[offset..offset + 1],
+                    "{args:?}: {page}"
+                );
+                assert_eq!(
+                    text.lines()
+                        .filter(|line| line.starts_with("unresolved receiver:"))
+                        .count(),
+                    1,
+                    "{text}"
+                );
+                assert!(
+                    text.contains(rows[offset]["caller"].as_str().unwrap()),
+                    "{text}"
+                );
+                assert_eq!(page["callers_incomplete"], true);
+            }
+        }
+    }
+    let both = f.query(&["who-calls", TARGET, SECOND, "--all", "--json"]);
+    let both_rows = unresolved(&both);
+    assert_eq!(both_rows.len(), 50, "{both}");
+    for offset in [0usize, 1, 26] {
+        let offset_arg = offset.to_string();
+        let args = [
+            "who-calls",
+            TARGET,
+            SECOND,
+            "--all",
+            "--limit",
+            "1",
+            "--offset",
+            &offset_arg,
+        ];
+        let text = f.run(&args);
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let page = f.query(&json_args);
+        assert_eq!(unresolved(&page), both_rows[offset..offset + 1], "{page}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("unresolved receiver:"))
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+    let filtered = f.query(&[
+        "who-calls",
+        TARGET,
+        "--path",
+        "src/later.rs",
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(
+        unresolved(&filtered).len(),
+        1,
+        "late matching file must survive prefilter fetch: {filtered}"
+    );
+    assert_eq!(unresolved(&filtered)[0]["caller"], "late_match");
+    assert_eq!(
+        filtered["unresolved_omitted"], 0,
+        "excluded files are not omitted matching rows: {filtered}"
+    );
+    assert_eq!(filtered["unresolved_truncated"], false, "{filtered}");
+}
+
+#[test]
+fn mixed_confirmed_and_unresolved_rows_share_one_continuation_budget() {
+    let f = Fixture::new();
+    f.write("src/lib.rs", "mod scene; mod safe; mod uncertain;\n");
+    f.write(
+        "src/safe.rs",
+        &caller("confirmed", "use crate::scene::Manifest;"),
+    );
+    let mut opaque = String::from("use crate::scene::Manifest; use external::Unknown;\n");
+    opaque.push_str(&caller("uncertain_a", ""));
+    opaque.push_str(&caller("uncertain_b", ""));
+    f.write("src/uncertain.rs", &opaque);
+    f.index();
+    let full = f.query(&["who-calls", TARGET, "--all", "--json"]);
+    assert_eq!(hits(&full), 1, "{full}");
+    let uncertain = unresolved(&full);
+    assert_eq!(uncertain.len(), 2, "{full}");
+    for limit_flag in ["--limit", "--max"] {
+        for offset in 0..3usize {
+            let offset_arg = offset.to_string();
+            let args = [
+                "who-calls",
+                TARGET,
+                "--all",
+                limit_flag,
+                "1",
+                "--offset",
+                &offset_arg,
+            ];
+            let text = f.run(&args);
+            let mut json_args = args.to_vec();
+            json_args.push("--json");
+            let page = f.query(&json_args);
+            assert_eq!(hits(&page) + unresolved(&page).len(), 1, "{page}");
+            assert_eq!(page["callers_incomplete"], true, "{page}");
+            if offset == 0 {
+                assert_eq!(hits(&page), 1, "{page}");
+                assert!(unresolved(&page).is_empty(), "{page}");
+                assert_eq!(page["unresolved_omitted"], 2, "{page}");
+                assert_eq!(page["unresolved_truncated"], true, "{page}");
+                assert!(text.contains("confirmed"), "{text}");
+                assert!(!text.contains("unresolved receiver:"), "{text}");
+            } else {
+                assert_eq!(hits(&page), 0, "{page}");
+                assert_eq!(unresolved(&page), uncertain[offset - 1..offset], "{page}");
+                assert!(
+                    text.contains(uncertain[offset - 1]["caller"].as_str().unwrap()),
+                    "{text}"
+                );
+                assert_eq!(
+                    text.lines()
+                        .filter(|line| line.starts_with("unresolved receiver:"))
+                        .count(),
+                    1,
+                    "{text}"
+                );
+                assert!(!text.contains(" confirmed"), "{text}");
+            }
+        }
+    }
+    let empty = f.query(&[
+        "who-calls",
+        TARGET,
+        "--limit",
+        "1",
+        "--offset",
+        "99",
+        "--json",
+    ]);
+    assert_eq!(hits(&empty) + unresolved(&empty).len(), 0, "{empty}");
+    assert_eq!(empty["callers_incomplete"], true, "{empty}");
+}
