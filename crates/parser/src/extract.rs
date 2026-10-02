@@ -504,6 +504,16 @@ fn rust_slice_iterator_owner(
     Some("core::slice::Iter")
 }
 
+/// Value items are visible throughout a block, including before their
+/// declaration. They shadow pattern bindings even when ownership is unknown.
+fn rust_block_item_shadows_binding(source: &[u8], block: Node<'_>, name: &str) -> bool {
+    (0..block.named_child_count()).filter_map(|i| block.named_child(i)).any(|item| {
+        matches!(item.kind(), "const_item" | "static_item" | "function_item" | "struct_item" | "enum_item")
+            && item.child_by_field_name("name")
+                .is_some_and(|ident| node_text(source, ident) == name)
+    })
+}
+
 /// Resolve only a transparent prelude Option pattern over an explicitly typed
 /// identifier. The outer Option records shadowing even when ownership is unknown.
 /// Field access, adapters (including as_ref), return-type inference and custom
@@ -575,6 +585,7 @@ fn rust_option_pattern_owner<'a>(
     let mut ancestor = callee.parent();
     while let Some(node) = ancestor {
         if node.kind() == "block" {
+            if rust_block_item_shadows_binding(source, node, name) { return Some(None); }
             for i in (0..node.named_child_count()).rev() {
                 let binding = node.named_child(i)?;
                 if binding.kind() == "let_declaration" && binding.end_byte() <= callee.start_byte() {
@@ -646,6 +657,11 @@ fn rust_option_pattern_owner<'a>(
     None
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static OPTION_FIELD_ROOT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Preserve field provenance for a Some binding over an Option field's
 /// inherent as_ref adapter. No return type or field ownership is guessed here.
 fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
@@ -695,12 +711,10 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
     let receiver = field.child_by_field_name("value")?;
     if receiver.kind() != "identifier" { return None; }
     let name = node_text(source, receiver);
-    let mut root = callee;
-    while let Some(parent) = root.parent() { root = parent; }
-    if shadows(source, root) { return None; }
     let mut ancestor = callee.parent();
     while let Some(node) = ancestor {
         if node.kind() == "block" {
+            if rust_block_item_shadows_binding(source, node, name) { return None; }
             for i in (0..node.named_child_count()).rev() {
                 let binding = node.named_child(i)?;
                 if binding.kind() == "let_declaration" && binding.end_byte() <= callee.start_byte()
@@ -741,6 +755,16 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
                 while ty.kind() == "reference_type" { ty = ty.child_by_field_name("type")?; }
                 if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") { return None; }
                 let base_type = node_text(source, ty);
+                // A consuming trait adapter or opaque Some binding can change
+                // the payload. Retain Unknown unless lookup is transparent.
+                if !rust_slice_iter_lookup_is_transparent(callee) { return None; }
+                // Expensive whole-source checks belong only to an applicable
+                // typed Option pattern, never every unresolved receiver call.
+                let mut root = callee;
+                while let Some(parent) = root.parent() { root = parent; }
+                #[cfg(test)]
+                OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(count.get() + 1));
+                if shadows(source, root) { return None; }
                 // A generic type parameter is not a concrete owner.
                 fn is_parameter(source: &[u8], node: Node<'_>, name: &str) -> bool {
                     (node.kind() == "type_parameter"
@@ -16139,11 +16163,81 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_receiver_calls_do_not_scan_option_field_root() {
+        OPTION_FIELD_ROOT_CHECKS.with(|count| count.set(0));
+        let source = format!("fn f(value: Unknown) {{ {} }}", "value.uniform();".repeat(256));
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 0);
+        let source = "fn f(manifest: crate::scene::Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }";
+        extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert_eq!(OPTION_FIELD_ROOT_CHECKS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn consuming_trait_and_wildcard_some_do_not_establish_option_payload() {
+        let source = r#"
+struct Field;
+struct Other;
+enum Alternate<T> { Some(T), None }
+use Alternate::*;
+trait Consume { fn as_ref(self) -> Alternate<Other>; }
+impl Consume for Option<Field> {
+    fn as_ref(self) -> Alternate<Other> { Alternate::Some(Other) }
+}
+struct Manifest { remaster_irradiance: Option<Field> }
+fn f(manifest: Manifest) {
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        let edge = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+            && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+        assert!(edge.properties.get("receiver_owner").is_none());
+        assert!(edge.properties.get("receiver_provenance").is_none());
+    }
+
+    #[test]
+    fn rust_option_receiver_patterns_respect_block_value_items_and_opaque_lookup() {
+        for declaration in ["const field: Other = Other;", "static field: Other = Other;", "struct field;"] {
+            for before in [true, false] {
+                let body = if before { format!("{declaration} field.uniform();") } else { format!("field.uniform(); {declaration}") };
+                for source in [
+                    format!("fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                    format!("fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                ] {
+                    let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+                    let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+                    assert!(call.properties.get("receiver_owner").is_none(), "{source}");
+                    assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
+                }
+            }
+        }
+        for opaque in [
+            "use custom::*;",
+            "trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }",
+            "inject_some_and_adapter!();",
+            "#[unknown_attribute]",
+            "use custom::Some;",
+        ] {
+            let source = format!("{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}");
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+            assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
+        }
+    }
+
+    #[test]
     fn rust_option_field_patterns_preserve_only_explicit_provenance() {
         let cases = [
-            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
-            ("use crate::scene::Manifest; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
+            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", false),
+            ("use crate::scene::Manifest; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", false),
             ("fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { field.uniform(); } }", true),
+            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", true),
             ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", false),
             ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", false),
             ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", false),

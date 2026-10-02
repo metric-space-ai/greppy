@@ -9055,10 +9055,8 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
 
     const OPTION_FIELD_CALLER: &str = r#"
 mod scene;
-use crate::scene::Manifest;
-use wasm_bindgen::prelude::*;
 pub fn load_scene() {
-    let manifest: Manifest = opaque();
+    let manifest: crate::scene::Manifest = opaque();
     let gi_matrix: Option<[f32;16]> = None;
     match (manifest.remaster_irradiance.as_ref(), gi_matrix) {
         (Some(field), Some(matrix)) => { field.storage(); field.uniform(matrix); },
@@ -9106,12 +9104,18 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
     #[test]
     fn option_field_receiver_preserves_owner_ambiguity_and_shadowing() {
         for (label, caller, scene) in [
+            ("opaque-wildcard", OPTION_FIELD_CALLER.replace(
+                "mod scene;", "mod scene; use custom::*;"), OPTION_FIELD_SCENE.to_string()),
+            ("opaque-consuming-trait", OPTION_FIELD_CALLER.replace(
+                "mod scene;", "mod scene; trait Consume { fn as_ref(self) -> Option<crate::scene::Other>; } impl Consume for Option<crate::scene::IrradianceField> { fn as_ref(self) -> Option<crate::scene::Other> { None } }"), OPTION_FIELD_SCENE.to_string()),
+            ("late-value-item", OPTION_FIELD_CALLER.replace(
+                "{ field.storage(); field.uniform(matrix); }", "{ field.storage(); field.uniform(matrix); const field: crate::scene::Other = crate::scene::Other; }"), OPTION_FIELD_SCENE.to_string()),
             ("shadowed-base", OPTION_FIELD_CALLER.replace(
                 "let gi_matrix:", "let manifest = opaque(); let gi_matrix:"), OPTION_FIELD_SCENE.to_string()),
             ("generic-base", OPTION_FIELD_CALLER.replace(
-                "pub fn load_scene()", "pub fn load_scene<Manifest>()"), OPTION_FIELD_SCENE.to_string()),
+                "let manifest: crate::scene::Manifest", "let manifest: Manifest").replace("pub fn load_scene()", "pub fn load_scene<Manifest>()"), OPTION_FIELD_SCENE.to_string()),
             ("ambiguous-owner", OPTION_FIELD_CALLER.replace(
-                "use crate::scene::Manifest;", "use crate::scene::Manifest; use crate::other::Manifest; mod other;"), OPTION_FIELD_SCENE.to_string()),
+                "mod scene;", "mod scene; use crate::scene::Manifest; use crate::other::Manifest; mod other;").replace("let manifest: crate::scene::Manifest", "let manifest: Manifest"), OPTION_FIELD_SCENE.to_string()),
             ("ambiguous-payload", OPTION_FIELD_CALLER.to_string(), OPTION_FIELD_SCENE.replace(
                 "IrradianceField", "LocalField").replace(
                 "pub struct Manifest", "use crate::other::IrradianceField; use crate::foreign::IrradianceField; pub struct Manifest").replace(
