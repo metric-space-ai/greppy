@@ -2897,6 +2897,7 @@ mod tests {
         std::env::set_var("GREPPY_AUTO_REINDEX", "1");
         std::env::set_var("GREPPY_TEST_SKIP_INFERENCE", "1");
         let path = crate::workspace_locator::store_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut store = greppy_store::Store::open(&path).unwrap();
         greppy_indexer::index(&mut store, &root, "p").unwrap();
         store
