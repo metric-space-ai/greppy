@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use greppy_agent::{
-    run_agent_loop_with_history, AgentConfig, Client, ExecutionEnv, GreppyEnv, LoopError,
-    LoopEvent, LoopStop, Message, StreamEvent, ToolOutcome, SYSTEM_PROMPT,
+    run_agent_loop_with_history, AgentConfig, Client, ClientError, ExecutionEnv, GreppyEnv,
+    LoopError, LoopEvent, LoopStop, Message, ModelRequest, ModelStream, StreamEvent, ToolOutcome,
+    TurnResult, SYSTEM_PROMPT,
 };
 use serde_json::{json, Value};
 
@@ -133,6 +134,7 @@ where
 {
     let server = Server::new(output, config);
     let code = server.run(input);
+    server.shutdown();
     server.wait_idle();
     code
 }
@@ -325,6 +327,13 @@ impl Server {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 self.cancel_session(session_id);
             }
+        }
+    }
+
+    fn shutdown(&self) {
+        let ids: Vec<String> = lock_state(&self.state).sessions.keys().cloned().collect();
+        for id in ids {
+            self.cancel_session(&id);
         }
     }
 
@@ -880,6 +889,10 @@ fn run_prompt(
     if let Some(key) = &config.api_key {
         client = client.with_api_key(key);
     }
+    let mut client = CancelModel {
+        client,
+        cancel: Arc::clone(&prepared.cancel),
+    };
 
     let inner: Box<dyn ExecutionEnv + Send> = if let Some(factory) = &config.tool_env {
         factory(&prepared.cwd)
@@ -972,6 +985,22 @@ fn emit_loop_event(out: &Out, session_id: &str, event: &LoopEvent) -> io::Result
         "id": "",
         "headers": []
     }))
+}
+
+struct CancelModel {
+    client: Client,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ModelStream for CancelModel {
+    fn stream_turn(
+        &mut self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> Result<TurnResult, ClientError> {
+        self.client
+            .stream_turn_interruptible(request, on_event, &self.cancel)
+    }
 }
 
 fn persist_turn(prepared: &PreparedPrompt, config: &AcpConfig, done: &PromptDone) {

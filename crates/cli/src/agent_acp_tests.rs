@@ -265,7 +265,7 @@ fn cancel_removes_only_its_permission_wait_and_ignores_late_approval() {
     assert!(!lock_state(&server.state).sessions[&second]
         .cancel
         .load(Ordering::Relaxed));
-    server.cancel_session(&second);
+    server.shutdown();
     assert!(
         second_outcome
             .recv_timeout(Duration::from_secs(2))
