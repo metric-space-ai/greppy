@@ -10896,6 +10896,23 @@ fn compact_read_json(value: &mut serde_json::Value) {
             compact.insert(key.into(), field);
         }
     }
+    // A proven coverage limitation is part of the answer, not bulk diagnostics.
+    // Ordinary misses retain their existing compact payload.
+    if value
+        .get("unsupported_definition_coverage")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|coverage| !coverage.is_empty())
+    {
+        for key in [
+            "lookup_scope",
+            "unsupported_definition_coverage",
+            "source_recovery",
+        ] {
+            if let Some(field) = value.get(key).filter(|value| !value.is_null()).cloned() {
+                compact.insert(key.into(), field);
+            }
+        }
+    }
     *value = serde_json::Value::Object(compact);
 }
 

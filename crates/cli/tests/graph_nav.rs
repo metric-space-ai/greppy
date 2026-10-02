@@ -3051,6 +3051,19 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
             !out.contains("definition extraction is unsupported"),
             "{out}"
         );
+        let (code, out, err) = run(
+            &["read", "road_structure", "--path", path, "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 1, "ordinary JSON miss: {out} {err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "not-found");
+        assert!(
+            value.get("unsupported_definition_coverage").is_none(),
+            "{out}"
+        );
+        assert!(value.get("source_recovery").is_none(), "{out}");
     }
     let (code, out, err) = run(
         &[
