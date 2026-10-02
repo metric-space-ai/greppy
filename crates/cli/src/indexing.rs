@@ -290,12 +290,29 @@ mod rust_repair_recovery_tests {
         let options = greppy_indexer::IndexOptions::default();
         validate_index_recovery_candidate(&candidate, &root, "p", &options).unwrap();
         {
-            let store = greppy_store::Store::open_with(&candidate, greppy_store::OpenOptions::query_writer()).unwrap();
-            store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
+            let store = greppy_store::Store::open_with(
+                &candidate,
+                greppy_store::OpenOptions::query_writer(),
+            )
+            .unwrap();
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
         }
-        let error = validate_index_recovery_candidate(&candidate, &root, "p", &options).unwrap_err();
-        assert!(error.to_string().contains("compatibility preparation"), "{error}");
-        assert!(candidate.exists(), "rejected candidate is not silently deleted");
+        let error =
+            validate_index_recovery_candidate(&candidate, &root, "p", &options).unwrap_err();
+        assert!(
+            error.to_string().contains("compatibility preparation"),
+            "{error}"
+        );
+        assert!(
+            candidate.exists(),
+            "rejected candidate is not silently deleted"
+        );
     }
 }
 
@@ -325,7 +342,8 @@ fn validate_index_recovery_candidate(
         .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
     if !greppy_indexer::rust_caller_edges_repaired(&store)? {
         return Err(Error::Store(
-            "recovery candidate requires Rust graph compatibility preparation before publication".into(),
+            "recovery candidate requires Rust graph compatibility preparation before publication"
+                .into(),
         ));
     }
     let expected_target = absolutize_path(target);

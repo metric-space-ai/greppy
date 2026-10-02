@@ -926,11 +926,9 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
     }
     drop(delta);
     if !crate::index_admission::inline_refresh_is_admitted() {
-        let visible = greppy_store::Store::open_with(
-            delta_path,
-            greppy_store::OpenOptions::read_only(),
-        )?
-        .attach_overlay(base_path, visibility)?;
+        let visible =
+            greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+                .attach_overlay(base_path, visibility)?;
         if rust_repair_requires_source_refresh(&visible, root, project) {
             return Ok(());
         }
@@ -2868,11 +2866,18 @@ mod tests {
 
     #[test]
     fn rejected_admission_does_not_run_hidden_single_store_repair() {
-        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::capture(&[
-            "GREPPY_STORE_DIR", "GREPPY_PROJECT_IDENTITY", "GREPPY_HEAVY_GATE",
-            "GREPPY_AUTO_REINDEX", "GREPPY_TEST_SKIP_INFERENCE",
-            ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT,
+            "GREPPY_STORE_DIR",
+            "GREPPY_PROJECT_IDENTITY",
+            "GREPPY_HEAVY_GATE",
+            "GREPPY_AUTO_REINDEX",
+            "GREPPY_TEST_SKIP_INFERENCE",
+            ENV_MODE,
+            ENV_BASE_PATH,
+            ENV_BASE_COMMIT,
         ]);
         for name in [ENV_MODE, ENV_BASE_PATH, ENV_BASE_COMMIT] {
             std::env::remove_var(name);
@@ -2881,7 +2886,11 @@ mod tests {
         let repo = fixture();
         let root = repo.path().canonicalize().unwrap();
         let gate = scratch.path().join("reject-gate.py");
-        std::fs::write(&gate, "import sys\nprint('another owner holds the lease', file=sys.stderr)\nsys.exit(75)\n").unwrap();
+        std::fs::write(
+            &gate,
+            "import sys\nprint('another owner holds the lease', file=sys.stderr)\nsys.exit(75)\n",
+        )
+        .unwrap();
         std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
         std::env::set_var("GREPPY_PROJECT_IDENTITY", "p");
         std::env::set_var("GREPPY_HEAVY_GATE", &gate);
@@ -2890,17 +2899,41 @@ mod tests {
         let path = crate::workspace_locator::store_path(&root);
         let mut store = greppy_store::Store::open(&path).unwrap();
         greppy_indexer::index(&mut store, &root, "p").unwrap();
-        store.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
-        let generation = store.get_workspace_state(root.to_string_lossy().as_ref()).unwrap().unwrap().graph_generation;
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let generation = store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap()
+            .graph_generation;
         drop(store);
         let error = ensure_persisted_single_store_repaired(&path, &root, "p").unwrap_err();
-        assert!(error.to_string().contains("shared host admission"), "{error}");
-        let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).unwrap();
+        assert!(
+            error.to_string().contains("shared host admission"),
+            "{error}"
+        );
+        let store =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).unwrap();
         assert!(persisted_v7_delta_needs_repair(&store, &root).unwrap());
-        assert_eq!(store.get_workspace_state(root.to_string_lossy().as_ref()).unwrap().unwrap().graph_generation, generation);
+        assert_eq!(
+            store
+                .get_workspace_state(root.to_string_lossy().as_ref())
+                .unwrap()
+                .unwrap()
+                .graph_generation,
+            generation
+        );
         let job = crate::read_background_job(&crate::background_job_path(&root)).unwrap();
         assert_eq!(job["state"], "failed");
-        assert!(job["last_error"].as_str().unwrap().contains("another owner holds the lease"));
+        assert!(job["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("another owner holds the lease"));
         assert!(greppy_freshness::try_acquire(&path).is_ok());
     }
 
@@ -2908,7 +2941,11 @@ mod tests {
     fn visible_overlay_repair_certifies_actual_base_references_once() {
         let scratch = tempfile::tempdir().unwrap();
         let repo = fixture();
-        std::fs::write(repo.path().join("src/a.rs"), "pub fn target() {}\npub fn caller() { let _ = target; }\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "pub fn target() {}\npub fn caller() { let _ = target; }\n",
+        )
+        .unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-q", "-m", "reference base"]);
         let base_path = scratch.path().join("base.db");
@@ -2916,20 +2953,46 @@ mod tests {
         {
             let mut base = greppy_store::Store::open(&base_path).unwrap();
             greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
-            base.conn().execute("DELETE FROM schema_meta WHERE key=?1", [RUST_CALLER_EDGES_REPAIR_META_KEY]).unwrap();
-            base.conn().execute("DELETE FROM edges WHERE edge_type='USAGE'", []).unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
+                .unwrap();
         }
         let visibility = VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
-        let mut store = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        let target = store.get_node_by_qname("p", "src/a.rs::Function::target").unwrap().unwrap();
-        let caller = store.get_node_by_qname("p", "src/a.rs::Function::caller").unwrap().unwrap();
-        assert!(store.incoming_edges(target.id, Some("USAGE"), 10).unwrap().is_empty());
+        let mut store =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let target = store
+            .get_node_by_qname("p", "src/a.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("p", "src/a.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .is_empty());
         assert!(complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
-        assert!(store.incoming_edges(target.id, Some("USAGE"), 10).unwrap().iter().any(|edge| edge.source_id==caller.id));
+        assert!(store
+            .incoming_edges(target.id, Some("USAGE"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
         assert!(greppy_indexer::rust_caller_edges_repaired(&store).unwrap());
         assert!(!complete_visible_overlay_rust_repair(&mut store, repo.path(), "p").unwrap());
-        let base = greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::read_only()).unwrap();
-        assert!(!greppy_indexer::rust_caller_edges_repaired(&base).unwrap(), "immutable Base is not falsely certified");
+        let base =
+            greppy_store::Store::open_with(&base_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        assert!(
+            !greppy_indexer::rust_caller_edges_repaired(&base).unwrap(),
+            "immutable Base is not falsely certified"
+        );
     }
 
     #[test]
