@@ -4266,7 +4266,7 @@ mod tests {
                         file_path: "fixture.rs".into(),
                         start_line: 1,
                         end_line: 1,
-                        content_sha256: "retained-content".into(),
+                        content_sha256: greppy_store::file_state::sha256_hex(b"fn retained() {}"),
                         graph_generation: 1,
                         vector: vec![1.0, 0.0],
                     })
@@ -4364,7 +4364,10 @@ mod tests {
             assert_eq!(retained.id, retained_id);
             let retained_vector: (i64, String, i64, Vec<u8>) = migrated.conn().query_row("SELECT node_id,content_sha256,graph_generation,vector FROM vector_embeddings WHERE qualified_name='fixture.rs::Function::retained'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
             assert_eq!(retained_vector.0, retained_id);
-            assert_eq!(retained_vector.1, "retained-content");
+            assert_eq!(
+                retained_vector.1,
+                greppy_store::file_state::sha256_hex(b"fn retained() {}")
+            );
             assert_eq!(retained_vector.2, 1);
             let previous = greppy_store::Store::open_with(
                 &previous_layout.graph,

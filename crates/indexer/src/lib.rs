@@ -6823,7 +6823,7 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 file_path: retained.file_path,
                 start_line: retained.start_line,
                 end_line: retained.end_line,
-                content_sha256: "same-source".into(),
+                content_sha256: file_state::sha256_hex(b"def retained(): pass\n"),
                 graph_generation: report.graph_generation,
                 vector: vec![1.0, 0.0],
             })
@@ -6895,7 +6895,13 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 -retained_id
             );
             let vector: (String, i64) = overlay.conn().query_row("SELECT content_sha256,node_id FROM vector_embeddings WHERE file_path='retained.py'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert_eq!(vector, ("same-source".into(), -retained_id));
+            assert_eq!(
+                vector,
+                (
+                    file_state::sha256_hex(b"def retained(): pass\n"),
+                    -retained_id
+                )
+            );
             assert!(overlay.list_private_file_states("test").unwrap().is_empty());
             assert!(
                 !recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap()
