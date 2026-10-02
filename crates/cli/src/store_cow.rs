@@ -812,10 +812,13 @@ pub(crate) fn complete_visible_overlay_rust_repair(
     root: &Path,
     project: &str,
 ) -> Result<bool> {
-    if greppy_indexer::rust_caller_edges_repaired(overlay)?
-        || rust_repair_requires_source_refresh(overlay, root, project)
-    {
+    if rust_repair_requires_source_refresh(overlay, root, project) {
         return Ok(false);
+    }
+    let effect_repaired =
+        greppy_indexer::recover_visible_effect_fn_bindings(overlay, project, root)?;
+    if greppy_indexer::rust_caller_edges_repaired(overlay)? {
+        return Ok(effect_repaired);
     }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
@@ -2961,6 +2964,95 @@ mod tests {
             .unwrap()
             .contains("another owner holds the lease"));
         assert!(greppy_freshness::try_acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn effect_fn_normal_overlay_upgrade_defers_changed_source_then_repairs_once() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let routing = repo.path().join("src/routing.ts");
+        let changed = repo.path().join("src/changed.ts");
+        std::fs::write(&routing, "import { Effect } from 'effect';\nconst target = Effect.fn('target')(function* () { return 1; });\nexport const caller = Effect.fn('caller')(function* () { return yield* target(); });\n").unwrap();
+        std::fs::write(&changed, "export function changed() { return 1; }\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Effect.fn base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            for name in ["target", "caller"] {
+                let node = base
+                    .get_node_by_qname("p", &format!("src/routing.ts::Function::{name}"))
+                    .unwrap()
+                    .unwrap();
+                base.update_node_identity(
+                    node.id,
+                    "Variable",
+                    &format!("src/routing.ts::Variable::{name}"),
+                )
+                .unwrap();
+            }
+            base.conn().execute("UPDATE raw_edges SET source_qname=replace(source_qname,'::Function::','::Variable::') WHERE file_path='src/routing.ts'", []).unwrap();
+            for mut state in base.list_workspace_states().unwrap() {
+                state.indexer_version = "greppy-indexer-v7".into();
+                base.upsert_workspace_state(&state).unwrap();
+            }
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(&changed, "export function changed() { return 2; }\n").unwrap();
+        {
+            let mut overlay = greppy_store::Store::open_overlay(
+                &base_path,
+                &delta_path,
+                &VisibilityIndex::default(),
+            )
+            .unwrap();
+            assert!(
+                !complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap(),
+                "source refresh must precede repair instead of returning a fingerprint error"
+            );
+        }
+        let visibility =
+            VisibilityIndex::new(["src/changed.ts".to_string()], Vec::<String>::new()).unwrap();
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(["src/changed.ts".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let refreshed =
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        assert_eq!(
+            refreshed.files_indexed, 1,
+            "only dirty source needs normal extraction"
+        );
+        let target = overlay
+            .get_node_by_qname("p", "src/routing.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = overlay
+            .get_node_by_qname("p", "src/routing.ts::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert!(overlay
+            .get_node_by_qname("p", "src/routing.ts::Variable::target")
+            .unwrap()
+            .is_none());
+        complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap();
+        assert!(!complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap());
+        assert_eq!(
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options)
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
     }
 
     #[test]

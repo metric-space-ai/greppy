@@ -2265,7 +2265,8 @@ fn extract_js_ts(
     let mut result = crate::spec::spec_extract(language, spec, queries, source, file_path)?;
     let tree = crate::parse(language, source)?;
     let root = tree.root_node();
-    extract_js_ts_variables(root, source, file_path, &mut result);
+    let effect_import = js_ts_has_effect_import(root, source);
+    extract_js_ts_variables(root, source, file_path, effect_import, &mut result);
 
     // CALLS — the shared spec engine hangs a call's source endpoint off the
     // nearest ancestor whose *kind* matches a callable `DefRule`. For JS/TS
@@ -2279,7 +2280,7 @@ fn extract_js_ts(
     // `method_definition` / `arrow_function` / `function_expression`, named the
     // way the def pass named it, with a `__file__` fallback at module scope.
     result.edges.retain(|e| e.edge_type != "CALLS");
-    extract_js_ts_calls(root, source, file_path, &mut result);
+    extract_js_ts_calls(root, source, file_path, effect_import, &mut result);
 
     // USAGE — a per-language reference pass: every bare
     // `identifier` / `type_identifier` that is NOT the callee/argument of a
@@ -2289,7 +2290,7 @@ fn extract_js_ts(
     // shared indexer resolves `ref_name` to any registered symbol and drops it
     // unless unique, so unresolved references never become edges (no
     // over-emission).
-    extract_js_ts_usages(root, source, file_path, &mut result);
+    extract_js_ts_usages(root, source, file_path, effect_import, &mut result);
     Ok(result)
 }
 
@@ -2423,7 +2424,12 @@ const JS_TS_KEYWORDS: &[&str] = &[
 ///   * if no named enclosing function exists but the call is nested in a
 ///     module-level variable initializer, use that Variable's qname;
 ///   * otherwise fall back to `{file}::__file__` for a true module-scope call.
-fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> String {
+fn js_ts_enclosing_qname(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    effect_import: bool,
+) -> String {
     let file_qname = format!("{file_path}::__file__");
     let mut module_variable = None;
     let mut p = node.parent();
@@ -2451,13 +2457,18 @@ fn js_ts_enclosing_qname(node: Node<'_>, source: &[u8], file_path: &str) -> Stri
             // to `__file__` below.
         }
         if module_variable.is_none() && cur.kind() == "variable_declarator" {
-            module_variable = js_ts_module_variable_name(cur, source);
+            module_variable = js_ts_module_variable_name(cur, source).map(|name| {
+                let label = if js_ts_effect_fn_binding(cur, source, effect_import) {
+                    "Function"
+                } else {
+                    "Variable"
+                };
+                format!("{file_path}::{label}::{name}")
+            });
         }
         p = cur.parent();
     }
-    module_variable
-        .map(|name| format!("{file_path}::Variable::{name}"))
-        .unwrap_or(file_qname)
+    module_variable.unwrap_or(file_qname)
 }
 
 /// Return the binding name when `declarator` is one of the module Variables
@@ -2550,6 +2561,7 @@ fn extract_js_ts_calls(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
@@ -2557,7 +2569,7 @@ fn extract_js_ts_calls(
         if JS_TS_CALL_KINDS.contains(&node.kind()) {
             if let Some(callee) = js_ts_callee_name(node, source) {
                 if !callee.is_empty() && callee != "require" {
-                    let src = js_ts_enclosing_qname(node, source, file_path);
+                    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: src,
@@ -2612,11 +2624,12 @@ fn extract_js_ts_usages(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        try_emit_js_ts_usage(node, source, file_path, result);
+        try_emit_js_ts_usage(node, source, file_path, effect_import, result);
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
@@ -2628,6 +2641,7 @@ fn try_emit_js_ts_usage(
     node: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     // JS/TS references are `identifier` / `type_identifier`.
@@ -2648,7 +2662,7 @@ fn try_emit_js_ts_usage(
     if name.is_empty() || JS_TS_KEYWORDS.contains(&name) {
         return;
     }
-    let src = js_ts_enclosing_qname(node, source, file_path);
+    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
     result.edges.push(ExtractedEdge {
         edge_type: "USAGE".into(),
         source_qualified_name: src,
@@ -2760,6 +2774,7 @@ fn extract_js_ts_variables(
     root: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     // Module-level `const`/`let`/`var`. Only top-level children of the program
@@ -2769,7 +2784,7 @@ fn extract_js_ts_variables(
     for child in root.children(&mut cursor) {
         match child.kind() {
             "lexical_declaration" | "variable_declaration" => {
-                emit_js_ts_declarators(child, source, file_path, result);
+                emit_js_ts_declarators(child, source, file_path, effect_import, result);
             }
             // Unwrap an `export`/`statement`/`expression_statement` wrapper and
             // look one level in for a variable declaration or enum
@@ -2779,7 +2794,7 @@ fn extract_js_ts_variables(
                 for grand in child.named_children(&mut inner) {
                     match grand.kind() {
                         "lexical_declaration" | "variable_declaration" => {
-                            emit_js_ts_declarators(grand, source, file_path, result);
+                            emit_js_ts_declarators(grand, source, file_path, effect_import, result);
                         }
                         "enum_declaration" => {
                             emit_js_ts_enum_members(grand, source, file_path, result);
@@ -2802,6 +2817,7 @@ fn emit_js_ts_declarators(
     decl: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut cursor = decl.walk();
@@ -2823,10 +2839,17 @@ fn emit_js_ts_declarators(
         };
         match name_node.kind() {
             "object_pattern" | "array_pattern" => {
-                emit_js_ts_destructured(name_node, vd, source, file_path, result);
+                emit_js_ts_destructured(name_node, vd, source, file_path, effect_import, result);
             }
             _ => {
-                push_js_ts_variable(node_text(source, name_node), vd, file_path, result);
+                push_js_ts_variable(
+                    node_text(source, name_node),
+                    vd,
+                    source,
+                    file_path,
+                    effect_import,
+                    result,
+                );
             }
         }
     }
@@ -2838,6 +2861,7 @@ fn emit_js_ts_destructured(
     decl: Node<'_>,
     source: &[u8],
     file_path: &str,
+    effect_import: bool,
     result: &mut ExtractionResult,
 ) {
     let mut cursor = pattern.walk();
@@ -2854,12 +2878,12 @@ fn emit_js_ts_destructured(
         // A nested pattern (`{ a: { b } }`) recurses; a bare identifier emits.
         match ident.kind() {
             "object_pattern" | "array_pattern" => {
-                emit_js_ts_destructured(ident, decl, source, file_path, result);
+                emit_js_ts_destructured(ident, decl, source, file_path, effect_import, result);
             }
             _ => {
                 let text = node_text(source, ident);
                 if !text.is_empty() {
-                    push_js_ts_variable(text, decl, file_path, result);
+                    push_js_ts_variable(text, decl, source, file_path, effect_import, result);
                 }
             }
         }
@@ -2915,14 +2939,26 @@ fn emit_js_ts_enum_members(
 
 /// Push a single `Variable` node (`decl` supplies the line span, recording the
 /// declarator's position).
-fn push_js_ts_variable(name: &str, decl: Node<'_>, file_path: &str, result: &mut ExtractionResult) {
+fn push_js_ts_variable(
+    name: &str,
+    decl: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    effect_import: bool,
+    result: &mut ExtractionResult,
+) {
     if name.is_empty() {
         return;
     }
+    let label = if js_ts_effect_fn_binding(decl, source, effect_import) {
+        "Function"
+    } else {
+        "Variable"
+    };
     result.nodes.push(ExtractedNode {
-        label: "Variable".into(),
+        label: label.into(),
         name: name.to_string(),
-        qualified_name: format!("{file_path}::Variable::{name}"),
+        qualified_name: format!("{file_path}::{label}::{name}"),
         file_path: file_path.to_string(),
         start_line: decl.start_position().row as u32 + 1,
         end_line: decl.end_position().row as u32 + 1,
@@ -2930,7 +2966,136 @@ fn push_js_ts_variable(name: &str, decl: Node<'_>, file_path: &str, result: &mut
     });
 }
 
+/// Effect.fn(name)(callback) creates a callable binding; Effect.gen and
+/// arbitrary callback-consuming factories may produce ordinary values instead.
+fn js_ts_effect_fn_binding(decl: Node<'_>, source: &[u8], effect_import: bool) -> bool {
+    let Some(value) = decl.child_by_field_name("value") else {
+        return false;
+    };
+    if value.kind() != "call_expression" {
+        return false;
+    }
+    let Some(factory) = value.child_by_field_name("function") else {
+        return false;
+    };
+    if factory.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = factory.child_by_field_name("function") else {
+        return false;
+    };
+    if node_text(source, callee) != "Effect.fn" || !effect_import {
+        return false;
+    }
+    let Some(arguments) = value.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let callable = arguments.named_children(&mut cursor).any(|argument| {
+        matches!(
+            argument.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    });
+    callable
+}
+
+/// Require the named package import, and conservatively reject any local binding
+/// of Effect in this file. Unknown factories must remain ordinary Variables.
+fn js_ts_has_effect_import(node: Node<'_>, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut imported = false;
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "import_statement" {
+            let from_effect = !node_text(source, current)
+                .trim_start()
+                .starts_with("import type ")
+                && current.child_by_field_name("source").is_some_and(|path| {
+                    matches!(node_text(source, path), "\"effect\"" | "'effect'")
+                });
+            if from_effect {
+                let mut imports = vec![current];
+                while let Some(part) = imports.pop() {
+                    if part.kind() == "import_specifier" {
+                        let name = part
+                            .child_by_field_name("name")
+                            .map(|n| node_text(source, n));
+                        let alias = part
+                            .child_by_field_name("alias")
+                            .map(|n| node_text(source, n));
+                        let mut token_cursor = part.walk();
+                        let type_only = part
+                            .children(&mut token_cursor)
+                            .any(|token| token.kind() == "type");
+                        imported |= !type_only
+                            && name == Some("Effect")
+                            && alias.is_none_or(|name| name == "Effect");
+                    }
+                    let mut cursor = part.walk();
+                    imports.extend(part.named_children(&mut cursor));
+                }
+            }
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "variable_declarator" | "function_declaration" | "class_declaration"
+        ) && current
+            .child_by_field_name("name")
+            .is_some_and(|n| js_ts_binds_effect(n, source))
+        {
+            return false;
+        }
+        if matches!(
+            current.kind(),
+            "formal_parameters" | "required_parameter" | "optional_parameter"
+        ) {
+            let mut parameters = vec![current];
+            while let Some(parameter) = parameters.pop() {
+                if matches!(
+                    parameter.kind(),
+                    "identifier" | "shorthand_property_identifier_pattern"
+                ) && node_text(source, parameter) == "Effect"
+                {
+                    return false;
+                }
+                let mut cursor = parameter.walk();
+                parameters.extend(parameter.named_children(&mut cursor));
+            }
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.named_children(&mut cursor));
+    }
+    imported
+}
+
+/// Binding patterns only: a property key named Effect is not a shadow when
+/// destructuring binds another name (`{ Effect: different }`).
+fn js_ts_binds_effect(pattern: Node<'_>, source: &[u8]) -> bool {
+    if matches!(
+        pattern.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        return node_text(source, pattern) == "Effect";
+    }
+    if pattern.kind() == "pair_pattern" {
+        return pattern
+            .child_by_field_name("value")
+            .is_some_and(|value| js_ts_binds_effect(value, source));
+    }
+    let mut cursor = pattern.walk();
+    let binds = pattern
+        .named_children(&mut cursor)
+        .any(|child| js_ts_binds_effect(child, source));
+    binds
+}
+
 /// First direct child of `node` whose kind is `kind`, if any.
+
 fn find_child_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let found = node.children(&mut cursor).find(|c| c.kind() == kind);
@@ -18801,6 +18966,7 @@ export const make = Effect.gen(function* () {
     fn ts_effect_fn_generator_call_keeps_exported_binding_owner() {
         let r = ts(
             r#"
+import { Effect } from "effect";
 const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
     function* (input: { model: string }) { return input.model; },
 );
@@ -18815,7 +18981,7 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
 "#,
             "src/routing.ts",
         );
-        let owner = "src/routing.ts::Variable::resolveGatewayRoutedEnvironment";
+        let owner = "src/routing.ts::Function::resolveGatewayRoutedEnvironment";
         assert!(r.nodes.iter().any(|node| node.qualified_name == owner));
         let calls: Vec<_> = r
             .edges
@@ -18835,6 +19001,34 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "expected exactly one direct helper call: {calls:?}"
         );
         assert_eq!(calls[0].source_qualified_name, owner);
+    }
+
+    #[test]
+    fn ts_effect_fn_requires_package_import_without_shadowing() {
+        for prefix in [
+            "",
+            "const Effect = { fn: () => () => 42 };",
+            "import { type Effect } from 'effect';",
+            "import { Effect } from 'effect'; function shadow() { const { Effect } = local; }",
+            "import { Effect } from 'effect'; function shadow() { const { local: Effect } = local; }",
+
+            "import { Effect } from 'effect'; function unrelated(Effect: unknown) {}",
+            "import { Effect } from 'elsewhere';",
+        ] {
+            let source = format!("{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}");
+            let result = ts(&source, "shadow.ts");
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .any(|node| node.name == "value" && node.label == "Variable"),
+                "unproven or shadowed factory must remain a Variable: {prefix}"
+            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|node| node.name == "value" && node.label == "Function"));
+        }
     }
 
     #[test]

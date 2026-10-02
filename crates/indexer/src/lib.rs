@@ -452,6 +452,9 @@ pub fn index_with_options_and_progress(
             project_name,
             &entries,
             worker_count,
+            prior_indexer_version
+                .as_deref()
+                .is_some_and(|version| version.starts_with("greppy-indexer-v6")),
             &mut report,
             progress,
         )?;
@@ -633,6 +636,9 @@ pub fn index_with_options_and_progress(
     }
 
     report.graph_generation = generation;
+    if store.is_overlay() {
+        recover_visible_effect_fn_bindings(store, project_name, &abs_root)?;
+    }
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
@@ -684,8 +690,9 @@ fn indexer_version_for_options(options: &IndexOptions) -> String {
 fn is_rust_reexport_migration(prior: &str, current: &str) -> bool {
     let (prior_base, prior_scope) = prior.split_once(';').unwrap_or((prior, ""));
     let (current_base, current_scope) = current.split_once(';').unwrap_or((current, ""));
-    prior_base == "greppy-indexer-v6"
-        && current_base == "greppy-indexer-v7"
+    ((prior_base == "greppy-indexer-v6" && current_base == "greppy-indexer-v7")
+        || (matches!(prior_base, "greppy-indexer-v6" | "greppy-indexer-v7")
+            && current_base == "greppy-indexer-v8"))
         && prior_scope == current_scope
 }
 
@@ -1057,13 +1064,16 @@ fn run_incremental(
     Ok(changed_files)
 }
 
-/// Re-extract only raw edges for byte-identical Rust files during the v6→v7
-/// migration. Nodes, file state, content, and vectors deliberately stay put.
+/// Refresh byte-identical files affected by structural migrations: Rust raw
+/// edges for v6 upgrades, JS/TS raw edges and proven Effect.fn binding kinds
+/// for v8. Unaffected nodes, content and vectors stay put; changed definition
+/// identities lose their own vectors so embedding hashes remain authoritative.
 fn refresh_unchanged_rust_raw_edges(
     store: &mut Store,
     project_name: &str,
     entries: &[InventoryEntry],
     worker_count: usize,
+    refresh_rust: bool,
     report: &mut IndexReport,
     progress: &mut dyn FnMut(IndexBuildProgress),
 ) -> Result<std::collections::HashSet<String>> {
@@ -1091,9 +1101,11 @@ fn refresh_unchanged_rust_raw_edges(
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
+            let language = greppy_parser::language_for_path(&entry.abs_path);
             (!changed_paths.contains(entry.rel_path.as_str())
-                && greppy_parser::language_for_path(&entry.abs_path) == Language::Rust)
-                .then_some((idx, entry, Language::Rust))
+                && ((refresh_rust && language == Language::Rust)
+                    || matches!(language, Language::JavaScript | Language::TypeScript { .. })))
+            .then_some((idx, entry, language))
         })
         .collect::<Vec<_>>();
     let mut extraction_progress = |completed, total| {
@@ -1109,8 +1121,30 @@ fn refresh_unchanged_rust_raw_edges(
     for outcome in extractions {
         match outcome {
             FileOutcome::Extracted {
-                rel_path, edges, ..
+                rel_path,
+                nodes,
+                edges,
+                ..
             } => {
+                // v8 changes only proven Effect.fn Variables into Functions.
+                // Keep unaffected node IDs/content/vectors; retire embeddings
+                // for the changed identity rather than reuse an unverified hash.
+                for node in nodes.iter().filter(|node| node.label == "Function") {
+                    let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+                    if let Some(old) = store.get_node_by_qname(project_name, &old_qname)? {
+                        if old.label == "Variable"
+                            && old.name == node.name
+                            && old.start_line == i64::from(node.start_line)
+                            && old.end_line == i64::from(node.end_line)
+                        {
+                            store.update_node_identity(
+                                old.id,
+                                &node.label,
+                                &node.qualified_name,
+                            )?;
+                        }
+                    }
+                }
                 persist_raw_edges_for_file(store, project_name, &rel_path, &edges)?;
                 report.files_indexed += 1;
             }
@@ -2265,7 +2299,133 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
+/// Repair Effect.fn identities in a private overlay without mutating its Base
+/// or copying Base file-state/content/vector ownership into Delta.
+pub fn recover_visible_effect_fn_bindings(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    store
+        .conn()
+        .execute_batch("SAVEPOINT greppy_effect_fn_repair")
+        .map_err(sqlite_err)?;
+    let result = recover_visible_effect_fn_bindings_inner(store, project, root);
+    match result {
+        Ok(repaired) => {
+            store
+                .conn()
+                .execute_batch("RELEASE greppy_effect_fn_repair")
+                .map_err(sqlite_err)?;
+            Ok(repaired)
+        }
+        Err(error) => {
+            store
+                .conn()
+                .execute_batch(
+                    "ROLLBACK TO greppy_effect_fn_repair; RELEASE greppy_effect_fn_repair",
+                )
+                .map_err(sqlite_err)?;
+            Err(error)
+        }
+    }
+}
+
+fn recover_visible_effect_fn_bindings_inner(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    if !store.is_overlay() {
+        return Ok(false);
+    }
+    let marker = format!("greppy.effect_fn_repair_v8.{project}");
+    let completed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM main.schema_meta WHERE key=?1 AND value='complete'",
+            [&marker],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if completed != 0 {
+        return Ok(false);
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| {
+        greppy_core::Error::Invalid(format!("Effect.fn repair root unavailable: {e}"))
+    })?;
+    let mut prepared = Vec::new();
+    for state in store.list_file_states(project)? {
+        let language = greppy_parser::language_for_path(Path::new(&state.rel_path));
+        if !matches!(language, Language::JavaScript | Language::TypeScript { .. }) {
+            continue;
+        }
+        let relative = Path::new(&state.rel_path);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Effect.fn repair path".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unavailable: {e}"))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unreadable: {e}"))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Effect.fn source {} changed since indexing",
+                state.rel_path
+            )));
+        }
+        let extraction = parser_extract(language, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) =
+            validate_or_degrade(language, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn extraction validation failed".into(),
+            ));
+        }
+        prepared.push((state.rel_path, extraction));
+    }
+    // Validate every visible source fingerprint before changing any identity.
+    for (path, extraction) in &prepared {
+        for node in extraction
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Function")
+        {
+            let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+            if let Some(old) = store.get_node_by_qname(project, &old_qname)? {
+                if old.label == "Variable"
+                    && old.name == node.name
+                    && old.start_line == i64::from(node.start_line)
+                    && old.end_line == i64::from(node.end_line)
+                {
+                    store.update_node_identity(old.id, &node.label, &node.qualified_name)?;
+                }
+            }
+        }
+        persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
+    }
+    for (path, _) in &prepared {
+        store.conn().execute("INSERT OR IGNORE INTO main.js_ts_reference_override_files(project,file_path) VALUES(?1,?2)", rusqlite::params![project,path]).map_err(sqlite_err)?;
+    }
+    rebuild_visible_overlay_edges(store, project)?;
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [marker]).map_err(sqlite_err)?;
+    Ok(true)
+}
+
 /// One-shot single-store compatibility repair. Replace only Rust-owned
+
 /// non-structural relations from persisted raw edges; nodes, file identity,
 /// graph generation, content, embeddings and non-Rust edges remain untouched.
 /// Edge replacement and completion marker commit in the same transaction.
@@ -6499,6 +6659,7 @@ fn caller(value: Buffer) -> &'static [u8] {
         fs::write(
             repo.path().join("routing.ts"),
             r#"
+import { Effect } from "effect";
 const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
     function* (input: { model: string }) { return input.model; },
 );
@@ -6510,6 +6671,9 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
         return gatewayProvider;
     },
 );
+const plainValue = 42;
+const effectValue = Effect.gen(function* () { return 42; });
+export function invalidCalls() { plainValue(); effectValue(); }
 "#,
         )
         .unwrap();
@@ -6518,14 +6682,14 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
         let target = store
             .get_node_by_qname(
                 "test",
-                "routing.ts::Variable::resolveGatewayProviderForModel",
+                "routing.ts::Function::resolveGatewayProviderForModel",
             )
             .unwrap()
             .expect("private Effect.fn binding must exist");
         let caller = store
             .get_node_by_qname(
                 "test",
-                "routing.ts::Variable::resolveGatewayRoutedEnvironment",
+                "routing.ts::Function::resolveGatewayRoutedEnvironment",
             )
             .unwrap()
             .expect("exported Effect.fn binding must exist");
@@ -6536,6 +6700,220 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "expected one persisted direct caller: {incoming:?}"
         );
         assert_eq!(incoming[0].source_id, caller.id);
+        fs::write(repo.path().join("unrelated.py"), "def retained(): pass\n").unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let retained = store
+            .get_node_by_qname("test", "unrelated.py::Function::retained")
+            .unwrap()
+            .unwrap();
+        // Recreate the v7 binding identities while keeping identical file bytes.
+        store
+            .conn()
+            .execute("DELETE FROM main.edges WHERE source_id = ?1", [caller.id])
+            .unwrap();
+        for node in [&target, &caller] {
+            store
+                .update_node_identity(
+                    node.id,
+                    "Variable",
+                    &node.qualified_name.replace("::Function::", "::Variable::"),
+                )
+                .unwrap();
+        }
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version = "greppy-indexer-v7".into();
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let repaired = index(&mut store, repo.path(), "test").unwrap();
+        assert_eq!(
+            repaired.files_indexed, 1,
+            "only affected-language unchanged file is refreshed"
+        );
+        let restored = store
+            .get_node_by_qname("test", &target.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.id, target.id, "migration preserves node identity");
+        assert_eq!(
+            store
+                .get_node_by_qname("test", &retained.qualified_name)
+                .unwrap()
+                .unwrap()
+                .id,
+            retained.id,
+            "unaffected language nodes stay in place"
+        );
+        let incoming = store
+            .incoming_edges(restored.id, Some("CALLS"), 10)
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_id, caller.id);
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            0,
+            "migration must run once, without manual full reindex"
+        );
+
+        for name in ["plainValue", "effectValue"] {
+            let value = store
+                .get_node_by_qname("test", &format!("routing.ts::Variable::{name}"))
+                .unwrap()
+                .expect("ordinary value must remain a Variable");
+            assert!(
+                store
+                    .incoming_edges(value.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "noncallable values must not resolve as call targets"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_fn_overlay_upgrade_keeps_immutable_base_and_unaffected_vector() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("routing.ts"),
+            r#"
+import { Effect } from 'effect';
+const target = Effect.fn('target')(function* () { return 1; });
+export const caller = Effect.fn('caller')(function* () { return yield* target(); });
+"#,
+        )
+        .unwrap();
+        fs::write(repo.path().join("retained.py"), "def retained(): pass\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let base_path = stores.path().join("base.db");
+        let delta_path = stores.path().join("delta.db");
+        let retained_id;
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            let report = index(&mut base, repo.path(), "test").unwrap();
+            for name in ["target", "caller"] {
+                let node = base
+                    .get_node_by_qname("test", &format!("routing.ts::Function::{name}"))
+                    .unwrap()
+                    .unwrap();
+                base.update_node_identity(
+                    node.id,
+                    "Variable",
+                    &format!("routing.ts::Variable::{name}"),
+                )
+                .unwrap();
+            }
+            base.conn().execute("UPDATE main.raw_edges SET source_qname=replace(source_qname,'::Function::','::Variable::') WHERE file_path='routing.ts'", []).unwrap();
+            base.conn()
+                .execute("DELETE FROM main.edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            let retained = base
+                .get_node_by_qname("test", "retained.py::Function::retained")
+                .unwrap()
+                .unwrap();
+            retained_id = retained.id;
+            base.upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "test-model".into(),
+                prompt_version: "v1".into(),
+                task: "definition".into(),
+                node_id: Some(retained.id),
+                chunk_idx: 0,
+                qualified_name: retained.qualified_name,
+                file_path: retained.file_path,
+                start_line: retained.start_line,
+                end_line: retained.end_line,
+                content_sha256: "same-source".into(),
+                graph_generation: report.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        }
+        let base_hash = file_state::sha256_hex(&fs::read(&base_path).unwrap());
+        let visibility = greppy_store::VisibilityIndex::default();
+        {
+            let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let routing = repo.path().join("routing.ts");
+            let original = fs::read(&routing).unwrap();
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"\n// changed since indexing\n");
+            fs::write(&routing, changed).unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            let writes: i64 = overlay
+                .conn()
+                .query_row("SELECT COUNT(*) FROM main.nodes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                writes, 0,
+                "source mismatch must reject before identity writes"
+            );
+            fs::write(&routing, original).unwrap();
+            overlay.conn().execute_batch("CREATE TEMP TRIGGER fail_effect_repair BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'injected repair failure'); END;").unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            for table in [
+                "main.nodes",
+                "main.definition_identity_overrides",
+                "main.js_ts_reference_override_files",
+                "main.raw_edges",
+            ] {
+                let rows: i64 = overlay
+                    .conn()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0, "failed repair must roll back {table}");
+            }
+            let markers: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.schema_meta WHERE key LIKE 'greppy.effect_fn_repair%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(markers, 0);
+            overlay
+                .conn()
+                .execute_batch("DROP TRIGGER fail_effect_repair;")
+                .unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+            let target = overlay
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .unwrap();
+            let caller = overlay
+                .get_node_by_qname("test", "routing.ts::Function::caller")
+                .unwrap()
+                .unwrap();
+            assert!(overlay
+                .get_node_by_qname("test", "routing.ts::Variable::target")
+                .unwrap()
+                .is_none());
+            assert!(overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|e| e.source_id == caller.id));
+            assert_eq!(
+                overlay
+                    .get_node_by_qname("test", "retained.py::Function::retained")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                -retained_id
+            );
+            let vector: (String, i64) = overlay.conn().query_row("SELECT content_sha256,node_id FROM vector_embeddings WHERE file_path='retained.py'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(vector, ("same-source".into(), -retained_id));
+            assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+            assert!(
+                !recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap()
+            );
+        }
+        assert_eq!(
+            file_state::sha256_hex(&fs::read(&base_path).unwrap()),
+            base_hash
+        );
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Variable::target")
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Function::target")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
