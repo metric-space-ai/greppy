@@ -285,6 +285,8 @@ thread_local! {
     static CLI_JSON_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
+    static NAV_TEXT_WINDOW: std::cell::RefCell<Option<NavTextWindow>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
@@ -7479,18 +7481,21 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         rows.extend(collected);
     }
 
-    // `--offset` is applied by the shared output-budget layer, which skips the
-    // first N result rows of whatever a command emitted. Producers therefore
-    // emit `offset + limit` rows from the top of the stream — the same
-    // convention every other greppy command follows.
+    // JSON retains its prefix for the shared JSON skip. Text selects actual
+    // caller rows here; headings and unresolved diagnostics are not callers.
     let total = rows.len();
     let default_cap = if req.code { CODE_NAV_LIMIT } else { NAV_LIMIT };
     let offset = cli_result_offset();
     let limit = cli_result_limit_raw().unwrap_or(if req.all { usize::MAX } else { default_cap });
+    let combined_total = total + unresolved_by_target.iter().map(|p| p.total).sum::<usize>();
     let mut diagnostic_skip = offset.saturating_sub(total);
     let mut diagnostic_budget = limit.saturating_sub(total.saturating_sub(offset).min(limit));
+    let mut unresolved_base = total;
+    let mut unresolved_starts = Vec::with_capacity(unresolved_by_target.len());
     for page in &mut unresolved_by_target {
         let start = diagnostic_skip.min(page.total);
+        unresolved_starts.push(unresolved_base + start);
+        unresolved_base += page.total;
         diagnostic_skip = diagnostic_skip.saturating_sub(page.total);
         let count = diagnostic_budget.min(page.total - start);
         diagnostic_budget = diagnostic_budget.saturating_sub(count);
@@ -7498,8 +7503,9 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         page.omitted = page.total - count;
         page.truncated = page.omitted > 0;
     }
-    let end = cli_result_limit_unless_all(default_cap, req.all).min(total);
-    let window = &rows[..end];
+    let start = if req.json { 0 } else { offset.min(total) };
+    let end = offset.saturating_add(limit).min(total);
+    let window = &rows[start..end];
     let shown = window.len();
     let root_path = resolve_root(req.root)?;
 
@@ -7585,6 +7591,16 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         return Ok(0);
     }
 
+    if OUTPUT_CAPTURE.with(|capture| capture.borrow().is_some()) {
+        NAV_TEXT_WINDOW.with(|window| {
+            *window.borrow_mut() = Some(NavTextWindow {
+                offset,
+                total: combined_total,
+                rows: Vec::new(),
+            })
+        });
+    }
+
     // The multi answer is the single answer, grouped: one bare line naming
     // the queried symbol opens each group (it answers "which question", it is
     // not decoration), then the same rows the single-symbol path prints. An
@@ -7613,7 +7629,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                 }
             } else {
                 println!("no resolved callers");
-                print_unresolved_receivers(unresolved_page);
+                print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
             }
             continue;
         }
@@ -7622,11 +7638,16 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         if !window.iter().any(|row| row.target == index) {
             println!("… {} below the cut", totals[index]);
             if unresolved_incomplete {
-                print_unresolved_receivers(unresolved_page);
+                print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
             }
             continue;
         }
-        for row in window.iter().filter(|row| row.target == index) {
+        for (position, row) in window
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.target == index)
+        {
+            let row_start = output_capture_position();
             // Same truth as the single-symbol rows: the shared source-aware
             // test detection, not the cheaper node-only heuristic.
             let lines = sources
@@ -7650,12 +7671,17 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
                     println!("handle: {handle}");
                 }
             }
+            record_nav_text_row(start + position, row_start);
         }
         if unresolved_incomplete {
-            print_unresolved_receivers(unresolved_page);
+            print_multi_unresolved_receivers(unresolved_page, unresolved_starts[index]);
         }
     }
-    if !req.all && cli_result_offset() == 0 && end < total {
+    if !req.all
+        && cli_result_offset() == 0
+        && end < total
+        && NAV_TEXT_WINDOW.with(|window| window.borrow().is_none())
+    {
         println!(
             "… {} more — {}",
             total - end,
@@ -10716,7 +10742,40 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
     })
 }
 
+#[derive(Clone)]
+struct NavTextWindow {
+    offset: usize,
+    total: usize,
+    // Absolute canonical caller index and its whole rendered block.
+    rows: Vec<(usize, usize, usize)>,
+}
+
+fn output_capture_position() -> usize {
+    OUTPUT_CAPTURE.with(|capture| capture.borrow().as_ref().map_or(0, Vec::len))
+}
+
+fn record_nav_text_row(index: usize, start: usize) {
+    let end = output_capture_position();
+    NAV_TEXT_WINDOW.with(|window| {
+        if let Some(window) = window.borrow_mut().as_mut() {
+            window.rows.push((index, start, end));
+        }
+    });
+}
+
+fn print_multi_unresolved_receivers(page: &UnresolvedReceiverPage, start: usize) {
+    for (offset, item) in page.rows.iter().enumerate() {
+        let row_start = output_capture_position();
+        println!("{}", unresolved_receiver_line(item));
+        record_nav_text_row(start + offset, row_start);
+    }
+    if page.truncated {
+        println!("… {} unresolved receivers omitted", page.omitted.max(1));
+    }
+}
+
 fn begin_output_capture() {
+    NAV_TEXT_WINDOW.with(|window| *window.borrow_mut() = None);
     OUTPUT_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
 }
 
@@ -11263,7 +11322,52 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("no resolved callers")
 }
 
+fn budget_nav_text_output(
+    bytes: &[u8],
+    spec: &OutputBudgetSpec,
+    mut window: NavTextWindow,
+) -> Vec<u8> {
+    window.rows.sort_by_key(|row| row.0);
+    let mut keep = window.rows.len();
+    loop {
+        let mut removed = window.rows[keep..].to_vec();
+        removed.sort_by_key(|row| row.1);
+        let mut rendered = Vec::new();
+        let mut cursor = 0;
+        for (_, start, end) in removed {
+            rendered.extend_from_slice(&bytes[cursor..start]);
+            cursor = end;
+        }
+        rendered.extend_from_slice(&bytes[cursor..]);
+        let next = window.offset.min(window.total).saturating_add(keep);
+        let truncated = next < window.total;
+        if truncated || window.offset > 0 {
+            rendered.extend_from_slice(
+                format!(
+                    "\nshown: {keep}\ntotal: {}\noffset: {}\ntruncated: {truncated}\n",
+                    window.total, window.offset
+                )
+                .as_bytes(),
+            );
+            if truncated {
+                rendered.extend_from_slice(
+                    format!("try: {}\n", retry_with_offset(spec.command, next)).as_bytes(),
+                );
+            }
+        }
+        // Keep one complete caller block even when the byte budget is too
+        // small, so continuation advances instead of retrying the same row.
+        if spec.max_bytes.is_none_or(|max| rendered.len() <= max) || keep <= 1 {
+            return rendered;
+        }
+        keep -= 1;
+    }
+}
+
 fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
+    if let Some(window) = NAV_TEXT_WINDOW.with(|window| window.borrow_mut().take()) {
+        return budget_nav_text_output(bytes, spec, window);
+    }
     let text = String::from_utf8_lossy(bytes);
     let mut priority = Vec::new();
     let mut content = Vec::new();

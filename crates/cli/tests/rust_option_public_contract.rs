@@ -466,4 +466,35 @@ fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
             }
         }
     }
+    for offset in 0..=canonical.len() {
+        let offset_arg = offset.to_string();
+        let text = f.run(&[
+            "who-calls",
+            TARGET,
+            SECOND,
+            "--all",
+            "--limit",
+            "3",
+            "--offset",
+            &offset_arg,
+            "--max-bytes",
+            "1",
+        ]);
+        let expected = canonical
+            .iter()
+            .skip(offset)
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text_rows(&text),
+            expected,
+            "byte budget offset={offset}\n{text}"
+        );
+        if offset < canonical.len() - 1 {
+            assert!(text.contains(&format!("--offset {}", offset + 1)), "{text}");
+        } else {
+            assert!(!text.contains("try:"), "{text}");
+        }
+    }
 }
