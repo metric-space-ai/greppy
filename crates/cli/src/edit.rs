@@ -3496,6 +3496,88 @@ fn rust_selected_local_free_function_owns_site(
     true
 }
 
+/// A full Rust replacement that supplies outer attributes owns those attributes
+/// too. Without supplied attributes, preserve the existing prefix as before;
+/// body-only edits never call this helper.
+fn edit_rust_attribute_replacement_range(
+    content: &[u8],
+    range: (usize, usize),
+    replacement: &[u8],
+) -> (usize, usize) {
+    let Ok(requested) = greppy_parser::parse(greppy_edit::Language::Rust, replacement) else {
+        return range;
+    };
+    let mut cursor = requested.root_node().walk();
+    let supplies_attributes = requested
+        .root_node()
+        .named_children(&mut cursor)
+        .find_map(|node| match node.kind() {
+            "attribute_item" => Some(true),
+            "line_comment" | "block_comment" => None,
+            _ => Some(false),
+        })
+        .unwrap_or(false);
+    if !supplies_attributes {
+        return range;
+    }
+    let Ok(tree) = greppy_parser::parse(greppy_edit::Language::Rust, content) else {
+        return range;
+    };
+    let Some(offset) = content
+        .get(range.0..range.1)
+        .and_then(|bytes| bytes.iter().position(|byte| !byte.is_ascii_whitespace()))
+    else {
+        return range;
+    };
+    let Some(mut node) = tree
+        .root_node()
+        .descendant_for_byte_range(range.0 + offset, range.1.saturating_sub(1))
+    else {
+        return range;
+    };
+    while !matches!(
+        node.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "impl_item"
+            | "mod_item"
+            | "const_item"
+            | "static_item"
+    ) {
+        let Some(parent) = node.parent() else {
+            return range;
+        };
+        node = parent;
+    }
+    if node.end_byte() > range.1 {
+        return range;
+    }
+    let mut start = node.start_byte();
+    let mut previous = node.prev_named_sibling();
+    while let Some(prefix) = previous {
+        match prefix.kind() {
+            "attribute_item" => start = prefix.start_byte(),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = prefix.prev_named_sibling();
+    }
+    let line_start = content[..start]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |offset| offset + 1);
+    if content[line_start..start]
+        .iter()
+        .all(|byte| byte.is_ascii_whitespace())
+    {
+        start = line_start;
+    }
+    (start.min(range.0), range.1)
+}
+
 pub(crate) fn dispatch_edit_grammar(
     command: EditCommand,
     json: bool,
@@ -3524,7 +3606,19 @@ pub(crate) fn dispatch_edit_grammar(
                     target: None,
                     path: None,
                 };
-                let located = edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
+                let mut located =
+                    edit_locate(&spec, SelectorKind::Symbol, root, root_path, file_base)?;
+                if !body
+                    && greppy_edit::language_for_path(std::path::Path::new(&located.rel))
+                        == greppy_edit::Language::Rust
+                {
+                    edit_check_cardinality(&located, Some(1))?;
+                    located.ranges[0] = edit_rust_attribute_replacement_range(
+                        &located.content,
+                        located.ranges[0],
+                        &new_bytes,
+                    );
+                }
                 if body {
                     edit_check_cardinality(&located, Some(1))?;
                     let (start, end) = located.ranges[0];
