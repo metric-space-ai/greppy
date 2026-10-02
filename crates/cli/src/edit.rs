@@ -986,9 +986,7 @@ fn edit_check_regex_replacement(regex: &regex::bytes::Regex, replacement: &[u8])
         if !known {
             return Err(EditRefusal::new(
                 "unknown_replacement_capture",
-                format!(
-                    "--regex expands captures in NEW, but capture '{name}' does not exist in OLD; nothing written. Use $$ for a literal dollar sign, or omit --regex for a literal OLD pattern."
-                ),
+                format!("--regex expands captures in NEW, but capture '{name}' does not exist in OLD; nothing written. Use $$ for a literal dollar sign, or omit --regex for a literal OLD pattern."),
                 17,
             ));
         }
@@ -1263,7 +1261,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
         Err(error) => {
             return vec![format!(
                 "verify: unavailable — cannot capture stdout: {error}"
-            )];
+            )]
         }
     };
     let stderr = match std::fs::File::create(&stderr_path) {
@@ -1620,14 +1618,14 @@ pub(crate) fn run_edit_undo(
                     "nothing_to_undo",
                     format!("no edit transaction begins with {requested}"),
                     10,
-                ));
+                ))
             }
             _ => {
                 return Err(EditRefusal::new(
                     "ambiguous_transaction",
                     format!("{requested} names more than one edit transaction"),
                     11,
-                ));
+                ))
             }
         }
     } else {
@@ -1704,10 +1702,7 @@ pub(crate) fn edit_resolve_new_path(
                 if !normalized.pop() {
                     return Err(EditRefusal::new(
                         "path_outside_repo",
-                        format!(
-                            "{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR",
-                            workspace.display()
-                        ),
+                        format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
                         17,
                     ));
                 }
@@ -1718,10 +1713,7 @@ pub(crate) fn edit_resolve_new_path(
     let Ok(relative) = normalized.strip_prefix(&workspace) else {
         return Err(EditRefusal::new(
             "path_outside_repo",
-            format!(
-                "{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR",
-                workspace.display()
-            ),
+            format!("{file} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", workspace.display()),
             17,
         ));
     };
@@ -1933,10 +1925,7 @@ pub(crate) fn run_trained_write(
         if !canonical.starts_with(&root) {
             return Err(EditRefusal::new(
                 "path_outside_repo",
-                format!(
-                    "{path} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR",
-                    root.display()
-                ),
+                format!("{path} is outside {}; nothing written. To edit another workspace, pass --root DIR and a path relative to DIR", root.display()),
                 17,
             ));
         }
@@ -2277,7 +2266,7 @@ fn apply_trained_patch_file(
                         hunk.declared_old_line
                     ),
                     13,
-                ));
+                ))
             }
             many => {
                 let declared = hunk.declared_old_line.saturating_sub(1);
@@ -2478,11 +2467,7 @@ fn run_trained_patch_with_publish_hook(
             let recovery = if conflicts.is_empty() {
                 "earlier files written by this patch were rolled back; the failed target was left unchanged. Re-read the affected files before retrying".to_string()
             } else {
-                format!(
-                    "rollback refused to overwrite changed files: {}. Some patch writes may remain; inspect the affected files and rollback-conflict evidence in {} before retrying",
-                    conflicts.join("; "),
-                    journal.display()
-                )
+                format!("rollback refused to overwrite changed files: {}. Some patch writes may remain; inspect the affected files and rollback-conflict evidence in {} before retrying", conflicts.join("; "), journal.display())
             };
             return Err(EditRefusal::new(
                 "publish_failed",
@@ -2683,9 +2668,7 @@ fn rust_rename_reference_inventory(
             .ok_or_else(|| {
                 EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"
-                    ),
+                    format!("cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"),
                     12,
                 )
             })?;
@@ -2697,10 +2680,7 @@ fn rust_rename_reference_inventory(
                 RenameEdgeIdentity::Unknown => {
                     return Err(EditRefusal::new(
                         "unresolved_reference_identity",
-                        format!(
-                            "live Rust reference in {rel}:{} lacks identity proving whether it targets `{symbol}` — nothing written",
-                            edge.line
-                        ),
+                        format!("live Rust reference in {rel}:{} lacks identity proving whether it targets `{symbol}` — nothing written", edge.line),
                         12,
                     ));
                 }
@@ -2710,10 +2690,7 @@ fn rust_rename_reference_inventory(
             if sites.iter().any(|site| !planned.contains(site)) {
                 return Err(EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "live Rust reference in {rel}:{} targets `{symbol}` but is absent from the graph rename plan — refresh the index; nothing written",
-                        edge.line
-                    ),
+                    format!("live Rust reference in {rel}:{} targets `{symbol}` but is absent from the graph rename plan — refresh the index; nothing written", edge.line),
                     12,
                 ));
             }
@@ -2750,9 +2727,7 @@ fn rust_free_function_reference_inventory(
             .map_err(|error| {
                 EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"
-                    ),
+                    format!("cannot read {rel} while inventorying `{symbol}`: {error} — nothing written"),
                     12,
                 )
             })?;
@@ -2807,9 +2782,7 @@ fn rust_free_function_reference_inventory(
             .ok_or_else(|| {
                 EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"
-                    ),
+                    format!("cannot parse live Rust reference in {rel} for `{symbol}` — nothing written"),
                     12,
                 )
             })?;
@@ -2841,10 +2814,7 @@ fn rust_free_function_reference_inventory(
             }
             return Err(EditRefusal::new(
                 "unresolved_reference_identity",
-                format!(
-                    "live Rust free-function reference in {rel}:{} is not proven to target `{symbol}` or a distinct local definition — refresh the index; nothing written",
-                    edge.line
-                ),
+                format!("live Rust free-function reference in {rel}:{} is not proven to target `{symbol}` or a distinct local definition — refresh the index; nothing written", edge.line),
                 12,
             ));
         }
@@ -3048,7 +3018,7 @@ pub(crate) fn run_trained_rename(
                 "symbol_not_found",
                 format!("no symbol `{symbol}`"),
                 10,
-            )));
+            )))
         }
     };
     let mut def_nodes = Vec::new();
@@ -3181,9 +3151,7 @@ pub(crate) fn run_trained_rename(
             if source.file_path.is_empty() || source.start_line < 1 {
                 return Ok(Err(EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "graph reference to `{symbol}` has no readable source location — nothing written"
-                    ),
+                    format!("graph reference to `{symbol}` has no readable source location — nothing written"),
                     12,
                 )));
             }
@@ -3207,10 +3175,7 @@ pub(crate) fn run_trained_rename(
             ) else {
                 return Ok(Err(EditRefusal::new(
                     "unresolved_reference",
-                    format!(
-                        "cannot resolve graph reference source span {} for `{symbol}` — nothing written",
-                        source.file_path
-                    ),
+                    format!("cannot resolve graph reference source span {} for `{symbol}` — nothing written", source.file_path),
                     12,
                 )));
             };
