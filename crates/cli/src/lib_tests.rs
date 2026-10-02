@@ -52,7 +52,6 @@ fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-
 #[cfg(target_os = "macos")]
 #[test]
 fn disposable_initializers_use_ensured_path_after_late_durable_store() {
