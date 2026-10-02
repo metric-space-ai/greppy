@@ -188,8 +188,10 @@ fn search_symbol_name_contains(node: &greppy_store::Node, query: &str) -> bool {
 
 fn search_symbol_no_match_status(
     query: &str,
+    root_path: &std::path::Path,
     path_filters: &QueryPathFilters,
     matches_outside_filter: usize,
+    unsupported_files: &[String],
 ) {
     println!("status: no_matches");
     if path_filters.is_empty() {
@@ -201,6 +203,19 @@ fn search_symbol_no_match_status(
         );
     } else {
         println!("scope: path filter {}", path_filters.shown());
+        for path in unsupported_files {
+            println!("coverage: definition extraction is unsupported for indexed file {path}");
+            println!(
+                "next: search its live text: greppy search-pattern {} --fixed --path {} --root {}",
+                shell_example_arg(query),
+                shell_example_arg(path),
+                shell_example_arg(&root_path.to_string_lossy())
+            );
+        }
+        if unsupported_files.len() == path_filters.filters.len() {
+            println!("message: these files have no definition provider; reindexing does not add symbol coverage");
+            return;
+        }
         println!(
             "message: no definition named `{query}` under path filter: {}",
             path_filters.shown()
@@ -526,7 +541,27 @@ pub(crate) fn dispatch_search_symbols(
         return Ok(0);
     }
 
-    search_symbol_no_match_status(q, &path_filters, matches_outside_filter);
+    // File state is read through the logical overlay view, unlike skip rows
+    // which may live only in the immutable Base. Diagnose actual indexed
+    // unsupported files, never a guessed extension or a nonexistent filter.
+    let mut unsupported_files = Vec::new();
+    for path in path_filters.repo_prefixes() {
+        let language = greppy_parser::language_for_path(std::path::Path::new(&path));
+        if !language.is_supported() {
+            if let Some(state) = store.get_file_state(&project, &path)? {
+                if state.language == language.name() {
+                    unsupported_files.push(path);
+                }
+            }
+        }
+    }
+    search_symbol_no_match_status(
+        q,
+        &root_path,
+        &path_filters,
+        matches_outside_filter,
+        &unsupported_files,
+    );
 
     let wanted_normalized = search_name_normalized(q);
     let mut similar = nodes
