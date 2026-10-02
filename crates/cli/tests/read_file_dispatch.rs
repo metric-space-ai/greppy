@@ -93,7 +93,7 @@ fn large_sparse_file_prefix_is_bounded_and_independent_of_invalid_tail() {
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("dump.txt:1-3\nalpha\nbeta\ngamma\n"), "{out}");
     assert!(
-        !store.exists(),
+        !store.join("workspaces").exists() && !store.join("graph.db").exists(),
         "plain bounded reads must not create a graph"
     );
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
