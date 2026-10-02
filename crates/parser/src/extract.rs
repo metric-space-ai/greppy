@@ -329,6 +329,181 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
     None
 }
 
+/// Resolve an explicit binding type without inferring expression return types.
+/// Any nearer lexical binding, including destructuring/control-flow bindings,
+/// blocks parameter fallback even when its type is unknown.
+fn rust_visible_binding_type<'tree>(
+    source: &[u8],
+    callee: Node<'tree>,
+    name: &str,
+) -> Option<Node<'tree>> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        if matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+            && node_text(source, node) == name
+        {
+            return true;
+        }
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            // Value items are visible throughout their lexical block, including
+            // before their declaration. They can shadow a slice parameter.
+            for i in 0..node.named_child_count() {
+                let item = node.named_child(i)?;
+                if matches!(
+                    item.kind(),
+                    "const_item" | "static_item" | "function_item" | "struct_item" | "enum_item"
+                ) && item
+                    .child_by_field_name("name")
+                    .is_some_and(|item_name| node_text(source, item_name) == name)
+                {
+                    return None;
+                }
+            }
+            for i in (0..node.named_child_count()).rev() {
+                let binding = node.named_child(i)?;
+                if binding.kind() != "let_declaration" || binding.end_byte() > callee.start_byte() {
+                    continue;
+                }
+                let Some(pattern) = binding.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if binds(source, pattern, name) {
+                    return (node_text(source, pattern).trim() == name)
+                        .then(|| binding.child_by_field_name("type"))
+                        .flatten();
+                }
+            }
+        }
+        if matches!(
+            node.kind(),
+            "closure_expression" | "for_expression" | "match_arm"
+        ) {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return None;
+            }
+        }
+        if matches!(node.kind(), "if_expression" | "while_expression") {
+            if let Some(condition) = node.child_by_field_name("condition") {
+                fn condition_binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+                    if node.kind() == "let_condition"
+                        && node
+                            .child_by_field_name("pattern")
+                            .is_some_and(|pattern| binds(source, pattern, name))
+                    {
+                        return true;
+                    }
+                    (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .any(|child| condition_binds(source, child, name))
+                }
+                if condition_binds(source, condition, name) {
+                    return None;
+                }
+            }
+        }
+        if node.kind() == "function_item" {
+            let parameters = node.child_by_field_name("parameters")?;
+            for i in 0..parameters.named_child_count() {
+                let parameter = parameters.named_child(i)?;
+                let Some(pattern) = parameter.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if binds(source, pattern, name) {
+                    return (node_text(source, pattern).trim() == name)
+                        .then(|| parameter.child_by_field_name("type"))
+                        .flatten();
+                }
+            }
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// A trait on a slice reference can shadow the slice's inherent `iter` during
+/// Rust method lookup. Imports, traits and item-generating macros/attributes
+/// make that lookup opaque; retain Unknown rather than guessing their contents.
+fn rust_slice_iter_lookup_is_transparent(callee: Node<'_>) -> bool {
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            for i in 0..scope.named_child_count() {
+                let Some(item) = scope.named_child(i) else {
+                    continue;
+                };
+                if matches!(
+                    item.kind(),
+                    "use_declaration"
+                        | "extern_crate_declaration"
+                        | "trait_item"
+                        | "macro_invocation"
+                        | "attribute_item"
+                        | "inner_attribute_item"
+                ) {
+                    return false;
+                }
+                if item.kind() == "expression_statement"
+                    && (0..item.named_child_count())
+                        .filter_map(|i| item.named_child(i))
+                        .any(|child| child.kind() == "macro_invocation")
+                {
+                    return false;
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    true
+}
+
+/// Prove exactly `explicit_slice_binding.iter()`; adapters, custom containers,
+/// aliases and arbitrary return values deliberately remain unresolved.
+fn rust_slice_iterator_owner(
+    source: &[u8],
+    receiver: Node<'_>,
+    callee: Node<'_>,
+) -> Option<&'static str> {
+    if receiver.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = receiver.child_by_field_name("arguments")?;
+    if arguments.named_child_count() != 0 {
+        return None;
+    }
+    let function = receiver.child_by_field_name("function")?;
+    if function.kind() != "field_expression"
+        || node_text(source, function.child_by_field_name("field")?) != "iter"
+    {
+        return None;
+    }
+    let binding = function.child_by_field_name("value")?;
+    if binding.kind() != "identifier" {
+        return None;
+    }
+    let ty = rust_visible_binding_type(source, callee, node_text(source, binding))?;
+    if ty.kind() != "reference_type" {
+        return None;
+    }
+    // tree-sitter-rust represents slices as array_type without a length.
+    let slice = ty.child_by_field_name("type")?;
+    if slice.kind() != "array_type" || slice.child_by_field_name("length").is_some() {
+        return None;
+    }
+    if !rust_slice_iter_lookup_is_transparent(callee) {
+        return None;
+    }
+    Some("core::slice::Iter")
+}
+
 /// Resolve the owner type of an unambiguous Rust receiver call when the AST
 /// carries enough local type evidence. `self.method()` inherits the enclosing
 /// impl owner; named receivers are accepted for explicitly typed parameters or
@@ -346,7 +521,7 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
         return enclosing_impl_type(source, callee);
     }
     if receiver.kind() != "identifier" || receiver_text.is_empty() {
-        return None;
+        return rust_slice_iterator_owner(source, receiver, callee);
     }
 
     let mut ancestor = field.parent();
@@ -15636,6 +15811,53 @@ mod tests {
             !callee_names.contains("Foo"),
             "must NOT capture type path `Foo`, got {callee_names:?}"
         );
+    }
+
+    #[test]
+    fn rust_slice_iterator_receiver_requires_transparent_typed_binding() {
+        let cases = [
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
+            ("fn f(items: &[i32]) { items.iter().next(); }", true),
+            ("fn f(items: &[i32; 2]) { items.iter().next(); }", false),
+
+            ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
+            ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
+            ("fn f(items: &[i32]) { let items = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }", false),
+            ("fn f(items: &[i32]) { let f = |items| items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }", false),
+            ("fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }", false),
+            ("fn f(items: Custom) { items.iter().next(); }", false),
+            ("type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }", false),
+            ("fn f() { let items = &[1,2]; items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { items.iter().map(custom).next(); }", false),
+            ("fn f(items: &mut [i32]) { items.iter_mut().next(); }", false),
+            ("use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { inject!(); items.iter().next(); }", false),
+            ("#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }", false),
+        ];
+        for (source, proven) in cases {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let edge = result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                            == Some("next")
+                })
+                .unwrap();
+            let owner = edge
+                .properties
+                .get("receiver_owner")
+                .and_then(|v| v.as_str());
+            assert_eq!(owner, proven.then_some("core::slice::Iter"), "{source}");
+        }
     }
 
     #[test]
