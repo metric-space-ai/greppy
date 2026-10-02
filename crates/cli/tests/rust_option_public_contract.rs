@@ -348,3 +348,122 @@ fn mixed_confirmed_and_unresolved_rows_share_one_continuation_budget() {
     assert_eq!(hits(&empty) + unresolved(&empty).len(), 0, "{empty}");
     assert_eq!(empty["callers_incomplete"], true, "{empty}");
 }
+
+#[test]
+fn mixed_multi_target_text_and_json_offsets_select_the_same_actual_rows() {
+    let f = Fixture::new();
+    f.write("src/lib.rs", "mod scene; mod safe; mod uncertain;\n");
+    // Only the first target has a confirmed caller; the second target's
+    // candidates must remain uncertain throughout every continuation page.
+    f.write(
+        "src/safe.rs",
+        &caller("confirmed_uniform", "use crate::scene::Manifest;").replace("field.storage();", ""),
+    );
+    let mut opaque = String::from("use crate::scene::Manifest; use external::Unknown;\n");
+    opaque.push_str(&caller("uncertain_a", ""));
+    opaque.push_str(&caller("uncertain_b", ""));
+    f.write("src/uncertain.rs", &opaque);
+    f.index();
+
+    // Identity includes the target because the same uncertain caller appears
+    // under both questions. Bare target headings are metadata, never rows.
+    let json_rows = |value: &Value| -> Vec<(String, String, bool)> {
+        let mut rows = value["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["target"].as_str().unwrap().to_owned(),
+                    row["name"].as_str().unwrap().to_owned(),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.extend(unresolved(value).iter().map(|row| {
+            (
+                row["target"].as_str().unwrap().to_owned(),
+                row["caller"].as_str().unwrap().to_owned(),
+                true,
+            )
+        }));
+        rows
+    };
+    let text_rows = |text: &str| -> Vec<(String, String, bool)> {
+        let mut target = None;
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line == TARGET || line == SECOND {
+                target = Some(line.to_owned());
+                continue;
+            }
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            let identity = if line.starts_with("unresolved receiver:") {
+                assert!(words.len() >= 4, "malformed diagnostic: {line}");
+                Some((words[3], true))
+            } else if words.first().is_some_and(|word| {
+                word.starts_with("src/safe.rs:") || word.starts_with("src/uncertain.rs:")
+            }) {
+                assert!(words.len() >= 2, "malformed caller: {line}");
+                Some((words[1], false))
+            } else {
+                None
+            };
+            if let Some((caller, uncertain)) = identity {
+                rows.push((
+                    target.clone().expect("caller row must identify its target"),
+                    caller.to_owned(),
+                    uncertain,
+                ));
+            }
+        }
+        rows
+    };
+    let full = f.query(&["who-calls", TARGET, SECOND, "--all", "--json"]);
+    assert_eq!(hits(&full), 1, "{full}");
+    let canonical = json_rows(&full);
+    assert_eq!(canonical.len(), 5, "{full}");
+    assert_eq!(
+        canonical[0],
+        (TARGET.to_owned(), "confirmed_uniform".to_owned(), false)
+    );
+    assert!(canonical[1..].iter().all(|row| row.2), "{canonical:?}");
+    assert_eq!(canonical.iter().filter(|row| row.0 == SECOND).count(), 2);
+
+    for cap in ["--limit", "--max"] {
+        for all in [false, true] {
+            for offset in 0..=canonical.len() {
+                let offset_arg = offset.to_string();
+                let mut args = vec![
+                    "who-calls",
+                    TARGET,
+                    SECOND,
+                    cap,
+                    "1",
+                    "--offset",
+                    &offset_arg,
+                ];
+                if all {
+                    args.push("--all");
+                }
+                let text = f.run(&args);
+                args.push("--json");
+                let page = f.query(&args);
+                let expected = canonical
+                    .iter()
+                    .skip(offset)
+                    .take(1)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(json_rows(&page), expected, "args={args:?}\nJSON={page}");
+                assert_eq!(
+                    text_rows(&text),
+                    expected,
+                    "args={args:?}\ntext={text}\nJSON={page}"
+                );
+                assert_eq!(page["callers_incomplete"], true, "{page}");
+            }
+        }
+    }
+}
