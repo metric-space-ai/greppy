@@ -825,7 +825,7 @@ fn trusted_digest_directory() -> io::Result<fs::File> {
     #[cfg(target_os = "macos")]
     let path = home.join("Library/Application Support/greppy/verified-base-digests-v1");
     #[cfg(not(target_os = "macos"))]
-    let path = home.join(".local/share/greppy/verified-base-digests-v1");
+    let path = home.join(".local/share/greppy-verified-base-digests-v1");
     trusted_digest_directory_at(&path)
 }
 
@@ -1527,8 +1527,53 @@ mod tests {
         #[cfg(target_os = "macos")]
         let namespace = home.join("Library/Application Support/greppy/verified-base-digests-v1");
         #[cfg(not(target_os = "macos"))]
-        let namespace = home.join(".local/share/greppy/verified-base-digests-v1");
+        let namespace = home.join(".local/share/greppy-verified-base-digests-v1");
         tempfile::tempdir_in(namespace).unwrap()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn persistent_digest_relocated_store_child() {
+        if std::env::var_os("GREPPY_TEST_RELOCATED_PROOF_HOME").is_none() {
+            return;
+        }
+        let directory = trusted_digest_directory().unwrap();
+        let proof = sample_digest_proof();
+        write_digest_proof(&directory, &proof).unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_some());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn persistent_digest_namespace_is_independent_of_relocated_global_store() {
+        use std::os::unix::fs::symlink;
+        let home = private_proof_fixture();
+        let share = home.path().join(".local/share");
+        fs::create_dir_all(&share).unwrap();
+        // A disposable/global graph store may be redirected. Proof metadata
+        // uses a separate private namespace; no symlink is traversed for trust.
+        symlink("/nonexistent-disposable-greppy-store", share.join("greppy")).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "base_store::tests::persistent_digest_relocated_store_child",
+                "--nocapture",
+            ])
+            .env("HOME", home.path())
+            .env("GREPPY_TEST_RELOCATED_PROOF_HOME", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        assert!(fs::symlink_metadata(share.join("greppy"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(target_os = "macos")]
