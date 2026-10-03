@@ -593,12 +593,11 @@ fn verified_base_digest_at(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let before = digest_file_identity(&file)?;
-    let started_at = digest_now_secs();
-    let started_monotonic = digest_monotonic_secs();
+    let started = DigestVerificationTime::now();
 
     if let Some(directory) = &proofs {
         if let Some(proof) = read_digest_proof(directory, binding, expected) {
-            if proof.matches(before, binding, expected, started_at) {
+            if proof.matches(before, binding, expected, started.wall) {
                 if digest_file_identity(&file)? != before {
                     return Err(invalid_data(
                         "Base file changed during snapshot verification",
@@ -611,28 +610,27 @@ fn verified_base_digest_at(
         }
     }
     let digest = hash_opened_file(&mut file)?;
-    if digest_file_identity(&file)? != before {
+    let after = digest_file_identity(&file)?;
+    if after != before {
         return Err(invalid_data("Base file changed during digest verification"));
     }
-    // Never record a mismatch, a fresh initial identity, or an identity
-    // whose time bucket merely aged during a long full read.
-    if digest == expected
-        && digest_cache_insert_eligible(
-            digest_cache_eligible(before, started_at),
-            before,
-            digest_now_secs(),
-        )
-    {
-        if let (Some(directory), Some(verified_at)) = (proofs, started_at) {
-            let proof = DigestProof {
-                version: 1,
-                manifest_sha256: binding.to_owned(),
-                digest: digest.clone(),
-                identity: before,
-                verified_at,
-                verified_monotonic: started_monotonic.unwrap_or(u64::MAX),
-            };
-            let _ = write_digest_proof(&directory, &proof);
+    // Anchor only after the matching full read and opened-file stability
+    // checks. Initial eligibility remains mandatory: a long read must not
+    // promote fresh metadata merely because its time bucket aged meanwhile.
+    if digest == expected {
+        let completed = DigestVerificationTime::now();
+        if let Some(directory) = proofs {
+            if let Some(proof) = DigestProof::from_completed_read(
+                before,
+                after,
+                binding,
+                expected,
+                Ok(digest.as_str()),
+                started,
+                completed,
+            ) {
+                let _ = write_digest_proof(&directory, &proof);
+            }
         }
     }
     Ok(digest)
@@ -680,6 +678,23 @@ fn digest_monotonic_secs() -> Option<u64> {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct DigestVerificationTime {
+    wall: Option<u64>,
+    monotonic: Option<u64>,
+}
+
+#[cfg(unix)]
+impl DigestVerificationTime {
+    fn now() -> Self {
+        Self {
+            wall: digest_now_secs(),
+            monotonic: digest_monotonic_secs(),
+        }
+    }
+}
+
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DigestProof {
@@ -693,6 +708,42 @@ struct DigestProof {
 
 #[cfg(unix)]
 impl DigestProof {
+    fn from_completed_read(
+        before: DigestFileIdentity,
+        after: DigestFileIdentity,
+        binding: &str,
+        expected: &str,
+        digest: Result<&str, &io::Error>,
+        started: DigestVerificationTime,
+        completed: DigestVerificationTime,
+    ) -> Option<Self> {
+        let actual = digest.ok()?;
+        let started_wall = started.wall?;
+        let started_monotonic = started.monotonic?;
+        let verified_at = completed.wall?;
+        let verified_monotonic = completed.monotonic?;
+        if actual != expected
+            || before != after
+            || verified_at < started_wall
+            || verified_monotonic < started_monotonic
+            || !digest_cache_insert_eligible(
+                digest_cache_eligible(before, Some(started_wall)),
+                before,
+                Some(verified_at),
+            )
+        {
+            return None;
+        }
+        Some(Self {
+            version: 1,
+            manifest_sha256: binding.to_owned(),
+            digest: actual.to_owned(),
+            identity: before,
+            verified_at,
+            verified_monotonic,
+        })
+    }
+
     fn matches(
         &self,
         identity: DigestFileIdentity,
@@ -700,7 +751,25 @@ impl DigestProof {
         expected: &str,
         now: Option<u64>,
     ) -> bool {
-        let Some(now) = now else {
+        self.matches_at(
+            identity,
+            binding,
+            expected,
+            DigestVerificationTime {
+                wall: now,
+                monotonic: digest_monotonic_secs(),
+            },
+        )
+    }
+
+    fn matches_at(
+        &self,
+        identity: DigestFileIdentity,
+        binding: &str,
+        expected: &str,
+        now: DigestVerificationTime,
+    ) -> bool {
+        let (Some(now), Some(monotonic)) = (now.wall, now.monotonic) else {
             return false;
         };
         self.version == 1
@@ -709,10 +778,8 @@ impl DigestProof {
             && self.identity == identity
             && self.verified_at <= now
             && now - self.verified_at < DIGEST_PROOF_TTL_SECS
-            && digest_monotonic_secs().is_some_and(|now| {
-                now >= self.verified_monotonic
-                    && now - self.verified_monotonic < DIGEST_PROOF_TTL_SECS
-            })
+            && monotonic >= self.verified_monotonic
+            && monotonic - self.verified_monotonic < DIGEST_PROOF_TTL_SECS
             && digest_cache_eligible(identity, Some(self.verified_at))
             && digest_cache_eligible(identity, Some(now))
     }
@@ -1191,6 +1258,209 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn verification_time(wall: u64, monotonic: u64) -> DigestVerificationTime {
+        DigestVerificationTime {
+            wall: Some(wall),
+            monotonic: Some(monotonic),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_slow_read_anchors_nonsliding_window_at_completion() {
+        let seed = sample_digest_proof_at(1000);
+        let started = verification_time(100, 1000);
+        let completed = verification_time(180, 1080); // deterministic 80-second full read
+        let proof = DigestProof::from_completed_read(
+            seed.identity,
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            Ok(&seed.digest),
+            started,
+            completed,
+        )
+        .expect("an initially aged stable matching slow read must produce a live proof");
+        assert_eq!(proof.verified_at, 180);
+        assert_eq!(proof.verified_monotonic, 1080);
+        for elapsed in [0, 1, 10, 29] {
+            assert!(proof.matches_at(
+                seed.identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                verification_time(180 + elapsed, 1080 + elapsed)
+            ));
+            assert_eq!((proof.verified_at, proof.verified_monotonic), (180, 1080));
+        }
+        assert!(!proof.matches_at(
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            verification_time(210, 1110)
+        ));
+        // Either clock independently bounds reuse, even if the other clock stalls.
+        assert!(!proof.matches_at(
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            verification_time(210, 1081)
+        ));
+        assert!(!proof.matches_at(
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            verification_time(181, 1110)
+        ));
+        assert!(!proof.matches_at(
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            verification_time(179, 1081)
+        ));
+        assert!(!proof.matches_at(
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            verification_time(181, 1079)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_completion_never_promotes_fresh_unknown_or_failed_reads() {
+        let seed = sample_digest_proof_at(1000);
+        let started = verification_time(100, 1000);
+        let completed = verification_time(180, 1080);
+        let fresh = DigestFileIdentity {
+            changed: (99, 123),
+            ..seed.identity
+        };
+        let coarse = DigestFileIdentity {
+            changed: (90, 0),
+            ..seed.identity
+        };
+        let fresh_hfs = DigestFileIdentity {
+            changed: (97, 0),
+            known_hfs: true,
+            ..seed.identity
+        };
+        for identity in [fresh, coarse, fresh_hfs] {
+            assert!(
+                DigestProof::from_completed_read(
+                    identity,
+                    identity,
+                    &seed.manifest_sha256,
+                    &seed.digest,
+                    Ok(&seed.digest),
+                    started,
+                    completed
+                )
+                .is_none()
+            );
+        }
+        let error = io::Error::new(io::ErrorKind::UnexpectedEof, "injected failed full read");
+        assert!(
+            DigestProof::from_completed_read(
+                seed.identity,
+                seed.identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Err(&error),
+                started,
+                completed
+            )
+            .is_none()
+        );
+        assert!(
+            DigestProof::from_completed_read(
+                seed.identity,
+                seed.identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Ok("wrong digest"),
+                started,
+                completed
+            )
+            .is_none()
+        );
+        for after in [
+            DigestFileIdentity {
+                inode: 3,
+                ..seed.identity
+            },
+            DigestFileIdentity {
+                size: 9,
+                ..seed.identity
+            },
+            DigestFileIdentity {
+                changed: (91, 123),
+                ..seed.identity
+            },
+        ] {
+            assert!(
+                DigestProof::from_completed_read(
+                    seed.identity,
+                    after,
+                    &seed.manifest_sha256,
+                    &seed.digest,
+                    Ok(&seed.digest),
+                    started,
+                    completed
+                )
+                .is_none()
+            );
+        }
+        for invalid in [
+            DigestVerificationTime {
+                wall: None,
+                ..completed
+            },
+            DigestVerificationTime {
+                monotonic: None,
+                ..completed
+            },
+            verification_time(99, 1080),
+            verification_time(180, 999),
+        ] {
+            assert!(
+                DigestProof::from_completed_read(
+                    seed.identity,
+                    seed.identity,
+                    &seed.manifest_sha256,
+                    &seed.digest,
+                    Ok(&seed.digest),
+                    started,
+                    invalid
+                )
+                .is_none()
+            );
+        }
+        for invalid in [
+            DigestVerificationTime {
+                wall: None,
+                ..started
+            },
+            DigestVerificationTime {
+                monotonic: None,
+                ..started
+            },
+        ] {
+            assert!(
+                DigestProof::from_completed_read(
+                    seed.identity,
+                    seed.identity,
+                    &seed.manifest_sha256,
+                    &seed.digest,
+                    Ok(&seed.digest),
+                    invalid,
+                    completed
+                )
+                .is_none()
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn production_proof_fixture() -> tempfile::TempDir {
         // Tiny operational proof metadata belongs in the ownership-enforcing
@@ -1536,6 +1806,11 @@ mod tests {
 
     #[cfg(unix)]
     fn sample_digest_proof() -> DigestProof {
+        sample_digest_proof_at(digest_monotonic_secs().unwrap())
+    }
+
+    #[cfg(unix)]
+    fn sample_digest_proof_at(verified_monotonic: u64) -> DigestProof {
         DigestProof {
             version: 1,
             manifest_sha256: hex_sha256(b"manifest"),
@@ -1549,7 +1824,7 @@ mod tests {
                 known_hfs: false,
             },
             verified_at: 100,
-            verified_monotonic: digest_monotonic_secs().unwrap(),
+            verified_monotonic,
         }
     }
 
@@ -1638,7 +1913,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_proof_rejects_corrupt_unsafe_and_symlink_records() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let tmp = tempfile::tempdir().unwrap();
         let directory = fs::File::open(tmp.path()).unwrap();
         let proof = sample_digest_proof();
@@ -2119,10 +2394,12 @@ mod tests {
             .publish_graph_with_summary(identity(), &staged, &summary)
             .unwrap();
         assert_eq!(first, second);
-        assert!(fs::metadata(&layout.graph)
-            .unwrap()
-            .permissions()
-            .readonly());
+        assert!(
+            fs::metadata(&layout.graph)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
         assert_eq!(layout.read_verified_manifest().unwrap(), first);
         fs::write(&layout.graph, b"tamper").unwrap_err();
     }
@@ -2252,12 +2529,16 @@ mod tests {
         assert_eq!(edges[0].target_id, target.id);
         let content = store.search_file_content("p", "target", 10).unwrap();
         assert_eq!(content.len(), 2);
-        assert!(content
-            .iter()
-            .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3));
-        assert!(content
-            .iter()
-            .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20));
+        assert!(
+            content
+                .iter()
+                .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3)
+        );
+        assert!(
+            content
+                .iter()
+                .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20)
+        );
         assert!(!content.iter().any(|hit| hit.line == 2));
         assert_eq!(store.count_file_content_matches("p", "target").unwrap(), 2);
         let symbol_hits = crate::fts::search_fts_in_project(store, "p", "target", 10).unwrap();
@@ -2357,12 +2638,16 @@ mod tests {
                         expected
                     );
                 }
-                assert!(visible
-                    .iter()
-                    .any(|candidate| candidate.qualified_name == "p.shared"));
-                assert!(visible
-                    .iter()
-                    .any(|candidate| candidate.qualified_name == own_qname));
+                assert!(
+                    visible
+                        .iter()
+                        .any(|candidate| candidate.qualified_name == "p.shared")
+                );
+                assert!(
+                    visible
+                        .iter()
+                        .any(|candidate| candidate.qualified_name == own_qname)
+                );
                 assert!(!visible.iter().any(|candidate| {
                     candidate.qualified_name.starts_with("p.agent_")
                         && candidate.qualified_name != own_qname

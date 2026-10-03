@@ -1,7 +1,8 @@
 # Bounded verification snapshots for published Bases
 
 Published immutable Bases reuse a verified digest across CLI processes for less
-than 30 seconds after the original full read began. This policy is confined to
+than 30 seconds after the original full read completed and passed digest and
+opened-file stability checks. This policy is confined to
 `BaseStoreLayout::read_verified_manifest`; ordinary `file_sha256` callers retain
 their existing process-local behavior. A snapshot hit does **not** cryptographically
 revalidate unread bytes.
@@ -20,12 +21,18 @@ Unknown whole-second metadata falls back to full hashing. Fractional metadata
 must already be two seconds old at full-hash start and remain eligible at its
 end. An opened-file `fstatfs` HFS classification permits known coarse HFS change
 times only after four seconds. A long hash cannot promote an initially fresh
-identity. Reuse never extends the original full-verification time.
+identity. Reuse never extends the original successful verification-completion
+time. Initially eligible files whose full read takes longer than 30 seconds
+still receive a usable 30-second window after successful completion.
 
 Expiry checks both wall time and system monotonic time. Future/unknown times,
-malformed records and expired records miss. Proof timestamps start before the
-full read, so its duration consumes the reuse window. No environment override
-can lengthen the window or disable integrity checks.
+malformed records and expired records miss. Proof timestamps are captured only
+after the full digest matches and the same opened descriptor retains its exact
+pre-read identity. Both completion clocks must be known and no earlier than
+their corresponding start clocks. The original pre-read metadata-aging gate is
+still mandatory; completion does not promote a fresh identity into eligibility.
+Cache hits never refresh either timestamp. No environment override can lengthen
+the window or disable integrity checks.
 
 ## Proof storage and concurrent publication
 
@@ -59,8 +66,14 @@ leftovers are bounded to at most 192 small files, with no unbounded cache log.
 
 A trusted record authenticates a recently verified snapshot under normal
 filesystem metadata semantics. It cannot detect silent media corruption that
-changes bytes without changing metadata. Such corruption is detected at the
-next full verification, once the original 30-second window expires. Privileged
+changes bytes without changing metadata. Such corruption is detected by a
+subsequent command performing full verification after the fixed 30-second
+completion window expires. Corruption
+of bytes already consumed during a long read can predate completion by part of
+the read duration; this policy does not promise detection within 30 seconds of
+the corruption itself. Detection also requires a subsequent command and its
+full scan. The cache adds at most 30 seconds after successful completion before
+that next command must start full revalidation. Privileged
 attackers, compromised processes running as the same UID and filesystems that
 lie about change metadata are outside the snapshot trust boundary.
 
@@ -84,6 +97,11 @@ and proof files whose POSIX modes remain 0700/0600; a deny-only/read-search
 positive exercises normal production namespace traversal. A separate command
 reopens that namespace and proves a cache hit with zero full digest reads.
 An invalid-descriptor ACL query proves failures are not empty ACLs.
+Completion-origin regressions inject an 80-second read interval and both clocks
+without sleeps or skips: the completed proof remains usable for 29 seconds,
+expires at 30, and repeated hits never slide its origin. Fresh-to-aged and
+unknown-coarse metadata, read failure, mismatch, changed opened-file identity,
+missing clocks and backwards clocks all refuse proof creation.
 The worker ran rustfmt only; the release owner owns compilation,
 local tests and operational performance acceptance under the shared resource
 lease. No test result or release acceptance is claimed here.
