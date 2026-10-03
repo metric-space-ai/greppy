@@ -739,7 +739,7 @@ fn open_relative(
             directory.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode as libc::c_uint,
+            mode,
         )
     };
     if fd < 0 {
