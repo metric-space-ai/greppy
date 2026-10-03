@@ -10263,12 +10263,10 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
                 .unwrap();
             state.indexer_version = prior_version.into();
             store.upsert_workspace_state(&state).unwrap();
-            assert!(
-                recover_persisted_rust_usages(&mut store, "test", &repo)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("trait receiver facts")
-            );
+            assert!(recover_persisted_rust_usages(&mut store, "test", &repo)
+                .unwrap_err()
+                .to_string()
+                .contains("trait receiver facts"));
 
             fs::write(
                 repo.join("src/changed.rs"),
