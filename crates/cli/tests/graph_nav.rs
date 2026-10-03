@@ -3152,7 +3152,8 @@ fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
         .as_str()
         .unwrap()
         .contains("--root"));
-    for path in ["src/lib.rs"] {
+    {
+        let path = "src/lib.rs";
         let (code, out, err) = run(&["read", "road_structure", "--path", path], &repo, &store);
         assert_eq!(code, 1, "filtered miss: {out} {err}");
         assert!(

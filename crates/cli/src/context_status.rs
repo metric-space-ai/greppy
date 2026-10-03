@@ -340,14 +340,16 @@ mod tests {
     }
     #[test]
     fn transition_requires_restriction_and_is_consumed_once() {
-        let mut s = Status::default();
-        s.publication = Some(Publication {
-            revision: 1,
-            generation: 4,
-            graph: true,
-            semantic: false,
-            fingerprint: fp(1),
-        });
+        let mut s = Status {
+            publication: Some(Publication {
+                revision: 1,
+                generation: 4,
+                graph: true,
+                semantic: false,
+                fingerprint: fp(1),
+            }),
+            ..Status::default()
+        };
         assert!(s.take_notice("a", &fp(1), [false; 2]).is_none());
         s.restrict("a".into(), 4, Capability::Graph);
         s.publication.as_mut().unwrap().revision = 2;
@@ -425,14 +427,16 @@ mod tests {
     }
     #[test]
     fn a_session_restriction_does_not_erase_shared_readiness() {
-        let mut s = Status::default();
-        s.publication = Some(Publication {
-            revision: 1,
-            generation: 4,
-            graph: true,
-            semantic: true,
-            fingerprint: fp(1),
-        });
+        let mut s = Status {
+            publication: Some(Publication {
+                revision: 1,
+                generation: 4,
+                graph: true,
+                semantic: true,
+                fingerprint: fp(1),
+            }),
+            ..Status::default()
+        };
         s.restrict("a".into(), 4, Capability::Semantic);
         assert!(s.publication.as_ref().unwrap().semantic);
         // A prior ready publication does not satisfy a later restriction.
