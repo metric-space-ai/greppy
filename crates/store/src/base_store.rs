@@ -1017,7 +1017,10 @@ fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
     }
     match present {
         0 => return Ok(()),
-        1 => {}
+        // Darwin returns a property bitmask (currently 32), not normalized 1.
+        // The public contract reports nonzero presence; the negative sentinel
+        // also keeps an unwritten/invalid output fail-closed.
+        value if value > 0 => {}
         _ => return Err(invalid_data("unknown digest proof ACL presence")),
     }
     let mut acl = std::ptr::null_mut();
@@ -1031,8 +1034,10 @@ fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    if acl.is_null() {
-        return Err(invalid_data("present digest proof ACL is unavailable"));
+    if acl.is_null() || acl as usize == 1 {
+        return Err(invalid_data(
+            "present digest proof ACL is unavailable or a removal sentinel",
+        ));
     }
     let acl = OwnedAcl(acl);
     if unsafe { acl_valid(acl.0) } != 0 {
@@ -1506,6 +1511,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn private_proof_fixture() -> tempfile::TempDir {
+        #[cfg(target_os = "macos")]
+        let fixture = production_proof_fixture();
+        #[cfg(not(target_os = "macos"))]
+        let fixture = tempfile::tempdir().unwrap();
+        trusted_digest_directory_at(fixture.path()).expect("checked private proof fixture");
+        fixture
+    }
+
     #[cfg(target_os = "macos")]
     fn production_proof_fixture() -> tempfile::TempDir {
         // Tiny operational proof metadata belongs in the ownership-enforcing
@@ -1713,8 +1728,8 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("base.db");
-        let proofs = tmp.path().join("proofs");
-        fs::create_dir(&proofs).unwrap();
+        let proof_fixture = private_proof_fixture();
+        let proofs = proof_fixture.path().to_path_buf();
         fs::write(&path, b"original").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(5));
         let binding = hex_sha256(b"manifest");
@@ -1764,8 +1779,8 @@ mod tests {
     fn persistent_digest_concurrent_base_write_never_certifies_old_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("base.db");
-        let proofs = tmp.path().join("proofs");
-        fs::create_dir(&proofs).unwrap();
+        let proof_fixture = private_proof_fixture();
+        let proofs = proof_fixture.path().to_path_buf();
         fs::write(&path, b"original").unwrap();
         let (start_tx, start_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1802,7 +1817,7 @@ mod tests {
         let Some(path) = std::env::var_os("GREPPY_TEST_DIGEST_PROOF_DIRECTORY") else {
             return;
         };
-        let directory = fs::File::open(path).unwrap();
+        let directory = trusted_digest_directory_at(Path::new(&path)).unwrap();
         let expected = sample_digest_proof();
         let proof =
             read_digest_proof(&directory, &expected.manifest_sha256, &expected.digest).unwrap();
@@ -1817,8 +1832,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_proof_survives_process_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let directory = fs::File::open(tmp.path()).unwrap();
+        let tmp = private_proof_fixture();
+        let directory = trusted_digest_directory_at(tmp.path()).unwrap();
         write_digest_proof(&directory, &sample_digest_proof()).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1842,8 +1857,8 @@ mod tests {
     fn persistent_digest_mismatch_is_not_recorded_and_symlink_base_is_refused() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
-        let proofs = tmp.path().join("proofs");
-        fs::create_dir(&proofs).unwrap();
+        let proof_fixture = private_proof_fixture();
+        let proofs = proof_fixture.path().to_path_buf();
         let path = tmp.path().join("base.db");
         fs::write(&path, b"tampered").unwrap();
         let expected = hex_sha256(b"original");
@@ -1973,8 +1988,8 @@ mod tests {
     #[test]
     fn persistent_digest_proof_rejects_corrupt_unsafe_and_symlink_records() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let directory = fs::File::open(tmp.path()).unwrap();
+        let tmp = private_proof_fixture();
+        let directory = trusted_digest_directory_at(tmp.path()).unwrap();
         let proof = sample_digest_proof();
         write_digest_proof(&directory, &proof).unwrap();
         let name = digest_proof_name(&proof.manifest_sha256, &proof.digest);
@@ -1996,6 +2011,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         let target = tmp.path().join("target");
         fs::write(&target, serde_json::to_vec(&proof).unwrap()).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, &path).unwrap();
         assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
         fs::remove_file(&path).unwrap();
@@ -2007,7 +2023,8 @@ mod tests {
     #[test]
     fn persistent_digest_directory_refuses_writable_ancestors_and_symlinks() {
         use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = private_proof_fixture();
+        assert!(trusted_digest_directory_at(tmp.path()).is_ok());
         let link = tmp.path().join("link");
         symlink(tmp.path(), &link).unwrap();
         assert!(trusted_digest_directory_at(&link.join("proofs")).is_err());
@@ -2020,8 +2037,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_atomic_writers_never_publish_partial_records() {
-        let tmp = tempfile::tempdir().unwrap();
-        let directory = fs::File::open(tmp.path()).unwrap();
+        let tmp = private_proof_fixture();
+        let directory = trusted_digest_directory_at(tmp.path()).unwrap();
         let proof = sample_digest_proof();
         let binding = proof.manifest_sha256.clone();
         let expected = proof.digest.clone();
@@ -2031,7 +2048,9 @@ mod tests {
                 let proof = &proof;
                 scope.spawn(move || {
                     for _ in 0..8 {
-                        let _ = write_digest_proof(directory, proof);
+                        if let Err(error) = write_digest_proof(directory, proof) {
+                            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+                        }
                     }
                 });
             }
