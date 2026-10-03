@@ -38,7 +38,7 @@ the window or disable integrity checks.
 
 Small operational records use the current user's production data namespace:
 `~/Library/Application Support/greppy/verified-base-digests-v1` on macOS and
-`~/.local/share/greppy/verified-base-digests-v1` elsewhere on Unix. Missing
+`~/.local/share/greppy-verified-base-digests-v1` elsewhere on Unix. Missing
 components are created with mode 0700. Directory traversal uses `openat` and
 `O_NOFOLLOW`, validates ownership and denies group/other-write ancestors; the
 final directory must be private and owned by the current UID. On macOS, native
