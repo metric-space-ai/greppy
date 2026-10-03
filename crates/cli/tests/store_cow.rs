@@ -802,13 +802,20 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         cold_code, 0,
         "cold structural refresh failed: {cold_out}\n{cold_err}"
     );
+    // Status verifies the complete Base manifest, including summaries. The
+    // missing-summary fixture has served its no-checkout assertion above;
+    // restore that deliberate corruption before checking the healthy binding.
+    std::fs::write(&summary_cache, saved_summary_cache).unwrap();
     let cold_status = query_json_raw(&first, &store, &["index", "status"], None);
     assert_eq!(
         cold_status["store_cow"]["base_path"],
         base_path.to_string_lossy().as_ref(),
         "a current Base missing only summaries keeps its pinned structural graph"
     );
-    std::fs::write(&summary_cache, saved_summary_cache).unwrap();
+    assert_eq!(
+        cold_status["freshness"]["source"], "verified_store_cow_overlay",
+        "the restored current Base must retain its verified visibility proof"
+    );
 
     // Downgrade the published fixture to a verified v6 Base and remove the
 
