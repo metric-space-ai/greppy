@@ -289,20 +289,61 @@ fn callees_lists_what_symbol_calls() {
         "callees must print the callee's file:line (src/mid.rs); got: {out:?}"
     );
     assert!(
-        !out.contains("no callees"),
+        !out.contains("no resolved indexed callees"),
         "entry calls middle, so callees must be non-empty; got: {out:?}"
     );
 }
 
 #[test]
-fn callees_reports_no_callees_for_leaf() {
+fn callees_reports_no_indexed_callees_for_leaf() {
     let (repo, store) = index_fixture("callees-none");
-    // `leaf` calls nothing.
+    // Even for a true leaf, an empty graph result is not a completeness proof.
     let (code, out, _err) = run(&["callees", "leaf"], &repo, &store);
     assert_eq!(code, 0);
     assert_eq!(
-        out, "no callees\n",
-        "leaf calls nothing, so callees must say so; got: {out:?}"
+        out,
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
+inspect source with: greppy read leaf\n",
+        "an empty result must state the indexed scope and offer source inspection"
+    );
+}
+
+#[test]
+fn callees_does_not_claim_external_calls_are_absent() {
+    let (repo, store) = make_chain_repo("callees-external");
+    std::fs::write(
+        repo.join("src/leaf.rs"),
+        "pub fn leaf() -> u32 { std::process::id() }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["callees", "leaf"], &repo, &store);
+    assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
+    assert_eq!(
+        out,
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
+inspect source with: greppy read leaf\n",
+        "the unindexed standard-library call must not become a definitive no-calls claim"
+    );
+}
+
+#[test]
+fn callees_reports_when_path_filter_excludes_known_call() {
+    let (repo, store) = index_fixture("callees-filtered");
+    // entry calls middle in mid.rs, which the leaf.rs filter excludes.
+    let (code, out, err) = run(
+        &["callees", "entry", "--path", "src/leaf.rs"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
+    assert_eq!(
+        out,
+        "no resolved indexed callees under path filter: src/leaf.rs\n\
+external, unresolved or filtered calls may still exist; inspect source with: greppy read entry\n",
+        "filtering out a known call must preserve the filter and uncertainty in the answer"
     );
 }
 
