@@ -6727,28 +6727,30 @@ export function invalidCalls() { plainValue(); effectValue(); }
         }
         let repaired = index(&mut store, repo.path(), "test").unwrap();
         assert_eq!(
-            repaired.files_indexed, 1,
-            "only affected-language unchanged file is refreshed"
+            repaired.files_indexed, 2,
+            "v9 re-extracts every retained source in the incompatible cache"
         );
         let restored = store
             .get_node_by_qname("test", &target.qualified_name)
             .unwrap()
             .unwrap();
-        assert_eq!(restored.id, target.id, "migration preserves node identity");
-        assert_eq!(
+        assert_ne!(restored.id, target.id, "v9 replaces old declaration nodes");
+        assert!(
             store
                 .get_node_by_qname("test", &retained.qualified_name)
                 .unwrap()
-                .unwrap()
-                .id,
-            retained.id,
-            "unaffected language nodes stay in place"
+                .is_some(),
+            "cross-language definitions survive full cache refresh"
         );
         let incoming = store
             .incoming_edges(restored.id, Some("CALLS"), 10)
             .unwrap();
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].source_id, caller.id);
+        let restored_caller = store
+            .get_node_by_qname("test", &caller.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming[0].source_id, restored_caller.id);
         assert_eq!(
             index(&mut store, repo.path(), "test")
                 .unwrap()
@@ -7438,40 +7440,51 @@ def Widget():
         )
         .unwrap();
         assert_eq!(
-            migration.files_indexed, 21,
-            "all 21 migration-required fixture files re-extract despite sparse scope"
+            migration.files_indexed, initial.files_indexed,
+            "v9 re-extracts every retained source despite sparse scope"
         );
         let untouched_after = store
             .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
             .unwrap()
             .expect("unrelated Python definition survives migration");
-        assert_eq!(untouched_after.id, untouched_before.id);
+        assert_ne!(
+            untouched_after.id, untouched_before.id,
+            "v9 replaces old cache nodes"
+        );
         let target_after = store
             .get_node_by_qname("test", "src/channels/command.rs::Function::target")
             .unwrap()
             .expect("Rust target survives migration");
-        assert_eq!(
+        assert_ne!(
             target_after.id, target.id,
-            "unchanged Rust nodes retain identity"
+            "v9 re-extracts unchanged Rust declarations"
         );
         assert!(
             store
                 .get_node_by_qname("test", "src/other.rs::Function::target")
                 .unwrap()
                 .is_none(),
-            "a genuinely changed Rust file still takes the normal incremental rewrite path"
+            "a changed Rust file is also freshly extracted during the full refresh"
         );
         assert!(store
             .get_node_by_qname("test", "src/other.rs::Function::replacement")
             .unwrap()
             .is_some());
+        let local_target_after = store
+            .get_node_by_qname("test", &local_target.qualified_name)
+            .unwrap()
+            .unwrap();
+        let missing_caller_after = store
+            .get_node_by_qname("test", &missing_caller.qualified_name)
+            .unwrap()
+            .unwrap();
         assert!(
             store
-                .incoming_edges(local_target.id, Some("USAGE"), 10)
+                .incoming_edges(local_target_after.id, Some("USAGE"), 10)
                 .unwrap()
                 .iter()
-                .all(|edge| edge.source_id != missing_caller.id),
-            "full migration re-resolution removes a stale v6 false-positive edge"
+                .all(|edge| edge.source_id != missing_caller_after.id),
+            "full refresh removes a stale v6 false-positive edge"
         );
         let preserved_vectors: i64 = store
             .conn()
@@ -7482,19 +7495,17 @@ def Widget():
             )
             .unwrap();
         assert_eq!(
-            preserved_vectors, 2,
-            "Rust and Python vectors are reusable in the v7 generation"
+            preserved_vectors, 0,
+            "old node-bound vectors are retired with the incompatible declaration cache"
         );
-        for (qualified_name, content_sha256, expected_node_id) in [
+        for (qualified_name, content_sha256) in [
             (
                 "src/unrelated.py::Function::untouched",
                 "79e7f0faa5c096d71e2144fed19041c227465b02667a95b613c0ecd4648e1a03",
-                untouched_before.id,
             ),
             (
                 "src/channels/command.rs::Function::target",
                 "0126ac6c598444305c31117e8a38a15cb496335cbd34fb503dfd331926e93fb7",
-                target.id,
             ),
         ] {
             let reusable = store
@@ -7507,10 +7518,11 @@ def Widget():
                     chunk_idx: 0,
                     content_sha256,
                 })
-                .unwrap()
-                .expect("unchanged chunk must remain reusable after migration");
-            assert_eq!(reusable.node_id, Some(expected_node_id));
-            assert_eq!(reusable.graph_generation, migration.graph_generation);
+                .unwrap();
+            assert!(
+                reusable.is_none(),
+                "old node-bound vectors must not certify fresh declarations"
+            );
         }
         let clean = index_with_options(
             &mut store,
@@ -10087,6 +10099,64 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
             assert_eq!(unresolved_uniform, label == "opaque-wildcard", "{label}");
             fs::remove_dir_all(repo).unwrap();
         }
+    }
+
+    #[test]
+    fn v8_upgrade_reextracts_unchanged_trait_receiver_facts() {
+        let repo = setup_repo(
+            "v8-trait-receiver-upgrade",
+            "pub trait HttpTransport: Send + Sync { fn execute(&self); }\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let source_before = store.list_file_states("test").unwrap();
+        store.conn().execute(
+            "UPDATE nodes SET properties=json_remove(properties, '$.has_bounds', '$.as_ref_receiver') WHERE label='Interface'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute(
+            "INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')",
+            [],
+        ).unwrap();
+        let root = greppy_discover::detect_repo_root(&repo).unwrap();
+        let mut state = store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap();
+        state.indexer_version = "greppy-indexer-v8".into();
+        store.upsert_workspace_state(&state).unwrap();
+        assert!(recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string()
+            .contains("trait receiver facts"));
+
+        let upgrade = index(&mut store, &repo, "test").unwrap();
+        assert_eq!(
+            upgrade.files_indexed, 1,
+            "unchanged source requires fresh declaration nodes"
+        );
+        let node = store
+            .get_node_by_qname("test", "src/lib.rs::Interface::HttpTransport")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.properties.get("has_bounds"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            store.list_file_states("test").unwrap()[0].sha256,
+            source_before[0].sha256
+        );
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert_eq!(index(&mut store, &repo, "test").unwrap().files_indexed, 0);
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

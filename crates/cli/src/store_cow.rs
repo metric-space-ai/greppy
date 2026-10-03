@@ -1757,6 +1757,8 @@ fn verified_previous_indexer_base_layout(
     let versions: &[&str] = match current_identity.indexer_version.as_str() {
         "greppy-indexer-v7" => &["greppy-indexer-v6"],
         "greppy-indexer-v8" => &["greppy-indexer-v7", "greppy-indexer-v6"],
+        // v9 needs declaration properties that older Bases never extracted.
+        // Reusing their byte-identical sources would preserve incomplete nodes.
         _ => &[],
     };
     // Schema17 only adds private override tables. A copied schema16 graph
@@ -4401,6 +4403,24 @@ mod tests {
                 ),
                 previous_summary_hash,
                 "published v6 summary cache remains immutable"
+            );
+            // A v8 cache must not seed v9 with identical source/model identity:
+            // its Rust declaration facts may be incomplete.
+            let mut v8_identity = current_identity.clone();
+            v8_identity.indexer_version = "greppy-indexer-v8".into();
+            let v8_layout = BaseStoreLayout::new(data_root.path(), &v8_identity).unwrap();
+            if !v8_layout.graph.exists() {
+                v8_layout
+                    .publish_graph_with_summary(v8_identity.clone(), &graph, &summary)
+                    .unwrap();
+            }
+            let mut v9_identity = v8_identity;
+            v9_identity.indexer_version = "greppy-indexer-v9".into();
+            assert!(
+                verified_previous_indexer_base_layout(data_root.path(), &v9_identity)
+                    .unwrap()
+                    .is_none(),
+                "v9 must re-extract old Base declaration facts"
             );
         }
     }
