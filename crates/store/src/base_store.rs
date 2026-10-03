@@ -566,6 +566,7 @@ struct DigestFileIdentity {
     size: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+    known_hfs: bool,
 }
 
 #[cfg(unix)]
@@ -581,7 +582,32 @@ fn digest_file_identity(file: &fs::File) -> io::Result<DigestFileIdentity> {
         size: metadata.size(),
         modified: (metadata.mtime(), metadata.mtime_nsec()),
         changed: (metadata.ctime(), metadata.ctime_nsec()),
+        known_hfs: file_is_known_hfs(file),
     })
+}
+
+#[cfg(unix)]
+fn file_is_known_hfs(file: &fs::File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        return info
+            .f_fstypename
+            .iter()
+            .map(|c| *c as u8)
+            .take_while(|c| *c != 0)
+            .eq(b"hfs".iter().copied());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -591,15 +617,20 @@ static VERIFIED_FILE_DIGESTS: std::sync::LazyLock<
 
 #[cfg(unix)]
 fn digest_cache_eligible(identity: DigestFileIdentity, now_secs: Option<u64>) -> bool {
-    // Zero nanoseconds may mean a whole-second filesystem. Never certify
-    // metadata-only reuse there. Even fractional timestamps can be rounded:
-    // wait until the change-time second is fully past before trusting a key.
+    // Unknown whole-second filesystems cannot certify metadata-only reuse.
+    // An actual opened-file HFS identity has a known coarse resolution;
+    // reuse waits beyond its complete bucket. Fractional metadata is aged too.
     let Some(now) = now_secs else {
         return false;
     };
+    let known_coarse = identity.known_hfs && identity.changed.1 == 0;
+    let fractional = (1..1_000_000_000).contains(&identity.changed.1);
     identity.changed.0 >= 0
-        && (1..1_000_000_000).contains(&identity.changed.1)
-        && now.saturating_sub(identity.changed.0 as u64) >= 2
+        && (known_coarse || fractional)
+        // HFS timestamps are coarse. Four seconds conservatively excludes
+        // the current bucket and two-second rounding; unknown coarse filesystems
+        // still cannot certify reuse. Eligibility must hold before and after hashing.
+        && now.saturating_sub(identity.changed.0 as u64) >= if known_coarse { 4 } else { 2 }
 }
 
 #[cfg(unix)]
@@ -716,6 +747,90 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn known_hfs_cache_reuses_only_aged_keys_and_rejects_tampering() {
+        let hfs = DigestFileIdentity {
+            device: u64::MAX - 1,
+            inode: u64::MAX - 1,
+            size: 8,
+            modified: (100, 0),
+            changed: (100, 0),
+            known_hfs: true,
+        };
+        let unknown = DigestFileIdentity {
+            known_hfs: false,
+            ..hfs
+        };
+        {
+            let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+            cache.insert(hfs, hex_sha256(b"original"));
+            cache.insert(unknown, hex_sha256(b"original"));
+        }
+        assert_eq!(
+            cached_file_digest(hfs, Some(104)),
+            Some(hex_sha256(b"original"))
+        );
+        assert_eq!(cached_file_digest(unknown, Some(200)), None);
+        for now in 100..104 {
+            assert_eq!(cached_file_digest(hfs, Some(now)), None);
+        }
+        let initially_fresh = digest_cache_eligible(hfs, Some(100));
+        assert!(!digest_cache_insert_eligible(
+            initially_fresh,
+            hfs,
+            Some(200)
+        ));
+        assert!(digest_cache_insert_eligible(true, hfs, Some(104)));
+        assert_eq!(cached_file_digest(hfs, None), None);
+        assert_eq!(cached_file_digest(hfs, Some(99)), None);
+        // An aged file changed now cannot retain its old ctime even if mtime
+        // and size are restored. Fresh mutations never certify a reused key.
+        let changed = DigestFileIdentity {
+            changed: (104, 0),
+            ..hfs
+        };
+        assert_eq!(cached_file_digest(changed, Some(104)), None);
+        assert_eq!(cached_file_digest(changed, Some(108)), None);
+        let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+        cache.remove(&hfs);
+        cache.remove(&unknown);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opened_file_hfs_classification_matches_kernel_filesystem_type() {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.db");
+        fs::write(&path, b"fixture").unwrap();
+        let file = fs::File::open(path).unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) },
+            0
+        );
+        let info = unsafe { info.assume_init() };
+        let name: Vec<u8> = info
+            .f_fstypename
+            .iter()
+            .map(|c| *c as u8)
+            .take_while(|c| *c != 0)
+            .collect();
+        let identity = digest_file_identity(&file).unwrap();
+        assert_eq!(identity.known_hfs, name == b"hfs");
+        if identity.known_hfs && identity.changed.1 == 0 {
+            assert!(!digest_cache_eligible(
+                identity,
+                Some(identity.changed.0 as u64)
+            ));
+            assert!(digest_cache_eligible(
+                identity,
+                Some(identity.changed.0 as u64 + 4)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn digest_cache_does_not_promote_fresh_identity_after_long_hash() {
         let identity = DigestFileIdentity {
             device: 1,
@@ -723,6 +838,7 @@ mod tests {
             size: 8,
             modified: (100, 123_456_789),
             changed: (100, 123_456_789),
+            known_hfs: false,
         };
         let initially_fresh = digest_cache_eligible(identity, Some(100));
         assert!(!initially_fresh);
@@ -759,6 +875,7 @@ mod tests {
             size: 8,
             modified: (100, 123_456_789),
             changed: (100, 123_456_789),
+            known_hfs: false,
         };
         let coarse = DigestFileIdentity {
             changed: (100, 0),
