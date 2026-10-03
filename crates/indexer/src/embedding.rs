@@ -229,12 +229,24 @@ pub fn count_code_embedding_documents_for_project(
     provider: &dyn CodeEmbeddingProvider,
     options: EmbeddingIndexOptions,
 ) -> Result<usize> {
+    count_code_embedding_documents_for_scope(store, root, project, provider, options, &[])
+}
+
+/// Count only documents within normalized repository path prefixes.
+pub fn count_code_embedding_documents_for_scope(
+    store: &Store,
+    root: &Path,
+    project: &str,
+    provider: &dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+    prefixes: &[String],
+) -> Result<usize> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
     let mut total = 0usize;
 
     loop {
-        let nodes = if store.is_overlay() {
+        let nodes = if store.is_overlay() && prefixes.is_empty() {
             store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
         } else {
             store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
@@ -245,7 +257,9 @@ pub fn count_code_embedding_documents_for_project(
         offset += nodes.len();
 
         for node in nodes {
-            if !is_embedding_candidate_label(&node.label) {
+            if !embedding_path_matches(&node.file_path, prefixes)
+                || !is_embedding_candidate_label(&node.label)
+            {
                 continue;
             }
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
@@ -273,6 +287,18 @@ pub fn count_code_embedding_documents_for_project(
         }
     }
     Ok(total)
+}
+
+/// Match exact files or directory descendants, never neighboring prefix names.
+pub fn embedding_path_matches(file: &str, prefixes: &[String]) -> bool {
+    prefixes.is_empty()
+        || prefixes.iter().any(|prefix| {
+            prefix.is_empty()
+                || file == prefix
+                || file
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 /// Index vectors for all embeddable symbol nodes in `project`.
@@ -307,6 +333,29 @@ pub fn index_code_embeddings_for_project_with_progress(
     total_documents: usize,
     progress: &mut dyn FnMut(EmbeddingIndexProgress),
 ) -> Result<EmbeddingIndexReport> {
+    index_code_embeddings_for_scope_with_progress(
+        store,
+        root,
+        project,
+        provider,
+        options,
+        total_documents,
+        progress,
+        &[],
+    )
+}
+
+/// Scoped passes reuse the same vectors/cache and never prune unrelated rows.
+pub fn index_code_embeddings_for_scope_with_progress(
+    store: &mut Store,
+    root: &Path,
+    project: &str,
+    provider: &mut dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+    total_documents: usize,
+    progress: &mut dyn FnMut(EmbeddingIndexProgress),
+    prefixes: &[String],
+) -> Result<EmbeddingIndexReport> {
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
@@ -327,7 +376,7 @@ pub fn index_code_embeddings_for_project_with_progress(
     });
 
     loop {
-        let nodes = if store.is_overlay() {
+        let nodes = if store.is_overlay() && prefixes.is_empty() {
             store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
         } else {
             store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
@@ -337,7 +386,10 @@ pub fn index_code_embeddings_for_project_with_progress(
         }
         offset += nodes.len();
 
-        for node in nodes {
+        for mut node in nodes {
+            if !embedding_path_matches(&node.file_path, prefixes) {
+                continue;
+            }
             report.nodes_considered += 1;
             if !is_embedding_candidate_label(&node.label) {
                 report.nodes_skipped_non_definition += 1;
@@ -380,6 +432,23 @@ pub fn index_code_embeddings_for_project_with_progress(
                 continue;
             }
 
+            // Base nodes have negative ids and cannot be FK targets in the
+            // writable Delta. Copy only this scoped definition, with identical
+            // graph identity/content, before adding its vectors to the Delta.
+            // The composed graph still exposes one definition and remaps edges
+            // through its qualified name; the immutable Base remains untouched.
+            if store.is_overlay() && node.id < 0 {
+                node.id = store.insert_writable_node(&greppy_store::NewNode {
+                    project: node.project.clone(),
+                    label: node.label.clone(),
+                    name: node.name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    file_path: node.file_path.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    properties: node.properties.clone(),
+                })?;
+            }
             for chunk in chunks {
                 let content_sha256 = sha256_hex(chunk.text.as_bytes());
                 if let Some(existing) =
@@ -482,7 +551,7 @@ pub fn index_code_embeddings_for_project_with_progress(
     // missing documents (successful vectors are reused by content hash).
     // Pruning is skipped in that case so prior-generation vectors remain
     // available both for queries and for reuse on the retry.
-    if options.prune_before_generation && report.is_complete() {
+    if prefixes.is_empty() && options.prune_before_generation && report.is_complete() {
         report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, options.graph_generation)?;
     }
@@ -1491,6 +1560,272 @@ mod tests {
     }
 
     #[test]
+    fn scoped_overlay_embeds_visible_base_definitions_without_mutating_base() {
+        for warm in [false, true] {
+            let root = tempdir_via_env();
+            std::fs::create_dir_all(root.join("src/scrape")).unwrap();
+            std::fs::write(root.join("src/scrape/person.rs"), "pub fn person() {}\n").unwrap();
+            std::fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+            let base_path = root.join("base.db");
+            let delta_path = root.join("delta.db");
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+            insert_node(
+                &mut base,
+                "p.person",
+                "person",
+                "Function",
+                "src/scrape/person.rs",
+                1,
+                1,
+            );
+            insert_node(
+                &mut base,
+                "p.other",
+                "other",
+                "Function",
+                "src/other.rs",
+                1,
+                1,
+            );
+            let mut provider = DeterministicProvider;
+            if warm {
+                index_code_embeddings_for_project(
+                    &mut base,
+                    &root,
+                    "p",
+                    &mut provider,
+                    EmbeddingIndexOptions::for_generation(1),
+                )
+                .unwrap();
+            }
+            drop(base);
+            let immutable = std::fs::read(&base_path).unwrap();
+            let mut overlay = Store::open_overlay(
+                &base_path,
+                &delta_path,
+                &greppy_store::VisibilityIndex::default(),
+            )
+            .unwrap();
+            overlay
+                .upsert_project(&Project {
+                    name: "p".into(),
+                    indexed_at: "x".into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                })
+                .unwrap();
+            let prefixes = vec!["src/scrape".to_owned()];
+            let options = EmbeddingIndexOptions::for_generation(2);
+            let total = count_code_embedding_documents_for_scope(
+                &overlay, &root, "p", &provider, options, &prefixes,
+            )
+            .unwrap();
+            assert_eq!(
+                total, 1,
+                "a sparse Delta must include the requested Base definitions"
+            );
+            let report = index_code_embeddings_for_scope_with_progress(
+                &mut overlay,
+                &root,
+                "p",
+                &mut provider,
+                options,
+                total,
+                &mut |_| {},
+                &prefixes,
+            )
+            .unwrap();
+            assert_eq!(report.nodes_considered, 1);
+            assert_eq!(report.nodes_reused, usize::from(warm));
+            let query = VectorSearchQuery {
+                project: "p",
+                model_id: "test-code-embedder",
+                prompt_version: "test-prompt-v1",
+                task: "embeddinggemma_code_retrieval",
+                graph_generation: Some(2),
+                file_path: None,
+                path_prefixes: Some(&prefixes),
+                limit: 5,
+                min_score: None,
+            };
+            assert_eq!(
+                overlay.count_vector_search_scope(&query).unwrap(),
+                1,
+                "Base and Delta copies must not duplicate candidates"
+            );
+            let hits = overlay.vector_search_exact(&[1.0, 0.0], &query).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(
+                hits[0].embedding.node_id.unwrap() > 0,
+                "scoped vector must reference a writable Delta definition"
+            );
+            assert!(
+                overlay
+                    .get_node(hits[0].embedding.node_id.unwrap())
+                    .unwrap()
+                    .is_some(),
+                "vector keeps a valid composed graph reference"
+            );
+            assert_eq!(overlay.count_nodes("p", "", "").unwrap(), 2);
+            let all_visible = vec![String::new()];
+            index_code_embeddings_for_scope_with_progress(
+                &mut overlay,
+                &root,
+                "p",
+                &mut provider,
+                EmbeddingIndexOptions::for_generation(3),
+                2,
+                &mut |_| {},
+                &all_visible,
+            )
+            .unwrap();
+            assert_eq!(
+                overlay
+                    .count_vector_embeddings(
+                        "p",
+                        "test-code-embedder",
+                        "test-prompt-v1",
+                        "embeddinggemma_code_retrieval",
+                        None
+                    )
+                    .unwrap(),
+                2
+            );
+            overlay.integrity_check().unwrap();
+            assert_eq!(std::fs::read(&base_path).unwrap(), immutable);
+        }
+    }
+
+    #[test]
+    fn scoped_pass_counts_and_embeds_only_boundary_matched_paths_without_pruning() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src/scrape")).unwrap();
+        std::fs::create_dir_all(root.join("src/scraper")).unwrap();
+        std::fs::write(
+            root.join("src/scrape/person.rs"),
+            "pub fn person() { refund(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/scraper/other.rs"), "pub fn other() {}\n").unwrap();
+        let mut store = store_with_project(&root);
+        insert_node(
+            &mut store,
+            "p.person",
+            "person",
+            "Function",
+            "src/scrape/person.rs",
+            1,
+            1,
+        );
+        insert_node(
+            &mut store,
+            "p.other",
+            "other",
+            "Function",
+            "src/scraper/other.rs",
+            1,
+            1,
+        );
+        let mut provider = DeterministicProvider;
+        let cold_prefixes = vec!["src/scrape".to_owned()];
+        let cold_options = EmbeddingIndexOptions::for_generation(1);
+        let cold_total = count_code_embedding_documents_for_scope(
+            &store,
+            &root,
+            "p",
+            &provider,
+            cold_options,
+            &cold_prefixes,
+        )
+        .unwrap();
+        assert_eq!(cold_total, 1);
+        let cold = index_code_embeddings_for_scope_with_progress(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            cold_options,
+            cold_total,
+            &mut |_| {},
+            &cold_prefixes,
+        )
+        .unwrap();
+        assert_eq!(cold.nodes_considered, 1);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(1)
+                )
+                .unwrap(),
+            1
+        );
+        index_code_embeddings_for_project(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            EmbeddingIndexOptions::for_generation(1),
+        )
+        .unwrap();
+        let prefixes = vec!["src/scrape".to_owned(), "src/scrape/person.rs".to_owned()];
+        let options = EmbeddingIndexOptions::for_generation(2);
+        let total = count_code_embedding_documents_for_scope(
+            &store, &root, "p", &provider, options, &prefixes,
+        )
+        .unwrap();
+        assert_eq!(total, 1, "overlapping filters must not duplicate documents");
+        let report = index_code_embeddings_for_scope_with_progress(
+            &mut store,
+            &root,
+            "p",
+            &mut provider,
+            options,
+            total,
+            &mut |_| {},
+            &prefixes,
+        )
+        .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.nodes_considered, 1);
+        assert_eq!(report.nodes_reused, 1);
+        assert_eq!(report.stale_rows_pruned, 0);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(1)
+                )
+                .unwrap(),
+            1,
+            "unrelated vector survives"
+        );
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(2)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn long_definition_indexes_multiple_header_prefixed_chunks_covering_body() {
         let root = tempdir_via_env();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1725,6 +2060,7 @@ pub fn next_definition() {
                     task: "embeddinggemma_code_retrieval",
                     graph_generation: Some(2),
                     file_path: None,
+                    path_prefixes: None,
                     limit: 5,
                     min_score: None,
                 },
@@ -1913,6 +2249,7 @@ pub fn next_definition() {
                     task: "embeddinggemma_code_retrieval",
                     graph_generation: Some(4),
                     file_path: None,
+                    path_prefixes: None,
                     limit: 2,
                     min_score: None,
                 },
@@ -2108,6 +2445,7 @@ pub fn next_definition() {
                         task: "embeddinggemma_code_retrieval",
                         graph_generation: Some(7),
                         file_path: None,
+                        path_prefixes: None,
                         limit: 1,
                         min_score: None,
                     },
@@ -2198,6 +2536,7 @@ pub fn next_definition() {
                         task: "embeddinggemma_code_retrieval",
                         graph_generation: Some(8),
                         file_path: None,
+                        path_prefixes: None,
                         limit: 1,
                         min_score: None,
                     },

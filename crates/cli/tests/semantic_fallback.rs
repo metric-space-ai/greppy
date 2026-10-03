@@ -105,6 +105,100 @@ fn index_graph(repo: &Path, store: &Path) {
 }
 
 #[test]
+fn scoped_embedding_job_reuses_standalone_linked_graph_without_global_completion() {
+    let (primary, store, _scratch) = fixture("scoped-linked", "pub fn person_record() {}\n");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&primary, &["init"]);
+    git(&primary, &["add", "lib.rs"]);
+    git(
+        &primary,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = primary.parent().unwrap().join("linked");
+    git(
+        &primary,
+        &["worktree", "add", "-b", "scoped", linked.to_str().unwrap()],
+    );
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    let db = graph_db(&store);
+    let graph = greppy_store::Store::open(&db).unwrap();
+    let generation = graph
+        .get_workspace_state(linked.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    drop(graph);
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_BACKGROUND_EMBED_PATHS", "[\"lib.rs\"]"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(
+        !err.contains("linked worktree uses shared Base"),
+        "scoped embedding must not migrate the Base: {err}"
+    );
+    let graph = greppy_store::Store::open(&db).unwrap();
+    assert_eq!(
+        graph
+            .get_workspace_state(linked.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap()
+            .graph_generation,
+        generation
+    );
+    let stamps: Vec<(String, String)> = graph
+        .conn()
+        .prepare("SELECT key, value FROM schema_meta WHERE key LIKE 'embedding_complete:%'")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "must publish only the scoped completion stamp: {stamps:?}"
+    );
+    assert!(stamps[0].0.ends_with(":scope:[\"lib.rs\"]"), "{stamps:?}");
+    assert!(
+        stamps[0].1.starts_with(&format!("{generation}|")),
+        "{stamps:?}"
+    );
+}
+
+#[test]
 fn search_does_not_report_ownerless_metadata_as_live_embedding_progress() {
     let (repo, store, _scratch) = fixture(
         "building",

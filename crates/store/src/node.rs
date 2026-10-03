@@ -180,6 +180,13 @@ impl Store {
         if let Some(id) = self.equivalent_visible_overlay_node(n)? {
             return Ok(id);
         }
+        self.insert_writable_node(n)
+    }
+
+    /// Insert into the writable graph even when an identical Base definition exists.
+    /// Vector foreign keys require a positive Delta id; ordinary structural insertion
+    /// may instead reuse the immutable Base identity through `insert_node`.
+    pub fn insert_writable_node(&mut self, n: &NewNode) -> Result<i64> {
         let tx = self.transaction()?;
         let id = insert_node_in_tx(tx.raw(), n)?;
         tx.commit()?;
