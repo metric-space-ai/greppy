@@ -1816,6 +1816,54 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 }
 
 #[test]
+fn index_status_empty_admission_deferred_store_does_not_report_discovery_loss() {
+    let (repo, store, _scratch) = make_real_git_repo("status-deferred-no-discovery");
+    for n in 0..100 {
+        std::fs::write(repo.join(format!("src/tracked_{n}.rs")), "pub fn tracked() {}\n")
+            .unwrap();
+    }
+    git(&repo, &["add", "."]);
+    let db = store
+        .join("workspaces/v2")
+        .join(greppy_core::workspace::workspace_hash(&repo))
+        .join("graph.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    drop(greppy_store::Store::open(&db).unwrap());
+    std::fs::write(
+        db.parent().unwrap().join("index.job"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": 0,
+            "started_at_unix_secs": 1,
+            "state": "failed",
+            "failure_kind": "admission_deferred",
+            "completed_spans": 0,
+            "total_spans": 0,
+            "error": "Automatic indexing deferred by shared host admission; no index work started"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for args in [
+        vec!["index", "status", "--json"],
+        vec!["index", "status", "--json", "--diagnostics"],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 73, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["project_present"], false, "{value}");
+        assert_eq!(value["graph_generation"], serde_json::Value::Null);
+        assert_eq!(value["git_tracked_files"], 101);
+        assert_eq!(value["coverage_warning"], serde_json::Value::Null);
+        assert_eq!(value["background_job"]["state"], "failed");
+        assert_eq!(value["background_job"]["failure_kind"], "admission_deferred");
+        assert!(!out.contains("discovery may be dropping files"), "{out}");
+        assert!(!db.parent().unwrap().join("index.spawn").exists());
+    }
+}
+
+#[test]
 #[cfg(not(feature = "ci-test-assets"))]
 fn index_status_does_not_materialize_inference_assets() {
     let (repo, store, _scratch) = make_repo("status-no-assets", "status_identity_marker");
