@@ -2422,6 +2422,7 @@ fn recover_visible_effect_fn_bindings_inner(
             .or_insert(0usize) += 1;
     }
     let mut changed_paths = Vec::new();
+    let mut changed_identity = false;
     // Validate every visible source fingerprint before changing any identity.
     for (path, extraction) in &prepared {
         for node in extraction
@@ -2437,6 +2438,7 @@ fn recover_visible_effect_fn_bindings_inner(
                     && old.end_line == i64::from(node.end_line)
                 {
                     store.update_node_identity(old.id, &node.label, &node.qualified_name)?;
+                    changed_identity = true;
                 }
             }
         }
@@ -2457,10 +2459,26 @@ fn recover_visible_effect_fn_bindings_inner(
             changed_paths.push(path);
         }
     }
+    let changed_relations = !changed_paths.is_empty();
     for path in changed_paths {
         store.conn().execute("INSERT OR IGNORE INTO main.js_ts_reference_override_files(project,file_path) VALUES(?1,?2)", rusqlite::params![project,path]).map_err(sqlite_err)?;
     }
-    rebuild_visible_overlay_edges(store, project)?;
+    // Current extraction already resolved clean Base relations. Rebuilding
+    // them needlessly materializes and pins duplicate CALLS/USAGE rows in the
+    // Delta, even after an exact source revert. Older or unidentified Bases
+    // still require the compatibility repair when their raw facts are equal.
+    let current_base: bool = store
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM greppy_base.workspace_state)
+         AND NOT EXISTS(SELECT 1 FROM greppy_base.workspace_state WHERE indexer_version <> ?1)",
+            [greppy_core::INDEXER_VERSION_BASE],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if changed_identity || changed_relations || !current_base {
+        rebuild_visible_overlay_edges(store, project)?;
+    }
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [marker]).map_err(sqlite_err)?;
     Ok(true)
 }
@@ -6812,6 +6830,66 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    #[test]
+    fn effect_fn_repair_keeps_current_base_sparse_but_repairs_old_resolver_edges() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("routing.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let base_path = stores.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+        }
+        let visibility = greppy_store::VisibilityIndex::default();
+        {
+            let mut overlay =
+                Store::open_overlay(&base_path, &stores.path().join("current.db"), &visibility)
+                    .unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+            let rows: i64 = overlay
+                .conn()
+                .query_row("SELECT COUNT(*) FROM main.overlay_edges", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "unchanged current Base edges must stay shared");
+            let target = overlay
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .unwrap();
+            assert!(!overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .is_empty());
+        }
+        // An older resolver can have identical raw facts and missing resolved
+        // edges. That case must still repair the immutable Base via the Delta.
+        {
+            let base = Store::open(&base_path).unwrap();
+            base.conn()
+                .execute(
+                    "UPDATE main.workspace_state SET indexer_version='greppy-indexer-v8'",
+                    [],
+                )
+                .unwrap();
+            base.conn()
+                .execute("DELETE FROM main.edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+        }
+        let mut overlay =
+            Store::open_overlay(&base_path, &stores.path().join("old.db"), &visibility).unwrap();
+        assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+        let target = overlay
+            .get_node_by_qname("test", "routing.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        assert!(!overlay
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .is_empty());
+        let repairs: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.overlay_edges WHERE json_extract(properties,'$.greppy_base_repair_v2')=1", [], |r| r.get(0)).unwrap();
+        assert!(repairs > 0, "old resolver recovery remains active");
     }
 
     #[test]
