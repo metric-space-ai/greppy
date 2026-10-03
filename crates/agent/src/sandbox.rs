@@ -1784,32 +1784,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// U1: `/var/...`-style system-alias roots still resolve via the fixed
-    /// allowlist (macOS). On other platforms this is a no-op of the temp-dir
-    /// acceptance already covered elsewhere.
+    /// U1: the fixed macOS /var alias resolves and deduplicates with its
+    /// canonical root, independently of a caller's TMPDIR.
     #[cfg(target_os = "macos")]
     #[test]
     fn prepare_expands_macos_var_system_alias() {
-        // temp_dir() on macOS is under /var/folders/… which must expand through
-        // the fixed /var → /private/var allowlist entry.
-        let tmp = std::env::temp_dir();
+        // Both roots already exist: this test creates no temporary data on
+        // the system volume and also runs with TMPDIR on another volume.
+        let via_var = PathBuf::from("/var");
+        let canonical = PathBuf::from("/private/var");
+        assert!(via_var.is_dir(), "macOS /var system alias must exist");
         assert!(
-            tmp.starts_with("/var") || tmp.starts_with("/private/var"),
-            "expected macOS temp_dir under /var, got {}",
-            tmp.display()
+            canonical.is_dir(),
+            "macOS canonical /private/var must exist"
         );
-        let roots = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert!(
-            roots[0].starts_with("/private/var"),
-            "canonical root must live under /private/var, got {}",
-            roots[0].display()
-        );
-        // Direct /var/folders request (pre-expansion form) must also work.
-        if tmp.starts_with("/var") {
-            let via_var = prepare_writable_roots(std::slice::from_ref(&tmp)).unwrap();
-            assert_eq!(via_var[0], roots[0]);
-        }
+        let roots = prepare_writable_roots(&[via_var, canonical.clone()]).unwrap();
+        assert_eq!(roots, vec![canonical]);
     }
 
     /// U1 unit: expand_system_alias_prefixes rewrites only allowlisted heads.

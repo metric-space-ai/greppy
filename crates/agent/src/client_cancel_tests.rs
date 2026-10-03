@@ -95,7 +95,7 @@ fn completed_interruptible_turn_preserves_text_and_usage() {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
         let body = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"fixture-model\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Grüße\"}}\n\n",
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
