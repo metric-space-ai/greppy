@@ -1513,24 +1513,22 @@ mod tests {
 
     #[cfg(unix)]
     fn private_proof_fixture() -> tempfile::TempDir {
-        #[cfg(target_os = "macos")]
         let fixture = production_proof_fixture();
-        #[cfg(not(target_os = "macos"))]
-        let fixture = tempfile::tempdir().unwrap();
         trusted_digest_directory_at(fixture.path()).expect("checked private proof fixture");
         fixture
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn production_proof_fixture() -> tempfile::TempDir {
         // Tiny operational proof metadata belongs in the ownership-enforcing
         // production namespace. Base bytes stay on the disposable test volume.
         trusted_digest_directory().expect("safe native production proof namespace");
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        tempfile::tempdir_in(
-            home.join("Library/Application Support/greppy/verified-base-digests-v1"),
-        )
-        .unwrap()
+        #[cfg(target_os = "macos")]
+        let namespace = home.join("Library/Application Support/greppy/verified-base-digests-v1");
+        #[cfg(not(target_os = "macos"))]
+        let namespace = home.join(".local/share/greppy/verified-base-digests-v1");
+        tempfile::tempdir_in(namespace).unwrap()
     }
 
     #[cfg(target_os = "macos")]
