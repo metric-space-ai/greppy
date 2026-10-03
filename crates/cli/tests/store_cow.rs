@@ -1792,8 +1792,12 @@ fn overlay_matches_full_private_index_for_dirty_deleted_renamed_and_untracked_fi
         "pub fn clean_after_status_edit() -> i32 { 31 }\n",
     )
     .unwrap();
-    let (drift_code, drift_out, drift_err) =
-        run(&repo, &delta_store, &["index", "status", "--json"], overlay);
+    let (drift_code, drift_out, drift_err) = run(
+        &repo,
+        &delta_store,
+        &["index", "status", "--json", "--diagnostics"],
+        overlay,
+    );
     assert_eq!(
         drift_code, 73,
         "dirty overlay status must fail closed\nstdout={drift_out}\nstderr={drift_err}"
