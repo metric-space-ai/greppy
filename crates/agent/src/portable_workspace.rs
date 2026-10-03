@@ -494,8 +494,12 @@ impl AgentWorkspace {
         let changed_paths = filter_agent_owned_ephemeral_paths(
             &self.worktree,
             &self.baseline_tree,
-            backend_changed_paths,
+            backend_changed_paths.clone(),
         )?;
+        let excluded_paths: Vec<_> = backend_changed_paths.iter()
+            .filter(|path| !changed_paths.contains(path) && is_web_ephemeral_path(path))
+            .map(|path| format!(":(literal,exclude){path}"))
+            .collect();
         let changed_paths =
             filter_ignored_paths(&self.worktree, &self.private_index, changed_paths)?;
         let hardlink_groups = match &self.backend {
@@ -511,6 +515,7 @@ impl AgentWorkspace {
         if !changed_paths.is_empty() {
             let mut arguments = vec!["add", "-A", "--"];
             arguments.extend(changed_paths.iter().map(String::as_str));
+            arguments.extend(excluded_paths.iter().map(String::as_str));
             git_with_index(&self.worktree, &self.private_index, &arguments)?;
         }
         stage_hardlink_groups(
@@ -4694,12 +4699,7 @@ fn filter_agent_owned_ephemeral_paths(
     let excluded: Vec<_> = candidates.into_iter()
         .filter(|path| !baseline_paths.contains(path.as_str()))
         .collect();
-    paths.retain(|path| {
-        !excluded.iter().any(|ephemeral| ephemeral == path)
-            && !(excluded.iter().any(|ephemeral| ephemeral.starts_with(&format!("{path}/")))
-                && matches!(path.as_str(), ".greppy" | ".greppy/web"
-                    | ".greppy/web/runtime-routes" | ".greppy/web/session-routes"))
-    });
+    paths.retain(|path| !excluded.contains(path));
     Ok(paths)
 }
 
@@ -4949,7 +4949,7 @@ mod tests {
         ];
         assert_eq!(
             filter_agent_owned_ephemeral_paths(root.path(), &empty_tree, changed.clone()).unwrap(),
-            ["WEB_REPORT.md"]
+            [".greppy", ".greppy/web", "WEB_REPORT.md"]
         );
 
         fs::create_dir_all(root.path().join(".greppy/web")).unwrap();
@@ -5972,6 +5972,17 @@ mod tests {
                 b"{\"session\":\"runtime-only\"}\n",
             )
             .unwrap();
+        let runtime_route = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
+        fs::create_dir_all(workspace.worktree_path().join(".greppy/web/runtime-routes")).unwrap();
+        workspace.core.mkdir(&workspace.handle, ".greppy/web/runtime-routes", 0o755).unwrap();
+        for (path, contents) in [
+            (runtime_route.as_str(), b"runtime state".as_slice()),
+            (".greppy/web/user-notes.txt", b"user notes".as_slice()),
+        ] {
+            fs::write(workspace.worktree_path().join(path), contents).unwrap();
+            workspace.core.create_file(&workspace.handle, path, 0o100644).unwrap();
+            workspace.core.write(&workspace.handle, path, 0, contents).unwrap();
+        }
         let outcome = workspace.finish("agent result").unwrap();
         let (commit, ref_name, patch) = match outcome {
             RunOutcome::Proposal {
@@ -5993,6 +6004,8 @@ mod tests {
         )
         .is_empty());
         assert!(!patch.contains(WEB_CURRENT_SCOPE_PATH));
+        assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &runtime_route]).is_empty());
+        assert_eq!(git(&repo, &["show", &format!("{commit}:.greppy/web/user-notes.txt")]), "user notes");
 
         let index = git_path(&repo, "index").unwrap();
         let index_before = fs::read(&index).unwrap();
@@ -6653,6 +6666,46 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&replacement, &path).unwrap();
         assert!(verify_ordinary_identity(&root, "run", "git-run", "nonce").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_finish_preserves_user_web_ancestry_and_excludes_new_routes() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data = temp.path().join("data");
+        fs::create_dir_all(repo.join(".greppy/web/runtime-routes")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        fs::write(repo.join(".greppy/web/runtime-routes/user.sh"), b"user baseline").unwrap();
+        git(&repo, &["add", ".greppy"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
+        std::env::set_var("GREPPY_WORKSPACE_DIR", &data);
+        let workspace = AgentWorkspace::create(&repo, "ordinary-web-routes").unwrap();
+        let route = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
+        fs::write(workspace.worktree_path().join(&route), b"runtime state").unwrap();
+        let user = ".greppy/web/runtime-routes/user.sh";
+        fs::write(workspace.worktree_path().join(user), b"user update").unwrap();
+        fs::set_permissions(workspace.worktree_path().join(user), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(workspace.worktree_path().join(".greppy/web/notes.txt"), b"user notes").unwrap();
+        let commit = match workspace.finish("web result").unwrap() {
+            RunOutcome::Proposal { commit, .. } => commit,
+            RunOutcome::Clean => panic!("user files must produce a proposal"),
+        };
+        assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &route]).is_empty());
+        assert_eq!(git(&repo, &["show", &format!("{commit}:{user}")]), "user update");
+        assert!(git(&repo, &["ls-tree", &commit, "--", user]).starts_with("100755"));
+        assert_eq!(git(&repo, &["show", &format!("{commit}:.greppy/web/notes.txt")]), "user notes");
+        assert!(workspace.worktree_path().join(route).exists());
+        workspace.cleanup().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("GREPPY_WORKSPACE_DIR", value),
+            None => std::env::remove_var("GREPPY_WORKSPACE_DIR"),
+        }
     }
 
     #[cfg(unix)]
