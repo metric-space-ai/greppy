@@ -1528,7 +1528,10 @@ mod tests {
         let namespace = home.join("Library/Application Support/greppy/verified-base-digests-v1");
         #[cfg(not(target_os = "macos"))]
         let namespace = home.join(".local/share/greppy-verified-base-digests-v1");
-        tempfile::tempdir_in(namespace).unwrap()
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir_in(namespace).unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fixture
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1549,7 +1552,12 @@ mod tests {
         use std::os::unix::fs::symlink;
         let home = private_proof_fixture();
         let share = home.path().join(".local/share");
-        fs::create_dir_all(&share).unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&share)
+            .unwrap();
         // A disposable/global graph store may be redirected. Proof metadata
         // uses a separate private namespace; no symlink is traversed for trust.
         symlink("/nonexistent-disposable-greppy-store", share.join("greppy")).unwrap();
