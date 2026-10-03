@@ -1717,6 +1717,10 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
     const MAX_PARENT_DEPTH: usize = 10;
     let mut cur = node.parent();
     let mut depth = 0;
+    // A callback argument belongs to its nearest call. An outer chained
+    // method's receiver also contains the inner arguments, but does not turn
+    // those arguments into callees.
+    let mut nearest_call_seen = false;
     while let Some(n) = cur {
         if depth >= MAX_PARENT_DEPTH {
             break;
@@ -1724,8 +1728,11 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
         if RUST_USAGE_IMPORT_SUPPRESSORS.contains(&n.kind()) {
             return true;
         }
-        if n.kind() == "call_expression" && rust_node_is_call_target(node, n) {
-            return true;
+        if n.kind() == "call_expression" && !nearest_call_seen {
+            nearest_call_seen = true;
+            if rust_node_is_call_target(node, n) {
+                return true;
+            }
         }
         if n.kind() == "macro_invocation" {
             return true;
@@ -1790,6 +1797,40 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
 #[cfg(test)]
 mod rust_constructor_reference_tests {
     use super::*;
+
+    #[test]
+    fn chained_rust_calls_keep_callback_argument_usages() {
+        let code = r#"
+fn predicate(value: i32) -> bool { value > 0 }
+fn callbacks(value: Option<i32>) -> bool {
+    value.map(predicate).unwrap_or(false);
+    value.map(crate::predicate).unwrap_or(false);
+    value.map(|item| predicate(item)).unwrap_or(false);
+    predicate(1)
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut references = Vec::new();
+        walk_rust_usages(
+            code.as_bytes(),
+            tree.root_node(),
+            &mut |node, name, path| {
+                if name == "predicate" {
+                    references.push((node.start_position().row, path.map(str::to_owned)));
+                }
+            },
+        );
+        assert_eq!(
+            references,
+            vec![(3, None), (4, Some("crate::predicate".into()))],
+            "callback arguments remain usages; declarations and direct callees do not"
+        );
+    }
 
     #[test]
     fn structured_rust_value_paths_are_usages_not_definitions() {
