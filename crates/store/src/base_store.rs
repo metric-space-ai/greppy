@@ -609,10 +609,7 @@ fn verified_base_digest_at(
             }
         }
     }
-    let digest = hash_opened_file(&mut file);
-    if digest.is_err() {
-        return digest;
-    }
+    let digest = hash_opened_file(&mut file)?;
     let after = digest_file_identity(&file)?;
     if after != before {
         return Err(invalid_data("Base file changed during digest verification"));
@@ -620,7 +617,7 @@ fn verified_base_digest_at(
     // Anchor only after the matching full read and opened-file stability
     // checks. Initial eligibility remains mandatory: a long read must not
     // promote fresh metadata merely because its time bucket aged meanwhile.
-    if digest.as_deref().is_ok_and(|actual| actual == expected) {
+    if digest == expected {
         let completed = DigestVerificationTime::now();
         if let Some(directory) = proofs {
             if let Some(proof) = DigestProof::from_completed_read(
@@ -628,7 +625,7 @@ fn verified_base_digest_at(
                 after,
                 binding,
                 expected,
-                digest.as_deref(),
+                Ok(digest.as_str()),
                 started,
                 completed,
             ) {
@@ -636,7 +633,7 @@ fn verified_base_digest_at(
             }
         }
     }
-    digest
+    Ok(digest)
 }
 
 #[cfg(test)]
