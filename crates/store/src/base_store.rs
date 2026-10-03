@@ -589,6 +589,38 @@ static VERIFIED_FILE_DIGESTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<DigestFileIdentity, String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
+#[cfg(unix)]
+fn digest_cache_eligible(identity: DigestFileIdentity, now_secs: Option<u64>) -> bool {
+    // Zero nanoseconds may mean a whole-second filesystem. Never certify
+    // metadata-only reuse there. Even fractional timestamps can be rounded:
+    // wait until the change-time second is fully past before trusting a key.
+    let Some(now) = now_secs else {
+        return false;
+    };
+    identity.changed.0 >= 0
+        && (1..1_000_000_000).contains(&identity.changed.1)
+        && now.saturating_sub(identity.changed.0 as u64) >= 2
+}
+
+#[cfg(unix)]
+fn digest_now_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_secs())
+}
+
+#[cfg(unix)]
+fn cached_file_digest(identity: DigestFileIdentity, now: Option<u64>) -> Option<String> {
+    if !digest_cache_eligible(identity, now) {
+        return None;
+    }
+    VERIFIED_FILE_DIGESTS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&identity).cloned())
+}
+
 // Only memoize inside this process, never trust a persistent checksum sidecar.
 // Every process performs its first full digest. File replacement or mutation
 // invalidates reuse even when length and modification time are restored.
@@ -597,11 +629,7 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     #[cfg(unix)]
     let before = digest_file_identity(&file)?;
     #[cfg(unix)]
-    if let Some(digest) = VERIFIED_FILE_DIGESTS
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&before).cloned())
-    {
+    if let Some(digest) = cached_file_digest(before, digest_now_secs()) {
         return Ok(digest);
     }
     let mut hasher = Sha256::new();
@@ -623,12 +651,14 @@ fn file_sha256(path: &Path) -> io::Result<String> {
         if digest_file_identity(&file)? != before {
             return Err(invalid_data("Base file changed during digest verification"));
         }
-        if let Ok(mut cache) = VERIFIED_FILE_DIGESTS.lock() {
-            // Bound memory across long-lived query/agent processes.
-            if cache.len() >= 64 {
-                cache.clear();
+        if digest_cache_eligible(before, digest_now_secs()) {
+            if let Ok(mut cache) = VERIFIED_FILE_DIGESTS.lock() {
+                // Bound memory across long-lived query/agent processes.
+                if cache.len() >= 64 {
+                    cache.clear();
+                }
+                cache.insert(before, digest.clone());
             }
-            cache.insert(before, digest.clone());
         }
     }
     Ok(digest)
@@ -671,6 +701,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn digest_cache_reuses_aged_fractional_metadata_and_rejects_coarse_collision() {
+        let fine = DigestFileIdentity {
+            device: u64::MAX,
+            inode: u64::MAX,
+            size: 8,
+            modified: (100, 123_456_789),
+            changed: (100, 123_456_789),
+        };
+        let coarse = DigestFileIdentity {
+            changed: (100, 0),
+            ..fine
+        };
+        {
+            let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+            cache.insert(fine, hex_sha256(b"original"));
+            // Simulate a stale entry with an identical coarse metadata key.
+            cache.insert(coarse, hex_sha256(b"original"));
+        }
+        assert_eq!(
+            cached_file_digest(fine, Some(102)),
+            Some(hex_sha256(b"original"))
+        );
+        assert_eq!(
+            cached_file_digest(fine, Some(103)),
+            Some(hex_sha256(b"original"))
+        );
+        assert_eq!(cached_file_digest(coarse, Some(102)), None);
+        assert_eq!(cached_file_digest(coarse, Some(200)), None);
+        // Fractional resolution alone is insufficient in the current time bucket.
+        assert_eq!(cached_file_digest(fine, Some(100)), None);
+        assert_eq!(cached_file_digest(fine, Some(101)), None);
+        assert_eq!(cached_file_digest(fine, None), None);
+        assert_eq!(cached_file_digest(fine, Some(99)), None);
+        let changed = DigestFileIdentity {
+            changed: (102, 123_456_789),
+            ..fine
+        };
+        assert_eq!(cached_file_digest(changed, Some(104)), None);
+        let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+        cache.remove(&fine);
+        cache.remove(&coarse);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn process_digest_cache_invalidates_same_length_tamper_with_restored_mtime() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("graph.db");
@@ -678,12 +753,15 @@ mod tests {
         let original_time = fs::metadata(&path).unwrap().modified().unwrap();
         let original = file_sha256(&path).unwrap();
         let stamp = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
-        assert_eq!(
-            VERIFIED_FILE_DIGESTS.lock().unwrap().get(&stamp),
-            Some(&original)
-        );
+        // Seed the stale entry the previous implementation would trust. The
+        // eligibility guard must reject it on fresh/coarse metadata, including
+        // when the later write returns exactly the same ctime.
+        VERIFIED_FILE_DIGESTS
+            .lock()
+            .unwrap()
+            .insert(stamp, original.clone());
         assert_eq!(file_sha256(&path).unwrap(), original);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+
         fs::write(&path, b"tampered").unwrap();
         fs::File::options()
             .write(true)
@@ -694,9 +772,11 @@ mod tests {
         let changed = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
         assert_eq!(changed.size, stamp.size);
         assert_eq!(changed.modified, stamp.modified);
-        assert_ne!(changed.changed, stamp.changed);
+        // A whole-second filesystem can return the identical ctime here.
+        // This is precisely the regression: identical metadata must not certify stale bytes.
         assert_eq!(file_sha256(&path).unwrap(), hex_sha256(b"tampered"));
         assert_ne!(file_sha256(&path).unwrap(), original);
+        VERIFIED_FILE_DIGESTS.lock().unwrap().remove(&stamp);
     }
 
     #[cfg(unix)]
