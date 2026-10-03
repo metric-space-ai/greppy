@@ -2959,9 +2959,10 @@ mod tests {
         }
     }
 
-    fn assert_persisted_v7_delta_query_is_correct(root: &str) -> std::result::Result<(), String> {
-        let cli = crate::Cli::try_parse_from(["greppy", "--root", root, "who-calls", "target"])
-            .map_err(|error| error.to_string())?;
+    fn assert_persisted_v7_delta_query_is_correct(
+        root: &str,
+        cli: crate::Cli,
+    ) -> std::result::Result<(), String> {
         let exit = crate::dispatch(cli).map_err(|error| error.to_string())?;
         if exit != 0 {
             return Err(format!("who-calls CLI returned exit code {exit}"));
@@ -3976,15 +3977,33 @@ mod tests {
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let first_start = std::sync::Arc::clone(&start);
         let first_root = root_string.clone();
+        // Parse the complete Clap surface on the existing fixture thread;
+        // only the normal query/repair dispatch must run concurrently here.
+        let first_cli = crate::Cli::try_parse_from([
+            "greppy",
+            "--root",
+            first_root.as_str(),
+            "who-calls",
+            "target",
+        ])
+        .unwrap();
         let first = std::thread::spawn(move || {
             first_start.wait();
-            assert_persisted_v7_delta_query_is_correct(&first_root)
+            assert_persisted_v7_delta_query_is_correct(&first_root, first_cli)
         });
         let second_start = std::sync::Arc::clone(&start);
         let second_root = root_string.clone();
+        let second_cli = crate::Cli::try_parse_from([
+            "greppy",
+            "--root",
+            second_root.as_str(),
+            "who-calls",
+            "target",
+        ])
+        .unwrap();
         let second = std::thread::spawn(move || {
             second_start.wait();
-            assert_persisted_v7_delta_query_is_correct(&second_root)
+            assert_persisted_v7_delta_query_is_correct(&second_root, second_cli)
         });
         start.wait();
         // Exercise the normal freshness wait budget rather than the old

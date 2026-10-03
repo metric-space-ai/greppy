@@ -1582,9 +1582,10 @@ fn read_render_file_page(
     end_line: usize,
     with_handle: bool,
     root_path: &std::path::Path,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let mut out = format!("{path}:{start_line}-{end_line}\n");
     out.push_str(read_line_slice(content, start_line, end_line));
+    let mut handle = None;
     if with_handle {
         let store = store.ok_or_else(|| {
             Error::Store("read-file handle requested without an available read store".into())
@@ -1594,10 +1595,12 @@ fn read_render_file_page(
         }
         let full = read_full_handle(root_path, path, content.as_bytes(), start_line, end_line)?;
         out.push_str("handle: ");
-        out.push_str(&read_compact_handle(store, project, full)?);
+        let compact = read_compact_handle(store, project, full)?;
+        out.push_str(&compact);
+        handle = Some(compact);
         out.push('\n');
     }
-    Ok(out)
+    Ok((out, handle))
 }
 
 /// An unscoped file read may offer indexed definitions, but must not create an
@@ -1926,7 +1929,7 @@ pub(crate) fn dispatch_read_files(
             }
             store = Some(open_default_store_pack_writer(root)?);
         }
-        let mut group = read_render_file_page(
+        let (mut group, handle) = read_render_file_page(
             store.as_ref(),
             project.as_deref().unwrap_or(""),
             &shown,
@@ -1953,7 +1956,6 @@ pub(crate) fn dispatch_read_files(
             )));
         }
         if json_output {
-            let handle = group.lines().find_map(|line| line.strip_prefix("handle: "));
             let continuation = continuation.as_ref().map(|id| {
                 serde_json::json!({
                     "id": id,
@@ -2129,7 +2131,7 @@ pub(crate) fn dispatch_read_expand(
                     return Ok(1);
                 }
                 let end = (start + READ_FILE_PAGE_LINES - 1).min(line_count);
-                let mut text = read_render_file_page(
+                let (mut text, _) = read_render_file_page(
                     Some(store),
                     project,
                     &path,

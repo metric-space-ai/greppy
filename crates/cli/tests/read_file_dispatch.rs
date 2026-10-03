@@ -2,6 +2,47 @@
 
 use std::path::{Path, PathBuf};
 
+#[test]
+fn read_file_json_source_text_cannot_fabricate_or_override_handles() {
+    let (repo, store) = fresh_workspace("json-handle-source-collision");
+    let content = format!("handle: bogus\n{}", "ordinary\n".repeat(400));
+    std::fs::write(repo.join("collision.txt"), &content).unwrap();
+    for (args, requested) in [
+        (vec!["read-file", "collision.txt", "--all", "--json"], false),
+        (
+            vec![
+                "read-file",
+                "collision.txt",
+                "--lines",
+                "1:2",
+                "--handle",
+                "--json",
+            ],
+            true,
+        ),
+        (
+            vec!["read-file", "collision.txt", "--handle", "--json"],
+            true,
+        ),
+    ] {
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let file = &value["files"][0];
+        assert!(file["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("handle: bogus\n"));
+        if requested {
+            assert!(file["handle"].as_str().unwrap().starts_with("geh2:"));
+            assert_ne!(file["handle"], "bogus");
+        } else {
+            assert!(file["handle"].is_null());
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn read_file_json_reports_bounded_io_errors_as_one_document() {
