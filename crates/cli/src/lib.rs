@@ -9627,10 +9627,10 @@ fn preparation_recovery_message(freshness: &serde_json::Value) -> String {
         .unwrap_or("greppy index status --json");
     match freshness.get("state").and_then(serde_json::Value::as_str) {
         Some("refreshing") => format!("index publication is in progress; inspect `{diagnostics}`, then retry this command after publication"),
-        Some("unknown") => format!("freshness could not be verified; inspect `{diagnostics}`, then retry this command when host capacity is available"),
+        Some("unknown") => format!("freshness could not be verified; inspect `{diagnostics}` and resolve the reported freshness failure before retrying this command"),
         Some("failed") => match freshness.get("preparation_error").and_then(serde_json::Value::as_str) {
             Some(error) => format!("{error} Inspect `{diagnostics}`; retry the original command after resolving this preparation failure"),
-            None => format!("automatic index preparation failed; inspect `{diagnostics}` for the admission or startup failure, then retry this command when host capacity is available"),
+            None => format!("automatic index preparation failed; inspect `{diagnostics}` for the concrete failure, resolve it, then retry this command"),
         },
         _ => STALE_REMEDIATION.into(),
     }

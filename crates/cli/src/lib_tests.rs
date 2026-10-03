@@ -286,14 +286,20 @@ fn indexed_refusal_recovery_matches_observed_freshness_state() {
         "{message}"
     );
     let unknown = serde_json::json!({
-        "state": "unknown", "reasons": ["inventory budget exhausted"]
+        "state": "unknown", "reasons": ["Store-CoW freshness proof failed: private row absent from Delta visibility manifest"]
     });
     let message = indexed_stale_skip_message("search-symbol", &unknown);
     assert!(
         message.contains("freshness could not be verified"),
         "{message}"
     );
-    assert!(message.contains("retry this command"), "{message}");
+    assert!(message.contains("retrying this command"), "{message}");
+    assert!(
+        message.contains("resolve the reported freshness failure"),
+        "{message}"
+    );
+    assert!(message.contains("Delta visibility manifest"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
     assert!(!message.contains("publication is in progress"), "{message}");
     let failed = serde_json::json!({
         "state": "failed", "reasons": ["files modified since last index"]
@@ -304,6 +310,7 @@ fn indexed_refusal_recovery_matches_observed_freshness_state() {
         "{message}"
     );
     assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
     assert!(!message.contains("publication is in progress"), "{message}");
     let drift = serde_json::json!({
         "state": "drift", "reasons": ["files modified since last index"]
