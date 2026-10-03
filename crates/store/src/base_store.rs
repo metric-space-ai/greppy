@@ -1219,6 +1219,16 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn clear_test_acl(path: &Path) {
+        let result = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(result.success());
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn persistent_digest_mac_acl_rejects_writable_ancestor_directory_and_proof() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1295,6 +1305,8 @@ mod tests {
         set_test_acl(&path, "everyone allow read,readattr,readsecurity");
         assert!(validate_private_proof_file(&fs::File::open(&path).unwrap()).is_ok());
         assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_some());
+        clear_test_acl(&path);
+        clear_test_acl(fixture.path());
     }
 
     #[cfg(target_os = "macos")]
