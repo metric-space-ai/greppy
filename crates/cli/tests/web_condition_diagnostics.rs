@@ -66,3 +66,18 @@ fn valid_css_and_javascript_regex_reach_session_resolution() {
         assert!(!output.contains("unknown query kind"), "{output}");
     }
 }
+
+#[test]
+fn extraction_suffix_is_diagnosed_before_runtime_resolution() {
+    let query =
+        "css=#reviews, #review-form, .review-toolbar, .review-add, div[data-block=reviews] => text";
+    for verb in ["extract", "find", "wait", "assert"] {
+        let (code, output) = run(verb, query);
+        assert_eq!(code, 30, "{verb}: {output}");
+        assert!(output.contains("invalid CSS query"), "{output}");
+        assert!(output.contains("--fields text"), "{output}");
+        assert!(!output.contains("engine_error"), "{output}");
+        assert!(!output.contains("web.doctor"), "{output}");
+        assert!(!output.contains("no current web session"), "{output}");
+    }
+}
