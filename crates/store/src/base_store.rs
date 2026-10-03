@@ -603,6 +603,15 @@ fn digest_cache_eligible(identity: DigestFileIdentity, now_secs: Option<u64>) ->
 }
 
 #[cfg(unix)]
+fn digest_cache_insert_eligible(
+    eligible_at_start: bool,
+    identity: DigestFileIdentity,
+    now_secs: Option<u64>,
+) -> bool {
+    eligible_at_start && digest_cache_eligible(identity, now_secs)
+}
+
+#[cfg(unix)]
 fn digest_now_secs() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -629,7 +638,11 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     #[cfg(unix)]
     let before = digest_file_identity(&file)?;
     #[cfg(unix)]
-    if let Some(digest) = cached_file_digest(before, digest_now_secs()) {
+    let started_at = digest_now_secs();
+    #[cfg(unix)]
+    let eligible_at_start = digest_cache_eligible(before, started_at);
+    #[cfg(unix)]
+    if let Some(digest) = cached_file_digest(before, started_at) {
         return Ok(digest);
     }
     let mut hasher = Sha256::new();
@@ -651,7 +664,9 @@ fn file_sha256(path: &Path) -> io::Result<String> {
         if digest_file_identity(&file)? != before {
             return Err(invalid_data("Base file changed during digest verification"));
         }
-        if digest_cache_eligible(before, digest_now_secs()) {
+        // A long read must not promote an initially fresh/rounded identity
+        // into a trusted digest merely because its time bucket aged meanwhile.
+        if digest_cache_insert_eligible(eligible_at_start, before, digest_now_secs()) {
             if let Ok(mut cache) = VERIFIED_FILE_DIGESTS.lock() {
                 // Bound memory across long-lived query/agent processes.
                 if cache.len() >= 64 {
@@ -698,6 +713,42 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_cache_does_not_promote_fresh_identity_after_long_hash() {
+        let identity = DigestFileIdentity {
+            device: 1,
+            inode: 1,
+            size: 8,
+            modified: (100, 123_456_789),
+            changed: (100, 123_456_789),
+        };
+        let initially_fresh = digest_cache_eligible(identity, Some(100));
+        assert!(!initially_fresh);
+        assert!(digest_cache_eligible(identity, Some(103)));
+        assert!(!digest_cache_insert_eligible(
+            initially_fresh,
+            identity,
+            Some(103)
+        ));
+        let initially_aged = digest_cache_eligible(identity, Some(102));
+        assert!(digest_cache_insert_eligible(
+            initially_aged,
+            identity,
+            Some(103)
+        ));
+        assert!(!digest_cache_insert_eligible(
+            initially_aged,
+            identity,
+            Some(100)
+        ));
+        assert!(!digest_cache_insert_eligible(
+            initially_aged,
+            identity,
+            None
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
