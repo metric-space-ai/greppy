@@ -1,4 +1,54 @@
 #[test]
+fn rejected_model_changes_preserve_the_active_and_persisted_model() {
+    let root = tempfile::tempdir().unwrap();
+    let (server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    lock_state(&server.state)
+        .sessions
+        .get_mut(&id)
+        .unwrap()
+        .busy = true;
+    let rejected = request(
+        &server,
+        &rx,
+        "busy-model",
+        "session/set_model",
+        json!({"sessionId":id, "modelId":"rejected-busy-model"}),
+    );
+    assert_eq!(rejected["error"]["code"], -32600);
+    {
+        let mut state = lock_state(&server.state);
+        let session = state.sessions.get_mut(&id).unwrap();
+        assert_eq!(session.model, "fixture-model");
+        session.busy = false;
+        let (data_root, project) = server.store_identity(&session.cwd);
+        assert_eq!(
+            SessionStore::new(data_root, project)
+                .load(&id)
+                .unwrap()
+                .model,
+            "fixture-model"
+        );
+    }
+    let data_root = server.config.data_root.as_ref().unwrap();
+    std::fs::remove_dir_all(data_root).unwrap();
+    std::fs::write(data_root, b"fixture blocks model persistence").unwrap();
+    let rejected = request(
+        &server,
+        &rx,
+        "unsaved-model",
+        "session/set_config_option",
+        json!({"sessionId":id, "configId":"model", "value":"unsaved-model"}),
+    );
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert_eq!(
+        lock_state(&server.state).sessions[&id].model,
+        "fixture-model"
+    );
+}
+
+#[test]
 fn persistence_failure_is_reported_instead_of_claiming_a_saved_turn() {
     let root = tempfile::tempdir().unwrap();
     let (server, rx) = fixture(root.path());

@@ -679,22 +679,22 @@ impl Server {
     }
 
     fn write_model(&self, session_id: &str, model_id: &str, id: &Value) -> Value {
-        let (cwd, project) = {
-            let mut state = lock_state(&self.state);
-            let Some(session) = state.sessions.get_mut(session_id) else {
-                return rpc_error(id, -32002, &format!("session not found: {session_id}"));
-            };
-            if session.closed {
-                return rpc_error(id, -32600, "session is closed");
-            }
-            session.model = model_id.to_string();
-            (session.cwd.clone(), session.project.clone())
+        let mut state = lock_state(&self.state);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return rpc_error(id, -32002, &format!("session not found: {session_id}"));
         };
-        let (data_root, _) = self.store_identity(&cwd);
-        let store = SessionStore::new(data_root, project);
+        if session.closed {
+            return rpc_error(id, -32600, "session is closed");
+        }
+        if session.busy {
+            return rpc_error(id, -32600, "session is busy");
+        }
+        let (data_root, _) = self.store_identity(&session.cwd);
+        let store = SessionStore::new(data_root, session.project.clone());
         if let Err(error) = store.set_model(session_id, model_id) {
             return rpc_error(id, -32603, &format!("cannot persist model: {error}"));
         }
+        session.model = model_id.to_string();
         rpc_ok(id, json!({}))
     }
 
