@@ -69,7 +69,8 @@ fn valid_css_and_javascript_regex_reach_session_resolution() {
 
 #[test]
 fn extraction_suffix_is_diagnosed_before_runtime_resolution() {
-    let query = "css=#reviews, #review-form, .review-toolbar, .review-add, div[data-block=reviews] => text";
+    let query =
+        "css=#reviews, #review-form, .review-toolbar, .review-add, div[data-block=reviews] => text";
     for verb in ["extract", "find", "wait", "assert"] {
         let (code, output) = run(verb, query);
         assert_eq!(code, 30, "{verb}: {output}");
