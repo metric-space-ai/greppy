@@ -5492,7 +5492,11 @@ await browser.close();
     let paths: Vec<_> = fixture.events.try_iter().collect();
     assert!(paths.iter().any(|path| path == "/redirect"), "{paths:?}");
     assert!(
-        paths.iter().filter(|path| path.as_str() == "/landed").count() >= 3,
+        paths
+            .iter()
+            .filter(|path| path.as_str() == "/landed")
+            .count()
+            >= 3,
         "{paths:?}"
     );
     assert!(paths.iter().any(|path| path == "/landed?v=2"), "{paths:?}");
