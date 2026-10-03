@@ -496,7 +496,8 @@ impl AgentWorkspace {
             &self.baseline_tree,
             backend_changed_paths.clone(),
         )?;
-        let excluded_paths: Vec<_> = backend_changed_paths.iter()
+        let excluded_paths: Vec<_> = backend_changed_paths
+            .iter()
             .filter(|path| !changed_paths.contains(path) && is_web_ephemeral_path(path))
             .map(|path| format!(":(literal,exclude){path}"))
             .collect();
@@ -4659,10 +4660,8 @@ fn filter_ignored_paths(
 }
 
 const WEB_CURRENT_SCOPE_PATH: &str = ".greppy/web/current.json";
-const WEB_ROUTE_DIRECTORIES: [&str; 2] = [
-    ".greppy/web/runtime-routes",
-    ".greppy/web/session-routes",
-];
+const WEB_ROUTE_DIRECTORIES: [&str; 2] =
+    [".greppy/web/runtime-routes", ".greppy/web/session-routes"];
 
 fn is_web_ephemeral_path(path: &str) -> bool {
     if path == WEB_CURRENT_SCOPE_PATH {
@@ -4674,7 +4673,9 @@ fn is_web_ephemeral_path(path: &str) -> bool {
             .and_then(|name| name.strip_suffix(".json"))
             .is_some_and(|digest| {
                 digest.len() == 64
-                    && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             })
     })
 }
@@ -4684,7 +4685,11 @@ fn filter_agent_owned_ephemeral_paths(
     baseline_tree: &str,
     mut paths: Vec<String>,
 ) -> Result<Vec<String>, WorkspaceError> {
-    let candidates: Vec<_> = paths.iter().filter(|path| is_web_ephemeral_path(path)).cloned().collect();
+    let candidates: Vec<_> = paths
+        .iter()
+        .filter(|path| is_web_ephemeral_path(path))
+        .cloned()
+        .collect();
     if candidates.is_empty() {
         return Ok(paths);
     }
@@ -4696,7 +4701,8 @@ fn filter_agent_owned_ephemeral_paths(
     args.extend(candidates.iter().map(String::as_str));
     let baseline_entries = git_ok(worktree, &args)?;
     let baseline_paths: std::collections::HashSet<_> = baseline_entries.lines().collect();
-    let excluded: Vec<_> = candidates.into_iter()
+    let excluded: Vec<_> = candidates
+        .into_iter()
         .filter(|path| !baseline_paths.contains(path.as_str()))
         .collect();
     paths.retain(|path| !excluded.contains(path));
@@ -4988,15 +4994,27 @@ mod tests {
         let new_runtime = format!(".greppy/web/runtime-routes/{}.json", "b".repeat(64));
         let custom = ".greppy/web/session-routes/notes.json".to_string();
         let report = "AGENT_RESPONSE.json".to_string();
-        let paths = vec![runtime.clone(), new_runtime, session.clone(), custom.clone(), report.clone()];
+        let paths = vec![
+            runtime.clone(),
+            new_runtime,
+            session.clone(),
+            custom.clone(),
+            report.clone(),
+        ];
         assert_eq!(
             filter_agent_owned_ephemeral_paths(root.path(), &tree, paths).unwrap(),
             vec![runtime, custom, report]
         );
         assert!(is_web_ephemeral_path(&session));
         assert!(!is_web_ephemeral_path(&format!("{session}/child")));
-        assert!(!is_web_ephemeral_path(&format!(".greppy/web/session-routes/{}.json", "a".repeat(63))));
-        assert!(!is_web_ephemeral_path(&format!(".greppy/web/runtime-routes/{}.json", "G".repeat(64))));
+        assert!(!is_web_ephemeral_path(&format!(
+            ".greppy/web/session-routes/{}.json",
+            "a".repeat(63)
+        )));
+        assert!(!is_web_ephemeral_path(&format!(
+            ".greppy/web/runtime-routes/{}.json",
+            "G".repeat(64)
+        )));
     }
 
     #[test]
@@ -5974,14 +5992,23 @@ mod tests {
             .unwrap();
         let runtime_route = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
         fs::create_dir_all(workspace.worktree_path().join(".greppy/web/runtime-routes")).unwrap();
-        workspace.core.mkdir(&workspace.handle, ".greppy/web/runtime-routes", 0o755).unwrap();
+        workspace
+            .core
+            .mkdir(&workspace.handle, ".greppy/web/runtime-routes", 0o755)
+            .unwrap();
         for (path, contents) in [
             (runtime_route.as_str(), b"runtime state".as_slice()),
             (".greppy/web/user-notes.txt", b"user notes".as_slice()),
         ] {
             fs::write(workspace.worktree_path().join(path), contents).unwrap();
-            workspace.core.create_file(&workspace.handle, path, 0o100644).unwrap();
-            workspace.core.write(&workspace.handle, path, 0, contents).unwrap();
+            workspace
+                .core
+                .create_file(&workspace.handle, path, 0o100644)
+                .unwrap();
+            workspace
+                .core
+                .write(&workspace.handle, path, 0, contents)
+                .unwrap();
         }
         let outcome = workspace.finish("agent result").unwrap();
         let (commit, ref_name, patch) = match outcome {
@@ -6005,7 +6032,13 @@ mod tests {
         .is_empty());
         assert!(!patch.contains(WEB_CURRENT_SCOPE_PATH));
         assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &runtime_route]).is_empty());
-        assert_eq!(git(&repo, &["show", &format!("{commit}:.greppy/web/user-notes.txt")]), "user notes");
+        assert_eq!(
+            git(
+                &repo,
+                &["show", &format!("{commit}:.greppy/web/user-notes.txt")]
+            ),
+            "user notes"
+        );
 
         let index = git_path(&repo, "index").unwrap();
         let index_before = fs::read(&index).unwrap();
@@ -6680,7 +6713,11 @@ mod tests {
         git(&repo, &["init", "-q"]);
         git(&repo, &["config", "user.name", "Test"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
-        fs::write(repo.join(".greppy/web/runtime-routes/user.sh"), b"user baseline").unwrap();
+        fs::write(
+            repo.join(".greppy/web/runtime-routes/user.sh"),
+            b"user baseline",
+        )
+        .unwrap();
         git(&repo, &["add", ".greppy"]);
         git(&repo, &["commit", "-qm", "base"]);
         let previous = std::env::var_os("GREPPY_WORKSPACE_DIR");
@@ -6690,16 +6727,30 @@ mod tests {
         fs::write(workspace.worktree_path().join(&route), b"runtime state").unwrap();
         let user = ".greppy/web/runtime-routes/user.sh";
         fs::write(workspace.worktree_path().join(user), b"user update").unwrap();
-        fs::set_permissions(workspace.worktree_path().join(user), fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(workspace.worktree_path().join(".greppy/web/notes.txt"), b"user notes").unwrap();
+        fs::set_permissions(
+            workspace.worktree_path().join(user),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            workspace.worktree_path().join(".greppy/web/notes.txt"),
+            b"user notes",
+        )
+        .unwrap();
         let commit = match workspace.finish("web result").unwrap() {
             RunOutcome::Proposal { commit, .. } => commit,
             RunOutcome::Clean => panic!("user files must produce a proposal"),
         };
         assert!(git(&repo, &["ls-tree", "-r", &commit, "--", &route]).is_empty());
-        assert_eq!(git(&repo, &["show", &format!("{commit}:{user}")]), "user update");
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:{user}")]),
+            "user update"
+        );
         assert!(git(&repo, &["ls-tree", &commit, "--", user]).starts_with("100755"));
-        assert_eq!(git(&repo, &["show", &format!("{commit}:.greppy/web/notes.txt")]), "user notes");
+        assert_eq!(
+            git(&repo, &["show", &format!("{commit}:.greppy/web/notes.txt")]),
+            "user notes"
+        );
         assert!(workspace.worktree_path().join(route).exists());
         workspace.cleanup().unwrap();
         match previous {
