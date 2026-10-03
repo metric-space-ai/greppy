@@ -273,7 +273,10 @@ fn search_missing_asset_names_the_unavailable_backend() {
     use sha2::Digest as _;
     let mut digest = sha2::Sha256::new();
     for (name, value) in [
-        ("embeddinggemma-300M-Q4_K.gguf", env!("GREPPY_EMBEDDED_GGUF_SHA")),
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
         ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
     ] {
         digest.update(name.as_bytes());
@@ -294,7 +297,8 @@ fn search_missing_asset_names_the_unavailable_backend() {
             file_path: node.file_path,
             start_line: node.start_line,
             end_line: node.end_line,
-            content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+            content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
             graph_generation: generation,
             vector: vec![1.0, 0.0],
         })
@@ -303,7 +307,10 @@ fn search_missing_asset_names_the_unavailable_backend() {
         .conn()
         .execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?1, ?2)",
-            rusqlite::params![format!("embedding_complete:{}", node.project), format!("{generation}|{model_id}")],
+            rusqlite::params![
+                format!("embedding_complete:{}", node.project),
+                format!("{generation}|{model_id}")
+            ],
         )
         .unwrap();
     drop(graph);
