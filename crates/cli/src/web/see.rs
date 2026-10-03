@@ -52,7 +52,7 @@ pub enum SeeCommand {
     ///
     ///   greppy web extract 'css=a.lnk' --fields text,href
     Extract {
-        /// Node query, same grammar as `find`.
+        /// Node query, same grammar as `find`; select output with --fields, not `=>`.
         query: String,
         /// Comma-separated fields: text, href, value, id, tag, attr:NAME.
         #[arg(long, default_value = "text")]
@@ -157,9 +157,6 @@ pub(super) fn dispatch(command: SeeCommand, root: Option<&str>) -> Result<i32> {
             session,
             json,
         } => {
-            if let Err(message) = validate_query(&query) {
-                return emit_error(json, invalid(&format!("web extract: {message}")));
-            }
             if let Err(message) = validate_query(&query) {
                 return emit_error(json, invalid(&format!("web extract: {message}")));
             }
@@ -424,6 +421,42 @@ mod tests {
     }
 
     #[test]
+    fn css_projection_has_actionable_preflight_diagnostics() {
+        for query in [
+            "css=#reviews, #review-form, .review-toolbar, .review-add, div[data-block=reviews] => text",
+            "#reviews => text",
+            r##"css="#reviews => text""##,
+            "css=a[href='=>'] => href",
+        ] {
+            for result in [validate_query(query), validate_condition_query(query)] {
+                let message = result.expect_err(query);
+                assert!(message.contains("invalid CSS query"), "{message}");
+                assert!(message.contains("--fields text"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn literal_css_arrows_and_other_query_kinds_are_preserved() {
+        for query in [
+            r#"css=a[data-label="=> text"]"#,
+            "a[data-label='=>']",
+            r#"css=#foo\=\>bar"#,
+            "css=a/* => text */ > span",
+            r#"css=a[data-label="escaped\" => text"]"#,
+            "text= => text",
+            "text~/=> text/i",
+            "xpath=//*[@title='=>']",
+            "div~span",
+        ] {
+            assert!(validate_query(query).is_ok(), "{query}");
+            assert!(validate_condition_query(query).is_ok(), "{query}");
+        }
+        // Unrelated malformed CSS stays an engine/parser responsibility.
+        assert!(validate_query("css=[").is_ok());
+    }
+
+    #[test]
     fn node_query_quotes_are_only_cli_grouping() {
         assert_eq!(normalize_node_query("css=a b"), "css=a b");
         assert_eq!(normalize_node_query(r#"css="a b""#), "css=a b");
@@ -586,6 +619,50 @@ fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
     }
 }
 
+/// Recognize unsupported projection syntax without parsing CSS. Quotes,
+/// comments and escapes can contain literal arrows in valid selectors.
+fn css_projection_suffix(query: &str) -> bool {
+    let normalized = normalize_node_query(query);
+    let selector = if let Some(selector) = normalized.strip_prefix("css=") {
+        selector
+    } else {
+        if let Some(split) = normalized.find(['=', '~']) {
+            let kind = &normalized[..split];
+            if !kind.is_empty() && kind.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                let op = normalized.as_bytes()[split];
+                if op == b'=' || matches!(kind, "css" | "xpath" | "text" | "role" | "id" | "tag") {
+                    return false;
+                }
+            }
+        }
+        &normalized
+    };
+    let mut chars = selector.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            chars.next();
+        } else if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else if ch == '=' && chars.peek() == Some(&'>') {
+            return true;
+        }
+    }
+    false
+}
+
 fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result<(), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -593,6 +670,9 @@ fn validate_query_impl(query: &str, validate_regex: bool) -> std::result::Result
     }
     if let Some(message) = wait_condition_used_as_node_query(trimmed) {
         return Err(message);
+    }
+    if css_projection_suffix(trimmed) {
+        return Err("invalid CSS query: `=>` is not an extraction operator; remove the suffix and use `greppy web extract 'css=SELECTOR' --fields text` (or --fields text,href)".into());
     }
     const KINDS: [&str; 6] = ["css", "xpath", "text", "role", "id", "tag"];
     let Some(split) = trimmed.find(['=', '~']) else {
