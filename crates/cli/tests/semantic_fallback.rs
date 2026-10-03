@@ -261,6 +261,53 @@ fn search_missing_asset_names_the_unavailable_backend() {
     );
     index_graph(&repo, &store);
 
+    // This tests missing query assets on a published vector snapshot. A cold
+    // graph with inference disabled must fail the owner launch earlier instead.
+    let mut graph = greppy_store::Store::open(&graph_db(&store)).unwrap();
+    let generation = graph
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    let node = graph.list_nodes("repo", "", "", 0, 1).unwrap().remove(0);
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    for (name, value) in [
+        ("embeddinggemma-300M-Q4_K.gguf", env!("GREPPY_EMBEDDED_GGUF_SHA")),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    let model_id = format!("google/embeddinggemma-300m@sha256:{:x}", digest.finalize());
+    graph
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: node.project.clone(),
+            model_id: model_id.clone(),
+            prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+            task: greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE.into(),
+            node_id: Some(node.id),
+            chunk_idx: 0,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+            graph_generation: generation,
+            vector: vec![1.0, 0.0],
+        })
+        .unwrap();
+    graph
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("embedding_complete:{}", node.project), format!("{generation}|{model_id}")],
+        )
+        .unwrap();
+    drop(graph);
+
     let (code, stdout, stderr) = run(
         &["search", "find asset fallback marker"],
         &repo,
