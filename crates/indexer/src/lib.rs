@@ -5068,6 +5068,11 @@ impl GraphIndex {
     }
 
     fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
+        if edge.properties.get("ref_local_binding").and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return None;
+        }
         let name = edge
             .properties
             .get("ref_name")

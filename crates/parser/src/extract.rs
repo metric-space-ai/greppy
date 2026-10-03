@@ -1743,6 +1743,82 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
     false
 }
 
+/// Bare value names bound in an active local scope do not name a module
+/// function. Only patterns bind; initializer calls and parameter types do not.
+fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: &str) -> bool {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier") {
+            return node_text(source, pattern) == name;
+        }
+        let constructor = pattern.child_by_field_name("type");
+        let field_label = (pattern.kind() == "field_pattern")
+            .then(|| pattern.child_by_field_name("name"))
+            .flatten();
+        (0..pattern.named_child_count())
+            .filter_map(|index| pattern.named_child(index))
+            .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
+            .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "block" {
+            for index in 0..scope.named_child_count() {
+                let Some(declaration) = scope.named_child(index) else { continue };
+                if declaration.kind() == "let_declaration"
+                    && declaration.end_byte() <= reference.start_byte()
+                    && declaration.child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if matches!(scope.kind(), "function_item" | "closure_expression") {
+            if let Some(parameters) = scope.child_by_field_name("parameters") {
+                for index in 0..parameters.named_child_count() {
+                    let Some(parameter) = parameters.named_child(index) else { continue };
+                    let pattern = parameter.child_by_field_name("pattern")
+                        .or_else(|| (parameter.kind() == "identifier").then_some(parameter));
+                    if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                        return true;
+                    }
+                }
+            }
+            if scope.kind() == "function_item" {
+                break;
+            }
+        }
+        if scope.kind() == "for_expression"
+            && scope.child_by_field_name("body")
+                .is_some_and(|body| node_contains(body, reference))
+            && scope.child_by_field_name("pattern")
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        if scope.kind() == "match_arm"
+            && scope.child_by_field_name("pattern")
+                .is_some_and(|pattern| !node_contains(pattern, reference)
+                    && binds(source, pattern, name))
+        {
+            return true;
+        }
+        if matches!(scope.kind(), "if_expression" | "while_expression")
+            && scope.child_by_field_name("consequence")
+                .or_else(|| scope.child_by_field_name("body"))
+                .is_some_and(|body| node_contains(body, reference))
+            && scope.child_by_field_name("condition")
+                .filter(|condition| condition.kind() == "let_condition")
+                .and_then(|condition| condition.child_by_field_name("pattern"))
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
 /// The Rust USAGE walker. Visits every
 /// node in the subtree rooted at `node` (pre-order), and for each
 /// reference-kind node that is NOT inside a call/import,
@@ -4127,6 +4203,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 line: node.start_position().row as u32 + 1,
                 properties: {
                     let mut properties = serde_json::json!({ "ref_name": text });
+                    if ref_path.is_none()
+                        && node.kind() == "identifier"
+                        && rust_usage_has_local_value_binding(source, node, text)
+                    {
+                        // Keep the raw reference, but never bind a proven local
+                        // value to a same-named module function or type.
+                        properties["ref_local_binding"] = serde_json::json!(true);
+                    }
                     if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
                         object.insert(
                             "ref_path".into(),
