@@ -1836,6 +1836,7 @@ pub(crate) fn index_overlay_snapshot(
     };
     checkpoint_store(&store, &temp_path)?;
     drop(store);
+    validate_overlay_snapshot_visibility(&temp_path, Some(overlay))?;
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
     if let Some(job) = progress {
         job.publication_boundary(|| publish_store_snapshot(&temp_path, active_path), |_| true)?;
@@ -2157,6 +2158,7 @@ fn complete_embeddings_from_published_graph(
         })?;
     }
     drop(integrity);
+    validate_overlay_snapshot_visibility(&temp_path, overlay)?;
     cleanup_sqlite_sidecars(&temp_path)?;
     sync_file(&temp_path)?;
     sync_parent_dir(&temp_path)?;
@@ -2176,6 +2178,37 @@ fn complete_embeddings_from_published_graph(
         global_complete,
     );
     Ok(outcome)
+}
+
+fn validate_overlay_snapshot_visibility(
+    snapshot: &std::path::Path,
+    overlay: Option<&crate::store_cow::OverlaySpec>,
+) -> Result<()> {
+    if let Some(overlay) = overlay {
+        let store = greppy_store::Store::open_overlay_read_only(
+            &overlay.base_path,
+            snapshot,
+            &overlay.visibility,
+        )?;
+        let persisted =
+            crate::store_cow::cached_visibility_from_connection(store.conn(), &overlay.base_commit)
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "staged Store-CoW snapshot has no matching visibility manifest".into(),
+                    )
+                })??;
+        if !persisted.dirty_paths().eq(overlay.visibility.dirty_paths())
+            || !persisted
+                .deleted_paths()
+                .eq(overlay.visibility.deleted_paths())
+        {
+            return Err(Error::Invalid(
+                "staged Store-CoW visibility differs from the intended publication".into(),
+            ));
+        }
+        crate::store_cow::validate_overlay_delta_visibility(&store, &persisted)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn index_embeddings_into_temp_store(
