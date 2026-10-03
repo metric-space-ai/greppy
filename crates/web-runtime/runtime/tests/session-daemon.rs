@@ -5322,6 +5322,62 @@ await browser.close();
 }
 
 #[test]
+fn page_goto_redirecting_to_current_url_waits_for_the_new_document() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-current-url-redirect-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_current_url_redirect", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_current_url_redirect",
+        &format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const origin = {origin:?};
+await page.goto(origin + "/landed");
+await page.evaluate(() => window.__redirectRegression = true);
+await page.goto(origin + "/redirect", {{ timeout: 5000 }});
+if (await page.url() !== origin + "/landed") throw new Error("wrong redirect destination");
+if (await page.evaluate(() => typeof window.__redirectRegression) !== "undefined") {{
+  throw new Error("goto returned the previous document after redirect");
+}}
+await page.evaluate(() => window.__reloadRegression = true);
+await page.goto(origin + "/landed", {{ timeout: 5000 }});
+if (await page.evaluate(() => typeof window.__reloadRegression) !== "undefined") {{
+  throw new Error("same-URL goto returned the previous document");
+}}
+await page.evaluate(() => window.__queryRegression = true);
+await page.goto(origin + "/landed?v=2", {{ timeout: 5000 }});
+if (await page.url() !== origin + "/landed?v=2") throw new Error("query navigation was lost");
+if (await page.evaluate(() => typeof window.__queryRegression) !== "undefined") {{
+  throw new Error("query-only goto returned the previous document");
+}}
+console.log("redirect-reloaded-current-url");
+await browser.close();
+"#,
+            origin = fixture.origin,
+        ),
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert!(
+        ran.result.as_ref().unwrap()["stdout"]
+            .as_str().unwrap_or("")
+            .contains("redirect-reloaded-current-url"),
+        "{ran:?}"
+    );
+}
+
+#[test]
 fn page_goto_observes_domcontentloaded_and_load_separately() {
     let fixture = serve_navigation_lifecycle_fixture();
     let socket = std::env::temp_dir().join(format!(

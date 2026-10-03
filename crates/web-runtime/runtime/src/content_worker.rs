@@ -2903,6 +2903,7 @@ impl ContentEngine {
                 // top-level navigation only and has stalled at HeadParsed.
                 delegate.navigation_failure.replace(None);
                 let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+                let document_generation_before = delegate.document_generation.get();
                 webview.load(url.clone());
                 let loading = webview.clone();
                 let expected = url.clone();
@@ -2924,6 +2925,13 @@ impl ContentEngine {
                         let url_settled = loading.url().is_some_and(|current| {
                             urls_match(&current, &expected)
                                 || previous.as_ref().is_some_and(|old| current != *old)
+                                // A redirect can commit a new document at the
+                                // previous URL. Its request and document epochs,
+                                // rather than a URL change, prove the commit.
+                                || (denied.main_frame_navigation_epoch.get()
+                                    != navigation_epoch_before
+                                    && denied.document_generation.get()
+                                        != document_generation_before)
                         });
                         if !url_settled || !stamped {
                             return url_settled;
