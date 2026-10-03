@@ -1192,6 +1192,7 @@ name = "greppy-store"
 version = "0.4.1"
 dependencies = [
  "greppy-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

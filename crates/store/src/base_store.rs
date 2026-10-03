@@ -203,7 +203,9 @@ impl BaseStoreLayout {
                 "Base Store graph.db is missing",
             ));
         }
-        let actual_graph_sha256 = file_sha256(&self.graph)?;
+        let binding = hex_sha256(&bytes);
+        let actual_graph_sha256 =
+            verified_base_digest(&self.graph, &binding, &manifest.graph_sha256)?;
         if actual_graph_sha256 != manifest.graph_sha256 {
             return Err(invalid_data("Base Store graph digest mismatch"));
         }
@@ -213,7 +215,12 @@ impl BaseStoreLayout {
                 "Base Store summary_cache.db is missing",
             ));
         }
-        if file_sha256(&self.summary_cache)? != manifest.summary_cache_sha256 {
+        if verified_base_digest(
+            &self.summary_cache,
+            &binding,
+            &manifest.summary_cache_sha256,
+        )? != manifest.summary_cache_sha256
+        {
             return Err(invalid_data("Base Store summary cache digest mismatch"));
         }
         Ok(manifest)
@@ -558,14 +565,374 @@ fn hex_sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// Persistent reuse is confined to manifest-bound published Bases. A hit is a
+// recently verified snapshot, not a fresh cryptographic check of unread bytes.
+// Undetectable media corruption is found at the next full verification (30s).
+fn verified_base_digest(path: &Path, binding: &str, expected: &str) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        verified_base_digest_at(path, binding, expected, trusted_digest_directory().ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (binding, expected);
+        file_sha256(path)
+    }
+}
+
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+fn verified_base_digest_at(
+    path: &Path,
+    binding: &str,
+    expected: &str,
+    proofs: Option<fs::File>,
+) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let before = digest_file_identity(&file)?;
+    let started_at = digest_now_secs();
+    let started_monotonic = digest_monotonic_secs();
+
+    if let Some(directory) = &proofs {
+        if let Some(proof) = read_digest_proof(directory, binding, expected) {
+            if proof.matches(before, binding, expected, started_at) {
+                if digest_file_identity(&file)? != before {
+                    return Err(invalid_data(
+                        "Base file changed during snapshot verification",
+                    ));
+                }
+                if proof.matches(before, binding, expected, digest_now_secs()) {
+                    return Ok(expected.to_owned());
+                }
+            }
+        }
+    }
+    let digest = hash_opened_file(&mut file)?;
+    if digest_file_identity(&file)? != before {
+        return Err(invalid_data("Base file changed during digest verification"));
+    }
+    // Never record a mismatch, a fresh initial identity, or an identity
+    // whose time bucket merely aged during a long full read.
+    if digest == expected
+        && digest_cache_insert_eligible(
+            digest_cache_eligible(before, started_at),
+            before,
+            digest_now_secs(),
+        )
+    {
+        if let (Some(directory), Some(verified_at)) = (proofs, started_at) {
+            let proof = DigestProof {
+                version: 1,
+                manifest_sha256: binding.to_owned(),
+                digest: digest.clone(),
+                identity: before,
+                verified_at,
+                verified_monotonic: started_monotonic.unwrap_or(u64::MAX),
+            };
+            let _ = write_digest_proof(&directory, &proof);
+        }
+    }
+    Ok(digest)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_DIGEST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BEFORE_DIGEST_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn hash_opened_file(file: &mut fs::File) -> io::Result<String> {
+    #[cfg(test)]
+    FULL_DIGEST_READS.with(|reads| reads.set(reads.get() + 1));
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_DIGEST_READ.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(unix)]
+const DIGEST_PROOF_TTL_SECS: u64 = 30;
+
+#[cfg(unix)]
+fn digest_monotonic_secs() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    u64::try_from(unsafe { time.assume_init() }.tv_sec).ok()
+}
+
+#[cfg(unix)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DigestProof {
+    version: u32,
+    manifest_sha256: String,
+    digest: String,
+    identity: DigestFileIdentity,
+    verified_at: u64,
+    verified_monotonic: u64,
+}
+
+#[cfg(unix)]
+impl DigestProof {
+    fn matches(
+        &self,
+        identity: DigestFileIdentity,
+        binding: &str,
+        expected: &str,
+        now: Option<u64>,
+    ) -> bool {
+        let Some(now) = now else {
+            return false;
+        };
+        self.version == 1
+            && self.manifest_sha256 == binding
+            && self.digest == expected
+            && self.identity == identity
+            && self.verified_at <= now
+            && now - self.verified_at < DIGEST_PROOF_TTL_SECS
+            && digest_monotonic_secs().is_some_and(|now| {
+                now >= self.verified_monotonic
+                    && now - self.verified_monotonic < DIGEST_PROOF_TTL_SECS
+            })
+            && digest_cache_eligible(identity, Some(self.verified_at))
+            && digest_cache_eligible(identity, Some(now))
+    }
+}
+
+// Fixed slots bound normal persistent storage to 64 small records. Collisions
+// replace an optimization only; the exact manifest/digest/identity still match.
+#[cfg(unix)]
+fn digest_proof_name(binding: &str, digest: &str) -> std::ffi::CString {
+    let key = Sha256::digest(format!("{binding}:{digest}"));
+    std::ffi::CString::new(format!("proof-{:02x}.json", key[0] % 64)).unwrap()
+}
+
+#[cfg(unix)]
+fn open_relative(
+    directory: &fs::File,
+    name: &std::ffi::CStr,
+    flags: i32,
+    mode: u32,
+) -> io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn trusted_digest_directory() -> io::Result<fs::File> {
+    let home = std::env::var_os("HOME").ok_or_else(|| invalid_data("HOME unavailable"))?;
+    let home = Path::new(&home);
+    if !home.is_absolute() {
+        return Err(invalid_data("digest proof HOME is not absolute"));
+    }
+    #[cfg(target_os = "macos")]
+    let path = home.join("Library/Application Support/greppy/verified-base-digests-v1");
+    #[cfg(not(target_os = "macos"))]
+    let path = home.join(".local/share/greppy/verified-base-digests-v1");
+    trusted_digest_directory_at(&path)
+}
+
+#[cfg(unix)]
+fn trusted_digest_directory_at(path: &Path) -> io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if !path.is_absolute() {
+        return Err(invalid_data("digest proof path is not absolute"));
+    }
+    let uid = unsafe { libc::geteuid() };
+    let mut directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/")?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if component == Component::RootDir {
+                continue;
+            }
+            return Err(invalid_data("unsafe digest proof path component"));
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let name =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid_data("NUL proof path"))?;
+        let next = match open_relative(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Ok(next) => next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+                if result != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                open_relative(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = next.metadata()?;
+        if (metadata.uid() != 0 && metadata.uid() != uid) || metadata.mode() & 0o022 != 0 {
+            return Err(invalid_data(
+                "unsafe digest proof directory owner or permissions",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(next.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Darwin MNT_IGNORE_OWNERS: synthesized ownership is not proof.
+            if unsafe { info.assume_init() }.f_flags & 0x0020_0000 != 0 {
+                return Err(invalid_data("digest proof filesystem ignores ownership"));
+            }
+        }
+        directory = next;
+    }
+    let metadata = directory.metadata()?;
+    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(invalid_data(
+            "digest proof directory must be private and owned",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn read_digest_proof(directory: &fs::File, binding: &str, expected: &str) -> Option<DigestProof> {
+    use std::os::unix::fs::MetadataExt;
+    let file = open_relative(
+        directory,
+        &digest_proof_name(binding, expected),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )
+    .ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file()
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.mode() & 0o077 != 0
+        || before.nlink() != 1
+        || before.len() > 4096
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut file = file;
+    (&mut file).take(4097).read_to_end(&mut bytes).ok()?;
+    let after = file.metadata().ok()?;
+    if bytes.len() > 4096
+        || before.len() != after.len()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(unix)]
+fn validate_private_proof_file(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(invalid_data(
+            "unsafe digest proof file owner, type, links or permissions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_digest_proof(directory: &fs::File, proof: &DigestProof) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = digest_proof_name(&proof.manifest_sha256, &proof.digest);
+    // A fixed per-slot lock and staging file bound crash leftovers as well as
+    // published records. Independent open descriptions lock across processes
+    // and threads; process exit releases the lock without trusting a sidecar.
+    let lock_name = std::ffi::CString::new(format!(".lock-{}", name.to_string_lossy())).unwrap();
+    let lock = open_relative(
+        directory,
+        &lock_name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+        0o600,
+    )?;
+    validate_private_proof_file(&lock)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let temporary = std::ffi::CString::new(format!(".pending-{}", name.to_string_lossy())).unwrap();
+    let mut file = open_relative(
+        directory,
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
+        0o600,
+    )?;
+    validate_private_proof_file(&file)?;
+    file.set_len(0)?;
+    let result = (|| {
+        let bytes = serde_json::to_vec(proof).map_err(|error| invalid_data(error.to_string()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        directory.sync_all()
+    })();
+    unsafe {
+        libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+    }
+    result
+}
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct DigestFileIdentity {
     device: u64,
     inode: u64,
     size: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+    known_hfs: bool,
 }
 
 #[cfg(unix)]
@@ -581,7 +948,32 @@ fn digest_file_identity(file: &fs::File) -> io::Result<DigestFileIdentity> {
         size: metadata.size(),
         modified: (metadata.mtime(), metadata.mtime_nsec()),
         changed: (metadata.ctime(), metadata.ctime_nsec()),
+        known_hfs: file_is_known_hfs(file),
     })
+}
+
+#[cfg(unix)]
+fn file_is_known_hfs(file: &fs::File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        return info
+            .f_fstypename
+            .iter()
+            .map(|c| *c as u8)
+            .take_while(|c| *c != 0)
+            .eq(b"hfs".iter().copied());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -591,15 +983,20 @@ static VERIFIED_FILE_DIGESTS: std::sync::LazyLock<
 
 #[cfg(unix)]
 fn digest_cache_eligible(identity: DigestFileIdentity, now_secs: Option<u64>) -> bool {
-    // Zero nanoseconds may mean a whole-second filesystem. Never certify
-    // metadata-only reuse there. Even fractional timestamps can be rounded:
-    // wait until the change-time second is fully past before trusting a key.
+    // Unknown whole-second filesystems cannot certify metadata-only reuse.
+    // An actual opened-file HFS identity has a known coarse resolution;
+    // reuse waits beyond its complete bucket. Fractional metadata is aged too.
     let Some(now) = now_secs else {
         return false;
     };
+    let known_coarse = identity.known_hfs && identity.changed.1 == 0;
+    let fractional = (1..1_000_000_000).contains(&identity.changed.1);
     identity.changed.0 >= 0
-        && (1..1_000_000_000).contains(&identity.changed.1)
-        && now.saturating_sub(identity.changed.0 as u64) >= 2
+        && (known_coarse || fractional)
+        // HFS timestamps are coarse. Four seconds conservatively excludes
+        // the current bucket and two-second rounding; unknown coarse filesystems
+        // still cannot certify reuse. Eligibility must hold before and after hashing.
+        && now.saturating_sub(identity.changed.0 as u64) >= if known_coarse { 4 } else { 2 }
 }
 
 #[cfg(unix)]
@@ -645,20 +1042,7 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     if let Some(digest) = cached_file_digest(before, started_at) {
         return Ok(digest);
     }
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = hash_opened_file(&mut file)?;
     #[cfg(unix)]
     {
         if digest_file_identity(&file)? != before {
@@ -716,6 +1100,423 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_digest_real_snapshot_hit_and_write_invalidation() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("base.db");
+        let proofs = tmp.path().join("proofs");
+        fs::create_dir(&proofs).unwrap();
+        fs::write(&path, b"original").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let binding = hex_sha256(b"manifest");
+        let expected = hex_sha256(b"original");
+        let directory = || Some(fs::File::open(&proofs).unwrap());
+        FULL_DIGEST_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            verified_base_digest_at(&path, &binding, &expected, directory()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            verified_base_digest_at(&path, &binding, &expected, directory()).unwrap(),
+            expected
+        );
+        let identity = digest_file_identity(&fs::File::open(&path).unwrap()).unwrap();
+        if digest_cache_eligible(identity, digest_now_secs()) {
+            FULL_DIGEST_READS.with(|reads| assert_eq!(reads.get(), 1));
+        } else {
+            FULL_DIGEST_READS.with(|reads| assert_eq!(reads.get(), 2));
+        }
+        let metadata = fs::metadata(&path).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().size(), metadata.size());
+        assert_eq!(
+            verified_base_digest_at(&path, &binding, &expected, directory()).unwrap(),
+            hex_sha256(b"tampered")
+        );
+        let proof = read_digest_proof(&fs::File::open(&proofs).unwrap(), &binding, &expected);
+        if let Some(proof) = proof {
+            assert!(!proof.matches(
+                digest_file_identity(&fs::File::open(&path).unwrap()).unwrap(),
+                &binding,
+                &expected,
+                digest_now_secs()
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_concurrent_base_write_never_certifies_old_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("base.db");
+        let proofs = tmp.path().join("proofs");
+        fs::create_dir(&proofs).unwrap();
+        fs::write(&path, b"original").unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            fs::write(writer_path, b"tampered").unwrap();
+            done_tx.send(()).unwrap();
+        });
+        BEFORE_DIGEST_READ.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            }));
+        });
+        let result = verified_base_digest_at(
+            &path,
+            &hex_sha256(b"manifest"),
+            &hex_sha256(b"original"),
+            Some(fs::File::open(&proofs).unwrap()),
+        );
+        writer.join().unwrap();
+        if let Ok(digest) = result {
+            // Whole-second filesystems may not expose this fresh write in
+            // metadata; the mandatory full read still observes the mismatch.
+            assert_eq!(digest, hex_sha256(b"tampered"));
+        }
+        assert_eq!(fs::read_dir(proofs).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_proof_child() {
+        let Some(path) = std::env::var_os("GREPPY_TEST_DIGEST_PROOF_DIRECTORY") else {
+            return;
+        };
+        let directory = fs::File::open(path).unwrap();
+        let expected = sample_digest_proof();
+        let proof =
+            read_digest_proof(&directory, &expected.manifest_sha256, &expected.digest).unwrap();
+        assert!(proof.matches(
+            expected.identity,
+            &expected.manifest_sha256,
+            &expected.digest,
+            Some(110)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_proof_survives_process_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = fs::File::open(tmp.path()).unwrap();
+        write_digest_proof(&directory, &sample_digest_proof()).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "base_store::tests::persistent_digest_proof_child",
+                "--nocapture",
+            ])
+            .env("GREPPY_TEST_DIGEST_PROOF_DIRECTORY", tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_mismatch_is_not_recorded_and_symlink_base_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let proofs = tmp.path().join("proofs");
+        fs::create_dir(&proofs).unwrap();
+        let path = tmp.path().join("base.db");
+        fs::write(&path, b"tampered").unwrap();
+        let expected = hex_sha256(b"original");
+        let binding = hex_sha256(b"manifest");
+        let actual = verified_base_digest_at(
+            &path,
+            &binding,
+            &expected,
+            Some(fs::File::open(&proofs).unwrap()),
+        )
+        .unwrap();
+        assert_ne!(actual, expected);
+        assert_eq!(actual, hex_sha256(b"tampered"));
+        assert_eq!(fs::read_dir(&proofs).unwrap().count(), 0);
+        let link = tmp.path().join("symlink.db");
+        symlink(&path, &link).unwrap();
+        assert!(verified_base_digest_at(&link, &binding, &expected, None).is_err());
+    }
+
+    #[cfg(unix)]
+    fn sample_digest_proof() -> DigestProof {
+        DigestProof {
+            version: 1,
+            manifest_sha256: hex_sha256(b"manifest"),
+            digest: hex_sha256(b"original"),
+            identity: DigestFileIdentity {
+                device: 1,
+                inode: 2,
+                size: 8,
+                modified: (90, 123),
+                changed: (90, 123),
+                known_hfs: false,
+            },
+            verified_at: 100,
+            verified_monotonic: digest_monotonic_secs().unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_proof_bounds_age_and_exact_manifest_identity() {
+        let mut proof = sample_digest_proof();
+        let identity = proof.identity;
+        assert!(proof.matches(identity, &proof.manifest_sha256, &proof.digest, Some(100)));
+        assert!(proof.matches(identity, &proof.manifest_sha256, &proof.digest, Some(129)));
+        for now in [None, Some(99), Some(130), Some(u64::MAX)] {
+            assert!(!proof.matches(identity, &proof.manifest_sha256, &proof.digest, now));
+        }
+        assert!(!proof.matches(identity, "another manifest", &proof.digest, Some(101)));
+        assert!(!proof.matches(
+            identity,
+            &proof.manifest_sha256,
+            "another digest",
+            Some(101)
+        ));
+        for changed in [
+            DigestFileIdentity {
+                inode: 3,
+                ..identity
+            },
+            DigestFileIdentity {
+                device: 3,
+                ..identity
+            },
+            DigestFileIdentity {
+                size: 9,
+                ..identity
+            },
+            DigestFileIdentity {
+                changed: (91, 123),
+                ..identity
+            },
+            DigestFileIdentity {
+                modified: (91, 123),
+                ..identity
+            },
+        ] {
+            assert!(!proof.matches(changed, &proof.manifest_sha256, &proof.digest, Some(101)));
+        }
+        proof.verified_monotonic = u64::MAX;
+        assert!(!proof.matches(identity, &proof.manifest_sha256, &proof.digest, Some(101)));
+        proof.verified_monotonic = digest_monotonic_secs().unwrap();
+        proof.version = 2;
+        assert!(!proof.matches(identity, &proof.manifest_sha256, &proof.digest, Some(101)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_proof_rejects_unknown_coarse_and_initially_fresh_metadata() {
+        let mut proof = sample_digest_proof();
+        proof.identity.changed = (100, 123);
+        assert!(!proof.matches(
+            proof.identity,
+            &proof.manifest_sha256,
+            &proof.digest,
+            Some(110)
+        ));
+        proof.identity.changed = (90, 0);
+        assert!(!proof.matches(
+            proof.identity,
+            &proof.manifest_sha256,
+            &proof.digest,
+            Some(110)
+        ));
+        proof.identity.known_hfs = true;
+        assert!(proof.matches(
+            proof.identity,
+            &proof.manifest_sha256,
+            &proof.digest,
+            Some(110)
+        ));
+        proof.identity.changed = (97, 0);
+        assert!(!proof.matches(
+            proof.identity,
+            &proof.manifest_sha256,
+            &proof.digest,
+            Some(110)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_proof_rejects_corrupt_unsafe_and_symlink_records() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = fs::File::open(tmp.path()).unwrap();
+        let proof = sample_digest_proof();
+        write_digest_proof(&directory, &proof).unwrap();
+        let name = digest_proof_name(&proof.manifest_sha256, &proof.digest);
+        let path = tmp.path().join(name.to_str().unwrap());
+        let loaded = read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).unwrap();
+        assert!(loaded.matches(
+            proof.identity,
+            &proof.manifest_sha256,
+            &proof.digest,
+            Some(110)
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"not json").unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+        fs::write(&path, vec![b'x'; 4097]).unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+        fs::remove_file(&path).unwrap();
+        let target = tmp.path().join("target");
+        fs::write(&target, serde_json::to_vec(&proof).unwrap()).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&target, &path).unwrap();
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_directory_refuses_writable_ancestors_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        symlink(tmp.path(), &link).unwrap();
+        assert!(trusted_digest_directory_at(&link.join("proofs")).is_err());
+        // tempfile fixtures are disposable, not a trusted production namespace;
+        // on macOS /Volumes/tmp also has ownership explicitly disabled.
+        assert!(trusted_digest_directory_at(Path::new("relative")).is_err());
+        assert!(trusted_digest_directory_at(Path::new("/tmp/proofs")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_digest_atomic_writers_never_publish_partial_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = fs::File::open(tmp.path()).unwrap();
+        let proof = sample_digest_proof();
+        let binding = proof.manifest_sha256.clone();
+        let expected = proof.digest.clone();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let directory = &directory;
+                let proof = &proof;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let _ = write_digest_proof(directory, proof);
+                    }
+                });
+            }
+            for _ in 0..32 {
+                if let Some(loaded) = read_digest_proof(&directory, &binding, &expected) {
+                    assert!(loaded.matches(proof.identity, &binding, &expected, Some(110)));
+                }
+            }
+        });
+        assert!(read_digest_proof(&directory, &binding, &expected).is_some());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_hfs_cache_reuses_only_aged_keys_and_rejects_tampering() {
+        let hfs = DigestFileIdentity {
+            device: u64::MAX - 1,
+            inode: u64::MAX - 1,
+            size: 8,
+            modified: (100, 0),
+            changed: (100, 0),
+            known_hfs: true,
+        };
+        let unknown = DigestFileIdentity {
+            known_hfs: false,
+            ..hfs
+        };
+        {
+            let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+            cache.insert(hfs, hex_sha256(b"original"));
+            cache.insert(unknown, hex_sha256(b"original"));
+        }
+        assert_eq!(
+            cached_file_digest(hfs, Some(104)),
+            Some(hex_sha256(b"original"))
+        );
+        assert_eq!(cached_file_digest(unknown, Some(200)), None);
+        for now in 100..104 {
+            assert_eq!(cached_file_digest(hfs, Some(now)), None);
+        }
+        let initially_fresh = digest_cache_eligible(hfs, Some(100));
+        assert!(!digest_cache_insert_eligible(
+            initially_fresh,
+            hfs,
+            Some(200)
+        ));
+        assert!(digest_cache_insert_eligible(true, hfs, Some(104)));
+        assert_eq!(cached_file_digest(hfs, None), None);
+        assert_eq!(cached_file_digest(hfs, Some(99)), None);
+        // An aged file changed now cannot retain its old ctime even if mtime
+        // and size are restored. Fresh mutations never certify a reused key.
+        let changed = DigestFileIdentity {
+            changed: (104, 0),
+            ..hfs
+        };
+        assert_eq!(cached_file_digest(changed, Some(104)), None);
+        assert_eq!(cached_file_digest(changed, Some(108)), None);
+        let mut cache = VERIFIED_FILE_DIGESTS.lock().unwrap();
+        cache.remove(&hfs);
+        cache.remove(&unknown);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opened_file_hfs_classification_matches_kernel_filesystem_type() {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.db");
+        fs::write(&path, b"fixture").unwrap();
+        let file = fs::File::open(path).unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) },
+            0
+        );
+        let info = unsafe { info.assume_init() };
+        let name: Vec<u8> = info
+            .f_fstypename
+            .iter()
+            .map(|c| *c as u8)
+            .take_while(|c| *c != 0)
+            .collect();
+        let identity = digest_file_identity(&file).unwrap();
+        assert_eq!(identity.known_hfs, name.as_slice() == b"hfs");
+        if identity.known_hfs && identity.changed.1 == 0 {
+            assert!(!digest_cache_eligible(
+                identity,
+                Some(identity.changed.0 as u64)
+            ));
+            assert!(digest_cache_eligible(
+                identity,
+                Some(identity.changed.0 as u64 + 4)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn digest_cache_does_not_promote_fresh_identity_after_long_hash() {
         let identity = DigestFileIdentity {
             device: 1,
@@ -723,6 +1524,7 @@ mod tests {
             size: 8,
             modified: (100, 123_456_789),
             changed: (100, 123_456_789),
+            known_hfs: false,
         };
         let initially_fresh = digest_cache_eligible(identity, Some(100));
         assert!(!initially_fresh);
@@ -759,6 +1561,7 @@ mod tests {
             size: 8,
             modified: (100, 123_456_789),
             changed: (100, 123_456_789),
+            known_hfs: false,
         };
         let coarse = DigestFileIdentity {
             changed: (100, 0),
@@ -1036,10 +1839,12 @@ mod tests {
             .publish_graph_with_summary(identity(), &staged, &summary)
             .unwrap();
         assert_eq!(first, second);
-        assert!(fs::metadata(&layout.graph)
-            .unwrap()
-            .permissions()
-            .readonly());
+        assert!(
+            fs::metadata(&layout.graph)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
         assert_eq!(layout.read_verified_manifest().unwrap(), first);
         fs::write(&layout.graph, b"tamper").unwrap_err();
     }
@@ -1169,12 +1974,16 @@ mod tests {
         assert_eq!(edges[0].target_id, target.id);
         let content = store.search_file_content("p", "target", 10).unwrap();
         assert_eq!(content.len(), 2);
-        assert!(content
-            .iter()
-            .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3));
-        assert!(content
-            .iter()
-            .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20));
+        assert!(
+            content
+                .iter()
+                .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3)
+        );
+        assert!(
+            content
+                .iter()
+                .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20)
+        );
         assert!(!content.iter().any(|hit| hit.line == 2));
         assert_eq!(store.count_file_content_matches("p", "target").unwrap(), 2);
         let symbol_hits = crate::fts::search_fts_in_project(store, "p", "target", 10).unwrap();
@@ -1274,12 +2083,16 @@ mod tests {
                         expected
                     );
                 }
-                assert!(visible
-                    .iter()
-                    .any(|candidate| candidate.qualified_name == "p.shared"));
-                assert!(visible
-                    .iter()
-                    .any(|candidate| candidate.qualified_name == own_qname));
+                assert!(
+                    visible
+                        .iter()
+                        .any(|candidate| candidate.qualified_name == "p.shared")
+                );
+                assert!(
+                    visible
+                        .iter()
+                        .any(|candidate| candidate.qualified_name == own_qname)
+                );
                 assert!(!visible.iter().any(|candidate| {
                     candidate.qualified_name.starts_with("p.agent_")
                         && candidate.qualified_name != own_qname
