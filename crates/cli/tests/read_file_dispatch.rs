@@ -1,6 +1,29 @@
 //! Contract coverage for read, read-smart, and read-file.
 
 use std::path::{Path, PathBuf};
+
+#[test]
+fn read_file_json_accepts_option_before_or_after_exact_range_operand() {
+    let (repo, store) = fresh_workspace("json-range-option");
+    let path = repo.join("sample.txt");
+    std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+
+    for args in [
+        vec!["read-file", "--json", "sample.txt", "--lines", "2:3"],
+        vec!["read-file", "sample.txt", "--lines", "2:3", "--json"],
+    ] {
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["command"], "read-file");
+        assert_eq!(value["files"][0]["path"], "sample.txt");
+        assert_eq!(value["files"][0]["start_line"], 2);
+        assert_eq!(value["files"][0]["end_line"], 3);
+        assert_eq!(value["files"][0]["content"], "second\nthird\n");
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn read_file_unknown_options_refuse_before_opening_any_file() {
     let (repo, store) = fresh_workspace("unknown-option-no-read");

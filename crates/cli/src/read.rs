@@ -817,6 +817,7 @@ pub(crate) fn dispatch_read(
                 None,
                 false,
                 with_handle,
+                false,
                 path_filters,
                 root,
             )?
@@ -1680,6 +1681,7 @@ pub(crate) fn dispatch_read_files(
     lines: Option<&str>,
     all: bool,
     with_handle: bool,
+    json_output: bool,
     path_filter_args: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
@@ -1707,8 +1709,14 @@ pub(crate) fn dispatch_read_files(
     let mut failed = false;
     let mut printed = false;
     let mut previous_ended_with_newline = true;
+    let mut json_files = Vec::new();
     for path in paths {
         let Some((shown, canonical)) = read_resolve_file(&file_base, &canonical_root, path) else {
+            if json_output {
+                json_files.push(serde_json::json!({"path": path, "error": "no such file"}));
+                failed = true;
+                continue;
+            }
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");
             previous_ended_with_newline = true;
@@ -1716,6 +1724,11 @@ pub(crate) fn dispatch_read_files(
             continue;
         };
         if !path_filters.matches(&shown) {
+            if json_output {
+                json_files.push(serde_json::json!({"path": path, "error": "outside path filter"}));
+                failed = true;
+                continue;
+            }
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("outside path filter: {path}");
             previous_ended_with_newline = true;
@@ -1739,6 +1752,15 @@ pub(crate) fn dispatch_read_files(
                 }
                 Err(error) => return Err(error),
             };
+            if json_output {
+                json_files.push(serde_json::json!({
+                    "path": shown,
+                    "start_line": start,
+                    "end_line": end,
+                    "content": text,
+                }));
+                continue;
+            }
             let group = format!("{shown}:{start}-{end}\n{text}");
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             let stdout = std::io::stdout();
@@ -1758,6 +1780,14 @@ pub(crate) fn dispatch_read_files(
         let (content, truncated_size) = match preview {
             Ok(preview) => preview,
             Err(error) => {
+                if json_output {
+                    json_files.push(serde_json::json!({
+                        "path": path,
+                        "error": error.to_string(),
+                    }));
+                    failed = true;
+                    continue;
+                }
                 read_begin_group(&mut printed, &mut previous_ended_with_newline);
                 if error.kind() == std::io::ErrorKind::NotFound {
                     println!("no such file: {path}");
@@ -1785,6 +1815,20 @@ pub(crate) fn dispatch_read_files(
             // Absolute operands keep this recovery command exact even
             // when --root selected a nested directory or an external file.
             let operand = format!("'{}'", canonical.to_string_lossy().replace('\'', "'\\''"));
+            if json_output {
+                json_files.push(serde_json::json!({
+                    "path": shown,
+                    "start_line": 1,
+                    "end_line": shown_end,
+                    "content": prefix,
+                    "truncated": true,
+                    "last_line_partial": partial,
+                    "source_bytes_read": end,
+                    "source_bytes_at_open": size_at_open,
+                    "next_line": resume,
+                }));
+                continue;
+            }
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!(
                 "{shown}:1-{shown_end}{}",
@@ -1813,6 +1857,14 @@ pub(crate) fn dispatch_read_files(
         }
         if lines.is_none() && !all && line_count > 60 {
             if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
+                if json_output {
+                    json_files.push(serde_json::json!({
+                        "path": shown,
+                        "kind": "outline",
+                        "content": outline,
+                    }));
+                    continue;
+                }
                 read_begin_group(&mut printed, &mut previous_ended_with_newline);
                 print!("{outline}");
                 if with_handle {
@@ -1862,7 +1914,7 @@ pub(crate) fn dispatch_read_files(
             with_handle,
             &root_path,
         )?;
-        if let Some(id) = continuation {
+        if let Some(id) = continuation.as_ref() {
             if !group.ends_with('\n') {
                 group.push('\n');
             }
@@ -1878,6 +1930,17 @@ pub(crate) fn dispatch_read_files(
                 "read-file produced no output for existing file `{shown}` lines {start_line}:{end_line}; retry the command and report this invariant failure"
             )));
         }
+        if json_output {
+            json_files.push(serde_json::json!({
+                "path": shown,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": read_line_slice(&content, start_line, end_line),
+                "rendered": group,
+                "continuation": continuation,
+            }));
+            continue;
+        }
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
         {
             let stdout = std::io::stdout();
@@ -1888,6 +1951,16 @@ pub(crate) fn dispatch_read_files(
                 .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
         }
         previous_ended_with_newline = group.ends_with('\n');
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "command": "read-file",
+                "files": json_files,
+            }))
+            .map_err(|error| Error::Store(format!("serialize read-file JSON: {error}")))?
+        );
     }
     Ok(if failed { 1 } else { 0 })
 }
