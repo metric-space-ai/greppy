@@ -728,7 +728,61 @@ mod tests {
     use crate::wire::map_stop_reason;
 
     #[test]
+    fn consume_truncated_parallel_tools_never_finalizes_unstopped_calls() {
+        let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        for (stop_index, expected_stops) in [(2, vec![]), (3, vec![2])] {
+            let marker = format!(
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{stop_index}}}"
+            );
+            let (truncated, _) = fixture.split_once(&marker).expect("captured stop marker");
+            let mut events = Vec::new();
+            let mut reader = std::io::Cursor::new(truncated.as_bytes());
+            let error = Client::new("http://127.0.0.1:9", "test")
+                .consume_sse(&mut reader, &mut |event| events.push(event))
+                .expect_err("EOF with one or both concurrent tools open must fail");
+            assert!(matches!(error, ClientError::Stream(ref message)
+                if message.contains("open content block")), "{error:?}");
+            let starts: Vec<_> = events.iter().filter_map(|event| match event {
+                StreamEvent::ToolCallStarted { index, .. } => Some(*index),
+                _ => None,
+            }).collect();
+            let stops: Vec<_> = events.iter().filter_map(|event| match event {
+                StreamEvent::BlockFinished { index } if *index >= 2 => Some(*index),
+                _ => None,
+            }).collect();
+            assert_eq!(starts, vec![2, 3]);
+            assert_eq!(stops, expected_stops);
+            assert!(!events.iter().any(|event| matches!(event, StreamEvent::Finished { .. })));
+        }
+    }
+
+    #[test]
+    fn consume_parallel_tool_events_after_terminal_are_stream_errors() {
+        let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        let (before_message_stop, _) = fixture.split_once("event: message_stop\n")
+            .expect("captured terminal trailer");
+        let late_events = [
+            ("content_block_start", serde_json::json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"late","name":"greppy","input":{}}})),
+            ("content_block_delta", serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}})),
+            ("content_block_stop", serde_json::json!({"type":"content_block_stop","index":3})),
+        ];
+        for (prefix, expected) in [
+            (before_message_stop, "event after terminal stop"),
+            (fixture, "event after stream stopped"),
+        ] {
+            for (name, data) in &late_events {
+                let body = format!("{prefix}event: {name}\ndata: {data}\n\n");
+                let error = consume_sse_for_test(body.as_bytes(), body.len(), 1000)
+                    .expect_err("late tool event must not reopen a completed turn");
+                assert!(matches!(error, ClientError::Stream(ref message)
+                    if message.contains(expected)), "{name}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
     fn consume_captured_parallel_tool_response_preserves_both_calls() {
+
         let fixture = include_bytes!("../tests/fixtures/glm-parallel-tools.sse");
         let (turn, events) = consume_sse_for_test(fixture, fixture.len(), 1000)
             .expect("captured concurrent tool-use blocks assemble");
