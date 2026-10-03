@@ -1272,7 +1272,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_slow_read_anchors_nonsliding_window_at_completion() {
-        let seed = sample_digest_proof();
+        let seed = sample_digest_proof_at(1000);
         let started = verification_time(100, 1000);
         let completed = verification_time(180, 1080); // deterministic 80-second full read
         let proof = DigestProof::from_completed_read(
@@ -1332,7 +1332,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_completion_never_promotes_fresh_unknown_or_failed_reads() {
-        let seed = sample_digest_proof();
+        let seed = sample_digest_proof_at(1000);
         let started = verification_time(100, 1000);
         let completed = verification_time(180, 1080);
         let fresh = DigestFileIdentity {
@@ -1809,6 +1809,11 @@ mod tests {
 
     #[cfg(unix)]
     fn sample_digest_proof() -> DigestProof {
+        sample_digest_proof_at(digest_monotonic_secs().unwrap())
+    }
+
+    #[cfg(unix)]
+    fn sample_digest_proof_at(verified_monotonic: u64) -> DigestProof {
         DigestProof {
             version: 1,
             manifest_sha256: hex_sha256(b"manifest"),
@@ -1822,7 +1827,7 @@ mod tests {
                 known_hfs: false,
             },
             verified_at: 100,
-            verified_monotonic: digest_monotonic_secs().unwrap(),
+            verified_monotonic,
         }
     }
 

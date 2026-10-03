@@ -66,8 +66,9 @@ leftovers are bounded to at most 192 small files, with no unbounded cache log.
 
 A trusted record authenticates a recently verified snapshot under normal
 filesystem metadata semantics. It cannot detect silent media corruption that
-changes bytes without changing metadata. Such corruption is detected by a subsequent command performing full
-verification after the fixed 30-second completion window expires. Corruption
+changes bytes without changing metadata. Such corruption is detected by a
+subsequent command performing full verification after the fixed 30-second
+completion window expires. Corruption
 of bytes already consumed during a long read can predate completion by part of
 the read duration; this policy does not promise detection within 30 seconds of
 the corruption itself. Detection also requires a subsequent command and its
