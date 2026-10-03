@@ -2484,7 +2484,6 @@ fn recover_visible_effect_fn_bindings_inner(
 }
 
 /// One-shot single-store compatibility repair. Replace only Rust-owned
-
 /// non-structural relations from persisted raw edges; nodes, file identity,
 /// graph generation, content, embeddings and non-Rust edges remain untouched.
 /// Edge replacement and completion marker commit in the same transaction.
@@ -4820,7 +4819,7 @@ impl GraphIndex {
             "Option" => {
                 if !self
                     .rust_module_export_targets(
-                        &[field.file_path.clone()],
+                        std::slice::from_ref(&field.file_path),
                         "Option",
                         &CONSTRUCTABLE_LABELS,
                     )
