@@ -28,7 +28,7 @@ A sentence after an em dash is a generated hint, not source.
   impact S [--depth N]           how far a change to S reaches (tests marked)
   path --from A --to B           call chains from A to B
   read S | read-smart S          source of S (read-smart folds nested blocks)
-  read-file PATH --lines A:B     the lines you need, not whole files
+  read-file PATH [--lines A:B]   file contents, paginated
   replace S [NEW]                NEW replaces S's definition (--body: body only)
   replace-text F OLD [NEW]       refused unless OLD occurs exactly once
   replace-lines F A:B [NEW]      NEW replaces those lines
@@ -48,15 +48,6 @@ Running a command is `["bash-smart", "--", "cargo", "test"]`; the output comes
 back compacted (verdict line, then errors and warnings). When raw text matching
 is genuinely wanted: `greppy PATTERN [FILE]` behaves exactly like grep,
 `greppy rg …` exactly like ripgrep.
-
-READING CODE — read the symbol, never the whole file:
-  a function, method or type        greppy read S        (S exactly as search / search-symbol printed it)
-  several of them                   greppy read S1 S2 …
-  only its shape                    greppy read-smart S
-  non-code text (config, docs)      greppy read-file PATH --lines A:B
-  any lines of a file               greppy read-file PATH --lines A:B    (never cat, sed or head on source files)
-  read tool missing or failed       use greppy read S / greppy read-file PATH --lines A:B — never fall back to cat
-  never                             read a whole source file to find or edit one definition
 
 Indexing and embedding preparation are one-time work for the current source
 state, not evidence that Greppy is unavailable. If Greppy reports preparation in
@@ -136,23 +127,17 @@ mod tests {
     }
 
     #[test]
-    fn reading_guidance_matches_the_owner_approved_public_prompt() {
-        fn reading_block(text: &str) -> String {
-            let start = text
-                .find("READING CODE —")
-                .expect("reading guidance must be present");
-            text[start..]
-                .lines()
-                .take_while(|line| !line.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        let public = include_str!("../../../AGENTS.md");
-        assert_eq!(reading_block(SYSTEM_PROMPT), reading_block(public));
+    fn built_in_prompt_retains_approved_pre_reading_guidance() {
+        use sha2::{Digest, Sha256};
+        // Restore the pre-e3261805 wording, matching the approved public
+        // contract. Prompt changes require explicit owner approval in both
+        // surfaces; a green guard must not silently add an unapproved block.
         assert_eq!(
-            reading_block(SYSTEM_PROMPT),
-            reading_block(&public.lines().collect::<Vec<_>>().join("\r\n"))
+            format!("{:x}", Sha256::digest(SYSTEM_PROMPT.as_bytes())),
+            "ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1"
         );
+        assert!(SYSTEM_PROMPT.contains("read S | read-smart S"));
+        assert!(SYSTEM_PROMPT.contains("read-file PATH [--lines A:B]"));
     }
 
     #[test]
