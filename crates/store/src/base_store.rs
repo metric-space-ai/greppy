@@ -816,7 +816,7 @@ mod tests {
             .take_while(|c| *c != 0)
             .collect();
         let identity = digest_file_identity(&file).unwrap();
-        assert_eq!(identity.known_hfs, name == b"hfs");
+        assert_eq!(identity.known_hfs, name.as_slice() == b"hfs");
         if identity.known_hfs && identity.changed.1 == 0 {
             assert!(!digest_cache_eligible(
                 identity,
