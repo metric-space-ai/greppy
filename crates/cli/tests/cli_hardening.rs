@@ -1819,8 +1819,11 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 fn index_status_empty_admission_deferred_store_does_not_report_discovery_loss() {
     let (repo, store, _scratch) = make_real_git_repo("status-deferred-no-discovery");
     for n in 0..100 {
-        std::fs::write(repo.join(format!("src/tracked_{n}.rs")), "pub fn tracked() {}\n")
-            .unwrap();
+        std::fs::write(
+            repo.join(format!("src/tracked_{n}.rs")),
+            "pub fn tracked() {}\n",
+        )
+        .unwrap();
     }
     git(&repo, &["add", "."]);
     let db = store
@@ -1857,7 +1860,10 @@ fn index_status_empty_admission_deferred_store_does_not_report_discovery_loss() 
         assert_eq!(value["git_tracked_files"], 101);
         assert_eq!(value["coverage_warning"], serde_json::Value::Null);
         assert_eq!(value["background_job"]["state"], "failed");
-        assert_eq!(value["background_job"]["failure_kind"], "admission_deferred");
+        assert_eq!(
+            value["background_job"]["failure_kind"],
+            "admission_deferred"
+        );
         assert!(!out.contains("discovery may be dropping files"), "{out}");
         assert!(!db.parent().unwrap().join("index.spawn").exists());
     }
@@ -4307,7 +4313,9 @@ fn read_queries_handle_lifecycle_contention_without_silent_wait() {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{command} blocked on a lifecycle lease instead of returning its command-specific result");
+                panic!(
+                    "{command} blocked on a lifecycle lease instead of returning its command-specific result"
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
