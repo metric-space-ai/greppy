@@ -364,6 +364,31 @@ pub(crate) fn overlay_freshness_proof(
         }
     }
 
+    validate_overlay_delta_visibility(store, &cached)?;
+
+    let total_inventory = store
+        .file_count(project)
+        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
+    let total_inventory = usize::try_from(total_inventory)
+        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
+    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+}
+
+/// Check the intended manifest against the complete staged Delta, including
+/// rows materialized by embedding and language repair. Query-time validation
+/// alone is too late: a completed job must not publish an unusable snapshot.
+pub(crate) fn validate_overlay_delta_visibility(
+    store: &greppy_store::Store,
+    visibility: &VisibilityIndex,
+) -> Result<()> {
+    if !store.is_overlay() {
+        return Err(Error::Invalid(
+            "Store-CoW visibility validation requires an attached Base".into(),
+        ));
+    }
+    let dirty = visibility
+        .dirty_paths()
+        .collect::<std::collections::BTreeSet<_>>();
     let private_paths = private_delta_paths(store)?;
     if let Some(unbound) = private_paths
         .iter()
@@ -373,13 +398,7 @@ pub(crate) fn overlay_freshness_proof(
             "private Store-CoW row `{unbound}` is absent from the Delta visibility manifest"
         )));
     }
-
-    let total_inventory = store
-        .file_count(project)
-        .map_err(|error| Error::Store(format!("count Store-CoW inventory: {error}")))?;
-    let total_inventory = usize::try_from(total_inventory)
-        .map_err(|_| Error::Invalid("Store-CoW inventory count is negative".into()))?;
-    Ok(Some(OverlayFreshnessProof::Fresh { total_inventory }))
+    Ok(())
 }
 
 fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) -> Vec<String> {
@@ -4836,6 +4855,43 @@ mod tests {
             })
             .unwrap();
         (scratch, overlay)
+    }
+
+    #[test]
+    fn overlay_publication_allows_identical_base_materialization() {
+        let visibility = VisibilityIndex::default();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+    }
+
+    #[test]
+    fn overlay_publication_rejects_undeclared_private_rows() {
+        let visibility = VisibilityIndex::default();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        overlay
+            .conn()
+            .execute(
+                "UPDATE main.vector_embeddings SET file_path='src/rogue.rs'",
+                [],
+            )
+            .unwrap();
+        let error = validate_overlay_delta_visibility(&overlay, &visibility)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("src/rogue.rs"), "{error}");
+        assert!(error.contains("Delta visibility manifest"), "{error}");
+    }
+
+    #[test]
+    fn overlay_publication_allows_declared_private_changes() {
+        let visibility =
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap();
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+        overlay
+            .conn()
+            .execute("UPDATE main.nodes SET name='changed'", [])
+            .unwrap();
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
     }
 
     #[test]
