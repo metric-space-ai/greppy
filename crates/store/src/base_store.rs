@@ -1121,14 +1121,22 @@ fn write_digest_proof(directory: &fs::File, proof: &DigestProof) -> io::Result<(
     // published records. Independent open descriptions lock across processes
     // and threads; process exit releases the lock without trusting a sidecar.
     let lock_name = std::ffi::CString::new(format!(".lock-{}", name.to_string_lossy())).unwrap();
+    // Concurrent non-exclusive O_CREAT opens can fail with ENOENT on Darwin.
+    // Create the permanent lock exactly once, then open the existing inode.
+    // Only EEXIST selects that path: missing or unsafe files still fail closed.
     let lock = stage(
         "open lock",
-        open_relative(
+        match open_relative(
             directory,
             &lock_name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
             0o600,
-        ),
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_relative(directory, &lock_name, libc::O_RDWR | libc::O_NONBLOCK, 0)
+            }
+            result => result,
+        },
     )?;
 
     stage("validate lock", validate_private_proof_file(&lock))?;
@@ -2122,11 +2130,14 @@ mod tests {
         let proof = sample_digest_proof();
         let binding = proof.manifest_sha256.clone();
         let expected = proof.digest.clone();
+        let start = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let directory = &directory;
                 let proof = &proof;
+                let start = &start;
                 scope.spawn(move || {
+                    start.wait();
                     for _ in 0..8 {
                         if let Err(error) = write_digest_proof(directory, proof) {
                             assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
