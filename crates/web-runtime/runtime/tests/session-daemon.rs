@@ -1133,7 +1133,22 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                         return;
                     }
                 }
+                if path == "/redirect" {
+                    if let Err(error) = stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ) {
+                        diagnostics
+                            .lock()
+                            .unwrap()
+                            .push(format!("write redirect for {path}: {error}"));
+                    }
+                    return;
+                }
                 let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    path if path == "/landed" || path.starts_with("/landed?") => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><title>Landed</title></head><body><p id='landed'>landed</p></body></html>".to_vec(),
+                    ),
                     "/parser" => (
                         "text/html; charset=utf-8",
                         b"<!doctype html><html><head></head><body><script src='/parser-gate.js'></script><p id='late'>parser-finished</p></body></html>".to_vec(),
@@ -5442,7 +5457,8 @@ const origin = {origin:?};
 await page.goto(origin + "/landed");
 await page.evaluate(() => window.__redirectRegression = true);
 await page.goto(origin + "/redirect", {{ timeout: 5000 }});
-if (await page.url() !== origin + "/landed") throw new Error("wrong redirect destination");
+const redirectDestination = await page.url();
+if (redirectDestination !== origin + "/landed") throw new Error(`wrong redirect destination: ${{redirectDestination}}; expected ${{origin}}/landed`);
 if (await page.evaluate(() => typeof window.__redirectRegression) !== "undefined") {{
   throw new Error("goto returned the previous document after redirect");
 }}
@@ -5473,6 +5489,13 @@ await browser.close();
             .contains("redirect-reloaded-current-url"),
         "{ran:?}"
     );
+    let paths: Vec<_> = fixture.events.try_iter().collect();
+    assert!(paths.iter().any(|path| path == "/redirect"), "{paths:?}");
+    assert!(
+        paths.iter().filter(|path| path.as_str() == "/landed").count() >= 3,
+        "{paths:?}"
+    );
+    assert!(paths.iter().any(|path| path == "/landed?v=2"), "{paths:?}");
 }
 
 #[test]
