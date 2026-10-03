@@ -573,7 +573,7 @@ fn stream_turn_with_retry(
     model: &mut dyn ModelStream,
     req: &ModelRequest,
     on_event: &mut dyn FnMut(LoopEvent),
-) -> Result<TurnResult, LoopError> {
+) -> Result<TurnResult, ClientError> {
     match call_model(model, req, on_event) {
         Ok(t) => Ok(t),
         Err(first) if is_retryable(&first) => {
@@ -581,9 +581,9 @@ fn stream_turn_with_retry(
             // Deviation from pi: pi's session-level auto-retry is configurable
             // and delayed; we do a single immediate retry.
             std::thread::sleep(std::time::Duration::from_secs(2));
-            call_model(model, req, on_event).map_err(LoopError::from)
+            call_model(model, req, on_event)
         }
-        Err(other) => Err(LoopError::from(other)),
+        Err(other) => Err(other),
     }
 }
 
