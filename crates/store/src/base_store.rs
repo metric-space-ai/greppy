@@ -1346,44 +1346,38 @@ mod tests {
             ..seed.identity
         };
         for identity in [fresh, coarse, fresh_hfs] {
-            assert!(
-                DigestProof::from_completed_read(
-                    identity,
-                    identity,
-                    &seed.manifest_sha256,
-                    &seed.digest,
-                    Ok(&seed.digest),
-                    started,
-                    completed
-                )
-                .is_none()
-            );
+            assert!(DigestProof::from_completed_read(
+                identity,
+                identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Ok(&seed.digest),
+                started,
+                completed
+            )
+            .is_none());
         }
         let error = io::Error::new(io::ErrorKind::UnexpectedEof, "injected failed full read");
-        assert!(
-            DigestProof::from_completed_read(
-                seed.identity,
-                seed.identity,
-                &seed.manifest_sha256,
-                &seed.digest,
-                Err(&error),
-                started,
-                completed
-            )
-            .is_none()
-        );
-        assert!(
-            DigestProof::from_completed_read(
-                seed.identity,
-                seed.identity,
-                &seed.manifest_sha256,
-                &seed.digest,
-                Ok("wrong digest"),
-                started,
-                completed
-            )
-            .is_none()
-        );
+        assert!(DigestProof::from_completed_read(
+            seed.identity,
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            Err(&error),
+            started,
+            completed
+        )
+        .is_none());
+        assert!(DigestProof::from_completed_read(
+            seed.identity,
+            seed.identity,
+            &seed.manifest_sha256,
+            &seed.digest,
+            Ok("wrong digest"),
+            started,
+            completed
+        )
+        .is_none());
         for after in [
             DigestFileIdentity {
                 inode: 3,
@@ -1398,18 +1392,16 @@ mod tests {
                 ..seed.identity
             },
         ] {
-            assert!(
-                DigestProof::from_completed_read(
-                    seed.identity,
-                    after,
-                    &seed.manifest_sha256,
-                    &seed.digest,
-                    Ok(&seed.digest),
-                    started,
-                    completed
-                )
-                .is_none()
-            );
+            assert!(DigestProof::from_completed_read(
+                seed.identity,
+                after,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Ok(&seed.digest),
+                started,
+                completed
+            )
+            .is_none());
         }
         for invalid in [
             DigestVerificationTime {
@@ -1423,18 +1415,16 @@ mod tests {
             verification_time(99, 1080),
             verification_time(180, 999),
         ] {
-            assert!(
-                DigestProof::from_completed_read(
-                    seed.identity,
-                    seed.identity,
-                    &seed.manifest_sha256,
-                    &seed.digest,
-                    Ok(&seed.digest),
-                    started,
-                    invalid
-                )
-                .is_none()
-            );
+            assert!(DigestProof::from_completed_read(
+                seed.identity,
+                seed.identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Ok(&seed.digest),
+                started,
+                invalid
+            )
+            .is_none());
         }
         for invalid in [
             DigestVerificationTime {
@@ -1446,18 +1436,16 @@ mod tests {
                 ..started
             },
         ] {
-            assert!(
-                DigestProof::from_completed_read(
-                    seed.identity,
-                    seed.identity,
-                    &seed.manifest_sha256,
-                    &seed.digest,
-                    Ok(&seed.digest),
-                    invalid,
-                    completed
-                )
-                .is_none()
-            );
+            assert!(DigestProof::from_completed_read(
+                seed.identity,
+                seed.identity,
+                &seed.manifest_sha256,
+                &seed.digest,
+                Ok(&seed.digest),
+                invalid,
+                completed
+            )
+            .is_none());
         }
     }
 
@@ -1913,7 +1901,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_proof_rejects_corrupt_unsafe_and_symlink_records() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let directory = fs::File::open(tmp.path()).unwrap();
         let proof = sample_digest_proof();
@@ -2394,12 +2382,10 @@ mod tests {
             .publish_graph_with_summary(identity(), &staged, &summary)
             .unwrap();
         assert_eq!(first, second);
-        assert!(
-            fs::metadata(&layout.graph)
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
+        assert!(fs::metadata(&layout.graph)
+            .unwrap()
+            .permissions()
+            .readonly());
         assert_eq!(layout.read_verified_manifest().unwrap(), first);
         fs::write(&layout.graph, b"tamper").unwrap_err();
     }
@@ -2529,16 +2515,12 @@ mod tests {
         assert_eq!(edges[0].target_id, target.id);
         let content = store.search_file_content("p", "target", 10).unwrap();
         assert_eq!(content.len(), 2);
-        assert!(
-            content
-                .iter()
-                .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3)
-        );
-        assert!(
-            content
-                .iter()
-                .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20)
-        );
+        assert!(content
+            .iter()
+            .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3));
+        assert!(content
+            .iter()
+            .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20));
         assert!(!content.iter().any(|hit| hit.line == 2));
         assert_eq!(store.count_file_content_matches("p", "target").unwrap(), 2);
         let symbol_hits = crate::fts::search_fts_in_project(store, "p", "target", 10).unwrap();
@@ -2638,16 +2620,12 @@ mod tests {
                         expected
                     );
                 }
-                assert!(
-                    visible
-                        .iter()
-                        .any(|candidate| candidate.qualified_name == "p.shared")
-                );
-                assert!(
-                    visible
-                        .iter()
-                        .any(|candidate| candidate.qualified_name == own_qname)
-                );
+                assert!(visible
+                    .iter()
+                    .any(|candidate| candidate.qualified_name == "p.shared"));
+                assert!(visible
+                    .iter()
+                    .any(|candidate| candidate.qualified_name == own_qname));
                 assert!(!visible.iter().any(|candidate| {
                     candidate.qualified_name.starts_with("p.agent_")
                         && candidate.qualified_name != own_qname
