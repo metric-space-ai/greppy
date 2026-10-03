@@ -409,7 +409,7 @@ fn validate_index_snapshot(
     let project_row = store
         .get_project(project)?
         .ok_or_else(|| Error::Store(format!("recovery candidate lacks project `{project}`")))?;
-    if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+    if !greppy_indexer::rust_caller_edges_repaired(store)? {
         return Err(Error::Store(
             "recovery candidate requires Rust graph compatibility preparation before publication"
                 .into(),
@@ -435,7 +435,7 @@ fn validate_index_snapshot(
         )));
     }
     let freshness = greppy_freshness::check_files_report_with_ttl(
-        &store,
+        store,
         target,
         project,
         std::time::Duration::from_secs(300),
