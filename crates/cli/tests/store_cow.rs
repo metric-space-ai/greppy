@@ -697,7 +697,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     // Invalidating only Delta metadata must refresh private sources while
     // retaining a current immutable Base and its fast visibility proof.
     {
-        let old_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+        let mut old_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
         for mut workspace in old_delta.list_private_workspace_states().unwrap() {
             workspace.indexer_version = "greppy-indexer-v6".into();
             old_delta.upsert_workspace_state(&workspace).unwrap();
