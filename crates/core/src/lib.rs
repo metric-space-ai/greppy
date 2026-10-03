@@ -36,7 +36,9 @@
 ///   v6 -> v7: retain grouped Rust reexports and scoped function-item usages;
 ///   existing ambiguous caller edges need complete re-extraction/resolution.
 ///   v7 -> v8: recognize imported Effect.fn callback bindings as Functions.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v8";
+///   v8 -> v9: persist Rust declared-field and trait receiver facts required
+///   by caller repair; unchanged-source v8 nodes need full re-extraction.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v9";
 
 pub mod cache;
 pub mod diag;
