@@ -406,13 +406,48 @@ fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) ->
 
 fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::BTreeSet<String>> {
     let mut private_paths = std::collections::BTreeSet::new();
+    // Embedding publication materializes identical Base definitions in main
+    // because vectors require writable node foreign keys. These are derived
+    // rows, not source changes. Exempt only exact Base copies and vectors bound
+    // to them; an unrelated or changed private definition still needs visibility.
+    let nodes = if store.is_overlay() {
+        "SELECT d.file_path FROM main.nodes d
+         WHERE d.file_path <> '' AND d.label <> 'Folder'
+         AND NOT EXISTS (
+             SELECT 1 FROM greppy_base.nodes b
+             WHERE b.project = d.project AND b.qualified_name = d.qualified_name
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND b.start_line = d.start_line
+               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+         )"
+    } else {
+        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'"
+    };
+    let vectors = if store.is_overlay() {
+        "SELECT v.file_path FROM main.vector_embeddings v
+         WHERE v.file_path <> '' AND NOT EXISTS (
+             SELECT 1 FROM nodes d JOIN greppy_base.nodes b
+               ON b.project = d.project AND b.qualified_name = d.qualified_name
+             WHERE (v.node_id IS NULL OR d.id = v.node_id) AND d.project = v.project
+               AND d.qualified_name = v.qualified_name AND d.file_path = v.file_path
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND b.start_line = d.start_line
+               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+               AND v.start_line >= d.start_line AND v.end_line >= v.start_line
+               AND (v.end_line <= d.end_line OR d.end_line = d.start_line)
+         )"
+    } else {
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''"
+    };
     for query in [
         "SELECT rel_path FROM main.file_state",
         "SELECT rel_path FROM main.index_skips",
-        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'",
+        nodes,
         "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
         "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
-        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+        vectors,
     ] {
         let mut statement = store
             .conn()
@@ -4650,6 +4685,111 @@ mod tests {
         let paths = private_delta_paths(&store).unwrap();
         assert!(!paths.contains("src"));
         assert!(paths.contains("src/lib.rs"));
+    }
+
+    fn materialized_base_embedding_fixture(
+        visibility: &VisibilityIndex,
+    ) -> (tempfile::TempDir, greppy_store::Store) {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let node = greppy_store::NewNode {
+            project: "p".into(),
+            label: "Function".into(),
+            name: "run".into(),
+            qualified_name: "src/lib.rs::Function::run".into(),
+            file_path: "src/lib.rs".into(),
+            start_line: 2,
+            end_line: 4,
+            properties: serde_json::json!({"signature": "fn run()"}),
+        };
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            base.insert_node(&node).unwrap();
+        }
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
+        overlay.upsert_project(&greppy_store::Project {
+            name: "p".into(),
+            indexed_at: "2026-10-03T00:00:00Z".into(),
+            root_path: "/repo".into(),
+        }).unwrap();
+        let id = overlay.insert_writable_node(&node).unwrap();
+        overlay
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "fixture".into(),
+                prompt_version: "fixture".into(),
+                task: "code".into(),
+                node_id: Some(id),
+                chunk_idx: 0,
+                qualified_name: node.qualified_name,
+                file_path: node.file_path,
+                start_line: 2,
+                end_line: 4,
+                content_sha256: "a".repeat(64),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        (scratch, overlay)
+    }
+
+    #[test]
+    fn private_delta_paths_allow_identical_base_embedding_materialization() {
+        let (_scratch, overlay) =
+            materialized_base_embedding_fixture(&VisibilityIndex::default());
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        // Legacy node-less chunks must still bind by complete visible identity.
+        overlay.conn().execute("UPDATE main.vector_embeddings SET node_id=NULL", []).unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        overlay.conn().execute("DELETE FROM main.nodes", []).unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+    }
+
+    #[test]
+    fn private_delta_paths_reject_changed_or_rogue_materialization() {
+        for mutation in [
+            "UPDATE main.nodes SET name='changed'",
+            "UPDATE main.nodes SET label='Variable'",
+            "UPDATE main.nodes SET properties='{}'",
+            "UPDATE main.nodes SET end_line=5",
+            "UPDATE main.vector_embeddings SET qualified_name='rogue'",
+            "UPDATE main.vector_embeddings SET file_path='src/rogue.rs'",
+            "UPDATE main.vector_embeddings SET start_line=1",
+            "UPDATE main.vector_embeddings SET end_line=5",
+            "INSERT INTO main.file_state (project,rel_path,sha256) VALUES ('p','src/lib.rs','rogue')",
+            "INSERT INTO main.file_content (project,rel_path,line,snippet,file_path) VALUES ('p','src/lib.rs',2,'rogue','src/lib.rs')",
+            "INSERT INTO main.raw_edges (project,file_path,source_qname,target_qname,edge_type,properties) VALUES ('p','src/lib.rs','run','rogue','CALLS','{}')",
+        ] {
+            let (_scratch, overlay) =
+                materialized_base_embedding_fixture(&VisibilityIndex::default());
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(
+                !private_delta_paths(&overlay).unwrap().is_empty(),
+                "undeclared Delta modification escaped the freshness guard: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_do_not_exempt_hidden_base_copies() {
+        for visibility in [
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap(),
+            VisibilityIndex::new(Vec::<String>::new(), ["src/lib.rs".to_string()]).unwrap(),
+        ] {
+            let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+            assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.rs"));
+        }
     }
 
     #[test]
