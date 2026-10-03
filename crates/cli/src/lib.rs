@@ -94,6 +94,7 @@ mod context;
 mod workspace_setup;
 use context::*;
 mod agent;
+mod agent_acp;
 mod agent_clients;
 #[cfg(unix)]
 #[path = "agent_control.rs"]
