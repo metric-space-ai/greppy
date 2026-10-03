@@ -783,6 +783,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_session_new_alias_preserves_profile_policy() {
+        for verb in ["create", "new"] {
+            let cli = Cli::try_parse_from(["greppy", "web", "session", verb]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Web {
+                    command: WebCommand::Sessions(SessionsCommand::Session {
+                        command: SessionCommand::Create { profile, json: false }
+                    })
+                }) if profile == "research"
+            ));
+
+            let cli = Cli::try_parse_from([
+                "greppy",
+                "web",
+                "session",
+                verb,
+                "--profile",
+                "project",
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Web {
+                    command: WebCommand::Sessions(SessionsCommand::Session {
+                        command: SessionCommand::Create { profile, json: true }
+                    })
+                }) if profile == "project"
+            ));
+        }
+    }
+
+    #[test]
     fn parse_web_session_and_run() {
         let cli = Cli::try_parse_from([
             "greppy",
