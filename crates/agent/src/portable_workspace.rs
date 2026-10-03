@@ -4654,35 +4654,52 @@ fn filter_ignored_paths(
 }
 
 const WEB_CURRENT_SCOPE_PATH: &str = ".greppy/web/current.json";
-const WEB_CURRENT_SCOPE_ANCESTORS: [&str; 2] = [".greppy", ".greppy/web"];
+const WEB_ROUTE_DIRECTORIES: [&str; 2] = [
+    ".greppy/web/runtime-routes",
+    ".greppy/web/session-routes",
+];
+
+fn is_web_ephemeral_path(path: &str) -> bool {
+    if path == WEB_CURRENT_SCOPE_PATH {
+        return true;
+    }
+    WEB_ROUTE_DIRECTORIES.iter().any(|directory| {
+        path.strip_prefix(directory)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    })
+}
 
 fn filter_agent_owned_ephemeral_paths(
     worktree: &Path,
     baseline_tree: &str,
     mut paths: Vec<String>,
 ) -> Result<Vec<String>, WorkspaceError> {
-    if !paths.iter().any(|path| path == WEB_CURRENT_SCOPE_PATH) {
+    let candidates: Vec<_> = paths.iter().filter(|path| is_web_ephemeral_path(path)).cloned().collect();
+    if candidates.is_empty() {
         return Ok(paths);
     }
 
-    // The web CLI writes this session pointer as runtime state. Exclude it only
-    // when Greppy created it during the agent run. A file already visible in the
-    // immutable baseline is user-owned and remains an ordinary proposal path.
-    let baseline_entry = git_ok(
-        worktree,
-        &[
-            "ls-tree",
-            "--name-only",
-            baseline_tree,
-            "--",
-            WEB_CURRENT_SCOPE_PATH,
-        ],
-    )?;
-    if baseline_entry.trim().is_empty() {
-        paths.retain(|path| {
-            path != WEB_CURRENT_SCOPE_PATH && !WEB_CURRENT_SCOPE_ANCESTORS.contains(&path.as_str())
-        });
-    }
+    // Runtime metadata created during this run is ephemeral. Baseline entries
+    // remain user-owned, including route-shaped files. Match only the runtime's
+    // exact digest filenames; unrelated files under .greppy stay proposal paths.
+    let mut args = vec!["ls-tree", "-r", "--name-only", baseline_tree, "--"];
+    args.extend(candidates.iter().map(String::as_str));
+    let baseline_entries = git_ok(worktree, &args)?;
+    let baseline_paths: std::collections::HashSet<_> = baseline_entries.lines().collect();
+    let excluded: Vec<_> = candidates.into_iter()
+        .filter(|path| !baseline_paths.contains(path.as_str()))
+        .collect();
+    paths.retain(|path| {
+        !excluded.iter().any(|ephemeral| ephemeral == path)
+            && !(excluded.iter().any(|ephemeral| ephemeral.starts_with(&format!("{path}/")))
+                && matches!(path.as_str(), ".greppy" | ".greppy/web"
+                    | ".greppy/web/runtime-routes" | ".greppy/web/session-routes"))
+    });
     Ok(paths)
 }
 
@@ -4953,6 +4970,33 @@ mod tests {
                 "WEB_REPORT.md"
             ]
         );
+    }
+
+    #[test]
+    fn proposal_filter_excludes_new_routes_without_current_scope() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "test@example.test"]);
+        git(root.path(), &["config", "user.name", "Test"]);
+        let runtime = format!(".greppy/web/runtime-routes/{}.json", "a".repeat(64));
+        let session = format!(".greppy/web/session-routes/{}.json", "1".repeat(64));
+        fs::create_dir_all(root.path().join(".greppy/web/runtime-routes")).unwrap();
+        fs::write(root.path().join(&runtime), b"user baseline").unwrap();
+        git(root.path(), &["add", "--", &runtime]);
+        git(root.path(), &["commit", "-q", "-m", "baseline route"]);
+        let tree = git(root.path(), &["rev-parse", "HEAD^{tree}"]);
+        let new_runtime = format!(".greppy/web/runtime-routes/{}.json", "b".repeat(64));
+        let custom = ".greppy/web/session-routes/notes.json".to_string();
+        let report = "AGENT_RESPONSE.json".to_string();
+        let paths = vec![runtime.clone(), new_runtime, session.clone(), custom.clone(), report.clone()];
+        assert_eq!(
+            filter_agent_owned_ephemeral_paths(root.path(), &tree, paths).unwrap(),
+            vec![runtime, custom, report]
+        );
+        assert!(is_web_ephemeral_path(&session));
+        assert!(!is_web_ephemeral_path(&format!("{session}/child")));
+        assert!(!is_web_ephemeral_path(&format!(".greppy/web/session-routes/{}.json", "a".repeat(63))));
+        assert!(!is_web_ephemeral_path(&format!(".greppy/web/runtime-routes/{}.json", "G".repeat(64))));
     }
 
     #[test]
