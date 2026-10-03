@@ -932,10 +932,28 @@ fn read_digest_proof(directory: &fs::File, binding: &str, expected: &str) -> Opt
 
 #[cfg(target_os = "macos")]
 mod darwin_acl {
-    // Darwin SDK sys/acl.h ABI. The working ACL is an independent copy;
+    pub const FILESEC_ACL: libc::c_int = 5;
+    // Darwin SDK file-security and ACL ABI. The working ACL is an independent copy;
     // acl_valid plus fixed selectors makes EINVAL the documented end marker.
     unsafe extern "C" {
-        pub fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        pub fn filesec_init() -> *mut libc::c_void;
+        pub fn filesec_free(security: *mut libc::c_void);
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstatx_np$INODE64")]
+        pub fn fstatx_np(
+            fd: libc::c_int,
+            stat: *mut libc::stat,
+            security: *mut libc::c_void,
+        ) -> libc::c_int;
+        pub fn filesec_query_property(
+            security: *mut libc::c_void,
+            property: libc::c_int,
+            present: *mut libc::c_int,
+        ) -> libc::c_int;
+        pub fn filesec_get_property(
+            security: *mut libc::c_void,
+            property: libc::c_int,
+            value: *mut libc::c_void,
+        ) -> libc::c_int;
         pub fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
         pub fn acl_get_entry(
             acl: *mut libc::c_void,
@@ -945,6 +963,14 @@ mod darwin_acl {
         pub fn acl_get_tag_type(entry: *mut libc::c_void, tag: *mut libc::c_int) -> libc::c_int;
         pub fn acl_get_permset_mask_np(entry: *mut libc::c_void, mask: *mut u64) -> libc::c_int;
         pub fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    pub struct OwnedSecurity(pub *mut libc::c_void);
+    impl Drop for OwnedSecurity {
+        fn drop(&mut self) {
+            unsafe {
+                filesec_free(self.0);
+            }
+        }
     }
     pub struct OwnedAcl(pub *mut libc::c_void);
     impl Drop for OwnedAcl {
@@ -973,9 +999,40 @@ fn reject_mutating_acl(file: &fs::File) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
     use darwin_acl::*;
-    let acl = unsafe { acl_get_fd_np(fd, 0x100) }; // ACL_TYPE_EXTENDED
-    if acl.is_null() {
+    // acl_get_fd_np conflates a successful descriptor query with no extended
+    // ACL and a failed query: both return NULL, commonly with ENOENT. Query
+    // file security directly so only positively confirmed absence is safe.
+    let security = unsafe { filesec_init() };
+    if security.is_null() {
         return Err(io::Error::last_os_error());
+    }
+    let security = OwnedSecurity(security);
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { fstatx_np(fd, metadata.as_mut_ptr(), security.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut present = -1;
+    if unsafe { filesec_query_property(security.0, FILESEC_ACL, &mut present) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match present {
+        0 => return Ok(()),
+        1 => {}
+        _ => return Err(invalid_data("unknown digest proof ACL presence")),
+    }
+    let mut acl = std::ptr::null_mut();
+    if unsafe {
+        filesec_get_property(
+            security.0,
+            FILESEC_ACL,
+            (&mut acl as *mut *mut libc::c_void).cast(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if acl.is_null() {
+        return Err(invalid_data("present digest proof ACL is unavailable"));
     }
     let acl = OwnedAcl(acl);
     if unsafe { acl_valid(acl.0) } != 0 {
@@ -1532,6 +1589,20 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert!(validate_private_proof_file(&fs::File::open(&path).unwrap()).is_err());
         assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_mac_acl_absence_requires_successful_native_query() {
+        let fixture = production_proof_fixture();
+        clear_test_acl(fixture.path());
+        let directory = fs::File::open(fixture.path()).unwrap();
+        assert!(reject_mutating_acl(&directory).is_ok());
+        let path = fixture.path().join("no-extended-acl");
+        fs::write(&path, b"private proof fixture").unwrap();
+        clear_test_acl(&path);
+        assert!(reject_mutating_acl(&fs::File::open(&path).unwrap()).is_ok());
+        assert!(reject_mutating_acl_fd(-1).is_err());
     }
 
     #[cfg(target_os = "macos")]
