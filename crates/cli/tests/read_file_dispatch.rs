@@ -2,6 +2,47 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+#[test]
+fn read_file_json_reports_bounded_io_errors_as_one_document() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, store) = fresh_workspace("json-bounded-io-error");
+    let sealed = repo.join("sealed.txt");
+    std::fs::write(repo.join("readable.txt"), "first\nsecond\n").unwrap();
+    std::fs::write(&sealed, "private\n").unwrap();
+    let original = std::fs::metadata(&sealed).unwrap().permissions();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&sealed).is_ok() {
+        // Privileged users bypass POSIX read denial; this fixture requires it.
+        std::fs::set_permissions(&sealed, original).unwrap();
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+        return;
+    }
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "read-file",
+            "readable.txt",
+            "sealed.txt",
+            "--lines",
+            "1:1",
+            "--json",
+        ],
+    );
+    std::fs::set_permissions(&sealed, original).unwrap();
+    assert_eq!(code, 1, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["content"], "first\n");
+    assert_eq!(value["files"][1]["path"], "sealed.txt");
+    assert!(value["files"][1]["error"].is_string());
+    assert!(
+        err.is_empty(),
+        "JSON diagnostic must stay structured: {err}"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn read_file_json_accepts_option_before_or_after_exact_range_operand() {
     let (repo, store) = fresh_workspace("json-range-option");

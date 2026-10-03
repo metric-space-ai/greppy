@@ -7889,7 +7889,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .outgoing_edges(missing.id, Some("USAGE"), 20)
                 .unwrap()
                 .is_empty(),
-            "an unknown qualified owner must not bind to a same-name local enum; resolved={:?}; raw={:?}", store.outgoing_edges(missing.id, Some("USAGE"), 20).unwrap(), load_all_raw_edges(&store, "test").unwrap().into_iter().filter(|edge| edge.source_qualified_name == missing.qualified_name).collect::<Vec<_>>()
+            "an unknown qualified owner must not bind to a same-name local enum; resolved={:?}; raw={:?}",
+            store.outgoing_edges(missing.id, Some("USAGE"), 20).unwrap(),
+            load_all_raw_edges(&store, "test")
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.source_qualified_name == missing.qualified_name)
+                .collect::<Vec<_>>()
         );
         let other = store
             .get_node_by_qname("test", "src/lib.rs::Function::other")
@@ -7938,7 +7944,10 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
 
     #[test]
     fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
-        let repo = setup_repo("constructor-recovery", "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n");
+        let repo = setup_repo(
+            "constructor-recovery",
+            "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n",
+        );
         let base_path = repo.join("base.db");
         let delta_path = repo.join("delta.db");
         {
@@ -10109,7 +10118,10 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
     fn cross_file_receiver_resolution_avoids_project_wide_scans() {
         let small = receiver_resolution_work(1000);
         let large = receiver_resolution_work(4000);
-        assert!(large < small * 5, "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically");
+        assert!(
+            large < small * 5,
+            "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically"
+        );
     }
 
     const OPTION_FIELD_CALLER: &str = r#"

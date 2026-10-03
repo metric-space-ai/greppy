@@ -1638,7 +1638,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_digest_proof_rejects_corrupt_unsafe_and_symlink_records() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let directory = fs::File::open(tmp.path()).unwrap();
         let proof = sample_digest_proof();
@@ -2119,12 +2119,10 @@ mod tests {
             .publish_graph_with_summary(identity(), &staged, &summary)
             .unwrap();
         assert_eq!(first, second);
-        assert!(
-            fs::metadata(&layout.graph)
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
+        assert!(fs::metadata(&layout.graph)
+            .unwrap()
+            .permissions()
+            .readonly());
         assert_eq!(layout.read_verified_manifest().unwrap(), first);
         fs::write(&layout.graph, b"tamper").unwrap_err();
     }
@@ -2254,16 +2252,12 @@ mod tests {
         assert_eq!(edges[0].target_id, target.id);
         let content = store.search_file_content("p", "target", 10).unwrap();
         assert_eq!(content.len(), 2);
-        assert!(
-            content
-                .iter()
-                .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3)
-        );
-        assert!(
-            content
-                .iter()
-                .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20)
-        );
+        assert!(content
+            .iter()
+            .any(|hit| hit.rel_path == "src/a.rs" && hit.line == 3));
+        assert!(content
+            .iter()
+            .any(|hit| hit.rel_path == "src/b.rs" && hit.line == 20));
         assert!(!content.iter().any(|hit| hit.line == 2));
         assert_eq!(store.count_file_content_matches("p", "target").unwrap(), 2);
         let symbol_hits = crate::fts::search_fts_in_project(store, "p", "target", 10).unwrap();
@@ -2363,16 +2357,12 @@ mod tests {
                         expected
                     );
                 }
-                assert!(
-                    visible
-                        .iter()
-                        .any(|candidate| candidate.qualified_name == "p.shared")
-                );
-                assert!(
-                    visible
-                        .iter()
-                        .any(|candidate| candidate.qualified_name == own_qname)
-                );
+                assert!(visible
+                    .iter()
+                    .any(|candidate| candidate.qualified_name == "p.shared"));
+                assert!(visible
+                    .iter()
+                    .any(|candidate| candidate.qualified_name == own_qname));
                 assert!(!visible.iter().any(|candidate| {
                     candidate.qualified_name.starts_with("p.agent_")
                         && candidate.qualified_name != own_qname

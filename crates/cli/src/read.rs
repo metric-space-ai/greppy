@@ -687,7 +687,9 @@ fn read_report_missing(
             coverage.len() - 3
         );
     }
-    println!("message: this graph lookup cannot rule out a definition in unsupported source; reindexing does not add symbol coverage");
+    println!(
+        "message: this graph lookup cannot rule out a definition in unsupported source; reindexing does not add symbol coverage"
+    );
     println!(
         "next: locate it in source: greppy search-pattern {} --fixed --root {}",
         shell_example_arg(query),
@@ -1744,6 +1746,14 @@ pub(crate) fn dispatch_read_files(
             let (text, start, end) = match span {
                 Ok(span) => span,
                 Err(error @ Error::Io { .. }) => {
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": path,
+                            "error": error.to_string(),
+                        }));
+                        failed = true;
+                        continue;
+                    }
                     read_begin_group(&mut printed, &mut previous_ended_with_newline);
                     println!("cannot read file {path}: {error}");
                     previous_ended_with_newline = true;
@@ -1843,10 +1853,12 @@ pub(crate) fn dispatch_read_files(
                 println!();
             }
             println!(
-                    "truncated at {end} source bytes (default limit {READ_FILE_PAGE_BYTES}); total line count unknown"
-                );
+                "truncated at {end} source bytes (default limit {READ_FILE_PAGE_BYTES}); total line count unknown"
+            );
             if let Some(omitted) = size_at_open.checked_sub(end as u64) {
-                println!("{omitted} source bytes omitted according to file size at open ({size_at_open} bytes)");
+                println!(
+                    "{omitted} source bytes omitted according to file size at open ({size_at_open} bytes)"
+                );
             }
             println!("next line: greppy read-file {operand} --lines {resume}:{resume}");
             if partial {
@@ -1854,7 +1866,9 @@ pub(crate) fn dispatch_read_files(
             }
             println!("full file: greppy read-file {operand} --all");
             if with_handle {
-                println!("note: no handle for a byte-truncated page; request an explicit --lines A:B span");
+                println!(
+                    "note: no handle for a byte-truncated page; request an explicit --lines A:B span"
+                );
             }
             previous_ended_with_newline = true;
             continue;
