@@ -10134,7 +10134,10 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
             .get_node_by_qname("test", "src/lib.rs::Interface::HttpTransport")
             .unwrap()
             .unwrap();
-        assert_eq!(node.properties.get("has_bounds"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            node.properties.get("has_bounds"),
+            Some(&serde_json::json!(1))
+        );
         assert_eq!(
             store.list_file_states("test").unwrap()[0].sha256,
             source_before[0].sha256
