@@ -1791,9 +1791,17 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
         assert_eq!(compact[key], v[key], "health changed for {key}");
     }
     assert!(compact.get("providers").is_none(), "{compact}");
-    assert_eq!(
-        compact["diagnostics_command"],
-        "greppy index status --json --diagnostics"
+    let guidance = compact["diagnostics_command"].as_str().unwrap();
+    assert!(guidance.starts_with("GREPPY_STORE_DIR="), "{guidance}");
+    assert!(guidance.contains(store.to_string_lossy().as_ref()), "{guidance}");
+    assert!(guidance.contains("greppy --root "), "{guidance}");
+    assert!(
+        guidance.contains(v["root_path"].as_str().unwrap()),
+        "{guidance}"
+    );
+    assert!(
+        guidance.ends_with("index status --json --diagnostics"),
+        "{guidance}"
     );
     assert!(!compact_err.contains("still running"), "{compact_err}");
     assert!(
@@ -4160,7 +4168,14 @@ fn refreshing_query_refusal_reports_publication_and_original_command_recovery() 
     );
     assert_eq!(code, 75, "{out} {err}");
     assert!(out.contains("publication is in progress"), "{out} {err}");
-    assert!(out.contains("greppy index status --json"), "{out} {err}");
+    assert!(out.contains("index status --json"), "{out} {err}");
+    assert!(out.contains("GREPPY_STORE_DIR="), "{out} {err}");
+    assert!(out.contains(store.to_string_lossy().as_ref()), "{out} {err}");
+    assert!(out.contains("greppy --root "), "{out} {err}");
+    assert!(
+        out.contains(repo.canonicalize().unwrap().to_string_lossy().as_ref()),
+        "{out} {err}"
+    );
     assert!(out.contains("retry this command"), "{out} {err}");
     assert!(!out.contains("run `greppy index .` first"), "{out} {err}");
     assert!(!out.contains("pub fn old_refresh_marker"), "{out} {err}");
