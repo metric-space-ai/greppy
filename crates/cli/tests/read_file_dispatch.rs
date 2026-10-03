@@ -1,6 +1,95 @@
 //! Contract coverage for read, read-smart, and read-file.
 
 use std::path::{Path, PathBuf};
+
+#[test]
+fn read_file_json_accepts_option_before_or_after_exact_range_operand() {
+    let (repo, store) = fresh_workspace("json-range-option");
+    let path = repo.join("sample.txt");
+    std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+
+    for args in [
+        vec!["--json", "read-file", "sample.txt", "--lines", "2:3"],
+        vec!["read-file", "--json", "sample.txt", "--lines", "2:3"],
+        vec!["read-file", "sample.txt", "--lines", "2:3", "--json"],
+    ] {
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["command"], "read-file");
+        assert_eq!(value["files"][0]["path"], "sample.txt");
+        assert_eq!(value["files"][0]["start_line"], 2);
+        assert_eq!(value["files"][0]["end_line"], 3);
+        assert_eq!(value["files"][0]["content"], "second\nthird\n");
+        assert!(
+            err.is_empty(),
+            "JSON output must not gain a context notice: {err}"
+        );
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_json_keeps_multi_file_errors_and_structured_page_metadata() {
+    let (repo, store) = fresh_workspace("json-page-metadata");
+    std::fs::write(
+        repo.join("paged.txt"),
+        (1..=401).map(|n| format!("line {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "--json",
+            "read-file",
+            "paged.txt",
+            "missing.txt",
+            "--handle",
+        ],
+    );
+    assert_eq!(code, 1, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["start_line"], 1);
+    assert_eq!(value["files"][0]["end_line"], 400);
+    assert!(value["files"][0].get("rendered").is_none(), "{value}");
+    assert!(value["files"][0]["handle"]
+        .as_str()
+        .unwrap()
+        .starts_with("geh2:"));
+    assert_eq!(value["files"][0]["continuation"]["next_line"], 401);
+    assert_eq!(value["files"][0]["continuation"]["remaining_lines"], 1);
+    assert_eq!(value["files"][1]["path"], "missing.txt");
+    assert_eq!(value["files"][1]["error"], "no such file");
+    assert!(
+        err.is_empty(),
+        "JSON output must not gain a context notice: {err}"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_json_reports_truncation_without_fabricating_a_handle() {
+    let (repo, store) = fresh_workspace("json-truncation");
+    std::fs::write(repo.join("huge.txt"), "x".repeat(100_000)).unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "huge.txt", "--json", "--handle"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["files"][0]["truncated"], true);
+    assert!(value["files"][0]["content"].as_str().unwrap().len() <= 65_536);
+    assert!(value["files"][0]["handle"].is_null());
+    assert!(value["files"][0]["handle_unavailable"]
+        .as_str()
+        .unwrap()
+        .contains("--lines A:B"));
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn read_file_unknown_options_refuse_before_opening_any_file() {
     let (repo, store) = fresh_workspace("unknown-option-no-read");

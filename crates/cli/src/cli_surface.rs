@@ -306,6 +306,9 @@ pub enum Command {
         /// Also print a compact edit handle for every printed span.
         #[arg(long)]
         handle: bool,
+        /// Emit a compact machine-readable file/range result.
+        #[arg(long)]
+        json: bool,
         /// Only results under this file or directory (repeatable).
         #[arg(long = "path", value_name = "PATH")]
         path_opts: Vec<String>,

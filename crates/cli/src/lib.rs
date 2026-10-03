@@ -2456,11 +2456,19 @@ fn dispatch_subcommand(
             lines,
             all,
             handle,
+            json,
             path_opts,
         } => {
             validate_path_filters(root, &path_opts, "--path")?;
-            let result =
-                dispatch_read_files(&paths, lines.as_deref(), all, handle, &path_opts, root);
+            let result = dispatch_read_files(
+                &paths,
+                lines.as_deref(),
+                all,
+                handle,
+                json,
+                &path_opts,
+                root,
+            );
             if matches!(result, Ok(0)) {
                 context_status::attach_read_notice(root);
             }
@@ -10797,7 +10805,8 @@ fn command_requests_json(command: Option<&Command>) -> bool {
         | Some(Command::SearchSymbol { json, .. })
         | Some(Command::Plus { json, .. })
         | Some(Command::Search { json, .. })
-        | Some(Command::Context { json, .. }) => *json,
+        | Some(Command::Context { json, .. })
+        | Some(Command::ReadFile { json, .. }) => *json,
         _ => false,
     }
 }
