@@ -674,6 +674,145 @@ fn background_health_guidance_does_not_request_duplicate_or_unnecessary_preparat
     assert!(background_health_observation(None, Some("refreshing"), false, 200).is_some());
 }
 
+const STATUS_WORKER_ENV: &str = "GREPPY_INTERNAL_STATUS_WORKER";
+const STATUS_PHASE_PREFIX: &str = "greppy-status-phase:";
+
+fn status_diagnostic_phase(phase: &str) {
+    if std::env::var_os(STATUS_WORKER_ENV).is_some() {
+        eprintln!("{STATUS_PHASE_PREFIX}{phase}");
+    }
+}
+
+#[cfg(unix)]
+fn incomplete_status(root: &str, phase: &str, budget_ms: u64) -> serde_json::Value {
+    serde_json::json!({
+        "command": "index-status", "status": "unknown", "healthy": null,
+        "root_path": root, "store_exists": null, "store_format": null,
+        "store_bytes": null, "writer_active": null, "startup_active": null,
+        "background_job": null, "background_state": null,
+        "background_observation": null, "fresh": null, "freshness": null,
+        "schema_current": null, "integrity_ok": null, "embedding_complete": null,
+        "dirty_overlay": null, "store_cow": null,
+        "diagnostics_complete": false, "diagnostic_phase": phase,
+        "diagnostic_budget_ms": budget_ms,
+        "message": "status diagnostic budget exhausted; health and freshness are unknown; retry status when capacity is available; no rebuild is implied",
+    })
+}
+
+// A cancellable process boundary is required: a recursive filesystem walk,
+// SQLite operation or Git child cannot be safely interrupted inside a thread.
+// Only this invocation's fresh process group is terminated, never an indexer.
+#[cfg(unix)]
+fn bounded_index_status(json: bool, root: Option<&str>) -> Result<i32> {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    const BUDGET_MS: u64 = 5_000;
+    let mut command =
+        Command::new(std::env::current_exe().map_err(|e| Error::io("status executable", e))?);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(STATUS_WORKER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| Error::io("spawn bounded status inspection", e))?;
+    struct OwnedInspection(Option<std::process::Child>);
+    impl Drop for OwnedInspection {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut owned = OwnedInspection(Some(child));
+    let child = owned.0.as_mut().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let output = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let phase = Arc::new(Mutex::new(String::from("startup")));
+    let observed_phase = Arc::clone(&phase);
+    let errors = std::thread::spawn(move || {
+        let mut errors = Vec::new();
+        for line in std::io::BufReader::new(stderr).split(b'\n') {
+            let line = line?;
+            if let Some(stage) = String::from_utf8_lossy(&line).strip_prefix(STATUS_PHASE_PREFIX) {
+                *observed_phase.lock().unwrap() = stage.to_owned();
+            } else {
+                errors.extend_from_slice(&line);
+                errors.push(b'\n');
+            }
+        }
+        Ok::<_, std::io::Error>(errors)
+    });
+    let start = std::time::Instant::now();
+    let terminal = loop {
+        if let Some(status) = owned
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .map_err(|e| Error::io("wait for status inspection", e))?
+        {
+            owned.0.take();
+            break Some(status);
+        }
+        if start.elapsed() >= std::time::Duration::from_millis(BUDGET_MS) {
+            drop(owned);
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let bytes = output
+        .join()
+        .map_err(|_| Error::Invalid("status output reader failed".into()))?
+        .map_err(|e| Error::io("read status output", e))?;
+    let error_bytes = errors
+        .join()
+        .map_err(|_| Error::Invalid("status diagnostic reader failed".into()))?
+        .map_err(|e| Error::io("read status diagnostics", e))?;
+    if let Some(status) = terminal {
+        std::io::stdout()
+            .write_all(&bytes)
+            .map_err(|e| Error::io("write status output", e))?;
+        std::io::stderr()
+            .write_all(&error_bytes)
+            .map_err(|e| Error::io("write status error", e))?;
+        return Ok(status.code().unwrap_or(EXIT_TEMPFAIL as i32));
+    }
+    let phase = phase.lock().unwrap();
+    let status = incomplete_status(root.unwrap_or("."), &phase, BUDGET_MS);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).map_err(|e| Error::Invalid(e.to_string()))?
+        );
+    } else {
+        println!(
+            "status: unknown\ndiagnostic_phase: {phase}\nmessage: {}",
+            status["message"].as_str().unwrap()
+        );
+    }
+    Ok(EXIT_TEMPFAIL as i32)
+}
+
 fn dispatch_index_health_with_detail(
     command: &str,
     json: bool,
@@ -681,6 +820,11 @@ fn dispatch_index_health_with_detail(
     embedding_args: EmbeddingCliArgs<'_>,
     detailed: bool,
 ) -> Result<i32> {
+    #[cfg(unix)]
+    if command == "index-status" && std::env::var_os(STATUS_WORKER_ENV).is_none() {
+        return bounded_index_status(json, root);
+    }
+    status_diagnostic_phase("resolve_workspace");
     let effective_root = resolve_root(root)?;
     let project = workspace_locator::project_identity(&effective_root);
     let store_path = workspace_locator::store_path(&effective_root);
@@ -688,10 +832,8 @@ fn dispatch_index_health_with_detail(
         .parent()
         .and_then(|parent| greppy_core::cache::read_store_manifest(parent).ok())
         .map(|manifest| manifest.format_version);
-    let store_bytes = store_path
-        .parent()
-        .map(cache_path_bytes)
-        .unwrap_or_default();
+    // Advisory size accounting must not precede writer/progress observation.
+    let mut store_bytes = serde_json::Value::Null;
     let background_job = read_background_job(&background_job_path(&effective_root));
     let effective_root_string = effective_root.to_string_lossy().into_owned();
     let writer_active = workspace_writer_active(Some(&effective_root_string));
@@ -809,6 +951,12 @@ fn dispatch_index_health_with_detail(
         }
         return Ok(EXIT_TEMPFAIL as i32);
     }
+    status_diagnostic_phase("cache_size");
+    store_bytes = serde_json::json!(store_path
+        .parent()
+        .map(cache_path_bytes)
+        .unwrap_or_default());
+    status_diagnostic_phase("git_status");
     let dirty_overlay = dirty_overlay(&effective_root)?;
     let inference = (command == "doctor")
         .then(inference_registry_status)
@@ -898,6 +1046,7 @@ fn dispatch_index_health_with_detail(
         return Ok(1);
     }
 
+    status_diagnostic_phase("overlay_binding");
     let overlay = match crate::store_cow::overlay_spec(&effective_root) {
         Ok(overlay) => overlay,
         Err(issue) => {
@@ -950,6 +1099,7 @@ fn dispatch_index_health_with_detail(
             return Ok(EXIT_TEMPFAIL as i32);
         }
     };
+    status_diagnostic_phase("open_store");
     let store = match overlay {
         Some(overlay) => greppy_store::Store::open_overlay_read_only(
             &overlay.base_path,
@@ -960,9 +1110,13 @@ fn dispatch_index_health_with_detail(
             greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())?
         }
     };
+    status_diagnostic_phase("base_verification");
     let store_cow = crate::store_cow::diagnostics(&effective_root, &store, &store_path);
+    status_diagnostic_phase("graph_integrity");
     let diag = store.diagnostics()?;
+    status_diagnostic_phase("source_freshness");
     let freshness = nav_freshness_json(&store, root, &project);
+    status_diagnostic_phase("embedding_completion");
     let fresh = freshness
         .get("fresh")
         .and_then(serde_json::Value::as_bool)

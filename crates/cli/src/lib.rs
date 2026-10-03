@@ -1423,12 +1423,45 @@ fn command_skips_automatic_cache_maintenance(command: Option<&Command>) -> bool 
     match command {
         // These commands do not need a graph. In particular, a missing file
         // must be diagnosed before unrelated cache maintenance can do writes.
-        Some(Command::ReadFile { .. } | Command::Cache { .. }) => true,
+        Some(
+            Command::ReadFile { .. }
+            | Command::Cache { .. }
+            | Command::ReplaceText { .. }
+            | Command::ReplaceLines { .. }
+            | Command::ReplaceSpan { .. }
+            | Command::Write { .. }
+            | Command::DeleteLines { .. }
+            | Command::InsertLines { .. }
+            | Command::Patch { .. }
+            | Command::Undo { .. },
+        ) => true,
         Some(Command::Index { path, .. }) if path.as_deref() == Some("status") => true,
         #[cfg(feature = "bash-smart")]
         Some(Command::BashSmart { .. }) => true,
         _ => false,
     }
+}
+
+#[test]
+fn literal_edits_skip_unrelated_startup_maintenance() {
+    for args in [
+        vec!["greppy", "replace-lines", "note.md", "1:1", "new"],
+        vec!["greppy", "replace-text", "note.md", "old", "new"],
+        vec!["greppy", "insert-lines", "note.md", "1", "new"],
+        vec!["greppy", "delete-lines", "note.md", "1:1"],
+        vec!["greppy", "write", "note.md", "new"],
+        vec!["greppy", "patch"],
+        vec!["greppy", "undo"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(command_skips_automatic_cache_maintenance(
+            cli.command.as_ref()
+        ));
+    }
+    let cli = Cli::try_parse_from(["greppy", "replace", "some_symbol", "new"]).unwrap();
+    assert!(!command_skips_automatic_cache_maintenance(
+        cli.command.as_ref()
+    ));
 }
 
 fn prune_expired_evidence_packs_in_existing_store(path: &std::path::Path, now: u64) -> usize {
