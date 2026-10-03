@@ -34,7 +34,14 @@ Small operational records use the current user's production data namespace:
 `~/.local/share/greppy/verified-base-digests-v1` elsewhere on Unix. Missing
 components are created with mode 0700. Directory traversal uses `openat` and
 `O_NOFOLLOW`, validates ownership and denies group/other-write ancestors; the
-final directory must be private and owned by the current UID. macOS volumes
+final directory must be private and owned by the current UID. On macOS, native
+extended ACLs are queried on the actual directory/file descriptors, including
+root and all traversed ancestors, the cache directory, records, locks and staging
+files. Every mutation ALLOW grant is rejected conservatively (including owner
+and inherited grants); read/search ALLOWs and DENY-only ACLs remain acceptable.
+Unknown tags, permission bits and ACL query failures fail closed to a full hash.
+The SDK-documented EINVAL end marker is accepted only on a validated independent
+ACL copy using fixed FIRST/NEXT selectors. macOS volumes
 with `MNT_IGNORE_OWNERS` are rejected, so owners-disabled `/Volumes/tmp`
 sidecars never establish proof. Unavailable/unsafe storage simply misses.
 
@@ -72,6 +79,11 @@ mutation, cross-process proof loading, expiry/future clocks, exact manifest and
 file identity, fresh and unknown coarse metadata, digest mismatches, unsafe
 proof permissions, symlinks/hardlinks, malformed/oversized proofs and concurrent
 atomic publication. HFS classification and start/end age tests from PR #222 are
-included. The worker ran rustfmt only; the release owner owns compilation,
+included. Native Mac ACL negatives cover writable ancestors, cache directories
+and proof files whose POSIX modes remain 0700/0600; a deny-only/read-search
+positive exercises normal production namespace traversal. A separate command
+reopens that namespace and proves a cache hit with zero full digest reads.
+An invalid-descriptor ACL query proves failures are not empty ACLs.
+The worker ran rustfmt only; the release owner owns compilation,
 local tests and operational performance acceptance under the shared resource
 lease. No test result or release acceptance is claimed here.

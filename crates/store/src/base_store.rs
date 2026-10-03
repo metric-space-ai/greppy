@@ -774,6 +774,7 @@ fn trusted_digest_directory_at(path: &Path) -> io::Result<fs::File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open("/")?;
+    reject_mutating_acl(&directory)?;
     for component in path.components() {
         let Component::Normal(name) = component else {
             if component == Component::RootDir {
@@ -813,6 +814,7 @@ fn trusted_digest_directory_at(path: &Path) -> io::Result<fs::File> {
                 return Err(invalid_data("digest proof filesystem ignores ownership"));
             }
         }
+        reject_mutating_acl(&next)?;
         directory = next;
     }
     let metadata = directory.metadata()?;
@@ -834,6 +836,7 @@ fn read_digest_proof(directory: &fs::File, binding: &str, expected: &str) -> Opt
         0,
     )
     .ok()?;
+    validate_private_proof_file(&file).ok()?;
     let before = file.metadata().ok()?;
     if !before.is_file()
         || before.uid() != unsafe { libc::geteuid() }
@@ -847,6 +850,7 @@ fn read_digest_proof(directory: &fs::File, binding: &str, expected: &str) -> Opt
     let mut file = file;
     (&mut file).take(4097).read_to_end(&mut bytes).ok()?;
     let after = file.metadata().ok()?;
+    validate_private_proof_file(&file).ok()?;
     if bytes.len() > 4096
         || before.len() != after.len()
         || before.ctime() != after.ctime()
@@ -857,6 +861,96 @@ fn read_digest_proof(directory: &fs::File, binding: &str, expected: &str) -> Opt
         return None;
     }
     serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(target_os = "macos")]
+mod darwin_acl {
+    // Darwin SDK sys/acl.h ABI. The working ACL is an independent copy;
+    // acl_valid plus fixed selectors makes EINVAL the documented end marker.
+    unsafe extern "C" {
+        pub fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        pub fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
+        pub fn acl_get_entry(
+            acl: *mut libc::c_void,
+            selector: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        pub fn acl_get_tag_type(entry: *mut libc::c_void, tag: *mut libc::c_int) -> libc::c_int;
+        pub fn acl_get_permset_mask_np(entry: *mut libc::c_void, mask: *mut u64) -> libc::c_int;
+        pub fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    pub struct OwnedAcl(pub *mut libc::c_void);
+    impl Drop for OwnedAcl {
+        fn drop(&mut self) {
+            unsafe {
+                acl_free(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reject_mutating_acl(file: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        reject_mutating_acl_fd(file.as_raw_fd())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
+    use darwin_acl::*;
+    use std::os::fd::AsRawFd;
+    let acl = unsafe { acl_get_fd_np(fd, 0x100) }; // ACL_TYPE_EXTENDED
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let acl = OwnedAcl(acl);
+    if unsafe { acl_valid(acl.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut selector = 0; // ACL_FIRST_ENTRY
+    for _ in 0..=128 {
+        let mut entry = std::ptr::null_mut();
+        if unsafe { acl_get_entry(acl.0, selector, &mut entry) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        selector = -1; // ACL_NEXT_ENTRY
+        let mut tag = 0;
+        let mut permissions = 0;
+        if entry.is_null()
+            || unsafe { acl_get_tag_type(entry, &mut tag) } != 0
+            || unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0
+        {
+            return Err(invalid_data("digest proof ACL entry query failed"));
+        }
+        // Conservatively reject every mutating ALLOW, including inherited
+        // grants and owner grants. Read/search ALLOWs and DENYs are safe.
+        // WRITE/APPEND_DATA, DELETE[_CHILD], WRITE_{ATTRIBUTES,EXTATTRIBUTES,
+        // SECURITY}, CHANGE_OWNER (sys/acl.h). No principal resolution,
+        // group membership or ordering can accidentally broaden trust.
+        // READ_DATA, EXECUTE/SEARCH, READ_ATTRIBUTES, READ_EXTATTRIBUTES,
+        // READ_SECURITY and SYNCHRONIZE only; reject unknown future bits.
+        let read_only = (1_u64 << 1) | (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11) | (1 << 20);
+        match tag {
+            1 if permissions & !read_only == 0 => {} // ACL_EXTENDED_ALLOW
+            2 => {}                                  // ACL_EXTENDED_DENY
+            1 => return Err(invalid_data("digest proof ACL permits mutation")),
+            _ => return Err(invalid_data("unknown digest proof ACL tag")),
+        }
+    }
+    Err(invalid_data("digest proof ACL exceeds Darwin entry bound"))
 }
 
 #[cfg(unix)]
@@ -872,7 +966,7 @@ fn validate_private_proof_file(file: &fs::File) -> io::Result<()> {
             "unsafe digest proof file owner, type, links or permissions",
         ));
     }
-    Ok(())
+    reject_mutating_acl(file)
 }
 
 #[cfg(unix)]
@@ -1097,6 +1191,181 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn production_proof_fixture() -> tempfile::TempDir {
+        // Tiny operational proof metadata belongs in the ownership-enforcing
+        // production namespace. Base bytes stay on the disposable test volume.
+        trusted_digest_directory().expect("safe native production proof namespace");
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        tempfile::tempdir_in(
+            home.join("Library/Application Support/greppy/verified-base-digests-v1"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_test_acl(path: &Path, acl: &str) {
+        let result = std::process::Command::new("/bin/chmod")
+            .args(["+a", acl])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_mac_acl_rejects_writable_ancestor_directory_and_proof() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fixture = production_proof_fixture();
+        let ancestor = fixture.path().join("ancestor");
+        let cache = ancestor.join("cache");
+        fs::create_dir(&ancestor).unwrap();
+        fs::create_dir(&cache).unwrap();
+        for path in [&ancestor, &cache] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(trusted_digest_directory_at(&cache).is_ok());
+        set_test_acl(
+            &ancestor,
+            "everyone allow search,add_file,add_subdirectory,delete_child",
+        );
+        assert_eq!(fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o700);
+        assert!(trusted_digest_directory_at(&cache).is_err());
+        let result = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&ancestor)
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert!(trusted_digest_directory_at(&cache).is_ok());
+        set_test_acl(&cache, "everyone allow search,add_file,delete_child");
+        assert!(trusted_digest_directory_at(&cache).is_err());
+        let result = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&cache)
+            .status()
+            .unwrap();
+        assert!(result.success());
+        let directory = trusted_digest_directory_at(&cache).unwrap();
+        let proof = sample_digest_proof();
+        write_digest_proof(&directory, &proof).unwrap();
+        let path = cache.join(
+            digest_proof_name(&proof.manifest_sha256, &proof.digest)
+                .to_str()
+                .unwrap(),
+        );
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_some());
+        set_test_acl(&path, "everyone allow write,append,writesecurity");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert!(validate_private_proof_file(&fs::File::open(&path).unwrap()).is_err());
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_mac_acl_query_failure_is_not_empty_acl() {
+        // A query failure must never be interpreted as absent/harmless ACL.
+        assert!(reject_mutating_acl_fd(-1).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_mac_acl_accepts_deny_only_and_read_search() {
+        let fixture = production_proof_fixture();
+        set_test_acl(fixture.path(), "everyone deny delete");
+        set_test_acl(
+            fixture.path(),
+            "everyone allow list,search,readattr,readsecurity",
+        );
+        let directory = trusted_digest_directory_at(fixture.path()).unwrap();
+        let proof = sample_digest_proof();
+        write_digest_proof(&directory, &proof).unwrap();
+        let path = fixture.path().join(
+            digest_proof_name(&proof.manifest_sha256, &proof.digest)
+                .to_str()
+                .unwrap(),
+        );
+        set_test_acl(&path, "everyone deny delete");
+        set_test_acl(&path, "everyone allow read,readattr,readsecurity");
+        assert!(validate_private_proof_file(&fs::File::open(&path).unwrap()).is_ok());
+        assert!(read_digest_proof(&directory, &proof.manifest_sha256, &proof.digest).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_production_namespace_child() {
+        let Some(cache) = std::env::var_os("GREPPY_TEST_PRODUCTION_PROOF_DIRECTORY") else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os("GREPPY_TEST_PRODUCTION_BASE_PATH").unwrap());
+        let binding = hex_sha256(path.to_string_lossy().as_bytes());
+        let expected = hex_sha256(b"original");
+        FULL_DIGEST_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            verified_base_digest_at(
+                &path,
+                &binding,
+                &expected,
+                Some(trusted_digest_directory_at(Path::new(&cache)).unwrap())
+            )
+            .unwrap(),
+            expected
+        );
+        FULL_DIGEST_READS.with(|reads| {
+            assert_eq!(
+                reads.get(),
+                0,
+                "second command must reuse native namespace proof"
+            )
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_digest_native_production_namespace_reuses_across_commands() {
+        let fixture = production_proof_fixture();
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("base.db");
+        fs::write(&path, b"original").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let binding = hex_sha256(path.to_string_lossy().as_bytes());
+        let expected = hex_sha256(b"original");
+        FULL_DIGEST_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            verified_base_digest_at(
+                &path,
+                &binding,
+                &expected,
+                Some(trusted_digest_directory_at(fixture.path()).unwrap())
+            )
+            .unwrap(),
+            expected
+        );
+        FULL_DIGEST_READS.with(|reads| assert_eq!(reads.get(), 1));
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "base_store::tests::persistent_digest_production_namespace_child",
+                "--nocapture",
+            ])
+            .env("GREPPY_TEST_PRODUCTION_PROOF_DIRECTORY", fixture.path())
+            .env("GREPPY_TEST_PRODUCTION_BASE_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    }
 
     #[cfg(unix)]
     #[test]
