@@ -358,10 +358,12 @@ impl SseParser {
     fn handle_content_block_start(&mut self, data: &str) -> SseItem {
         match self.state {
             ProtocolState::InMessage => {}
-            ProtocolState::InBlock { .. } => {
+            ProtocolState::InBlock { index, kind } => {
                 return malformed(
                     "content_block_start",
-                    "content_block_start while a block is open".to_string(),
+                    format!(
+                        "content_block_start while a block is open (index={index}, kind={kind:?}); expected content_block_stop before another start"
+                    ),
                 )
             }
             ProtocolState::AwaitingStart => {
@@ -1269,7 +1271,80 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
     }
 
     #[test]
+    fn sse_text_to_tool_requires_explicit_block_stop() {
+        // Minimal synthetic analogue of the retained actor error, not a replay
+        // of its unavailable raw gateway SSE. Never infer a missing stop.
+        let fixture = r#"event: message_start
+data: {"type":"message_start","message":{"model":"m"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"I'll inspect."}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t1","name":"inspect","input":{}}}
+
+"#;
+        let mut parser = SseParser::new();
+        let items: Vec<_> = fixture
+            .lines()
+            .flat_map(|line| parser.feed_line(line))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                SseItem::Event(StreamEvent::Started { model: "m".into() }),
+                SseItem::Ignored,
+                SseItem::Event(StreamEvent::TextDelta { text: "I'll inspect.".into() }),
+                malformed(
+                    "content_block_start",
+                    "content_block_start while a block is open (index=2, kind=Text); expected content_block_stop before another start",
+                ),
+            ]
+        );
+
+        let valid = fixture.replace(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3",
+        ) + r#"event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"README.md\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let events = parse_all(&valid).expect("explicit stop permits the next block");
+        assert_eq!(events[2], StreamEvent::BlockFinished { index: 2 });
+        assert_eq!(events[3], StreamEvent::ToolCallStarted {
+            index: 3, id: "t1".into(), name: "inspect".into(),
+        });
+        assert_eq!(events[4], StreamEvent::ToolCallArgumentsDelta {
+            index: 3, json_fragment: "{\"path\":".into(),
+        });
+        assert_eq!(events[5], StreamEvent::ToolCallArgumentsDelta {
+            index: 3, json_fragment: "\"README.md\"}".into(),
+        });
+        assert_eq!(events[6], StreamEvent::BlockFinished { index: 3 });
+        assert!(matches!(events[7], StreamEvent::Finished {
+            stop_reason: StopReason::ToolUse, ..
+        }));
+        assert_eq!(events.len(), 8);
+    }
+
+    #[test]
     fn sse_duplicate_message_start_is_malformed() {
+
         let fixture = "\
 event: message_start
 data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
