@@ -104,6 +104,43 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn write_names_an_absent_workspace_root_and_preserves_the_calling_workspace() {
+    let fixture = Fixture::new("write-missing-root");
+    let missing = fixture.base.join("not-yet-created");
+    let root = missing.to_str().unwrap();
+    for json in [false, true] {
+        let mut args = vec!["--root", root];
+        if json {
+            args.push("--json");
+        }
+        args.extend(["write", "client/run.py", "# harmless fixture\n"]);
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+        let body = combined(&output);
+        assert!(body.contains("does not exist"), "{body}");
+        assert!(body.contains("Create this directory"), "{body}");
+        assert!(!body.contains("is outside"), "{body}");
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(value.get("error").is_some(), "{value}");
+        }
+        assert!(!missing.exists());
+        assert!(!fixture.repo.join("client/run.py").exists());
+    }
+    std::fs::create_dir_all(missing.join("client")).unwrap();
+    let retry = fixture.run(&[
+        "--root",
+        root,
+        "write",
+        "client/run.py",
+        "# harmless fixture\n",
+    ]);
+    assert!(retry.status.success(), "{}", combined(&retry));
+    assert_file(&missing.join("client/run.py"), "# harmless fixture\n");
+    assert!(!fixture.repo.join("client/run.py").exists());
+}
+
+#[test]
 fn regex_replacement_refuses_unknown_captures_and_preserves_literal_routes() {
     let fixture = Fixture::new("regex-route");
     let path = fixture.repo.join("route.ts");
