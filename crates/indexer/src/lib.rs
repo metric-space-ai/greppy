@@ -1827,7 +1827,7 @@ fn resolve_edges_with_replacement(
             if !seen.insert(module_file.clone()) {
                 continue;
             }
-            for raw in store.list_raw_edges_for_file(project, &module_file)? {
+            for raw in store.list_raw_import_edges_for_file(project, &module_file)? {
                 let edge = extracted_edge_from_raw(raw);
                 if edge.edge_type != "IMPORTS" {
                     continue;
