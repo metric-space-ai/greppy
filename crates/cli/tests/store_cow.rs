@@ -694,7 +694,40 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             .as_str()
             .expect("refreshed Delta path"),
     );
+    // Invalidating only Delta metadata must refresh private sources while
+    // retaining a current immutable Base and its fast visibility proof.
+    {
+        let mut old_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+        for mut workspace in old_delta.list_private_workspace_states().unwrap() {
+            workspace.indexer_version = "greppy-indexer-v6".into();
+            old_delta.upsert_workspace_state(&workspace).unwrap();
+        }
+    }
+    let (delta_upgrade_code, delta_upgrade_out, delta_upgrade_err) = run_with_env(
+        &first,
+        &store,
+        &["index", "."],
+        None,
+        &[
+            ("GREPPY_STRUCTURAL_FIRST_USE", "1"),
+            ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
+        ],
+    );
+    assert_eq!(
+        delta_upgrade_code, 0,
+        "private Delta upgrade must reuse the current Base: {delta_upgrade_out}\n{delta_upgrade_err}"
+    );
+    let upgraded_delta_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        upgraded_delta_status["store_cow"]["base_identity"],
+        shared_identity
+    );
+    assert_eq!(
+        upgraded_delta_status["freshness"]["source"], "verified_store_cow_overlay",
+        "upgrading private metadata must preserve a sparse verified overlay"
+    );
     let mut refreshed_delta = greppy_store::Store::open(&refreshed_delta_path).unwrap();
+
     let project = greppy_core::project_identity(&first);
     let generation = refreshed_delta
         .get_workspace_state(first.canonicalize().unwrap().to_string_lossy().as_ref())
@@ -768,6 +801,12 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     assert_eq!(
         cold_code, 0,
         "cold structural refresh failed: {cold_out}\n{cold_err}"
+    );
+    let cold_status = query_json_raw(&first, &store, &["index", "status"], None);
+    assert_eq!(
+        cold_status["store_cow"]["base_path"],
+        base_path.to_string_lossy().as_ref(),
+        "a current Base missing only summaries keeps its pinned structural graph"
     );
     std::fs::write(&summary_cache, saved_summary_cache).unwrap();
 
@@ -989,7 +1028,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
     assert_ne!(
         structural_status["store_cow"]["base_path"],
         previous_layout.graph.to_string_lossy().as_ref(),
-        "structural first use must publish a v7 Base"
+        "structural first use must replace an incompatible Base with the current extraction"
     );
     let migrated_base = greppy_store::Store::open(Path::new(
         structural_status["store_cow"]["base_path"]
@@ -1003,7 +1042,7 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             .unwrap()
             .len(),
         1,
-        "v7 migration must retain the v6 Base node"
+        "current extraction must recover the older Base source definition"
     );
     let migrated_vectors: i64 = migrated_base
         .conn()
@@ -1012,8 +1051,16 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         })
         .unwrap();
     assert_eq!(
-        migrated_vectors, v6_vectors,
-        "v7 migration must retain vectors"
+        migrated_vectors, 0,
+        "v9 re-extraction retires old Base node-bound vectors"
+    );
+    assert!(
+        migrated_base
+            .list_workspace_states()
+            .unwrap()
+            .iter()
+            .all(|workspace| { workspace.indexer_version == greppy_core::INDEXER_VERSION_BASE }),
+        "replacement Base must carry the current extraction identity"
     );
     let migrated_generation = migrated_base
         .list_workspace_states()
