@@ -11323,6 +11323,13 @@ fn compact_read_json(value: &mut serde_json::Value) {
 
 fn compact_default_json_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // File reads already emit a compact typed payload. Preserve their command,
+    // file content and continuation/handle metadata across every JSON spelling.
+    if value.get("command").and_then(serde_json::Value::as_str) == Some("read-file") {
+        let mut rendered = serde_json::to_vec_pretty(&value).ok()?;
+        rendered.push(b'\n');
+        return Some(rendered);
+    }
     // Preparation refusals have no answer rows to compact. Preserve their
     // typed failure and exact root/store recovery even without --diagnostics.
     if matches!(

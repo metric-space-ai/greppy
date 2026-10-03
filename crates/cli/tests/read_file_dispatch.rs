@@ -98,7 +98,7 @@ fn read_file_json_accepts_option_before_or_after_exact_range_operand() {
         let (code, out, err) = run(&repo, &store, &args);
         assert_eq!(code, 0, "{out}\n{err}");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["command"], "read-file");
+        assert_eq!(value["command"], "read-file", "argv={args:?}\n{out}");
         assert_eq!(value["files"][0]["path"], "sample.txt");
         assert_eq!(value["files"][0]["start_line"], 2);
         assert_eq!(value["files"][0]["end_line"], 3);
