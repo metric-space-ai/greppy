@@ -406,13 +406,90 @@ fn visibility_changed_paths(cached: &VisibilityIndex, live: &VisibilityIndex) ->
 
 fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::BTreeSet<String>> {
     let mut private_paths = std::collections::BTreeSet::new();
+    // Embedding publication materializes identical Base definitions in main
+    // because vectors require writable node foreign keys. These are derived
+    // rows, not source changes. Exempt only exact Base copies and vectors bound
+    // to them; an unrelated or changed private definition still needs visibility.
+    let nodes = if store.is_overlay() {
+        "SELECT d.file_path FROM main.nodes d
+         WHERE d.file_path <> '' AND d.label <> 'Folder'
+         AND NOT EXISTS (
+             SELECT 1 FROM greppy_base.nodes b
+             WHERE b.project = d.project AND b.qualified_name = d.qualified_name
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND b.start_line = d.start_line
+               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+         )"
+    } else {
+        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'"
+    };
+    let raw_edges = if store.is_overlay() {
+        // Older Effect.fn repair re-extracted every visible JS/TS file into
+        // main, even when its complete raw-edge contribution was unchanged.
+        // A repair marker alone cannot authorize arbitrary private edges.
+        "WITH candidates AS (
+             SELECT o.project, o.file_path FROM main.js_ts_reference_override_files o
+             JOIN main.schema_meta m ON m.key='greppy.effect_fn_repair_v8.' || o.project
+               AND m.value='complete'
+             WHERE NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path=o.file_path)
+               AND EXISTS (SELECT 1 FROM greppy_base.file_state s
+                           WHERE s.project=o.project AND s.rel_path=o.file_path)
+         ), delta_groups AS (
+             SELECT d.project,d.file_path,d.source_qname,d.target_qname,d.edge_type,d.properties,COUNT(*) AS n
+             FROM main.raw_edges d JOIN candidates c
+               ON c.project=d.project AND c.file_path=d.file_path
+             GROUP BY d.project,d.file_path,d.source_qname,d.target_qname,d.edge_type,d.properties
+         ), base_groups AS (
+             SELECT b.project,b.file_path,b.source_qname,b.target_qname,b.edge_type,b.properties,COUNT(*) AS n
+             FROM greppy_base.raw_edges b JOIN candidates c
+               ON c.project=b.project AND c.file_path=b.file_path
+             GROUP BY b.project,b.file_path,b.source_qname,b.target_qname,b.edge_type,b.properties
+         ), delta_difference AS (
+             SELECT * FROM delta_groups EXCEPT SELECT * FROM base_groups
+         ), base_difference AS (
+             SELECT * FROM base_groups EXCEPT SELECT * FROM delta_groups
+         ), mismatches AS (
+             SELECT project,file_path FROM delta_difference
+             UNION SELECT project,file_path FROM base_difference
+         )
+         SELECT DISTINCT d.file_path FROM main.raw_edges d WHERE d.file_path <> ''
+         AND NOT EXISTS (SELECT 1 FROM candidates c
+                         WHERE c.project=d.project AND c.file_path=d.file_path
+                           AND NOT EXISTS (SELECT 1 FROM mismatches x
+                                           WHERE x.project=c.project AND x.file_path=c.file_path))
+         UNION SELECT o.file_path FROM main.js_ts_reference_override_files o
+         WHERE NOT EXISTS (SELECT 1 FROM candidates c
+                           WHERE c.project=o.project AND c.file_path=o.file_path
+                             AND NOT EXISTS (SELECT 1 FROM mismatches x
+                                             WHERE x.project=c.project AND x.file_path=c.file_path))"
+    } else {
+        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''"
+    };
+    let vectors = if store.is_overlay() {
+        "SELECT v.file_path FROM main.vector_embeddings v
+         WHERE v.file_path <> '' AND NOT EXISTS (
+             SELECT 1 FROM nodes d JOIN greppy_base.nodes b
+               ON b.project = d.project AND b.qualified_name = d.qualified_name
+             WHERE (v.node_id IS NULL OR d.id = v.node_id) AND d.project = v.project
+               AND d.qualified_name = v.qualified_name AND d.file_path = v.file_path
+               AND b.label = d.label AND b.name = d.name
+               AND b.file_path = d.file_path AND b.start_line = d.start_line
+               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
+               AND v.start_line >= d.start_line AND v.end_line >= v.start_line
+               AND (v.end_line <= d.end_line OR d.end_line = d.start_line)
+         )"
+    } else {
+        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''"
+    };
     for query in [
         "SELECT rel_path FROM main.file_state",
         "SELECT rel_path FROM main.index_skips",
-        "SELECT file_path FROM main.nodes WHERE file_path <> '' AND label <> 'Folder'",
-        "SELECT file_path FROM main.raw_edges WHERE file_path <> ''",
+        nodes,
+        raw_edges,
         "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
-        "SELECT file_path FROM main.vector_embeddings WHERE file_path <> ''",
+        vectors,
     ] {
         let mut statement = store
             .conn()
@@ -4670,6 +4747,284 @@ mod tests {
         let paths = private_delta_paths(&store).unwrap();
         assert!(!paths.contains("src"));
         assert!(paths.contains("src/lib.rs"));
+    }
+
+    fn materialized_base_embedding_fixture(
+        visibility: &VisibilityIndex,
+    ) -> (tempfile::TempDir, greppy_store::Store) {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let node = greppy_store::NewNode {
+            project: "p".into(),
+            label: "Function".into(),
+            name: "run".into(),
+            qualified_name: "src/lib.rs::Function::run".into(),
+            file_path: "src/lib.rs".into(),
+            start_line: 2,
+            end_line: 4,
+            properties: serde_json::json!({"signature": "fn run()"}),
+        };
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            base.insert_node(&node).unwrap();
+        }
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
+        overlay
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+        let id = overlay.insert_writable_node(&node).unwrap();
+        overlay
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "fixture".into(),
+                prompt_version: "fixture".into(),
+                task: "code".into(),
+                node_id: Some(id),
+                chunk_idx: 0,
+                qualified_name: node.qualified_name,
+                file_path: node.file_path,
+                start_line: 2,
+                end_line: 4,
+                content_sha256: "a".repeat(64),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        (scratch, overlay)
+    }
+
+    #[test]
+    fn private_delta_paths_allow_identical_base_embedding_materialization() {
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&VisibilityIndex::default());
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        // Legacy node-less chunks must still bind by complete visible identity.
+        overlay
+            .conn()
+            .execute("UPDATE main.vector_embeddings SET node_id=NULL", [])
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        overlay
+            .conn()
+            .execute("DELETE FROM main.nodes", [])
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+    }
+
+    #[test]
+    fn private_delta_paths_reject_changed_or_rogue_materialization() {
+        for mutation in [
+            "UPDATE main.nodes SET name='changed'",
+            "UPDATE main.nodes SET label='Variable'",
+            "UPDATE main.nodes SET properties='{}'",
+            "UPDATE main.nodes SET end_line=5",
+            "UPDATE main.vector_embeddings SET qualified_name='rogue'",
+            "UPDATE main.vector_embeddings SET file_path='src/rogue.rs'",
+            "UPDATE main.vector_embeddings SET start_line=1",
+            "UPDATE main.vector_embeddings SET end_line=5",
+            "INSERT INTO main.file_state (project,rel_path,sha256) VALUES ('p','src/lib.rs','rogue')",
+            "INSERT INTO main.file_content (project,rel_path,line,snippet,file_path) VALUES ('p','src/lib.rs',2,'rogue','src/lib.rs')",
+            "INSERT INTO main.raw_edges (project,file_path,source_qname,target_qname,edge_type,properties) VALUES ('p','src/lib.rs','run','rogue','CALLS','{}')",
+        ] {
+            let (_scratch, overlay) =
+                materialized_base_embedding_fixture(&VisibilityIndex::default());
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(
+                !private_delta_paths(&overlay).unwrap().is_empty(),
+                "undeclared Delta modification escaped the freshness guard: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_do_not_exempt_hidden_base_copies() {
+        for visibility in [
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap(),
+            VisibilityIndex::new(Vec::<String>::new(), ["src/lib.rs".to_string()]).unwrap(),
+        ] {
+            let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.rs"));
+        }
+    }
+
+    fn unchanged_repair_edges_fixture(
+        visibility: &VisibilityIndex,
+        with_base_state: bool,
+        with_base_edges: bool,
+    ) -> (tempfile::TempDir, greppy_store::Store) {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            base.upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "now".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            if with_base_state {
+                base.conn().execute("INSERT INTO main.file_state(project,rel_path,sha256) VALUES('p','src/lib.ts','base')", []).unwrap();
+            }
+            let edge = greppy_store::NewRawEdge {
+                project: "p".into(),
+                file_path: "src/lib.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "target".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"line": 2}),
+            };
+            if with_base_edges {
+                base.insert_raw_edges(&[edge.clone(), edge]).unwrap();
+            }
+        }
+        let overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
+        overlay.conn().execute_batch(
+            "INSERT INTO main.projects SELECT * FROM greppy_base.projects;
+             INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+             SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM greppy_base.raw_edges;
+             INSERT INTO main.js_ts_reference_override_files VALUES('p','src/lib.ts');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');"
+        ).unwrap();
+        (scratch, overlay)
+    }
+
+    #[test]
+    fn private_delta_paths_allow_only_complete_unchanged_repair_edges() {
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        for mutation in [
+            "DELETE FROM main.raw_edges",
+            "DELETE FROM main.raw_edges WHERE id=(SELECT MIN(id) FROM main.raw_edges)",
+            "INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties) SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM main.raw_edges LIMIT 1",
+            "UPDATE main.raw_edges SET target_qname='rogue'",
+            "UPDATE main.raw_edges SET properties='{}'",
+            "DELETE FROM main.js_ts_reference_override_files",
+            "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
+        ] {
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+            overlay.conn().execute(mutation, []).unwrap();
+            assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.ts"), "{mutation}");
+        }
+        for visibility in [
+            VisibilityIndex::new(["src/lib.ts".to_string()], Vec::<String>::new()).unwrap(),
+            VisibilityIndex::new(Vec::<String>::new(), ["src/lib.ts".to_string()]).unwrap(),
+        ] {
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&visibility, true, true);
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
+            overlay
+                .conn()
+                .execute("DELETE FROM main.raw_edges", [])
+                .unwrap();
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
+        }
+    }
+
+    #[test]
+    fn private_delta_paths_validate_overrides_even_without_private_edges() {
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, false);
+        assert!(
+            private_delta_paths(&overlay).unwrap().is_empty(),
+            "certified empty Base contribution must remain valid"
+        );
+        overlay
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
+                [],
+            )
+            .unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+        overlay.conn().execute_batch("DELETE FROM main.raw_edges; DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p';").unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), false, false);
+        assert!(
+            private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"),
+            "override without Base file identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn effect_fn_repair_does_not_republish_unchanged_base_edges() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/plain.ts"),
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "plain JS base"]);
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
+        assert!(overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        let count: i64 = overlay
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.js_ts_reference_override_files",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!greppy_indexer::recover_visible_effect_fn_bindings(
+            &mut overlay,
+            "p",
+            repo.path()
+        )
+        .unwrap());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
     }
 
     #[test]
