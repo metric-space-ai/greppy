@@ -1793,7 +1793,10 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
     assert!(compact.get("providers").is_none(), "{compact}");
     let guidance = compact["diagnostics_command"].as_str().unwrap();
     assert!(guidance.starts_with("GREPPY_STORE_DIR="), "{guidance}");
-    assert!(guidance.contains(store.to_string_lossy().as_ref()), "{guidance}");
+    assert!(
+        guidance.contains(store.to_string_lossy().as_ref()),
+        "{guidance}"
+    );
     assert!(guidance.contains("greppy --root "), "{guidance}");
     assert!(
         guidance.contains(v["root_path"].as_str().unwrap()),
@@ -4170,7 +4173,10 @@ fn refreshing_query_refusal_reports_publication_and_original_command_recovery() 
     assert!(out.contains("publication is in progress"), "{out} {err}");
     assert!(out.contains("index status --json"), "{out} {err}");
     assert!(out.contains("GREPPY_STORE_DIR="), "{out} {err}");
-    assert!(out.contains(store.to_string_lossy().as_ref()), "{out} {err}");
+    assert!(
+        out.contains(store.to_string_lossy().as_ref()),
+        "{out} {err}"
+    );
     assert!(out.contains("greppy --root "), "{out} {err}");
     assert!(
         out.contains(repo.canonicalize().unwrap().to_string_lossy().as_ref()),
