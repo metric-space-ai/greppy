@@ -415,14 +415,8 @@ fn truncate(s: &str, max: usize) -> &str {
 #[derive(Debug)]
 enum OpenBlock {
     None,
-    Text {
-        index: usize,
-        text: String,
-    },
-    Thinking {
-        index: usize,
-        text: String,
-    },
+    Text { index: usize, text: String },
+    Thinking { index: usize, text: String },
 }
 
 #[derive(Debug)]
@@ -501,13 +495,18 @@ impl TurnAssembler {
                 if self.open_tools.contains_key(index)
                     || self.parts.iter().any(|(seen, _)| seen == index)
                 {
-                    return Err(ClientError::Stream(format!("duplicate tool block index: {index}")));
+                    return Err(ClientError::Stream(format!(
+                        "duplicate tool block index: {index}"
+                    )));
                 }
-                self.open_tools.insert(*index, OpenTool {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args_json: String::new(),
-                });
+                self.open_tools.insert(
+                    *index,
+                    OpenTool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args_json: String::new(),
+                    },
+                );
                 // Soft indices track the highest seen block index + 1.
                 self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
                 Ok(())
@@ -552,7 +551,9 @@ impl TurnAssembler {
 
     fn append_text(&mut self, text: &str) -> Result<(), ClientError> {
         if !self.open_tools.is_empty() {
-            return Err(ClientError::Stream("text delta while tool blocks are open".into()));
+            return Err(ClientError::Stream(
+                "text delta while tool blocks are open".into(),
+            ));
         }
         match &mut self.open {
             OpenBlock::Text { text: acc, .. } => {
@@ -575,7 +576,9 @@ impl TurnAssembler {
 
     fn append_thinking(&mut self, text: &str) -> Result<(), ClientError> {
         if !self.open_tools.is_empty() {
-            return Err(ClientError::Stream("thinking delta while tool blocks are open".into()));
+            return Err(ClientError::Stream(
+                "thinking delta while tool blocks are open".into(),
+            ));
         }
         match &mut self.open {
             OpenBlock::Thinking { text: acc, .. } => {
@@ -598,16 +601,21 @@ impl TurnAssembler {
 
     fn flush_open(&mut self, index: usize) -> Result<(), ClientError> {
         if let Some(tool) = self.open_tools.remove(&index) {
-            self.parts.push((index, ContentPart::ToolCall {
-                id: tool.id,
-                name: tool.name,
-                arguments: parse_arguments(&tool.args_json),
-            }));
+            self.parts.push((
+                index,
+                ContentPart::ToolCall {
+                    id: tool.id,
+                    name: tool.name,
+                    arguments: parse_arguments(&tool.args_json),
+                },
+            ));
             self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
             return Ok(());
         }
         if !self.open_tools.is_empty() || self.parts.iter().any(|(seen, _)| *seen == index) {
-            return Err(ClientError::Stream(format!("block stop without an open block at index {index}")));
+            return Err(ClientError::Stream(format!(
+                "block stop without an open block at index {index}"
+            )));
         }
         match std::mem::replace(&mut self.open, OpenBlock::None) {
             OpenBlock::None => {
@@ -725,22 +733,34 @@ mod tests {
         let (turn, events) = consume_sse_for_test(fixture, fixture.len(), 1000)
             .expect("captured concurrent tool-use blocks assemble");
         assert_eq!(turn.stop_reason, StopReason::ToolUse);
-        let calls: Vec<_> = turn.message.content.into_iter()
-            .filter(|part| matches!(part, ContentPart::ToolCall { .. })).collect();
-        assert_eq!(calls, vec![
-            ContentPart::ToolCall {
-                id: "call_5fa6967629d34f238f6ff6f9".into(), name: "greppy".into(),
-                arguments: serde_json::json!({"args": ["where-am-i"]}),
-            },
-            ContentPart::ToolCall {
-                id: "call_bbec7d7ef9a548ad9a9e75a8".into(), name: "greppy".into(),
-                arguments: serde_json::json!({"args": ["web", "session", "create", "--profile", "project", "--json"]}),
-            },
-        ]);
-        let indices: Vec<_> = events.iter().filter_map(|event| match event {
-            StreamEvent::ToolCallStarted { index, .. } => Some(*index),
-            _ => None,
-        }).collect();
+        let calls: Vec<_> = turn
+            .message
+            .content
+            .into_iter()
+            .filter(|part| matches!(part, ContentPart::ToolCall { .. }))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ContentPart::ToolCall {
+                    id: "call_5fa6967629d34f238f6ff6f9".into(),
+                    name: "greppy".into(),
+                    arguments: serde_json::json!({"args": ["where-am-i"]}),
+                },
+                ContentPart::ToolCall {
+                    id: "call_bbec7d7ef9a548ad9a9e75a8".into(),
+                    name: "greppy".into(),
+                    arguments: serde_json::json!({"args": ["web", "session", "create", "--profile", "project", "--json"]}),
+                },
+            ]
+        );
+        let indices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallStarted { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
         assert_eq!(indices, vec![2, 3]);
         assert_eq!(turn.usage.input_tokens, 2577);
         assert_eq!(turn.usage.output_tokens, 192);
@@ -749,54 +769,94 @@ mod tests {
     #[test]
     fn assembler_parallel_tools_require_each_stop_and_keep_index_order() {
         let mut assembler = TurnAssembler::new();
-        assembler.observe(&StreamEvent::Started { model: "m".into() }).unwrap();
+        assembler
+            .observe(&StreamEvent::Started { model: "m".into() })
+            .unwrap();
         for index in [2, 3] {
-            assembler.observe(&StreamEvent::ToolCallStarted {
-                index, id: format!("t{index}"), name: "g".into(),
-            }).unwrap();
+            assembler
+                .observe(&StreamEvent::ToolCallStarted {
+                    index,
+                    id: format!("t{index}"),
+                    name: "g".into(),
+                })
+                .unwrap();
         }
-        assert!(assembler.observe(&StreamEvent::ToolCallStarted {
-            index: 2, id: "duplicate".into(), name: "g".into(),
-        }).is_err());
-        assert!(assembler.observe(&StreamEvent::ToolCallArgumentsDelta {
-            index: 4, json_fragment: "{}".into(),
-        }).is_err());
+        assert!(assembler
+            .observe(&StreamEvent::ToolCallStarted {
+                index: 2,
+                id: "duplicate".into(),
+                name: "g".into(),
+            })
+            .is_err());
+        assert!(assembler
+            .observe(&StreamEvent::ToolCallArgumentsDelta {
+                index: 4,
+                json_fragment: "{}".into(),
+            })
+            .is_err());
         for (index, fragment) in [(3, "{\"b\":"), (2, "{\"a\":1}"), (3, "2}")] {
-            assembler.observe(&StreamEvent::ToolCallArgumentsDelta {
-                index, json_fragment: fragment.into(),
-            }).unwrap();
+            assembler
+                .observe(&StreamEvent::ToolCallArgumentsDelta {
+                    index,
+                    json_fragment: fragment.into(),
+                })
+                .unwrap();
         }
-        assembler.observe(&StreamEvent::BlockFinished { index: 3 }).unwrap();
-        assert!(assembler.observe(&StreamEvent::Finished {
-            stop_reason: StopReason::ToolUse, usage: Usage::default(),
-        }).is_err());
+        assembler
+            .observe(&StreamEvent::BlockFinished { index: 3 })
+            .unwrap();
+        assert!(assembler
+            .observe(&StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+            .is_err());
         assert!(assembler.observe_message_stop().is_err());
-        assert!(assembler.observe(&StreamEvent::BlockFinished { index: 3 }).is_err());
-        assembler.observe(&StreamEvent::BlockFinished { index: 2 }).unwrap();
-        assembler.observe(&StreamEvent::Finished {
-            stop_reason: StopReason::ToolUse, usage: Usage::default(),
-        }).unwrap();
+        assert!(assembler
+            .observe(&StreamEvent::BlockFinished { index: 3 })
+            .is_err());
+        assembler
+            .observe(&StreamEvent::BlockFinished { index: 2 })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+            .unwrap();
         let turn = assembler.finish().unwrap();
-        assert_eq!(turn.message.content, vec![
-            ContentPart::ToolCall {
-                id: "t2".into(), name: "g".into(), arguments: serde_json::json!({"a": 1}),
-            },
-            ContentPart::ToolCall {
-                id: "t3".into(), name: "g".into(), arguments: serde_json::json!({"b": 2}),
-            },
-        ]);
+        assert_eq!(
+            turn.message.content,
+            vec![
+                ContentPart::ToolCall {
+                    id: "t2".into(),
+                    name: "g".into(),
+                    arguments: serde_json::json!({"a": 1}),
+                },
+                ContentPart::ToolCall {
+                    id: "t3".into(),
+                    name: "g".into(),
+                    arguments: serde_json::json!({"b": 2}),
+                },
+            ]
+        );
 
         let mut unfinished = TurnAssembler::new();
-        unfinished.observe(&StreamEvent::Started { model: "m".into() }).unwrap();
-        unfinished.observe(&StreamEvent::ToolCallStarted {
-            index: 0, id: "open".into(), name: "g".into(),
-        }).unwrap();
+        unfinished
+            .observe(&StreamEvent::Started { model: "m".into() })
+            .unwrap();
+        unfinished
+            .observe(&StreamEvent::ToolCallStarted {
+                index: 0,
+                id: "open".into(),
+                name: "g".into(),
+            })
+            .unwrap();
         assert!(unfinished.finish().is_err());
     }
 
     #[test]
     fn normalize_base_url_strips_trailing_slashes() {
-
         assert_eq!(
             normalize_base_url("http://127.0.0.1:8317/"),
             "http://127.0.0.1:8317"

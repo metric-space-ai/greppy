@@ -1316,27 +1316,44 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
     #[test]
     fn sse_captured_parallel_tools_preserve_each_call_and_argument() {
         let events = parse_all(GLM_PARALLEL_TOOLS).expect("indexed tool-use overlap is valid");
-        let tools: Vec<_> = events.into_iter().filter(|event| matches!(event,
-            StreamEvent::ToolCallStarted { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::BlockFinished { index: 2 | 3 }
-        )).collect();
-        assert_eq!(tools, vec![
-            StreamEvent::ToolCallStarted {
-                index: 2, id: "call_5fa6967629d34f238f6ff6f9".into(), name: "greppy".into(),
-            },
-            StreamEvent::ToolCallStarted {
-                index: 3, id: "call_bbec7d7ef9a548ad9a9e75a8".into(), name: "greppy".into(),
-            },
-            StreamEvent::ToolCallArgumentsDelta {
-                index: 2, json_fragment: r#"{"args":["where-am-i"]}"#.into(),
-            },
-            StreamEvent::BlockFinished { index: 2 },
-            StreamEvent::ToolCallArgumentsDelta {
-                index: 3, json_fragment: r#"{"args":["web", "session", "create", "--profile", "project", "--json"]}"#.into(),
-            },
-            StreamEvent::BlockFinished { index: 3 },
-        ]);
+        let tools: Vec<_> = events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ToolCallStarted { .. }
+                        | StreamEvent::ToolCallArgumentsDelta { .. }
+                        | StreamEvent::BlockFinished { index: 2 | 3 }
+                )
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            vec![
+                StreamEvent::ToolCallStarted {
+                    index: 2,
+                    id: "call_5fa6967629d34f238f6ff6f9".into(),
+                    name: "greppy".into(),
+                },
+                StreamEvent::ToolCallStarted {
+                    index: 3,
+                    id: "call_bbec7d7ef9a548ad9a9e75a8".into(),
+                    name: "greppy".into(),
+                },
+                StreamEvent::ToolCallArgumentsDelta {
+                    index: 2,
+                    json_fragment: r#"{"args":["where-am-i"]}"#.into(),
+                },
+                StreamEvent::BlockFinished { index: 2 },
+                StreamEvent::ToolCallArgumentsDelta {
+                    index: 3,
+                    json_fragment:
+                        r#"{"args":["web", "session", "create", "--profile", "project", "--json"]}"#
+                            .into(),
+                },
+                StreamEvent::BlockFinished { index: 3 },
+            ]
+        );
     }
 
     fn tool_overlap_prefix() -> &'static str {
@@ -1349,7 +1366,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[test]
     fn sse_parallel_tools_allow_reverse_stop_order_and_split_arguments() {
-        let fixture = tool_overlap_prefix().to_owned() + r#"event: content_block_delta
+        let fixture = tool_overlap_prefix().to_owned()
+            + r#"event: content_block_delta
 data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"b\":"}}
 
 event: content_block_delta
@@ -1372,31 +1390,77 @@ data: {"type":"message_stop"}
 
 "#;
         let events = parse_all(&fixture).expect("reverse stops and interleaved fragments");
-        assert_eq!(events[3], StreamEvent::ToolCallArgumentsDelta {
-            index: 3, json_fragment: "{\"b\":".into(),
-        });
-        assert_eq!(events[4], StreamEvent::ToolCallArgumentsDelta {
-            index: 2, json_fragment: "{\"a\":1}".into(),
-        });
-        assert_eq!(events[5], StreamEvent::ToolCallArgumentsDelta {
-            index: 3, json_fragment: "2}".into(),
-        });
+        assert_eq!(
+            events[3],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "{\"b\":".into(),
+            }
+        );
+        assert_eq!(
+            events[4],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 2,
+                json_fragment: "{\"a\":1}".into(),
+            }
+        );
+        assert_eq!(
+            events[5],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "2}".into(),
+            }
+        );
         assert_eq!(events[6], StreamEvent::BlockFinished { index: 3 });
         assert_eq!(events[7], StreamEvent::BlockFinished { index: 2 });
-        assert!(matches!(events[8], StreamEvent::Finished { stop_reason: StopReason::ToolUse, .. }));
+        assert!(matches!(
+            events[8],
+            StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
+        ));
         assert_eq!(events.len(), 9);
     }
 
     #[test]
     fn sse_parallel_tools_remain_strict_about_indices_kinds_and_stops() {
         let invalid = [
-            ("content_block_start", json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"duplicate","name":"g"}}), "duplicate"),
-            ("content_block_start", json!({"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}), "only tool_use"),
-            ("content_block_start", json!({"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":""}}), "only tool_use"),
-            ("content_block_delta", json!({"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{}"}}), "index mismatch"),
-            ("content_block_delta", json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"wrong"}}), "non-text"),
-            ("content_block_stop", json!({"type":"content_block_stop","index":4}), "index mismatch"),
-            ("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}), "open"),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"duplicate","name":"g"}}),
+                "duplicate",
+            ),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}),
+                "only tool_use",
+            ),
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":""}}),
+                "only tool_use",
+            ),
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                "index mismatch",
+            ),
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"wrong"}}),
+                "non-text",
+            ),
+            (
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":4}),
+                "index mismatch",
+            ),
+            (
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                "open",
+            ),
             ("message_stop", json!({"type":"message_stop"}), "open"),
         ];
         for (name, data, expected) in invalid {
@@ -1418,7 +1482,6 @@ data: {"type":"message_stop"}
 
     #[test]
     fn sse_text_to_tool_requires_explicit_block_stop() {
-
         // Minimal synthetic analogue of the retained actor error, not a replay
         // of its unavailable raw gateway SSE. Never infer a missing stop.
         let fixture = r#"event: message_start
@@ -1473,25 +1536,41 @@ data: {"type":"message_stop"}
 "#;
         let events = parse_all(&valid).expect("explicit stop permits the next block");
         assert_eq!(events[2], StreamEvent::BlockFinished { index: 2 });
-        assert_eq!(events[3], StreamEvent::ToolCallStarted {
-            index: 3, id: "t1".into(), name: "inspect".into(),
-        });
-        assert_eq!(events[4], StreamEvent::ToolCallArgumentsDelta {
-            index: 3, json_fragment: "{\"path\":".into(),
-        });
-        assert_eq!(events[5], StreamEvent::ToolCallArgumentsDelta {
-            index: 3, json_fragment: "\"README.md\"}".into(),
-        });
+        assert_eq!(
+            events[3],
+            StreamEvent::ToolCallStarted {
+                index: 3,
+                id: "t1".into(),
+                name: "inspect".into(),
+            }
+        );
+        assert_eq!(
+            events[4],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "{\"path\":".into(),
+            }
+        );
+        assert_eq!(
+            events[5],
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                json_fragment: "\"README.md\"}".into(),
+            }
+        );
         assert_eq!(events[6], StreamEvent::BlockFinished { index: 3 });
-        assert!(matches!(events[7], StreamEvent::Finished {
-            stop_reason: StopReason::ToolUse, ..
-        }));
+        assert!(matches!(
+            events[7],
+            StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
+        ));
         assert_eq!(events.len(), 8);
     }
 
     #[test]
     fn sse_duplicate_message_start_is_malformed() {
-
         let fixture = "\
 event: message_start
 data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}
