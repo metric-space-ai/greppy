@@ -499,6 +499,13 @@ SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
        b.vector, b.created_at, b.vector_i8, b.i8_scale
 FROM greppy_base.vector_embeddings b
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.vector_embeddings d
+    WHERE d.project = b.project AND d.model_id = b.model_id
+      AND d.prompt_version = b.prompt_version AND d.task = b.task
+      AND d.qualified_name = b.qualified_name AND d.chunk_idx = b.chunk_idx
+      AND d.content_sha256 = b.content_sha256
+)
+AND NOT EXISTS (
     SELECT 1 FROM definition_identity_overrides q
     WHERE q.project = b.project AND q.qualified_name = b.qualified_name
 )

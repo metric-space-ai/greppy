@@ -246,7 +246,7 @@ pub fn count_code_embedding_documents_for_scope(
     let mut total = 0usize;
 
     loop {
-        let nodes = if store.is_overlay() {
+        let nodes = if store.is_overlay() && prefixes.is_empty() {
             store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
         } else {
             store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
@@ -376,7 +376,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
     });
 
     loop {
-        let nodes = if store.is_overlay() {
+        let nodes = if store.is_overlay() && prefixes.is_empty() {
             store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
         } else {
             store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?
@@ -386,7 +386,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
         }
         offset += nodes.len();
 
-        for node in nodes {
+        for mut node in nodes {
             if !embedding_path_matches(&node.file_path, prefixes) {
                 continue;
             }
@@ -432,6 +432,23 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 continue;
             }
 
+            // Base nodes have negative ids and cannot be FK targets in the
+            // writable Delta. Copy only this scoped definition, with identical
+            // graph identity/content, before adding its vectors to the Delta.
+            // The composed graph still exposes one definition and remaps edges
+            // through its qualified name; the immutable Base remains untouched.
+            if store.is_overlay() && node.id < 0 {
+                node.id = store.insert_node(&greppy_store::NewNode {
+                    project: node.project.clone(),
+                    label: node.label.clone(),
+                    name: node.name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    file_path: node.file_path.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    properties: node.properties.clone(),
+                })?;
+            }
             for chunk in chunks {
                 let content_sha256 = sha256_hex(chunk.text.as_bytes());
                 if let Some(existing) =
@@ -1540,6 +1557,144 @@ mod tests {
                 properties: serde_json::json!({}),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn scoped_overlay_embeds_visible_base_definitions_without_mutating_base() {
+        for warm in [false, true] {
+            let root = tempdir_via_env();
+            std::fs::create_dir_all(root.join("src/scrape")).unwrap();
+            std::fs::write(root.join("src/scrape/person.rs"), "pub fn person() {}\n").unwrap();
+            std::fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+            let base_path = root.join("base.db");
+            let delta_path = root.join("delta.db");
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+            insert_node(
+                &mut base,
+                "p.person",
+                "person",
+                "Function",
+                "src/scrape/person.rs",
+                1,
+                1,
+            );
+            insert_node(
+                &mut base,
+                "p.other",
+                "other",
+                "Function",
+                "src/other.rs",
+                1,
+                1,
+            );
+            let mut provider = DeterministicProvider;
+            if warm {
+                index_code_embeddings_for_project(
+                    &mut base,
+                    &root,
+                    "p",
+                    &mut provider,
+                    EmbeddingIndexOptions::for_generation(1),
+                )
+                .unwrap();
+            }
+            drop(base);
+            let immutable = std::fs::read(&base_path).unwrap();
+            let mut overlay = Store::open_overlay(
+                &base_path,
+                &delta_path,
+                &greppy_store::VisibilityIndex::default(),
+            )
+            .unwrap();
+            overlay
+                .upsert_project(&Project {
+                    name: "p".into(),
+                    indexed_at: "x".into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                })
+                .unwrap();
+            let prefixes = vec!["src/scrape".to_owned()];
+            let options = EmbeddingIndexOptions::for_generation(2);
+            let total = count_code_embedding_documents_for_scope(
+                &overlay, &root, "p", &provider, options, &prefixes,
+            )
+            .unwrap();
+            assert_eq!(
+                total, 1,
+                "a sparse Delta must include the requested Base definitions"
+            );
+            let report = index_code_embeddings_for_scope_with_progress(
+                &mut overlay,
+                &root,
+                "p",
+                &mut provider,
+                options,
+                total,
+                &mut |_| {},
+                &prefixes,
+            )
+            .unwrap();
+            assert_eq!(report.nodes_considered, 1);
+            assert_eq!(report.nodes_reused, usize::from(warm));
+            let query = VectorSearchQuery {
+                project: "p",
+                model_id: "test-code-embedder",
+                prompt_version: "test-prompt-v1",
+                task: "embeddinggemma_code_retrieval",
+                graph_generation: Some(2),
+                file_path: None,
+                path_prefixes: Some(&prefixes),
+                limit: 5,
+                min_score: None,
+            };
+            assert_eq!(
+                overlay.count_vector_search_scope(&query).unwrap(),
+                1,
+                "Base and Delta copies must not duplicate candidates"
+            );
+            let hits = overlay.vector_search_exact(&[1.0, 0.0], &query).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(
+                overlay
+                    .get_node(hits[0].embedding.node_id.unwrap())
+                    .unwrap()
+                    .is_some(),
+                "vector keeps a valid composed graph reference"
+            );
+            assert_eq!(overlay.count_nodes("p", "", "").unwrap(), 2);
+            let all_visible = vec![String::new()];
+            index_code_embeddings_for_scope_with_progress(
+                &mut overlay,
+                &root,
+                "p",
+                &mut provider,
+                EmbeddingIndexOptions::for_generation(3),
+                2,
+                &mut |_| {},
+                &all_visible,
+            )
+            .unwrap();
+            assert_eq!(
+                overlay
+                    .count_vector_embeddings(
+                        "p",
+                        "test-code-embedder",
+                        "test-prompt-v1",
+                        "embeddinggemma_code_retrieval",
+                        None
+                    )
+                    .unwrap(),
+                2
+            );
+            overlay.integrity_check().unwrap();
+            assert_eq!(std::fs::read(&base_path).unwrap(), immutable);
+        }
     }
 
     #[test]

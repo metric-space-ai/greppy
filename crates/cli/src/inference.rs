@@ -61,6 +61,26 @@ pub(crate) fn embedding_generation_complete(
         == Some(format!("{graph_generation}|{model_id}"))
 }
 
+/// Delta-only global preparation is safe only with a complete immutable Base.
+pub(crate) fn base_embedding_generation_complete(
+    store: &greppy_store::Store,
+    project: &str,
+    model_id: &str,
+) -> bool {
+    store.is_overlay()
+        && store
+            .conn()
+            .query_row(
+                "SELECT EXISTS (
+            SELECT 1 FROM greppy_base.workspace_state w, greppy_base.schema_meta m
+            WHERE m.key = ?1 AND m.value = CAST(w.graph_generation AS TEXT) || '|' || ?2
+        )",
+                rusqlite::params![embedding_complete_key(project), model_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+}
+
 pub(crate) fn background_embedding_path_prefixes() -> Result<Vec<String>> {
     if std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() != Some("embedding") {
         return Ok(Vec::new());

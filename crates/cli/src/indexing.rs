@@ -1955,13 +1955,30 @@ fn index_embeddings_into_temp_store_scoped(
     }
     let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
     let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
-    let embedding_report = if let Some(job) = background_job {
+    // A structural-only Base may have no meanings yet. A later global query
+    // must catch up every visible node before writing a global stamp, while
+    // a complete Base retains the inexpensive Delta-only path.
+    let include_incomplete_base = prefixes.is_empty()
+        && store.is_overlay()
+        && !base_embedding_generation_complete(store, project, &cfg.model_id);
+    let visible_root_scope = [String::new()];
+    let index_prefixes = if include_incomplete_base {
+        &visible_root_scope[..]
+    } else {
+        prefixes
+    };
+    let mut embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
         // model weights and must remain observable instead of leaving status
         // frozen at the misleading `loading_model` phase.
         job.finalization_phase("counting_embeddings");
         let total_documents = greppy_indexer::count_code_embedding_documents_for_scope(
-            store, target, project, &provider, options, prefixes,
+            store,
+            target,
+            project,
+            &provider,
+            options,
+            index_prefixes,
         )?;
         let (backend, device) = provider.backend_plan();
         job.device = device;
@@ -1975,7 +1992,7 @@ fn index_embeddings_into_temp_store_scoped(
             options,
             total_documents,
             &mut progress,
-            prefixes,
+            index_prefixes,
         )?
     } else {
         greppy_indexer::index_code_embeddings_for_scope_with_progress(
@@ -1986,7 +2003,7 @@ fn index_embeddings_into_temp_store_scoped(
             options,
             0,
             &mut |_| {},
-            prefixes,
+            index_prefixes,
         )?
     };
     if !embedding_report.is_complete() {
@@ -2009,6 +2026,10 @@ fn index_embeddings_into_temp_store_scoped(
             report: Some(embedding_report),
             reason,
         });
+    }
+    if include_incomplete_base {
+        embedding_report.stale_rows_pruned =
+            store.prune_vector_embeddings_before_generation(project, graph_generation)?;
     }
     let key = if prefixes.is_empty() {
         embedding_complete_key(project)
