@@ -483,6 +483,128 @@ fn coverage_warning_requires_publication_but_keeps_real_underindexing_visible() 
     assert!(published_coverage_warning(Some(0), Some(1), Some(99)).is_none());
 }
 
+fn background_health_state(
+    job: Option<&serde_json::Value>,
+    writer_active: bool,
+    spawn_active: bool,
+    recorded_process_alive: bool,
+) -> Option<&'static str> {
+    if writer_active {
+        return Some("refreshing");
+    }
+    if spawn_active {
+        return Some("starting");
+    }
+    let job = job?;
+    match job.get("state").and_then(serde_json::Value::as_str) {
+        Some("failed")
+            if job
+                .get("preparation_failure_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("admission_deferred") =>
+        {
+            Some("admission_deferred")
+        }
+        Some("failed") => Some("failed"),
+        Some("cancelled") => Some("cancelled"),
+        // PID observation may describe a gate wrapper or a reused PID. It
+        // cannot prove admission, writer ownership, progress or snapshot safety.
+        _ if recorded_process_alive => Some("process_alive"),
+        _ => Some("abandoned"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn background_health_separates_liveness_ownership_and_terminal_outcomes() {
+    let job = serde_json::json!({"state": "preparing_base"});
+    assert_eq!(
+        background_health_state(Some(&job), false, false, true),
+        Some("process_alive")
+    );
+    assert_eq!(
+        background_health_state(Some(&job), true, false, false),
+        Some("refreshing")
+    );
+    assert_eq!(
+        background_health_state(Some(&job), false, true, false),
+        Some("starting")
+    );
+    assert_eq!(
+        background_health_state(Some(&job), false, false, false),
+        Some("abandoned")
+    );
+    assert_eq!(background_health_state(None, false, false, false), None);
+    for (state, failure, expected) in [
+        ("failed", "admission_deferred", "admission_deferred"),
+        ("failed", "preparation_failed", "failed"),
+        ("cancelled", "", "cancelled"),
+    ] {
+        let terminal = serde_json::json!({"state": state, "preparation_failure_kind": failure});
+        assert_eq!(
+            background_health_state(Some(&terminal), false, false, true),
+            Some(expected)
+        );
+    }
+}
+
+fn background_health_observation(
+    job: Option<&serde_json::Value>,
+    state: Option<&str>,
+    recorded_process_alive: bool,
+    now: u64,
+) -> Option<serde_json::Value> {
+    let state = state?;
+    let recovery = match state {
+        "admission_deferred" => "Shared host admission deferred preparation; wait for capacity, then retry the original command. Do not start duplicate preparation.",
+        "cancelled" => "Preparation was cancelled; retry the original work when it is requested again.",
+        "failed" => "Inspect background_job.last_error and the original invocation before choosing recovery; do not rebuild merely because a prior job failed.",
+        "refreshing" | "starting" | "process_alive" => "Observe the existing job and its owner before starting another index; retry this status command. PID liveness alone does not prove it is making progress.",
+        _ => "No writer or startup lease and no live recorded process were observed. Inspect the prior job and current store diagnostics before choosing recovery; a stale journal alone does not require rebuilding a healthy graph.",
+    };
+    let progress_age_seconds = job
+        .and_then(|job| job.get("updated_at_unix_secs"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|updated| now.saturating_sub(updated));
+    let phase = job
+        .and_then(|job| job.get("state"))
+        .and_then(serde_json::Value::as_str);
+    Some(serde_json::json!({
+        "recorded_process_alive": recorded_process_alive,
+        "process_identity_confirmed": false,
+        "recovery": recovery,
+        "progress_age_seconds": progress_age_seconds,
+        "progress_stale": progress_age_seconds.map(|age| age >= progress_stall_threshold_seconds(phase)),
+        "note": "PID liveness does not establish admission, writer ownership or current progress; an old progress timestamp alone does not establish process exit",
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn background_health_guidance_does_not_request_duplicate_or_unnecessary_preparation() {
+    let none = background_health_observation(None, None, false, 200);
+    assert!(none.is_none());
+    assert!(serde_json::to_value(none).unwrap().is_null());
+    for (state, expected) in [
+        ("admission_deferred", "retry the original command"),
+        ("cancelled", "when it is requested again"),
+        ("failed", "background_job.last_error"),
+        ("abandoned", "healthy graph"),
+        ("process_alive", "Observe the existing job"),
+    ] {
+        let job = serde_json::json!({"updated_at_unix_secs": 1});
+        let observation =
+            background_health_observation(Some(&job), Some(state), true, 200).unwrap();
+        let recovery = observation["recovery"].as_str().unwrap();
+        assert!(recovery.contains(expected), "{state}: {recovery}");
+        assert!(!recovery.contains("greppy index"), "{state}: {recovery}");
+        assert_eq!(observation["progress_stale"], true);
+        assert_eq!(observation["process_identity_confirmed"], false);
+    }
+    // A writer without a journal still supplies useful ownership context.
+    assert!(background_health_observation(None, Some("refreshing"), false, 200).is_some());
+}
+
 fn dispatch_index_health_with_detail(
     command: &str,
     json: bool,
@@ -505,19 +627,26 @@ fn dispatch_index_health_with_detail(
     let effective_root_string = effective_root.to_string_lossy().into_owned();
     let writer_active = workspace_writer_active(Some(&effective_root_string));
     let spawn_active = background_job_spawn_active(&effective_root);
-    let background_state = if writer_active {
-        Some("refreshing")
-    } else if spawn_active {
-        Some("starting")
-    } else {
-        background_job.as_ref().map(|job| {
-            if job.get("state").and_then(serde_json::Value::as_str) == Some("failed") {
-                "failed"
-            } else {
-                "abandoned"
-            }
-        })
-    };
+    let recorded_process_alive = background_job
+        .as_ref()
+        .and_then(|job| job.get("pid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .is_some_and(process_is_alive);
+    let background_state = background_health_state(
+        background_job.as_ref(),
+        writer_active,
+        spawn_active,
+        recorded_process_alive,
+    );
+    let background_observation = background_health_observation(
+        background_job.as_ref(),
+        background_state,
+        recorded_process_alive,
+        unix_now_secs_cli(),
+    );
+
     // `status` must never queue behind the writer it is meant to observe.
     // Opening the previous graph and running integrity/freshness checks can be
     // expensive while an atomic replacement is underway. Return the writer's
@@ -561,6 +690,8 @@ fn dispatch_index_health_with_detail(
             "store_bytes": store_bytes,
             "background_job": background_job,
             "background_state": "refreshing",
+            "background_observation": background_observation,
+
             "progress_age_seconds": progress_age_seconds,
             "progress_stall_threshold_seconds": stall_threshold_seconds,
             "progress_stalled": progress_stalled,
@@ -639,6 +770,8 @@ fn dispatch_index_health_with_detail(
             "store_bytes": store_bytes,
             "background_job": background_job,
             "background_state": background_state,
+            "background_observation": background_observation,
+
             "embedding_complete": false,
             "project": project,
             "fresh": false,
@@ -715,6 +848,8 @@ fn dispatch_index_health_with_detail(
                 "store_bytes": store_bytes,
                 "background_job": background_job,
                 "background_state": background_state,
+            "background_observation": background_observation,
+
                 "embedding_complete": false,
                 "project": project,
                 "fresh": false,
@@ -888,6 +1023,8 @@ fn dispatch_index_health_with_detail(
             "store_bytes": store_bytes,
             "background_job": background_job,
             "background_state": background_state,
+            "background_observation": background_observation,
+
             "embedding_complete": embedding_complete,
             "current_embedding_rows": current_embedding_rows,
             "project": project,
