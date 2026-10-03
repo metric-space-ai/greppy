@@ -1099,35 +1099,63 @@ fn validate_private_proof_file(file: &fs::File) -> io::Result<()> {
 
 #[cfg(unix)]
 fn write_digest_proof(directory: &fs::File, proof: &DigestProof) -> io::Result<()> {
+    // Preserve native error values in production. Tests need the failing stage
+    // to distinguish ACL-query failures from staging/rename races on Darwin.
+    fn stage<T>(name: &str, result: io::Result<T>) -> io::Result<T> {
+        #[cfg(test)]
+        {
+            result.map_err(|error| {
+                io::Error::new(error.kind(), format!("digest proof {name}: {error}"))
+            })
+        }
+        #[cfg(not(test))]
+        {
+            let _ = name;
+            result
+        }
+    }
+
     use std::os::fd::AsRawFd;
     let name = digest_proof_name(&proof.manifest_sha256, &proof.digest);
     // A fixed per-slot lock and staging file bound crash leftovers as well as
     // published records. Independent open descriptions lock across processes
     // and threads; process exit releases the lock without trusting a sidecar.
     let lock_name = std::ffi::CString::new(format!(".lock-{}", name.to_string_lossy())).unwrap();
-    let lock = open_relative(
-        directory,
-        &lock_name,
-        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
-        0o600,
+    let lock = stage(
+        "open lock",
+        open_relative(
+            directory,
+            &lock_name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            0o600,
+        ),
     )?;
-    validate_private_proof_file(&lock)?;
+
+    stage("validate lock", validate_private_proof_file(&lock))?;
+
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error());
+        return stage("flock lock", Err(io::Error::last_os_error()));
     }
     let temporary = std::ffi::CString::new(format!(".pending-{}", name.to_string_lossy())).unwrap();
-    let mut file = open_relative(
-        directory,
-        &temporary,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
-        0o600,
+
+    let mut file = stage(
+        "open pending",
+        open_relative(
+            directory,
+            &temporary,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
+            0o600,
+        ),
     )?;
-    validate_private_proof_file(&file)?;
-    file.set_len(0)?;
+
+    stage("validate pending", validate_private_proof_file(&file))?;
+    stage("truncate pending", file.set_len(0))?;
+
     let result = (|| {
         let bytes = serde_json::to_vec(proof).map_err(|error| invalid_data(error.to_string()))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        stage("write pending", file.write_all(&bytes))?;
+        stage("sync pending", file.sync_all())?;
+
         if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
@@ -1137,10 +1165,12 @@ fn write_digest_proof(directory: &fs::File, proof: &DigestProof) -> io::Result<(
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            return stage("rename pending", Err(io::Error::last_os_error()));
         }
-        directory.sync_all()
+        stage("sync directory", directory.sync_all())
+
     })();
+
     unsafe {
         libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
     }
