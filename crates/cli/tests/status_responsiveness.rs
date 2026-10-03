@@ -93,3 +93,41 @@ fn prompt_status_keeps_existing_no_index_result() {
     assert!(!String::from_utf8_lossy(&result.stderr).contains("greppy-status-phase:"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn large_advisory_cache_does_not_prevent_graph_readiness_inspection() {
+    let fixture_root = fixture("advisory");
+    let repo = fixture_root.join("repo");
+    let store = fixture_root.join("store");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join("value.rs"), "pub fn value() -> i32 { 1 }\n").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_greppy"))
+            .args(args)
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_AUTO_REINDEX", "0")
+            .env_remove("GREPPY_INTERNAL_STATUS_WORKER")
+            .output()
+            .unwrap()
+    };
+    let indexed = run(&["index", "."]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let baseline = run(&["index", "status", "--json"]);
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+    let graph = std::path::PathBuf::from(baseline["store_path"].as_str().unwrap());
+    let advisory = graph.parent().unwrap().join("advisory-fixture");
+    std::fs::create_dir_all(&advisory).unwrap();
+    for number in 0..600 {
+        std::fs::write(advisory.join(number.to_string()), b"advisory").unwrap();
+    }
+    let inspected = run(&["index", "status", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_ne!(value["status"], "unknown", "{inspected:?}");
+    assert_eq!(value["store_bytes_complete"], false, "{value}");
+    assert!(value["store_bytes"].is_null(), "{value}");
+    assert_eq!(value["integrity_ok"], true, "{value}");
+    assert_eq!(value["fresh"], true, "{value}");
+    std::fs::remove_dir_all(fixture_root).unwrap();
+}
