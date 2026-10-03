@@ -906,7 +906,6 @@ fn reject_mutating_acl(file: &fs::File) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
     use darwin_acl::*;
-    use std::os::fd::AsRawFd;
     let acl = unsafe { acl_get_fd_np(fd, 0x100) }; // ACL_TYPE_EXTENDED
     if acl.is_null() {
         return Err(io::Error::last_os_error());
