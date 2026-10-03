@@ -10231,61 +10231,85 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
     }
 
     #[test]
-    fn v8_upgrade_reextracts_unchanged_trait_receiver_facts() {
-        let repo = setup_repo(
-            "v8-trait-receiver-upgrade",
-            "pub trait HttpTransport: Send + Sync { fn execute(&self); }\n",
-        );
-        let mut store = Store::open_memory().unwrap();
-        index(&mut store, &repo, "test").unwrap();
-        let source_before = store.list_file_states("test").unwrap();
-        store.conn().execute(
+    fn legacy_upgrade_reextracts_unchanged_trait_receiver_facts() {
+        for prior_version in ["greppy-indexer-v7", "greppy-indexer-v8"] {
+            let repo = setup_repo(
+                &format!("{prior_version}-trait-receiver-upgrade"),
+                "pub trait HttpTransport: Send + Sync { fn execute(&self); }\n",
+            );
+            fs::write(repo.join("src/changed.rs"), "pub fn changed() {}\n").unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let source_before = store.list_file_states("test").unwrap();
+            store.conn().execute(
             "UPDATE nodes SET properties=json_remove(properties, '$.has_bounds', '$.as_ref_receiver') WHERE label='Interface'",
             [],
         ).unwrap();
-        store
-            .conn()
-            .execute(
-                "DELETE FROM schema_meta WHERE key=?1",
-                [RUST_CALLER_EDGES_REPAIR_META_KEY],
-            )
-            .unwrap();
-        store.conn().execute(
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            store.conn().execute(
             "INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')",
             [],
         ).unwrap();
-        let root = greppy_discover::detect_repo_root(&repo).unwrap();
-        let mut state = store
-            .get_workspace_state(root.to_string_lossy().as_ref())
-            .unwrap()
-            .unwrap();
-        state.indexer_version = "greppy-indexer-v8".into();
-        store.upsert_workspace_state(&state).unwrap();
-        assert!(recover_persisted_rust_usages(&mut store, "test", &repo)
-            .unwrap_err()
-            .to_string()
-            .contains("trait receiver facts"));
+            let root = greppy_discover::detect_repo_root(&repo).unwrap();
+            let mut state = store
+                .get_workspace_state(root.to_string_lossy().as_ref())
+                .unwrap()
+                .unwrap();
+            state.indexer_version = prior_version.into();
+            store.upsert_workspace_state(&state).unwrap();
+            assert!(
+                recover_persisted_rust_usages(&mut store, "test", &repo)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("trait receiver facts")
+            );
 
-        let upgrade = index(&mut store, &repo, "test").unwrap();
-        assert_eq!(
-            upgrade.files_indexed, 1,
-            "unchanged source requires fresh declaration nodes"
-        );
-        let node = store
-            .get_node_by_qname("test", "src/lib.rs::Interface::HttpTransport")
-            .unwrap()
+            fs::write(
+                repo.join("src/changed.rs"),
+                "pub fn changed() { let value = 1; }\n",
+            )
             .unwrap();
-        assert_eq!(
-            node.properties.get("has_bounds"),
-            Some(&serde_json::json!(1))
-        );
-        assert_eq!(
-            store.list_file_states("test").unwrap()[0].sha256,
-            source_before[0].sha256
-        );
-        assert!(rust_caller_edges_repaired(&store).unwrap());
-        assert_eq!(index(&mut store, &repo, "test").unwrap().files_indexed, 0);
-        fs::remove_dir_all(repo).unwrap();
+            let options = IndexOptions {
+                only_paths: Some(["src/changed.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            };
+            let upgrade = index_with_options(&mut store, &repo, "test", &options).unwrap();
+            assert_eq!(
+                upgrade.files_indexed, 2,
+                "unchanged source requires fresh declaration nodes"
+            );
+            let node = store
+                .get_node_by_qname("test", "src/lib.rs::Interface::HttpTransport")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                node.properties.get("has_bounds"),
+                Some(&serde_json::json!(1))
+            );
+            assert_eq!(
+                store
+                    .list_file_states("test")
+                    .unwrap()
+                    .into_iter()
+                    .find(|state| state.rel_path == "src/lib.rs")
+                    .unwrap()
+                    .sha256,
+                source_before
+                    .into_iter()
+                    .find(|state| state.rel_path == "src/lib.rs")
+                    .unwrap()
+                    .sha256
+            );
+            assert!(rust_caller_edges_repaired(&store).unwrap());
+            assert_eq!(index(&mut store, &repo, "test").unwrap().files_indexed, 0);
+            fs::remove_dir_all(repo).unwrap();
+        }
     }
 
     #[test]
