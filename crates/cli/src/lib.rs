@@ -4980,6 +4980,7 @@ struct BackgroundJobGuard {
     owner_pid: u32,
     cause: String,
     kind: String,
+    path_prefixes: Vec<String>,
     started_at_unix_secs: u64,
     target_generation: u64,
     worker_count: Option<usize>,
@@ -5071,6 +5072,10 @@ impl BackgroundJobGuard {
                 .map(str::to_owned)
                 .or_else(|| std::env::var("GREPPY_BACKGROUND_KIND").ok())
                 .unwrap_or_else(|| "index".into()),
+            path_prefixes: inherited
+                .and_then(|job| job.get("path_prefixes"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default(),
             started_at_unix_secs: inherited
                 .and_then(|job| {
                     job.get("started_at_unix_secs")
@@ -5287,6 +5292,7 @@ impl BackgroundJobGuard {
         let value = serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": self.kind,
+            "path_prefixes": self.path_prefixes,
             "pid": self.owner_pid,
             "started_at_unix_secs": self.started_at_unix_secs,
             "updated_at_unix_secs": now,
@@ -5635,6 +5641,16 @@ fn spawn_background_job_handle(
     kind: &str,
     embedding_cfg: Option<&EmbeddingModelConfig>,
 ) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle_scoped(root, cause, kind, embedding_cfg, &[])
+}
+
+fn spawn_background_job_handle_scoped(
+    root: Option<&str>,
+    cause: &str,
+    kind: &str,
+    embedding_cfg: Option<&EmbeddingModelConfig>,
+    prefixes: &[String],
+) -> Option<BackgroundJobLaunch> {
     // Integration tests use short-lived stores and explicitly opt out of
     // inference. A detached child can outlive the fixture guard, recreate the
     // removed store, and extract hundreds of MiB of embedded model assets per
@@ -5691,7 +5707,11 @@ fn spawn_background_job_handle(
     let started_at = unix_now_secs_cli();
     let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
         let (backend, device) = embedding_backend_plan(cfg);
-        let total = current_embedding_candidate_count(&root);
+        let total = if prefixes.is_empty() {
+            current_embedding_candidate_count(&root)
+        } else {
+            0
+        };
         let eta = initial_embedding_eta_seconds(total, &backend);
         (Some(backend), device, total, eta)
     } else {
@@ -5707,6 +5727,7 @@ fn spawn_background_job_handle(
     let mut value = serde_json::json!({
         "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
         "kind": kind,
+        "path_prefixes": prefixes,
         "pid": serde_json::Value::Null,
         "started_at_unix_secs": started_at,
         "updated_at_unix_secs": started_at,
@@ -5747,6 +5768,10 @@ fn spawn_background_job_handle(
         .env("GREPPY_BACKGROUND_JOB", &job_path)
         .env("GREPPY_BACKGROUND_CAUSE", cause)
         .env("GREPPY_BACKGROUND_KIND", kind)
+        .env(
+            "GREPPY_BACKGROUND_EMBED_PATHS",
+            serde_json::to_string(prefixes).ok()?,
+        )
         .env("GREPPY_BACKGROUND_STARTED_AT", started_at.to_string())
         .env(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
@@ -5933,13 +5958,6 @@ pub(crate) fn spawn_agent_background_index(
 /// CUDA choices and automatic GPU priority remain identical in the child.
 fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> bool {
     spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
-}
-
-pub(crate) fn spawn_background_embed_handle(
-    root: Option<&str>,
-    cfg: &EmbeddingModelConfig,
-) -> Option<BackgroundJobLaunch> {
-    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg))
 }
 
 fn format_embedding_eta(seconds: u64) -> String {

@@ -1365,13 +1365,28 @@ pub(crate) fn dispatch_semantic(
         ));
     }
     let path_filters = prepare_query_path_filters(root, "semantic-search", q, paths)?;
+    let mut prefixes = path_filters.repo_prefixes();
+    if !path_filters.is_empty() && prefixes.is_empty() {
+        semantic_no_match_status(q, &path_filters);
+        return Ok(1);
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    if prefixes.iter().any(String::is_empty) {
+        prefixes.clear();
+    }
 
     // Stale/unknown snapshots are never served. Semantic search is always
     // vector-backed on current main, so auto-refresh is allowed only when the
     // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let mut store = open_default_store_query_writer(root)?;
-    maybe_reindex_stale_semantic(&mut store, root, allow_reindex)?;
+    if prefixes.is_empty() {
+        maybe_reindex_stale_semantic(&mut store, root, allow_reindex)?;
+    } else if allow_reindex {
+        // Refresh structure first; meanings will be prepared only for this scope.
+        maybe_reindex_stale(&mut store, root)?;
+    }
     let project = project_for(root)?;
     let decision =
         freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false, false);
@@ -1418,6 +1433,7 @@ pub(crate) fn dispatch_semantic(
                 SEMANTIC_VECTOR_CANDIDATE_LIMIT,
             );
             scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
+            scope.path_prefixes = Some(&prefixes);
             let total = greppy_search::count_vector_search_scope(&store, &scope)?;
             if json {
                 semantic_vector_json(
@@ -1439,10 +1455,12 @@ pub(crate) fn dispatch_semantic(
             }
             return Ok(freshness_refusal_exit(&freshness));
         }
-        if !embedding_generation_complete(&store, &project, generation, &cfg.model_id) {
+        if !embedding_scope_complete(&store, &project, generation, &cfg.model_id, &prefixes) {
             let root_path = resolve_root(root)?;
             drop(store);
-            store = wait_for_embedding_publication(root, &root_path, &project, generation, &cfg)?;
+            store = wait_for_embedding_publication(
+                root, &root_path, &project, generation, &cfg, &prefixes,
+            )?;
             let reopened_decision = freshness_serve_decision_with_policy(
                 &store,
                 root,
@@ -1509,6 +1527,7 @@ pub(crate) fn dispatch_semantic(
             Some(generation),
             SEMANTIC_VECTOR_CANDIDATE_LIMIT,
         );
+        scope.path_prefixes = Some(&prefixes);
         let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         if total == 0 {
             if json {
@@ -1653,6 +1672,7 @@ fn wait_for_embedding_publication(
     project: &str,
     requested_generation: u64,
     cfg: &EmbeddingModelConfig,
+    prefixes: &[String],
 ) -> Result<greppy_store::Store> {
     let mut announced = false;
     crate::context_status::restricted(
@@ -1661,7 +1681,14 @@ fn wait_for_embedding_publication(
         crate::context_status::Capability::Semantic,
     );
     loop {
-        let mut launch = spawn_background_embed_handle(root, cfg).ok_or_else(|| {
+        let mut launch = spawn_background_job_handle_scoped(
+            root,
+            "embedding-first-use",
+            "embedding",
+            Some(cfg),
+            prefixes,
+        )
+        .ok_or_else(|| {
             let detail = background_embedding_failure(embedding_progress_value(
                 effective_root,
                 cfg,
@@ -1677,6 +1704,11 @@ fn wait_for_embedding_publication(
         let follow_attached_owner = matches!(launch, BackgroundJobLaunch::Attached { .. })
             && !initial_job.as_ref().is_some_and(|job| {
                 job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
+                    && job
+                        .get("path_prefixes")
+                        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+                        .unwrap_or_default()
+                        == prefixes
             });
         if !announced {
             crate::context_status::restricted(
@@ -1719,8 +1751,13 @@ fn wait_for_embedding_publication(
         }
         let store = open_default_store_query_writer(root)?;
         let published_generation = current_graph_generation(&store, root)?;
-        let publication_complete =
-            embedding_generation_complete(&store, project, published_generation, &cfg.model_id);
+        let publication_complete = embedding_scope_complete(
+            &store,
+            project,
+            published_generation,
+            &cfg.model_id,
+            prefixes,
+        );
         match observe_background_embedding(
             read_background_job(launch.path()).as_ref(),
             false,
@@ -1728,10 +1765,17 @@ fn wait_for_embedding_publication(
             follow_attached_owner,
         ) {
             BackgroundEmbeddingObservation::Published => {
-                crate::context_status::acknowledge(
-                    effective_root,
-                    crate::context_status::Capability::Semantic,
-                );
+                if embedding_generation_complete(
+                    &store,
+                    project,
+                    published_generation,
+                    &cfg.model_id,
+                ) {
+                    crate::context_status::acknowledge(
+                        effective_root,
+                        crate::context_status::Capability::Semantic,
+                    );
+                }
                 return Ok(store);
             }
             BackgroundEmbeddingObservation::FollowIndex => {
@@ -2140,6 +2184,7 @@ pub(crate) fn semantic_vector_json_with_expand(
         "prompt_version": greppy_embed_native::PROMPT_VERSION,
         "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
         "graph_generation": graph_generation,
+        "embedding_complete": embedding_generation_complete(store, project, graph_generation, &cfg.model_id),
         "fresh": freshness
             .and_then(|v| v.get("fresh"))
             .and_then(serde_json::Value::as_bool)

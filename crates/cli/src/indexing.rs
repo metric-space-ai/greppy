@@ -1221,9 +1221,12 @@ pub(crate) fn dispatch_index(
     };
     let embedding_job =
         std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
+    let scoped_embedding_job = !background_embedding_path_prefixes()?.is_empty();
     let had_overlay_binding = embedding_job
         && crate::store_cow::overlay_environment_for_recovery(&effective_root)?.is_some();
-    let _embedding_overlay = if embedding_job {
+    // A cold scoped query can already have a complete standalone graph. Do
+    // not migrate it to a new repository-wide Base merely to embed its scope.
+    let _embedding_overlay = if embedding_job && (!scoped_embedding_job || had_overlay_binding) {
         match crate::store_cow::prepare_auto_linked_worktree_overlay(
             &effective_root,
             &greppy_core::cache::data_root(),
@@ -1251,7 +1254,9 @@ pub(crate) fn dispatch_index(
     };
     let embedding_only = embedding_job
         && store_path.is_file()
-        && (!effective_root.join(".git").is_file() || embedding_overlay.is_some());
+        && (!effective_root.join(".git").is_file()
+            || embedding_overlay.is_some()
+            || (scoped_embedding_job && !had_overlay_binding));
     if embedding_only {
         let cfg = embedding_config.as_ref().ok_or_else(|| {
             Error::Invalid("background embedding job has no embedding configuration".into())
@@ -1834,15 +1839,17 @@ fn complete_embeddings_from_published_graph(
         .get_workspace_state(effective_root.to_string_lossy().as_ref())?
         .ok_or_else(|| Error::Invalid("published graph has no workspace state".into()))?
         .graph_generation;
-    let outcome = index_embeddings_into_temp_store(
+    let prefixes = background_embedding_path_prefixes()?;
+    let outcome = index_embeddings_into_temp_store_scoped(
         &mut store,
         target,
         project,
         cfg,
         generation,
-        active_path.parent().map(std::path::Path::to_path_buf),
         background_job.as_deref_mut(),
+        &prefixes,
     )?;
+    let global_complete = embedding_generation_complete(&store, project, generation, &cfg.model_id);
     if let Some(job) = background_job.as_deref_mut() {
         job.finalization_phase("checkpointing_wal");
     }
@@ -1872,7 +1879,8 @@ fn complete_embeddings_from_published_graph(
     crate::context_status::semantic_published(
         effective_root,
         generation,
-        matches!(&outcome, EmbeddingBuildOutcome::Complete(_)),
+        // A completed scoped job publishes useful vectors, not global readiness.
+        global_complete,
     );
     Ok(outcome)
 }
@@ -1886,6 +1894,26 @@ pub(crate) fn index_embeddings_into_temp_store(
     _tokenizer_cache_dir: Option<std::path::PathBuf>,
     background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<EmbeddingBuildOutcome> {
+    index_embeddings_into_temp_store_scoped(
+        store,
+        target,
+        project,
+        cfg,
+        graph_generation,
+        background_job,
+        &[],
+    )
+}
+
+fn index_embeddings_into_temp_store_scoped(
+    store: &mut greppy_store::Store,
+    target: &std::path::Path,
+    project: &str,
+    cfg: &EmbeddingModelConfig,
+    graph_generation: u64,
+    background_job: Option<&mut BackgroundJobGuard>,
+    prefixes: &[String],
+) -> Result<EmbeddingBuildOutcome> {
     #[cfg(debug_assertions)]
     if std::env::var_os(ENV_TEST_EMBED_UNAVAILABLE).is_some() {
         return Ok(EmbeddingBuildOutcome::Degraded {
@@ -1894,7 +1922,11 @@ pub(crate) fn index_embeddings_into_temp_store(
         });
     }
     if test_embedding_completion_forced() {
-        let key = embedding_complete_key(project);
+        let key = if prefixes.is_empty() {
+            embedding_complete_key(project)
+        } else {
+            embedding_scope_complete_key(project, prefixes)
+        };
         store
             .conn()
             .execute(
@@ -1928,14 +1960,14 @@ pub(crate) fn index_embeddings_into_temp_store(
         // model weights and must remain observable instead of leaving status
         // frozen at the misleading `loading_model` phase.
         job.finalization_phase("counting_embeddings");
-        let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
-            store, target, project, &provider, options,
+        let total_documents = greppy_indexer::count_code_embedding_documents_for_scope(
+            store, target, project, &provider, options, prefixes,
         )?;
         let (backend, device) = provider.backend_plan();
         job.device = device;
         job.embedding_started(&backend, total_documents);
         let mut progress = |value| job.embedding_progress(value);
-        greppy_indexer::index_code_embeddings_for_project_with_progress(
+        greppy_indexer::index_code_embeddings_for_scope_with_progress(
             store,
             target,
             project,
@@ -1943,14 +1975,18 @@ pub(crate) fn index_embeddings_into_temp_store(
             options,
             total_documents,
             &mut progress,
+            prefixes,
         )?
     } else {
-        greppy_indexer::index_code_embeddings_for_project(
+        greppy_indexer::index_code_embeddings_for_scope_with_progress(
             store,
             target,
             project,
             &mut provider,
             options,
+            0,
+            &mut |_| {},
+            prefixes,
         )?
     };
     if !embedding_report.is_complete() {
@@ -1974,7 +2010,11 @@ pub(crate) fn index_embeddings_into_temp_store(
             reason,
         });
     }
-    let key = embedding_complete_key(project);
+    let key = if prefixes.is_empty() {
+        embedding_complete_key(project)
+    } else {
+        embedding_scope_complete_key(project, prefixes)
+    };
     store
         .conn()
         .execute(
