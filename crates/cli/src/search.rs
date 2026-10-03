@@ -1056,8 +1056,22 @@ fn print_search_pattern_rows(
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
     let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
-    let shown = default_shown.min(cli_result_limit_unless_all(default_shown, all));
-    if shown < rows.len() {
+    let offset = cli_result_offset();
+    let start = offset.min(rows.len());
+    let shown = default_shown
+        .min(cli_result_limit_raw().unwrap_or(usize::MAX))
+        .min(rows.len() - start);
+    let buffered = OUTPUT_CAPTURE.with(|capture| capture.borrow().is_some());
+    if buffered {
+        NAV_TEXT_WINDOW.with(|window| {
+            *window.borrow_mut() = Some(NavTextWindow {
+                offset,
+                total: rows.len(),
+                rows: Vec::new(),
+            });
+        });
+    }
+    if !buffered && shown < rows.len() {
         // A limited query must not list every omitted file in its preamble.
         println!(
             "— {} matches in {} files; showing {}",
@@ -1074,7 +1088,8 @@ fn print_search_pattern_rows(
     } else {
         None
     };
-    for (index, row) in rows.iter().take(shown).enumerate() {
+    for (index, row) in rows.iter().skip(start).take(shown).enumerate() {
+        let row_start = output_capture_position();
         if let Some(node) = &row.node {
             print_search_row(
                 &row.hit.file,
@@ -1117,6 +1132,7 @@ fn print_search_pattern_rows(
                 println!();
             }
         }
+        record_nav_text_row(start + index, row_start);
     }
 }
 
