@@ -1920,10 +1920,7 @@ impl ContentEngine {
                 "timed out evaluating structured DOM query",
             ));
         }
-        let result = saved
-            .borrow_mut()
-            .take()
-            .expect("evaluation completed");
+        let result = saved.borrow_mut().take().expect("evaluation completed");
         result.map_err(|error| io::Error::other(format!("structured DOM query failed: {error:?}")))
     }
 
@@ -2270,12 +2267,19 @@ impl ContentEngine {
         // installation reply is in flight. Only the installed document may
         // certify its reply; otherwise the loop rebinds before inspecting it.
         if delegate.document_generation.get() == document_generation {
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
-            if delegate.document_generation.get() == document_generation && jsvalue_is_truthy(&first) {
+            if delegate.document_generation.get() == document_generation
+                && jsvalue_is_truthy(&first)
+            {
                 self.drop_wait_slot(&webview, &token, io_deadline);
                 if !strict_boolean {
                     self.settle_pump_tokens(&webview);
@@ -2317,12 +2321,19 @@ impl ContentEngine {
                     }
                 };
                 if delegate.document_generation.get() == document_generation {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
                     }
-                    if delegate.document_generation.get() == document_generation && jsvalue_is_truthy(&first) {
+                    if delegate.document_generation.get() == document_generation
+                        && jsvalue_is_truthy(&first)
+                    {
                         self.drop_wait_slot(&webview, &token, io_deadline);
                         if !strict_boolean {
                             self.settle_pump_tokens(&webview);
@@ -2332,9 +2343,14 @@ impl ContentEngine {
                 }
                 continue;
             }
-            if let Some(result) =
-                self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
-            {
+            if let Some(result) = self.finish_if_expected_nonce(
+                &webview,
+                delegate,
+                &token,
+                document_generation,
+                Some(deadline),
+                strict_boolean,
+            )? {
                 return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2365,9 +2381,14 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready => {}
                 WakePoll::TimedOut => {
-                    if let Some(result) =
-                        self.finish_if_expected_nonce(&webview, delegate, &token, document_generation, Some(deadline), strict_boolean)?
-                    {
+                    if let Some(result) = self.finish_if_expected_nonce(
+                        &webview,
+                        delegate,
+                        &token,
+                        document_generation,
+                        Some(deadline),
+                        strict_boolean,
+                    )? {
                         return result;
                     }
                     if delegate.document_generation.get() != document_generation {
@@ -2464,7 +2485,8 @@ impl ContentEngine {
             &delegate.document_generation,
             document_generation,
             || self.take_completed_wait_slot(webview, token, deadline),
-        )? else {
+        )?
+        else {
             delegate.clear_wait_notice(token);
             return Ok(None);
         };
@@ -5896,16 +5918,19 @@ mod serialize_tests {
             reads.set(reads.get() + 1);
             generation.set(2);
             Ok(Some("old-document completion"))
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(old, None);
         assert_eq!(reads.get(), 1);
         let stale = take_wait_completion_in_document(&generation, 1, || {
             reads.set(reads.get() + 1);
             Ok(Some("must not read new document with old nonce"))
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(stale, None);
         assert_eq!(reads.get(), 1);
-        let current = take_wait_completion_in_document(&generation, 2, || Ok(Some("new document"))).unwrap();
+        let current =
+            take_wait_completion_in_document(&generation, 2, || Ok(Some("new document"))).unwrap();
         assert_eq!(current, Some("new document"));
     }
 
@@ -5916,7 +5941,10 @@ mod serialize_tests {
         let result = take_wait_completion_in_document::<()>(&generation, 1, || {
             reads.set(reads.get() + 1);
             generation.set(2);
-            Err(io::Error::new(io::ErrorKind::TimedOut, "consumed slot callback expired"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "consumed slot callback expired",
+            ))
         });
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(reads.get(), 1);
