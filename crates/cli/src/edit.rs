@@ -1899,7 +1899,31 @@ pub(crate) fn run_trained_write(
     dry_run: bool,
     verify: bool,
 ) -> EditResult<EditRecord> {
+    match std::fs::metadata(root_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EditRefusal::new(
+                "workspace_root_missing",
+                format!(
+                    "workspace root {} does not exist; nothing written. Create this directory, then retry with --root and a path relative to it",
+                    root_path.display()
+                ),
+                17,
+            ));
+        }
+        Err(error) => {
+            return Err(EditRefusal::new(
+                "workspace_root_unavailable",
+                format!(
+                    "cannot inspect workspace root {}: {error}; nothing written. Restore access to this directory before retrying",
+                    root_path.display()
+                ),
+                17,
+            ));
+        }
+        Ok(_) => {}
+    }
     let (rel, abs) = edit_resolve_new_path(root_path, file_base, path)?;
+
     if abs.is_dir() {
         return Err(EditRefusal::new(
             "file_exists",
