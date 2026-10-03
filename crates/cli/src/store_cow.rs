@@ -1464,11 +1464,22 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
             Some((_, commit)) => commit.clone(),
             None => git_output(&primary, &["rev-parse", "HEAD"])?,
         };
+        // An older identity cannot take the cold structural-only shortcut:
+        // its unchanged declaration nodes still need current extraction. The
+        // identity-derived path distinguishes it from a current Base whose
+        // summary cache is missing, without trusting an unverified manifest.
+        let current_identity = base_identity_parts(&primary, &base_commit)?;
+        let current_layout = BaseStoreLayout::new(shared_data_root, &current_identity)
+            .map_err(|error| Error::io("resolve current bound Base identity", error))?;
+        let incompatible_bound_graph = existing_binding
+            .as_ref()
+            .is_some_and(|(path, _)| !paths_resolve_equal(path, &current_layout.graph));
         let prepared =
             match reuse_verified_base_store(&primary, &base_commit, shared_data_root, &project)? {
                 Some(prepared) => Some(prepared),
                 None if structural_first_use
                     && !missing_bound_graph
+                    && !incompatible_bound_graph
                     && !has_verified_previous_indexer_base(
                         &primary,
                         &base_commit,
