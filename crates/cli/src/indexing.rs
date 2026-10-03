@@ -548,6 +548,63 @@ fn background_health_separates_liveness_ownership_and_terminal_outcomes() {
     }
 }
 
+fn background_health_observation(
+    job: Option<&serde_json::Value>,
+    state: Option<&str>,
+    recorded_process_alive: bool,
+    now: u64,
+) -> Option<serde_json::Value> {
+    let state = state?;
+    let recovery = match state {
+        "admission_deferred" => "Shared host admission deferred preparation; wait for capacity, then retry the original command. Do not start duplicate preparation.",
+        "cancelled" => "Preparation was cancelled; retry the original work when it is requested again.",
+        "failed" => "Inspect background_job.last_error and the original invocation before choosing recovery; do not rebuild merely because a prior job failed.",
+        "refreshing" | "starting" | "process_alive" => "Observe the existing job and its owner before starting another index; retry this status command. PID liveness alone does not prove it is making progress.",
+        _ => "No writer or startup lease and no live recorded process were observed. Inspect the prior job and current store diagnostics before choosing recovery; a stale journal alone does not require rebuilding a healthy graph.",
+    };
+    let progress_age_seconds = job
+        .and_then(|job| job.get("updated_at_unix_secs"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|updated| now.saturating_sub(updated));
+    let phase = job
+        .and_then(|job| job.get("state"))
+        .and_then(serde_json::Value::as_str);
+    Some(serde_json::json!({
+        "recorded_process_alive": recorded_process_alive,
+        "process_identity_confirmed": false,
+        "recovery": recovery,
+        "progress_age_seconds": progress_age_seconds,
+        "progress_stale": progress_age_seconds.map(|age| age >= progress_stall_threshold_seconds(phase)),
+        "note": "PID liveness does not establish admission, writer ownership or current progress; an old progress timestamp alone does not establish process exit",
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn background_health_guidance_does_not_request_duplicate_or_unnecessary_preparation() {
+    let none = background_health_observation(None, None, false, 200);
+    assert!(none.is_none());
+    assert!(serde_json::to_value(none).unwrap().is_null());
+    for (state, expected) in [
+        ("admission_deferred", "retry the original command"),
+        ("cancelled", "when it is requested again"),
+        ("failed", "background_job.last_error"),
+        ("abandoned", "healthy graph"),
+        ("process_alive", "Observe the existing job"),
+    ] {
+        let job = serde_json::json!({"updated_at_unix_secs": 1});
+        let observation =
+            background_health_observation(Some(&job), Some(state), true, 200).unwrap();
+        let recovery = observation["recovery"].as_str().unwrap();
+        assert!(recovery.contains(expected), "{state}: {recovery}");
+        assert!(!recovery.contains("greppy index"), "{state}: {recovery}");
+        assert_eq!(observation["progress_stale"], true);
+        assert_eq!(observation["process_identity_confirmed"], false);
+    }
+    // A writer without a journal still supplies useful ownership context.
+    assert!(background_health_observation(None, Some("refreshing"), false, 200).is_some());
+}
+
 fn dispatch_index_health_with_detail(
     command: &str,
     json: bool,
@@ -583,28 +640,12 @@ fn dispatch_index_health_with_detail(
         spawn_active,
         recorded_process_alive,
     );
-    let progress_age_seconds = background_job
-        .as_ref()
-        .and_then(|job| job.get("updated_at_unix_secs"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|updated| unix_now_secs_cli().saturating_sub(updated));
-    let phase = background_job
-        .as_ref()
-        .and_then(|job| job.get("state"))
-        .and_then(serde_json::Value::as_str);
-    let background_observation = serde_json::json!({
-        "recorded_process_alive": recorded_process_alive,
-        "process_identity_confirmed": false,
-        "recovery": if writer_active || spawn_active || background_state == Some("process_alive") {
-            "Observe the existing job and its owner before starting another index; retry this status command. PID liveness alone does not prove it is making progress."
-        } else {
-            "Inspect the recorded terminal error and store_cow diagnostics. Rebuild an invalid or missing snapshot with greppy index for this root using the same GREPPY_STORE_DIR; do not delete shared Base files."
-        },
-
-        "progress_age_seconds": progress_age_seconds,
-        "progress_stale": progress_age_seconds.map(|age| age >= progress_stall_threshold_seconds(phase)),
-        "note": "PID liveness does not establish admission, writer ownership or current progress; an old progress timestamp alone does not establish process exit",
-    });
+    let background_observation = background_health_observation(
+        background_job.as_ref(),
+        background_state,
+        recorded_process_alive,
+        unix_now_secs_cli(),
+    );
 
     // `status` must never queue behind the writer it is meant to observe.
     // Opening the previous graph and running integrity/freshness checks can be
