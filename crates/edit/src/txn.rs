@@ -717,6 +717,44 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_linkage_lookalikes_keep_valid_comment_and_string_bytes() {
+        let pair = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint value;\n#ifdef __cplusplus\n}\n#endif\n";
+        let comment = format!("/*\n{pair}*/\nint value;\n");
+        let raw_string = format!("const char *value = R\"guard(\n{pair})guard\";\n");
+        // Ordinary strings encode newlines and quotes; they must remain literal
+        // data, independently of the raw-string/comment ancestor exclusions.
+        let escaped = pair
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let string = format!("const char *value = \"{escaped}\";\n");
+        for (language, source) in [
+            (Language::C, comment),
+            (Language::Cpp, string),
+            (Language::Cpp, raw_string),
+        ] {
+            let tree = greppy_parser::parse(language, source.as_bytes()).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{source}\n{}",
+                tree.root_node().to_sexp()
+            );
+            let view = guarded_linkage_validation_content(language, source.as_bytes());
+            assert!(
+                matches!(view, Cow::Borrowed(_)),
+                "lookalike normalized: {source}"
+            );
+            assert_eq!(view.as_ref(), source.as_bytes());
+            assert_eq!(
+                syntax_counts(language, source.as_bytes()).unwrap(),
+                SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }
+            );
+        }
+    }
     use super::*;
 
     #[test]
