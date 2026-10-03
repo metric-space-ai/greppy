@@ -2400,12 +2400,26 @@ fn recover_visible_effect_fn_bindings_inner(
     // Compare complete contributions, including duplicate counts, before
     // publishing overrides. Identical clean Base relations need no Delta copy.
     let signature = |source: &str, target: &str, kind: &str, properties: &serde_json::Value| {
-        (source.to_owned(), target.to_owned(), kind.to_owned(), properties.to_string())
+        (
+            source.to_owned(),
+            target.to_owned(),
+            kind.to_owned(),
+            properties.to_string(),
+        )
     };
     let mut previous = std::collections::HashMap::new();
     for edge in store.list_raw_edges(project)? {
-        let counts = previous.entry(edge.file_path).or_insert_with(std::collections::BTreeMap::new);
-        *counts.entry(signature(&edge.source_qname, &edge.target_qname, &edge.edge_type, &edge.properties)).or_insert(0usize) += 1;
+        let counts = previous
+            .entry(edge.file_path)
+            .or_insert_with(std::collections::BTreeMap::new);
+        *counts
+            .entry(signature(
+                &edge.source_qname,
+                &edge.target_qname,
+                &edge.edge_type,
+                &edge.properties,
+            ))
+            .or_insert(0usize) += 1;
     }
     let mut changed_paths = Vec::new();
     // Validate every visible source fingerprint before changing any identity.
@@ -2429,7 +2443,14 @@ fn recover_visible_effect_fn_bindings_inner(
         let mut current = std::collections::BTreeMap::new();
         for edge in &extraction.edges {
             let edge = new_raw_edge_for(project, path, edge);
-            *current.entry(signature(&edge.source_qname, &edge.target_qname, &edge.edge_type, &edge.properties)).or_insert(0usize) += 1;
+            *current
+                .entry(signature(
+                    &edge.source_qname,
+                    &edge.target_qname,
+                    &edge.edge_type,
+                    &edge.properties,
+                ))
+                .or_insert(0usize) += 1;
         }
         if previous.get(path).cloned().unwrap_or_default() != current {
             persist_raw_edges_for_file(store, project, path, &extraction.edges)?;

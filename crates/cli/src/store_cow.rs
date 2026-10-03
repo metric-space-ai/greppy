@@ -458,7 +458,11 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
                          WHERE c.project=d.project AND c.file_path=d.file_path
                            AND NOT EXISTS (SELECT 1 FROM mismatches x
                                            WHERE x.project=c.project AND x.file_path=c.file_path))
-         UNION SELECT file_path FROM mismatches"
+         UNION SELECT o.file_path FROM main.js_ts_reference_override_files o
+         WHERE NOT EXISTS (SELECT 1 FROM candidates c
+                           WHERE c.project=o.project AND c.file_path=o.file_path
+                             AND NOT EXISTS (SELECT 1 FROM mismatches x
+                                             WHERE x.project=c.project AND x.file_path=c.file_path))"
     } else {
         "SELECT file_path FROM main.raw_edges WHERE file_path <> ''"
     };
@@ -4756,11 +4760,13 @@ mod tests {
             visibility,
         )
         .unwrap();
-        overlay.upsert_project(&greppy_store::Project {
-            name: "p".into(),
-            indexed_at: "2026-10-03T00:00:00Z".into(),
-            root_path: "/repo".into(),
-        }).unwrap();
+        overlay
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "2026-10-03T00:00:00Z".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
         let id = overlay.insert_writable_node(&node).unwrap();
         overlay
             .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
@@ -4784,13 +4790,18 @@ mod tests {
 
     #[test]
     fn private_delta_paths_allow_identical_base_embedding_materialization() {
-        let (_scratch, overlay) =
-            materialized_base_embedding_fixture(&VisibilityIndex::default());
+        let (_scratch, overlay) = materialized_base_embedding_fixture(&VisibilityIndex::default());
         assert!(private_delta_paths(&overlay).unwrap().is_empty());
         // Legacy node-less chunks must still bind by complete visible identity.
-        overlay.conn().execute("UPDATE main.vector_embeddings SET node_id=NULL", []).unwrap();
+        overlay
+            .conn()
+            .execute("UPDATE main.vector_embeddings SET node_id=NULL", [])
+            .unwrap();
         assert!(private_delta_paths(&overlay).unwrap().is_empty());
-        overlay.conn().execute("DELETE FROM main.nodes", []).unwrap();
+        overlay
+            .conn()
+            .execute("DELETE FROM main.nodes", [])
+            .unwrap();
         assert!(private_delta_paths(&overlay).unwrap().is_empty());
     }
 
@@ -4826,31 +4837,48 @@ mod tests {
             VisibilityIndex::new(Vec::<String>::new(), ["src/lib.rs".to_string()]).unwrap(),
         ] {
             let (_scratch, overlay) = materialized_base_embedding_fixture(&visibility);
-            assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.rs"));
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.rs"));
         }
     }
 
     fn unchanged_repair_edges_fixture(
         visibility: &VisibilityIndex,
+        with_base_state: bool,
+        with_base_edges: bool,
     ) -> (tempfile::TempDir, greppy_store::Store) {
         let scratch = tempfile::tempdir().unwrap();
         let base_path = scratch.path().join("base.db");
         {
             let mut base = greppy_store::Store::open(&base_path).unwrap();
             base.upsert_project(&greppy_store::Project {
-                name: "p".into(), indexed_at: "now".into(), root_path: "/repo".into(),
-            }).unwrap();
-            base.conn().execute("INSERT INTO main.file_state(project,rel_path,sha256) VALUES('p','src/lib.ts','base')", []).unwrap();
+                name: "p".into(),
+                indexed_at: "now".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+            if with_base_state {
+                base.conn().execute("INSERT INTO main.file_state(project,rel_path,sha256) VALUES('p','src/lib.ts','base')", []).unwrap();
+            }
             let edge = greppy_store::NewRawEdge {
-                project: "p".into(), file_path: "src/lib.ts".into(),
-                source_qname: "run".into(), target_qname: "target".into(),
-                edge_type: "CALLS".into(), properties: serde_json::json!({"line": 2}),
+                project: "p".into(),
+                file_path: "src/lib.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "target".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({"line": 2}),
             };
-            base.insert_raw_edges(&[edge.clone(), edge]).unwrap();
+            if with_base_edges {
+                base.insert_raw_edges(&[edge.clone(), edge]).unwrap();
+            }
         }
         let overlay = greppy_store::Store::open_overlay(
-            &base_path, &scratch.path().join("delta.db"), visibility,
-        ).unwrap();
+            &base_path,
+            &scratch.path().join("delta.db"),
+            visibility,
+        )
+        .unwrap();
         overlay.conn().execute_batch(
             "INSERT INTO main.projects SELECT * FROM greppy_base.projects;
              INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
@@ -4863,7 +4891,8 @@ mod tests {
 
     #[test]
     fn private_delta_paths_allow_only_complete_unchanged_repair_edges() {
-        let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default());
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
         assert!(private_delta_paths(&overlay).unwrap().is_empty());
         for mutation in [
             "DELETE FROM main.raw_edges",
@@ -4874,7 +4903,7 @@ mod tests {
             "DELETE FROM main.js_ts_reference_override_files",
             "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
         ] {
-            let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default());
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
             overlay.conn().execute(mutation, []).unwrap();
             assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.ts"), "{mutation}");
         }
@@ -4882,17 +4911,65 @@ mod tests {
             VisibilityIndex::new(["src/lib.ts".to_string()], Vec::<String>::new()).unwrap(),
             VisibilityIndex::new(Vec::<String>::new(), ["src/lib.ts".to_string()]).unwrap(),
         ] {
-            let (_scratch, overlay) = unchanged_repair_edges_fixture(&visibility);
-            assert!(private_delta_paths(&overlay).unwrap().contains("src/lib.ts"));
+            let (_scratch, overlay) = unchanged_repair_edges_fixture(&visibility, true, true);
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
+            overlay
+                .conn()
+                .execute("DELETE FROM main.raw_edges", [])
+                .unwrap();
+            assert!(private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"));
         }
+    }
+
+    #[test]
+    fn private_delta_paths_validate_overrides_even_without_private_edges() {
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, false);
+        assert!(
+            private_delta_paths(&overlay).unwrap().is_empty(),
+            "certified empty Base contribution must remain valid"
+        );
+        overlay
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
+                [],
+            )
+            .unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
+        overlay.conn().execute_batch("DELETE FROM main.raw_edges; DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p';").unwrap();
+        assert!(private_delta_paths(&overlay)
+            .unwrap()
+            .contains("src/lib.ts"));
+
+        let (_scratch, overlay) =
+            unchanged_repair_edges_fixture(&VisibilityIndex::default(), false, false);
+        assert!(
+            private_delta_paths(&overlay)
+                .unwrap()
+                .contains("src/lib.ts"),
+            "override without Base file identity must fail closed"
+        );
     }
 
     #[test]
     fn effect_fn_repair_does_not_republish_unchanged_base_edges() {
         let scratch = tempfile::tempdir().unwrap();
         let repo = fixture();
-        std::fs::write(repo.path().join("src/plain.ts"),
-            "export function target() {}\nexport function caller() { target(); }\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/plain.ts"),
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )
+        .unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-q", "-m", "plain JS base"]);
         let base_path = scratch.path().join("base.db");
@@ -4902,13 +4979,31 @@ mod tests {
         }
         let base_bytes = std::fs::read(&base_path).unwrap();
         let mut overlay = greppy_store::Store::open_overlay(
-            &base_path, &scratch.path().join("delta.db"), &VisibilityIndex::default(),
-        ).unwrap();
-        assert!(greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path()).unwrap());
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
         assert!(overlay.list_delta_raw_edges("p").unwrap().is_empty());
-        let count: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.js_ts_reference_override_files", [], |row| row.get(0)).unwrap();
+        let count: i64 = overlay
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.js_ts_reference_override_files",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
-        assert!(!greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path()).unwrap());
+        assert!(!greppy_indexer::recover_visible_effect_fn_bindings(
+            &mut overlay,
+            "p",
+            repo.path()
+        )
+        .unwrap());
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
     }
 
