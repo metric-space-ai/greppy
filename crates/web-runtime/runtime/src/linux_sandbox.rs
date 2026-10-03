@@ -4,7 +4,7 @@
 //! Linux-only. The two profiles are equivalent in spirit (deny-default FS,
 //! write confined to `tmp`) but are different kernels and different ABIs.
 //!
-//! # ABI — `apply(exe, tmp)`
+//! # ABI — `apply(exe, tmp, persistent_profiles)`
 //!
 //! Called in the worker process after exec and before engine/JS startup
 //! (wired from `supervisor::apply_worker_sandbox`).
@@ -54,14 +54,14 @@ use std::path::{Path, PathBuf};
 ///
 /// See the module docs for the ABI. Fail-closed: `Ok(())` means Landlock
 /// (and on Linux, seccomp) are enforced.
-pub fn apply(exe: &Path, tmp: &Path) -> io::Result<()> {
+pub fn apply(exe: &Path, tmp: &Path, persistent_profiles: Option<&Path>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux::apply(exe, tmp)
+        linux::apply(exe, tmp, persistent_profiles)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (exe, tmp);
+        let _ = (exe, tmp, persistent_profiles);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "linux_sandbox::apply is Linux-only; refusing to start unsandboxed",
@@ -77,6 +77,7 @@ enum GrantKind {
     ReadFile { execute: bool },
     DeviceRw,
     WriteTree,
+    PersistentWriteTree,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,8 +121,19 @@ impl FsPathGrant {
         }
     }
 
+    fn persistent_write_tree(path: impl Into<PathBuf>, required: bool) -> Self {
+        Self {
+            path: path.into(),
+            kind: GrantKind::PersistentWriteTree,
+            required,
+        }
+    }
+
     fn is_write_tree(&self) -> bool {
-        matches!(self.kind, GrantKind::WriteTree)
+        matches!(
+            self.kind,
+            GrantKind::WriteTree | GrantKind::PersistentWriteTree
+        )
     }
 }
 
@@ -130,7 +142,11 @@ impl FsPathGrant {
 /// Optional system trees are included even if they are absent on this host
 /// (`apply` skips `ENOENT` when opening). `exe` / `tmp` are canonicalized
 /// when they exist so `..` and symlinks cannot sneak past the checks.
-fn fs_allow_list(exe: &Path, tmp: &Path) -> io::Result<Vec<FsPathGrant>> {
+fn fs_allow_list(
+    exe: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> io::Result<Vec<FsPathGrant>> {
     if exe.as_os_str().is_empty() || tmp.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -160,6 +176,12 @@ fn fs_allow_list(exe: &Path, tmp: &Path) -> io::Result<Vec<FsPathGrant>> {
         if !is_filesystem_root(dir) {
             grants.push(FsPathGrant::read_tree(dir, false));
         }
+    }
+
+    if let Some(path) = persistent_profiles {
+        let path = normalize(path);
+        refuse_filesystem_root(&path, "persistent profiles")?;
+        grants.push(FsPathGrant::persistent_write_tree(path, true));
     }
 
     Ok(grants)
@@ -242,15 +264,23 @@ mod linux {
         parent_fd: i32,
     }
 
-    pub(super) fn apply(exe: &Path, tmp: &Path) -> io::Result<()> {
-        restrict_filesystem(exe, tmp)?;
+    pub(super) fn apply(
+        exe: &Path,
+        tmp: &Path,
+        persistent_profiles: Option<&Path>,
+    ) -> io::Result<()> {
+        restrict_filesystem(exe, tmp, persistent_profiles)?;
         apply_seccomp()?;
         Ok(())
     }
 
     /// Landlock only. Used by tests so a live restrict does not install a
     /// process-killing seccomp filter on the cargo-test thread.
-    pub(super) fn restrict_filesystem(exe: &Path, tmp: &Path) -> io::Result<()> {
+    pub(super) fn restrict_filesystem(
+        exe: &Path,
+        tmp: &Path,
+        persistent_profiles: Option<&Path>,
+    ) -> io::Result<()> {
         if !tmp.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -263,7 +293,7 @@ mod linux {
 
         let abi = probe_abi()?;
         let handled = handled_fs(abi);
-        let grants = fs_allow_list(exe, tmp)?;
+        let grants = fs_allow_list(exe, tmp, persistent_profiles)?;
         let ruleset = create_ruleset(handled)?;
 
         let mut added = 0usize;
@@ -348,7 +378,10 @@ mod linux {
         }
         let c_path = path_c_string(&grant.path)?;
         let mut flags = libc::O_PATH | libc::O_CLOEXEC;
-        if matches!(grant.kind, GrantKind::ReadTree | GrantKind::WriteTree) {
+        if matches!(
+            grant.kind,
+            GrantKind::ReadTree | GrantKind::WriteTree | GrantKind::PersistentWriteTree
+        ) {
             flags |= libc::O_DIRECTORY;
         }
         let raw = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -414,6 +447,19 @@ mod linux {
                     | ACCESS_FS_MAKE_FIFO
                     | ACCESS_FS_MAKE_SYM
                     | ACCESS_FS_REFER
+                    | ACCESS_FS_TRUNCATE
+            }
+            GrantKind::PersistentWriteTree => {
+                ACCESS_FS_EXECUTE
+                    | ACCESS_FS_WRITE_FILE
+                    | ACCESS_FS_READ_FILE
+                    | ACCESS_FS_READ_DIR
+                    | ACCESS_FS_REMOVE_DIR
+                    | ACCESS_FS_REMOVE_FILE
+                    | ACCESS_FS_MAKE_DIR
+                    | ACCESS_FS_MAKE_REG
+                    | ACCESS_FS_MAKE_SOCK
+                    | ACCESS_FS_MAKE_FIFO
                     | ACCESS_FS_TRUNCATE
             }
         };
@@ -637,7 +683,7 @@ mod tests {
     fn allow_list_includes_required_system_and_worker_paths() {
         let exe = Path::new("/opt/greppy/libexec/web-runtime");
         let tmp = Path::new("/tmp/greppy-worker-unit");
-        let grants = fs_allow_list(exe, tmp).unwrap();
+        let grants = fs_allow_list(exe, tmp, None).unwrap();
         let paths = grant_paths(&grants);
         for expected in [
             Path::new("/usr"),
@@ -662,7 +708,7 @@ mod tests {
     fn allow_list_does_not_grant_home_or_workspace_root() {
         let exe = Path::new("/opt/greppy/libexec/web-runtime");
         let tmp = Path::new("/tmp/greppy-worker-unit");
-        let grants = fs_allow_list(exe, tmp).unwrap();
+        let grants = fs_allow_list(exe, tmp, None).unwrap();
         let paths = grant_paths(&grants);
 
         for banned in ["/", "/home", "/Users", "/root", "/var", "/dev"] {
@@ -698,7 +744,7 @@ mod tests {
     fn allow_list_may_include_workspace_only_when_it_is_tmp() {
         let exe = Path::new("/opt/greppy/libexec/web-runtime");
         let cwd = std::env::current_dir().expect("cwd");
-        let grants = fs_allow_list(exe, &cwd).unwrap();
+        let grants = fs_allow_list(exe, &cwd, None).unwrap();
         assert!(
             grants.iter().any(|g| g.path == cwd && g.is_write_tree()),
             "workspace as tmp must be the write tree: {grants:?}"
@@ -716,7 +762,7 @@ mod tests {
     fn allow_list_write_tree_is_only_tmp() {
         let exe = Path::new("/opt/greppy/libexec/web-runtime");
         let tmp = Path::new("/tmp/greppy-worker-unit");
-        let grants = fs_allow_list(exe, tmp).unwrap();
+        let grants = fs_allow_list(exe, tmp, None).unwrap();
         let writes: Vec<_> = grants
             .iter()
             .filter(|g| g.is_write_tree())
@@ -726,9 +772,23 @@ mod tests {
     }
 
     #[test]
+    fn allow_list_adds_only_the_explicit_persistent_profile_root() {
+        let exe = Path::new("/opt/greppy/libexec/web-runtime");
+        let tmp = Path::new("/tmp/greppy-worker-unit");
+        let profiles = Path::new("/var/lib/greppy/web-runtime/profiles");
+        let grants = fs_allow_list(exe, tmp, Some(profiles)).unwrap();
+        let writes: Vec<_> = grants
+            .iter()
+            .filter(|grant| grant.is_write_tree())
+            .map(|grant| grant.path.as_path())
+            .collect();
+        assert_eq!(writes, vec![tmp, profiles]);
+    }
+
+    #[test]
     fn allow_list_refuses_filesystem_root_as_tmp() {
         let err =
-            fs_allow_list(Path::new("/opt/greppy/bin/web-runtime"), Path::new("/")).unwrap_err();
+            fs_allow_list(Path::new("/opt/greppy/bin/web-runtime"), Path::new("/"), None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("filesystem root"), "{err}");
     }
@@ -736,7 +796,12 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn apply_is_unsupported_off_linux() {
-        let err = apply(Path::new("/opt/greppy/bin/web-runtime"), Path::new("/tmp")).unwrap_err();
+        let err = apply(
+            Path::new("/opt/greppy/bin/web-runtime"),
+            Path::new("/tmp"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(
             err.to_string().contains("refusing to start unsandboxed"),
@@ -750,6 +815,7 @@ mod tests {
         let err = apply(
             Path::new("/usr/bin/true"),
             Path::new("/no/such/greppy-worker-tmp"),
+            None,
         )
         .unwrap_err();
         assert_ne!(
@@ -797,7 +863,7 @@ mod tests {
         std::thread::Builder::new()
             .name("greppy-landlock-probe".into())
             .spawn(move || {
-                let outcome = match linux::restrict_filesystem(&exe, &tmp_for_thread) {
+                let outcome = match linux::restrict_filesystem(&exe, &tmp_for_thread, None) {
                     Err(err) => Err(err),
                     Ok(()) => {
                         let allowed = fs::read(&allowed_for_thread);

@@ -121,7 +121,7 @@ exit 0
 EOF
 chmod 0755 "$deb_root/DEBIAN/postinst"
 mkdir -p "$(dirname "$DEB_OUTPUT")"
-dpkg-deb --root-owner-group --build "$deb_root" "$DEB_OUTPUT" >/dev/null
+dpkg-deb --root-owner-group -Zxz --build "$deb_root" "$DEB_OUTPUT" >/dev/null
 
 rpm_top="$work_root/rpmbuild"
 mkdir -p "$rpm_top/BUILD" "$rpm_top/BUILDROOT" "$rpm_top/RPMS" "$rpm_top/SOURCES" "$rpm_top/SPECS" "$rpm_top/SRPMS"

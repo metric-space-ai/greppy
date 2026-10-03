@@ -22,6 +22,35 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+fn mark_call_provider_unavailable(store_dir: &Path) {
+    fn graph_db(dir: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(db) = graph_db(&path) {
+                    return Some(db);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("graph.db") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let db = graph_db(store_dir).expect("fixture graph.db");
+    let store = greppy_store::Store::open(&db).expect("open provider fixture");
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE provider_state SET status = 'partial',
+             supported_edge_classes = '[\"definitions\",\"usages\"]',
+             unsupported_edge_classes = '[\"calls\"]', files_failed = 0
+             WHERE project = 'repo' AND language = 'rust'",
+            [],
+        )
+        .expect("mark requested call relation unavailable");
+    assert_eq!(changed, 1, "fixture must contain one Rust provider row");
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
 }
@@ -260,20 +289,61 @@ fn callees_lists_what_symbol_calls() {
         "callees must print the callee's file:line (src/mid.rs); got: {out:?}"
     );
     assert!(
-        !out.contains("no callees"),
+        !out.contains("no resolved indexed callees"),
         "entry calls middle, so callees must be non-empty; got: {out:?}"
     );
 }
 
 #[test]
-fn callees_reports_no_callees_for_leaf() {
+fn callees_reports_no_indexed_callees_for_leaf() {
     let (repo, store) = index_fixture("callees-none");
-    // `leaf` calls nothing.
+    // Even for a true leaf, an empty graph result is not a completeness proof.
     let (code, out, _err) = run(&["callees", "leaf"], &repo, &store);
     assert_eq!(code, 0);
     assert_eq!(
-        out, "no callees\n",
-        "leaf calls nothing, so callees must say so; got: {out:?}"
+        out,
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
+inspect source with: greppy read leaf\n",
+        "an empty result must state the indexed scope and offer source inspection"
+    );
+}
+
+#[test]
+fn callees_does_not_claim_external_calls_are_absent() {
+    let (repo, store) = make_chain_repo("callees-external");
+    std::fs::write(
+        repo.join("src/leaf.rs"),
+        "pub fn leaf() -> u32 { std::process::id() }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed; stderr={err}\nstdout={out}");
+
+    let (code, out, err) = run(&["callees", "leaf"], &repo, &store);
+    assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
+    assert_eq!(
+        out,
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
+inspect source with: greppy read leaf\n",
+        "the unindexed standard-library call must not become a definitive no-calls claim"
+    );
+}
+
+#[test]
+fn callees_reports_when_path_filter_excludes_known_call() {
+    let (repo, store) = index_fixture("callees-filtered");
+    // entry calls middle in mid.rs, which the leaf.rs filter excludes.
+    let (code, out, err) = run(
+        &["callees", "entry", "--path", "src/leaf.rs"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
+    assert_eq!(
+        out,
+        "no resolved indexed callees under path filter: src/leaf.rs\n\
+external, unresolved or filtered calls may still exist; inspect source with: greppy read entry\n",
+        "filtering out a known call must preserve the filter and uncertainty in the answer"
     );
 }
 
@@ -340,7 +410,9 @@ fn path_json_reports_shortest_path_counts_and_metadata() {
     assert_eq!(v["path_found"], true);
     assert!(v["reason"].is_null());
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["provider_complete"], true);
+    assert_eq!(v["incomplete_provider_count"], 0);
+    assert_eq!(v["incomplete_providers"], serde_json::json!([]));
     assert_eq!(v["scope"], "shortest_path");
     assert_eq!(v["direction"], "outgoing");
     assert_eq!(v["edge_type"], "CALLS");
@@ -364,6 +436,9 @@ fn path_json_reports_shortest_path_counts_and_metadata() {
 #[test]
 fn provider_policy_require_complete_blocks_path_json() {
     let (repo, store) = index_fixture("provider-policy-path-json");
+    // A normal Rust provider is complete for CALLS. Keep this a real
+    // fail-closed test by withholding the relation that path requests.
+    mark_call_provider_unavailable(&store);
 
     let (code, out, err) = run_with_env(
         &[
@@ -449,41 +524,46 @@ fn path_json_refuses_stale_steps_when_auto_reindex_disabled() {
     );
 }
 
-/// The same small drift with automatic repair enabled is refused for the
-/// triggering request. A subsequent request observes the atomically published
-/// fresh generation and reports that the renamed-away endpoint is gone.
+/// Automatic repair completes inside the triggering query: it observes the
+/// published generation and reports that the renamed-away endpoint is gone.
 #[test]
 fn path_json_auto_reindexes_small_stale_drift() {
-    let (repo, store) = index_fixture("path-json-heal");
+    let (repo, store) = make_chain_repo("path-json-heal");
+    // `leaf` also names the file's Module node, which legitimately survives
+    // renaming its function. Give the endpoint a distinct name so absence
+    // proves function removal rather than making an incorrect module claim.
     std::fs::write(
         repo.join("src/leaf.rs"),
-        "pub fn renamed_leaf() -> u32 { 8 }\n",
+        "pub fn endpoint_before() -> u32 { 7 }\n",
     )
     .unwrap();
-
-    let (first_code, first_out, first_err) = run(
+    std::fs::write(
+        repo.join("src/mid.rs"),
+        "pub fn middle() { crate::leaf::endpoint_before(); }\n",
+    )
+    .unwrap();
+    let (index_code, index_out, index_err) = run(&["index", "."], &repo, &store);
+    assert_eq!(index_code, 0, "{index_out}\n{index_err}");
+    let (before_code, before_out, before_err) = run(
         &[
             "path",
             "--from",
             "entry",
             "--to",
-            "leaf",
+            "endpoint_before",
             "--json",
-            "--diagnostics",
         ],
         &repo,
         &store,
     );
-    assert_eq!(
-        first_code, 75,
-        "triggering stale request must be refused; stderr={first_err}\nstdout={first_out}"
-    );
-    let first: serde_json::Value = serde_json::from_str(&first_out)
-        .unwrap_or_else(|e| panic!("invalid refresh json: {e}; stdout={first_out:?}"));
-    assert_eq!(first["status"], "skipped_stale_index");
-    assert_eq!(first["fresh"], false);
-    assert_eq!(first["freshness"]["state"], "refreshing");
-    assert!(first["steps"].as_array().unwrap().is_empty());
+    assert_eq!(before_code, 0, "{before_out}\n{before_err}");
+    let before: serde_json::Value = serde_json::from_str(&before_out).unwrap();
+    assert_eq!(before["path_found"], true, "{before}");
+    std::fs::write(
+        repo.join("src/leaf.rs"),
+        "pub fn endpoint_after() -> u32 { 8 }\n",
+    )
+    .unwrap();
 
     let (code, out, err) = run(
         &[
@@ -491,7 +571,7 @@ fn path_json_auto_reindexes_small_stale_drift() {
             "--from",
             "entry",
             "--to",
-            "leaf",
+            "endpoint_before",
             "--json",
             "--diagnostics",
         ],
@@ -500,7 +580,7 @@ fn path_json_auto_reindexes_small_stale_drift() {
     );
     assert_eq!(
         code, 1,
-        "healed path: `leaf` no longer exists, so no path; stderr={err}\nstdout={out}"
+        "healed path: `endpoint_before` no longer exists, so no path; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid healed path json: {e}; stdout={out:?}"));
@@ -509,6 +589,9 @@ fn path_json_auto_reindexes_small_stale_drift() {
         v["fresh"], true,
         "auto-reindex must yield a fresh answer: {v:?}"
     );
+    assert_eq!(v["freshness"]["state"], "fresh");
+    assert_eq!(v["to_found"], false, "renamed-away endpoint must be absent");
+    assert!(v["steps"].as_array().unwrap().is_empty());
     assert_eq!(v["path_found"], false);
 }
 

@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[path = "support/portable_provider.rs"]
 mod portable_provider;
-use portable_provider::spawn_fake_provider;
+use portable_provider::{spawn_fake_provider, spawn_fake_provider_with_edits};
 
 fn binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
+    std::env::var_os("GREPPY_ACCEPTANCE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_greppy")))
 }
 
 fn unique_temp(tag: &str) -> PathBuf {
@@ -62,7 +64,14 @@ fn init_repo(root: &std::path::Path) {
 
 /// Minimal Anthropic Messages gateway: GET /v1/models → 200; POST /v1/messages
 /// → canned SSE text-only end_turn stream.
-fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway_sequence(vec![sse])
+}
+
+fn spawn_gateway_sequence(
+    responses: Vec<&'static str>,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    assert!(!responses.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
         .set_nonblocking(true)
@@ -72,35 +81,16 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let stop_flag = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
-        let sse = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
-            "\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
-            "\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi from stub\"}}\n",
-            "\n",
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
-            "\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n",
-            "\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n",
-            "\n",
-        );
-
+        let mut message_index: usize = 0;
         while !stop_flag.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 16384];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let Ok(request) = read_gateway_request(&mut stream) else {
+                        continue;
+                    };
+                    let req = String::from_utf8_lossy(&request);
                     let first_line = req.lines().next().unwrap_or("");
                     if first_line.starts_with("GET /v1/models") {
                         let body = r#"{"data":[{"id":"test"}]}"#;
@@ -111,6 +101,8 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
                         );
                         let _ = stream.write_all(resp.as_bytes());
                     } else if first_line.starts_with("POST /v1/messages") {
+                        let sse = responses[message_index.min(responses.len() - 1)];
+                        message_index += 1;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             sse.len(),
@@ -146,6 +138,236 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     }
 
     (endpoint, stop, handle)
+}
+
+fn read_gateway_request(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    // Drain the complete HTTP request before replying. A partial read can leave
+    // unread request bytes and reset the connection, consuming a scripted turn
+    // that the agent never received.
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut expected = None;
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        request.extend_from_slice(&buf[..n]);
+        if request.len() > 1024 * 1024 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        if expected.is_none() {
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>())
+                    .transpose()
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?
+                    .unwrap_or(0);
+                expected = Some(end + 4 + length);
+            }
+        }
+        if expected.is_some_and(|length| request.len() >= length) {
+            return Ok(request);
+        }
+    }
+}
+
+#[test]
+fn gateway_reads_fragmented_request_before_consuming_scripted_response() {
+    struct Fragments(Vec<std::io::Cursor<Vec<u8>>>);
+    impl Read for Fragments {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let Some(first) = self.0.first_mut() else {
+                    return Ok(0);
+                };
+                let count = first.read(bytes)?;
+                if count != 0 {
+                    return Ok(count);
+                }
+                self.0.remove(0);
+            }
+        }
+    }
+    let body = vec![b'x'; 32768];
+    let headers = format!(
+        "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut fragments = Fragments(vec![
+        std::io::Cursor::new(headers.as_bytes()[..7].to_vec()),
+        std::io::Cursor::new(headers.as_bytes()[7..].to_vec()),
+        std::io::Cursor::new(body.clone()),
+    ]);
+    let request = read_gateway_request(&mut fragments).unwrap();
+    assert_eq!(request.len(), headers.len() + body.len());
+    assert_eq!(&request[headers.len()..], body);
+    assert!(read_gateway_request(&mut &headers.as_bytes()[..]).is_err());
+}
+
+fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway(stub_gateway_response())
+}
+
+fn stub_gateway_response() -> &'static str {
+    concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+        "\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi from stub\"}}\n",
+        "\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n",
+        "\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+        "\n",
+    )
+}
+
+fn spawn_edit_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway(edit_gateway_response())
+}
+
+fn edit_gateway_response() -> &'static str {
+    concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_edit\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+        "\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit\",\"name\":\"greppy\",\"input\":{}}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"args\\\":[\\\"write\\\",\\\"hello.txt\\\",\\\"partial\\\\n\\\"]}\"}}\n",
+        "\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}\n",
+        "\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+        "\n",
+    )
+}
+
+#[test]
+fn greppy_p_without_provider_preserves_dirty_source_and_publishes_proposal() {
+    assert_provider_optional_proposal(false);
+}
+
+#[test]
+fn greppy_p_with_inactive_provider_preserves_dirty_source_and_publishes_proposal() {
+    assert_provider_optional_proposal(true);
+}
+
+fn assert_provider_optional_proposal(installed_inactive: bool) {
+    let root = unique_temp("no-provider-agent");
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::write(repo.join("hello.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "hello.txt"]);
+    std::fs::write(repo.join("hello.txt"), "local\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "keep me\n").unwrap();
+    let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+    let no_provider = root.join("workspace-without-provider");
+    let manifest_bytes = installed_inactive.then(|| {
+        std::fs::create_dir(&no_provider).unwrap();
+        let manifest = serde_json::json!({
+            "protocol_version": greppy_workspace_core::PROVIDER_PROTOCOL_VERSION,
+            "adapter_version": "0.4.1", "adapter_kind": greppy_workspace_core::AdapterKind::FsKit,
+            "state": "ready", "instance_id": "installed-inactive",
+            "data_root": no_provider, "mount_root": root.join("unmounted"),
+            "heartbeat_unix_ms": 1,
+            "capabilities": {"hard_links":true,"symbolic_links":true,"byte_range_locks":true,
+                "memory_maps":true,"atomic_rename":true,"case_preserving":true}
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(no_provider.join("provider.json"), &bytes).unwrap();
+        bytes
+    });
+    let (endpoint, stop, handle) =
+        spawn_gateway_sequence(vec![edit_gateway_response(), stub_gateway_response()]);
+    let mut command = Command::new(binary_path());
+    command
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", root.join("store"))
+        .env("GREPPY_WORKSPACE_DIR", &no_provider)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "change hello.txt",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--private-store",
+            "--skip-selfcheck",
+            "--json",
+        ]);
+    if std::env::var_os("GREPPY_ACCEPTANCE_BINARY").is_some() {
+        command
+            .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+            .env_remove("CI");
+    }
+    let output = command.output().expect("spawn no-provider agent");
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "result")
+        .expect("completed agent result");
+    assert_eq!(result["turns"], 2, "{result}");
+    assert_eq!(result["applied"], false, "{result}");
+    let proposal = result["proposal_ref"].as_str().expect("proposal ref");
+    assert!(proposal.starts_with("refs/greppy/agent/"), "{proposal}");
+    let shown = Command::new("git")
+        .current_dir(&repo)
+        .args(["show", &format!("{proposal}:hello.txt")])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert_eq!(shown.stdout, b"partial\n");
+    assert_eq!(std::fs::read(repo.join("hello.txt")).unwrap(), b"local\n");
+    assert_eq!(
+        std::fs::read(repo.join("untracked.txt")).unwrap(),
+        b"keep me\n"
+    );
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).unwrap(),
+        index_before
+    );
+    match manifest_bytes {
+        Some(bytes) => assert_eq!(
+            std::fs::read(no_provider.join("provider.json")).unwrap(),
+            bytes
+        ),
+        None => assert!(!no_provider.join("provider.json").exists()),
+    }
+    assert!(
+        !root.join("unmounted").exists(),
+        "must not activate a provider"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -330,17 +552,84 @@ fn greppy_e_dash_p_is_not_intercepted_as_agent() {
 }
 
 #[test]
-fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
-    // --deadline-secs 0 expires at loop start (Instant computed after self-check).
-    // The loop must stop with LoopStop::Deadline, print the stopped: line, and
-    // still produce the normal clean outcome (exit 0) — never discard work.
-    let repo = unique_temp("deadline-repo");
-    init_repo(&repo);
-    let store = unique_temp("deadline-store");
-    let provider_root = unique_temp("deadline-provider");
-    let provider = spawn_fake_provider(&provider_root, &repo);
+fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
+    // Neither run reaches a model turn; both must retain a usable result.
+    for (limit_args, expected_stop) in [
+        (
+            vec!["--max-turns", "4", "--deadline-secs", "0"],
+            "deadline reached",
+        ),
+        (vec!["--max-turns", "0"], "turn limit reached"),
+    ] {
+        let repo = unique_temp("limited-repo");
+        init_repo(&repo);
+        let store = unique_temp("limited-store");
+        let provider_root = unique_temp("limited-provider");
+        let provider = spawn_fake_provider(&provider_root, &repo);
+        let (endpoint, stop, handle) = spawn_stub_gateway();
+        let output = Command::new(binary_path())
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_WORKSPACE_DIR", &provider.data)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_MODEL")
+            .env_remove("GREPPY_ENDPOINT")
+            .env_remove("GREPPY_DEADLINE_SECS")
+            .args([
+                "-p",
+                "say hi",
+                "--model",
+                "test",
+                "--endpoint",
+                &endpoint,
+                "--private-store",
+                "--skip-selfcheck",
+                "--json",
+            ])
+            .args(limit_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn greppy -p");
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+        let result = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "result")
+            .expect("final result must be delivered when a limit is reached");
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["exit_code"], 5);
+        assert_eq!(result["stop"], expected_stop);
+        assert_eq!(result["turns"], 0);
+        assert!(!result["session_id"].as_str().unwrap().is_empty());
+        assert_eq!(result["applied"], false);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&store);
+        drop(provider);
+        let _ = std::fs::remove_dir_all(&provider_root);
+    }
+}
 
-    let (endpoint, stop, handle) = spawn_stub_gateway();
+#[test]
+fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
+    let repo = unique_temp("partial-proposal-repo");
+    init_repo(&repo);
+    let store = unique_temp("partial-proposal-store");
+    let provider_root = unique_temp("partial-proposal-provider");
+    let provider = spawn_fake_provider_with_edits(
+        &provider_root,
+        &repo,
+        vec![(PathBuf::from("hello.txt"), b"partial\n".to_vec())],
+    );
+    let (endpoint, stop, handle) = spawn_edit_gateway();
 
     let output = Command::new(binary_path())
         .current_dir(&repo)
@@ -349,29 +638,24 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_MODEL")
         .env_remove("GREPPY_ENDPOINT")
-        .env_remove("GREPPY_DEADLINE_SECS")
         .args([
             "-p",
-            "say hi",
+            "change hello.txt",
             "--model",
             "test",
             "--endpoint",
             &endpoint,
             "--max-turns",
-            "4",
-            "--deadline-secs",
-            "0",
-            // This test isolates loop deadline delivery. Base publication has
-            // its own fail-closed tests and CI fixture assets intentionally do
-            // not contain a complete embedding model.
+            "1",
             "--private-store",
             "--skip-selfcheck",
+            "--apply",
+            "--json",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .expect("spawn greppy -p");
-
     stop.store(true, Ordering::SeqCst);
     let _ = handle.join();
 
@@ -379,19 +663,58 @@ fn greppy_p_deadline_zero_stops_cleanly_and_delivers_outcome() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(0),
+        Some(5),
         "stdout={stdout}\nstderr={stderr}"
     );
+    let result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "result")
+        .expect("incomplete proposal result");
+    assert_eq!(result["status"], "incomplete");
+    assert_eq!(result["stop"], "turn limit reached");
+    assert_eq!(result["turns"], 1);
+    assert_eq!(result["applied"], false);
+    let proposal = result["proposal_ref"].as_str().unwrap_or_else(|| {
+        panic!("partial proposal must remain inspectable; stdout={stdout}\nstderr={stderr}")
+    });
+    assert!(!proposal.is_empty(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("hello.txt")).unwrap(),
+        "hello\n",
+        "--apply must not stage an incomplete proposal"
+    );
+    let shown = Command::new("git")
+        .args(["show", "--format=", proposal, "--", "hello.txt"])
+        .current_dir(&repo)
+        .output()
+        .expect("inspect proposal ref");
     assert!(
-        stderr.contains("stopped: wall-clock deadline reached (0s) — the result may be incomplete"),
-        "expected deadline stop line; stderr={stderr}"
+        shown.status.success(),
+        "proposal={proposal} stderr={}",
+        String::from_utf8_lossy(&shown.stderr)
     );
     assert!(
-        stdout.contains("no changes proposed."),
-        "deadline stop must still deliver the clean/proposal outcome: stdout={stdout}\nstderr={stderr}"
+        String::from_utf8_lossy(&shown.stdout).contains("partial"),
+        "proposal={proposal} stdout={}",
+        String::from_utf8_lossy(&shown.stdout)
     );
-    let _ = session_id_from_stderr(&stderr);
+    let kept = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree kept for debugging: "))
+        .map(PathBuf::from)
+        .expect("incomplete run must report its retained worktree");
+    assert!(
+        kept.exists(),
+        "retained worktree missing: {}",
+        kept.display()
+    );
 
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&kept)
+        .current_dir(&repo)
+        .status();
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&store);
     drop(provider);

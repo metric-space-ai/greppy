@@ -128,8 +128,9 @@ use greppy_store::{
 use rayon::prelude::*;
 
 pub use embedding::{
-    count_code_embedding_documents_for_project, count_embedding_candidate_nodes,
-    index_code_embeddings_for_project, index_code_embeddings_for_project_with_progress,
+    count_code_embedding_documents_for_project, count_code_embedding_documents_for_scope,
+    count_embedding_candidate_nodes, embedding_path_matches, index_code_embeddings_for_project,
+    index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
     CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
     EmbeddingIndexProgress, EmbeddingIndexReport, EmbeddingProviderCacheStats,
 };
@@ -266,32 +267,62 @@ pub fn index_with_options_and_progress(
 ) -> Result<IndexReport> {
     progress(IndexBuildProgress::new("discovering_files", 0, 0));
     let abs_root = greppy_discover::detect_repo_root(root)?;
+    let indexer_version = indexer_version_for_options(options);
+    let prior_state = store.list_private_file_states(project_name)?;
+    // Compatibility must be read before publishing the new version or filtering
+    // the inventory. Migrate every retained file in this store layer, even when
+    // this invocation would ordinarily refresh only a few Delta paths.
+    let prior_indexer_version = store
+        .list_private_workspace_states()?
+        .iter()
+        .find(|state| state.root_path == abs_root.to_string_lossy())
+        .map(|state| state.indexer_version.clone());
+    let rust_reexport_migration = prior_indexer_version
+        .as_deref()
+        .is_some_and(|prior| is_rust_reexport_migration(prior, &indexer_version));
+    let incompatible_index = prior_indexer_version
+        .as_deref()
+        .map_or(!prior_state.is_empty(), |prior| prior != indexer_version)
+        && !rust_reexport_migration;
+    let mut only_paths = options.only_paths.clone();
+    if rust_reexport_migration {
+        if let Some(paths) = only_paths.as_mut() {
+            // `compute_file_diff` treats retained rows omitted from the
+            // inventory as deleted. Include every retained path for the
+            // migration, while the raw-edge refresh below still extracts
+            // only unchanged Rust files.
+            paths.extend(prior_state.iter().map(|state| state.rel_path.clone()));
+        }
+    } else if incompatible_index {
+        if let Some(paths) = only_paths.as_mut() {
+            paths.extend(prior_state.iter().map(|state| state.rel_path.clone()));
+        }
+    }
     let discovered_entries = greppy_discover::walk_with_policy_and_overrides(
         &abs_root,
         &greppy_discover::SkipPolicy::walk_default(),
         &options.discover_overrides,
     )?;
-    let (all_entries, discovery_filtered_entries) =
-        if let Some(only_paths) = options.only_paths.as_ref() {
-            let discovered_paths = discovered_entries
-                .iter()
-                .map(|entry| entry.rel_path.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let filtered = only_paths
-                .iter()
-                .filter(|rel_path| !discovered_paths.contains(rel_path.as_str()))
-                .filter_map(|rel_path| explicit_filtered_inventory_entry(&abs_root, rel_path))
-                .collect::<Vec<_>>();
-            (
-                discovered_entries
-                    .into_iter()
-                    .filter(|entry| only_paths.contains(&entry.rel_path))
-                    .collect::<Vec<_>>(),
-                filtered,
-            )
-        } else {
-            (discovered_entries, Vec::new())
-        };
+    let (all_entries, discovery_filtered_entries) = if let Some(only_paths) = only_paths.as_ref() {
+        let discovered_paths = discovered_entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let filtered = only_paths
+            .iter()
+            .filter(|rel_path| !discovered_paths.contains(rel_path.as_str()))
+            .filter_map(|rel_path| explicit_filtered_inventory_entry(&abs_root, rel_path))
+            .collect::<Vec<_>>();
+        (
+            discovered_entries
+                .into_iter()
+                .filter(|entry| only_paths.contains(&entry.rel_path))
+                .collect::<Vec<_>>(),
+            filtered,
+        )
+    } else {
+        (discovered_entries, Vec::new())
+    };
     progress(IndexBuildProgress::new(
         "classifying_files",
         0,
@@ -335,7 +366,16 @@ pub fn index_with_options_and_progress(
         head_oid: fp.head_oid.clone(),
         index_signature: fp.index_signature.clone(),
         schema_version: store.schema_version()?,
-        indexer_version: indexer_version_for_options(options),
+        // Do not advertise v7 until its scoped Rust raw-edge refresh and
+        // full re-resolution have both completed. A failed migration must
+        // remain retryable on the next invocation.
+        indexer_version: if rust_reexport_migration {
+            prior_indexer_version
+                .clone()
+                .unwrap_or_else(|| indexer_version.clone())
+        } else {
+            indexer_version.clone()
+        },
         graph_generation: 0,
         updated_at: ws::now_iso8601(),
     })?;
@@ -396,10 +436,66 @@ pub fn index_with_options_and_progress(
     // paths then re-resolve over the *whole* project's raw edges, so the
     // resulting graph is byte-for-byte identical to a full reindex (the
     // `incremental_matches_full_reindex` test enforces this).
-    let prior_state = store.list_file_states(project_name)?;
-    let incremental = !prior_state.is_empty() && raw_edges_present;
+    if incompatible_index {
+        // Reuse the ordinary per-file cleanup, including files removed or
+        // excluded since the old snapshot, before full extraction. This stays
+        // inside the unpublished snapshot used by CLI indexing.
+        for state in &prior_state {
+            drop_indexed_rows_for_skip(store, project_name, &state.rel_path)?;
+            store.delete_index_skip(project_name, &state.rel_path)?;
+        }
+    }
+    let incremental = !incompatible_index && !prior_state.is_empty() && raw_edges_present;
 
-    if incremental {
+    if rust_reexport_migration && incremental {
+        let validated_unchanged = refresh_unchanged_rust_raw_edges(
+            store,
+            project_name,
+            &entries,
+            worker_count,
+            prior_indexer_version
+                .as_deref()
+                .is_some_and(|version| version.starts_with("greppy-indexer-v6")),
+            &mut report,
+            progress,
+        )?;
+        let _changed_files = run_incremental(
+            store,
+            project_name,
+            &entries,
+            generation,
+            worker_count,
+            &mut report,
+            progress,
+        )?;
+        // Changed/deleted files lost stale vectors through the normal node
+        // rewrite. Every row left here still belongs to a retained node whose
+        // bytes are unchanged, so make that cached vector visible in v7.
+        for rel_path in validated_unchanged {
+            store
+                .conn()
+                .execute(
+                    "UPDATE main.vector_embeddings SET graph_generation = ?3
+                     WHERE project = ?1 AND file_path = ?2",
+                    rusqlite::params![project_name, rel_path, generation as i64],
+                )
+                .map_err(sqlite_err)?;
+        }
+        // Resolver semantics changed. Replace the complete non-structural
+        // graph so an edge rejected by v7 cannot survive from v6.
+        if !store.is_overlay() {
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM main.edges WHERE project = ?1",
+                    rusqlite::params![project_name],
+                )
+                .map_err(sqlite_err)?;
+        }
+        let raw_edges = load_all_raw_edges(store, project_name)?;
+        report.edges_extracted =
+            resolve_and_persist_edges_with_progress(store, project_name, &raw_edges, progress)?;
+    } else if incremental {
         // Capture the project's **definition fingerprint** before we touch
         // any node (PHASE A deletes/re-inserts changed files' nodes). The
         // fingerprint is the exact set of node identity tuples that
@@ -466,6 +562,13 @@ pub fn index_with_options_and_progress(
         }
     }
 
+    if !store.is_overlay() {
+        if incremental && !rust_caller_edges_repaired(store)? {
+            report.edges_extracted += rebuild_single_store_rust_edges(store, project_name)?;
+        }
+        mark_rust_caller_edges_repaired(store)?;
+    }
+
     // Structural spine (Project / Folder / File nodes + CONTAINS_FILE /
     // CONTAINS_FOLDER / DEFINES edges) — builds the structural pass plus the
     // File→DEFINES edges. Runs AFTER
@@ -523,7 +626,20 @@ pub fn index_with_options_and_progress(
     // parser internals.
     sync_provider_states(store, project_name, &all_entries, generation)?;
 
+    if rust_reexport_migration {
+        let mut migrated_state = store
+            .get_workspace_state(abs_root.to_string_lossy().as_ref())?
+            .ok_or_else(|| {
+                greppy_core::Error::Store("workspace state disappeared during v7 migration".into())
+            })?;
+        migrated_state.indexer_version = indexer_version;
+        store.upsert_workspace_state(&migrated_state)?;
+    }
+
     report.graph_generation = generation;
+    if store.is_overlay() {
+        recover_visible_effect_fn_bindings(store, project_name, &abs_root)?;
+    }
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
@@ -544,7 +660,9 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     }
     let abs_path = root.join(relative);
     let metadata = std::fs::symlink_metadata(&abs_path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // Tracked Delta symlinks are not source files, but still need an identity
+    // so unchanged queries remain fresh without following their targets.
+    if !metadata.file_type().is_symlink() && !metadata.is_file() {
         return None;
     }
     let stable = stable_metadata(&metadata);
@@ -568,6 +686,15 @@ fn indexer_version_for_options(options: &IndexOptions) -> String {
             greppy_core::INDEXER_VERSION_BASE
         )
     }
+}
+
+fn is_rust_reexport_migration(prior: &str, current: &str) -> bool {
+    let (prior_base, prior_scope) = prior.split_once(';').unwrap_or((prior, ""));
+    let (current_base, current_scope) = current.split_once(';').unwrap_or((current, ""));
+    ((prior_base == "greppy-indexer-v6" && current_base == "greppy-indexer-v7")
+        || (matches!(prior_base, "greppy-indexer-v6" | "greppy-indexer-v7")
+            && current_base == "greppy-indexer-v8"))
+        && prior_scope == current_scope
 }
 
 /// Full (first) index: classify every file, extract every supported file
@@ -936,6 +1063,102 @@ fn run_incremental(
     // generation, so this is idempotent for them.
     bump_all_persisted_generations(store, project_name, generation)?;
     Ok(changed_files)
+}
+
+/// Refresh byte-identical files affected by structural migrations: Rust raw
+/// edges for v6 upgrades, JS/TS raw edges and proven Effect.fn binding kinds
+/// for v8. Unaffected nodes, content and vectors stay put; changed definition
+/// identities lose their own vectors so embedding hashes remain authoritative.
+fn refresh_unchanged_rust_raw_edges(
+    store: &mut Store,
+    project_name: &str,
+    entries: &[InventoryEntry],
+    worker_count: usize,
+    refresh_rust: bool,
+    report: &mut IndexReport,
+    progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<std::collections::HashSet<String>> {
+    let diffs = greppy_freshness::compute_file_diff(store, project_name, entries)?;
+    // `compute_file_diff` sorts its result by path, while discovery order is
+    // independently deterministic and need not be the same. `Unchanged`
+    // intentionally carries no path, so zipping the two sequences can assign
+    // another file's classification. Build the explicit changed-path set and
+    // classify inventory entries by exclusion instead.
+    let changed_paths = diffs
+        .iter()
+        .filter_map(|diff| match diff {
+            greppy_freshness::FileDiff::Added(entry)
+            | greppy_freshness::FileDiff::Modified { entry, .. } => Some(entry.rel_path.as_str()),
+            greppy_freshness::FileDiff::Deleted(rel) => Some(rel.as_str()),
+            greppy_freshness::FileDiff::Unchanged => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let validated_unchanged = entries
+        .iter()
+        .filter(|entry| !changed_paths.contains(entry.rel_path.as_str()))
+        .map(|entry| entry.rel_path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let unchanged_rust = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let language = greppy_parser::language_for_path(&entry.abs_path);
+            (!changed_paths.contains(entry.rel_path.as_str())
+                && ((refresh_rust && language == Language::Rust)
+                    || matches!(language, Language::JavaScript | Language::TypeScript { .. })))
+            .then_some((idx, entry, language))
+        })
+        .collect::<Vec<_>>();
+    let mut extraction_progress = |completed, total| {
+        progress(IndexBuildProgress::new(
+            "extracting_files",
+            completed,
+            total,
+        ));
+    };
+    let (extractions, throttled) =
+        parallel_extract(&unchanged_rust, worker_count, &mut extraction_progress);
+    report.throttled_for_memory |= throttled;
+    for outcome in extractions {
+        match outcome {
+            FileOutcome::Extracted {
+                rel_path,
+                nodes,
+                edges,
+                ..
+            } => {
+                // v8 changes only proven Effect.fn Variables into Functions.
+                // Keep unaffected node IDs/content/vectors; retire embeddings
+                // for the changed identity rather than reuse an unverified hash.
+                for node in nodes.iter().filter(|node| node.label == "Function") {
+                    let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+                    if let Some(old) = store.get_node_by_qname(project_name, &old_qname)? {
+                        if old.label == "Variable"
+                            && old.name == node.name
+                            && old.start_line == i64::from(node.start_line)
+                            && old.end_line == i64::from(node.end_line)
+                        {
+                            store.update_node_identity(
+                                old.id,
+                                &node.label,
+                                &node.qualified_name,
+                            )?;
+                        }
+                    }
+                }
+                persist_raw_edges_for_file(store, project_name, &rel_path, &edges)?;
+                report.files_indexed += 1;
+            }
+            FileOutcome::Unreadable { entry, detail, .. } => {
+                report.files_unreadable += 1;
+                return Err(greppy_core::Error::Invalid(format!(
+                    "v7 Rust migration could not re-extract {}: {detail}",
+                    entry.rel_path
+                )));
+            }
+        }
+    }
+    Ok(validated_unchanged)
 }
 
 /// Bulk-stamp `generation` onto every `file_state` and `index_skips` row for
@@ -1471,7 +1694,7 @@ fn resolve_and_persist_edges(
     project: &str,
     edges: &[ExtractedEdge],
 ) -> Result<usize> {
-    resolve_and_persist_edges_with_progress(store, project, edges, &mut |_| {})
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, &mut |_| {}, &[])
 }
 
 fn resolve_and_persist_edges_with_progress(
@@ -1479,6 +1702,34 @@ fn resolve_and_persist_edges_with_progress(
     project: &str,
     edges: &[ExtractedEdge],
     progress: &mut dyn FnMut(IndexBuildProgress),
+) -> Result<usize> {
+    resolve_and_persist_edges_with_progress_and_preserved(store, project, edges, progress, &[])
+}
+
+fn resolve_and_persist_edges_with_progress_and_preserved(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+    preserved_overlay_edges: &[NewOverlayEdge],
+) -> Result<usize> {
+    resolve_edges_with_replacement(
+        store,
+        project,
+        edges,
+        progress,
+        preserved_overlay_edges,
+        false,
+    )
+}
+
+fn resolve_edges_with_replacement(
+    store: &mut Store,
+    project: &str,
+    edges: &[ExtractedEdge],
+    progress: &mut dyn FnMut(IndexBuildProgress),
+    preserved_overlay_edges: &[NewOverlayEdge],
+    replace_single_rust_edges: bool,
 ) -> Result<usize> {
     // Build the in-memory index ONCE (single query over the project's
     // nodes) instead of querying the store per edge.
@@ -1510,6 +1761,7 @@ fn resolve_and_persist_edges_with_progress(
         };
         let src_id = src.id;
         let src_file = src.file_path.clone();
+        index.record_import_items(edge, &src_file);
         let target_id = match edge
             .properties
             .get("imported_name")
@@ -1521,7 +1773,12 @@ fn resolve_and_persist_edges_with_progress(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+                index.resolve_import_target(
+                    &src_file,
+                    name,
+                    path,
+                    edge.properties.get("imported_items"),
+                )
             }
             // Brace groups / globs / renames leave imported_name empty —
             // a future expansion pass owns those.
@@ -1535,6 +1792,102 @@ fn resolve_and_persist_edges_with_progress(
         // Record the import so the reference resolver can disambiguate.
         index.record_import(&src_file, target_id);
         resolved.push(new_edge(project, src_id, target_id, edge));
+    }
+
+    // A Store-CoW Delta resolves only its own raw edges, but a qualified Rust
+    // reference can depend on reexports in the immutable Base. Hydrate import
+    // context only for module files reached from the Delta's imports. This
+    // preserves the O(Delta + reached modules) bound instead of scanning every
+    // Base raw edge, while allowing `channels::target` to follow a Base
+    // `pub use command::{..., target}`.
+    if store.is_overlay() {
+        let mut pending = index
+            .rust_namespaces_by_file
+            .values()
+            .flat_map(|aliases| aliases.values().flatten().cloned())
+            .collect::<Vec<_>>();
+        pending.extend(
+            index
+                .import_module_files_by_file
+                .values()
+                .flat_map(|files| files.iter().cloned()),
+        );
+        for (source_file, globs) in &index.import_globs_by_file {
+            for glob in globs {
+                pending.extend(
+                    index
+                        .rust_module_files_for_module_path(source_file, glob)
+                        .into_iter()
+                        .filter(|file| index.known_files.contains(file)),
+                );
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(module_file) = pending.pop() {
+            if !seen.insert(module_file.clone()) {
+                continue;
+            }
+            for raw in store.list_raw_import_edges_for_file(project, &module_file)? {
+                let edge = extracted_edge_from_raw(raw);
+                if edge.edge_type != "IMPORTS" {
+                    continue;
+                }
+                let Some(src) = index.by_qname(&edge.source_qualified_name) else {
+                    continue;
+                };
+                let src_id = src.id;
+                let src_file = src.file_path.clone();
+                index.record_import_items(&edge, &src_file);
+                let Some(name) = edge
+                    .properties
+                    .get("imported_name")
+                    .and_then(|value| value.as_str())
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let path = edge
+                    .properties
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if let Some(target_id) = index
+                    .resolve_import_target(
+                        &src_file,
+                        name,
+                        path,
+                        edge.properties.get("imported_items"),
+                    )
+                    .filter(|target_id| *target_id != src_id)
+                {
+                    index.record_import(&src_file, target_id);
+                }
+            }
+            pending.extend(
+                index
+                    .rust_namespaces_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|aliases| aliases.values().flatten().cloned()),
+            );
+            pending.extend(
+                index
+                    .import_module_files_by_file
+                    .get(&module_file)
+                    .into_iter()
+                    .flat_map(|files| files.iter().cloned()),
+            );
+            if let Some(globs) = index.import_globs_by_file.get(&module_file) {
+                for glob in globs {
+                    pending.extend(
+                        index
+                            .rust_module_files_for_module_path(&module_file, glob)
+                            .into_iter()
+                            .filter(|file| index.known_files.contains(file)),
+                    );
+                }
+            }
+        }
     }
 
     // PASS 2 — reference edges (CALLS / TYPE_REF / USES / other).
@@ -1566,16 +1919,14 @@ fn resolve_and_persist_edges_with_progress(
             // resolve it to any registered symbol (callable, type, or value)
             // via the symbol registry. No direct target qname exists, so this
             // is name-based only.
-            "USAGE" => match edge.properties.get("ref_name").and_then(|v| v.as_str()) {
-                Some(name) if !name.is_empty() => {
-                    index.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
-                }
-                _ => None,
-            },
+            "USAGE" => index.resolve_usage_target(edge, src_id),
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
 
-        let Some(target_id) = target_id else { continue };
+        let Some(target_id) = target_id else {
+            clear_option_field_unresolved();
+            continue;
+        };
 
         // An edge must connect two DISTINCT nodes; a self-loop here is
         // almost always a same-file guess qname accidentally matching the
@@ -1583,6 +1934,7 @@ fn resolve_and_persist_edges_with_progress(
         // keeps self-loops (direct recursion is legitimate); the others
         // drop them.
         if target_id == src_id && edge.edge_type != "CALLS" {
+            clear_option_field_unresolved();
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
@@ -1593,7 +1945,7 @@ fn resolve_and_persist_edges_with_progress(
     // the same IMPORTS-then-references order resolved above.
     progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
     if store.is_overlay() {
-        let logical = resolved
+        let resolved_logical = resolved
             .iter()
             .map(|edge| {
                 let source_qualified_name =
@@ -1619,9 +1971,15 @@ fn resolve_and_persist_edges_with_progress(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut logical = preserved_overlay_edges.to_vec();
+        logical.extend(resolved_logical);
         store.replace_overlay_edges(project, &logical)?;
     } else {
-        insert_edges_batched(store, &resolved)?;
+        persist_edges_batched(
+            store,
+            &resolved,
+            replace_single_rust_edges.then_some(project),
+        )?;
     }
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
@@ -1773,11 +2131,407 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v10";
+pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
+
+pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
+    let marker = store.conn().query_row(
+        "SELECT value FROM main.schema_meta WHERE key = ?1",
+        [RUST_CALLER_EDGES_REPAIR_META_KEY],
+        |row| row.get::<_, String>(0),
+    );
+    match marker {
+        Ok(value) => Ok(value == RUST_CALLER_EDGES_REPAIR_COMPLETE),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(sqlite_err(error)),
+    }
+}
+
+pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "INSERT INTO main.schema_meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                RUST_CALLER_EDGES_REPAIR_META_KEY,
+                RUST_CALLER_EDGES_REPAIR_COMPLETE,
+            ),
+        )
+        .map_err(sqlite_err)?;
+    Ok(())
+}
+
+/// Recover references and caller provenance omitted by older Rust extractors without rebuilding nodes
+/// or embeddings. Validate every visible Rust source before writing anything.
+/// Private usage overrides also work for immutable Base files: no file-state ownership
+/// is copied into Delta, and ordinary sparse publication remains Delta-bounded.
+pub fn recover_persisted_rust_usages(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<usize> {
+    let states = store.list_file_states(project)?;
+    let indexed_paths = {
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT DISTINCT file_path FROM nodes WHERE project=?1 AND file_path LIKE '%.rs'",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map([project], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    if indexed_paths
+        .iter()
+        .any(|path| !states.iter().any(|state| &state.rel_path == path))
+    {
+        return Err(greppy_core::Error::Invalid("Rust reference repair requires indexed source fingerprints for every visible Rust file".into()));
+    }
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        greppy_core::Error::Invalid(format!("Rust reference repair cannot read root: {error}"))
+    })?;
+    let mut replacements = Vec::new();
+    let mut files = Vec::new();
+    for state in states
+        .iter()
+        .filter(|state| state.rel_path.ends_with(".rs"))
+    {
+        let relative = Path::new(&state.rel_path);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Rust repair source path".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|error| {
+            greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} unavailable: {error}",
+                state.rel_path
+            ))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "Rust repair source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|error| {
+            greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} unreadable: {error}",
+                state.rel_path
+            ))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} changed since indexing",
+                state.rel_path
+            )));
+        }
+        let extraction = parser_extract(Language::Rust, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) =
+            validate_or_degrade(Language::Rust, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust reference repair source {} failed extraction validation",
+                state.rel_path
+            )));
+        }
+        // Receiver provenance depends on persisted Field declarations as well
+        // as raw calls. Never certify an older Base whose field facts are
+        // absent or differ from the fingerprint-validated source extraction.
+        for field in extraction.nodes.iter().filter(|node| node.label == "Field") {
+            let cached = store.get_node_by_qname(project, &field.qualified_name)?;
+            if cached.as_ref().is_none_or(|node| {
+                node.label != "Field"
+                    || node.properties.get("return_type") != field.properties.get("return_type")
+                    || node.properties.get("generic_payload")
+                        != field.properties.get("generic_payload")
+            }) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust reference repair source {} has unavailable or stale declared field facts for {}; re-extract declared field nodes from source before caller repair",
+                    state.rel_path, field.qualified_name
+                )));
+            }
+        }
+        for trait_node in extraction
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Interface")
+        {
+            let cached = store.get_node_by_qname(project, &trait_node.qualified_name)?;
+            if cached.as_ref().is_none_or(|node| {
+                node.label != "Interface"
+                    || node.properties.get("has_bounds") != trait_node.properties.get("has_bounds")
+                    || node.properties.get("as_ref_receiver")
+                        != trait_node.properties.get("as_ref_receiver")
+            }) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust reference repair source {} has unavailable or stale trait receiver facts for {}; re-extract trait nodes from source before caller repair",
+                    state.rel_path, trait_node.qualified_name
+                )));
+            }
+        }
+        files.push(state.rel_path.clone());
+        replacements.extend(
+            extraction
+                .edges
+                .iter()
+                .filter(|edge| matches!(edge.edge_type.as_str(), "USAGE" | "CALLS"))
+                .map(|edge| new_raw_edge_for(project, &state.rel_path, edge)),
+        );
+    }
+    // All source fingerprints validate before any persisted write. Replace
+    // USAGE and CALLS contributions, retaining imports, nodes and cached data.
+    let usages = replacements
+        .iter()
+        .filter(|edge| edge.edge_type == "USAGE")
+        .cloned()
+        .collect::<Vec<_>>();
+    let calls = replacements
+        .into_iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .collect::<Vec<_>>();
+    let changed = store.replace_validated_rust_usages(project, &files, &usages)?;
+    Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
+}
+
+/// Repair Effect.fn identities in a private overlay without mutating its Base
+/// or copying Base file-state/content/vector ownership into Delta.
+pub fn recover_visible_effect_fn_bindings(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    store
+        .conn()
+        .execute_batch("SAVEPOINT greppy_effect_fn_repair")
+        .map_err(sqlite_err)?;
+    let result = recover_visible_effect_fn_bindings_inner(store, project, root);
+    match result {
+        Ok(repaired) => {
+            store
+                .conn()
+                .execute_batch("RELEASE greppy_effect_fn_repair")
+                .map_err(sqlite_err)?;
+            Ok(repaired)
+        }
+        Err(error) => {
+            store
+                .conn()
+                .execute_batch(
+                    "ROLLBACK TO greppy_effect_fn_repair; RELEASE greppy_effect_fn_repair",
+                )
+                .map_err(sqlite_err)?;
+            Err(error)
+        }
+    }
+}
+
+fn recover_visible_effect_fn_bindings_inner(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    if !store.is_overlay() {
+        return Ok(false);
+    }
+    let marker = format!("greppy.effect_fn_repair_v8.{project}");
+    let completed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM main.schema_meta WHERE key=?1 AND value='complete'",
+            [&marker],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if completed != 0 {
+        return Ok(false);
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| {
+        greppy_core::Error::Invalid(format!("Effect.fn repair root unavailable: {e}"))
+    })?;
+    let mut prepared = Vec::new();
+    for state in store.list_file_states(project)? {
+        let language = greppy_parser::language_for_path(Path::new(&state.rel_path));
+        if !matches!(language, Language::JavaScript | Language::TypeScript { .. }) {
+            continue;
+        }
+        let relative = Path::new(&state.rel_path);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Effect.fn repair path".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unavailable: {e}"))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Effect.fn source unreadable: {e}"))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Effect.fn source {} changed since indexing",
+                state.rel_path
+            )));
+        }
+        let extraction = parser_extract(language, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) =
+            validate_or_degrade(language, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(
+                "Effect.fn extraction validation failed".into(),
+            ));
+        }
+        prepared.push((state.rel_path, extraction));
+    }
+    // Compare complete contributions, including duplicate counts, before
+    // publishing overrides. Identical clean Base relations need no Delta copy.
+    let signature = |source: &str, target: &str, kind: &str, properties: &serde_json::Value| {
+        (
+            source.to_owned(),
+            target.to_owned(),
+            kind.to_owned(),
+            properties.to_string(),
+        )
+    };
+    let mut previous = std::collections::HashMap::new();
+    for edge in store.list_raw_edges(project)? {
+        let counts = previous
+            .entry(edge.file_path)
+            .or_insert_with(std::collections::BTreeMap::new);
+        *counts
+            .entry(signature(
+                &edge.source_qname,
+                &edge.target_qname,
+                &edge.edge_type,
+                &edge.properties,
+            ))
+            .or_insert(0usize) += 1;
+    }
+    let mut changed_paths = Vec::new();
+    let mut changed_identity = false;
+    // Validate every visible source fingerprint before changing any identity.
+    for (path, extraction) in &prepared {
+        for node in extraction
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Function")
+        {
+            let old_qname = node.qualified_name.replace("::Function::", "::Variable::");
+            if let Some(old) = store.get_node_by_qname(project, &old_qname)? {
+                if old.label == "Variable"
+                    && old.name == node.name
+                    && old.start_line == i64::from(node.start_line)
+                    && old.end_line == i64::from(node.end_line)
+                {
+                    store.update_node_identity(old.id, &node.label, &node.qualified_name)?;
+                    changed_identity = true;
+                }
+            }
+        }
+        let mut current = std::collections::BTreeMap::new();
+        for edge in &extraction.edges {
+            let edge = new_raw_edge_for(project, path, edge);
+            *current
+                .entry(signature(
+                    &edge.source_qname,
+                    &edge.target_qname,
+                    &edge.edge_type,
+                    &edge.properties,
+                ))
+                .or_insert(0usize) += 1;
+        }
+        if previous.get(path).cloned().unwrap_or_default() != current {
+            persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
+            changed_paths.push(path);
+        }
+    }
+    let changed_relations = !changed_paths.is_empty();
+    for path in changed_paths {
+        store.conn().execute("INSERT OR IGNORE INTO main.js_ts_reference_override_files(project,file_path) VALUES(?1,?2)", rusqlite::params![project,path]).map_err(sqlite_err)?;
+    }
+    // Current extraction already resolved clean Base relations. Rebuilding
+    // them needlessly materializes and pins duplicate CALLS/USAGE rows in the
+    // Delta, even after an exact source revert. Older or unidentified Bases
+    // still require the compatibility repair when their raw facts are equal.
+    let current_base: bool = store
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM greppy_base.workspace_state)
+         AND NOT EXISTS(SELECT 1 FROM greppy_base.workspace_state WHERE indexer_version <> ?1)",
+            [greppy_core::INDEXER_VERSION_BASE],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if changed_identity || changed_relations || !current_base {
+        rebuild_visible_overlay_edges(store, project)?;
+    }
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [marker]).map_err(sqlite_err)?;
+    Ok(true)
+}
+
+/// One-shot single-store compatibility repair. Replace only Rust-owned
+/// non-structural relations from persisted raw edges; nodes, file identity,
+/// graph generation, content, embeddings and non-Rust edges remain untouched.
+/// Edge replacement and completion marker commit in the same transaction.
+pub fn rebuild_single_store_rust_edges(store: &mut Store, project: &str) -> Result<usize> {
+    if store.is_overlay() {
+        return Err(greppy_core::Error::Invalid(
+            "single-store Rust repair requires a private Store".into(),
+        ));
+    }
+    let root = store
+        .get_project(project)?
+        .ok_or_else(|| greppy_core::Error::Invalid("Rust repair project is missing".into()))?
+        .root_path;
+    recover_persisted_rust_usages(store, project, Path::new(&root))?;
+    let raw = load_all_raw_edges(store, project)?;
+    let rust_edges = raw
+        .into_iter()
+        .filter(|edge| edge.file_path.ends_with(".rs"))
+        .collect::<Vec<_>>();
+    if rust_edges.is_empty() {
+        let existing: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM main.edges WHERE project = ?1
+             AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')
+             AND source_id IN (SELECT id FROM nodes WHERE project = ?1 AND file_path LIKE '%.rs')",
+                [project],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if existing != 0 {
+            return Err(greppy_core::Error::Invalid(
+                "single-store Rust graph has relations but no persisted Rust raw edges to repair"
+                    .into(),
+            ));
+        }
+    }
+    note_reresolved(rust_edges.len());
+    resolve_edges_with_replacement(store, project, &rust_edges, &mut |_| {}, &[], true)
+}
+
 /// Rebuild the complete bounded logical edge contribution of a private
 /// Store-CoW Delta. This is intentionally O(Delta raw edges), never O(Base):
 /// it closes no-op/prune generations where the incremental parser correctly
 /// skips unchanged dirty files but publication still needs a self-contained
-/// next Delta snapshot.
+/// next Delta snapshot. A small set of compatibility edges published by the
+/// one-shot Base repair is carried forward from existing overlay rows; it is
+/// filtered by current visibility and does not rescan Base raw edges.
 pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
     if !store.is_overlay() {
         return Err(greppy_core::Error::Invalid(
@@ -1785,7 +2539,129 @@ pub fn rebuild_overlay_edges(store: &mut Store, project: &str) -> Result<usize> 
         ));
     }
     let raw_edges = load_all_raw_edges(store, project)?;
-    resolve_and_persist_edges(store, project, &raw_edges)
+    let preserved = repaired_base_overlay_edges(store, project)?;
+    resolve_and_persist_edges_with_progress_and_preserved(
+        store,
+        project,
+        &raw_edges,
+        &mut |_| {},
+        &preserved,
+    )
+}
+
+/// Rebuild every visible logical edge in a private Store-CoW Delta from the
+/// composed raw-edge view. This is reserved for one-shot compatibility repair
+/// of an immutable Base whose raw edges were extracted by an older resolver;
+/// ordinary Delta indexing must keep using [`rebuild_overlay_edges`] so its
+/// work remains bounded by Delta-owned files.
+pub fn rebuild_visible_overlay_edges(store: &mut Store, project: &str) -> Result<usize> {
+    if !store.is_overlay() {
+        return Err(greppy_core::Error::Invalid(
+            "rebuild_visible_overlay_edges requires an overlay Store".into(),
+        ));
+    }
+    let raw_edges = store.list_raw_edges(project)?;
+    let edges = raw_edges
+        .into_iter()
+        .map(extracted_edge_from_raw)
+        .collect::<Vec<_>>();
+    let resolved = resolve_and_persist_edges(store, project, &edges)?;
+    mark_missing_base_repair_edges(store, project)?;
+    Ok(resolved)
+}
+
+fn mark_missing_base_repair_edges(store: &mut Store, project: &str) -> Result<()> {
+    store
+        .conn()
+        .execute(
+            "UPDATE main.overlay_edges AS d
+             SET properties = json_set(
+                 CASE WHEN json_type(d.properties) = 'object' THEN d.properties ELSE '{}' END,
+                 '$.greppy_base_repair_v2', 1)
+             WHERE d.project = ?1
+               AND EXISTS (
+                   SELECT 1 FROM nodes s
+                   WHERE s.project = d.project
+                     AND s.qualified_name = d.source_qualified_name
+                     AND NOT EXISTS (
+                         SELECT 1 FROM temp.greppy_hidden_paths h
+                         WHERE h.path = s.file_path
+                     )
+               )
+               AND (d.edge_type IN ('USAGE', 'CALLS') OR NOT EXISTS (
+                   SELECT 1
+                   FROM greppy_base.nodes bs
+                   JOIN greppy_base.edges e
+                     ON e.project = bs.project AND e.source_id = bs.id
+                   JOIN greppy_base.nodes bt
+                     ON bt.project = e.project AND bt.id = e.target_id
+                   WHERE bs.project = d.project
+                     AND bs.qualified_name = d.source_qualified_name
+                     AND bt.project = d.project
+                     AND bt.qualified_name = d.target_qualified_name
+                     AND e.project = d.project
+                     AND e.edge_type = d.edge_type
+               ))
+               AND json_extract(d.properties, '$.greppy_base_repair_v2') IS NULL",
+            rusqlite::params![project],
+        )
+        .map_err(sqlite_err)?;
+    Ok(())
+}
+
+fn repaired_base_overlay_edges(store: &Store, project: &str) -> Result<Vec<NewOverlayEdge>> {
+    let rows = {
+        let mut stmt = store
+            .conn()
+            .prepare_cached(
+                "SELECT source_qualified_name, target_qualified_name, edge_type, properties
+                 FROM main.overlay_edges
+                 WHERE project = ?1
+                   AND json_extract(properties, '$.greppy_base_repair_v2') = 1",
+            )
+            .map_err(sqlite_err)?;
+        let collected = stmt
+            .query_map(rusqlite::params![project], |row| {
+                let properties: String = row.get(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    properties,
+                ))
+            })
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        collected
+    };
+    let mut preserved = Vec::with_capacity(rows.len());
+    for (source, target, edge_type, properties) in rows {
+        let Some(source_node) = store.get_node_by_qname(project, &source)? else {
+            continue;
+        };
+        let source_hidden: i64 = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.greppy_hidden_paths WHERE path = ?1)",
+                rusqlite::params![source_node.file_path],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if source_hidden != 0 || store.get_node_by_qname(project, &target)?.is_none() {
+            continue;
+        }
+        preserved.push(NewOverlayEdge {
+            project: project.to_string(),
+            source_qualified_name: source,
+            target_qualified_name: target,
+            edge_type,
+            properties: serde_json::from_str(&properties).map_err(|error| {
+                greppy_core::Error::Store(format!("overlay edge JSON: {error}"))
+            })?,
+        });
+    }
+    Ok(preserved)
 }
 
 // Test-only instrumentation: the number of raw edges PHASE B actually fed
@@ -1843,10 +2719,11 @@ fn note_edge_resolution_work(_n: usize) {}
 
 /// The project's **definition fingerprint**: the sorted set of node
 /// identity tuples that cross-file edge resolution actually consults —
-/// `qualified_name`, `name`, `label`, `file_path`. Edge resolution is a
+/// `qualified_name`, `name`, `label`, `file_path`, Field declared types and
+/// `generic_payload`, and Interface `has_bounds` / `as_ref_receiver`. Edge resolution is a
 /// pure function of this set (plus the per-edge raw data): `by_qname`
 /// targets, `by_name` candidate sets, the same-file preference, and IMPORTS
-/// disambiguation all read only these four columns. Node `id`s are
+/// disambiguation and typed field receivers consult these facts. Node `id`s are
 /// deliberately excluded — they are autoincrement and change on
 /// re-extraction even for byte-identical content, but a changed id never
 /// changes *which* definition a name resolves to.
@@ -1871,7 +2748,18 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
     // correctness.
     let mut stmt = conn
         .prepare_cached(
-            "SELECT qualified_name, name, label, file_path
+            "SELECT qualified_name, name, label, file_path,
+                    CASE
+                        WHEN label = 'Field' THEN
+                            COALESCE(json_extract(properties, '$.return_type'), '')
+                            || char(31)
+                            || COALESCE(json_extract(properties, '$.generic_payload'), '')
+                        WHEN label = 'Interface' THEN
+                            COALESCE(json_extract(properties, '$.has_bounds'), '')
+                            || char(31)
+                            || COALESCE(json_extract(properties, '$.as_ref_receiver'), '')
+                        ELSE ''
+                    END
              FROM nodes WHERE project = ?1
                AND label NOT IN ('Project', 'Folder', 'File')",
         )
@@ -1879,11 +2767,12 @@ fn def_fingerprint(store: &Store, project: &str) -> Result<std::collections::BTr
     let rows = stmt
         .query_map(rusqlite::params![project], |r| {
             Ok(format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
             ))
         })
         .map_err(sqlite_err)?;
@@ -1957,8 +2846,20 @@ fn resolve_edges_incremental(
     // copied into the Delta merely because a definition changed.
     if store.is_overlay() {
         let raw_edges = load_all_raw_edges(store, project)?;
+        // A persisted Delta may also contain the bounded Base-edge repairs
+        // published by `rebuild_visible_overlay_edges`. Replacing the
+        // Delta's resolved edges from its own raw rows must carry those
+        // explicitly marked rows forward; otherwise the structural index
+        // pass erases them before the caller can rebuild the composed view.
+        let repaired_base_edges = repaired_base_overlay_edges(store, project)?;
         note_reresolved(raw_edges.len());
-        return resolve_and_persist_edges_with_progress(store, project, &raw_edges, progress);
+        return resolve_and_persist_edges_with_progress_and_preserved(
+            store,
+            project,
+            &raw_edges,
+            progress,
+            &repaired_base_edges,
+        );
     }
 
     // Did a changed file alter the resolvable definition set? If so, an
@@ -2008,17 +2909,9 @@ fn resolve_edges_incremental(
     // Instrumentation: how many raw edges this cheap path actually resolves.
     note_reresolved(all_raw.iter().filter(|e| is_candidate(e)).count());
 
-    // PASS 1 — IMPORTS. Resolve the imports of every file that owns a
-    // candidate reference edge (and every candidate IMPORTS edge itself) so
-    // PASS 2's disambiguation matches the full resolver. Because the def set
-    // is unchanged, these imports resolve exactly as they did before.
-    let mut candidate_owner_files: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
-    for e in &all_raw {
-        if e.edge_type != "IMPORTS" && is_candidate(e) {
-            candidate_owner_files.insert(source_file_of(e));
-        }
-    }
+    // PASS 1 — IMPORTS. Resolve all import signals so grouped reexports and
+    // parent-module globs can disambiguate candidate references exactly as in
+    // the full resolver. Only candidate IMPORTS edges are persisted again.
     let mut resolved: Vec<NewEdge> = Vec::new();
     for edge in all_raw.iter().filter(|e| e.edge_type == "IMPORTS") {
         examined += 1;
@@ -2032,13 +2925,8 @@ fn resolve_edges_incremental(
         };
         let src_id = src.id;
         let src_file = src.file_path.clone();
-        // Only resolve this import if its file owns a candidate reference
-        // edge OR the import edge itself is a candidate (so it lands in the
-        // index for disambiguation and, when itself cascaded, is re-inserted).
         let is_cand_import = is_candidate(edge);
-        if !is_cand_import && !candidate_owner_files.contains(src_file.as_str()) {
-            continue;
-        }
+        index.record_import_items(edge, &src_file);
         let target_id = match edge
             .properties
             .get("imported_name")
@@ -2050,7 +2938,12 @@ fn resolve_edges_incremental(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                index.unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+                index.resolve_import_target(
+                    &src_file,
+                    name,
+                    path,
+                    edge.properties.get("imported_items"),
+                )
             }
             _ => None,
         };
@@ -2095,16 +2988,15 @@ fn resolve_edges_incremental(
             // resolve it to any registered symbol (callable, type, or value)
             // via the symbol registry. No direct target qname exists, so this
             // is name-based only.
-            "USAGE" => match edge.properties.get("ref_name").and_then(|v| v.as_str()) {
-                Some(name) if !name.is_empty() => {
-                    index.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
-                }
-                _ => None,
-            },
+            "USAGE" => index.resolve_usage_target(edge, src_id),
             _ => index.by_qname(&edge.target_qualified_name).map(|n| n.id),
         };
-        let Some(target_id) = target_id else { continue };
+        let Some(target_id) = target_id else {
+            clear_option_field_unresolved();
+            continue;
+        };
         if target_id == src_id && edge.edge_type != "CALLS" {
+            clear_option_field_unresolved();
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
@@ -2146,30 +3038,100 @@ fn edge_references_name(edge: &ExtractedEdge, names: &std::collections::HashSet<
         .unwrap_or(false)
 }
 
+/// Reasons for one Option-field `CALLS` edge. The slot is keyed by that edge
+/// and cleared when resolution is skipped, fails, or persists a different
+/// edge. A later `CALLS` row must not inherit it.
+struct OptionFieldUnresolved {
+    source_qualified_name: String,
+    file_path: String,
+    line: u32,
+    callee_name: String,
+    reasons: Vec<String>,
+}
+
+fn option_edge_callee_name(edge: &ExtractedEdge) -> &str {
+    edge.properties
+        .get("callee_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+fn option_unresolved_matches(pending: &OptionFieldUnresolved, edge: &ExtractedEdge) -> bool {
+    pending.source_qualified_name == edge.source_qualified_name
+        && pending.file_path == edge.file_path
+        && pending.line == edge.line
+        && pending.callee_name == option_edge_callee_name(edge)
+}
+
+std::thread_local! {
+    static OPTION_FIELD_UNRESOLVED_REASONS: std::cell::RefCell<Option<OptionFieldUnresolved>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn clear_option_field_unresolved() {
+    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn set_option_field_unresolved(edge: &ExtractedEdge, reasons: Vec<String>) {
+    let pending = OptionFieldUnresolved {
+        source_qualified_name: edge.source_qualified_name.clone(),
+        file_path: edge.file_path.clone(),
+        line: edge.line,
+        callee_name: option_edge_callee_name(edge).to_string(),
+        reasons,
+    };
+    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| *slot.borrow_mut() = Some(pending));
+}
+
+fn take_option_field_unresolved_for(edge: &ExtractedEdge) -> Option<Vec<String>> {
+    OPTION_FIELD_UNRESOLVED_REASONS.with(|slot| {
+        let mut pending = slot.borrow_mut();
+        if pending
+            .as_ref()
+            .is_some_and(|item| option_unresolved_matches(item, edge))
+        {
+            pending.take().map(|item| item.reasons)
+        } else {
+            *pending = None;
+            None
+        }
+    })
+}
+
 /// Build a [`NewEdge`] from a resolved source/target pair, cloning the
-/// parser's edge properties.
+/// parser's edge properties. A typed Option field whose `as_ref`/`Some`
+/// identity was not proven is stored as `UNRESOLVED_CALLS` instead of a
+/// confirmed caller. Ambiguous receivers never reach this override.
 fn new_edge(project: &str, source_id: i64, target_id: i64, edge: &ExtractedEdge) -> NewEdge {
+    let mut edge_type = persisted_edge_label(edge).to_string();
+    let mut props = edge.properties.clone();
+    if edge_type == "CALLS" {
+        if let Some(reasons) = take_option_field_unresolved_for(edge) {
+            edge_type = "UNRESOLVED_CALLS".to_string();
+            if let Some(map) = props.as_object_mut() {
+                map.insert("unresolved_reasons".into(), serde_json::json!(reasons));
+            }
+        }
+    } else {
+        // An import or other edge persisted out of order must not leave a
+        // pending Option reason for the next CALLS row.
+        clear_option_field_unresolved();
+    }
+    // Fold the reference-site line into the resolved edge too (P4):
+    // nav commands print it grep-shaped so one answer carries the
+    // call-site evidence. Raw edges round-trip it via properties, so
+    // `edge.line` is populated on both extract and re-resolve paths.
+    if edge.line > 0 {
+        if let Some(map) = props.as_object_mut() {
+            map.insert("line".into(), serde_json::json!(edge.line));
+        }
+    }
     NewEdge {
         project: project.to_string(),
         source_id,
         target_id,
-        // The compatibility graph schema folds reference kinds into `USAGE`.
-        // Providers with certified logical classification may opt into keeping
-        // `TYPE_REF` / `USES` distinct via `preserve_reference_kind`.
-        edge_type: persisted_edge_label(edge).to_string(),
-        properties: {
-            // Fold the reference-site line into the resolved edge too (P4):
-            // nav commands print it grep-shaped so one answer carries the
-            // call-site evidence. Raw edges round-trip it via properties, so
-            // `edge.line` is populated on both extract and re-resolve paths.
-            let mut props = edge.properties.clone();
-            if edge.line > 0 {
-                if let Some(map) = props.as_object_mut() {
-                    map.insert("line".into(), serde_json::json!(edge.line));
-                }
-            }
-            props
-        },
+        edge_type,
+        properties: props,
     }
 }
 
@@ -2230,7 +3192,12 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if index
-            .unique_def_named_with_path(&greppy_resolver::IMPORTABLE_LABELS, name, path)
+            .resolve_import_target(
+                &edge.file_path,
+                name,
+                path,
+                edge.properties.get("imported_items"),
+            )
             .is_some()
         {
             continue; // already resolved to a symbol by the reference pass
@@ -2313,7 +3280,15 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
 }
 
 fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
-    if edges.is_empty() {
+    persist_edges_batched(store, edges, None)
+}
+
+fn persist_edges_batched(
+    store: &mut Store,
+    edges: &[NewEdge],
+    replace_rust_project: Option<&str>,
+) -> Result<()> {
+    if edges.is_empty() && replace_rust_project.is_none() {
         return Ok(());
     }
     if store.is_overlay() {
@@ -2374,6 +3349,14 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
     let conn = store.conn();
     conn.execute_batch("BEGIN").map_err(sqlite_err)?;
     let result = (|| -> Result<()> {
+        if let Some(project) = replace_rust_project {
+            conn.execute(
+                "DELETE FROM main.edges WHERE project = ?1
+                 AND edge_type NOT IN ('CONTAINS_FOLDER', 'CONTAINS_FILE', 'DEFINES')
+                 AND source_id IN (SELECT id FROM nodes WHERE project = ?1 AND file_path LIKE '%.rs')",
+                [project],
+            ).map_err(sqlite_err)?;
+        }
         let mut stmt = conn
             .prepare_cached(
                 "INSERT INTO main.edges (project, source_id, target_id, edge_type, properties)
@@ -2393,6 +3376,9 @@ fn insert_edges_batched(store: &mut Store, edges: &[NewEdge]) -> Result<()> {
                 props_str,
             ])
             .map_err(sqlite_err)?;
+        }
+        if replace_rust_project.is_some() {
+            mark_rust_caller_edges_repaired(store)?;
         }
         Ok(())
     })();
@@ -2417,6 +3403,7 @@ struct NodeLite {
     id: i64,
     label: String,
     file_path: String,
+    declared_type: Option<String>,
 }
 
 /// Rank graph labels exactly like CLI symbol navigation. When one source symbol
@@ -2448,6 +3435,7 @@ fn navigation_label_rank(label: &str) -> u8 {
 ///   `Store::outgoing_edges`).
 struct GraphIndex {
     by_qname: std::collections::HashMap<String, NodeLite>,
+    by_id: std::collections::HashMap<i64, NodeLite>,
     /// `name → nodes sharing that name`, each inner vec sorted by
     /// `qualified_name` so the candidate order matches the old
     /// `list_nodes_by_name` ordering (resolution depends only on the
@@ -2457,6 +3445,25 @@ struct GraphIndex {
     /// [`record_import`](GraphIndex::record_import) during the IMPORTS
     /// pass; consulted by [`resolve_unique_with_imports`].
     imports_by_file: std::collections::HashMap<String, std::collections::HashSet<i64>>,
+    import_aliases_by_file: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, std::collections::HashSet<i64>>,
+    >,
+    import_alias_sources_by_file:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, String)>>>,
+    import_module_files_by_file:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    import_globs_by_file: std::collections::HashMap<String, Vec<String>>,
+    /// Rust namespace aliases imported into a file (`channels` in
+    /// `use crate::core::mission::channels`). Values are exact candidate
+    /// module files, never global basename matches.
+    rust_namespaces_by_file:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    /// Declared Cargo target files for this project. `None` means no readable
+    /// Cargo manifest was available. Uncovered files retain the conventional
+    /// source-layout fallback because target discovery is intentionally bounded.
+    rust_crate_roots: Option<std::collections::HashSet<String>>,
+    rust_libraries: Vec<RustPackage>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
     id_to_file: std::collections::HashMap<i64, String>,
@@ -2468,6 +3475,11 @@ struct GraphIndex {
     /// Erlang/Zig/Dart module imports). Populated at load; only usable AFTER
     /// the structural pass has created the File nodes.
     files_by_stem: std::collections::HashMap<String, Vec<i64>>,
+    known_files: std::collections::HashSet<String>,
+    /// `file::Trait::as_ref` → the method's self parameter text. Used only to
+    /// reject a by-value adapter that can hide Option::as_ref.
+    as_ref_receivers: std::collections::HashMap<String, String>,
+    open_traits: std::collections::HashSet<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2486,7 +3498,497 @@ impl UniqueResolution {
     }
 }
 
+fn rust_module_files_for_module_path_with_crate_roots(
+    referrer_file: &str,
+    module_path: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    // Cargo permits a binary/library target outside the conventional
+    // `src/{main,lib}.rs` location. When Cargo target metadata is available,
+    // choose the nearest ancestor of one of those declared target files for
+    // `crate::` paths. This keeps module resolution lexical without treating
+    // an arbitrary nested `main.rs`/`lib.rs` as a crate root.
+    let referrer = Path::new(referrer_file);
+    let parent = referrer.parent().unwrap_or_else(|| Path::new(""));
+    let is_module_root = referrer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "lib.rs" | "main.rs" | "mod.rs"))
+        || crate_roots.is_some_and(|roots| roots.contains(referrer_file));
+    let mut base = if is_module_root {
+        parent.to_path_buf()
+    } else {
+        referrer.with_extension("")
+    };
+    for (position, module) in module_path
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        match module {
+            "crate" if position == 0 => {
+                base = crate_roots
+                    .and_then(|roots| rust_crate_root_for_file(referrer_file, roots))
+                    .or_else(|| {
+                        // Manifest discovery is intentionally bounded. Preserve
+                        // conventional crate resolution for uncovered members.
+                        let root_end = referrer_file
+                            .rfind("/src/")
+                            .map(|offset| offset + "/src".len())
+                            .or_else(|| referrer_file.starts_with("src/").then_some("src".len()));
+                        root_end.map(|end| std::path::PathBuf::from(&referrer_file[..end]))
+                    })
+                    .unwrap_or_else(|| {
+                        referrer
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .to_path_buf()
+                    });
+            }
+            "self" if position == 0 => {}
+            "super" => {
+                base.pop();
+            }
+            part => base.push(part),
+        }
+    }
+    let flat = base
+        .with_extension("rs")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let nested = base.join("mod.rs").to_string_lossy().replace('\\', "/");
+    let lib = base.join("lib.rs").to_string_lossy().replace('\\', "/");
+    let main = base.join("main.rs").to_string_lossy().replace('\\', "/");
+    vec![flat, nested, lib, main]
+}
+
+fn rust_crate_root_for_file(
+    referrer_file: &str,
+    crate_roots: &std::collections::HashSet<String>,
+) -> Option<std::path::PathBuf> {
+    let mut directory = Path::new(referrer_file).parent()?.to_path_buf();
+    loop {
+        if crate_roots
+            .iter()
+            .any(|root| Path::new(root).parent() == Some(directory.as_path()))
+        {
+            return Some(directory);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
+/// Only the owning package's library is an implicit extern crate. A matching
+/// name elsewhere in the workspace is not evidence of a dependency.
+#[derive(Debug)]
+struct RustPackage {
+    package_dir: String,
+    library: Option<RustLibrary>,
+}
+
+#[derive(Debug)]
+struct RustLibrary {
+    name: String,
+    root_file: String,
+}
+
+fn rust_crate_roots_for_project(
+    store: &Store,
+    project: &str,
+    known_files: &std::collections::HashSet<String>,
+) -> Option<(std::collections::HashSet<String>, Vec<RustPackage>)> {
+    let project = store.get_project(project).ok().flatten()?;
+    let root = std::fs::canonicalize(project.root_path).ok()?;
+    let mut roots = std::collections::HashSet::new();
+    let mut libraries = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    if !rust_crate_roots_from_manifest(
+        &root.join("Cargo.toml"),
+        &root,
+        known_files,
+        &mut roots,
+        &mut libraries,
+        &mut visited,
+    ) {
+        return None;
+    }
+    Some((roots, libraries))
+}
+
+fn rust_crate_roots_from_manifest(
+    manifest_path: &std::path::Path,
+    repository_root: &std::path::Path,
+    known_files: &std::collections::HashSet<String>,
+    roots: &mut std::collections::HashSet<String>,
+    libraries: &mut Vec<RustPackage>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> bool {
+    let manifest_path = std::fs::canonicalize(manifest_path)
+        .ok()
+        .unwrap_or_else(|| manifest_path.to_path_buf());
+    if !visited.insert(manifest_path.clone()) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let manifest_root = manifest_path.parent().unwrap_or(repository_root);
+    if let Some(members) = document
+        .get("workspace")
+        .and_then(|item| item.as_table())
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_array())
+    {
+        for member in members.iter().filter_map(|value| value.as_str()) {
+            for member_manifest in workspace_member_manifests(manifest_root, member) {
+                let _ = rust_crate_roots_from_manifest(
+                    &member_manifest,
+                    repository_root,
+                    known_files,
+                    roots,
+                    libraries,
+                    visited,
+                );
+            }
+        }
+    }
+    let Some(package) = document.get("package").and_then(|item| item.as_table()) else {
+        return true;
+    };
+
+    let relative_path = |path: &std::path::Path| -> Option<String> {
+        // Cargo accepts `./` and parent components in explicit target paths.
+        // Canonicalize existing targets before comparing with indexed files;
+        // targets escaping the repository still fail the prefix check.
+        let canonical = std::fs::canonicalize(path).ok();
+        let relative = canonical
+            .as_deref()
+            .unwrap_or(path)
+            .strip_prefix(repository_root)
+            .ok()?;
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    };
+    let add_target = |target: &str, roots: &mut std::collections::HashSet<String>| {
+        let path = manifest_root.join(target);
+        if let Some(relative) = relative_path(&path) {
+            roots.insert(relative);
+        }
+    };
+    let known_target = |target: &str| {
+        relative_path(&manifest_root.join(target))
+            .is_some_and(|relative| known_files.contains(&relative))
+    };
+    let autolib = package
+        .get("autolib")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+    let autobins = package
+        .get("autobins")
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_bool())
+        != Some(false);
+
+    let lib = document.get("lib").and_then(|item| item.as_table());
+    if let Some(path) = lib
+        .and_then(|table| table.get("path"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_str())
+    {
+        add_target(path, roots);
+    } else if (autolib || lib.is_some()) && known_target("src/lib.rs") {
+        add_target("src/lib.rs", roots);
+    }
+
+    let library_path = lib
+        .and_then(|table| table.get("path"))
+        .and_then(|item| item.as_str())
+        .or_else(|| {
+            ((autolib || lib.is_some()) && known_target("src/lib.rs")).then_some("src/lib.rs")
+        });
+    let library_name = lib
+        .and_then(|table| table.get("name"))
+        .and_then(|item| item.as_str())
+        .or_else(|| package.get("name").and_then(|item| item.as_str()));
+    let mut library = None;
+    if let (Some(path), Some(name)) = (library_path, library_name) {
+        if let Some(root_file) = relative_path(&manifest_root.join(path)) {
+            if known_files.contains(&root_file) {
+                library = Some(RustLibrary {
+                    name: name.replace('-', "_"),
+                    root_file,
+                });
+            }
+        }
+    }
+
+    if let Some(package_dir) = relative_path(manifest_root) {
+        libraries.push(RustPackage {
+            package_dir,
+            library,
+        });
+    }
+
+    if let Some(bins) = document
+        .get("bin")
+        .and_then(|item| item.as_array_of_tables())
+    {
+        for bin in bins {
+            if let Some(path) = bin
+                .get("path")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                add_target(path, roots);
+            } else if let Some(name) = bin
+                .get("name")
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.as_str())
+            {
+                let inferred = format!("src/bin/{name}.rs");
+                if known_target(&inferred) {
+                    add_target(&inferred, roots);
+                }
+            }
+        }
+    }
+    if autobins {
+        if known_target("src/main.rs") {
+            add_target("src/main.rs", roots);
+        }
+        let manifest_prefix = relative_path(manifest_root).unwrap_or_default();
+        let bin_prefix = if manifest_prefix.is_empty() {
+            "src/bin/".to_string()
+        } else {
+            format!("{manifest_prefix}/src/bin/")
+        };
+        for path in known_files {
+            let Some(rest) = path.strip_prefix(&bin_prefix) else {
+                continue;
+            };
+            let direct = !rest.contains('/') && rest.ends_with(".rs");
+            let nested = rest.matches('/').count() == 1 && rest.ends_with("/main.rs");
+            if direct || nested {
+                let target = format!("src/bin/{rest}");
+                add_target(&target, roots);
+            }
+        }
+    }
+    true
+}
+
+fn workspace_member_manifests(
+    workspace_root: &std::path::Path,
+    member: &str,
+) -> Vec<std::path::PathBuf> {
+    // This is deliberately a narrow manifest reader: explicit members and a
+    // single standalone `*` component are enough for the source layouts that
+    // need crate-root resolution here. Cargo's full glob semantics and
+    // `workspace.exclude` are not reproduced by this helper.
+    let pattern = std::path::Path::new(member);
+    let Some((wildcard_index, _)) = pattern
+        .components()
+        .enumerate()
+        .find(|(_, component)| component.as_os_str().to_string_lossy() == "*")
+    else {
+        return vec![workspace_root.join(pattern).join("Cargo.toml")];
+    };
+    let components = pattern.components().collect::<Vec<_>>();
+    let mut prefix = std::path::PathBuf::new();
+    for component in &components[..wildcard_index] {
+        prefix.push(component.as_os_str());
+    }
+    let mut suffix = std::path::PathBuf::new();
+    for component in &components[wildcard_index + 1..] {
+        suffix.push(component.as_os_str());
+    }
+    let Ok(entries) = std::fs::read_dir(workspace_root.join(prefix)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .map(|path| path.join(&suffix).join("Cargo.toml"))
+        .collect()
+}
+
+fn rust_module_files_below_alias(
+    alias_files: &[String],
+    ref_path: &str,
+    name: &str,
+    crate_roots: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let segments = ref_path.split("::").collect::<Vec<_>>();
+    let nested = segments
+        .get(1..segments.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    if segments.last().copied() != Some(name) {
+        return Vec::new();
+    }
+    alias_files
+        .iter()
+        .flat_map(|module_file| {
+            let path = Path::new(module_file);
+            let mut base = if path.file_name().and_then(|part| part.to_str()) == Some("mod.rs")
+                || crate_roots.is_some_and(|roots| roots.contains(module_file))
+            {
+                path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
+            } else {
+                path.with_extension("")
+            };
+            for segment in nested {
+                base.push(segment);
+            }
+            [
+                base.with_extension("rs")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                base.join("mod.rs").to_string_lossy().replace('\\', "/"),
+            ]
+        })
+        .collect()
+}
+
 impl GraphIndex {
+    fn resolve_import_target(
+        &self,
+        file: &str,
+        name: &str,
+        path: &str,
+        imported_items: Option<&serde_json::Value>,
+    ) -> Option<i64> {
+        if !file.ends_with(".rs") {
+            return self.unique_def_named_with_path(
+                &greppy_resolver::IMPORTABLE_LABELS,
+                name,
+                path,
+            );
+        }
+        if path.is_empty() {
+            // Older cached Rust imports may preserve the exact provenance
+            // only in imported_items. Recover that path rather than guessing
+            // a project-wide namesake or requiring source re-extraction.
+            let mut targets = Vec::new();
+            for item in imported_items
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(original) = item.get("original_name").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if original != name
+                    && item.get("imported_name").and_then(|value| value.as_str()) != Some(name)
+                {
+                    continue;
+                }
+                let Some(item_path) = item.get("path").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let files = self.rust_module_files_for_path(file, item_path, original);
+                targets.extend(self.rust_module_export_targets(
+                    &files,
+                    original,
+                    &greppy_resolver::IMPORTABLE_LABELS,
+                ));
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            return match targets.as_slice() {
+                [target] => Some(*target),
+                _ => None,
+            };
+        }
+        let files = self.rust_module_files_for_path(file, path, name);
+        let targets =
+            self.rust_module_export_targets(&files, name, &greppy_resolver::IMPORTABLE_LABELS);
+        match targets.as_slice() {
+            [target] => Some(*target),
+            _ => None,
+        }
+    }
+
+    fn rust_module_files_for_path(&self, file: &str, path: &str, name: &str) -> Vec<String> {
+        let Some(module) = path
+            .strip_suffix(name)
+            .and_then(|path| path.strip_suffix("::"))
+        else {
+            return Vec::new();
+        };
+        self.rust_module_files_for_module_path(file, module)
+    }
+
+    fn rust_module_files_for_module_path(&self, file: &str, module: &str) -> Vec<String> {
+        let normalized = module.trim_start_matches("::");
+        let mut segments = normalized.split("::");
+        let first = segments.next().unwrap_or("");
+        if !module.starts_with("::") && !matches!(first, "crate" | "self" | "super") {
+            let lexical = rust_module_files_for_module_path_with_crate_roots(
+                file,
+                module,
+                self.rust_crate_roots.as_ref(),
+            );
+            if lexical
+                .iter()
+                .any(|candidate| self.known_files.contains(candidate))
+            {
+                return lexical;
+            }
+        }
+        let owning = self
+            .rust_libraries
+            .iter()
+            .filter(|library| Path::new(file).starts_with(&library.package_dir))
+            .collect::<Vec<_>>();
+        let nearest = owning.iter().map(|library| library.package_dir.len()).max();
+        let libraries = owning
+            .into_iter()
+            .filter(|package| Some(package.package_dir.len()) == nearest)
+            .filter_map(|package| package.library.as_ref())
+            .filter(|library| library.name == first)
+            .collect::<Vec<_>>();
+        if let [library] = libraries.as_slice() {
+            let rest = segments.collect::<Vec<_>>();
+            if rest.is_empty() {
+                return vec![library.root_file.clone()];
+            }
+            let mut base = Path::new(&library.root_file)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            for segment in rest {
+                base.push(segment);
+            }
+            return vec![
+                base.with_extension("rs")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                base.join("mod.rs").to_string_lossy().replace('\\', "/"),
+            ];
+        }
+        if !libraries.is_empty() || module.starts_with("::") {
+            return Vec::new();
+        }
+        rust_module_files_for_module_path_with_crate_roots(
+            file,
+            module,
+            self.rust_crate_roots.as_ref(),
+        )
+    }
+
     /// Load every node for `project` in a single query and build the
     /// lookup maps. `qualified_name` order from SQL gives a deterministic
     /// per-name candidate order.
@@ -2495,17 +3997,31 @@ impl GraphIndex {
             std::collections::HashMap::new();
         let mut by_name: std::collections::HashMap<String, Vec<NodeLite>> =
             std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<i64, NodeLite> = std::collections::HashMap::new();
         let mut id_to_file: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut id_to_qname: std::collections::HashMap<i64, String> =
             std::collections::HashMap::new();
         let mut files_by_stem: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
+        let mut known_files = std::collections::HashSet::new();
+        let mut as_ref_receivers = std::collections::HashMap::new();
+        let mut open_traits = std::collections::HashSet::new();
         {
             let conn = store.conn();
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, name, qualified_name, label, file_path
+                    "SELECT id, name, qualified_name, label, file_path,
+                            CASE
+                                WHEN label = 'Field' AND json_extract(properties, '$.generic_payload') = 1 THEN NULL
+                                WHEN label = 'Field' THEN json_extract(properties, '$.return_type')
+                            END,
+                            CASE WHEN label = 'Method' AND name = 'as_ref'
+                                THEN json_extract(properties, '$.params[0].type') END,
+                            CASE WHEN label = 'Interface'
+                                THEN json_extract(properties, '$.has_bounds') END,
+                            CASE WHEN label = 'Interface'
+                                THEN json_extract(properties, '$.as_ref_receiver') END
                      FROM nodes WHERE project = ?1 ORDER BY qualified_name",
                 )
                 .map_err(sqlite_err)?;
@@ -2517,35 +4033,86 @@ impl GraphIndex {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 })
                 .map_err(sqlite_err)?;
             for row in rows {
-                let (id, name, qname, label, file_path) = row.map_err(sqlite_err)?;
+                let (
+                    id,
+                    name,
+                    qname,
+                    label,
+                    file_path,
+                    declared_type,
+                    as_ref_receiver,
+                    trait_bounds,
+                    trait_as_ref,
+                ) = row.map_err(sqlite_err)?;
                 note_edge_resolution_work(1);
                 if label == "File" {
                     let base = file_path.rsplit('/').next().unwrap_or(&file_path);
                     let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
                     files_by_stem.entry(stem.to_string()).or_default().push(id);
                 }
+                if label == "Method" && name == "as_ref" {
+                    if let Some(receiver) = as_ref_receiver {
+                        as_ref_receivers.insert(qname.clone(), receiver);
+                    }
+                }
+                if label == "Interface" {
+                    if let Some(receiver) = trait_as_ref {
+                        let trait_name = qname.rsplit("::").next().unwrap_or("");
+                        if !trait_name.is_empty() {
+                            as_ref_receivers
+                                .entry(format!("{file_path}::{trait_name}::as_ref"))
+                                .or_insert(receiver);
+                        }
+                    }
+                }
+                if trait_bounds == Some(1) {
+                    open_traits.insert(id);
+                }
                 let node = NodeLite {
                     id,
                     label,
                     file_path: file_path.clone(),
+                    declared_type,
                 };
+                known_files.insert(file_path.clone());
                 id_to_file.insert(id, file_path);
                 id_to_qname.insert(id, qname.clone());
                 by_name.entry(name).or_default().push(node.clone());
+                by_id.insert(id, node.clone());
                 by_qname.insert(qname, node);
             }
         }
+        let metadata = rust_crate_roots_for_project(store, project, &known_files);
+        let (rust_crate_roots, rust_libraries) = match metadata {
+            Some((roots, libraries)) => (Some(roots), libraries),
+            None => (None, Vec::new()),
+        };
         Ok(GraphIndex {
             by_qname,
+            by_id,
             by_name,
             imports_by_file: std::collections::HashMap::new(),
+            import_aliases_by_file: std::collections::HashMap::new(),
+            import_alias_sources_by_file: std::collections::HashMap::new(),
+            import_module_files_by_file: std::collections::HashMap::new(),
+            import_globs_by_file: std::collections::HashMap::new(),
+            rust_namespaces_by_file: std::collections::HashMap::new(),
+            rust_crate_roots,
+            rust_libraries,
             id_to_file,
             id_to_qname,
             files_by_stem,
+            known_files,
+            as_ref_receivers,
+            open_traits,
         })
     }
 
@@ -2566,6 +4133,85 @@ impl GraphIndex {
             .entry(file.to_string())
             .or_default()
             .insert(target_id);
+    }
+
+    fn record_import_items(&mut self, edge: &ExtractedEdge, file: &str) {
+        let Some(items) = edge
+            .properties
+            .get("imported_items")
+            .and_then(|value| value.as_array())
+        else {
+            return;
+        };
+        for item in items {
+            if item.get("glob").and_then(|value| value.as_bool()) == Some(true) {
+                if let Some(path) = item.get("path").and_then(|value| value.as_str()) {
+                    self.import_globs_by_file
+                        .entry(file.to_string())
+                        .or_default()
+                        .push(path.to_string());
+                }
+                continue;
+            }
+            let Some(name) = item.get("original_name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let path = item
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let module_files = self.rust_module_files_for_path(file, path, name);
+            let visible_module_files = module_files
+                .iter()
+                .filter(|module_file| self.known_files.contains(*module_file))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.import_module_files_by_file
+                .entry(file.to_string())
+                .or_default()
+                .extend(visible_module_files);
+            let alias = item
+                .get("imported_name")
+                .and_then(|value| value.as_str())
+                .filter(|alias| !alias.is_empty())
+                .unwrap_or(name);
+            self.import_alias_sources_by_file
+                .entry(file.to_string())
+                .or_default()
+                .entry(alias.to_string())
+                .or_default()
+                .push((path.to_string(), name.to_string()));
+            let candidates = self.defs_named(&greppy_resolver::IMPORTABLE_LABELS, name);
+            let exact = candidates
+                .iter()
+                .filter(|candidate| module_files.contains(&candidate.file_path))
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            if let [target] = exact.as_slice() {
+                self.record_import(file, *target);
+                self.import_aliases_by_file
+                    .entry(file.to_string())
+                    .or_default()
+                    .entry(alias.to_string())
+                    .or_default()
+                    .insert(*target);
+            }
+            let namespace_path = format!("{path}::__namespace__");
+            let existing_modules = self
+                .rust_module_files_for_path(file, &namespace_path, "__namespace__")
+                .into_iter()
+                .filter(|module_file| self.known_files.contains(module_file))
+                .collect::<Vec<_>>();
+            if !existing_modules.is_empty() {
+                self.rust_namespaces_by_file
+                    .entry(file.to_string())
+                    .or_default()
+                    .insert(alias.to_string(), existing_modules);
+            }
+        }
     }
 
     /// The set of node `name`s defined in any of `files`. Used by the
@@ -2644,6 +4290,111 @@ impl GraphIndex {
             .unique_id()
     }
 
+    fn rust_module_export_targets(
+        &self,
+        module_files: &[String],
+        name: &str,
+        labels: &[&str],
+    ) -> Vec<i64> {
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for module_file in module_files {
+            self.rust_module_export_targets_from_file(
+                module_file,
+                name,
+                labels,
+                &mut seen,
+                &mut targets,
+            );
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn rust_module_export_targets_from_file(
+        &self,
+        module_file: &str,
+        name: &str,
+        labels: &[&str],
+        seen: &mut std::collections::HashSet<(String, String)>,
+        targets: &mut Vec<i64>,
+    ) {
+        if !seen.insert((module_file.to_string(), name.to_string())) {
+            return;
+        }
+        let initial_count = targets.len();
+        targets.extend(
+            self.defs_named(labels, name)
+                .into_iter()
+                .filter(|node| node.file_path == module_file)
+                .map(|node| node.id),
+        );
+        if targets.len() > initial_count {
+            return;
+        }
+        if let Some(aliases) = self
+            .import_aliases_by_file
+            .get(module_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            targets.extend(aliases.iter().copied().filter(|target| {
+                self.by_id
+                    .get(target)
+                    .is_some_and(|node| labels.contains(&node.label.as_str()))
+            }));
+        }
+        if let Some(sources) = self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            for (path, original_name) in sources {
+                let mut source_files = self
+                    .rust_module_files_for_path(module_file, path, original_name)
+                    .into_iter()
+                    .filter(|file| self.known_files.contains(file))
+                    .collect::<Vec<_>>();
+                if source_files.is_empty() && path == original_name {
+                    source_files.push(module_file.to_string());
+                }
+                for source_file in source_files {
+                    self.rust_module_export_targets_from_file(
+                        &source_file,
+                        original_name,
+                        labels,
+                        seen,
+                        targets,
+                    );
+                }
+            }
+        }
+        // An explicit binding shadows glob imports even when its target is
+        // unresolved; do not invent a different binding through a glob.
+        if self
+            .import_alias_sources_by_file
+            .get(module_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return;
+        }
+        if let Some(globs) = self.import_globs_by_file.get(module_file) {
+            for glob in globs {
+                for exported_file in self.rust_module_files_for_module_path(module_file, glob) {
+                    if self.known_files.contains(&exported_file) {
+                        self.rust_module_export_targets_from_file(
+                            &exported_file,
+                            name,
+                            labels,
+                            seen,
+                            targets,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_unique_status_with_imports(
         &self,
         labels: &[&str],
@@ -2654,7 +4405,61 @@ impl GraphIndex {
         let Some(referrer_file) = self.file_of(referrer_id) else {
             return UniqueResolution::Unresolved;
         };
+        if let Some(alias_targets) = self
+            .import_aliases_by_file
+            .get(referrer_file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            let matching = alias_targets
+                .iter()
+                .filter(|target| {
+                    self.by_id
+                        .get(target)
+                        .is_some_and(|node| labels.contains(&node.label.as_str()))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if let [target] = matching.as_slice() {
+                return UniqueResolution::Unique(*target);
+            }
+        }
+        // A local Rust item shadows a glob import. Do not let Base export
+        // hydration redirect a same-file reference to an imported namesake.
         let candidates = self.defs_named(labels, name);
+        let local = candidates
+            .iter()
+            .filter(|node| node.file_path == referrer_file)
+            .collect::<Vec<_>>();
+        if let Some(target) = local
+            .iter()
+            .min_by_key(|node| (navigation_label_rank(&node.label), node.id))
+        {
+            return UniqueResolution::Unique(target.id);
+        }
+        if self
+            .import_alias_sources_by_file
+            .get(referrer_file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            let exported =
+                self.rust_module_export_targets(&[referrer_file.to_string()], name, labels);
+            return match exported.as_slice() {
+                [target] => UniqueResolution::Unique(*target),
+                [] => UniqueResolution::Unresolved,
+                _ => UniqueResolution::Ambiguous,
+            };
+        }
+        if let Some(globs) = self.import_globs_by_file.get(referrer_file) {
+            let module_files = globs
+                .iter()
+                .flat_map(|glob| self.rust_module_files_for_module_path(referrer_file, glob))
+                .filter(|file| self.known_files.contains(file))
+                .collect::<Vec<_>>();
+            let exported = self.rust_module_export_targets(&module_files, name, labels);
+            if let [target] = exported.as_slice() {
+                return UniqueResolution::Unique(*target);
+            }
+        }
         if let Some(id) = Self::resolve_unique(&candidates, referrer_file) {
             return UniqueResolution::Unique(id);
         }
@@ -2724,6 +4529,7 @@ impl GraphIndex {
     /// is worse than leaving the edge unresolved. Other calls retain the
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
+        clear_option_field_unresolved();
         let src = self.by_qname(&edge.source_qualified_name)?;
         let src_id = src.id;
         let name = edge
@@ -2739,35 +4545,90 @@ impl GraphIndex {
             .and_then(|value| value.as_str())
             == Some("receiver")
         {
+            if let Some(fact) = edge.properties.get("receiver_provenance") {
+                return self.resolve_option_field_receiver(src_id, edge, fact, name);
+            }
             let owner = edge
                 .properties
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())?;
+            if edge
+                .properties
+                .get("receiver_option_pattern")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                let id = self.resolve_rust_type_path(&edge.file_path, owner)?;
+                let owner_file = self.file_of(id)?;
+                let owner_name = self.qname_for_id(id)?.rsplit("::").next()?;
+                let method = self.by_qname(&format!("{owner_file}::{owner_name}::{name}"))?;
+                return (method.label == "Method").then_some(method.id);
+            }
             return self.resolve_receiver_method(&edge.file_path, owner, name);
         }
-        // A module-qualified call names its module explicitly (`store::f()`).
-        // Honour that before the same-file guess: a same-named function in the
-        // caller's own file is not the callee. Only a qualifier that maps onto
-        // a candidate's module file (`store.rs` / `store/mod.rs`) takes part;
-        // `Type::new`, `crate::f`, `self::f` keep the existing path. Several
-        // candidates in files of that module stay unresolved rather than
-        // guessed.
-        if let Some(module) = edge
+        // A module-qualified Rust call names its complete module path. Resolve
+        // it against the referrer's namespace and that module's imports before
+        // any same-file or global-name fallback. This distinguishes paths such
+        // as `left::channel::target` and `right::channel::target` even though
+        // both defining files are named `implementation.rs`.
+        let rust_qualified_path = edge
             .properties
             .get("callee_path")
             .and_then(|value| value.as_str())
-            .and_then(|path| greppy_resolver::path_module_segment(path, name))
-        {
-            let in_module: Vec<i64> = self
-                .defs_named(&CALLABLE_LABELS, name)
-                .into_iter()
-                .filter(|node| greppy_resolver::file_stem_matches(&node.file_path, module))
-                .map(|node| node.id)
-                .collect();
+            .filter(|_| edge.file_path.ends_with(".rs"));
+        if let Some(ref_path) = rust_qualified_path {
+            let referrer_file = self.file_of(src_id)?;
+            let first_segment = ref_path.split("::").next().unwrap_or("");
+            let module_files = self
+                .rust_namespaces_by_file
+                .get(referrer_file)
+                .and_then(|aliases| aliases.get(first_segment))
+                .map(|alias_files| {
+                    rust_module_files_below_alias(
+                        alias_files,
+                        ref_path,
+                        name,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                })
+                .unwrap_or_else(|| self.rust_module_files_for_path(referrer_file, ref_path, name));
+            let module_exists = module_files
+                .iter()
+                .any(|module_file| self.known_files.contains(module_file));
+            if !module_exists {
+                return self.resolve_associated_member(
+                    src_id,
+                    ref_path,
+                    name,
+                    &["Method", "EnumVariant"],
+                );
+            }
+            let in_module = self.rust_module_export_targets(&module_files, name, &CALLABLE_LABELS);
             match in_module.as_slice() {
                 [id] => return Some(*id),
-                [] => {}
                 _ => return None,
+            }
+        }
+        // Preserve the existing basename-based qualified-call behavior for
+        // non-Rust extractors, whose path syntax is language-specific.
+        if rust_qualified_path.is_none() {
+            if let Some(module) = edge
+                .properties
+                .get("callee_path")
+                .and_then(|value| value.as_str())
+                .and_then(|path| greppy_resolver::path_module_segment(path, name))
+            {
+                let in_module: Vec<i64> = self
+                    .defs_named(&CALLABLE_LABELS, name)
+                    .into_iter()
+                    .filter(|node| greppy_resolver::file_stem_matches(&node.file_path, module))
+                    .map(|node| node.id)
+                    .collect();
+                match in_module.as_slice() {
+                    [id] => return Some(*id),
+                    [] => {}
+                    _ => return None,
+                }
             }
         }
         if let Some(tgt) = self.by_qname(&edge.target_qualified_name) {
@@ -2780,6 +4641,475 @@ impl GraphIndex {
             }
             UniqueResolution::Ambiguous => None,
         }
+    }
+
+    /// Resolve a qualified method or enum member only when its owner resolves in the
+    /// referrer's scope. This preserves imported and lowercase Rust type names
+    /// without treating a missing qualified module as an unqualified call.
+    fn resolve_associated_member(
+        &self,
+        src_id: i64,
+        ref_path: &str,
+        name: &str,
+        member_labels: &[&str],
+    ) -> Option<i64> {
+        let owner = ref_path.rsplit("::").nth(1).unwrap_or("");
+        if owner.is_empty() || name.is_empty() {
+            return None;
+        }
+        let referrer_file = self.file_of(src_id)?;
+        let owner_path = ref_path.strip_suffix(name)?.strip_suffix("::")?;
+        let owner_id = if owner_path == "Self" {
+            let source_qname = self.qname_for_id(src_id)?;
+            if self.by_qname(source_qname)?.label != "Method" {
+                return None;
+            }
+            let context_owner = source_qname.rsplit("::").nth(1)?;
+            self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, context_owner, src_id)
+                .unique_id()?
+        } else if owner_path == owner {
+            self.resolve_unique_status_with_imports(&CONSTRUCTABLE_LABELS, owner, src_id)
+                .unique_id()?
+        } else {
+            let first_segment = owner_path.split("::").next().unwrap_or("");
+            let module_files = self
+                .rust_namespaces_by_file
+                .get(referrer_file)
+                .and_then(|aliases| aliases.get(first_segment))
+                .map(|alias_files| {
+                    rust_module_files_below_alias(
+                        alias_files,
+                        owner_path,
+                        owner,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    self.rust_module_files_for_path(referrer_file, owner_path, owner)
+                });
+            let owners = self
+                .defs_named(&CONSTRUCTABLE_LABELS, owner)
+                .into_iter()
+                .filter(|candidate| {
+                    module_files.iter().any(|file| {
+                        candidate.file_path == *file
+                            || self
+                                .imports_by_file
+                                .get(file)
+                                .is_some_and(|targets| targets.contains(&candidate.id))
+                    })
+                })
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            match owners.as_slice() {
+                [id] => *id,
+                _ => return None,
+            }
+        };
+        let owner_file = self.file_of(owner_id)?;
+        if self.by_id.get(&owner_id)?.label == "Enum"
+            && (owner_path == owner || owner_path == "Self")
+        {
+            // Enum owners must be bound in the current file. Project-wide
+            // uniqueness alone does not make another module's type visible.
+            let bound_name = if owner_path == "Self" {
+                self.qname_for_id(src_id)?.rsplit("::").nth(1)?
+            } else {
+                owner
+            };
+            let scoped = self.rust_module_export_targets(
+                &[referrer_file.to_string()],
+                bound_name,
+                &["Enum"],
+            );
+            if scoped.as_slice() != [owner_id] {
+                return None;
+            }
+        }
+        let resolved_owner = self.qname_for_id(owner_id)?.rsplit("::").next()?;
+        let suffix = format!("::{resolved_owner}::{name}");
+        let matches = self
+            .defs_named(member_labels, name)
+            .into_iter()
+            .filter(|node| {
+                node.file_path == owner_file
+                    && self
+                        .qname_for_id(node.id)
+                        .is_some_and(|qname| qname.ends_with(&suffix))
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Resolve a type only in its lexical module/import scope. Project-wide
+    /// uniqueness does not establish that a type is bound in this scope.
+    fn resolve_rust_type_path(&self, file: &str, path: &str) -> Option<i64> {
+        let path = path.trim();
+        if path.is_empty()
+            || !path.split("::").all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+            })
+        {
+            return None;
+        }
+        let name = path.rsplit("::").next()?;
+        if !path.contains("::") {
+            return self.resolve_bare_rust_type_name(file, name);
+        }
+        let files = {
+            let first = path.split("::").next()?;
+            self.rust_namespaces_by_file
+                .get(file)
+                .and_then(|aliases| aliases.get(first))
+                .map(|files| {
+                    rust_module_files_below_alias(files, path, name, self.rust_crate_roots.as_ref())
+                })
+                .unwrap_or_else(|| self.rust_module_files_for_path(file, path, name))
+        };
+        let owners = self.rust_module_export_targets(&files, name, &["Class", "Struct", "Enum"]);
+        match owners.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn resolve_option_field_receiver(
+        &self,
+        src_id: i64,
+        edge: &ExtractedEdge,
+        fact: &serde_json::Value,
+        name: &str,
+    ) -> Option<i64> {
+        if fact.get("adapter")?.as_str()? != "as_ref" || fact.get("pattern")?.as_str()? != "Some" {
+            return None;
+        }
+        let file = self.file_of(src_id)?;
+        let base = self.resolve_rust_type_path(file, fact.get("base_type")?.as_str()?)?;
+        let owner_qname = self.qname_for_id(base)?;
+        let field_name = fact.get("field")?.as_str()?;
+        let field = self.by_qname(&format!("{owner_qname}::{field_name}"))?;
+        if field.label != "Field" {
+            return None;
+        }
+        let declared = field.declared_type.as_deref()?.trim();
+        let (option, payload) = declared.split_once('<')?;
+        let payload = payload.strip_suffix('>')?.trim();
+        // Only a simple explicit Option payload is represented. References,
+        // generics, aliases and arbitrary adapters remain unresolved.
+        match option.trim() {
+            "std::option::Option" | "core::option::Option" => {
+                let files =
+                    self.rust_module_files_for_path(&field.file_path, option.trim(), "Option");
+                let first = option.trim().split("::").next()?;
+                if !self
+                    .rust_module_export_targets(&files, "Option", &CONSTRUCTABLE_LABELS)
+                    .is_empty()
+                    || self
+                        .rust_namespaces_by_file
+                        .get(&field.file_path)
+                        .is_some_and(|aliases| aliases.contains_key(first))
+                {
+                    return None;
+                }
+            }
+            "Option" => {
+                if !self
+                    .rust_module_export_targets(
+                        std::slice::from_ref(&field.file_path),
+                        "Option",
+                        &CONSTRUCTABLE_LABELS,
+                    )
+                    .is_empty()
+                    || self
+                        .import_globs_by_file
+                        .get(&field.file_path)
+                        .is_some_and(|globs| !globs.is_empty())
+                {
+                    return None;
+                }
+                if let Some(sources) = self
+                    .import_alias_sources_by_file
+                    .get(&field.file_path)
+                    .and_then(|aliases| aliases.get("Option"))
+                {
+                    if sources.iter().any(|(path, original)| {
+                        original != "Option"
+                            || !matches!(
+                                path.as_str(),
+                                "std::option::Option" | "core::option::Option"
+                            )
+                    }) {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        let payload_id = self.resolve_rust_type_path(&field.file_path, payload)?;
+        let payload_file = self.file_of(payload_id)?;
+        let payload_name = self.qname_for_id(payload_id)?.rsplit("::").next()?;
+        let method = self.by_qname(&format!("{payload_file}::{payload_name}::{name}"))?;
+        let reasons = self.option_receiver_limits(file, fact)?;
+        let id = (method.label == "Method").then_some(method.id)?;
+        if reasons.is_empty() {
+            clear_option_field_unresolved();
+        } else {
+            // `new_edge` applies these reasons only when the persisted row is
+            // this same CALLS edge. A skipped resolution clears the slot.
+            set_option_field_unresolved(edge, reasons);
+        }
+        Some(id)
+    }
+
+    /// A bare type name is the same-file definition, or one imported type alias.
+    /// A local item and an import, or two imports, are ambiguous and resolve
+    /// to nothing.
+    fn resolve_bare_rust_type_name(&self, file: &str, name: &str) -> Option<i64> {
+        let local = self.rust_module_export_targets(
+            &[file.to_string()],
+            name,
+            &["Class", "Struct", "Enum"],
+        );
+        let Some(ids) = self
+            .import_aliases_by_file
+            .get(file)
+            .and_then(|aliases| aliases.get(name))
+        else {
+            return match local.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            };
+        };
+        let typed = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.by_id
+                    .get(id)
+                    .is_some_and(|node| matches!(node.label.as_str(), "Class" | "Struct" | "Enum"))
+            })
+            .collect::<Vec<_>>();
+        if ids.len() != typed.len() || typed.len() > 1 {
+            return None;
+        }
+        if let [imported] = typed.as_slice() {
+            if local.is_empty() || local.as_slice() == [*imported].as_slice() {
+                return Some(*imported);
+            }
+            return None;
+        }
+        match local.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// `None` rejects the receiver (no edge). An empty vec is a proven
+    /// `CALLS` edge. Any other vec is an unresolved candidate for the one
+    /// method the declared field type already identified.
+    fn option_receiver_limits(&self, file: &str, fact: &serde_json::Value) -> Option<Vec<String>> {
+        let Some(limits) = fact.get("limits") else {
+            // A cached fact with no scope record is not proof that the
+            // receiver is Option::as_ref. Drop the candidate. Fresh
+            // extraction writes `limits` and can prove or leave it unresolved.
+            return None;
+        };
+        if !limits.is_object() {
+            return Some(vec!["unparsed import".to_string()]);
+        }
+        let mut reasons = Vec::new();
+        let mut globs = Vec::new();
+        if let Some(values) = limits.get("globs").and_then(|value| value.as_array()) {
+            for value in values {
+                if let Some(path) = value.as_str() {
+                    push_unique_glob(&mut globs, path);
+                }
+            }
+        }
+        if let Some(stored) = self.import_globs_by_file.get(file) {
+            for path in stored {
+                push_unique_glob(&mut globs, path);
+            }
+        }
+        for path in globs {
+            reasons.push(format!("wildcard import {path}"));
+        }
+        if let Some(values) = limits.get("macros").and_then(|value| value.as_array()) {
+            for value in values {
+                let Some(name) = value.as_str().filter(|name| !name.is_empty()) else {
+                    continue;
+                };
+                if name == "unparsed import" {
+                    reasons.push("unparsed import".to_string());
+                } else {
+                    reasons.push(format!("macro {name}"));
+                }
+            }
+        }
+        if let Some(values) = limits.get("attributes").and_then(|value| value.as_array()) {
+            for value in values {
+                if let Some(name) = value.as_str().filter(|name| !name.is_empty()) {
+                    reasons.push(format!("attribute {name}"));
+                }
+            }
+        }
+        if let Some(values) = limits.get("imports").and_then(|value| value.as_array()) {
+            for item in values {
+                let path = item
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if path.starts_with("extern crate") || name.is_empty() {
+                    reasons.push(format!("extern crate {path}"));
+                    continue;
+                }
+                if matches!(name, "Some" | "Option") {
+                    return None;
+                }
+                let first = path.split("::").next().unwrap_or("");
+                let scope_shadowed = !path.starts_with("::")
+                    && limits
+                        .get("standard_namespace_bindings")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|bindings| {
+                            bindings
+                                .iter()
+                                .any(|binding| binding.as_str() == Some(first))
+                        });
+                if scope_shadowed {
+                    reasons.push(format!("shadowed standard import {path}"));
+                    continue;
+                }
+                if self.rust_standard_import(file, path) {
+                    continue;
+                }
+                match self.classify_rust_import(file, path, name) {
+                    RustImportClass::Safe => {}
+                    RustImportClass::Reject => return None,
+                    RustImportClass::Unresolved(reason) => reasons.push(reason),
+                }
+            }
+        }
+        reasons.sort();
+        reasons.dedup();
+        Some(reasons)
+    }
+
+    fn classify_rust_import(&self, file: &str, path: &str, name: &str) -> RustImportClass {
+        if matches!(name, "Some" | "Option") {
+            return RustImportClass::Reject;
+        }
+        let Some(ids) = self
+            .import_aliases_by_file
+            .get(file)
+            .and_then(|aliases| aliases.get(name))
+        else {
+            let rooted = matches!(
+                path.trim().trim_start_matches("::").split("::").next(),
+                Some("crate" | "self" | "super")
+            );
+            if rooted {
+                return RustImportClass::Unresolved(format!("unresolved import {name}"));
+            }
+            return RustImportClass::Unresolved(format!("external import {path}"));
+        };
+        if ids.len() != 1 {
+            return RustImportClass::Unresolved(format!("ambiguous import {name}"));
+        }
+        let Some(id) = ids.iter().next().copied() else {
+            return RustImportClass::Unresolved(format!("unresolved import {name}"));
+        };
+        let Some(node) = self.by_id.get(&id) else {
+            return RustImportClass::Unresolved(format!("unresolved import {name}"));
+        };
+        match node.label.as_str() {
+            "Class" | "Enum" | "Function" | "Variable" | "Module" | "Type" | "AssocConst"
+            | "AssocType" => RustImportClass::Safe,
+            "Interface" => self.classify_trait_import(node, name),
+            other => RustImportClass::Unresolved(format!("import {name} is {other}")),
+        }
+    }
+
+    fn classify_trait_import(&self, node: &NodeLite, name: &str) -> RustImportClass {
+        let trait_name = self
+            .qname_for_id(node.id)
+            .and_then(|qname| qname.rsplit("::").next())
+            .unwrap_or(name);
+        let method_qname = format!("{}::{trait_name}::as_ref", node.file_path);
+        if let Some(receiver) = self.as_ref_receivers.get(&method_qname) {
+            let compact: String = receiver.chars().filter(|ch| !ch.is_whitespace()).collect();
+            if compact == "self"
+                || compact == "mutself"
+                || compact.starts_with("self:")
+                || compact.starts_with("mutself:")
+            {
+                // A by-value adapter is probed before autoref reaches
+                // Option::as_ref, so the declared payload is not the receiver.
+                return RustImportClass::Reject;
+            }
+            if !compact.starts_with('&') {
+                return RustImportClass::Unresolved(format!(
+                    "trait import {name} has an unusual as_ref receiver"
+                ));
+            }
+        }
+        if self.open_traits.contains(&node.id) {
+            return RustImportClass::Unresolved(format!("trait import {name} has supertraits"));
+        }
+        RustImportClass::Safe
+    }
+
+    fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
+        let name = edge
+            .properties
+            .get("ref_name")
+            .and_then(|value| value.as_str())?;
+        if name.is_empty() {
+            return None;
+        }
+        if let Some(ref_path) = edge
+            .properties
+            .get("ref_path")
+            .and_then(|value| value.as_str())
+        {
+            let referrer_file = self.file_of(src_id)?;
+            let first_segment = ref_path.split("::").next().unwrap_or("");
+            let module_files = self
+                .rust_namespaces_by_file
+                .get(referrer_file)
+                .and_then(|aliases| aliases.get(first_segment))
+                .map(|alias_files| {
+                    rust_module_files_below_alias(
+                        alias_files,
+                        ref_path,
+                        name,
+                        self.rust_crate_roots.as_ref(),
+                    )
+                })
+                .unwrap_or_else(|| self.rust_module_files_for_path(referrer_file, ref_path, name));
+            let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
+            if let [id] = imported.as_slice() {
+                return Some(*id);
+            }
+            if !module_files
+                .iter()
+                .any(|file| self.known_files.contains(file))
+            {
+                return self.resolve_associated_member(src_id, ref_path, name, &["EnumVariant"]);
+            }
+            // Never discard syntactic qualification and retry this as an
+            // unqualified same-file/import lookup.
+            return None;
+        }
+        self.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
     }
 
     /// Resolve a receiver call only when its statically observed owner and
@@ -2795,12 +5125,17 @@ impl GraphIndex {
         }
 
         let suffix = format!("::{owner}::{name}");
-        note_edge_resolution_work(self.by_qname.len());
-        let mut matches = self
-            .by_qname
-            .iter()
-            .filter(|(qname, node)| node.label == "Method" && qname.ends_with(&suffix))
-            .map(|(_, node)| node.id);
+        // The name index already bounds candidates to this method name.
+        // Scanning every project node here made cross-file receiver calls
+        // proportional to the whole graph for every individual edge.
+        let candidates = self.defs_named(&["Method"], name);
+        let mut matches = candidates
+            .into_iter()
+            .filter(|node| {
+                self.qname_for_id(node.id)
+                    .is_some_and(|qname| qname.ends_with(&suffix))
+            })
+            .map(|node| node.id);
         let target = matches.next()?;
         matches.next().is_none().then_some(target)
     }
@@ -2896,6 +5231,70 @@ impl GraphIndex {
         } else {
             None
         }
+    }
+
+    /// Named `std`/`core`/`alloc` imports are safe only when that path is the
+    /// standard library. A local module, namespace alias, or import that binds
+    /// the same name is not that crate, so classification continues.
+    fn rust_standard_import(&self, file: &str, path: &str) -> bool {
+        let trimmed = path.trim();
+        let absolute = trimmed.starts_with("::");
+        let first = trimmed
+            .trim_start_matches("::")
+            .split("::")
+            .find(|part| !part.is_empty())
+            .unwrap_or("");
+        if !matches!(first, "std" | "core" | "alloc") {
+            return false;
+        }
+        !self.standard_namespace_is_shadowed(file, first, absolute)
+    }
+
+    fn standard_namespace_is_shadowed(&self, file: &str, name: &str, absolute: bool) -> bool {
+        if self
+            .rust_namespaces_by_file
+            .get(file)
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return true;
+        }
+        if self
+            .import_alias_sources_by_file
+            .get(file)
+            .is_some_and(|aliases| aliases.get(name).is_some_and(|sources| !sources.is_empty()))
+        {
+            return true;
+        }
+        if absolute {
+            return false;
+        }
+        let classified = self.rust_module_files_for_module_path(file, name);
+        if classified
+            .iter()
+            .any(|candidate| self.known_files.contains(candidate))
+        {
+            return true;
+        }
+        self.by_name
+            .get(name)
+            .is_some_and(|nodes| nodes.iter().any(|node| node.file_path == file))
+    }
+}
+
+enum RustImportClass {
+    Safe,
+    Reject,
+    Unresolved(String),
+}
+
+fn push_unique_glob(out: &mut Vec<String>, path: &str) {
+    let key = path
+        .trim()
+        .trim_end_matches('*')
+        .trim_end_matches(':')
+        .to_string();
+    if !key.is_empty() && !out.iter().any(|existing| existing == &key) {
+        out.push(key);
     }
 }
 
@@ -3193,7 +5592,7 @@ fn record_index_skip(
     detail: &str,
     generation: u64,
 ) -> Result<()> {
-    let metadata = std::fs::metadata(&entry.abs_path)
+    let metadata = std::fs::symlink_metadata(&entry.abs_path)
         .map(|md| stable_metadata(&md))
         .unwrap_or(StableFileMetadata {
             size: 0,
@@ -3360,9 +5759,14 @@ fn record_unsupported_file_state(
     entry: &InventoryEntry,
     generation: u64,
 ) {
-    let Ok(md) = std::fs::metadata(&entry.abs_path) else {
+    let Ok(md) = std::fs::symlink_metadata(&entry.abs_path) else {
         return;
     };
+    // The skip row owns a link's identity. Never read its target into a
+    // file_state: that mismatches lstat freshness and may leave the root.
+    if !md.is_file() {
+        return;
+    }
     if md.len() > max_file_size_bytes() {
         let metadata = stable_metadata(&md);
         // Oversized: record stat only, never read the body.
@@ -3698,6 +6102,323 @@ mod tests {
     }
 
     #[test]
+    fn index_version_upgrade_does_not_copy_base_into_delta() {
+        let repo = setup_repo("version-upgrade-overlay", "pub fn dirty_file() {}\n");
+        fs::write(repo.join("src/clean.rs"), "pub fn clean_base_file() {}\n").unwrap();
+        let stores = repo.with_extension("stores");
+        fs::create_dir_all(&stores).unwrap();
+        let base_path = stores.join("base.db");
+        let delta_path = stores.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+        }
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["src/lib.rs".to_string()])),
+            ..IndexOptions::default()
+        };
+        {
+            let mut delta = Store::open(&delta_path).unwrap();
+            index_with_options(&mut delta, &repo, "test", &options).unwrap();
+            for mut state in delta.list_workspace_states().unwrap() {
+                state.indexer_version = "greppy-indexer-v5".into();
+                delta.upsert_workspace_state(&state).unwrap();
+            }
+        }
+        let visibility =
+            greppy_store::VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new())
+                .unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(overlay
+            .list_file_states("test")
+            .unwrap()
+            .iter()
+            .any(|state| state.rel_path == "src/clean.rs"));
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        let report = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
+        assert_eq!(
+            report.files_indexed, 1,
+            "only the old Delta may be migrated"
+        );
+        let private = overlay.list_private_file_states("test").unwrap();
+        assert_eq!(private.len(), 1);
+        assert_eq!(private[0].rel_path, "src/lib.rs");
+        let nodes = overlay
+            .list_nodes_by_label("test", "Function", 100)
+            .unwrap();
+        assert!(nodes.iter().any(|node| node.name == "dirty_file"));
+        assert!(nodes.iter().any(|node| node.name == "clean_base_file"));
+        // A current Base row must not hide lost compatibility metadata in an
+        // existing private layer and wrongly permit incremental reuse.
+        overlay
+            .conn()
+            .execute("DELETE FROM main.workspace_state", [])
+            .unwrap();
+        assert!(!overlay.list_workspace_states().unwrap().is_empty());
+        assert!(overlay.list_private_workspace_states().unwrap().is_empty());
+        let repaired = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
+        assert_eq!(
+            repaired.files_indexed, 1,
+            "missing Delta metadata requires migration"
+        );
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
+        drop(overlay);
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(stores);
+    }
+
+    #[test]
+    fn overlay_delta_resolves_rust_usage_through_base_reexports() {
+        let repo = setup_multifile_repo(
+            "overlay-base-reexport",
+            "mod alias_chain; mod bare_glob; mod business_os; mod channels; mod decoys; mod glob_channels; mod parent; mod renamed_channels; mod super_exports;\n",
+            "// fixture placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/alias_chain")).unwrap();
+        fs::create_dir_all(repo.join("src/bare_glob")).unwrap();
+        fs::create_dir_all(repo.join("src/business_os")).unwrap();
+        fs::create_dir_all(repo.join("src/channels")).unwrap();
+        fs::create_dir_all(repo.join("src/glob_channels")).unwrap();
+        fs::create_dir_all(repo.join("src/parent/child")).unwrap();
+        fs::create_dir_all(repo.join("src/renamed_channels")).unwrap();
+        fs::create_dir_all(repo.join("src/super_exports")).unwrap();
+        fs::write(
+            repo.join("src/business_os/mod.rs"),
+            "pub mod store; pub use crate::super_exports::*;\n",
+        )
+        .unwrap();
+        let caller_source =
+            "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
+use crate::bare_glob::*;\n\
+use crate::alias_chain::outer;\n\
+use super::*;\n\
+pub fn grouped_caller() { let selected = channels::target; selected(); }\n\
+pub fn renamed_caller() { let selected = renamed_channels::renamed; selected(); }\n\
+pub fn glob_caller() { let selected = glob_channels::target; selected(); }\n\
+pub fn super_glob_caller() { let selected = child::target; selected(); }\n\
+pub fn alias_chain_caller() { let selected = alias_chain::outer; selected(); }\n\
+pub fn delta_crate_glob_caller() { let selected = bare_target; selected(); }\n\
+pub fn delta_super_glob_caller() { let selected = super_target; selected(); }\n\
+pub fn shadow_target() {}\n\
+pub fn local_shadow_caller() { let selected = shadow_target; selected(); }\n\
+pub struct Shadow; impl Shadow { pub fn shadow_target() {} }\n\
+pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
+        fs::write(repo.join("src/business_os/store.rs"), caller_source).unwrap();
+        fs::write(
+            repo.join("src/alias_chain/mod.rs"),
+            "mod sub; pub use sub::target as middle; pub use middle as outer;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/alias_chain/sub.rs"), "pub fn target() {}\n").unwrap();
+        fs::write(
+            repo.join("src/bare_glob/mod.rs"),
+            "mod command; pub use command::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/bare_glob/command.rs"),
+            "pub fn bare_target() {}\npub fn shadow_target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/mod.rs"),
+            "mod command; pub use command::{first, target};\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/command.rs"),
+            "pub fn first() {}\npub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/glob_channels/mod.rs"),
+            "mod command; pub use command::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/glob_channels/command.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/parent/mod.rs"),
+            "pub fn target() {}\npub mod child;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/parent/child/mod.rs"), "pub use super::*;\n").unwrap();
+        fs::write(
+            repo.join("src/renamed_channels/mod.rs"),
+            "mod command; pub use command::target as renamed;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/renamed_channels/command.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/super_exports/mod.rs"),
+            "pub fn super_target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/decoys.rs"),
+            "pub fn bare_target() {}\npub fn super_target() {}\n",
+        )
+        .unwrap();
+
+        let stores = repo.with_extension("overlay-base-reexport-stores");
+        fs::create_dir_all(&stores).unwrap();
+        let base_path = stores.join("base.db");
+        let delta_path = stores.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+        }
+
+        fs::write(
+            repo.join("src/business_os/store.rs"),
+            format!("{caller_source}// dirty worktree comment\n"),
+        )
+        .unwrap();
+        let dirty_path = "src/business_os/store.rs".to_string();
+        let visibility =
+            greppy_store::VisibilityIndex::new([dirty_path.clone()], Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        index_with_options(
+            &mut overlay,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(std::collections::BTreeSet::from([dirty_path])),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        rebuild_overlay_edges(&mut overlay, "test").unwrap();
+
+        for (target_qname, caller_qname, reexport_kind) in [
+            (
+                "src/channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::grouped_caller",
+                "grouped",
+            ),
+            (
+                "src/renamed_channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::renamed_caller",
+                "renamed",
+            ),
+            (
+                "src/glob_channels/command.rs::Function::target",
+                "src/business_os/store.rs::Function::glob_caller",
+                "glob",
+            ),
+            (
+                "src/parent/mod.rs::Function::target",
+                "src/business_os/store.rs::Function::super_glob_caller",
+                "transitive super glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::alias_chain_caller",
+                "explicit alias chain",
+            ),
+            (
+                "src/bare_glob/command.rs::Function::bare_target",
+                "src/business_os/store.rs::Function::delta_crate_glob_caller",
+                "Delta crate glob",
+            ),
+            (
+                "src/super_exports/mod.rs::Function::super_target",
+                "src/business_os/store.rs::Function::delta_super_glob_caller",
+                "Delta super glob",
+            ),
+            (
+                "src/business_os/store.rs::Function::shadow_target",
+                "src/business_os/store.rs::Function::local_shadow_caller",
+                "local item shadows Base glob",
+            ),
+            (
+                "src/alias_chain/sub.rs::Function::target",
+                "src/business_os/store.rs::Function::imported_alias_caller",
+                "explicit import of chained reexport",
+            ),
+        ] {
+            let target = overlay
+                .get_node_by_qname("test", target_qname)
+                .unwrap()
+                .expect("Base target remains visible");
+            let caller = overlay
+                .get_node_by_qname("test", caller_qname)
+                .unwrap()
+                .expect("dirty Delta caller");
+            let incoming = overlay
+                .incoming_edges(target.id, Some("USAGE"), 10)
+                .unwrap();
+            assert!(
+                incoming.iter().any(|edge| edge.source_id == caller.id),
+                "dirty Delta usage must resolve through the Base {reexport_kind} reexport: {incoming:?}"
+            );
+        }
+
+        drop(overlay);
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(stores);
+    }
+
+    #[test]
+    fn index_version_upgrade_preserves_sparse_layer_and_then_reuses_it() {
+        let repo = setup_repo("version-upgrade-sparse", "pub fn changed_path() {}\n");
+        fs::write(repo.join("src/retained.rs"), "pub fn retained_path() {}\n").unwrap();
+        fs::write(repo.join("src/outside.rs"), "pub fn outside_layer() {}\n").unwrap();
+        fs::write(repo.join(".gitattributes"), "*.bin binary\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let initial = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "src/lib.rs".to_string(),
+                "src/retained.rs".to_string(),
+                ".gitattributes".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        assert!(store
+            .get_index_skip("test", ".gitattributes")
+            .unwrap()
+            .is_some());
+        fs::remove_file(repo.join(".gitattributes")).unwrap();
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version = "greppy-indexer-v5".into();
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let narrow = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["src/lib.rs".to_string()])),
+            ..IndexOptions::default()
+        };
+        let upgraded = index_with_options(&mut store, &repo, "test", &narrow).unwrap();
+        assert_eq!(
+            upgraded.files_indexed, 2,
+            "all retained layer files need migration"
+        );
+        assert_eq!(upgraded.files_skipped, 0);
+        assert!(store
+            .get_index_skip("test", ".gitattributes")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_file_state("test", ".gitattributes")
+            .unwrap()
+            .is_none());
+        let nodes = store.list_nodes_by_label("test", "Function", 100).unwrap();
+        assert!(nodes.iter().any(|node| node.name == "retained_path"));
+        assert!(!nodes.iter().any(|node| node.name == "outside_layer"));
+        let unchanged = index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        assert_eq!(unchanged.files_indexed, 0, "migration must run only once");
+        assert_eq!(unchanged.files_skipped, 2);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
     fn index_with_options_honors_discovery_overrides() {
         let repo = setup_repo("discover-overrides", "pub fn keep_me() {}\n");
         fs::write(repo.join("src/generated.rs"), "pub fn drop_me() {}\n").unwrap();
@@ -3788,6 +6509,18 @@ mod tests {
         assert_eq!(fs.size as usize, RUST_SAMPLE.len());
         assert!(!fs.sha256.is_empty());
         assert_eq!(fs.sha256.len(), 64);
+    }
+
+    #[test]
+    fn rust_reexport_migration_preserves_matching_discovery_scope() {
+        assert!(is_rust_reexport_migration(
+            "greppy-indexer-v6;discover_scope=tracked",
+            "greppy-indexer-v7;discover_scope=tracked"
+        ));
+        assert!(!is_rust_reexport_migration(
+            "greppy-indexer-v6;discover_scope=tracked",
+            "greppy-indexer-v7;discover_scope=all"
+        ));
     }
 
     #[test]
@@ -3979,6 +6712,343 @@ fn caller(value: Buffer) -> &'static [u8] {
     }
 
     #[test]
+    fn effect_fn_generator_call_persists_incoming_edge_from_exported_binding() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("routing.ts"),
+            r#"
+import { Effect } from "effect";
+const resolveGatewayProviderForModel = Effect.fn("resolveGatewayProviderForModel")(
+    function* (input: { model: string }) { return input.model; },
+);
+export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEnvironment")(
+    function* (input: { model: string }) {
+        const gatewayProvider = input.model.length > 0
+            ? yield* resolveGatewayProviderForModel({ model: input.model })
+            : undefined;
+        return gatewayProvider;
+    },
+);
+const plainValue = 42;
+const effectValue = Effect.gen(function* () { return 42; });
+export function invalidCalls() { plainValue(); effectValue(); }
+"#,
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let target = store
+            .get_node_by_qname(
+                "test",
+                "routing.ts::Function::resolveGatewayProviderForModel",
+            )
+            .unwrap()
+            .expect("private Effect.fn binding must exist");
+        let caller = store
+            .get_node_by_qname(
+                "test",
+                "routing.ts::Function::resolveGatewayRoutedEnvironment",
+            )
+            .unwrap()
+            .expect("exported Effect.fn binding must exist");
+        let incoming = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert_eq!(
+            incoming.len(),
+            1,
+            "expected one persisted direct caller: {incoming:?}"
+        );
+        assert_eq!(incoming[0].source_id, caller.id);
+        fs::write(repo.path().join("unrelated.py"), "def retained(): pass\n").unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let retained = store
+            .get_node_by_qname("test", "unrelated.py::Function::retained")
+            .unwrap()
+            .unwrap();
+        // Recreate the v7 binding identities while keeping identical file bytes.
+        store
+            .conn()
+            .execute("DELETE FROM main.edges WHERE source_id = ?1", [caller.id])
+            .unwrap();
+        for node in [&target, &caller] {
+            store
+                .update_node_identity(
+                    node.id,
+                    "Variable",
+                    &node.qualified_name.replace("::Function::", "::Variable::"),
+                )
+                .unwrap();
+        }
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version = "greppy-indexer-v7".into();
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let repaired = index(&mut store, repo.path(), "test").unwrap();
+        assert_eq!(
+            repaired.files_indexed, 2,
+            "v9 re-extracts every retained source in the incompatible cache"
+        );
+        let restored = store
+            .get_node_by_qname("test", &target.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert_ne!(restored.id, target.id, "v9 replaces old declaration nodes");
+        assert!(
+            store
+                .get_node_by_qname("test", &retained.qualified_name)
+                .unwrap()
+                .is_some(),
+            "cross-language definitions survive full cache refresh"
+        );
+        let incoming = store
+            .incoming_edges(restored.id, Some("CALLS"), 10)
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        let restored_caller = store
+            .get_node_by_qname("test", &caller.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(incoming[0].source_id, restored_caller.id);
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            0,
+            "migration must run once, without manual full reindex"
+        );
+
+        for name in ["plainValue", "effectValue"] {
+            let value = store
+                .get_node_by_qname("test", &format!("routing.ts::Variable::{name}"))
+                .unwrap()
+                .expect("ordinary value must remain a Variable");
+            assert!(
+                store
+                    .incoming_edges(value.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "noncallable values must not resolve as call targets"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_fn_repair_keeps_current_base_sparse_but_repairs_old_resolver_edges() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("routing.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let base_path = stores.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+        }
+        let visibility = greppy_store::VisibilityIndex::default();
+        {
+            let mut overlay =
+                Store::open_overlay(&base_path, &stores.path().join("current.db"), &visibility)
+                    .unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+            let rows: i64 = overlay
+                .conn()
+                .query_row("SELECT COUNT(*) FROM main.overlay_edges", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "unchanged current Base edges must stay shared");
+            let target = overlay
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .unwrap();
+            assert!(!overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .is_empty());
+        }
+        // An older resolver can have identical raw facts and missing resolved
+        // edges. That case must still repair the immutable Base via the Delta.
+        {
+            let base = Store::open(&base_path).unwrap();
+            base.conn()
+                .execute(
+                    "UPDATE main.workspace_state SET indexer_version='greppy-indexer-v8'",
+                    [],
+                )
+                .unwrap();
+            base.conn()
+                .execute("DELETE FROM main.edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+        }
+        let mut overlay =
+            Store::open_overlay(&base_path, &stores.path().join("old.db"), &visibility).unwrap();
+        assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+        let target = overlay
+            .get_node_by_qname("test", "routing.ts::Function::target")
+            .unwrap()
+            .unwrap();
+        assert!(!overlay
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .is_empty());
+        let repairs: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.overlay_edges WHERE json_extract(properties,'$.greppy_base_repair_v2')=1", [], |r| r.get(0)).unwrap();
+        assert!(repairs > 0, "old resolver recovery remains active");
+    }
+
+    #[test]
+    fn effect_fn_overlay_upgrade_keeps_immutable_base_and_unaffected_vector() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("routing.ts"),
+            r#"
+import { Effect } from 'effect';
+const target = Effect.fn('target')(function* () { return 1; });
+export const caller = Effect.fn('caller')(function* () { return yield* target(); });
+"#,
+        )
+        .unwrap();
+        fs::write(repo.path().join("retained.py"), "def retained(): pass\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let base_path = stores.path().join("base.db");
+        let delta_path = stores.path().join("delta.db");
+        let retained_id;
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            let report = index(&mut base, repo.path(), "test").unwrap();
+            for name in ["target", "caller"] {
+                let node = base
+                    .get_node_by_qname("test", &format!("routing.ts::Function::{name}"))
+                    .unwrap()
+                    .unwrap();
+                base.update_node_identity(
+                    node.id,
+                    "Variable",
+                    &format!("routing.ts::Variable::{name}"),
+                )
+                .unwrap();
+            }
+            base.conn().execute("UPDATE main.raw_edges SET source_qname=replace(source_qname,'::Function::','::Variable::') WHERE file_path='routing.ts'", []).unwrap();
+            base.conn()
+                .execute("DELETE FROM main.edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            let retained = base
+                .get_node_by_qname("test", "retained.py::Function::retained")
+                .unwrap()
+                .unwrap();
+            retained_id = retained.id;
+            base.upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "test-model".into(),
+                prompt_version: "v1".into(),
+                task: "definition".into(),
+                node_id: Some(retained.id),
+                chunk_idx: 0,
+                qualified_name: retained.qualified_name,
+                file_path: retained.file_path,
+                start_line: retained.start_line,
+                end_line: retained.end_line,
+                content_sha256: file_state::sha256_hex(b"def retained(): pass\n"),
+                graph_generation: report.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        }
+        let base_hash = file_state::sha256_hex(&fs::read(&base_path).unwrap());
+        let visibility = greppy_store::VisibilityIndex::default();
+        {
+            let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let routing = repo.path().join("routing.ts");
+            let original = fs::read(&routing).unwrap();
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"\n// changed since indexing\n");
+            fs::write(&routing, changed).unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).is_err());
+            let writes: i64 = overlay
+                .conn()
+                .query_row("SELECT COUNT(*) FROM main.nodes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                writes, 0,
+                "source mismatch must reject before identity writes"
+            );
+            fs::write(&routing, original).unwrap();
+            overlay.conn().execute_batch("CREATE TEMP TRIGGER fail_effect_repair BEFORE INSERT ON main.raw_edges BEGIN SELECT RAISE(ABORT,'injected repair failure'); END;").unwrap();
+            let injected =
+                recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap_err();
+            assert!(
+                injected.to_string().contains("injected repair failure"),
+                "must reach the injected raw-edge failure after node promotion: {injected}"
+            );
+            for table in [
+                "main.projects",
+                "main.nodes",
+                "main.definition_identity_overrides",
+                "main.js_ts_reference_override_files",
+                "main.raw_edges",
+            ] {
+                let rows: i64 = overlay
+                    .conn()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0, "failed repair must roll back {table}");
+            }
+            let markers: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.schema_meta WHERE key LIKE 'greppy.effect_fn_repair%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(markers, 0);
+            overlay
+                .conn()
+                .execute_batch("DROP TRIGGER fail_effect_repair;")
+                .unwrap();
+            assert!(recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap());
+            let target = overlay
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .unwrap();
+            let caller = overlay
+                .get_node_by_qname("test", "routing.ts::Function::caller")
+                .unwrap()
+                .unwrap();
+            assert!(overlay
+                .get_node_by_qname("test", "routing.ts::Variable::target")
+                .unwrap()
+                .is_none());
+            assert!(overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|e| e.source_id == caller.id));
+            assert_eq!(
+                overlay
+                    .get_node_by_qname("test", "retained.py::Function::retained")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                -retained_id
+            );
+            let vector: (String, i64) = overlay.conn().query_row("SELECT content_sha256,node_id FROM vector_embeddings WHERE file_path='retained.py'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(
+                vector,
+                (
+                    file_state::sha256_hex(b"def retained(): pass\n"),
+                    -retained_id
+                )
+            );
+            assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+            assert!(
+                !recover_visible_effect_fn_bindings(&mut overlay, "test", repo.path()).unwrap()
+            );
+        }
+        assert_eq!(
+            file_state::sha256_hex(&fs::read(&base_path).unwrap()),
+            base_hash
+        );
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Variable::target")
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .get_node_by_qname("test", "routing.ts::Function::target")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn class_construction_persists_calls_edge_to_class() {
         const APP_PY: &str = r#"
 class RunnerFilter:
@@ -4092,6 +7162,1265 @@ def Widget():
         fs::write(tmp.join("src/lib.rs"), lib_rs).unwrap();
         fs::write(tmp.join("src/helper.rs"), helper_rs).unwrap();
         tmp
+    }
+
+    #[test]
+    fn rust_qualified_function_item_resolves_through_grouped_reexport() {
+        let repo = setup_multifile_repo(
+            "rust-reexport-function-item",
+            "mod business_os; mod channels; mod core; mod flat; mod left; mod right; mod other; mod types;\nuse other::imported_worker;\nfn target() {}\nfn root_target() {}\nstruct worker; impl worker { fn run() {} }\nfn caller() { let selected = channels::target; selected(); }\nfn left_caller() { let selected = left::channel::target; selected(); }\nfn left_direct_caller() { left::channel::target(); }\nfn local_associated_caller() { worker::run(); }\nfn imported_associated_caller() { imported_worker::run(); }\nfn qualified_associated_caller() { types::worker::run(); }\nfn missing_qualified_associated_caller() { missing::worker::run(); }\nfn missing_caller() { let _selected = missing::target; }\nfn missing_direct_caller() { missing::target(); }\n",
+            "// fixture placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/channels")).unwrap();
+        fs::write(
+            repo.join("src/channels/mod.rs"),
+            "mod command; mod tests; pub use command::{first, target};\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/command.rs"),
+            "pub fn first() {}\npub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channels/tests.rs"),
+            "use super::*;\nfn direct_test() { target(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/other.rs"),
+            "pub fn target() {}\npub struct imported_worker; impl imported_worker { pub fn run() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/types.rs"),
+            "pub struct worker; impl worker { pub fn run() {} }\n",
+        )
+        .unwrap();
+        for side in ["left", "right"] {
+            fs::create_dir_all(repo.join(format!("src/{side}/channel"))).unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/mod.rs")),
+                "pub mod channel;\n",
+            )
+            .unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/channel/mod.rs")),
+                "mod implementation; pub use implementation::target;\n",
+            )
+            .unwrap();
+            fs::write(
+                repo.join(format!("src/{side}/channel/implementation.rs")),
+                "pub fn target() {}\n",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(repo.join("src/core/mission/channels")).unwrap();
+        fs::create_dir_all(repo.join("src/business_os")).unwrap();
+        fs::write(repo.join("src/core/mod.rs"), "pub mod mission;\n").unwrap();
+        fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
+        fs::write(
+            repo.join("src/core/mission/channels/mod.rs"),
+            "mod command; pub use command::target;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/core/mission/channels/command.rs"),
+            "pub fn target() {}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/business_os/mod.rs"), "pub mod store;\n").unwrap();
+        fs::write(
+            repo.join("src/business_os/store.rs"),
+            "use crate::core::mission::channels;\nfn alias_caller() { let selected = channels::target; selected(); }\nfn nested_alias_missing() { let _selected = channels::missing::target; }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join("src/flat")).unwrap();
+        fs::write(
+            repo.join("src/flat.rs"),
+            "pub mod child;\nfn self_caller() { let selected = self::child::target; selected(); }\nfn super_caller() { let selected = super::root_target; selected(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/flat/child.rs"), "pub fn target() {}\n").unwrap();
+        fs::write(
+            repo.join("src/unrelated.py"),
+            "def untouched():\n    return 1\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        let initial = index(&mut store, &repo, "test").unwrap();
+        let target = store
+            .get_node_by_qname("test", "src/channels/command.rs::Function::target")
+            .unwrap()
+            .expect("reexported target function");
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::caller")
+            .unwrap()
+            .expect("caller function");
+        let incoming = store.incoming_edges(target.id, Some("USAGE"), 10).unwrap();
+        assert!(
+            incoming.iter().any(|edge| edge.source_id == caller.id),
+            "qualified function item must resolve through the module's grouped reexport: {incoming:?}"
+        );
+        let direct_test = store
+            .get_node_by_qname("test", "src/channels/tests.rs::Function::direct_test")
+            .unwrap()
+            .expect("direct test caller");
+        let calls = store.incoming_edges(target.id, Some("CALLS"), 10).unwrap();
+        assert!(
+            calls.iter().any(|edge| edge.source_id == direct_test.id),
+            "super glob must disambiguate the reexported direct call: {calls:?}"
+        );
+        let homonym = store
+            .get_node_by_qname("test", "src/other.rs::Function::target")
+            .unwrap()
+            .expect("unrelated homonym");
+        assert!(
+            store
+                .incoming_edges(homonym.id, None, 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != caller.id),
+            "module and glob evidence must not create cross-module homonym callers"
+        );
+        let left_target = store
+            .get_node_by_qname(
+                "test",
+                "src/left/channel/implementation.rs::Function::target",
+            )
+            .unwrap()
+            .expect("left channel target");
+        let right_target = store
+            .get_node_by_qname(
+                "test",
+                "src/right/channel/implementation.rs::Function::target",
+            )
+            .unwrap()
+            .expect("right channel target");
+        let left_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::left_caller")
+            .unwrap()
+            .expect("qualified left caller");
+        assert!(
+            store
+                .incoming_edges(left_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == left_caller.id),
+            "the full module path must select the left channel export"
+        );
+        assert!(
+            store
+                .incoming_edges(right_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != left_caller.id),
+            "a duplicate channel/mod.rs basename must not steal the qualified usage"
+        );
+        let left_direct_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::left_direct_caller")
+            .unwrap()
+            .expect("qualified left direct caller");
+        assert!(
+            store
+                .incoming_edges(left_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == left_direct_caller.id),
+            "the complete module path must select the left channel direct-call target"
+        );
+        assert!(
+            store
+                .incoming_edges(right_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != left_direct_caller.id),
+            "the duplicate right channel must not steal the qualified direct call"
+        );
+        let local_target = store
+            .get_node_by_qname("test", "src/lib.rs::Function::target")
+            .unwrap()
+            .expect("same-file homonym");
+        let missing_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing_caller")
+            .unwrap()
+            .expect("missing-module caller");
+        assert!(
+            store
+                .incoming_edges(local_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_caller.id),
+            "missing::target must not degrade to the same-file target"
+        );
+        let missing_direct_caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing_direct_caller")
+            .unwrap()
+            .expect("missing-module direct caller");
+        assert!(
+            [left_target.id, right_target.id, local_target.id]
+                .into_iter()
+                .all(|target_id| store
+                    .incoming_edges(target_id, Some("CALLS"), 10)
+                    .unwrap()
+                    .iter()
+                    .all(|edge| edge.source_id != missing_direct_caller.id)),
+            "missing::target must remain unresolved instead of guessing any homonym"
+        );
+        for (method_qname, caller_qname) in [
+            (
+                "src/lib.rs::worker::run",
+                "src/lib.rs::Function::local_associated_caller",
+            ),
+            (
+                "src/other.rs::imported_worker::run",
+                "src/lib.rs::Function::imported_associated_caller",
+            ),
+            (
+                "src/types.rs::worker::run",
+                "src/lib.rs::Function::qualified_associated_caller",
+            ),
+        ] {
+            let method = store
+                .get_node_by_qname("test", method_qname)
+                .unwrap()
+                .expect("lowercase associated method");
+            let associated_caller = store
+                .get_node_by_qname("test", caller_qname)
+                .unwrap()
+                .expect("lowercase associated caller");
+            assert!(
+                store
+                    .incoming_edges(method.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.source_id == associated_caller.id),
+                "a real lowercase type owner must preserve its associated call: {method_qname}"
+            );
+        }
+        let missing_qualified_associated_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/lib.rs::Function::missing_qualified_associated_caller",
+            )
+            .unwrap()
+            .expect("missing qualified associated caller");
+        let local_worker_method = store
+            .get_node_by_qname("test", "src/lib.rs::worker::run")
+            .unwrap()
+            .expect("local lowercase associated method");
+        assert!(
+            store
+                .incoming_edges(local_worker_method.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_qualified_associated_caller.id),
+            "missing::worker::run must not discard its prefix and bind to local worker::run"
+        );
+        let namespaced_target = store
+            .get_node_by_qname(
+                "test",
+                "src/core/mission/channels/command.rs::Function::target",
+            )
+            .unwrap()
+            .expect("mission channel target");
+        let alias_caller = store
+            .get_node_by_qname("test", "src/business_os/store.rs::Function::alias_caller")
+            .unwrap()
+            .expect("CTOX-shaped namespace caller");
+        assert!(
+            store
+                .incoming_edges(namespaced_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == alias_caller.id),
+            "a namespace imported with `use crate::...::channels` must resolve channels::target"
+        );
+        let nested_alias_missing = store
+            .get_node_by_qname(
+                "test",
+                "src/business_os/store.rs::Function::nested_alias_missing",
+            )
+            .unwrap()
+            .expect("nested namespace negative caller");
+        assert!(
+            store
+                .incoming_edges(namespaced_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != nested_alias_missing.id),
+            "channels::missing::target must not collapse to channels::target"
+        );
+        let flat_child_target = store
+            .get_node_by_qname("test", "src/flat/child.rs::Function::target")
+            .unwrap()
+            .expect("flat module child target");
+        let self_caller = store
+            .get_node_by_qname("test", "src/flat.rs::Function::self_caller")
+            .unwrap()
+            .expect("flat-module self caller");
+        assert!(
+            store
+                .incoming_edges(flat_child_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == self_caller.id),
+            "self::child from flat.rs must resolve beneath the flat module namespace"
+        );
+        let root_target = store
+            .get_node_by_qname("test", "src/lib.rs::Function::root_target")
+            .unwrap()
+            .expect("crate-root target");
+        let super_caller = store
+            .get_node_by_qname("test", "src/flat.rs::Function::super_caller")
+            .unwrap()
+            .expect("flat-module super caller");
+        assert!(
+            store
+                .incoming_edges(root_target.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == super_caller.id),
+            "super:: from flat.rs must resolve in the parent module"
+        );
+
+        let untouched_before = store
+            .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
+            .unwrap()
+            .expect("unrelated Python definition");
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "fixture-model".into(),
+                prompt_version: "v1".into(),
+                task: "code".into(),
+                node_id: Some(untouched_before.id),
+                chunk_idx: 0,
+                qualified_name: "src/unrelated.py::Function::untouched".into(),
+                file_path: "src/unrelated.py".into(),
+                start_line: 1,
+                end_line: 2,
+                content_sha256: "79e7f0faa5c096d71e2144fed19041c227465b02667a95b613c0ecd4648e1a03"
+                    .into(),
+                graph_generation: initial.graph_generation,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        store
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "test".into(),
+                model_id: "fixture-model".into(),
+                prompt_version: "v1".into(),
+                task: "code".into(),
+                node_id: Some(target.id),
+                chunk_idx: 0,
+                qualified_name: target.qualified_name.clone(),
+                file_path: target.file_path.clone(),
+                start_line: target.start_line,
+                end_line: target.end_line,
+                content_sha256: "0126ac6c598444305c31117e8a38a15cb496335cbd34fb503dfd331926e93fb7"
+                    .into(),
+                graph_generation: initial.graph_generation,
+                vector: vec![0.0, 1.0],
+            })
+            .unwrap();
+        store
+            .insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: missing_caller.id,
+                target_id: local_target.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({
+                    "ref_name": "target",
+                    "ref_path": "missing::target"
+                }),
+            })
+            .unwrap();
+        let root = greppy_discover::detect_repo_root(&repo).unwrap();
+        let mut state = store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("workspace state");
+        state.indexer_version = "greppy-indexer-v6".into();
+        store.upsert_workspace_state(&state).unwrap();
+        fs::write(repo.join("src/other.rs"), "pub fn replacement() {}\n").unwrap();
+
+        let migration = index_with_options(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            migration.files_indexed, initial.files_indexed,
+            "v9 re-extracts every retained source despite sparse scope"
+        );
+        let untouched_after = store
+            .get_node_by_qname("test", "src/unrelated.py::Function::untouched")
+            .unwrap()
+            .expect("unrelated Python definition survives migration");
+        assert_ne!(
+            untouched_after.id, untouched_before.id,
+            "v9 replaces old cache nodes"
+        );
+        let target_after = store
+            .get_node_by_qname("test", "src/channels/command.rs::Function::target")
+            .unwrap()
+            .expect("Rust target survives migration");
+        assert_ne!(
+            target_after.id, target.id,
+            "v9 re-extracts unchanged Rust declarations"
+        );
+        assert!(
+            store
+                .get_node_by_qname("test", "src/other.rs::Function::target")
+                .unwrap()
+                .is_none(),
+            "a changed Rust file is also freshly extracted during the full refresh"
+        );
+        assert!(store
+            .get_node_by_qname("test", "src/other.rs::Function::replacement")
+            .unwrap()
+            .is_some());
+        let local_target_after = store
+            .get_node_by_qname("test", &local_target.qualified_name)
+            .unwrap()
+            .unwrap();
+        let missing_caller_after = store
+            .get_node_by_qname("test", &missing_caller.qualified_name)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .incoming_edges(local_target_after.id, Some("USAGE"), 10)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != missing_caller_after.id),
+            "full refresh removes a stale v6 false-positive edge"
+        );
+        let preserved_vectors: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vector_embeddings WHERE project='test' AND graph_generation=?1 AND file_path IN ('src/unrelated.py', 'src/channels/command.rs')",
+                rusqlite::params![migration.graph_generation as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved_vectors, 0,
+            "old node-bound vectors are retired with the incompatible declaration cache"
+        );
+        for (qualified_name, content_sha256) in [
+            (
+                "src/unrelated.py::Function::untouched",
+                "79e7f0faa5c096d71e2144fed19041c227465b02667a95b613c0ecd4648e1a03",
+            ),
+            (
+                "src/channels/command.rs::Function::target",
+                "0126ac6c598444305c31117e8a38a15cb496335cbd34fb503dfd331926e93fb7",
+            ),
+        ] {
+            let reusable = store
+                .find_reusable_vector_embedding(&greppy_store::ReusableVectorEmbeddingKey {
+                    project: "test",
+                    model_id: "fixture-model",
+                    prompt_version: "v1",
+                    task: "code",
+                    qualified_name,
+                    chunk_idx: 0,
+                    content_sha256,
+                })
+                .unwrap();
+            assert!(
+                reusable.is_none(),
+                "old node-bound vectors must not certify fresh declarations"
+            );
+        }
+        let clean = index_with_options(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions {
+                only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(clean.files_indexed, 0, "the next sparse run is clean");
+    }
+
+    #[test]
+    fn rust_crate_root_under_src_core_resolves_calls_and_function_items() {
+        let repo = setup_multifile_repo(
+            "rust-crate-root-under-src-core",
+            "// ordinary source root remains in the fixture\n",
+            "// ordinary source root remains in the fixture\n",
+        );
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"src-core-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"fixture\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join("src/core/mission/channels")).unwrap();
+        fs::create_dir_all(repo.join("src/core/business_os")).unwrap();
+        fs::write(
+            repo.join("src/core/main.rs"),
+            "mod mission; mod business_os;\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
+        fs::write(
+            repo.join("src/core/mission/channels/mod.rs"),
+            "pub fn direct_target() {}\npub fn alternate_target() {}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/core/business_os/mod.rs"), "pub mod store;\n").unwrap();
+        fs::write(
+            repo.join("src/core/business_os/store.rs"),
+            "use crate::mission::channels;\n\
+             pub fn direct_caller() { channels::direct_target(); }\n\
+             pub fn function_item_caller(flag: bool) {\n\
+                 let selected = if flag { channels::direct_target } else { channels::alternate_target };\n\
+                 selected();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+
+        let direct_target = store
+            .get_node_by_qname(
+                "test",
+                "src/core/mission/channels/mod.rs::Function::direct_target",
+            )
+            .unwrap()
+            .expect("direct target");
+        let alternate_target = store
+            .get_node_by_qname(
+                "test",
+                "src/core/mission/channels/mod.rs::Function::alternate_target",
+            )
+            .unwrap()
+            .expect("alternate target");
+        let direct_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/core/business_os/store.rs::Function::direct_caller",
+            )
+            .unwrap()
+            .expect("direct caller");
+        let function_item_caller = store
+            .get_node_by_qname(
+                "test",
+                "src/core/business_os/store.rs::Function::function_item_caller",
+            )
+            .unwrap()
+            .expect("function-item caller");
+
+        assert!(
+            store
+                .incoming_edges(direct_target.id, Some("CALLS"), 10)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == direct_caller.id),
+            "crate-root direct call under src/core must resolve"
+        );
+        for target in [direct_target, alternate_target] {
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("USAGE"), 10)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.source_id == function_item_caller.id),
+                "crate-root function item under src/core must resolve: {}",
+                target.qualified_name
+            );
+        }
+    }
+
+    #[test]
+    fn rust_crate_root_uncovered_manifest_member_preserves_conventional_layout() {
+        let roots = std::collections::HashSet::from(["other/src/lib.rs".to_string()]);
+        let files = rust_module_files_for_module_path_with_crate_roots(
+            "crates/widget/src/nested/caller.rs",
+            "crate::helpers",
+            Some(&roots),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "crates/widget/src/helpers.rs".to_string(),
+                "crates/widget/src/helpers/mod.rs".to_string(),
+                "crates/widget/src/helpers/lib.rs".to_string(),
+                "crates/widget/src/helpers/main.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_enum_variants_resolve_constructors_patterns_and_exact_owners() {
+        let repo = setup_repo(
+            "enum-variant-references",
+            r#"
+mod caller;
+mod foreign;
+use crate::foreign::Remote as Renamed;
+pub fn unimported() { let _ = Remote::Halt; }
+pub fn remote_alias() { let _ = Renamed::Halt; }
+pub enum Instruction { AddImmediateByte { amount: u8 }, Tuple(u8), Halt }
+pub enum Other { AddImmediateByte { amount: u8 } }
+pub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }
+pub fn state(value: Instruction) -> u8 {
+    match value { Instruction::AddImmediateByte { amount } => amount, _ => 0 }
+}
+pub fn tuple() -> Instruction { Instruction::Tuple(1) }
+pub fn unit() -> Instruction { Instruction::Halt }
+pub fn function_item() { let _ = Instruction::Tuple; }
+pub fn other() -> Other { Other::AddImmediateByte { amount: 1 } }
+pub fn missing() { let _ = missing::Instruction::AddImmediateByte { amount: 1 }; }
+impl Instruction {
+    pub fn self_pattern(&self) -> u8 {
+        match self { Self::AddImmediateByte { amount } => *amount, _ => 0 }
+    }
+}
+"#,
+        );
+        fs::write(
+            repo.join("src/caller.rs"),
+            r#"
+use crate::Instruction as Opcode;
+pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
+"#,
+        )
+        .unwrap();
+        fs::write(repo.join("src/foreign.rs"), "pub enum Remote { Halt }\n").unwrap();
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        for (target, callers) in [
+            (
+                "src/lib.rs::Instruction::AddImmediateByte",
+                vec![
+                    ("src/lib.rs::Function::decode", "USAGE"),
+                    ("src/lib.rs::Function::state", "USAGE"),
+                    ("src/lib.rs::Instruction::self_pattern", "USAGE"),
+                    ("src/caller.rs::Function::aliased", "USAGE"),
+                ],
+            ),
+            (
+                "src/lib.rs::Instruction::Tuple",
+                vec![
+                    ("src/lib.rs::Function::tuple", "CALLS"),
+                    ("src/lib.rs::Function::function_item", "USAGE"),
+                ],
+            ),
+            (
+                "src/lib.rs::Instruction::Halt",
+                vec![("src/lib.rs::Function::unit", "USAGE")],
+            ),
+            (
+                "src/lib.rs::Other::AddImmediateByte",
+                vec![("src/lib.rs::Function::other", "USAGE")],
+            ),
+        ] {
+            let target = store
+                .get_node_by_qname("test", target)
+                .unwrap()
+                .expect("enum variant");
+            for (source, edge_type) in callers {
+                let source = store
+                    .get_node_by_qname("test", source)
+                    .unwrap()
+                    .expect("caller");
+                assert!(
+                    store
+                        .incoming_edges(target.id, Some(edge_type), 20)
+                        .unwrap()
+                        .iter()
+                        .any(|edge| edge.source_id == source.id),
+                    "missing {edge_type} {} -> {}; direct member={:?}; raw={:?}",
+                    source.qualified_name,
+                    target.qualified_name,
+                    GraphIndex::load(&store, "test")
+                        .unwrap()
+                        .resolve_associated_member(
+                            source.id,
+                            "Instruction::AddImmediateByte",
+                            "AddImmediateByte",
+                            &["EnumVariant"]
+                        ),
+                    load_all_raw_edges(&store, "test")
+                        .unwrap()
+                        .into_iter()
+                        .filter(|edge| edge.source_qualified_name == source.qualified_name)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let remote = store
+            .get_node_by_qname("test", "src/foreign.rs::Remote::Halt")
+            .unwrap()
+            .unwrap();
+        let imported = store
+            .get_node_by_qname("test", "src/lib.rs::Function::remote_alias")
+            .unwrap()
+            .unwrap();
+        let unimported = store
+            .get_node_by_qname("test", "src/lib.rs::Function::unimported")
+            .unwrap()
+            .unwrap();
+        let edges = store.incoming_edges(remote.id, Some("USAGE"), 20).unwrap();
+        assert!(edges.iter().any(|edge| edge.source_id == imported.id));
+        assert!(
+            edges.iter().all(|edge| edge.source_id != unimported.id),
+            "a unique cross-file enum is not an in-scope binding"
+        );
+        let missing = store
+            .get_node_by_qname("test", "src/lib.rs::Function::missing")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .outgoing_edges(missing.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty(),
+            "an unknown qualified owner must not bind to a same-name local enum; resolved={:?}; raw={:?}",
+            store.outgoing_edges(missing.id, Some("USAGE"), 20).unwrap(),
+            load_all_raw_edges(&store, "test")
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.source_qualified_name == missing.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        let other = store
+            .get_node_by_qname("test", "src/lib.rs::Function::other")
+            .unwrap()
+            .unwrap();
+        let instruction = store
+            .get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .incoming_edges(instruction.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != other.id),
+            "same-name variants retain their enum ownership"
+        );
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE target_id = ?1 AND edge_type IN ('CALLS', 'USAGE')",
+                [instruction.id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key = ?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v3','complete')", []).unwrap();
+        store.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(
+            !store
+                .incoming_edges(instruction.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty(),
+            "an unchanged older store recovers omitted constructor raw references"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
+        let repo = setup_repo(
+            "constructor-recovery",
+            "pub enum Instruction { AddImmediateByte { amount: u8 } }\npub fn decode() -> Instruction { Instruction::AddImmediateByte { amount: 1 } }\npub fn amount() {}\npub fn valid() { let _ = amount; }\n",
+        );
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("DELETE FROM raw_edges WHERE target_qname LIKE '%AddImmediateByte%' AND edge_type='USAGE'", []).unwrap();
+            let decode = base
+                .get_node_by_qname("test", "src/lib.rs::Function::decode")
+                .unwrap()
+                .unwrap();
+            let amount = base
+                .get_node_by_qname("test", "src/lib.rs::Function::amount")
+                .unwrap()
+                .unwrap();
+            base.insert_raw_edges(&[NewRawEdge {
+                project: "test".into(),
+                file_path: "src/lib.rs".into(),
+                source_qname: decode.qualified_name.clone(),
+                target_qname: amount.qualified_name.clone(),
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount", "line": 2}),
+            }])
+            .unwrap();
+            base.insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: decode.id,
+                target_id: amount.id,
+                edge_type: "USAGE".into(),
+                properties: serde_json::json!({"ref_name": "amount"}),
+            })
+            .unwrap();
+            base.conn().execute("DELETE FROM edges WHERE target_id IN (SELECT id FROM nodes WHERE name='AddImmediateByte')", []).unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+        }
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let states_before = overlay.list_file_states("test").unwrap();
+        let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
+        let base_raw_before = format!(
+            "{:?}",
+            Store::open(&base_path)
+                .unwrap()
+                .list_raw_edges("test")
+                .unwrap()
+        );
+        let original = fs::read(repo.join("src/lib.rs")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::remove_file(repo.join("src/lib.rs")).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::write(repo.join("src/lib.rs"), original).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        let target = overlay
+            .get_node_by_qname("test", "src/lib.rs::Instruction::AddImmediateByte")
+            .unwrap()
+            .unwrap();
+        let caller = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::decode")
+            .unwrap()
+            .unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        let amount = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::amount")
+            .unwrap()
+            .unwrap();
+        let valid = overlay
+            .get_node_by_qname("test", "src/lib.rs::Function::valid")
+            .unwrap()
+            .unwrap();
+        let usages = overlay
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap();
+        assert!(
+            usages.iter().all(|edge| edge.source_id != caller.id),
+            "obsolete struct field label must not resolve to a free function; usages={usages:?}; raw={:?}; mask={:?}",
+            overlay.list_raw_edges("test").unwrap(),
+            overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |row| row.get::<_, String>(0))
+        );
+        assert!(
+            usages.iter().any(|edge| edge.source_id == valid.id),
+            "legitimate raw usage remains visible"
+        );
+        assert!(
+            overlay
+                .outgoing_edges(caller.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.target_id != amount.id),
+            "typed outgoing queries must honor the same repair mask as incoming queries"
+        );
+        assert!(overlay
+            .outgoing_edges(valid.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.target_id == amount.id));
+        assert!(
+            overlay.list_delta_raw_edges("test").unwrap().is_empty(),
+            "Base compatibility repair must not enter sparse raw re-resolution"
+        );
+        assert_eq!(
+            recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
+            0
+        );
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert_eq!(overlay.list_file_states("test").unwrap(), states_before);
+        assert_eq!(
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()),
+            nodes_before
+        );
+        rebuild_overlay_edges(&mut overlay, "test").unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        let usages = overlay
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap();
+        assert!(usages.iter().all(|edge| edge.source_id != caller.id));
+        assert!(usages.iter().any(|edge| edge.source_id == valid.id));
+        drop(overlay);
+        // Persisted override works after a normal overlay reopen too.
+        let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert!(reopened
+            .incoming_edges(amount.id, Some("USAGE"), 20)
+            .unwrap()
+            .iter()
+            .all(|edge| edge.source_id != caller.id));
+        drop(reopened);
+        let base = Store::open(&base_path).unwrap();
+        assert_eq!(
+            format!("{:?}", base.list_raw_edges("test").unwrap()),
+            base_raw_before,
+            "all immutable Base raw edges are preserved exactly"
+        );
+        drop(base);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn cargo_library_paths_resolve_grouped_alias_and_example_callers() {
+        for (manifest_lib, library_file, library_name) in [
+            ("", "src/lib.rs", "vcop2_tools"),
+            (
+                "[lib]\nname = \"tool_api\"\npath = \"./engine/entry.rs\"\n",
+                "engine/entry.rs",
+                "tool_api",
+            ),
+        ] {
+            let repo = setup_repo("cargo-library-callers", "// conventional source\n");
+            fs::write(repo.join("Cargo.toml"), format!("[package]\nname = \"vcop2-tools\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{manifest_lib}")).unwrap();
+            let library_parent = Path::new(library_file).parent().unwrap();
+            fs::create_dir_all(repo.join(library_parent)).unwrap();
+            fs::write(
+                repo.join(library_file),
+                "pub mod m68000_aot; pub fn root_target() {}\n",
+            )
+            .unwrap();
+            let target_file = library_parent.join("m68000_aot.rs");
+            fs::write(
+                repo.join(&target_file),
+                "pub fn compile() {}\npub fn compile_reachable() {}\n",
+            )
+            .unwrap();
+            fs::create_dir_all(repo.join("tests")).unwrap();
+            fs::create_dir_all(repo.join("examples")).unwrap();
+            fs::write(repo.join("tests/grouped.rs"), format!("use {library_name}::m68000_aot::{{compile, compile_reachable as reach}};\nfn grouped() {{ compile(); reach(); }}\n")).unwrap();
+            fs::write(repo.join("tests/module.rs"), format!("use {library_name}::m68000_aot as engine;\nfn module_alias() {{ engine::compile(); }}\n")).unwrap();
+            fs::write(repo.join("tests/library.rs"), format!("use {library_name} as api;\nfn library_alias() {{ api::m68000_aot::compile(); }}\n")).unwrap();
+            fs::write(repo.join("examples/qualified.rs"), format!("fn example() {{ {library_name}::m68000_aot::compile(); {library_name}::root_target(); }}\nfn function_item() {{ let _ = {library_name}::m68000_aot::compile_reachable; }}\n")).unwrap();
+            fs::write(repo.join("tests/external.rs"), "use external_crate::m68000_aot::compile;\nfn external() { compile(); external_crate::m68000_aot::compile(); }\n").unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let target = store
+                .get_node_by_qname(
+                    "test",
+                    &format!("{}::Function::compile", target_file.to_string_lossy()),
+                )
+                .unwrap()
+                .unwrap();
+            for (file, caller) in [
+                ("tests/grouped.rs", "grouped"),
+                ("tests/module.rs", "module_alias"),
+                ("tests/library.rs", "library_alias"),
+                ("examples/qualified.rs", "example"),
+            ] {
+                let caller = store
+                    .get_node_by_qname("test", &format!("{file}::Function::{caller}"))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    store
+                        .outgoing_edges(caller.id, Some("CALLS"), 20)
+                        .unwrap()
+                        .iter()
+                        .any(|edge| edge.target_id == target.id),
+                    "missing Cargo library caller in {file}"
+                );
+            }
+            let external = store
+                .get_node_by_qname("test", "tests/external.rs::Function::external")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .outgoing_edges(external.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty(),
+                "external crate must not resolve by basename"
+            );
+            let reachable = store
+                .get_node_by_qname(
+                    "test",
+                    &format!(
+                        "{}::Function::compile_reachable",
+                        target_file.to_string_lossy()
+                    ),
+                )
+                .unwrap()
+                .unwrap();
+            let item = store
+                .get_node_by_qname("test", "examples/qualified.rs::Function::function_item")
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .outgoing_edges(item.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.target_id == reachable.id));
+            let grouped = store
+                .get_node_by_qname("test", "tests/grouped.rs::Function::grouped")
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .outgoing_edges(grouped.id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.target_id == reachable.id));
+            let root = store
+                .get_node_by_qname("test", &format!("{library_file}::Function::root_target"))
+                .unwrap()
+                .unwrap();
+            assert!(!store
+                .incoming_edges(root.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                index(&mut store, &repo, "test").unwrap().files_indexed,
+                0,
+                "unchanged Cargo metadata must preserve incremental extraction"
+            );
+            let stores = tempfile::tempdir().unwrap();
+            let base_path = stores.path().join("base.db");
+            let delta_path = stores.path().join("delta.db");
+            {
+                let mut base = Store::open(&base_path).unwrap();
+                index(&mut base, &repo, "test").unwrap();
+                // Simulate an old resolver: retain raw edges and all nodes,
+                // but remove the previously missing Cargo library relations.
+                base.conn()
+                    .execute(
+                        "DELETE FROM edges WHERE edge_type IN ('CALLS', 'USAGE', 'IMPORTS')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let visibility =
+                greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new())
+                    .unwrap();
+            let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let before = overlay
+                .list_nodes_by_label("test", "Function", 100)
+                .unwrap();
+            rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+            let repaired_target = overlay
+                .get_node_by_qname("test", &target.qualified_name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                overlay
+                    .incoming_edges(repaired_target.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert!(
+                overlay.list_private_file_states("test").unwrap().is_empty(),
+                "repair must not copy Base file state into Delta"
+            );
+            assert_eq!(
+                overlay
+                    .list_nodes_by_label("test", "Function", 100)
+                    .unwrap()
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>(),
+                before.iter().map(|node| node.id).collect::<Vec<_>>(),
+                "repair must preserve cached node identities"
+            );
+            rebuild_overlay_edges(&mut overlay, "test").unwrap();
+            assert_eq!(
+                overlay
+                    .incoming_edges(repaired_target.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .len(),
+                4,
+                "ordinary sparse rebuild preserves the one-shot repair"
+            );
+            drop(overlay);
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn cargo_library_name_does_not_override_a_local_binary_module() {
+        let repo = setup_repo("cargo-library-shadowing", "pub fn compile() {}\n");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"tools\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/main.rs"),
+            "mod tools; fn main() { tools::compile(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/tools.rs"), "pub fn compile() {}\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/main.rs::Function::main")
+            .unwrap()
+            .unwrap();
+        let local = store
+            .get_node_by_qname("test", "src/tools.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let library = store
+            .get_node_by_qname("test", "src/lib.rs::Function::compile")
+            .unwrap()
+            .unwrap();
+        let edges = store.outgoing_edges(caller.id, Some("CALLS"), 20).unwrap();
+        assert!(edges.iter().any(|edge| edge.target_id == local.id));
+        assert!(edges.iter().all(|edge| edge.target_id != library.id));
+        assert!(
+            rust_caller_edges_repaired(&store).unwrap(),
+            "fresh index already uses current resolver"
+        );
+        reset_reresolve_counter();
+        let unchanged = index(&mut store, &repo, "test").unwrap();
+        assert_eq!(unchanged.files_indexed, 0);
+        assert_eq!(
+            reresolve_count(),
+            0,
+            "current unchanged index must not repeat repair"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn cargo_library_resolution_does_not_guess_ambiguous_modules_or_other_packages() {
+        let repo = setup_repo("cargo-library-negative", "pub mod engine;\n");
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"tools\"\nversion = \"0.1.0\"\n[workspace]\nmembers = [\"binary\"]\n").unwrap();
+        fs::create_dir_all(repo.join("src/engine")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(repo.join("src/engine.rs"), "pub fn compile() {}\n").unwrap();
+        fs::write(repo.join("src/engine/mod.rs"), "pub fn compile() {}\n").unwrap();
+        fs::write(
+            repo.join("tests/ambiguous.rs"),
+            "fn ambiguous() { tools::engine::compile(); }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join("binary/src")).unwrap();
+        fs::write(
+            repo.join("binary/Cargo.toml"),
+            "[package]\nname = \"binary\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("binary/src/main.rs"),
+            "fn unrelated() { tools::engine::compile(); }\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        for qname in [
+            "tests/ambiguous.rs::Function::ambiguous",
+            "binary/src/main.rs::Function::unrelated",
+        ] {
+            let caller = store.get_node_by_qname("test", qname).unwrap().unwrap();
+            assert!(store
+                .outgoing_edges(caller.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty());
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn cargo_manifest_targets_cover_workspace_custom_and_implicit_bins() {
+        let repo = tempfile::tempdir().unwrap();
+        let custom = repo.path().join("custom");
+        let implicit = repo.path().join("implicit");
+        fs::create_dir_all(custom.join("src/core")).unwrap();
+        fs::create_dir_all(custom.join("src/core/decoy")).unwrap();
+        fs::create_dir_all(implicit.join("src/bin/nested")).unwrap();
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            custom.join("Cargo.toml"),
+            "[package]\nname = \"custom\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"custom\"\npath = \"src/core/main.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            implicit.join("Cargo.toml"),
+            "[package]\nname = \"implicit\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        for path in [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ] {
+            fs::write(repo.path().join(path), "fn item() {}\n").unwrap();
+        }
+        let known_files = [
+            "custom/src/core/main.rs",
+            "custom/src/core/decoy/main.rs",
+            "implicit/src/main.rs",
+            "implicit/src/bin/tool.rs",
+            "implicit/src/bin/nested/main.rs",
+            "implicit/src/bin/nested/helper.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut roots = std::collections::HashSet::new();
+        // Match the production caller, which canonicalizes the repository
+        // before comparing canonical Cargo targets (TMPDIR may be an alias).
+        let repository_root = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(rust_crate_roots_from_manifest(
+            &repository_root.join("Cargo.toml"),
+            &repository_root,
+            &known_files,
+            &mut roots,
+            &mut Vec::new(),
+            &mut std::collections::HashSet::new(),
+        ));
+        assert!(roots.contains("custom/src/core/main.rs"));
+        assert!(!roots.contains("custom/src/core/decoy/main.rs"));
+        assert!(roots.contains("implicit/src/main.rs"));
+        assert!(roots.contains("implicit/src/bin/tool.rs"));
+        assert!(roots.contains("implicit/src/bin/nested/main.rs"));
+        assert!(!roots.contains("implicit/src/bin/nested/helper.rs"));
     }
 
     #[test]
@@ -5742,6 +10071,965 @@ def Widget():
             "edge resolution must scale ~linearly; 4x input took {ratio:.2}x work \
              (quadratic would be ~16x). w1={w1}, w4={w4}"
         );
+    }
+
+    fn receiver_resolution_work(n: usize) -> usize {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(
+                store
+                    .insert_node(&NewNode {
+                        project: "p".into(),
+                        label: "Method".into(),
+                        name: format!("method{i}"),
+                        qualified_name: format!("src/m{i}.rs::Owner{i}::method{i}"),
+                        file_path: format!("src/m{i}.rs"),
+                        start_line: 1,
+                        end_line: 2,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap(),
+            );
+        }
+        let index = GraphIndex::load(&store, "p").unwrap();
+        reset_edge_resolution_work_counter();
+        for (i, id) in ids.into_iter().enumerate() {
+            assert_eq!(
+                index.resolve_receiver_method(
+                    "src/caller.rs",
+                    &format!("Owner{i}"),
+                    &format!("method{i}")
+                ),
+                Some(id)
+            );
+        }
+        edge_resolution_work_count()
+    }
+
+    #[test]
+    fn cross_file_receiver_resolution_avoids_project_wide_scans() {
+        let small = receiver_resolution_work(1000);
+        let large = receiver_resolution_work(4000);
+        assert!(
+            large < small * 5,
+            "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically"
+        );
+    }
+
+    const OPTION_FIELD_CALLER: &str = r#"
+mod scene;
+pub fn load_scene() {
+    let manifest: crate::scene::Manifest = opaque();
+    let gi_matrix: Option<[f32;16]> = None;
+    match (manifest.remaster_irradiance.as_ref(), gi_matrix) {
+        (Some(field), Some(matrix)) => { field.storage(); field.uniform(matrix); },
+        _ => (),
+    }
+}
+"#;
+    const OPTION_FIELD_SCENE: &str = r#"
+pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }
+pub struct IrradianceField;
+impl IrradianceField {
+    pub fn storage(&self) {}
+    pub fn uniform(&self, matrix: [f32;16]) {}
+}
+pub struct Other;
+impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
+"#;
+
+    fn assert_option_field_caller(store: &Store, target: &str, present: bool) {
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+            .unwrap()
+            .unwrap();
+        let method = store.get_node_by_qname("test", target).unwrap().unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 100)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id),
+            present,
+            "{target}"
+        );
+    }
+
+    #[test]
+    fn option_field_tuple_receiver_resolves_across_files_and_tracks_declared_type_changes() {
+        let repo = setup_repo("option-field-tuple", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
+        assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
+        // Same Field identity but different payload: unchanged caller facts must
+        // be re-resolved, not incorrectly retained by the body-edit fast path.
+        fs::write(
+            repo.join("src/scene.rs"),
+            OPTION_FIELD_SCENE.replace(
+                "Option<crate::scene::IrradianceField>",
+                "Option<crate::scene::Other>",
+            ),
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert_option_field_caller(&store, "src/scene.rs::Other::uniform", true);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_receiver_preserves_owner_ambiguity_and_shadowing() {
+        for (label, caller, scene) in [
+            ("opaque-wildcard", OPTION_FIELD_CALLER.replace(
+                "mod scene;", "mod scene; use custom::*;"), OPTION_FIELD_SCENE.to_string()),
+            ("opaque-consuming-trait", OPTION_FIELD_CALLER.replace(
+                "mod scene;", "mod scene; trait Consume { fn as_ref(self) -> Option<crate::scene::Other>; } impl Consume for Option<crate::scene::IrradianceField> { fn as_ref(self) -> Option<crate::scene::Other> { None } }"), OPTION_FIELD_SCENE.to_string()),
+            ("late-value-item", OPTION_FIELD_CALLER.replace(
+                "{ field.storage(); field.uniform(matrix); }", "{ field.storage(); field.uniform(matrix); const field: crate::scene::Other = crate::scene::Other; }"), OPTION_FIELD_SCENE.to_string()),
+            ("shadowed-base", OPTION_FIELD_CALLER.replace(
+                "let gi_matrix:", "let manifest = opaque(); let gi_matrix:"), OPTION_FIELD_SCENE.to_string()),
+            ("generic-base", OPTION_FIELD_CALLER.replace(
+                "let manifest: crate::scene::Manifest", "let manifest: Manifest").replace("pub fn load_scene()", "pub fn load_scene<Manifest>()"), OPTION_FIELD_SCENE.to_string()),
+            ("ambiguous-owner", OPTION_FIELD_CALLER.replace(
+                "mod scene;", "mod scene; use crate::scene::Manifest; use crate::other::Manifest; mod other;").replace("let manifest: crate::scene::Manifest", "let manifest: Manifest"), OPTION_FIELD_SCENE.to_string()),
+            ("ambiguous-payload", OPTION_FIELD_CALLER.to_string(), OPTION_FIELD_SCENE.replace(
+                "IrradianceField", "LocalField").replace(
+                "pub struct Manifest", "use crate::other::IrradianceField; use crate::foreign::IrradianceField; pub struct Manifest").replace(
+                "Option<crate::scene::LocalField>", "Option<IrradianceField>")),
+            ("custom-option", OPTION_FIELD_CALLER.to_string(), OPTION_FIELD_SCENE.replace(
+                "pub struct Manifest", "pub enum Option<T> { Some(T), None } pub struct Manifest")),
+        ] {
+            let repo = setup_repo(label, &caller);
+            fs::write(repo.join("src/scene.rs"), scene).unwrap();
+            fs::write(repo.join("src/other.rs"), "pub struct Manifest { pub remaster_irradiance: Option<IrradianceField> } pub struct IrradianceField; impl IrradianceField { pub fn uniform(&self) {} }").unwrap();
+            fs::write(repo.join("src/foreign.rs"), "pub struct IrradianceField; impl IrradianceField { pub fn uniform(&self) {} }").unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let caller = store.get_node_by_qname("test", "src/lib.rs::Function::load_scene").unwrap().unwrap();
+            assert!(store.outgoing_edges(caller.id, Some("CALLS"), 100).unwrap().iter().all(|edge| {
+                store.get_node(edge.target_id).unwrap().unwrap().name != "uniform"
+            }), "{label}: ownership must remain unresolved");
+            let unresolved_uniform = store.outgoing_edges(caller.id, Some("UNRESOLVED_CALLS"), 100).unwrap().into_iter().any(|edge| {
+                store.get_node(edge.target_id).unwrap().unwrap().name == "uniform"
+            });
+            // A wildcard leaves one declared candidate unproven. A consuming
+            // adapter, shadow, or ambiguous owner is not a candidate at all.
+            assert_eq!(unresolved_uniform, label == "opaque-wildcard", "{label}");
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_upgrade_reextracts_unchanged_trait_receiver_facts() {
+        for prior_version in ["greppy-indexer-v7", "greppy-indexer-v8"] {
+            let repo = setup_repo(
+                &format!("{prior_version}-trait-receiver-upgrade"),
+                "pub trait HttpTransport: Send + Sync { fn execute(&self); }\n",
+            );
+            fs::write(repo.join("src/changed.rs"), "pub fn changed() {}\n").unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let source_before = store.list_file_states("test").unwrap();
+            store.conn().execute(
+            "UPDATE nodes SET properties=json_remove(properties, '$.has_bounds', '$.as_ref_receiver') WHERE label='Interface'",
+            [],
+        ).unwrap();
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            store.conn().execute(
+            "INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')",
+            [],
+        ).unwrap();
+            let root = greppy_discover::detect_repo_root(&repo).unwrap();
+            let mut state = store
+                .get_workspace_state(root.to_string_lossy().as_ref())
+                .unwrap()
+                .unwrap();
+            state.indexer_version = prior_version.into();
+            store.upsert_workspace_state(&state).unwrap();
+            assert!(recover_persisted_rust_usages(&mut store, "test", &repo)
+                .unwrap_err()
+                .to_string()
+                .contains("trait receiver facts"));
+
+            fs::write(
+                repo.join("src/changed.rs"),
+                "pub fn changed() { let value = 1; }\n",
+            )
+            .unwrap();
+            let options = IndexOptions {
+                only_paths: Some(["src/changed.rs".to_string()].into_iter().collect()),
+                ..IndexOptions::default()
+            };
+            let upgrade = index_with_options(&mut store, &repo, "test", &options).unwrap();
+            assert_eq!(
+                upgrade.files_indexed, 2,
+                "unchanged source requires fresh declaration nodes"
+            );
+            let node = store
+                .get_node_by_qname("test", "src/lib.rs::Interface::HttpTransport")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                node.properties.get("has_bounds"),
+                Some(&serde_json::json!(1))
+            );
+            assert_eq!(
+                store
+                    .list_file_states("test")
+                    .unwrap()
+                    .into_iter()
+                    .find(|state| state.rel_path == "src/lib.rs")
+                    .unwrap()
+                    .sha256,
+                source_before
+                    .into_iter()
+                    .find(|state| state.rel_path == "src/lib.rs")
+                    .unwrap()
+                    .sha256
+            );
+            assert!(rust_caller_edges_repaired(&store).unwrap());
+            assert_eq!(index(&mut store, &repo, "test").unwrap().files_indexed, 0);
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn option_field_recovery_rejects_stale_declared_facts_without_certifying_base() {
+        let repo = setup_repo("option-field-stale-facts", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        store.conn().execute("UPDATE nodes SET properties=json_remove(properties,'$.return_type') WHERE label='Field'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let before = store.list_raw_edges("test").unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared field facts"), "{error}");
+        assert_eq!(store.list_raw_edges("test").unwrap(), before);
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_caller_recovery_refreshes_old_raw_facts_without_base_ownership() {
+        let repo = setup_repo("option-field-cache", OPTION_FIELD_CALLER);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            base.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v6','complete')", []).unwrap();
+            // The single-store upgrade also re-extracts, not merely re-resolves
+            // the stale receiver facts, and does not accept a v6 completion.
+            assert!(!rust_caller_edges_repaired(&base).unwrap());
+            rebuild_single_store_rust_edges(&mut base, "test").unwrap();
+            assert_option_field_caller(&base, "src/scene.rs::IrradianceField::uniform", true);
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+            base.conn()
+                .execute("DELETE FROM edges WHERE edge_type='CALLS'", [])
+                .unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+            let caller = base
+                .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+                .unwrap()
+                .unwrap();
+            let wrong = base
+                .get_node_by_qname("test", "src/scene.rs::Other::uniform")
+                .unwrap()
+                .unwrap();
+            base.insert_edge(&NewEdge {
+                project: "test".into(),
+                source_id: caller.id,
+                target_id: wrong.id,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        }
+        let base_before = fs::read(&base_path).unwrap();
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = fs::read(repo.join("src/scene.rs")).unwrap();
+        fs::write(repo.join("src/scene.rs"), "// drift\n").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        fs::write(repo.join("src/scene.rs"), original).unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        assert_option_field_caller(&overlay, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&overlay, "src/scene.rs::Other::uniform", false);
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        drop(overlay);
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        let mut reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        assert_option_field_caller(&reopened, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&reopened, "src/scene.rs::Other::uniform", false);
+        rebuild_overlay_edges(&mut reopened, "test").unwrap();
+        assert_option_field_caller(&reopened, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&reopened, "src/scene.rs::Other::uniform", false);
+        assert!(recover_persisted_rust_usages(&mut reopened, "test", &repo).unwrap() == 0);
+        drop(reopened);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn receiver_method_name_index_preserves_owner_and_ambiguity() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+        let mut ids = Vec::new();
+        for (file, owner, label) in [
+            ("src/a.rs", "Buffer", "Method"),
+            ("src/b.rs", "Buffer", "Method"),
+            ("src/c.rs", "Other", "Method"),
+            ("src/d.rs", "Buffer", "Function"),
+        ] {
+            ids.push(
+                store
+                    .insert_node(&NewNode {
+                        project: "p".into(),
+                        label: label.into(),
+                        name: "as_bytes".into(),
+                        qualified_name: format!("{file}::{owner}::as_bytes"),
+                        file_path: file.into(),
+                        start_line: 1,
+                        end_line: 2,
+                        properties: serde_json::json!({}),
+                    })
+                    .unwrap(),
+            );
+        }
+        let index = GraphIndex::load(&store, "p").unwrap();
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Buffer", "as_bytes"),
+            None
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/a.rs", "Buffer", "as_bytes"),
+            Some(ids[0])
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Other", "as_bytes"),
+            Some(ids[2])
+        );
+        assert_eq!(
+            index.resolve_receiver_method("src/caller.rs", "Missing", "as_bytes"),
+            None
+        );
+    }
+
+    fn option_edge_names(store: &Store, caller: &str, edge_type: &str) -> Vec<String> {
+        let caller = store.get_node_by_qname("test", caller).unwrap().unwrap();
+        let mut names = store
+            .outgoing_edges(caller.id, Some(edge_type), 100)
+            .unwrap()
+            .into_iter()
+            .map(|edge| store.get_node(edge.target_id).unwrap().unwrap().name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn option_unresolved_reasons(store: &Store) -> String {
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::load_scene")
+            .unwrap()
+            .unwrap();
+        store
+            .outgoing_edges(caller.id, Some("UNRESOLVED_CALLS"), 100)
+            .unwrap()
+            .into_iter()
+            .map(|edge| {
+                edge.properties
+                    .get("unresolved_reasons")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn option_field_named_imports_resolve_without_treating_opaque_scopes_as_callers() {
+        let proven = r#"
+mod scene;
+use crate::scene::Manifest;
+use std::collections::BTreeMap;
+#[allow(unused)]
+pub fn load_scene() {
+    println!("load");
+    let manifest: Manifest = opaque();
+    let _table: BTreeMap<String, u8> = BTreeMap::new();
+    let gi_matrix: Option<[f32; 16]> = None;
+    match (manifest.remaster_irradiance.as_ref(), gi_matrix) {
+        (Some(field), Some(matrix)) => { field.storage(); field.uniform(matrix); }
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-named-import", proven);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
+        assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .is_empty());
+        fs::remove_dir_all(repo).unwrap();
+
+        let alias = proven
+            .replace(
+                "use crate::scene::Manifest;",
+                "use crate::scene::Manifest as SceneManifest;",
+            )
+            .replace("let manifest: Manifest", "let manifest: SceneManifest");
+        let repo = setup_repo("option-field-alias", &alias);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .is_empty());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_original_import_shape_is_unresolved_not_a_caller() {
+        let caller = r#"
+mod scene;
+use crate::scene::{Manifest, VERTEX_STRIDE};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use wasm_bindgen::{JsCast, prelude::*};
+use wgpu::util::DeviceExt;
+
+#[wasm_bindgen]
+pub async fn load_scene() {
+    let _ = (VERTEX_STRIDE, BTreeMap::<String, u8>::new());
+    let manifest: Manifest = opaque();
+    let gi_matrix: Option<[f32; 16]> = None;
+    match (manifest.remaster_irradiance.as_ref(), gi_matrix) {
+        (Some(field), Some(matrix)) => { field.storage(); field.uniform(matrix); }
+        _ => (),
+    }
+}
+"#;
+        let scene = OPTION_FIELD_SCENE.replace(
+            "pub struct Manifest",
+            "pub const VERTEX_STRIDE: usize = 32;\npub struct Manifest",
+        );
+        let repo = setup_repo("option-field-original-shape", caller);
+        fs::write(repo.join("src/scene.rs"), scene).unwrap();
+        let db = repo.join("graph.db");
+        {
+            let mut store = Store::open(&db).unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            assert_eq!(
+                option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .into_iter()
+                    .filter(|name| name == "uniform" || name == "storage")
+                    .count(),
+                0
+            );
+            assert_eq!(
+                option_edge_names(
+                    &store,
+                    "src/lib.rs::Function::load_scene",
+                    "UNRESOLVED_CALLS"
+                ),
+                vec!["storage".to_string(), "uniform".to_string()]
+            );
+            let reasons = option_unresolved_reasons(&store);
+            assert!(
+                reasons.contains("wildcard import wasm_bindgen::prelude"),
+                "{reasons}"
+            );
+            assert!(reasons.contains("attribute wasm_bindgen"), "{reasons}");
+            assert!(
+                reasons.contains("external import sha2::Digest"),
+                "{reasons}"
+            );
+            assert!(
+                reasons.contains("external import wgpu::util::DeviceExt"),
+                "{reasons}"
+            );
+            assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            ),
+            vec!["storage".to_string(), "uniform".to_string()]
+        );
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_field_adversarial_imports_do_not_invent_or_confirm_callers() {
+        let base = r#"
+mod scene;
+mod adapter;
+use crate::scene::Manifest;
+pub fn load_scene() {
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let cases = [
+            (
+                "consuming-import",
+                "pub trait Consume { fn as_ref(self) -> Option<crate::scene::Other>; }\n",
+                "use crate::adapter::Consume;\n",
+                false,
+            ),
+            (
+                "ref-trait-import",
+                "pub trait View { fn as_ref(&self); }\n",
+                "use crate::adapter::View;\n",
+                true,
+            ),
+            (
+                "open-trait-import",
+                "pub trait Open: core::fmt::Debug {}\n",
+                "use crate::adapter::Open;\n",
+                false,
+            ),
+            ("generic-payload", "", "", false),
+        ];
+        for (label, adapter, import, proven) in cases {
+            let mut caller = base.replace("mod adapter;\n", &format!("mod adapter;\n{import}"));
+            let mut scene = OPTION_FIELD_SCENE.to_string();
+            if label == "generic-payload" {
+                caller = OPTION_FIELD_CALLER.to_string();
+                scene = OPTION_FIELD_SCENE.replace(
+                    "pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }",
+                    "pub struct Manifest<T> { pub remaster_irradiance: Option<T> }",
+                );
+            }
+            let repo = setup_repo(&format!("option-field-{label}"), &caller);
+            fs::write(repo.join("src/scene.rs"), scene).unwrap();
+            fs::write(repo.join("src/adapter.rs"), adapter).unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            assert_eq!(
+                option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .contains(&"uniform".to_string()),
+                proven,
+                "{label}"
+            );
+            let unresolved = option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS",
+            )
+            .contains(&"uniform".to_string());
+            if label == "open-trait-import" {
+                assert!(unresolved, "{label}");
+                assert!(
+                    option_unresolved_reasons(&store).contains("trait import Open has supertraits"),
+                    "{}",
+                    option_unresolved_reasons(&store)
+                );
+            } else {
+                assert!(!unresolved, "{label}");
+            }
+            fs::remove_dir_all(repo).unwrap();
+        }
+
+        let nested = r#"
+mod scene;
+mod nested { use custom::*; }
+use crate::scene::Manifest;
+pub fn load_scene() {
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-nested-glob", nested);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert!(
+            !option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                .contains(&"uniform".to_string())
+        );
+        assert!(option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        assert!(
+            option_unresolved_reasons(&store).contains("wildcard import custom"),
+            "{}",
+            option_unresolved_reasons(&store)
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn option_unresolved_reasons_do_not_attach_to_a_different_edge() {
+        let option_edge = greppy_parser::ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: "src/lib.rs::Function::load_scene".into(),
+            target_qualified_name: "src/lib.rs::Function::uniform".into(),
+            file_path: "src/lib.rs".into(),
+            line: 10,
+            properties: serde_json::json!({"callee_name": "uniform"}),
+        };
+        let other = greppy_parser::ExtractedEdge {
+            edge_type: "CALLS".into(),
+            source_qualified_name: "src/lib.rs::Function::load_scene".into(),
+            target_qualified_name: "src/lib.rs::Function::helper".into(),
+            file_path: "src/lib.rs".into(),
+            line: 11,
+            properties: serde_json::json!({"callee_name": "helper"}),
+        };
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let leaked = new_edge("p", 1, 2, &other);
+        assert_eq!(leaked.edge_type, "CALLS");
+        assert!(leaked.properties.get("unresolved_reasons").is_none());
+        let dropped = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(dropped.edge_type, "CALLS");
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let matched = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(matched.edge_type, "UNRESOLVED_CALLS");
+        assert!(matched.properties["unresolved_reasons"]
+            .to_string()
+            .contains("wildcard import custom"));
+        clear_option_field_unresolved();
+        let cleared = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(cleared.edge_type, "CALLS");
+        let import = greppy_parser::ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: "src/lib.rs::__file__".into(),
+            target_qualified_name: "src/lib.rs::Function::Manifest".into(),
+            file_path: "src/lib.rs".into(),
+            line: 1,
+            properties: serde_json::json!({}),
+        };
+        set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
+        let imported = new_edge("p", 1, 4, &import);
+        assert_eq!(imported.edge_type, "IMPORTS");
+        let after_import = new_edge("p", 1, 3, &option_edge);
+        assert_eq!(after_import.edge_type, "CALLS");
+    }
+
+    #[test]
+    fn option_field_name_resemblance_and_shadowed_std_stay_unresolved() {
+        let proven = r#"
+mod scene;
+use crate::scene::Manifest;
+use std::collections::BTreeMap;
+#[allow(unused)]
+pub fn load_scene() {
+    println!("load");
+    let manifest: Manifest = opaque();
+    let _table: BTreeMap<String, u8> = BTreeMap::new();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let cases = [
+            (
+                "qualified-macro",
+                proven.replace("#[allow(unused)]", "helper::assert!();\n#[custom::allow]"),
+                "pub struct LocalStd;\n",
+                false,
+            ),
+            (
+                "user-println",
+                proven.replace(
+                    "pub fn load_scene()",
+                    "macro_rules! println { () => {}; }\npub fn load_scene()",
+                ),
+                "pub struct LocalStd;\n",
+                false,
+            ),
+            (
+                "shadowed-std",
+                "mod std;\n".to_string() + proven,
+                "pub struct LocalStd;\n",
+                false,
+            ),
+        ];
+        for (label, caller, std_src, _proven) in cases {
+            let repo = setup_repo(&format!("option-field-{label}"), &caller);
+            fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+            if label == "shadowed-std" {
+                fs::write(repo.join("src/std.rs"), std_src).unwrap();
+            }
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            assert!(
+                !option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
+                    .contains(&"uniform".to_string()),
+                "{label}",
+            );
+            assert!(
+                option_edge_names(
+                    &store,
+                    "src/lib.rs::Function::load_scene",
+                    "UNRESOLVED_CALLS"
+                )
+                .contains(&"uniform".to_string()),
+                "{label}",
+            );
+            let reasons = option_unresolved_reasons(&store);
+            match label {
+                "qualified-macro" => {
+                    assert!(reasons.contains("macro helper::assert"), "{reasons}");
+                    assert!(reasons.contains("attribute custom::allow"), "{reasons}");
+                }
+                "user-println" => assert!(reasons.contains("macro println"), "{reasons}"),
+                "shadowed-std" => assert!(
+                    reasons.contains("std::collections::BTreeMap") || reasons.contains("import"),
+                    "{reasons}",
+                ),
+                _ => {}
+            }
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn option_field_missing_limits_and_trait_facts_do_not_keep_stale_callers() {
+        let caller = r#"
+mod scene;
+use crate::scene::Manifest;
+use std::collections::BTreeMap;
+#[allow(unused)]
+pub fn load_scene() {
+    println!("load");
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-missing-limits", caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        store.conn().execute(
+            "UPDATE raw_edges SET properties=json_remove(properties, '$.receiver_provenance.limits') WHERE edge_type='CALLS'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type IN ('CALLS', 'UNRESOLVED_CALLS')",
+                [],
+            )
+            .unwrap();
+        let raw = load_all_raw_edges(&store, "test").unwrap();
+        resolve_edges_with_replacement(&mut store, "test", &raw, &mut |_| {}, &[], true).unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        store.conn().execute(
+            "UPDATE nodes SET properties=json_set(properties, '$.generic_payload', 1) WHERE label='Field' AND name='remaster_irradiance'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared field facts"), "{error}");
+        fs::remove_dir_all(repo).unwrap();
+
+        let trait_caller = r#"
+mod scene;
+mod adapter;
+use crate::scene::Manifest;
+use crate::adapter::View;
+pub fn load_scene() {
+    let manifest: Manifest = opaque();
+    match manifest.remaster_irradiance.as_ref() {
+        Some(field) => field.uniform(),
+        _ => (),
+    }
+}
+"#;
+        let repo = setup_repo("option-field-trait-facts", trait_caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View: core::fmt::Debug { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(
+            option_unresolved_reasons(&store).contains("trait import View has supertraits"),
+            "{}",
+            option_unresolved_reasons(&store)
+        );
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        store.conn().execute(
+            "UPDATE nodes SET properties=json_set(properties, '$.has_bounds', 1) WHERE label='Interface' AND name='View'",
+            [],
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trait receiver facts"), "{error}");
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::remove_dir_all(repo).unwrap();
+
+        let repo = setup_repo("option-field-generic-edit", trait_caller);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE).unwrap();
+        fs::write(
+            repo.join("src/adapter.rs"),
+            "pub trait View { fn as_ref(&self); }\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
+        fs::write(repo.join("src/scene.rs"), OPTION_FIELD_SCENE.replace(
+            "pub struct Manifest { pub remaster_irradiance: Option<crate::scene::IrradianceField> }",
+            "pub struct Manifest<T> { pub remaster_irradiance: Option<T> }",
+        )).unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
+        assert!(!option_edge_names(
+            &store,
+            "src/lib.rs::Function::load_scene",
+            "UNRESOLVED_CALLS"
+        )
+        .contains(&"uniform".to_string()));
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rust_caller_repair_v7_marker_is_not_current() {
+        let store = Store::open_memory().unwrap();
+        store.conn().execute(
+            "INSERT INTO schema_meta(key, value) VALUES('greppy.rust_caller_edges_repair.v7', 'complete')",
+            [],
+        ).unwrap();
+        store.conn().execute(
+            "INSERT INTO schema_meta(key, value) VALUES('greppy.rust_caller_edges_repair.v8', 'complete')",
+            [],
+        ).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
     }
 
     /// ClickHouse regression: one anonymous node from grammar error-recovery

@@ -69,18 +69,25 @@ fn read_code_flag_returns_source_and_names_the_noop() {
 }
 
 #[test]
-fn read_path_positional_returns_the_file_and_names_the_degradation() {
+fn read_path_positional_offers_indexed_symbols_instead_of_the_file() {
     let (repo, store) = indexed_workspace("read-path");
 
     let (code, stdout, stderr) = run(&repo, &store, &["read", "src/lexer.rs"]);
 
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("`src/lexer.rs` is a path; reading it as a file"),
+        stdout.contains("`src/lexer.rs` is a file — read a symbol:"),
         "{stdout}"
     );
-    assert!(stdout.contains("src/lexer.rs:1-5"), "{stdout}");
-    assert!(stdout.contains("pub struct CommentIndentation"), "{stdout}");
+    assert!(stdout.contains("CommentIndentation"), "{stdout}");
+    assert!(
+        stdout.contains("greppy read-file src/lexer.rs --lines A:B"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("pub struct CommentIndentation"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -147,7 +154,7 @@ fn empty_searches_return_bounded_statuses_and_next_actions() {
         "{path_out}"
     );
     assert!(
-        path_out.contains("source match(es) exist outside the path filter"),
+        path_out.contains("paths outside it were not scanned"),
         "{path_out}"
     );
     assert!(

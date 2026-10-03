@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "greppy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -940,12 +940,13 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "greppy-agent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "filetime",
@@ -961,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "sha2",
@@ -973,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-discover"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "ignore",
@@ -984,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-edit"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-parser",
@@ -1001,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-embed-native"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "block2",
  "bytemuck",
@@ -1025,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-freshness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-discover",
@@ -1039,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-indexer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-discover",
@@ -1051,13 +1052,15 @@ dependencies = [
  "rayon",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "toml_edit 0.22.27",
  "tracing",
 ]
 
 [[package]]
 name = "greppy-parser"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bca-tree-sitter-tcl",
  "codebook-tree-sitter-latex",
@@ -1137,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-passthrough"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-freshness",
@@ -1149,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-qwen35-native"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-embed-native",
  "rayon",
@@ -1161,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-resolver"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-parser",
@@ -1172,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-search"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
  "greppy-embed-native",
@@ -1186,9 +1189,10 @@ dependencies = [
 
 [[package]]
 name = "greppy-store"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1202,13 +1206,15 @@ dependencies = [
 name = "greppy-web-client"
 version = "0.3.3"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
 name = "greppy-workspace-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "libc",
@@ -1223,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-workspace-ffi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "greppy-workspace-core",
  "libc",
@@ -1233,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "greppy-workspace-provider"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cc",
  "clap",
@@ -3048,8 +3054,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-css"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbc5e18f29a2c6d6435891f42569525cf95435a3e01c2f1947abcde178686f"
+source = "git+https://github.com/tree-sitter/tree-sitter-css?rev=a93651c7bef1b73c47bdc7cd530ffa4ebffae032#a93651c7bef1b73c47bdc7cd530ffa4ebffae032"
 dependencies = [
  "cc",
  "tree-sitter-language",

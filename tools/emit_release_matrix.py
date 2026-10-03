@@ -1,7 +1,8 @@
-"""Choose the release matrix. Windows is absent unless every signing secret is set.
+"""Choose the official production release matrix.
 
-include is applied after exclude, so a static Windows include row cannot be
-dropped with exclude. This script emits the include list the workflow expands.
+Production packages are limited to macOS arm64 with Metal and Linux x86_64
+with CUDA. The static matrix retains other rows for debug/CI and historical
+artifact-contract compatibility, but this script never emits them for release.
 """
 
 from __future__ import annotations
@@ -17,7 +18,14 @@ SECRET_ENV = (
     "WINDOWS_CERTIFICATE_PFX_BASE64",
     "WINDOWS_CERTIFICATE_PASSWORD",
 )
-WINDOWS_NAME = "windows-x86_64"
+PRODUCTION_RELEASE_NAMES = {
+    "build": frozenset(("macos-arm64", "linux-x86_64")),
+    "verify": frozenset(("macos-arm64", "linux-x86_64-no-toolkit")),
+}
+PRODUCTION_BUILD_FEATURES = {
+    "macos-arm64": "metal",
+    "linux-x86_64": "cuda",
+}
 
 
 def signing_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -26,15 +34,42 @@ def signing_enabled(environ: dict[str, str] | None = None) -> bool:
 
 
 def filtered_includes(enabled: bool, matrix: dict | None = None) -> dict[str, list]:
+    # Keep ``enabled`` in the interface because the workflow still records
+    # signing readiness for diagnostics. Signing readiness does not make a
+    # CPU-only package eligible for an official production release.
+    del enabled
     if matrix is None:
         path = Path(__file__).with_name("release_matrix.json")
         matrix = json.loads(path.read_text(encoding="utf-8"))
     chosen = {}
     for key in ("build", "verify"):
-        rows = matrix[key]
-        if not enabled:
-            rows = [row for row in rows if row["name"] != WINDOWS_NAME]
+        rows = [
+            row for row in matrix[key] if row["name"] in PRODUCTION_RELEASE_NAMES[key]
+        ]
+        selected_names = [row["name"] for row in rows]
+        missing = sorted(PRODUCTION_RELEASE_NAMES[key] - set(selected_names))
+        duplicates = sorted(
+            name for name in set(selected_names) if selected_names.count(name) != 1
+        )
+        if missing or duplicates:
+            details = []
+            if missing:
+                details.append(f"missing={missing}")
+            if duplicates:
+                details.append(f"duplicates={duplicates}")
+            raise ValueError(
+                f"invalid production release {key} rows: " + ", ".join(details)
+            )
         chosen[key] = rows
+
+    for row in chosen["build"]:
+        expected = PRODUCTION_BUILD_FEATURES[row["name"]]
+        actual = row.get("features")
+        if actual != expected:
+            raise ValueError(
+                "invalid production release backend for "
+                f"{row['name']}: expected features={expected!r}, got {actual!r}"
+            )
     return chosen
 
 

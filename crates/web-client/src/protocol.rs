@@ -1,6 +1,34 @@
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::Path;
 
 pub const SCHEMA: &str = "greppy.web-runtime.v1";
+
+/// Immutable content identity for the executable image.
+///
+/// File metadata only keys a private digest cache. The identity exposed over
+/// the protocol is the content digest, so reinstalling identical signed bytes
+/// does not create a different runtime generation.
+#[cfg(unix)]
+pub fn runtime_image_id(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    Ok(format!("sha256:{digest}"))
+}
+
+#[cfg(not(unix))]
+pub fn runtime_image_id(path: &Path) -> io::Result<String> {
+    use std::time::UNIX_EPOCH;
+
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(format!("portable:{:x}:{modified:x}", metadata.len()))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Request {
@@ -196,6 +224,36 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_image_id_tracks_content_not_file_instance() {
+        let root = std::env::temp_dir().join(format!(
+            "greppy-runtime-image-id-{}-{}",
+            std::process::id(),
+            random_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("web-runtime");
+        let replacement = root.join("web-runtime.new");
+        std::fs::write(&executable, b"old image").unwrap();
+        let old = runtime_image_id(&executable).unwrap();
+        std::fs::write(&replacement, b"new image").unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+        std::fs::write(
+            root.join("SHA256SUMS"),
+            format!("{}  web-runtime\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let new = runtime_image_id(&executable).unwrap();
+        assert_ne!(old, new);
+        assert_ne!(new, format!("sha256:{}", "0".repeat(64)));
+
+        let copy = root.join("copy");
+        std::fs::copy(&executable, &copy).unwrap();
+        assert_eq!(new, runtime_image_id(&copy).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn request_ids_use_required_prefix() {

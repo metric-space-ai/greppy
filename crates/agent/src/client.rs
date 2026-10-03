@@ -4,6 +4,7 @@
 //! base `http://127.0.0.1:8317`. Streaming is assembled into a single
 //! assistant [`Message`] plus stop reason and usage.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::Duration;
 
@@ -414,32 +415,28 @@ fn truncate(s: &str, max: usize) -> &str {
 #[derive(Debug)]
 enum OpenBlock {
     None,
-    Text {
-        index: usize,
-        text: String,
-    },
-    Thinking {
-        index: usize,
-        text: String,
-    },
-    Tool {
-        index: usize,
-        id: String,
-        name: String,
-        args_json: String,
-    },
+    Text { index: usize, text: String },
+    Thinking { index: usize, text: String },
+}
+
+#[derive(Debug)]
+struct OpenTool {
+    id: String,
+    name: String,
+    args_json: String,
 }
 
 /// Accumulates stream events into a final assistant message.
 ///
-/// Anthropic streams content blocks sequentially, so at most one block is
-/// open at a time. The wire parser enforces ordered protocol states; this
+/// Text/thinking blocks are sequential; tool-use blocks can overlap by index.
+/// Each tool accumulates its own arguments until its explicit stop. The
 /// assembler refuses to silently flush half-finished blocks. Requires a seen
 /// `message_start` and a terminal stop (`message_delta` with stop_reason, or
 /// `message_stop`).
 #[derive(Debug)]
 struct TurnAssembler {
     open: OpenBlock,
+    open_tools: BTreeMap<usize, OpenTool>,
     /// Completed parts as `(index, part)`.
     parts: Vec<(usize, ContentPart)>,
     stop_reason: Option<StopReason>,
@@ -455,6 +452,7 @@ impl TurnAssembler {
     fn new() -> Self {
         Self {
             open: OpenBlock::None,
+            open_tools: BTreeMap::new(),
             parts: Vec::new(),
             stop_reason: None,
             usage: Usage::default(),
@@ -494,12 +492,21 @@ impl TurnAssembler {
                         "tool_use start while a content block is open".to_string(),
                     ));
                 }
-                self.open = OpenBlock::Tool {
-                    index: *index,
-                    id: id.clone(),
-                    name: name.clone(),
-                    args_json: String::new(),
-                };
+                if self.open_tools.contains_key(index)
+                    || self.parts.iter().any(|(seen, _)| seen == index)
+                {
+                    return Err(ClientError::Stream(format!(
+                        "duplicate tool block index: {index}"
+                    )));
+                }
+                self.open_tools.insert(
+                    *index,
+                    OpenTool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args_json: String::new(),
+                    },
+                );
                 // Soft indices track the highest seen block index + 1.
                 self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
                 Ok(())
@@ -507,27 +514,18 @@ impl TurnAssembler {
             StreamEvent::ToolCallArgumentsDelta {
                 index,
                 json_fragment,
-            } => match &mut self.open {
-                OpenBlock::Tool {
-                    index: open_idx,
-                    args_json,
-                    ..
-                } => {
-                    if *open_idx != *index {
-                        return Err(ClientError::Stream(format!(
-                            "tool argument index mismatch: open={open_idx}, delta={index}"
-                        )));
-                    }
-                    args_json.push_str(json_fragment);
+            } => match self.open_tools.get_mut(index) {
+                Some(tool) => {
+                    tool.args_json.push_str(json_fragment);
                     Ok(())
                 }
-                _ => Err(ClientError::Stream(
-                    "tool argument delta without an open tool block".to_string(),
-                )),
+                None => Err(ClientError::Stream(format!(
+                    "tool argument delta without an open tool block at index {index}"
+                ))),
             },
             StreamEvent::BlockFinished { index } => self.flush_open(*index),
             StreamEvent::Finished { stop_reason, usage } => {
-                if !matches!(self.open, OpenBlock::None) {
+                if !matches!(self.open, OpenBlock::None) || !self.open_tools.is_empty() {
                     return Err(ClientError::Stream(
                         "terminal event while a content block is open".to_string(),
                     ));
@@ -542,7 +540,7 @@ impl TurnAssembler {
     }
 
     fn observe_message_stop(&mut self) -> Result<(), ClientError> {
-        if !matches!(self.open, OpenBlock::None) {
+        if !matches!(self.open, OpenBlock::None) || !self.open_tools.is_empty() {
             return Err(ClientError::Stream(
                 "terminal event while a content block is open".to_string(),
             ));
@@ -552,6 +550,11 @@ impl TurnAssembler {
     }
 
     fn append_text(&mut self, text: &str) -> Result<(), ClientError> {
+        if !self.open_tools.is_empty() {
+            return Err(ClientError::Stream(
+                "text delta while tool blocks are open".into(),
+            ));
+        }
         match &mut self.open {
             OpenBlock::Text { text: acc, .. } => {
                 acc.push_str(text);
@@ -572,6 +575,11 @@ impl TurnAssembler {
     }
 
     fn append_thinking(&mut self, text: &str) -> Result<(), ClientError> {
+        if !self.open_tools.is_empty() {
+            return Err(ClientError::Stream(
+                "thinking delta while tool blocks are open".into(),
+            ));
+        }
         match &mut self.open {
             OpenBlock::Thinking { text: acc, .. } => {
                 acc.push_str(text);
@@ -592,6 +600,23 @@ impl TurnAssembler {
     }
 
     fn flush_open(&mut self, index: usize) -> Result<(), ClientError> {
+        if let Some(tool) = self.open_tools.remove(&index) {
+            self.parts.push((
+                index,
+                ContentPart::ToolCall {
+                    id: tool.id,
+                    name: tool.name,
+                    arguments: parse_arguments(&tool.args_json),
+                },
+            ));
+            self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
+            return Ok(());
+        }
+        if !self.open_tools.is_empty() || self.parts.iter().any(|(seen, _)| *seen == index) {
+            return Err(ClientError::Stream(format!(
+                "block stop without an open block at index {index}"
+            )));
+        }
         match std::mem::replace(&mut self.open, OpenBlock::None) {
             OpenBlock::None => {
                 // Silent text/thinking start may produce a BlockFinished with
@@ -625,36 +650,13 @@ impl TurnAssembler {
                 self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
                 Ok(())
             }
-            OpenBlock::Tool {
-                index: tool_index,
-                id,
-                name,
-                args_json,
-            } => {
-                if tool_index != index {
-                    return Err(ClientError::Stream(format!(
-                        "block stop index mismatch: open={tool_index}, stop={index}"
-                    )));
-                }
-                let arguments = parse_arguments(&args_json);
-                self.parts.push((
-                    tool_index,
-                    ContentPart::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    },
-                ));
-                self.next_soft_index = self.next_soft_index.max(index.saturating_add(1));
-                Ok(())
-            }
         }
     }
 
     fn finish(mut self) -> Result<TurnResult, ClientError> {
         // Never silently flush a half-finished block (especially tool_use): an
         // unfinished tool call must not finalize a turn.
-        if !matches!(self.open, OpenBlock::None) {
+        if !matches!(self.open, OpenBlock::None) || !self.open_tools.is_empty() {
             return Err(ClientError::Stream(
                 "stream ended with an open content block".to_string(),
             ));
@@ -724,6 +726,211 @@ pub(crate) fn consume_sse_for_test(
 mod tests {
     use super::*;
     use crate::wire::map_stop_reason;
+
+    #[test]
+    fn consume_truncated_parallel_tools_never_finalizes_unstopped_calls() {
+        let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        for (stop_index, expected_stops) in [(2, vec![]), (3, vec![2])] {
+            let marker = format!(
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{stop_index}}}"
+            );
+            let (truncated, _) = fixture.split_once(&marker).expect("captured stop marker");
+            let mut events = Vec::new();
+            let mut reader = std::io::Cursor::new(truncated.as_bytes());
+            let error = Client::new("http://127.0.0.1:9", "test")
+                .consume_sse(&mut reader, &mut |event| events.push(event))
+                .expect_err("EOF with one or both concurrent tools open must fail");
+            assert!(
+                matches!(error, ClientError::Stream(ref message)
+                if message.contains("open content block")),
+                "{error:?}"
+            );
+            let starts: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ToolCallStarted { index, .. } => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            let stops: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::BlockFinished { index } if *index >= 2 => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts, vec![2, 3]);
+            assert_eq!(stops, expected_stops);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Finished { .. })));
+        }
+    }
+
+    #[test]
+    fn consume_parallel_tool_events_after_terminal_are_stream_errors() {
+        let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        let (before_message_stop, _) = fixture
+            .split_once("event: message_stop\n")
+            .expect("captured terminal trailer");
+        let late_events = [
+            (
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"late","name":"greppy","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":3}),
+            ),
+        ];
+        for (prefix, expected) in [
+            (before_message_stop, "event after terminal stop"),
+            (fixture, "event after stream stopped"),
+        ] {
+            for (name, data) in &late_events {
+                let body = format!("{prefix}event: {name}\ndata: {data}\n\n");
+                let error = consume_sse_for_test(body.as_bytes(), body.len(), 1000)
+                    .expect_err("late tool event must not reopen a completed turn");
+                assert!(
+                    matches!(error, ClientError::Stream(ref message)
+                    if message.contains(expected)),
+                    "{name}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consume_captured_parallel_tool_response_preserves_both_calls() {
+        let fixture = include_bytes!("../tests/fixtures/glm-parallel-tools.sse");
+        let (turn, events) = consume_sse_for_test(fixture, fixture.len(), 1000)
+            .expect("captured concurrent tool-use blocks assemble");
+        assert_eq!(turn.stop_reason, StopReason::ToolUse);
+        let calls: Vec<_> = turn
+            .message
+            .content
+            .into_iter()
+            .filter(|part| matches!(part, ContentPart::ToolCall { .. }))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ContentPart::ToolCall {
+                    id: "call_5fa6967629d34f238f6ff6f9".into(),
+                    name: "greppy".into(),
+                    arguments: serde_json::json!({"args": ["where-am-i"]}),
+                },
+                ContentPart::ToolCall {
+                    id: "call_bbec7d7ef9a548ad9a9e75a8".into(),
+                    name: "greppy".into(),
+                    arguments: serde_json::json!({"args": ["web", "session", "create", "--profile", "project", "--json"]}),
+                },
+            ]
+        );
+        let indices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallStarted { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, vec![2, 3]);
+        assert_eq!(turn.usage.input_tokens, 2577);
+        assert_eq!(turn.usage.output_tokens, 192);
+    }
+
+    #[test]
+    fn assembler_parallel_tools_require_each_stop_and_keep_index_order() {
+        let mut assembler = TurnAssembler::new();
+        assembler
+            .observe(&StreamEvent::Started { model: "m".into() })
+            .unwrap();
+        for index in [2, 3] {
+            assembler
+                .observe(&StreamEvent::ToolCallStarted {
+                    index,
+                    id: format!("t{index}"),
+                    name: "g".into(),
+                })
+                .unwrap();
+        }
+        assert!(assembler
+            .observe(&StreamEvent::ToolCallStarted {
+                index: 2,
+                id: "duplicate".into(),
+                name: "g".into(),
+            })
+            .is_err());
+        assert!(assembler
+            .observe(&StreamEvent::ToolCallArgumentsDelta {
+                index: 4,
+                json_fragment: "{}".into(),
+            })
+            .is_err());
+        for (index, fragment) in [(3, "{\"b\":"), (2, "{\"a\":1}"), (3, "2}")] {
+            assembler
+                .observe(&StreamEvent::ToolCallArgumentsDelta {
+                    index,
+                    json_fragment: fragment.into(),
+                })
+                .unwrap();
+        }
+        assembler
+            .observe(&StreamEvent::BlockFinished { index: 3 })
+            .unwrap();
+        assert!(assembler
+            .observe(&StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+            .is_err());
+        assert!(assembler.observe_message_stop().is_err());
+        assert!(assembler
+            .observe(&StreamEvent::BlockFinished { index: 3 })
+            .is_err());
+        assembler
+            .observe(&StreamEvent::BlockFinished { index: 2 })
+            .unwrap();
+        assembler
+            .observe(&StreamEvent::Finished {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let turn = assembler.finish().unwrap();
+        assert_eq!(
+            turn.message.content,
+            vec![
+                ContentPart::ToolCall {
+                    id: "t2".into(),
+                    name: "g".into(),
+                    arguments: serde_json::json!({"a": 1}),
+                },
+                ContentPart::ToolCall {
+                    id: "t3".into(),
+                    name: "g".into(),
+                    arguments: serde_json::json!({"b": 2}),
+                },
+            ]
+        );
+
+        let mut unfinished = TurnAssembler::new();
+        unfinished
+            .observe(&StreamEvent::Started { model: "m".into() })
+            .unwrap();
+        unfinished
+            .observe(&StreamEvent::ToolCallStarted {
+                index: 0,
+                id: "open".into(),
+                name: "g".into(),
+            })
+            .unwrap();
+        assert!(unfinished.finish().is_err());
+    }
 
     #[test]
     fn normalize_base_url_strips_trailing_slashes() {

@@ -276,9 +276,12 @@ pub fn run(config: Config) -> io::Result<()> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --run-id"))?;
         #[cfg(unix)]
         {
+            let executable = std::env::current_exe()?;
+            let runtime_image_id = greppy_web_client::runtime_image_id(&executable)?;
             return crate::daemon::serve(crate::daemon::DaemonConfig {
                 socket,
                 run_id,
+                runtime_image_id,
                 fixture_url: config.fixture_url,
                 search_endpoint: config.search_endpoint,
                 idle_ttl: config
@@ -412,6 +415,20 @@ pub(crate) fn route_until_script_complete(
     route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
+#[derive(Debug)]
+pub(crate) struct ScriptFailure {
+    pub message: String,
+    pub result: serde_json::Value,
+}
+
+impl std::fmt::Display for ScriptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ScriptFailure {}
+
 pub(crate) fn route_until_script_complete_gated(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
@@ -499,6 +516,19 @@ pub(crate) fn route_until_script_complete_gated(
                     }
                     wait_point = format!("content:{method}");
                     phase!("web-runtime: phase run-wait point={wait_point}");
+                    let mut params = params;
+                    if let Err(error) = content.prepare_engine_params(&method, &mut params) {
+                        controller.send_timeout(
+                            &Message::engine_result(
+                                request_id,
+                                false,
+                                serde_json::Value::Null,
+                                Some(error.to_string()),
+                            ),
+                            remaining,
+                        )?;
+                        continue;
+                    }
                     pending.insert(request_id, (method.clone(), params.clone()));
                     content.send_timeout(
                         &Message::engine_call(request_id, method.clone(), params),
@@ -549,10 +579,13 @@ pub(crate) fn route_until_script_complete_gated(
                     ok, result, error, ..
                 }) => {
                     if !ok {
-                        return Err(io::Error::other(format!(
-                            "controller script failed: {}",
-                            error.unwrap_or_else(|| result.to_string())
-                        )));
+                        return Err(io::Error::other(ScriptFailure {
+                            message: format!(
+                                "controller script failed: {}",
+                                error.unwrap_or_else(|| result.to_string())
+                            ),
+                            result,
+                        }));
                     }
                     return Ok(result);
                 }
@@ -806,7 +839,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
-    content_config_dir: Option<OwnedTempDir>,
+    worker_temp_dir: Option<OwnedTempDir>,
     reaped: bool,
 }
 
@@ -817,10 +850,15 @@ struct OwnedTempDir {
 
 impl OwnedTempDir {
     fn for_content_worker() -> io::Result<Self> {
+        Self::for_content_worker_in(&std::env::temp_dir())
+    }
+
+    fn for_content_worker_in(temp_root: &Path) -> io::Result<Self> {
         static SEQUENCE: AtomicU32 = AtomicU32::new(1);
-        reap_stale_content_worker_dirs();
+        let temp_root = temp_root.canonicalize()?;
+        reap_stale_content_worker_dirs_in(&temp_root);
         for _ in 0..32 {
-            let path = std::env::temp_dir().join(format!(
+            let path = temp_root.join(format!(
                 "greppy-web-content-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -848,9 +886,17 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn reap_stale_content_worker_dirs() {
+    let Ok(temp_root) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    reap_stale_content_worker_dirs_in(&temp_root);
+}
+
+#[cfg(unix)]
+fn reap_stale_content_worker_dirs_in(temp_root: &Path) {
     const PREFIX: &str = "greppy-web-content-";
     let self_pid = std::process::id();
-    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = fs::read_dir(temp_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -905,11 +951,20 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
         "GREPPY_WEB_TEST_IGNORE_CERTS",
+        #[cfg(debug_assertions)]
+        "GREPPY_TEST_TRACE_LIMIT_BYTES",
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        // Worker protocol and engine-call milestones. The supervisor reads
+        // this flag too, so scrubbing it from child workers produces a
+        // misleading supervisor-only trace exactly when a content call hangs.
+        "GREPPY_WEB_TRACE_PHASE",
         // Bounded, opt-in initialization milestones; no page data or secrets.
         "GREPPY_WEB_TRACE_STARTUP",
+        // Opt-in request-body producer lifecycle diagnostics. Values contain only
+        // process/request/channel identities and never page or body data.
+        "GREPPY_WEB_BODY_DIAGNOSTICS",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))
@@ -918,9 +973,17 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
 
 impl WorkerProcess {
     pub(crate) fn spawn(worker: WorkerKind, capability: String) -> io::Result<Self> {
+        Self::spawn_with_persistent_profiles(worker, capability, None)
+    }
+
+    pub(crate) fn spawn_with_persistent_profiles(
+        worker: WorkerKind,
+        capability: String,
+        persistent_profiles: Option<PathBuf>,
+    ) -> io::Result<Self> {
         #[cfg(not(unix))]
         {
-            let _ = (worker, capability);
+            let _ = (worker, capability, persistent_profiles);
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "worker re-exec requires a Unix inherited capability FD",
@@ -928,7 +991,7 @@ impl WorkerProcess {
         }
         #[cfg(unix)]
         {
-            spawn_unix(worker, capability)
+            spawn_unix(worker, capability, persistent_profiles)
         }
     }
 }
@@ -967,7 +1030,11 @@ fn duplicate_above_worker_protocol_fds(fd: i32) -> io::Result<std::os::fd::Owned
 }
 
 #[cfg(unix)]
-fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProcess> {
+fn spawn_unix(
+    worker: WorkerKind,
+    capability: String,
+    persistent_profiles: Option<PathBuf>,
+) -> io::Result<WorkerProcess> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
@@ -981,8 +1048,12 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             WorkerKind::Controller => "controller",
             WorkerKind::Content => "content",
         };
+        let worker_temp_dir = OwnedTempDir::for_content_worker()?;
+        let worker_temp_root = worker_temp_dir.path.clone();
         let content_config_dir = if worker == WorkerKind::Content {
-            Some(OwnedTempDir::for_content_worker()?)
+            let path = worker_temp_root.join("content-config");
+            fs::create_dir(&path)?;
+            Some(path)
         } else {
             None
         };
@@ -1015,11 +1086,17 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             .arg(role)
             .env_clear()
             .envs(inherited_worker_env())
+            .env("TMPDIR", &worker_temp_root)
+            .env("TMP", &worker_temp_root)
+            .env("TEMP", &worker_temp_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(dir) = content_config_dir.as_ref() {
-            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", &dir.path);
+            command.env("GREPPY_WEB_CONTENT_CONFIG_DIR", dir);
+        }
+        if let Some(dir) = persistent_profiles.as_ref() {
+            command.env("GREPPY_WEB_PERSISTENT_PROFILE_ROOT", dir);
         }
         command.process_group(0);
         let sandbox_exe = path.clone();
@@ -1146,7 +1223,7 @@ fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProces
             reader_thread: Some(reader_thread),
             stdout_log,
             stdout_drain: Some(stdout_drain),
-            content_config_dir,
+            worker_temp_dir: Some(worker_temp_dir),
             reaped: false,
         })
 }
@@ -1177,7 +1254,11 @@ fn sbpl_subpath(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
+pub(crate) fn apply_worker_sandbox(
+    exe: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int};
     extern "C" {
@@ -1185,7 +1266,11 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
         fn sandbox_free_error(errorbuf: *mut c_char);
     }
     let exe_dir = exe.parent().unwrap_or(exe);
-    let profile = macos_sandbox_profile(exe, exe_dir, tmp);
+    // Seatbelt authorizes resolved filesystem paths. TMPDIR can be a symlink
+    // (notably on the shared development host), so grant its physical target.
+    let tmp = tmp.canonicalize()?;
+    let persistent_profiles = persistent_profiles.map(Path::canonicalize).transpose()?;
+    let profile = macos_sandbox_profile(exe, exe_dir, &tmp, persistent_profiles.as_deref());
     let profile = CString::new(profile)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut errorbuf: *mut c_char = std::ptr::null_mut();
@@ -1206,7 +1291,15 @@ pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
+fn macos_sandbox_profile(
+    exe: &Path,
+    exe_dir: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> String {
+    let persistent_profiles = persistent_profiles
+        .map(sbpl_subpath)
+        .unwrap_or_default();
     format!(
         r#"(version 1)
 (deny default)
@@ -1225,6 +1318,7 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
   {exe}
   {exe_dir}
   {tmp}
+  {persistent_profiles}
   (subpath "/private/var/folders")
   (subpath "/private/tmp")
   (subpath "/tmp")
@@ -1235,9 +1329,7 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
 )
 (allow file-write*
   {tmp}
-  (subpath "/private/var/folders")
-  (subpath "/private/tmp")
-  (subpath "/tmp")
+  {persistent_profiles}
 )
 (allow sysctl-read)
 (allow mach-lookup)
@@ -1256,16 +1348,25 @@ fn macos_sandbox_profile(exe: &Path, exe_dir: &Path, tmp: &Path) -> String {
         exe = sbpl_subpath(exe),
         exe_dir = sbpl_subpath(exe_dir),
         tmp = sbpl_subpath(tmp),
+        persistent_profiles = persistent_profiles,
     )
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn apply_worker_sandbox(exe: &Path, tmp: &Path) -> io::Result<()> {
-    crate::linux_sandbox::apply(exe, tmp)
+pub(crate) fn apply_worker_sandbox(
+    exe: &Path,
+    tmp: &Path,
+    persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
+    crate::linux_sandbox::apply(exe, tmp, persistent_profiles)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn apply_worker_sandbox(_exe: &Path, _tmp: &Path) -> io::Result<()> {
+pub(crate) fn apply_worker_sandbox(
+    _exe: &Path,
+    _tmp: &Path,
+    _persistent_profiles: Option<&Path>,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "worker OS sandbox is not implemented on this platform; refusing to start unsandboxed",
@@ -1649,6 +1750,28 @@ impl WorkerProcess {
         self.child.id()
     }
 
+    pub(crate) fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    pub(crate) fn temp_dir(&self) -> Option<&Path> {
+        self.worker_temp_dir.as_ref().map(|dir| dir.path.as_path())
+    }
+
+    pub(crate) fn prepare_engine_params(
+        &self,
+        method: &str,
+        params: &mut serde_json::Value,
+    ) -> io::Result<()> {
+        if method != "page.setInputFiles" {
+            return Ok(());
+        }
+        let worker_root = self.temp_dir().ok_or_else(|| {
+            io::Error::other("upload unavailable: content worker has no private temp directory")
+        })?;
+        stage_input_files(params, &std::env::temp_dir(), worker_root)
+    }
+
     pub(crate) fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(None) => true,
@@ -1676,19 +1799,23 @@ impl WorkerProcess {
         unregister_owned_worker(pid);
         kill_process_tree(pid);
         let deadline = Instant::now() + reap_wait;
+        let mut reaped = false;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
                 Ok(None) if Instant::now() >= deadline => {
                     kill_process_tree(pid);
-                    let _ = self.child.try_wait();
+                    reaped = self.child.try_wait().is_ok_and(|status| status.is_some());
                     break;
                 }
                 Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
                 Err(_) => break,
             }
         }
-        self.reaped = true;
+        self.reaped = reaped;
         self.input.take();
         self.join_reader_bounded(reader_wait);
         phase!("web-runtime: phase {:?}-reap done pid={pid}", self.worker);
@@ -1888,13 +2015,237 @@ impl Drop for WorkerProcess {
         if !self.reaped {
             self.kill_tree();
         }
-        self.content_config_dir.take();
+        if self.reaped {
+            self.worker_temp_dir.take();
+        } else if let Some(temp_dir) = self.worker_temp_dir.take() {
+            // A still-live process may hold cwd/files in this directory. Leak
+            // the bounded path for stale-dir reaping on a later clean startup.
+            std::mem::forget(temp_dir);
+        }
     }
 }
 
+// Walk from pinned directory descriptors: O_NOFOLLOW on only the final path
+// component would still allow a swapped ancestor to escape the upload grant.
+#[cfg(unix)]
+fn open_granted_upload(granted_root: &Path, source: &Path) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let relative = source.strip_prefix(granted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "upload path outside granted temp directory",
+        )
+    })?;
+    let open_at = |directory: &File, name: &std::ffi::OsStr, is_directory: bool| {
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "upload path contains NUL"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if is_directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    };
+    let mut directory = File::open("/")?;
+    for component in granted_root.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => directory = open_at(&directory, name, true)?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid upload grant",
+                ))
+            }
+        }
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid relative upload path",
+            ));
+        };
+        let file = open_at(&directory, name, components.peek().is_some())?;
+        if components.peek().is_none() {
+            return Ok(file);
+        }
+        directory = file;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "upload requires a file",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_granted_upload(_granted_root: &Path, _source: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure upload staging requires Unix directory handles",
+    ))
+}
+
+// Keep the original supervisor-temp upload grant. Workers now use distinct
+// temporary roots, so the supervisor must transfer granted files instead of
+// asking the content worker to read outside its own sandbox.
+fn stage_input_files(
+    params: &mut serde_json::Value,
+    granted_root: &Path,
+    worker_root: &Path,
+) -> io::Result<()> {
+    let files = params
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setInputFiles requires a file list",
+            )
+        })?;
+    let granted_root = granted_root.canonicalize()?;
+    let mut sources = Vec::with_capacity(files.len());
+    for value in files {
+        let raw = value.as_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setInputFiles requires path strings",
+            )
+        })?;
+        let source = Path::new(raw);
+        let source = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            granted_root.join(source)
+        };
+        let source = source.canonicalize()?;
+        if !source.starts_with(&granted_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "upload path outside granted temp directory",
+            ));
+        }
+        let file = open_granted_upload(&granted_root, &source)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload requires a regular file",
+            ));
+        }
+        sources.push((source, file));
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+    static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+    let stage = worker_root.join(format!(
+        "upload-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&stage)?;
+    let result = (|| {
+        let mut staged = Vec::with_capacity(sources.len());
+        for (index, (source, mut input)) in sources.into_iter().enumerate() {
+            let dir = stage.join(index.to_string());
+            fs::create_dir(&dir)?;
+            let path = dir.join(
+                source
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("upload has no filename"))?,
+            );
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            let modified = input.metadata()?.modified()?;
+            io::copy(&mut input, &mut output)?;
+            output.set_times(fs::FileTimes::new().set_modified(modified))?;
+            staged.push(serde_json::Value::String(
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        Ok::<_, io::Error>(staged)
+    })();
+    match result {
+        Ok(staged) => {
+            // The content worker owns the entire ancestor root and removes all
+            // staged files when it exits. File objects may still need the bytes
+            // after setInputFiles returns, so do not delete them prematurely.
+            params["files"] = serde_json::Value::Array(staged);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage);
+            Err(error)
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_ancestor_swap_after_canonicalization_cannot_escape_grant() {
+        use std::os::unix::fs::symlink;
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let grant = root.path.join("grant");
+        let inside = grant.join("inside");
+        let outside = root.path.join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(inside.join("sample.txt"), b"allowed").unwrap();
+        fs::write(outside.join("sample.txt"), b"must-not-read").unwrap();
+        let checked = inside.join("sample.txt").canonicalize().unwrap();
+        fs::rename(&inside, grant.join("saved")).unwrap();
+        symlink(&outside, &inside).unwrap();
+        assert!(open_granted_upload(&grant, &checked).is_err());
+    }
+
+    #[test]
+    fn uploads_cross_private_worker_roots_without_losing_names_or_bytes() {
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let worker = OwnedTempDir::for_content_worker_in(&root.path).unwrap();
+        for (dir, bytes) in [("a", b"first".as_slice()), ("b", b"second".as_slice())] {
+            fs::create_dir(root.path.join(dir)).unwrap();
+            fs::write(root.path.join(dir).join("sample.txt"), bytes).unwrap();
+        }
+        let mut params = serde_json::json!({"files":[root.path.join("a/sample.txt"),root.path.join("b/sample.txt")]});
+        stage_input_files(&mut params, &root.path, &worker.path).unwrap();
+        for (index, (value, expected)) in params["files"].as_array().unwrap().iter().zip([b"first".as_slice(),b"second".as_slice()]).enumerate() {
+            let path = Path::new(value.as_str().unwrap());
+            assert!(path.starts_with(&worker.path));
+            assert_eq!(path.file_name().unwrap(), "sample.txt");
+            assert_eq!(fs::read(path).unwrap(), expected);
+            let original = root.path.join(if index == 0 { "a/sample.txt" } else { "b/sample.txt" });
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), fs::metadata(original).unwrap().modified().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_symlink_escape_refuses_entire_batch_before_staging() {
+        use std::os::unix::fs::symlink;
+        let root = OwnedTempDir::for_content_worker().unwrap();
+        let grant = root.path.join("grant");
+        fs::create_dir(&grant).unwrap();
+        let worker = OwnedTempDir::for_content_worker_in(&root.path).unwrap();
+        fs::write(grant.join("allowed.txt"), b"allowed").unwrap();
+        fs::write(root.path.join("outside.txt"), b"outside").unwrap();
+        symlink(root.path.join("outside.txt"), grant.join("escape.txt")).unwrap();
+        let mut params = serde_json::json!({"files":[grant.join("allowed.txt"),grant.join("escape.txt")]});
+        let before = params.clone();
+        assert_eq!(stage_input_files(&mut params, &grant, &worker.path).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(params, before);
+        assert_eq!(fs::read_dir(&worker.path).unwrap().count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1936,6 +2287,22 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_worker_temp_dir_resolves_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = OwnedTempDir::for_content_worker().unwrap();
+        let physical = fixture.path.join("physical");
+        let alias = fixture.path.join("alias");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+
+        let content = OwnedTempDir::for_content_worker_in(&alias).unwrap();
+        assert!(content.path.starts_with(&physical), "{}", content.path.display());
+        assert!(!content.path.starts_with(&alias), "{}", content.path.display());
     }
 
     #[cfg(unix)]
@@ -2049,7 +2416,7 @@ mod tests {
     #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     #[test]
     fn non_macos_worker_sandbox_refuses_unsandboxed_start() {
-        let err = apply_worker_sandbox(Path::new("/"), Path::new("/tmp")).unwrap_err();
+        let err = apply_worker_sandbox(Path::new("/"), Path::new("/tmp"), None).unwrap_err();
         assert!(
             err.to_string().contains("refusing to start unsandboxed"),
             "{err}"
@@ -2059,7 +2426,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_worker_sandbox_allows_public_network_outbound() {
-        let profile = macos_sandbox_profile(Path::new("/tmp/exe"), Path::new("/tmp"), Path::new("/tmp"));
+        let profile = macos_sandbox_profile(
+            Path::new("/tmp/exe"),
+            Path::new("/tmp"),
+            Path::new("/tmp/greppy-worker-unit"),
+            Some(Path::new("/var/lib/greppy/web-runtime/profiles")),
+        );
         assert!(
             profile.contains("(allow network-outbound)\n"),
             "policy proxy must be able to dial non-loopback hosts; seatbelt is not the policy layer: {profile}"
@@ -2076,12 +2448,39 @@ mod tests {
             profile.contains("/etc/resolv.conf"),
             "DNS needs resolv.conf: {profile}"
         );
+        assert!(
+            profile.contains("/var/lib/greppy/web-runtime/profiles"),
+            "only the explicit persistent profile root should be added: {profile}"
+        );
+        let writes = profile
+            .split_once("(allow file-write*")
+            .and_then(|(_, tail)| tail.split_once("(allow sysctl-read)"))
+            .map(|(writes, _)| writes)
+            .expect("file-write policy block");
+        for broad_temp in [
+            "(subpath \"/private/var/folders\")",
+            "(subpath \"/private/tmp\")",
+            "(subpath \"/tmp\")",
+        ] {
+            assert!(
+                !writes.contains(broad_temp),
+                "worker write policy must not expose sibling daemon locks: {writes}"
+            );
+        }
+        assert!(
+            writes.contains("/tmp/greppy-worker-unit"),
+            "owned worker temp is missing: {writes}"
+        );
+        assert!(
+            !writes.contains("profile-locks"),
+            "daemon lock root must never enter the worker policy: {writes}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_worker_sandbox_refuses_filesystem_root() {
-        let err = apply_worker_sandbox(Path::new("/"), Path::new("/")).unwrap_err();
+        let err = apply_worker_sandbox(Path::new("/"), Path::new("/"), None).unwrap_err();
         assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert!(
             !err.to_string().is_empty(),

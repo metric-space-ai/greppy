@@ -145,6 +145,31 @@ pub(crate) fn read_span_with_meta(
 }
 
 const READ_FILE_PAGE_LINES: usize = 400;
+const READ_FILE_PAGE_BYTES: usize = 64 * 1024;
+
+// Probe only one byte beyond the preview budget. UTF-8 errors inside the
+// shown prefix are errors; an incomplete character at its edge is omitted.
+// The unobserved tail is neither allocated nor validated.
+fn read_file_preview(path: &std::path::Path) -> std::io::Result<(String, Option<u64>)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut bytes = Vec::with_capacity(READ_FILE_PAGE_BYTES + 1);
+    file.take((READ_FILE_PAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > READ_FILE_PAGE_BYTES;
+    if truncated {
+        bytes.truncate(READ_FILE_PAGE_BYTES);
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) if truncated && error.error_len().is_none() => {
+            String::from_utf8(bytes[..error.valid_up_to()].to_vec()).expect("validated prefix")
+        }
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    };
+    Ok((text, truncated.then_some(size)))
+}
 const READ_PACK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const READ_SMART_PACK_KIND: &str = "greppy.read-smart.span.v1";
 const READ_FILE_PACK_KIND: &str = "greppy.read-file.page.v1";
@@ -252,6 +277,21 @@ fn read_definition(
         )));
     }
     let line_count = read_line_count(&content);
+    if is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name) {
+        // A canonical `__file__` node identifies the current indexed file, not
+        // a one-line callable definition. Older graphs persist its bookkeeping
+        // span as 1:1, but JSON caller pipelines legitimately carry this node
+        // into `read` / `read-smart`. Derive the readable span from the
+        // SHA-verified, confined file bytes above so the canonical identity
+        // yields real source without inventing a callable owner. Text
+        // --head/--tail then slice this full-file DefinitionRead normally.
+        return Ok(Some(DefinitionRead {
+            node,
+            content,
+            start_line: 1,
+            end_line: line_count.max(1),
+        }));
+    }
     let node_start = usize::try_from(node.start_line.max(1)).unwrap_or(1);
     if node_start > line_count.max(1) {
         return Ok(None);
@@ -280,25 +320,41 @@ fn read_real_nodes(store: &greppy_store::Store, ids: &[i64]) -> Result<Vec<grepp
         };
         if node.file_path.is_empty()
             || node.start_line < 1
-            || is_synthetic_file_anchor(&node.label, &node.name, &node.qualified_name)
-            || !seen.insert((node.file_path.clone(), node.start_line, node.end_line))
+            || !seen.insert((
+                node.file_path.clone(),
+                node.start_line,
+                node.end_line,
+                node.qualified_name.clone(),
+                node.label.clone(),
+            ))
         {
             continue;
         }
+        // A persisted module caller is represented by the canonical `__file__`
+        // graph node. `who-calls --json | greppy read -` must be able to carry
+        // that real identity back into the source-reading surface; read-file
+        // already exposes the same source, so accepting the anchor here adds no
+        // new content or resolver interpretation.
         nodes.push(node);
     }
     Ok(nodes)
 }
 
-fn read_is_ambiguous(target: &str, nodes: &[greppy_store::Node]) -> bool {
-    if split_path_qualified(target).is_some() {
-        return false;
+fn read_is_ambiguous(nodes: &[greppy_store::Node]) -> bool {
+    nodes.len() > 1
+}
+
+fn read_report_ambiguous(target: &str, nodes: &[greppy_store::Node]) {
+    println!("`{target}` is {} definitions", nodes.len());
+    for node in nodes {
+        println!(
+            "{}:{}  {} — greppy read {}",
+            node.file_path,
+            node.start_line.max(1),
+            node.qualified_name,
+            node.qualified_name
+        );
     }
-    let sites = nodes
-        .iter()
-        .map(|node| node.file_path.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    sites.len() > 1
 }
 
 fn read_begin_group(printed: &mut bool, previous_ended_with_newline: &mut bool) {
@@ -469,7 +525,10 @@ pub(crate) fn resolve_compact_read_handle(
         .collect::<String>();
     let mut expected = [0u8; 16];
     expected.copy_from_slice(&binary[9..25]);
-    let store = open_default_store_query_writer(root)?;
+    // Compact handles are continuation metadata, not graph evidence. Resolve
+    // them from the workspace-local pack store so a stale linked-worktree Base
+    // binding cannot make a filesystem edit handle require reindexing.
+    let store = open_default_store_pack_writer(root)?;
     let Some(pack) = store.get_expand_pack(&id)? else {
         return Ok(None);
     };
@@ -552,7 +611,104 @@ fn read_text_segments(
     }
 }
 
-fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> serde_json::Value {
+// A graph miss cannot rule out definitions in a discovered language without
+// a definition provider. Consult existing metadata only: no source scan or index.
+fn read_unsupported_definition_coverage(
+    store: &greppy_store::Store,
+    project: &str,
+    path_filters: &QueryPathFilters,
+) -> Result<Vec<serde_json::Value>> {
+    let mut providers = store
+        .list_provider_states(project)?
+        .into_iter()
+        .filter(|provider| {
+            provider.status == "unsupported"
+                && provider.files_seen > 0
+                // Unlike call-graph completeness, a read miss must retain
+                // recognized unsupported source. WGSL is currently registered
+                // only as an extension; generic snapshot/log noise stays out.
+                && (provider.language == "file extension .wgsl"
+                    || (!provider.language.starts_with("file extension .")
+                        && provider.language != "no file extension"))
+        })
+        .collect::<Vec<_>>();
+    if !path_filters.is_empty() {
+        // An exact indexed file can establish coverage for a filtered lookup.
+        // Never infer a missing file or directory's language from its suffix.
+        let mut languages = std::collections::BTreeSet::new();
+        for path in path_filters.repo_prefixes() {
+            let language = greppy_parser::language_for_path(std::path::Path::new(&path));
+            if !language.is_supported() {
+                if let Some(state) = store.get_file_state(project, &path)? {
+                    if state.language == language.name() {
+                        languages.insert(state.language);
+                    }
+                }
+            }
+        }
+        providers.retain(|provider| languages.contains(&provider.language));
+    }
+    providers.sort_by(|left, right| left.language.cmp(&right.language));
+    Ok(providers
+        .into_iter()
+        .map(|provider| {
+            serde_json::json!({
+                "language": provider.language,
+                "status": provider.status,
+                "files_seen": provider.files_seen,
+            })
+        })
+        .collect())
+}
+
+fn read_report_missing(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    path_filters: &QueryPathFilters,
+) -> Result<()> {
+    let coverage = read_unsupported_definition_coverage(store, project, path_filters)?;
+    if coverage.is_empty() {
+        nav_report_missing(store, project, query);
+        return Ok(());
+    }
+    println!("no indexed symbol `{query}`");
+    for provider in coverage.iter().take(3) {
+        println!(
+            "coverage: definition extraction is unsupported for {} ({} discovered files)",
+            provider["language"].as_str().unwrap_or("unknown"),
+            provider["files_seen"]
+        );
+    }
+    if coverage.len() > 3 {
+        println!(
+            "coverage: {} more unsupported languages",
+            coverage.len() - 3
+        );
+    }
+    println!(
+        "message: this graph lookup cannot rule out a definition in unsupported source; reindexing does not add symbol coverage"
+    );
+    println!(
+        "next: locate it in source: greppy search-pattern {} --fixed --root {}",
+        shell_example_arg(query),
+        shell_example_arg(&root_path.to_string_lossy())
+    );
+    println!(
+        "next: read a matching file with greppy read-file PATH --root {}",
+        shell_example_arg(&root_path.to_string_lossy())
+    );
+    Ok(())
+}
+
+fn read_json_miss(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    path_filters: &QueryPathFilters,
+) -> Result<serde_json::Value> {
     let candidates = symbol_miss_suggestions(store, project, query)
         .into_iter()
         .filter_map(|name| {
@@ -570,13 +726,21 @@ fn read_json_miss(store: &greppy_store::Store, project: &str, query: &str) -> se
         })
         .take(5)
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let coverage = read_unsupported_definition_coverage(store, project, path_filters)?;
+    Ok(serde_json::json!({
         "schema_version": "greppy.read.v1",
         "command": "read",
         "status": "not-found",
         "query": query,
         "candidates": candidates,
-    })
+        "lookup_scope": "indexed-definitions",
+        "unsupported_definition_coverage": coverage,
+        "source_recovery": format!(
+            "greppy search-pattern {} --fixed --root {}",
+            shell_example_arg(query),
+            shell_example_arg(&root_path.to_string_lossy())
+        ),
+    }))
 }
 
 #[expect(
@@ -597,11 +761,12 @@ pub(crate) fn dispatch_read(
     let canonical_root = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.clone());
+    let file_base = resolve_file_operand_base(root, &root_path);
     let file_intents = subjects
         .iter()
         .map(|subject| {
             looks_like_path(subject)
-                || read_open_file(&root_path, &canonical_root, subject).is_some()
+                || read_open_file(&file_base, &canonical_root, subject).is_some()
         })
         .collect::<Vec<_>>();
 
@@ -633,12 +798,28 @@ pub(crate) fn dispatch_read(
             println!();
         }
         let code = if is_file {
+            if let Some((shown, canonical)) =
+                read_resolve_file(&file_base, &canonical_root, subject)
+            {
+                let content = std::fs::read_to_string(&canonical).ok();
+                if let Some(outline) = content
+                    .as_deref()
+                    .and_then(|text| read_file_outline(&root_path, &shown, text, true))
+                {
+                    let filters = prepare_query_path_filters(root, "read", "", path_filters)?;
+                    if filters.matches(&shown) {
+                        print!("{outline}");
+                        continue;
+                    }
+                }
+            }
             println!("note: `{subject}` is a path; reading it as a file");
             dispatch_read_files(
                 std::slice::from_ref(subject),
                 None,
                 false,
                 with_handle,
+                false,
                 path_filters,
                 root,
             )?
@@ -765,17 +946,24 @@ pub(crate) fn dispatch_read_symbols(
         if nodes.is_empty() {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&read_json_miss(&store, &project, query))
-                    .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
+                serde_json::to_string_pretty(&read_json_miss(
+                    &store,
+                    &project,
+                    query,
+                    &root_path,
+                    &path_filters
+                )?)
+                .map_err(|error| Error::Invalid(format!("serialize read JSON: {error}")))?
             );
             return Ok(1);
         }
-        if read_is_ambiguous(query, &nodes) {
+        if read_is_ambiguous(&nodes) {
             let candidates = nodes
                 .iter()
                 .map(|node| {
                     serde_json::json!({
-                        "qualified_name": node.qualified_name,
+                        "qualified_name": node.qualified_name.clone(),
+                        "selector": node.qualified_name.clone(),
                         "path": node.file_path,
                         "line": node.start_line,
                     })
@@ -797,7 +985,14 @@ pub(crate) fn dispatch_read_symbols(
         let Some(definition) = read_definition(&store, &root_path, nodes[0].clone())? else {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&read_json_miss(&store, &project, query)).unwrap()
+                serde_json::to_string_pretty(&read_json_miss(
+                    &store,
+                    &project,
+                    query,
+                    &root_path,
+                    &path_filters
+                )?)
+                .unwrap()
             );
             return Ok(1);
         };
@@ -858,20 +1053,21 @@ pub(crate) fn dispatch_read_symbols(
                 ids.push(id);
             }
         }
-        if nav_refuse_ambiguous(&store, query, &ids)?.is_some() {
+        let nodes = read_real_nodes(&store, &ids)?;
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let nodes = read_real_nodes(&store, &ids)?;
         let Some(node) = nodes.first().cloned() else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
@@ -1152,20 +1348,20 @@ pub(crate) fn dispatch_read_smart(
         let ids = resolve_symbol_nodes(&store, Some(query))?;
         let mut nodes = read_real_nodes(&store, &ids)?;
         nodes.retain(|node| path_filters.matches(&node.file_path));
-        let filtered_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
-        if nav_refuse_ambiguous(&store, query, &filtered_ids)?.is_some() {
+        if read_is_ambiguous(&nodes) {
+            read_report_ambiguous(query, &nodes);
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
         let Some(node) = nodes.first().cloned() else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
         };
         let Some(definition) = read_definition(&store, &root_path, node)? else {
-            nav_report_missing(&store, &project, query);
+            read_report_missing(&store, &project, query, &root_path, &path_filters)?;
             previous_ended_with_newline = true;
             failed = true;
             continue;
@@ -1221,12 +1417,7 @@ pub(crate) fn dispatch_read_smart(
 }
 
 fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
-    let supplied = std::path::Path::new(subject);
-    if supplied.is_absolute() {
-        supplied.to_path_buf()
-    } else {
-        root_path.join(supplied)
-    }
+    file_operand_path(root_path, subject)
 }
 
 fn read_open_file(
@@ -1234,6 +1425,16 @@ fn read_open_file(
     canonical_root: &std::path::Path,
     subject: &str,
 ) -> Option<(String, std::path::PathBuf, String)> {
+    let (shown, canonical) = read_resolve_file(root_path, canonical_root, subject)?;
+    let content = std::fs::read_to_string(&canonical).ok()?;
+    Some((shown, canonical, content))
+}
+
+fn read_resolve_file(
+    root_path: &std::path::Path,
+    canonical_root: &std::path::Path,
+    subject: &str,
+) -> Option<(String, std::path::PathBuf)> {
     let candidate = read_file_candidate(root_path, subject);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.is_file() {
@@ -1242,15 +1443,29 @@ fn read_open_file(
     let shown = if let Ok(relative) = canonical.strip_prefix(canonical_root) {
         relative.to_string_lossy().replace('\\', "/")
     } else {
-        // Reading is allowed for an explicitly absolute diagnostic/artifact
-        // path. Keep relative `../` traversal confined to the repository.
-        if !std::path::Path::new(subject).is_absolute() {
-            return None;
+        let subject_path = std::path::Path::new(subject);
+        if subject_path.is_absolute() {
+            // Reading is allowed for an explicitly absolute diagnostic or
+            // artifact path.
+            canonical.to_string_lossy().replace('\\', "/")
+        } else {
+            // A dependency directory may be symlinked outside the workspace.
+            // Permit that ordinary read while keeping parent traversal from
+            // using a symlink plus `..` to escape the workspace implicitly.
+            if subject_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return None;
+            }
+            candidate
+                .strip_prefix(canonical_root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/")
         }
-        canonical.to_string_lossy().replace('\\', "/")
     };
-    let content = std::fs::read_to_string(&canonical).ok()?;
-    Some((shown, canonical, content))
+    Some((shown, canonical))
 }
 
 fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)> {
@@ -1276,6 +1491,40 @@ fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)>
         )));
     }
     Ok((start, end))
+}
+
+/// A plain explicit span needs neither the whole file nor a graph/handle.
+/// Skip preceding bytes without decoding and stop after the requested lines;
+/// invalid data elsewhere must not hide a readable diagnostic prefix.
+fn read_bounded_file_range(
+    reader: &mut impl std::io::BufRead,
+    raw: &str,
+    path: &str,
+) -> Result<(String, usize, usize)> {
+    let (start, end) = read_parse_file_range(raw, usize::MAX)?;
+    let mut selected = Vec::new();
+    let mut line_count = 0usize;
+    while line_count < end {
+        let count = if line_count + 1 < start {
+            reader.skip_until(b'\n')
+        } else {
+            reader.read_until(b'\n', &mut selected)
+        }
+        .map_err(|error| Error::io(format!("read-file requested lines in {path}"), error))?;
+        if count == 0 {
+            return Err(Error::Invalid(format!(
+                "read-file --lines ends at {end}, but the file has {line_count} lines"
+            )));
+        }
+        line_count += 1;
+    }
+    let text = String::from_utf8(selected).map_err(|error| {
+        Error::io(
+            format!("read-file cannot decode requested lines {start}:{end} in {path} as UTF-8"),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    Ok((text, start, end))
 }
 
 fn read_count(value: usize) -> String {
@@ -1333,9 +1582,10 @@ fn read_render_file_page(
     end_line: usize,
     with_handle: bool,
     root_path: &std::path::Path,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let mut out = format!("{path}:{start_line}-{end_line}\n");
     out.push_str(read_line_slice(content, start_line, end_line));
+    let mut handle = None;
     if with_handle {
         let store = store.ok_or_else(|| {
             Error::Store("read-file handle requested without an available read store".into())
@@ -1345,10 +1595,90 @@ fn read_render_file_page(
         }
         let full = read_full_handle(root_path, path, content.as_bytes(), start_line, end_line)?;
         out.push_str("handle: ");
-        out.push_str(&read_compact_handle(store, project, full)?);
+        let compact = read_compact_handle(store, project, full)?;
+        out.push_str(&compact);
+        handle = Some(compact);
         out.push('\n');
     }
-    Ok(out)
+    Ok((out, handle))
+}
+
+/// An unscoped file read may offer indexed definitions, but must not create an
+/// index, prewarm models, repair a graph or acquire a writer just to do so.
+/// Exact spans, explicit whole-file reads and cold/unindexed files remain plain
+/// filesystem operations even while another task is publishing the graph.
+fn read_file_outline(
+    root: &std::path::Path,
+    shown: &str,
+    content: &str,
+    symbol_read: bool,
+) -> Option<String> {
+    let path = greppy_core::cache::workspace_store_path(root);
+    if !path.is_file() {
+        return None;
+    }
+    let store =
+        greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only()).ok()?;
+    let store = if let Some((base, commit)) = crate::store_cow::overlay_environment(root).ok()? {
+        let visibility =
+            crate::store_cow::visibility_for_open_connection(root, &commit, store.conn()).ok()?;
+        store.attach_overlay(&base, &visibility).ok()?
+    } else {
+        store
+    };
+    let project = workspace_locator::project_identity(root);
+    // Same-length edits can leave obsolete indexed spans in bounds. Unknown
+    // or changed fingerprints fall back without index or repair work.
+    let indexed = store.get_file_state(&project, shown).ok()??;
+    use sha2::Digest;
+    let content_hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    if indexed.sha256 != content_hash {
+        return None;
+    }
+    let mut nodes = store.list_nodes_for_file(&project, shown).ok()?;
+    let line_count = read_line_count(content) as i64;
+    nodes.retain(|node| {
+        matches!(
+            node.label.as_str(),
+            "Function" | "Method" | "Class" | "Struct" | "Enum" | "Trait"
+        ) && node.start_line > 0
+            && node.start_line <= line_count
+            && !node.qualified_name.is_empty()
+    });
+    nodes.sort_by_key(|node| (node.start_line, std::cmp::Reverse(node.end_line)));
+    let mut top_level = Vec::<greppy_store::Node>::new();
+    for node in nodes {
+        if !top_level
+            .iter()
+            .any(|parent| parent.start_line <= node.start_line && parent.end_line >= node.end_line)
+        {
+            top_level.push(node);
+        }
+    }
+    if top_level.is_empty() {
+        return None;
+    }
+    let mut outline = if symbol_read {
+        format!("`{shown}` is a file — read a symbol:\n")
+    } else {
+        format!(
+            "Source outline for `{shown}` — large indexed source; text: --lines A:B or --all:\n"
+        )
+    };
+    for node in &top_level {
+        outline.push_str(&format!(
+            "{}:{}  {}  {}\n",
+            shown,
+            node.start_line,
+            node.qualified_name,
+            node.label.to_ascii_lowercase()
+        ));
+    }
+    outline.push_str(&format!(
+        "read one: greppy read {} · lines: greppy read-file {shown} --lines A:B · full text: greppy read-file {shown} --all\n",
+        top_level[0].qualified_name
+    ));
+    Some(outline)
 }
 
 pub(crate) fn dispatch_read_files(
@@ -1356,6 +1686,7 @@ pub(crate) fn dispatch_read_files(
     lines: Option<&str>,
     all: bool,
     with_handle: bool,
+    json_output: bool,
     path_filter_args: &[String],
     root: Option<&str>,
 ) -> Result<i32> {
@@ -1364,6 +1695,7 @@ pub(crate) fn dispatch_read_files(
     // query-writer connection that can collide with the indexer's schema
     // publication. The store is needed only for continuation/handle records.
     let root_path = resolve_root(root)?;
+    let file_base = resolve_file_operand_base(root, &root_path);
     let path_filters = if path_filter_args.is_empty() {
         QueryPathFilters::default()
     } else {
@@ -1374,28 +1706,201 @@ pub(crate) fn dispatch_read_files(
     // only for continuation packs or explicit handles. Re-resolving a linked
     // worktree several times made a plain file read crawl under filesystem
     // pressure and could leave callers waiting with no output.
+    // File operands join against `file_base` (the explicit --root, if any);
+    // shown paths, handles and continuation packs stay workspace-relative.
     let canonical_root = root_path.clone();
     let mut project = None::<String>;
     let mut store = None;
     let mut failed = false;
     let mut printed = false;
     let mut previous_ended_with_newline = true;
+    let mut json_files = Vec::new();
     for path in paths {
-        if !path_filters.matches(path) {
-            read_begin_group(&mut printed, &mut previous_ended_with_newline);
-            println!("outside path filter: {path}");
-            previous_ended_with_newline = true;
-            failed = true;
-            continue;
-        }
-        let Some((shown, _, content)) = read_open_file(&root_path, &canonical_root, path) else {
+        let Some((shown, canonical)) = read_resolve_file(&file_base, &canonical_root, path) else {
+            if json_output {
+                json_files.push(serde_json::json!({"path": path, "error": "no such file"}));
+                failed = true;
+                continue;
+            }
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");
             previous_ended_with_newline = true;
             failed = true;
             continue;
         };
+        if !path_filters.matches(&shown) {
+            if json_output {
+                json_files.push(serde_json::json!({"path": path, "error": "outside path filter"}));
+                failed = true;
+                continue;
+            }
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("outside path filter: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        }
+        if let Some(raw) = lines.filter(|_| !with_handle) {
+            let span = std::fs::File::open(&canonical)
+                .map_err(|error| Error::io(format!("open read-file {path}"), error))
+                .and_then(|file| {
+                    read_bounded_file_range(&mut std::io::BufReader::new(file), raw, path)
+                });
+            let (text, start, end) = match span {
+                Ok(span) => span,
+                Err(error @ Error::Io { .. }) => {
+                    if json_output {
+                        json_files.push(serde_json::json!({
+                            "path": path,
+                            "error": error.to_string(),
+                        }));
+                        failed = true;
+                        continue;
+                    }
+                    read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                    println!("cannot read file {path}: {error}");
+                    previous_ended_with_newline = true;
+                    failed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if json_output {
+                json_files.push(serde_json::json!({
+                    "path": shown,
+                    "start_line": start,
+                    "end_line": end,
+                    "content": text,
+                }));
+                continue;
+            }
+            let group = format!("{shown}:{start}-{end}\n{text}");
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            std::io::Write::write_all(&mut output, group.as_bytes())
+                .map_err(|error| Error::Store(format!("write read-file output: {error}")))?;
+            std::io::Write::flush(&mut output)
+                .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
+            previous_ended_with_newline = group.ends_with('\n');
+            continue;
+        }
+        let preview = if lines.is_none() && !all {
+            read_file_preview(&canonical)
+        } else {
+            std::fs::read_to_string(&canonical).map(|text| (text, None))
+        };
+        let (content, truncated_size) = match preview {
+            Ok(preview) => preview,
+            Err(error) => {
+                if json_output {
+                    json_files.push(serde_json::json!({
+                        "path": path,
+                        "error": error.to_string(),
+                    }));
+                    failed = true;
+                    continue;
+                }
+                read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    println!("no such file: {path}");
+                } else {
+                    println!("cannot read file {path}: {error}");
+                }
+                previous_ended_with_newline = true;
+                failed = true;
+                continue;
+            }
+        };
         let line_count = read_line_count(&content);
+        // A line page is not a byte budget: generated JSON/NDJSON can put
+        // megabytes on one line. Bound only implicit reads; explicit ranges
+        // and --all remain exact. Do this before outlines and pack creation
+        // so a partial line never acquires a misleading editable handle.
+        if let Some(size_at_open) = truncated_size {
+            let page = read_line_slice(&content, 1, line_count.min(READ_FILE_PAGE_LINES));
+            let prefix = page;
+            let end = prefix.len();
+            let complete_lines = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let partial = !prefix.ends_with('\n');
+            let shown_end = complete_lines + usize::from(partial);
+            let resume = complete_lines + 1;
+            // Absolute operands keep this recovery command exact even
+            // when --root selected a nested directory or an external file.
+            let operand = format!("'{}'", canonical.to_string_lossy().replace('\'', "'\\''"));
+            if json_output {
+                json_files.push(serde_json::json!({
+                    "path": shown,
+                    "start_line": 1,
+                    "end_line": shown_end,
+                    "content": prefix,
+                    "truncated": true,
+                    "last_line_partial": partial,
+                    "source_bytes_read": end,
+                    "source_bytes_at_open": size_at_open,
+                    "next_line": resume,
+                    "handle": serde_json::Value::Null,
+                    "handle_unavailable": with_handle.then_some(
+                        "byte-truncated previews cannot produce an edit handle; request an explicit --lines A:B span"
+                    ),
+                }));
+                continue;
+            }
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!(
+                "{shown}:1-{shown_end}{}",
+                if partial { " (last line partial)" } else { "" }
+            );
+            print!("{prefix}");
+            if partial {
+                println!();
+            }
+            println!(
+                "truncated at {end} source bytes (default limit {READ_FILE_PAGE_BYTES}); total line count unknown"
+            );
+            if let Some(omitted) = size_at_open.checked_sub(end as u64) {
+                println!(
+                    "{omitted} source bytes omitted according to file size at open ({size_at_open} bytes)"
+                );
+            }
+            println!("next line: greppy read-file {operand} --lines {resume}:{resume}");
+            if partial {
+                println!("note: the next command rereads the partial line in full");
+            }
+            println!("full file: greppy read-file {operand} --all");
+            if with_handle {
+                println!(
+                    "note: no handle for a byte-truncated page; request an explicit --lines A:B span"
+                );
+            }
+            previous_ended_with_newline = true;
+            continue;
+        }
+        if lines.is_none() && !all && line_count > 60 {
+            if let Some(outline) = read_file_outline(&root_path, &shown, &content, false) {
+                if json_output {
+                    json_files.push(serde_json::json!({
+                        "path": shown,
+                        "kind": "outline",
+                        "content": outline,
+                        "handle": serde_json::Value::Null,
+                        "handle_unavailable": with_handle.then_some(
+                            "outlines cannot produce an edit handle; request an explicit --lines A:B span"
+                        ),
+                    }));
+                    continue;
+                }
+                read_begin_group(&mut printed, &mut previous_ended_with_newline);
+                print!("{outline}");
+                if with_handle {
+                    println!(
+                        "note: for a handle, choose a symbol or an explicit --lines A:B span first"
+                    );
+                }
+                previous_ended_with_newline = true;
+                continue;
+            }
+        }
         let (start_line, end_line, continuation) = if let Some(raw) = lines {
             let (start, end) = read_parse_file_range(raw, line_count)?;
             (start, end, None)
@@ -1424,7 +1929,7 @@ pub(crate) fn dispatch_read_files(
             }
             store = Some(open_default_store_pack_writer(root)?);
         }
-        let mut group = read_render_file_page(
+        let (mut group, handle) = read_render_file_page(
             store.as_ref(),
             project.as_deref().unwrap_or(""),
             &shown,
@@ -1434,7 +1939,7 @@ pub(crate) fn dispatch_read_files(
             with_handle,
             &root_path,
         )?;
-        if let Some(id) = continuation {
+        if let Some(id) = continuation.as_ref() {
             if !group.ends_with('\n') {
                 group.push('\n');
             }
@@ -1450,6 +1955,24 @@ pub(crate) fn dispatch_read_files(
                 "read-file produced no output for existing file `{shown}` lines {start_line}:{end_line}; retry the command and report this invariant failure"
             )));
         }
+        if json_output {
+            let continuation = continuation.as_ref().map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "next_line": end_line + 1,
+                    "remaining_lines": line_count - end_line,
+                })
+            });
+            json_files.push(serde_json::json!({
+                "path": shown,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": read_line_slice(&content, start_line, end_line),
+                "handle": handle,
+                "continuation": continuation,
+            }));
+            continue;
+        }
         read_begin_group(&mut printed, &mut previous_ended_with_newline);
         {
             let stdout = std::io::stdout();
@@ -1460,6 +1983,16 @@ pub(crate) fn dispatch_read_files(
                 .map_err(|error| Error::Store(format!("flush read-file output: {error}")))?;
         }
         previous_ended_with_newline = group.ends_with('\n');
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "command": "read-file",
+                "files": json_files,
+            }))
+            .map_err(|error| Error::Store(format!("serialize read-file JSON: {error}")))?
+        );
     }
     Ok(if failed { 1 } else { 0 })
 }
@@ -1598,7 +2131,7 @@ pub(crate) fn dispatch_read_expand(
                     return Ok(1);
                 }
                 let end = (start + READ_FILE_PAGE_LINES - 1).min(line_count);
-                let mut text = read_render_file_page(
+                let (mut text, _) = read_render_file_page(
                     Some(store),
                     project,
                     &path,

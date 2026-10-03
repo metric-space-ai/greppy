@@ -57,6 +57,29 @@ fn find_graph_db(store_dir: &Path) -> Option<PathBuf> {
     found
 }
 
+fn set_rust_provider_completeness(
+    store_dir: &Path,
+    supported: &[&str],
+    unsupported: &[&str],
+    files_failed: i64,
+) {
+    let db = find_graph_db(store_dir).expect("graph.db after fixture index");
+    let store = greppy_store::Store::open(&db).expect("open provider fixture store");
+    let supported = serde_json::to_string(supported).unwrap();
+    let unsupported = serde_json::to_string(unsupported).unwrap();
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE provider_state
+             SET status = 'partial', supported_edge_classes = ?1,
+                 unsupported_edge_classes = ?2, files_failed = ?3
+             WHERE project = 'repo' AND language = 'rust'",
+            rusqlite::params![supported, unsupported, files_failed],
+        )
+        .expect("update Rust provider fixture");
+    assert_eq!(changed, 1, "fixture must contain one Rust provider row");
+}
+
 /// Build a git-rooted repo whose `src/lib.rs` exercises all three
 /// cross-file reference edges into `src/helper.rs` / `src/types.rs`:
 ///
@@ -301,6 +324,71 @@ fn who_calls_honours_the_module_qualifier_over_a_same_file_twin() {
 }
 
 #[test]
+fn index_upgrade_repairs_old_call_edges_without_source_edits() {
+    let (repo, store_dir) = make_graph_repo("old-call-edges");
+    let src = repo.join("src");
+    std::fs::write(src.join("lib.rs"), "mod store;\nmod app;\n").unwrap();
+    std::fs::write(src.join("store.rs"), "pub fn resolve_root() -> u32 { 1 }\n").unwrap();
+    std::fs::write(src.join("app.rs"), "use crate::store;\npub fn resolve_root() -> u32 { 2 }\npub fn use_store_root() -> u32 { store::resolve_root() }\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let db = find_graph_db(&store_dir).unwrap();
+    {
+        let store = greppy_store::Store::open(&db).unwrap();
+        // Simulate the persisted v5 defect, keeping raw callee_path metadata
+        // and unchanged file hashes so a no-op incremental run cannot repair it.
+        store
+            .conn()
+            .execute(
+                "UPDATE workspace_state SET indexer_version = 'greppy-indexer-v5'",
+                [],
+            )
+            .unwrap();
+        let changed = store.conn().execute(
+            "UPDATE edges SET target_id = (SELECT id FROM nodes WHERE name = 'resolve_root' AND file_path = 'src/app.rs')
+             WHERE edge_type = 'CALLS' AND source_id = (SELECT id FROM nodes WHERE name = 'use_store_root' AND file_path = 'src/app.rs')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            changed, 1,
+            "seed the wrong same-file twin as the persisted target"
+        );
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "upgrade must rebuild persisted edges: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/store.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("use_store_root"),
+        "missing real caller after upgrade: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/app.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !out.contains("use_store_root"),
+        "stale wrong edge survived migration: {out}\n{err}"
+    );
+    let store =
+        greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only()).unwrap();
+    assert!(store
+        .list_workspace_states()
+        .unwrap()
+        .iter()
+        .all(|state| state.indexer_version == greppy_core::INDEXER_VERSION_BASE));
+}
+
+#[test]
 fn who_calls_lists_cross_file_caller_with_file_line() {
     let (repo, store) = index_fixture("whocalls");
 
@@ -322,6 +410,241 @@ fn who_calls_lists_cross_file_caller_with_file_line() {
     assert!(
         !out.contains("(no callers)"),
         "who-calls must find at least one caller; got: {out:?}"
+    );
+}
+
+#[test]
+fn who_calls_resolves_function_items_under_a_src_core_crate_root() {
+    let root = fresh_dir("src-core-crate-root");
+    let repo = root.join("repo");
+    let store = root.join("store");
+    let channels = repo.join("src/core/mission/channels");
+    let business_os = repo.join("src/core/decoy/business_os");
+    std::fs::create_dir_all(&channels).unwrap();
+    std::fs::create_dir_all(&business_os).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"src-core-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"fixture\"\npath = \"src/core/main.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/core/main.rs"), "mod mission; mod decoy;\n").unwrap();
+    std::fs::write(
+        repo.join("src/core/decoy/main.rs"),
+        "pub fn unrelated_decoy_root() {}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/core/mission/mod.rs"), "pub mod channels;\n").unwrap();
+    std::fs::write(
+        channels.join("mod.rs"),
+        "pub fn direct_target() {}\npub fn alternate_target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(business_os.join("mod.rs"), "pub mod store;\n").unwrap();
+    std::fs::write(
+        business_os.join("store.rs"),
+        "use crate::mission::channels;\n\
+         pub fn direct_caller() { channels::direct_target(); }\n\
+         pub fn function_item_caller(flag: bool) {\n\
+             let selected = if flag { channels::direct_target } else { channels::alternate_target };\n\
+             selected();\n\
+         }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "direct_target"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls direct_target should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("direct_caller"),
+        "missing direct caller: {out}"
+    );
+    assert!(
+        out.contains("function_item_caller"),
+        "missing function-item caller: {out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "alternate_target"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls alternate_target should succeed; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("function_item_caller"),
+        "missing alternate function-item caller: {out}"
+    );
+}
+
+#[test]
+fn who_calls_typescript_factory_callback_reports_module_variable() {
+    let root = fresh_dir("typescript-factory-callback");
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        src.join("app.ts"),
+        r#"
+import { helper } from "./helper.ts";
+export const make = Effect.gen(function* () {
+    helper(platform);
+}).pipe(Effect.withSpan("make"));
+
+Effect.gen(function* () {
+    bareHelper(platform);
+});
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("helper.ts"),
+        "export function helper(platform: string): void {}\nexport function bareHelper(platform: string): void {}\n",
+    )
+    .unwrap();
+    let store = root.join("store");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "index . should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "who-calls should exit 0; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        out.contains("src/app.ts:4") && out.contains("make") && out.contains("helper(platform)"),
+        "who-calls must report the module variable and exact call site; got: {out:?}"
+    );
+    assert!(
+        !out.contains("no callers") && !out.contains("__file__"),
+        "a real callback call must not collapse to an empty answer or file anchor: {out:?}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "bareHelper", "--code"], &repo, &store);
+    assert_eq!(code, 0, "module caller should exit 0: {out}\n{err}");
+    assert!(
+        out.contains("src/app.ts:8")
+            && out.contains("<module>")
+            && out.contains("bareHelper(platform)"),
+        "a bare module callback must report its real call site: {out:?}"
+    );
+
+    // Recreate the already-persisted graph from the reported installation:
+    // both raw and resolved CALLS sources point at the synthetic file anchor,
+    // while source files and the workspace fingerprint remain unchanged. A
+    // replacement executable must answer from this retained graph without a
+    // rebuild (and therefore without invalidating reusable embeddings).
+    let db = find_graph_db(&store).unwrap();
+    {
+        let old = greppy_store::Store::open(&db).unwrap();
+        let raw = old
+            .conn()
+            .execute(
+                "UPDATE raw_edges SET source_qname = 'src/app.ts::__file__'
+                 WHERE edge_type = 'CALLS' AND json_extract(properties, '$.callee_name') = 'helper'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(raw, 1, "seed the persisted v6 raw CALLS source");
+        let resolved = old
+            .conn()
+            .execute(
+                "UPDATE edges SET source_id = (SELECT id FROM nodes WHERE qualified_name = 'src/app.ts::__file__')
+                 WHERE edge_type = 'CALLS' AND json_extract(properties, '$.callee_name') = 'helper'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(resolved, 1, "seed the persisted v6 resolved CALLS source");
+        let usage = old
+            .conn()
+            .execute(
+                "INSERT INTO edges (project, source_id, target_id, edge_type, properties)
+                 SELECT source.project, source.id, target.id, 'USAGE', '{\"line\":2}'
+                 FROM nodes source, nodes target
+                 WHERE source.qualified_name = 'src/app.ts::__file__'
+                   AND target.qualified_name = 'src/helper.ts::Function::helper'
+                   AND target.project = source.project",
+                [],
+            )
+            .unwrap();
+        assert_eq!(usage, 1, "seed an earlier same-anchor USAGE site");
+    }
+    let (code, out, err) = run(&["who-calls", "helper", "--code"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "retained-graph who-calls should exit 0: {out}\n{err}"
+    );
+    assert!(
+        out.contains("src/app.ts:4")
+            && out.contains("<module>")
+            && out.contains("helper(platform)"),
+        "the replacement executable must expose the retained call without reindexing: {out:?}"
+    );
+    assert!(
+        !out.contains("src/app.ts:2") && !out.contains("import { helper }"),
+        "CALLS evidence must win over an earlier same-anchor USAGE: {out:?}"
+    );
+
+    let (code, out, err) = run(&["who-calls", "helper", "--json"], &repo, &store);
+    assert_eq!(code, 0, "retained-graph JSON should exit 0: {out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let hit = &value["hits"][0];
+    assert_eq!(hit["qualified_name"], "src/app.ts::__file__", "{value}");
+    assert_eq!(hit["name"], "<module>", "{value}");
+    assert_eq!(hit["line"], 4, "{value}");
+    assert_eq!(hit["start_line"], 4, "{value}");
+    assert_eq!(hit["end_line"], 4, "{value}");
+
+    let (code, read_out, read_err) = run_with_stdin(&["read", "-"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "canonical retained caller must round-trip through read: {read_out}\n{read_err}"
+    );
+    assert!(
+        read_out.contains("src/app.ts:") && read_out.contains("helper(platform)"),
+        "piped module identity must resolve back to its source file: {read_out:?}"
+    );
+
+    let (code, head_out, head_err) =
+        run_with_stdin(&["read", "-", "--head", "2"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "module head read should succeed: {head_out}\n{head_err}"
+    );
+    assert!(
+        head_out.contains("import { helper }") && !head_out.contains("helper(platform)"),
+        "--head must slice the current file span rather than the old 1:1 anchor: {head_out:?}"
+    );
+
+    let (code, tail_out, tail_err) =
+        run_with_stdin(&["read", "-", "--tail", "3"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "module tail read should succeed: {tail_out}\n{tail_err}"
+    );
+    assert!(
+        tail_out.contains("bareHelper(platform)"),
+        "--tail must address the end of the current file span: {tail_out:?}"
+    );
+
+    let (code, smart_out, smart_err) = run_with_stdin(&["read-smart", "-"], &out, &repo, &store);
+    assert_eq!(
+        code, 0,
+        "canonical module caller must round-trip through read-smart: {smart_out}\n{smart_err}"
+    );
+    assert!(
+        smart_out.contains("helper(platform)") && smart_out.contains("bareHelper(platform)"),
+        "read-smart must expose the verified module source without a fabricated callable: {smart_out:?}"
     );
 }
 
@@ -366,9 +689,79 @@ fn expand_missing_id_reports_clear_message() {
     let (code, out, err) = run(&["expand", "does-not-exist"], &repo, &store);
     assert_eq!(code, 1, "missing expand id should exit 1; stderr={err}");
     assert!(
-        out.contains("expand: id not found or expired: does-not-exist"),
+        out.contains("expand: id not found in this project or expired: does-not-exist"),
         "missing expand id must be visible on stdout; got: {out:?}"
     );
+    assert!(
+        out.contains("--root ORIGINAL_PROJECT"),
+        "cross-project recovery missing: {out:?}"
+    );
+    assert!(
+        out.contains("rerun the original command"),
+        "expired handle recovery missing: {out:?}"
+    );
+}
+
+#[test]
+fn symbol_miss_names_unsupported_indexed_html_without_reindex_loop() {
+    let (repo, store) = index_fixture("html-symbol-coverage");
+    std::fs::create_dir_all(repo.join("public/crm")).unwrap();
+    std::fs::write(
+        repo.join("public/crm/index.html"),
+        "<script>async function dispatchAction() {} async function refreshCrmData() { return dispatchAction(); }</script>",
+    )
+    .unwrap();
+    let (code, out, err) = run(
+        &[
+            "search-symbol",
+            "dispatchAction",
+            "--code",
+            "--path",
+            "public/crm/index.html",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "HTML provider is not supported: {out} {err}");
+    assert!(
+        out.contains("definition extraction is unsupported for indexed file public/crm/index.html")
+    );
+    assert!(
+        out.contains("search-pattern dispatchAction --fixed --path public/crm/index.html --root")
+    );
+    assert!(out.contains("reindexing does not add symbol coverage"));
+    assert!(
+        !out.contains("next: refresh definitions")
+            && !out.contains("retry without the path filter")
+    );
+
+    // A guessed HTML suffix is not evidence that a nonexistent path was
+    // indexed and skipped, nor that supported Rust definitions were omitted.
+    for path in ["public/crm/missing.html", "src/lib.rs"] {
+        let (code, out, err) = run(
+            &["search-symbol", "dispatchAction", "--path", path],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 1, "unexpected symbol match: {out} {err}");
+        assert!(!out.contains("definition extraction is unsupported"));
+    }
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "dispatchAction",
+            "--fixed",
+            "--path",
+            "public/crm/index.html",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "literal recovery must still find the source: {out} {err}"
+    );
+    assert!(out.contains("public/crm/index.html"));
 }
 
 #[test]
@@ -447,19 +840,11 @@ fn direct_navigation_json_reports_exact_counts() {
             v["freshness"]["reasons"].as_array().unwrap().is_empty(),
             "fresh graph must not report stale reasons: {v:?}"
         );
-        assert_eq!(v["provider_complete"], false);
-        assert!(
-            v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1,
-            "nav JSON must expose provider incompleteness: {v:?}"
-        );
-        assert!(
-            v["incomplete_providers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|p| p["language"] == "rust"),
-            "rust provider incompleteness must be visible: {v:?}"
-        );
+        // The Rust fixture supports the relations these commands actually
+        // query; unrelated missing capabilities do not make the answer partial.
+        assert_eq!(v["provider_complete"], true, "{v:?}");
+        assert_eq!(v["incomplete_provider_count"], 0, "{v:?}");
+        assert_eq!(v["incomplete_providers"], serde_json::json!([]));
         assert_eq!(v["total_exact"], 1);
         assert_eq!(v["shown"], 1);
         assert_eq!(v["omitted"], 0);
@@ -495,6 +880,15 @@ fn direct_navigation_json_reports_exact_counts() {
 #[test]
 fn default_json_is_answer_only_and_diagnostics_restores_the_envelope() {
     let (repo, store) = index_fixture("answer-only-json");
+
+    // Exercise a genuinely missing requested relation. A normal Rust provider
+    // is complete for who-calls, even if unrelated capabilities are partial.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls"],
+        &["usages", "semantic"],
+        0,
+    );
 
     let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
     assert_eq!(code, 0, "stderr={err}\nstdout={out}");
@@ -742,8 +1136,8 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
     );
 }
 
-/// Large drift starts a background refresh and fails closed. No command may
-/// expose rows from the old generation while that refresh is in flight.
+/// Large drift fails closed when automatic healing is explicitly disabled.
+/// No command may expose rows from the old generation.
 fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
     let (repo, store) = index_fixture(tag);
     std::fs::write(
@@ -762,28 +1156,28 @@ fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
+fn graph_commands_refuse_rows_when_auto_reindex_is_disabled() {
     let (repo, store) = large_stale_graph_fixture("graph-stale-gate-brief");
 
     let (code, out, err) = run_with_env(
         &["brief", "do_it"],
         &repo,
         &store,
-        &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
+        &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
         code, 75,
-        "refreshing brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+        "stale brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
         "brief freshness refusal must stay on stdout; stderr={err:?}"
     );
     assert!(
-        out.contains("graph freshness is refreshing")
+        out.contains("graph freshness is drift")
             && out.contains("no stale indexed hits emitted")
             && !out.contains("== do_it"),
-        "refreshing brief must explain the refusal without old evidence; got: {out:?}"
+        "stale brief must explain the refusal without old evidence; got: {out:?}"
     );
 
     let json_cases: Vec<(Vec<&str>, &str, &str)> = vec![
@@ -811,32 +1205,27 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
     ];
     for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
         let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
-        let (code, out, err) = run_with_env(
-            &args,
-            &repo,
-            &store,
-            &[("GREPPY_INDEX_TIME_BUDGET_MS", "0")],
-        );
+        let (code, out, err) = run_with_env(&args, &repo, &store, &[("GREPPY_AUTO_REINDEX", "0")]);
         assert_eq!(
             code, 75,
-            "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+            "stale {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
         );
         assert!(
             err.is_empty(),
             "JSON freshness refusal must stay on stdout; stderr={err:?}"
         );
         let v: serde_json::Value = serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("invalid refreshing {command} json: {e}; stdout={out:?}"));
+            .unwrap_or_else(|e| panic!("invalid stale {command} json: {e}; stdout={out:?}"));
         assert_eq!(v["command"], command);
         assert_eq!(
             v["status"], "skipped_stale_index",
-            "refreshing {command} must be skipped: {v:?}"
+            "stale {command} must be skipped: {v:?}"
         );
         assert_eq!(
             v["fresh"], false,
             "{command} must label the result stale: {v:?}"
         );
-        assert_eq!(v["freshness"]["state"], "refreshing");
+        assert_eq!(v["freshness"]["state"], "drift");
         assert_eq!(
             v["freshness"]["stale_file_count"], 12,
             "{command} must report the drift extent: {v:?}"
@@ -845,6 +1234,12 @@ fn graph_commands_refuse_rows_when_heal_budget_is_exhausted() {
             v[collection_field].as_array().unwrap().is_empty(),
             "refreshing {command} must not serve rows from the old index: {v:?}"
         );
+        if command == "impact" {
+            assert_eq!(
+                v["provider_complete"], true,
+                "stale impact metadata must use its default incoming reference union, not broad provider completeness: {v:?}"
+            );
+        }
     }
 }
 
@@ -980,6 +1375,324 @@ fn trace_depth_zero_returns_only_start() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
+    let (repo, store) = make_graph_repo("search-format-contract");
+    for index in 0..8 {
+        std::fs::write(
+            repo.join(format!("src/symbol_{index}.rs")),
+            "pub fn contract_main() {}\n",
+        )
+        .unwrap();
+    }
+    for scope in ["a", "b"] {
+        std::fs::create_dir_all(repo.join("src").join(scope)).unwrap();
+        for index in 0..2 {
+            std::fs::write(
+                repo.join(format!("src/{scope}/path_{index}.rs")),
+                "pub fn path_match() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(
+        repo.join("src/kinds.rs"),
+        "pub struct ContractKind;\npub fn makeContractKind() {}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, text, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{text}\n{err}");
+    let (code, out, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["total_exact"], 8, "{out}");
+    assert_eq!(value["shown"], 3, "{out}");
+    assert_eq!(value["omitted"], 5, "{out}");
+    let locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            format!(
+                "{}:{}",
+                hit["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                hit["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        })
+        .collect::<Vec<_>>();
+    let text_locations = text
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.starts_with("src/symbol_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, locations,
+        "JSON must only change presentation"
+    );
+
+    for command in ["search-symbol", "search-pattern"] {
+        let args = [command, "path_match", "--path", "src/b", "--limit", "1"];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        assert!(text.contains("src/b/path_0.rs:1"), "{text}");
+        assert!(!text.contains("src/a/"), "{text}");
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, out, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 2,
+            "count must exclude other directory: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        assert_eq!(value["omitted"], 1, "{out}");
+        let location = if command == "search-symbol" {
+            format!(
+                "{}:{}",
+                value["hits"][0]["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                value["hits"][0]["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
+            )
+        } else {
+            value["hits"][0]["matches"][0]["location"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(location, "src/b/path_0.rs:1");
+        let (code, out, err) = run(
+            &[command, "ContractKind", "--kind", "struct", "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{command}: {out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 1,
+            "kind filter must precede counting: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        for query in ["QQZZABSENT987654321", "CONTRACT_MAIN"] {
+            for json in [false, true] {
+                let mut args = vec![command, query];
+                if json {
+                    args.push("--json");
+                }
+                let (code, out, err) = run(&args, &repo, &store);
+                assert_eq!(
+                    code, 1,
+                    "primary no-match must remain a miss, {args:?}: {out}\n{err}"
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(value["total_exact"], 0, "{out}");
+                    let status_key = if command == "search-symbol" {
+                        "status"
+                    } else {
+                        "result_status"
+                    };
+                    assert_eq!(value[status_key], "no_matches", "{out}");
+                    assert_eq!(value["hits"].as_array().unwrap().len(), 0, "{out}");
+                } else {
+                    assert!(out.contains("no_matches"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_cap_pattern_all_preserves_budget_and_offset() {
+    let (repo, store) = make_graph_repo("pattern-explicit-all-cap");
+    let content = (0..80)
+        .map(|i| format!("EXPLICIT_CAP_{i:03}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("matches.txt"), content).unwrap();
+    for offset in [0, 30] {
+        let offset_arg = offset.to_string();
+        let args = [
+            "search-pattern",
+            "EXPLICIT_CAP_",
+            "--fixed",
+            "--path",
+            "matches.txt",
+            "--all",
+            "--limit",
+            "30",
+            "--offset",
+            &offset_arg,
+        ];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        let rows = text
+            .lines()
+            .filter(|line| line.starts_with("matches.txt:"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 30, "{text}");
+        assert!(
+            rows[0].starts_with(&format!("matches.txt:{}", offset + 1)),
+            "{text}"
+        );
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, json, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{json}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["total_exact"], 80, "{json}");
+        assert_eq!(value["shown"], 30, "{json}");
+        assert_eq!(value["hits"].as_array().unwrap().len(), 30, "{json}");
+        assert_eq!(value["hits"][0]["matches"][0]["line"], offset + 1, "{json}");
+    }
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "EXPLICIT_CAP_",
+            "--fixed",
+            "--all",
+            "--path",
+            "matches.txt",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["shown"], 80, "{json}");
+    assert_eq!(value["hits"].as_array().unwrap().len(), 80, "{json}");
+    assert!(
+        find_graph_db(&store).is_none(),
+        "literal cap controls must not start indexing"
+    );
+    let (code, help, err) = run(&["search-pattern", "--help"], &repo, &store);
+    assert_eq!(code, 0, "{help}\n{err}");
+    assert!(help.contains("preserves an explicit --limit"), "{help}");
+}
+
+#[test]
+fn explicit_cap_symbol_all_preserves_budget_and_max_alias() {
+    let (repo, store) = make_graph_repo("symbol-explicit-all-cap");
+    let content = (0..40)
+        .map(|i| format!("pub fn explicit_cap_symbol_{i:03}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("src/cap.rs"), content).unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    for limit_flag in ["--limit", "--max"] {
+        let (code, json, err) = run(
+            &[
+                "search-symbol",
+                "explicit_cap_symbol_",
+                "--all",
+                limit_flag,
+                "3",
+                "--offset",
+                "2",
+                "--json",
+            ],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{json}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["total_exact"], 40, "{json}");
+        assert_eq!(value["shown"], 3, "{json}");
+        assert_eq!(value["hits"].as_array().unwrap().len(), 3, "{json}");
+    }
+    let (code, json, err) = run(
+        &["search-symbol", "explicit_cap_symbol_", "--all", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["shown"], 40, "{json}");
+}
+
+#[test]
+fn search_pattern_limited_summary_does_not_expand_omitted_files() {
+    let (repo, store) = make_graph_repo("pattern-limited-summary");
+    for index in 0..30 {
+        std::fs::write(
+            repo.join(format!("src/summary_{index:02}.rs")),
+            "pub fn limited_summary_marker() {}\n",
+        )
+        .unwrap();
+    }
+    // Name-order scanning would put this file first, but the shared result
+    // order prefers files with fewer matches. Exercise a real ranking split.
+    std::fs::write(repo.join("src/summary_00.rs"),
+        "pub fn limited_summary_marker() {}\n// limited_summary_marker\n// limited_summary_marker\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &["search-pattern", "limited_summary_marker", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("32 matches in 30 files; showing 3"), "{out}");
+    let text_locations = out
+        .lines()
+        .filter(|line| line.starts_with("src/summary_"))
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "limited_summary_marker",
+            "--limit",
+            "3",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["total_exact"], 32, "{json}");
+    let json_locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, json_locations,
+        "both formats must rank the same rows"
+    );
+    assert_eq!(text_locations[0], "src/summary_01.rs:1");
+    assert!(
+        !out.contains("src/summary_29.rs"),
+        "omitted paths must not leak through the summary: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("src/summary_"))
+            .count(),
+        3,
+        "{out}"
+    );
+}
+
+#[test]
 fn search_symbols_prints_label_and_file_line() {
     let (repo, store) = index_fixture("symbols");
 
@@ -1089,6 +1802,7 @@ fn search_symbol_heals_single_file_edits_in_band() {
 /// Start an indexer for a one-file edit that pauses at the publication
 /// failpoint, holding the writer lock. It publishes as soon as the returned
 /// release path exists; HOLD_MS only bounds a test that never releases.
+#[cfg(debug_assertions)]
 fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process::Child, PathBuf) {
     let ready = repo.parent().unwrap().join(format!("{tag}-ready"));
     let release = repo.parent().unwrap().join(format!("{tag}-release"));
@@ -1118,16 +1832,11 @@ fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process
     (child, release)
 }
 
-/// Run `read do_it --json --diagnostics` and hand every stderr line to
-/// `on_line` as it is written, so a test can react to the exact moment the
-/// query announces its bounded wait instead of guessing a delay.
-fn run_read_observing_stderr(
-    repo: &Path,
-    store: &Path,
-    mut on_line: impl FnMut(&str) + Send + 'static,
-) -> (i32, String, String) {
-    use std::io::{BufRead, Read};
-    let mut child = Command::new(bin())
+/// Keep the actual query alive while publication is held. Its result is
+/// checked after releasing the writer, without coupling to progress wording.
+#[cfg(debug_assertions)]
+fn spawn_read_during_refresh(repo: &Path, store: &Path) -> std::process::Child {
+    Command::new(bin())
         .args(["read", "do_it", "--json", "--diagnostics"])
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
@@ -1135,30 +1844,10 @@ fn run_read_observing_stderr(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn read");
-    let stderr = child.stderr.take().unwrap();
-    let observer = std::thread::spawn(move || {
-        let mut collected = String::new();
-        for line in std::io::BufReader::new(stderr).lines() {
-            let line = line.expect("read stderr line");
-            on_line(&line);
-            collected.push_str(&line);
-            collected.push('\n');
-        }
-        collected
-    });
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .expect("read stdout");
-    let status = child.wait().expect("wait for read");
-    let err = observer.join().expect("stderr observer");
-    (status.code().unwrap_or(-1), out, err)
+        .expect("spawn read")
 }
 
+#[cfg(debug_assertions)]
 fn edit_helper_to_84(repo: &Path) {
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -1167,30 +1856,34 @@ fn edit_helper_to_84(repo: &Path) {
     .unwrap();
 }
 
-/// A refresh that publishes inside the bounded wait serves the fresh graph:
-/// the query announces the wait, sees the publication and returns the
-/// post-edit definition with exit 0.
+/// Ordinary queries join a healthy refresh and return the current definition.
+/// They do not ask the agent to retry just because a former 2s budget elapsed.
+/// The publication hold is a debug-only product hook, so this synchronization
+/// test remains in the debug suite rather than pretending to exercise it in a
+/// production binary where the hook is deliberately compiled out.
+#[cfg(debug_assertions)]
 #[test]
 fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
     let (repo, store) = index_fixture("read-waits-for-edit-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "publishing");
-
-    let release_on_wait = release.clone();
-    let (code, out, err) = run_read_observing_stderr(&repo, &store, move |line| {
-        if line.contains("waiting up to 2s") {
-            std::fs::write(&release_on_wait, b"").unwrap();
-        }
-    });
+    let mut query = spawn_read_during_refresh(&repo, &store);
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let premature = query.try_wait().expect("observe waiting query");
+    std::fs::write(&release, b"").unwrap();
+    let result = query.wait_with_output().expect("finish waiting query");
+    let code = result.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&result.stdout);
+    let err = String::from_utf8_lossy(&result.stderr);
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(
+        premature.is_none(),
+        "query ended before publication: {result:?}"
+    );
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 0,
         "read must observe the published refresh; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh published"),
-        "the bounded lock wait and the publication must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1201,36 +1894,29 @@ fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
             .is_some_and(|source| source.contains("answer = 84")),
         "read must return the post-edit definition: {v:?}"
     );
-
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
 }
 
-/// A refresh still held when the bounded wait ends is a temporary failure:
-/// the query says so, emits no span from the stale graph, and the same
-/// query serves the fresh definition once the refresh has published.
+/// Explicitly declining automatic healing still must not expose stale spans.
+#[cfg(debug_assertions)]
 #[test]
-fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
+fn read_with_auto_refresh_disabled_refuses_stale_spans_while_writer_is_held() {
     let (repo, store) = index_fixture("read-refuses-held-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "held");
 
-    let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
+    let (code, out, err) = run_with_env(
+        &["read", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    // Release and reap even if the following assertions expose a regression.
+    std::fs::write(&release, b"").unwrap();
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 75,
         "a held publication is a temporary failure, not an answer; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh still active")
-            && err.contains("greppy index status --json"),
-        "the bounded wait and its outcome must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1247,14 +1933,6 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
         "no source from the stale graph may leak: {out}"
     );
 
-    std::fs::write(&release, b"").unwrap();
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
     let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -1270,8 +1948,12 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
     );
 }
 
+/// Existing-vector publication timing depends on the same debug-only hold
+/// hook. Keep the complete oracle in debug builds; release coverage must not
+/// infer a timing failure from an environment variable the binary ignores.
+#[cfg(debug_assertions)]
 #[test]
-fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inline() {
+fn structural_query_with_existing_vectors_joins_refresh_and_returns_callers() {
     let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");
     let db = find_graph_db(&store).expect("indexed graph");
     let graph = rusqlite::Connection::open(db).expect("open graph for vector fixture");
@@ -1324,30 +2006,19 @@ fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inli
     );
     let elapsed = started.elapsed();
     assert_eq!(
-        code, 75,
-        "vector-backed drift must be retryable while its background refresh publishes; stderr={err}\nstdout={out}"
+        code, 0,
+        "ordinary navigation must finish after its refresh publishes; stderr={err}\nstdout={out}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(4),
-        "navigation hid the five-second index build for {elapsed:?}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && (err.contains("graph refresh published")
-                || err.contains("greppy index status --json")),
-        "bounded wait and recovery must be visible; stderr={err:?}"
+        ready.exists() && elapsed >= std::time::Duration::from_secs(5),
+        "query must join the held publication before serving: {elapsed:?}"
     );
     let value: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|error| panic!("invalid retry JSON: {error}; stdout={out:?}"));
-    assert_eq!(value["status"], "skipped_stale_index");
-    assert_eq!(value["fresh"], false);
+        .unwrap_or_else(|error| panic!("invalid query JSON: {error}; stdout={out:?}"));
+    assert_eq!(value["fresh"], true, "{value:?}");
     assert!(
-        matches!(
-            value["freshness"]["state"].as_str(),
-            Some("refreshing" | "drift")
-        ),
-        "retryable freshness state missing: {value:?}"
+        out.contains("caller") && out.contains("src/lib.rs"),
+        "actual caller evidence must be returned: {value:?}"
     );
 }
 
@@ -1413,23 +2084,8 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
             "steps",
         ),
         (
-            vec!["who-calls", "do_it", "--json", "--diagnostics"],
-            "who-calls",
-            "hits",
-        ),
-        (
-            vec!["who-calls", "Widget", "--json", "--diagnostics"],
-            "who-calls",
-            "hits",
-        ),
-        (
             vec!["graph-locate", "src/lib.rs:6", "--json", "--diagnostics"],
             "graph-locate",
-            "hits",
-        ),
-        (
-            vec!["impact", "do_it", "--json", "--diagnostics"],
-            "impact",
             "hits",
         ),
         (vec!["fan-in", "--json", "--diagnostics"], "fan-in", "hits"),
@@ -1471,6 +2127,134 @@ fn provider_policy_require_complete_blocks_graph_commands_json_and_brief_text() 
     assert!(
         out.contains("brief: skipped indexed provider-dependent output"),
         "brief strict skip must be explicit; got: {out:?}"
+    );
+}
+
+#[test]
+fn who_calls_provider_completeness_tracks_its_relation_union_and_file_failures() {
+    let (repo, store) = index_fixture("who-calls-provider-relations");
+
+    // Broad partial status is legitimate metadata, but unrelated omitted
+    // capabilities must not hedge or block a CALLS+USAGE answer.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls", "usages"],
+        &["semantic", "gitdiff"],
+        0,
+    );
+    let (code, out, err) = run_with_env(
+        &["who-calls", "do_it", "--json", "--all"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(
+        code, 0,
+        "relation-complete provider must pass strict policy: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "ok", "{value:#}");
+    assert!(
+        value.get("warning").is_none(),
+        "unrelated partial capabilities must not warn: {value:#}"
+    );
+
+    // who-calls reads the union of incoming CALLS and USAGE. Missing either
+    // relation makes the answer partial even when the observed caller came
+    // from the supported half of that union.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls"],
+        &["usages", "semantic"],
+        0,
+    );
+    let (code, out, err) = run(&["who-calls", "do_it", "--json", "--all"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "metadata policy still serves partial evidence: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["warning"], "1 incomplete provider; answer may be partial",
+        "{value:#}"
+    );
+    let (strict_code, strict_out, strict_err) = run_with_env(
+        &["who-calls", "do_it", "--json", "--all"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(strict_code, 1, "missing requested relation must block strict policy: stderr={strict_err}\nstdout={strict_out}");
+    let strict: serde_json::Value = serde_json::from_str(&strict_out).unwrap();
+    assert_eq!(
+        strict["status"], "skipped_incomplete_provider",
+        "{strict:#}"
+    );
+
+    // The related graph commands have narrower, source-traced relation sets:
+    // callees and path(CALLS) read only calls, as does outgoing impact by
+    // default. They remain complete while incoming default impact's all-
+    // reference union correctly requires usages/type_refs/imports too.
+    for args in [
+        vec!["callees", "caller", "--json", "--all"],
+        vec!["path", "--from", "caller", "--to", "do_it", "--json"],
+        vec!["impact", "caller", "--direction", "outgoing", "--json"],
+    ] {
+        let (code, out, err) = run_with_env(
+            &args,
+            &repo,
+            &store,
+            &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+        );
+        assert_eq!(
+            code, 0,
+            "CALLS-only command {args:?} must pass strict policy: stderr={err}\nstdout={out}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            value.get("warning").is_none(),
+            "compact warning must use the same CALLS-only relation set as the strict gate for {args:?}: {value:#}"
+        );
+    }
+    let (incoming_warn_code, incoming_warn_out, incoming_warn_err) =
+        run(&["impact", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        incoming_warn_code, 0,
+        "metadata policy must serve partial incoming impact: stderr={incoming_warn_err}\nstdout={incoming_warn_out}"
+    );
+    let incoming_warn: serde_json::Value = serde_json::from_str(&incoming_warn_out).unwrap();
+    assert_eq!(
+        incoming_warn["warning"], "1 incomplete provider; answer may be partial",
+        "compact warning must use the same incoming reference union as the strict gate: {incoming_warn:#}"
+    );
+    let (incoming_code, incoming_out, incoming_err) = run_with_env(
+        &["impact", "do_it", "--json"],
+        &repo,
+        &store,
+        &[("GREPPY_PROVIDER_POLICY", "require_complete")],
+    );
+    assert_eq!(
+        incoming_code, 1,
+        "incoming all-reference impact must require its full union: stderr={incoming_err}\nstdout={incoming_out}"
+    );
+
+    // A failed source file can hide edges even when the manifest advertises
+    // every requested relation, so it remains incomplete for every query.
+    set_rust_provider_completeness(
+        &store,
+        &["definitions", "calls", "usages"],
+        &["semantic"],
+        1,
+    );
+    let (code, out, err) = run(&["who-calls", "do_it", "--json", "--all"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "metadata policy serves evidence despite failed files: stderr={err}\nstdout={out}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["warning"], "1 incomplete provider; answer may be partial",
+        "{value:#}"
     );
 }
 
@@ -1812,7 +2596,9 @@ fn impact_json_reports_exact_scope_counts_and_metadata() {
     assert_eq!(v["project"], "repo");
     assert_eq!(v["symbol_found"], true);
     assert_eq!(v["fresh"], true);
-    assert_eq!(v["provider_complete"], false);
+    assert_eq!(v["provider_complete"], true);
+    assert_eq!(v["incomplete_provider_count"], 0);
+    assert_eq!(v["incomplete_providers"], serde_json::json!([]));
     assert_eq!(v["scope"], "transitive");
     assert_eq!(v["direction"], "incoming");
     assert_eq!(v["edge_type"], "all_references");
@@ -2226,7 +3012,13 @@ fn recurse(n: u32) -> u32 {
         "brief must report a recursive self-call as a caller, got: {out}"
     );
     assert!(
-        out.contains("  recurse\n"),
+        out.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|field| field.parse::<u32>().is_ok())
+                && fields.next() == Some("recurse")
+        }),
         "brief's sketch must name the recursive call, got: {out}"
     );
 }
@@ -2305,5 +3097,114 @@ fn impact_outgoing_from_a_caller_reaches_the_hub() {
     assert!(
         out.contains("hub"),
         "outgoing impact from caller_0_0 must reach hub; got: {out}"
+    );
+}
+
+#[test]
+fn read_symbol_miss_reports_unsupported_wgsl_without_reindex_advice() {
+    let (repo, store) = index_fixture("wgsl-read-coverage");
+    std::fs::create_dir_all(repo.join("browser-runtime/src")).unwrap();
+    std::fs::write(
+        repo.join("browser-runtime/src/scene.wgsl"),
+        "fn road_structure(value: f32) -> f32 { return value; }\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "fixture index: {out} {err}");
+    for command in ["read", "read-smart"] {
+        let (code, out, err) = run(&[command, "road_structure"], &repo, &store);
+        assert_eq!(code, 1, "unsupported graph lookup: {out} {err}");
+        assert!(out.contains("no indexed symbol `road_structure`"), "{out}");
+        assert!(
+            out.to_ascii_lowercase()
+                .contains("definition extraction is unsupported")
+                && out.to_ascii_lowercase().contains("wgsl"),
+            "{out}"
+        );
+        assert!(out.contains("cannot rule out a definition"), "{out}");
+        assert!(
+            out.contains("reindexing does not add symbol coverage"),
+            "{out}"
+        );
+        assert!(
+            out.contains("search-pattern road_structure --fixed --root"),
+            "{out}"
+        );
+        assert!(out.contains("greppy read-file PATH --root"), "{out}");
+        assert!(!out.contains("greppy index ."), "{out}");
+    }
+    let (code, out, err) = run(&["read", "road_structure", "--json"], &repo, &store);
+    assert_eq!(code, 1, "JSON lookup: {out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "not-found");
+    assert_eq!(value["lookup_scope"], "indexed-definitions");
+    assert!(value["unsupported_definition_coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provider| provider["language"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("wgsl")
+            && provider["status"] == "unsupported"));
+    assert!(value["source_recovery"]
+        .as_str()
+        .unwrap()
+        .contains("--root"));
+    {
+        let path = "src/lib.rs";
+        let (code, out, err) = run(&["read", "road_structure", "--path", path], &repo, &store);
+        assert_eq!(code, 1, "filtered miss: {out} {err}");
+        assert!(
+            !out.contains("definition extraction is unsupported"),
+            "{out}"
+        );
+        let (code, out, err) = run(
+            &["read", "road_structure", "--path", path, "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 1, "ordinary JSON miss: {out} {err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "not-found");
+        assert!(
+            value.get("unsupported_definition_coverage").is_none(),
+            "{out}"
+        );
+        assert!(value.get("source_recovery").is_none(), "{out}");
+    }
+    let (code, out, err) = run(
+        &[
+            "read",
+            "road_structure",
+            "--path",
+            "browser-runtime/src/missing.wgsl",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 64, "invalid nonexistent path: {out} {err}");
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(
+        !out.contains("definition extraction is unsupported"),
+        "{out}"
+    );
+    let (code, out, err) = run(
+        &[
+            "read",
+            "road_structure",
+            "--path",
+            "browser-runtime/src/scene.wgsl",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 1, "actual unsupported file: {out} {err}");
+    assert!(
+        out.to_ascii_lowercase()
+            .contains("definition extraction is unsupported")
+            && out.to_ascii_lowercase().contains("wgsl"),
+        "{out}"
     );
 }

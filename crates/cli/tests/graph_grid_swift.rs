@@ -369,26 +369,15 @@ public func entryPoint() -> Payload {
         &store,
         &[("GREPPY_AUTO_REINDEX", "1")],
     );
-    assert!(
-        matches!(first_code, 0 | 75),
-        "freshness may heal inline or refuse while refreshing, never serve stale; stderr={first_err}\nstdout={first_out}"
+    assert_eq!(
+        first_code, 0,
+        "the first query must finish automatic repair; stderr={first_err}\nstdout={first_out}"
     );
-    if first_code == 75 {
-        assert_eq!(first["status"], "skipped_stale_index", "graph={first}");
-        assert_eq!(first["fresh"], false, "graph={first}");
-        assert!(
-            matches!(
-                first["freshness"]["state"].as_str(),
-                Some("refreshing" | "drift")
-            ),
-            "freshness must report the edit or active repair; graph={first}"
-        );
-    } else {
-        assert_eq!(
-            first["fresh"], true,
-            "an inline-healed first response must prove freshness; graph={first}"
-        );
-    }
+    assert_eq!(
+        first["fresh"], true,
+        "the first response must prove freshness; graph={first}"
+    );
+    assert_eq!(first["freshness"]["state"], "fresh");
     assert!(
         hits(&first).is_empty(),
         "the old caller->helperFunction edge must never escape after the edit; graph={first}"

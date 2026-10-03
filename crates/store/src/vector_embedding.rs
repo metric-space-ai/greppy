@@ -77,6 +77,8 @@ pub struct VectorSearchQuery<'a> {
     /// decisions.
     pub graph_generation: Option<u64>,
     pub file_path: Option<&'a str>,
+    /// Normalized repository prefixes; applied before candidate ranking.
+    pub path_prefixes: Option<&'a [String]>,
     pub limit: usize,
     pub min_score: Option<f32>,
 }
@@ -255,6 +257,38 @@ impl Store {
         Ok(n)
     }
 
+    /// Count the exact candidate scope, including path restrictions.
+    pub fn count_vector_search_scope(&self, q: &VectorSearchQuery<'_>) -> Result<i64> {
+        let generation = if self.is_overlay() {
+            None
+        } else {
+            q.graph_generation.map(|g| g as i64)
+        };
+        let prefixes = serde_json::to_string(q.path_prefixes.unwrap_or(&[]))
+            .map_err(|e| Error::Invalid(format!("vector path scope: {e}")))?;
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM vector_embeddings
+             WHERE project = ?1 AND model_id = ?2 AND prompt_version = ?3 AND task = ?4
+               AND (?5 IS NULL OR graph_generation = ?5)
+               AND (?6 = '' OR file_path = ?6)
+               AND (?7 = '[]' OR EXISTS (
+                   SELECT 1 FROM json_each(?7) AS scope
+                   WHERE scope.value = '' OR file_path = scope.value
+                      OR substr(file_path, 1, length(scope.value) + 1) = scope.value || '/'
+               ))",
+            params![
+                q.project,
+                q.model_id,
+                q.prompt_version,
+                q.task,
+                generation,
+                q.file_path.unwrap_or(""),
+                prefixes
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Distinct embedding model ids present for `project`, regardless of
     /// generation. Used by the inline auto-reindex to detect that a store
     /// HAD code-span vectors (so it must rebuild them for the new
@@ -328,6 +362,8 @@ impl Store {
             q.graph_generation.map(|g| g as i64)
         };
         let file = q.file_path.unwrap_or("");
+        let prefixes = serde_json::to_string(q.path_prefixes.unwrap_or(&[]))
+            .map_err(|e| Error::Invalid(format!("vector path scope: {e}")))?;
 
         // ---------------------------------------------------- pass 1: score
         // The old single-pass scan fully decoded EVERY candidate row (~10
@@ -371,7 +407,12 @@ impl Store {
                    AND prompt_version = ?3
                    AND task = ?4
                    AND (?5 IS NULL OR graph_generation = ?5)
-                   AND (?6 = '' OR file_path = ?6)",
+                   AND (?6 = '' OR file_path = ?6)
+                   AND (?7 = '[]' OR EXISTS (
+                       SELECT 1 FROM json_each(?7) AS scope
+                       WHERE scope.value = '' OR file_path = scope.value
+                          OR substr(file_path, 1, length(scope.value) + 1) = scope.value || '/'
+                   ))",
             )?;
             let mut rows = stmt.query(params![
                 q.project,
@@ -379,7 +420,8 @@ impl Store {
                 q.prompt_version,
                 q.task,
                 generation,
-                file
+                file,
+                prefixes
             ])?;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
@@ -517,6 +559,11 @@ impl Store {
                AND task = ?
                AND (? IS NULL OR graph_generation = ?)
                AND (? = '' OR file_path = ?)
+               AND (? = '[]' OR EXISTS (
+                   SELECT 1 FROM json_each(?) AS scope
+                   WHERE scope.value = '' OR file_path = scope.value
+                      OR substr(file_path, 1, length(scope.value) + 1) = scope.value || '/'
+               ))
                AND ({})",
             key_clauses.join(" OR ")
         );
@@ -530,6 +577,8 @@ impl Store {
             generation.map_or(SqlValue::Null, SqlValue::from),
             SqlValue::from(file.to_string()),
             SqlValue::from(file.to_string()),
+            SqlValue::from(prefixes.clone()),
+            SqlValue::from(prefixes),
         ];
         values.extend(node_ids.into_iter().map(SqlValue::from));
         values.extend(qnames_without_node.into_iter().map(SqlValue::from));
@@ -862,6 +911,7 @@ mod tests {
             task: "retrieval_document",
             graph_generation: generation,
             file_path: None,
+            path_prefixes: None,
             limit,
             min_score: None,
         }
@@ -938,6 +988,49 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn path_scope_filters_before_top_k_and_counts_the_same_candidates() {
+        let mut s = store_with_project("p");
+        for (name, file, hash, vector) in [
+            (
+                "p.outside",
+                "src/scraper/other.rs",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                vec![1.0, 0.0],
+            ),
+            (
+                "p.inside",
+                "src/scrape/person.rs",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                vec![0.8, 0.2],
+            ),
+            (
+                "p.second",
+                "src/people/person.rs",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                vec![0.0, 1.0],
+            ),
+        ] {
+            s.upsert_vector_embedding(&embedding("p", None, name, file, 4, hash, vector))
+                .unwrap();
+        }
+        let prefixes = vec!["src/scrape".to_owned(), "src/people/person.rs".to_owned()];
+        let mut scoped = query("p", Some(4), 1);
+        scoped.path_prefixes = Some(&prefixes);
+        assert_eq!(s.count_vector_search_scope(&scoped).unwrap(), 2);
+        let hits = s.vector_search_exact(&[1.0, 0.0], &scoped).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].embedding.qualified_name, "p.inside");
+        // Prefix bytes are literal (not SQL LIKE patterns).
+        let literal = vec!["src/scr%".to_owned()];
+        scoped.path_prefixes = Some(&literal);
+        assert_eq!(s.count_vector_search_scope(&scoped).unwrap(), 0);
+        assert!(s
+            .vector_search_exact(&[1.0, 0.0], &scoped)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

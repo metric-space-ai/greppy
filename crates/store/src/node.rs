@@ -6,6 +6,10 @@ use crate::fts;
 use crate::store::Store;
 use crate::store_error::{Error, Result};
 
+const FILE_NODES_SQL: &str =
+    "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+     FROM nodes WHERE project = ?1 AND file_path = ?2";
+
 /// One row of the `nodes` table plus its parsed JSON properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -63,7 +67,7 @@ fn fts_tokens(name: &str, qualified_name: &str) -> (String, String) {
 /// columns BEFORE the upsert and, when it exists, issue the FTS `'delete'`
 /// with those exact (old) values; then we upsert and insert the fresh
 /// posting. On a plain insert there is no prior row, so no delete runs.
-fn insert_node_in_tx(tx: &rusqlite::Transaction<'_>, n: &NewNode) -> Result<i64> {
+fn insert_node_in_tx(tx: &rusqlite::Connection, n: &NewNode) -> Result<i64> {
     // Prune the prior posting for an in-place upsert using the row's
     // existing (old) column values — the only values that match what was
     // last inserted into the contentless index for this rowid.
@@ -176,6 +180,13 @@ impl Store {
         if let Some(id) = self.equivalent_visible_overlay_node(n)? {
             return Ok(id);
         }
+        self.insert_writable_node(n)
+    }
+
+    /// Insert into the writable graph even when an identical Base definition exists.
+    /// Vector foreign keys require a positive Delta id; ordinary structural insertion
+    /// may instead reuse the immutable Base identity through `insert_node`.
+    pub fn insert_writable_node(&mut self, n: &NewNode) -> Result<i64> {
         let tx = self.transaction()?;
         let id = insert_node_in_tx(tx.raw(), n)?;
         tx.commit()?;
@@ -347,6 +358,25 @@ impl Store {
         Ok(out)
     }
 
+    /// All visible nodes in one exact file, in qualified-name/id order.
+    ///
+    /// Keep SQL limited to the indexed project/file lookup. An optional OR
+    /// filter plus SQL ORDER BY can make SQLite scan the project's qname
+    /// index for each file. Sorting only this file's rows preserves the old
+    /// order without repeating a project-wide scan during structural indexing.
+    pub fn list_nodes_for_file(&self, project: &str, file: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn().prepare_cached(FILE_NODES_SQL)?;
+        let mut rows = stmt
+            .query_map(params![project, file], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.sort_by(|a, b| {
+            a.qualified_name
+                .cmp(&b.qualified_name)
+                .then(a.id.cmp(&b.id))
+        });
+        Ok(rows)
+    }
+
     /// Paginated, filtered node listing for search / CLI surfaces.
     ///
     /// Lists nodes for `project`, optionally narrowed by `label` and/or
@@ -435,6 +465,85 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Change an owned definition identity without dropping its graph node ID.
+    /// Updates contentless FTS postings and retires kind-dependent embeddings.
+    /// Immutable Base identities receive a private override; their old node and
+    /// kind-dependent embedding become invisible without mutating the Base.
+    pub fn update_node_identity(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
+        self.conn()
+            .execute_batch("SAVEPOINT greppy_node_identity")?;
+        let result = self.update_node_identity_inner(id, label, qname);
+        match result {
+            Ok(()) => {
+                self.conn().execute_batch("RELEASE greppy_node_identity")?;
+                Ok(())
+            }
+            Err(error) => {
+                self.conn().execute_batch(
+                    "ROLLBACK TO greppy_node_identity; RELEASE greppy_node_identity",
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn update_node_identity_inner(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
+        if id < 0 && self.is_overlay() {
+            let old = self
+                .get_node(id)?
+                .ok_or_else(|| Error::Store(format!("missing Base definition {id}")))?;
+            // Node FKs refer to main.projects, while this additive override
+            // may be the first Delta write for a Base-only project. Copy only
+            // project metadata inside the same savepoint, never file ownership.
+            let project = self
+                .get_project(&old.project)?
+                .ok_or_else(|| Error::Store(format!("missing Base project {}", old.project)))?;
+            self.upsert_project(&project)?;
+            self.insert_node(&NewNode {
+                project: old.project.clone(),
+                label: label.into(),
+                name: old.name,
+                qualified_name: qname.into(),
+                file_path: old.file_path,
+                start_line: old.start_line,
+                end_line: old.end_line,
+                properties: old.properties,
+            })?;
+            self.conn().execute("INSERT OR IGNORE INTO main.definition_identity_overrides(project,qualified_name) VALUES(?1,?2)", params![old.project, old.qualified_name])?;
+            return Ok(());
+        }
+        let tx = self.transaction()?;
+        let row: Option<(String, String, String, String)> = tx
+            .raw()
+            .query_row(
+                "SELECT name, qualified_name, label, file_path FROM main.nodes WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((name, old_qname, old_label, file_path)) = row else {
+            return Err(Error::Store(format!(
+                "definition identity migration requires an owned node: {id}"
+            )));
+        };
+        let (old_name_col, old_qname_col) = fts_tokens(&name, &old_qname);
+        tx.raw().execute("INSERT INTO main.nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path) VALUES('delete', ?1, ?2, ?3, ?4, ?5)",
+            params![id, old_name_col, old_qname_col, old_label, file_path])?;
+        tx.raw().execute(
+            "DELETE FROM main.vector_embeddings WHERE node_id = ?1",
+            [id],
+        )?;
+        tx.raw().execute(
+            "UPDATE main.nodes SET label = ?2, qualified_name = ?3 WHERE id = ?1",
+            params![id, label, qname],
+        )?;
+        let (name_col, qname_col) = fts_tokens(&name, qname);
+        tx.raw().execute("INSERT INTO main.nodes_fts(rowid, name, qualified_name, label, file_path) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, name_col, qname_col, label, file_path])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Delete a node by id. Cascades to edges via the FK constraint.
@@ -652,6 +761,49 @@ mod tests {
         let classes = s.list_nodes_by_label("p", "Class", 100).unwrap();
         assert_eq!(classes.len(), 1);
         assert_eq!(s.count_nodes_by_label("p", "Function").unwrap(), 2);
+    }
+
+    #[test]
+    fn file_node_lookup_is_bounded_and_preserves_exact_results() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let mut s = store_with_project("p");
+        for i in (0..2000).rev() {
+            let mut n = new_node("p", "Function", &format!("p.n{i:05}"));
+            if i >= 10 {
+                n.file_path = format!("src/other_{i}.rs");
+            }
+            s.insert_node(&n).unwrap();
+        }
+        let expected = s.list_nodes("p", "", "src/lib.rs", 0, usize::MAX).unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        s.conn().progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let actual = s.list_nodes_for_file("p", "src/lib.rs").unwrap();
+        s.conn().progress_handler(0, None::<fn() -> bool>);
+        assert_eq!(actual.len(), 10);
+        assert_eq!(actual, expected);
+        assert!(
+            steps.load(Ordering::Relaxed) < 1500,
+            "one-file lookup scanned unrelated project nodes: {} SQLite steps",
+            steps.load(Ordering::Relaxed)
+        );
+        assert!(s
+            .list_nodes_for_file("other", "src/lib.rs")
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_nodes_for_file("p", "src/lib.rs.extra")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

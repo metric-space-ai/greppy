@@ -591,7 +591,8 @@ fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
     (content[open] == b'{' && content[close] == b'}').then_some((open, close))
 }
 
-fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
+/// Keep a selected body's outer braces when the replacement supplies only inner content.
+pub fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
     if outer_brace_offsets(requested).is_some() {
         return requested.to_vec();
     }
@@ -1023,6 +1024,75 @@ fn identifier_sites(
         }
     }
     Some(out)
+}
+
+/// AST-validated identifier ranges used by graph-backed rename planning.
+/// `None` means the file could not be parsed for its registered language.
+pub fn rename_identifier_sites(
+    path: &Path,
+    content: &[u8],
+    ranges: &[(usize, usize)],
+    name: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let language = greppy_parser::language_for_path(path);
+    let mut sites = Vec::new();
+    for &(start, end) in ranges {
+        sites.extend(identifier_sites(
+            language,
+            content,
+            (start, end.min(content.len())),
+            name.as_bytes(),
+        )?);
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    Some(sites)
+}
+
+/// Definition-name identifier ranges inside an indexed definition span.
+pub fn rename_definition_sites(
+    path: &Path,
+    content: &[u8],
+    range: (usize, usize),
+    name: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let language = greppy_parser::language_for_path(path);
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut sites = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        let is_definition_name = node.parent().is_some_and(|parent| {
+            parent.child_by_field_name("name").is_some_and(|field| {
+                field.start_byte() == node.start_byte() && field.end_byte() == node.end_byte()
+            })
+        });
+        if node.start_byte() >= range.0
+            && node.end_byte() <= range.1.min(content.len())
+            && node.child_count() == 0
+            && node.kind().contains("identifier")
+            && is_definition_name
+            && &content[node.start_byte()..node.end_byte()] == name.as_bytes()
+        {
+            sites.push((node.start_byte(), node.end_byte()));
+        }
+        if node.end_byte() >= range.0 && node.start_byte() <= range.1 && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    Some(sites)
 }
 
 /// Compatibility entry point for the pre-M4 parameters-only API. Its inputs
@@ -1760,6 +1830,11 @@ fn plan_semantic_file(
     scope_matches: usize,
     options: &VerbOptions,
 ) -> Result<SemanticFilePlan> {
+    let language = if language == Language::C {
+        crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+    } else {
+        language
+    };
     let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
     let syntax_after = syntax_counts(language, &applied.content);
@@ -1965,6 +2040,58 @@ fn count_workspace_residuals(
     )
 }
 
+fn count_rename_scope_residuals(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    name: &str,
+    replacement_name: &str,
+    projected: &[crate::journal::FilePublication],
+) -> Result<usize> {
+    let projected = projected
+        .iter()
+        .map(|publication| {
+            (
+                publication.rel_path.as_str(),
+                publication.content.as_slice(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut count = 0usize;
+    for scope in scopes {
+        let owned;
+        let content = if let Some(content) = projected.get(scope.rel_path.as_str()) {
+            *content
+        } else {
+            owned = std::fs::read(workspace_root.join(&scope.rel_path)).map_err(|source| {
+                greppy_core::Error::Io {
+                    context: format!("read {}", scope.rel_path),
+                    source,
+                }
+            })?;
+            owned.as_slice()
+        };
+        let replacement_delta = replacement_name.len() as isize - name.len() as isize;
+        let mut projected_spans = Vec::with_capacity(scope.spans.len());
+        let mut ordered = scope.spans.clone();
+        ordered.sort_unstable();
+        for (index, (start, _)) in ordered.into_iter().enumerate() {
+            let mapped_start = start.saturating_add_signed(replacement_delta * index as isize);
+            let mapped_end = mapped_start.saturating_add(name.len());
+            projected_spans.push((mapped_start, mapped_end));
+        }
+        count +=
+            rename_identifier_sites(Path::new(&scope.rel_path), content, &projected_spans, name)
+                .ok_or_else(|| {
+                    greppy_core::Error::Invalid(format!(
+                        "cannot parse rename residual scope {}",
+                        scope.rel_path
+                    ))
+                })?
+                .len();
+    }
+    Ok(count)
+}
+
 /// Graph-backed `rename-symbol`: rename identifier occurrences of `from`
 /// inside the given per-file scopes, publish all files as one journal
 /// transaction. Every site is AST-verified (identifier-kind leaf nodes
@@ -1975,6 +2102,29 @@ pub fn rename_symbol_files(
     from: &str,
     to: &str,
     options: &VerbOptions,
+) -> Result<Certificate> {
+    rename_symbol_files_with_residual_scope(workspace_root, scopes, from, to, options, false)
+}
+
+/// Graph-backed rename variant whose residual proof is limited to the exact
+/// identity-validated files supplied by the caller.
+pub fn rename_symbol_files_scoped(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    from: &str,
+    to: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    rename_symbol_files_with_residual_scope(workspace_root, scopes, from, to, options, true)
+}
+
+fn rename_symbol_files_with_residual_scope(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    from: &str,
+    to: &str,
+    options: &VerbOptions,
+    scoped_residuals: bool,
 ) -> Result<Certificate> {
     use std::collections::BTreeSet;
 
@@ -2084,12 +2234,22 @@ pub fn rename_symbol_files(
     if status == Status::Applied {
         let expected = options.expect_residual.unwrap_or(0);
         if let Some(language) = residual_language {
-            let residual_occurrences = count_workspace_residuals(
-                workspace_root,
-                language,
-                from,
-                Some(publications.as_slice()),
-            )?;
+            let residual_occurrences = if scoped_residuals {
+                count_rename_scope_residuals(
+                    workspace_root,
+                    scopes,
+                    from,
+                    to,
+                    publications.as_slice(),
+                )?
+            } else {
+                count_workspace_residuals(
+                    workspace_root,
+                    language,
+                    from,
+                    Some(publications.as_slice()),
+                )?
+            };
             let passed = residual_occurrences == expected;
             for report in &mut reports {
                 report.residual_occurrences = Some(residual_occurrences);
@@ -2281,6 +2441,13 @@ fn run_pipeline(
     {
         return Ok(certificate);
     }
+    let language = language.map(|language| {
+        if language == Language::C {
+            crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content)
+        } else {
+            language
+        }
+    });
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
     let mut applied = apply_in_memory(&snapshot, &ops)?;
     let mut formatter_expanded = false;
@@ -3191,6 +3358,9 @@ timeout = 30
         .unwrap();
         assert_eq!(cert.status, Status::InvalidResult);
         assert_eq!(cert.exit_code(), 13);
+        let diagnosis = cert.compact_failure_diagnosis().unwrap();
+        assert!(diagnosis.contains("syntax"), "{diagnosis}");
+        assert!(!diagnosis.contains("residual"), "{diagnosis}");
         assert!(!cert.published);
         assert_eq!(std::fs::read(&f).unwrap(), content);
     }
@@ -3231,6 +3401,105 @@ timeout = 30
     }
 
     #[test]
+    fn identity_scoped_rename_ignores_unrelated_same_name_methods() {
+        let dir = ws();
+        let selected = b"struct Scheduler;\nimpl Scheduler { fn next(&mut self) {} }\n";
+        let caller = b"fn caller(value: &mut Scheduler) { value.next(); }\n";
+        let unrelated_a = b"struct Other;\nimpl Other { fn next(&mut self) {} }\n";
+        let unrelated_b = b"fn iterator_next<I: Iterator>(value: &mut I) { value.next(); }\n";
+        for (path, content) in [
+            ("selected.rs", selected.as_slice()),
+            ("caller.rs", caller.as_slice()),
+            ("unrelated_a.rs", unrelated_a.as_slice()),
+            ("unrelated_b.rs", unrelated_b.as_slice()),
+        ] {
+            std::fs::write(dir.path().join(path), content).unwrap();
+        }
+        let selected_sites = rename_identifier_sites(
+            Path::new("selected.rs"),
+            selected,
+            &[(0, selected.len())],
+            "next",
+        )
+        .unwrap();
+        let caller_sites =
+            rename_identifier_sites(Path::new("caller.rs"), caller, &[(0, caller.len())], "next")
+                .unwrap();
+        assert_eq!(selected_sites.len(), 1);
+        assert_eq!(caller_sites.len(), 1);
+        assert!(
+            rename_identifier_sites(Path::new("caller.rs"), caller, &[(0, 8)], "next")
+                .unwrap()
+                .is_empty(),
+            "a misleading graph candidate range must not become an edit site"
+        );
+        let scopes = vec![
+            RenameFileScope {
+                rel_path: "selected.rs".into(),
+                spans: selected_sites,
+            },
+            RenameFileScope {
+                rel_path: "caller.rs".into(),
+                spans: caller_sites,
+            },
+        ];
+
+        let certificate =
+            rename_symbol_files_scoped(dir.path(), &scopes, "next", "advance", &rename_options(0))
+                .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert!(std::fs::read_to_string(dir.path().join("selected.rs"))
+            .unwrap()
+            .contains("fn advance"));
+        assert!(std::fs::read_to_string(dir.path().join("caller.rs"))
+            .unwrap()
+            .contains("value.advance()"));
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated_a.rs")).unwrap(),
+            unrelated_a
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated_b.rs")).unwrap(),
+            unrelated_b
+        );
+    }
+
+    #[test]
+    fn identity_scoped_residuals_follow_length_changed_multiple_sites() {
+        let dir = ws();
+        let source = b"struct Scheduler;\nimpl Scheduler { fn next(&mut self) { self.next(); } }\n";
+        std::fs::write(dir.path().join("selected.rs"), source).unwrap();
+        let sites = rename_identifier_sites(
+            Path::new("selected.rs"),
+            source,
+            &[(0, source.len())],
+            "next",
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+
+        let certificate = rename_symbol_files_scoped(
+            dir.path(),
+            &[RenameFileScope {
+                rel_path: "selected.rs".into(),
+                spans: sites,
+            }],
+            "next",
+            "advance",
+            &rename_options(0),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied);
+        assert_eq!(certificate.operations[0].residual_occurrences, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("selected.rs")).unwrap(),
+            "struct Scheduler;\nimpl Scheduler { fn advance(&mut self) { self.advance(); } }\n"
+        );
+    }
+
+    #[test]
     fn rename_symbol_unplanned_leftover_fails_residual_postcondition() {
         let dir = ws();
         std::fs::write(dir.path().join("a.rs"), b"fn old_name() {}\n").unwrap();
@@ -3258,6 +3527,12 @@ timeout = 30
         assert!(!certificate.published);
         assert_eq!(certificate.operations[0].file_sha256_after, None);
         assert_eq!(certificate.operations[0].residual_occurrences, Some(1));
+        let diagnosis = certificate.compact_failure_diagnosis().unwrap();
+        assert!(
+            diagnosis.contains("residual") || diagnosis.contains("occurrence"),
+            "{diagnosis}"
+        );
+        assert!(!diagnosis.contains("new syntax error"), "{diagnosis}");
         assert!(!certificate.operations[0].postconditions_passed);
         assert_eq!(
             std::fs::read(dir.path().join("a.rs")).unwrap(),

@@ -55,6 +55,80 @@ fn run(workspace: &Workspace, args: &[&str]) -> Output {
     command(workspace).args(args).output().expect("run greppy")
 }
 
+#[test]
+fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
+    let workspace = fresh_workspace("node-diagnostics");
+    let cases = [
+        (
+            "Error [ERR_MODULE_NOT_FOUND]: Cannot find package playwright-core\n    at packageResolve (node:internal/modules/esm/resolve:1:2)\n",
+            "1",
+            "FAILED — exit 1: 1 error, 0 warnings",
+        ),
+        (
+            "(node:42) [MODULE_TYPELESS_PACKAGE_JSON] Warning: first\n(node:43) [MODULE_TYPELESS_PACKAGE_JSON] Warning: second\n(node:44) [MODULE_TYPELESS_PACKAGE_JSON] Warning: third\n(node:45) [MODULE_TYPELESS_PACKAGE_JSON] Warning: fourth\n",
+            "0",
+            "ok — exit 0, 4 warnings",
+        ),
+    ];
+    for (payload, exit, verdict) in cases {
+        let script = format!("printf '%s' \"$1\" >&2; exit {exit}");
+        let output = run(
+            &workspace,
+            &[
+                "bash-smart",
+                "--",
+                "sh",
+                "-c",
+                &script,
+                "node-diagnostic-fixture",
+                payload,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(exit.parse::<i32>().unwrap()));
+        let shown = text(&output.stdout);
+        assert!(shown.starts_with(verdict), "{shown}");
+        assert_eq!(output.stderr, payload.as_bytes(), "child stderr changed");
+    }
+}
+
+#[test]
+fn cold_unavailable_daemon_does_not_materialize_embedded_model() {
+    let workspace = fresh_workspace("cold-no-daemon");
+    let fixture = workspace.repo.join("failed-output.txt");
+    let output_lines = (0..128)
+        .map(|i| {
+            let name = (0..4)
+                .map(|place| char::from(b'a' + ((i / 26usize.pow(place)) % 26) as u8))
+                .collect::<String>();
+            format!("fn source_{name}() {{ error.next_action(); }}\n")
+        })
+        .collect::<String>();
+    std::fs::write(&fixture, output_lines).unwrap();
+    let output = Command::new(bin())
+        .current_dir(&workspace.repo)
+        .env("GREPPY_STORE_DIR", &workspace.store)
+        .env("GREPPY_SHARED_INFERENCE_ROOT", &workspace.store)
+        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "cat \"$1\"; exit 1",
+            "failed-log-fixture",
+            fixture.to_str().expect("UTF-8 fixture path"),
+        ])
+        .output()
+        .expect("run greppy");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 1"));
+    assert!(
+        !workspace.store.join("models").exists(),
+        "daemon readiness probing must not extract embedded model assets"
+    );
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -66,6 +140,125 @@ fn expand_id(stdout: &str) -> &str {
         .nth(1)
         .unwrap_or_else(|| panic!("missing expand command in:\n{stdout}"));
     rest.split_whitespace().next().unwrap()
+}
+
+#[test]
+fn raw_output_continuations_and_missing_handles_never_prepare_a_code_index() {
+    let workspace = fresh_workspace("expand-no-index");
+    let marker = workspace.base.join("gate-was-called");
+    let gate = workspace.base.join("deny-heavy.py");
+    std::fs::write(&gate, format!("import pathlib, sys\npathlib.Path({:?}).write_text('called')\nprint('Capacity gate: expand fixture denied', file=sys.stderr)\nsys.exit(75)\n", marker.to_str().unwrap())).unwrap();
+    let raw = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1300); do echo line $i; done",
+        ],
+    );
+    assert_eq!(raw.status.code(), Some(0));
+    let mut id = expand_id(&text(&raw.stdout)).to_string();
+    std::fs::write(workspace.repo.join("source.rs"), "fn changed() {}\n").unwrap();
+    let mut lines = Vec::new();
+    let mut pages = 0;
+    loop {
+        let output = command(&workspace)
+            .args(["expand", &id, "--json"])
+            .env("GREPPY_AUTO_REINDEX", "1")
+            .env("GREPPY_HEAVY_GATE", &gate)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let page: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(page["kind"], "bash-smart");
+        for raw in page["raw_line_hex"].as_array().unwrap() {
+            let hex = raw.as_str().unwrap();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            lines.push(String::from_utf8(bytes).unwrap());
+        }
+        pages += 1;
+        match page["next"]["id"].as_str() {
+            Some(next) => {
+                assert_ne!(next, id);
+                id = next.to_string();
+            }
+            None => break,
+        }
+        assert!(pages < 10, "continuation did not advance");
+    }
+    assert!(pages >= 3);
+    assert_eq!(
+        lines.concat(),
+        (22..=1270)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>()
+    );
+    for json in [false, true] {
+        let mut cmd = command(&workspace);
+        cmd.args(["expand", "0000000000000000"])
+            .env("GREPPY_AUTO_REINDEX", "1")
+            .env("GREPPY_HEAVY_GATE", &gate);
+        if json {
+            cmd.args(["--json", "--max-bytes", "128"]);
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["status"], "expand_handle_not_found");
+            assert!(value["next"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--root ORIGINAL_PROJECT"));
+            assert!(value["store_path"]
+                .as_str()
+                .unwrap()
+                .contains(workspace.store.to_str().unwrap()));
+            assert!(value.get("total_exact").is_none() && value.get("results").is_none());
+        } else {
+            assert!(text(&output.stdout).contains("--root ORIGINAL_PROJECT"));
+        }
+    }
+    assert!(
+        !marker.exists(),
+        "saved logs and missing handles must never invoke indexing admission"
+    );
+}
+
+#[test]
+fn javascript_exception_headers_preserve_exit_count_and_stream_bytes() {
+    for class in [
+        "SyntaxError",
+        "TypeError",
+        "ReferenceError",
+        "RangeError",
+        "URIError",
+        "EvalError",
+        "AggregateError",
+        "InternalError",
+    ] {
+        for stream in ["stdout", "stderr"] {
+            let workspace = fresh_workspace("javascript-exception");
+            let diagnostic = format!("{class}: diagnostic probe\n    at fixture.js:1:7\n");
+            let redirect = if stream == "stderr" { " >&2" } else { "" };
+            let script = format!("printf '%s' '{diagnostic}'{redirect}; exit 1");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(1));
+            let verdict = "FAILED — exit 1: 1 error, 0 warnings\n";
+            if stream == "stdout" {
+                assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, diagnostic.as_bytes());
+            }
+        }
+    }
 }
 
 #[test]
@@ -101,6 +294,36 @@ fn oversized_single_line_keeps_failure_and_exact_raw_log_recovery() {
         );
         assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
     }
+}
+
+#[test]
+fn output_over_head_cap_preserves_child_exit_and_raw_log() {
+    let workspace = fresh_workspace("over-head-cap");
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "head -c 33554433 /dev/zero | tr '\\000' x; exit 7",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let stdout = text(&output.stdout);
+    assert!(stdout.starts_with("FAILED — exit 7: 0 errors, 0 warnings\n"));
+    assert!(output.stdout.len() < 12_000);
+    let path_json = stdout
+        .split("raw log ")
+        .nth(1)
+        .unwrap()
+        .split("; read with greppy read-file")
+        .next()
+        .unwrap();
+    let path: String = serde_json::from_str(path_json).unwrap();
+    let raw = std::fs::read(path).unwrap();
+    assert_eq!(raw.len(), 33_554_433);
+    assert!(raw.iter().all(|byte| *byte == b'x'));
 }
 
 #[test]
@@ -179,6 +402,164 @@ fn silent_long_running_child_emits_bounded_liveness_heartbeats() {
 }
 
 #[test]
+fn node_zero_failure_summary_preserves_bytes_and_child_status() {
+    let workspace = fresh_workspace("node-zero-failures");
+    let summary = "SUMMARY {\"success\":true,\"failed\":0}\npass 60\nfail 0\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{summary}'{redirect}; exit {exit}");
+            let output = run(
+                &workspace,
+                &[
+                    "bash-smart",
+                    "-e",
+                    "^fail |SUMMARY",
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                ],
+            );
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{summary}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, summary.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn aapt_xml_tree_preserves_bytes_and_child_status_without_false_errors() {
+    let workspace = fresh_workspace("aapt-xml");
+    let xml = "E: manifest (line=1)\n  A: package=example\n  E: uses-sdk (line=2)\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{xml}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{xml}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, xml.as_bytes());
+            }
+        }
+    }
+    let failed = format!("printf '%s' '{xml}E: failed to load resource\n'; exit 7");
+    let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &failed]);
+    assert_eq!(output.status.code(), Some(7));
+    assert!(text(&output.stdout).starts_with("FAILED — exit 7: 1 error, 0 warnings\n"));
+    assert!(text(&output.stdout).contains("E: failed to load resource"));
+}
+
+#[test]
+fn node_assertion_error_counts_and_keeps_the_original_failure() {
+    let workspace = fresh_workspace("node-assertion-error");
+    let diagnostic =
+        "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n1 !== 2\n";
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostic}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 1 error, 0 warnings\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostic.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn eslint_stylish_locations_count_and_preserve_child_streams() {
+    let workspace = fresh_workspace("eslint-stylish");
+    let cases = [
+        ("\n/project/e2e/mcp-crm-flow.mjs\n  148:49  error  Unsafe usage of ThrowStatement  no-unsafe-finally\n\n✖ 1 problem (1 error, 0 warnings)\n", 1, "FAILED — exit 1: 1 error, 0 warnings\n"),
+        ("\n/project/probe.mjs\n  2:1  warning  Unused variable  no-unused-vars\n\n✖ 1 problem (0 errors, 1 warning)\n", 0, "ok — exit 0, 1 warning\n"),
+        ("\n/project/probe.mjs\n  2:1  error  Unsafe finally  no-unsafe-finally\n  3:2  warning  Unused variable  no-unused-vars\n  4:1  error  Undefined name  no-undef\n\n✖ 3 problems (2 errors, 1 warning)\n", 1, "FAILED — exit 1: 2 errors, 1 warning\n"),
+        ("148:49 error_count: 7\n148:49 warning_count: 8\n148:x error prose\n", 0, "ok — exit 0\n"),
+    ];
+    for (diagnostic, exit, verdict) in cases {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{diagnostic}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{diagnostic}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, diagnostic.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn lint_help_error_prose_preserves_bytes_and_child_status() {
+    let workspace = fresh_workspace("lint-help-error-prose");
+    let help = "Usage: vp lint [OPTIONS]\n  --max-warnings <COUNT>\n      error status if there are too many warning-level rule violations in\n      the checked files\n";
+    for exit in [0, 7] {
+        for redirect in ["", " >&2"] {
+            let script = format!("printf '%s' '{help}'{redirect}; exit {exit}");
+            let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+            assert_eq!(output.status.code(), Some(exit));
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            if redirect.is_empty() {
+                assert_eq!(text(&output.stdout), format!("{verdict}{help}"));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(text(&output.stdout), verdict);
+                assert_eq!(output.stderr, help.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn global_compiler_error_codes_are_lifted_from_long_output() {
+    let workspace = fresh_workspace("global-compiler-error-codes");
+    let errors = "error TS18003: No inputs were found in config file\nerror MSB1009: Project file does not exist.\n";
+    let log = format!(
+        "{}{errors}{}",
+        "ordinary output\n".repeat(100),
+        "ordinary tail\n".repeat(100)
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{log}'{redirect}; exit 2");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(text(&output.stdout).starts_with("FAILED — exit 2: 2 errors, 0 warnings\n"));
+        // Long-output diagnostic prefixes are emitted on stdout for both
+        // origins; original stream bytes remain in the recovery payload.
+        let diagnostics = text(&output.stdout);
+        assert!(diagnostics.contains("error TS18003: No inputs were found in config file"));
+        assert!(diagnostics.contains("error MSB1009: Project file does not exist."));
+    }
+}
+
+#[test]
 fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
     let workspace = fresh_workspace("typescript-diagnostic");
     for redirect in ["", " >&2"] {
@@ -201,6 +582,36 @@ fn typescript_diagnostic_counts_one_error_and_preserves_exit_and_bytes() {
             &output.stderr
         };
         assert!(text(raw_stream).lines().any(|line| line == diagnostic));
+    }
+}
+
+#[test]
+fn linter_rule_diagnostics_count_and_preserve_child_exit_and_stream_bytes() {
+    let workspace = fresh_workspace("linter-rule-diagnostics");
+    let diagnostics = concat!(
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:2:1: error t3code(namespace-node-imports): Import node:net as a namespace named NodeNet.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:3:1: error t3code(namespace-node-imports): Import node:fs as a namespace named NodeFs.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:4:1: error t3code(namespace-node-imports): Import node:path as a namespace named NodePath.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:5:1: error t3code(namespace-node-imports): Import node:os as a namespace named NodeOs.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.test.ts:6:1: error t3code(namespace-node-imports): Import node:test as a namespace named NodeTest.\n",
+        "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:9:3: error t3code(no-global-process-runtime): Use the node:process import.\n",
+        "C:\\project files\\source.ts:12:4: warning eslint(no-unused-vars): Unused variable.\n",
+        "example.ts:12:4: error_count: 7\n",
+        "example.ts:x:y: error t3code(rule): Invalid location is not a diagnostic.\n",
+        "example.ts:12:4: error mentioned in documentation: Not a rule identifier.\n",
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 6 errors, 1 warning\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostics}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostics.as_bytes());
+        }
     }
 }
 
@@ -352,6 +763,29 @@ fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
         .collect::<String>();
     assert_eq!(expanded.stdout, expected_expanded.as_bytes());
     assert_eq!(text(&expanded.stdout).lines().count(), 149);
+
+    // Handles are scoped to the source repository even when the store base is
+    // shared. A root mistake must offer recovery without claiming expiry.
+    let wrong_root = fresh_workspace("expand-wrong-root");
+    let missing = command(&workspace)
+        .current_dir(&wrong_root.repo)
+        .args(["expand", id])
+        .output()
+        .expect("expand from another root");
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(text(&missing.stdout).contains("--root ORIGINAL_PROJECT"));
+    let recovered = command(&workspace)
+        .current_dir(&wrong_root.repo)
+        .args([
+            "expand",
+            id,
+            "--root",
+            workspace.repo.to_str().expect("UTF-8 root"),
+        ])
+        .output()
+        .expect("recover expand with original root");
+    assert_eq!(recovered.status.code(), Some(0));
+    assert_eq!(recovered.stdout, expected_expanded.as_bytes());
 }
 
 #[test]
@@ -384,6 +818,50 @@ fn repeated_middle_is_collapsed_arithmetically() {
     assert!(expanded.stderr.is_empty(), "{}", text(&expanded.stderr));
     assert_eq!(expanded.stdout, "hello\n".repeat(249).as_bytes());
     assert_eq!(text(&expanded.stdout).lines().count(), 249);
+}
+
+#[test]
+fn disjoint_array_values_have_gap_markers_before_each_retained_jump() {
+    let workspace = fresh_workspace("array-provenance");
+    let mut raw = "head\n".repeat(20);
+    for (label, base) in [("first", 100), ("second", 200), ("third", 300)] {
+        raw.push_str(&format!("  \"{label}\": [\n"));
+        for n in 1..=10 {
+            raw.push_str(&format!("    0.{:018},\n", base + n));
+        }
+        raw.push_str("  ],\n");
+    }
+    raw.push_str(&"tail\n".repeat(30));
+    let output = run(&workspace, &["bash-smart", "--", "printf", "%s", &raw]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = text(&output.stdout);
+    let first = stdout
+        .find("0.000000000000000101,")
+        .expect("first representative");
+    let second = stdout
+        .find("0.000000000000000201,")
+        .expect("second representative");
+    let third = stdout
+        .find("0.000000000000000301,")
+        .expect("third representative");
+    assert!(first < second && second < third, "{stdout}");
+    assert!(
+        stdout[first..second].contains("… lines "),
+        "first and second arrays were stitched: {stdout}"
+    );
+    assert!(
+        stdout[second..third].contains("… lines "),
+        "second and third arrays were stitched: {stdout}"
+    );
+    let expanded = run(&workspace, &["expand", expand_id(&stdout)]);
+    assert_eq!(expanded.status.code(), Some(0));
+    let expected = raw
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| (20..56).contains(i) && ![21, 33, 45].contains(i))
+        .map(|(_, line)| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(expanded.stdout, expected.as_bytes());
 }
 
 #[test]
@@ -535,7 +1013,10 @@ fn active_index_writer_never_blocks_command_execution() {
     let long_output = run(
         &workspace,
         &[
-            "bash-smart", "--", "sh", "-c",
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
             "i=0; while [ $i -lt 500 ]; do printf 'test case_%s ... ok\\n' \"$i\"; printf 'detail case_%s\\n' \"$i\" >&2; i=$((i+1)); done",
         ],
     );

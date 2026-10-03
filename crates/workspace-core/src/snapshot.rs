@@ -644,7 +644,7 @@ fn dirty_paths_for_candidates(repository: &Path, candidates: &[String]) -> Resul
     Ok(dirty.into_iter().collect())
 }
 
-fn capture_hardlink_groups(repository: &Path, paths: &[String]) -> Result<Vec<Vec<String>>> {
+pub fn capture_hardlink_groups(repository: &Path, paths: &[String]) -> Result<Vec<Vec<String>>> {
     let mut identities = BTreeMap::<HardlinkIdentity, Vec<String>>::new();
     for relative in paths {
         validate_relative_path(relative)?;
@@ -673,9 +673,19 @@ fn capture_hardlink_groups(repository: &Path, paths: &[String]) -> Result<Vec<Ve
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct HardlinkIdentity {
+pub struct HardlinkIdentity {
     volume: u64,
     file: u64,
+}
+
+pub fn path_hardlink_identity(path: &Path) -> Result<Option<HardlinkIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    hardlink_identity(path, &metadata)
 }
 
 #[cfg(unix)]

@@ -34,6 +34,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "src/build_policy.rs"]
+mod build_policy;
+
 const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
 const GGUF_SHA: &str = "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2";
 const TOK_NAME: &str = "tokenizer.json";
@@ -47,6 +50,21 @@ const CI_QWEN_GGUF_SHA: &str = "b14c40dfa0c3e2428232027344341fe7cb1b4495b5086d98
 const CI_QWEN_TOK_SHA: &str = "8a3b4f437b9ee58c2190c1e409e24c5b31c0b697041f22925705fca5365db5ca";
 
 fn main() {
+    let profile = std::env::var("PROFILE").expect("PROFILE");
+    let debug_info = std::env::var("DEBUG").as_deref() == Ok("true");
+    println!("cargo:rustc-check-cfg=cfg(greppy_debug_profile)");
+    if profile == "debug" {
+        println!("cargo:rustc-cfg=greppy_debug_profile");
+    }
+    if std::env::var_os("CARGO_FEATURE_CPU_ONLY").is_some()
+        && !build_policy::cpu_only_allowed(&profile, debug_info)
+    {
+        panic!(
+            "cpu-only is restricted to Cargo's debug profile; Greppy product builds require \
+             Metal on macOS or CUDA/nvcc on Linux x86_64"
+        );
+    }
+
     // clap's complete command tree is intentionally large. The default MSVC
     // PE stack can overflow while parsing nested commands such as
     // `greppy cache status`, so stamp a product/test stack that matches the

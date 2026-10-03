@@ -85,10 +85,7 @@ impl Store {
 
     /// Open with explicit options.
     pub fn open_with(path: &Path, opts: OpenOptions) -> Result<Self> {
-        let lifecycle = workspace_lifecycle_for_path(path).map_err(|e| Error::Io {
-            context: format!("acquire lifecycle lease for {}", path.display()),
-            source: e,
-        })?;
+        let lifecycle = workspace_lifecycle_for_path(path, opts.read_only)?;
         let conn = if opts.read_only {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
                 |e| Error::Io {
@@ -279,6 +276,21 @@ impl Store {
         base_path: &Path,
         visibility: &crate::VisibilityIndex,
     ) -> Result<Self> {
+        // Pre-v17 read-only Delta readers have no override rows yet. Empty
+        // indexed TEMP tables preserve reads until the next writer migrates.
+        for (table, column) in [
+            ("definition_identity_overrides", "qualified_name"),
+            ("js_ts_reference_override_files", "file_path"),
+        ] {
+            let present: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                self.conn.execute_batch(&format!("CREATE TEMP TABLE {table}(project TEXT NOT NULL, {column} TEXT NOT NULL, PRIMARY KEY(project,{column}));"))?;
+            }
+        }
         let base_uri = sqlite_read_only_uri(base_path)?;
         self.conn
             .execute("ATTACH DATABASE ?1 AS greppy_base", [base_uri])?;
@@ -315,7 +327,11 @@ impl Store {
     /// Begin a write transaction. Rolls back on drop if neither
     /// `commit()` nor `rollback()` is called explicitly.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
-        let tx = self.conn.transaction()?;
+        let tx = if self.conn.is_autocommit() {
+            WriteScope::Transaction(self.conn.transaction()?)
+        } else {
+            WriteScope::Savepoint(self.conn.savepoint()?)
+        };
         Ok(Transaction { tx })
     }
 }
@@ -360,6 +376,10 @@ SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
        b.file_path, b.start_line, b.end_line, b.properties
 FROM greppy_base.nodes b
 WHERE NOT EXISTS (
+    SELECT 1 FROM definition_identity_overrides q
+    WHERE q.project = b.project AND q.qualified_name = b.qualified_name
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 )
 AND NOT EXISTS (
@@ -374,8 +394,40 @@ SELECT -b.id AS id, b.project, b.file_path, b.source_qname,
        b.target_qname, b.edge_type, b.properties
 FROM greppy_base.raw_edges b
 WHERE NOT EXISTS (
+    SELECT 1 FROM js_ts_reference_override_files f
+    WHERE f.project = b.project AND f.file_path = b.file_path
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
-);
+)
+AND NOT (b.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = CASE b.edge_type WHEN 'CALLS' THEN 'greppy.rust_caller_override_files.' ELSE 'greppy.rust_usage_override_files.' END || b.project AND f.value = b.file_path
+))
+UNION ALL
+SELECT -9223372036854775807 + row_number() OVER (ORDER BY m.key, CAST(r.key AS INTEGER)) AS id,
+       substr(m.key, length('greppy.rust_usage_override_rows.') + 1) AS project,
+       json_extract(r.value, '$.file_path') AS file_path,
+       json_extract(r.value, '$.source_qname') AS source_qname,
+       json_extract(r.value, '$.target_qname') AS target_qname,
+       'USAGE' AS edge_type, json_extract(r.value, '$.properties') AS properties
+FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) r
+WHERE substr(m.key, 1, length('greppy.rust_usage_override_rows.')) = 'greppy.rust_usage_override_rows.'
+  AND NOT EXISTS (
+      SELECT 1 FROM greppy_hidden_paths h WHERE h.path = json_extract(r.value, '$.file_path')
+  )
+UNION ALL
+SELECT -4611686018427387903 + row_number() OVER (ORDER BY m.key, CAST(r.key AS INTEGER)) AS id,
+       substr(m.key, length('greppy.rust_caller_override_rows.') + 1) AS project,
+       json_extract(r.value, '$.file_path') AS file_path,
+       json_extract(r.value, '$.source_qname') AS source_qname,
+       json_extract(r.value, '$.target_qname') AS target_qname,
+       'CALLS' AS edge_type, json_extract(r.value, '$.properties') AS properties
+FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) r
+WHERE substr(m.key, 1, length('greppy.rust_caller_override_rows.')) = 'greppy.rust_caller_override_rows.'
+  AND NOT EXISTS (
+      SELECT 1 FROM greppy_hidden_paths h WHERE h.path = json_extract(r.value, '$.file_path')
+  );
 
 CREATE TEMP VIEW edges AS
 SELECT d.id, d.project, visible_source.id AS source_id,
@@ -402,8 +454,16 @@ JOIN nodes visible_target
   ON visible_target.project = base_target.project
  AND visible_target.qualified_name = base_target.qualified_name
 WHERE NOT EXISTS (
+    SELECT 1 FROM js_ts_reference_override_files f
+    WHERE f.project = e.project AND f.file_path = base_source.file_path
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
 )
+AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
+    SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+    WHERE m.key = CASE e.edge_type WHEN 'CALLS' THEN 'greppy.rust_caller_override_files.' ELSE 'greppy.rust_usage_override_files.' END || e.project AND f.value = base_source.file_path
+))
 AND NOT EXISTS (
     SELECT 1 FROM main.overlay_edges d
     WHERE d.project = e.project
@@ -439,6 +499,17 @@ SELECT -b.id AS id, b.project, b.model_id, b.prompt_version, b.task,
        b.vector, b.created_at, b.vector_i8, b.i8_scale
 FROM greppy_base.vector_embeddings b
 WHERE NOT EXISTS (
+    SELECT 1 FROM main.vector_embeddings d
+    WHERE d.project = b.project AND d.model_id = b.model_id
+      AND d.prompt_version = b.prompt_version AND d.task = b.task
+      AND d.qualified_name = b.qualified_name AND d.chunk_idx = b.chunk_idx
+      AND d.content_sha256 = b.content_sha256
+)
+AND NOT EXISTS (
+    SELECT 1 FROM definition_identity_overrides q
+    WHERE q.project = b.project AND q.qualified_name = b.qualified_name
+)
+AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 );
 
@@ -478,49 +549,119 @@ WHERE NOT EXISTS (
 
 fn workspace_lifecycle_for_path(
     path: &Path,
-) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    nonblocking: bool,
+) -> Result<Option<greppy_core::cache::FileLock>> {
     let Some(parent) = path.parent() else {
         return Ok(None);
     };
     let Ok(manifest) = greppy_core::cache::read_store_manifest(parent) else {
         return Ok(None);
     };
-    greppy_core::cache::acquire_workspace_lifecycle(
+    let lease = greppy_core::cache::acquire_workspace_lifecycle(
         &manifest.canonical_root,
         greppy_core::cache::LockMode::Shared,
-        false,
+        nonblocking,
     )
-    .inspect(|lease| {
-        debug_assert!(
-            lease.is_some(),
-            "blocking lifecycle lock must return a guard"
-        );
-    })
+    .map_err(|source| Error::Io {
+        context: format!("acquire lifecycle lease for {}", path.display()),
+        source,
+    })?;
+    if lease.is_none() {
+        return Err(Error::Lock(format!(
+            "workspace index lifecycle is busy for {}; retry this query after the active maintenance operation finishes",
+            manifest.canonical_root.display()
+        )));
+    }
+    Ok(lease)
 }
 
 /// A write transaction. Use `Store::transaction()` to acquire.
 pub struct Transaction<'a> {
-    tx: rusqlite::Transaction<'a>,
+    tx: WriteScope<'a>,
+}
+
+enum WriteScope<'a> {
+    Transaction(rusqlite::Transaction<'a>),
+    Savepoint(rusqlite::Savepoint<'a>),
 }
 
 impl<'a> Transaction<'a> {
     pub fn commit(self) -> Result<()> {
-        self.tx.commit().map_err(Error::Sqlite)
+        match self.tx {
+            WriteScope::Transaction(tx) => tx.commit(),
+            WriteScope::Savepoint(tx) => tx.commit(),
+        }
+        .map_err(Error::Sqlite)
     }
 
     pub fn rollback(self) -> Result<()> {
-        self.tx.rollback().map_err(Error::Sqlite)
+        match self.tx {
+            WriteScope::Transaction(tx) => tx.rollback(),
+            WriteScope::Savepoint(mut tx) => tx.rollback(),
+        }
+        .map_err(Error::Sqlite)
     }
 
     /// Borrow the underlying rusqlite transaction. Crate-internal.
-    pub(crate) fn raw(&self) -> &rusqlite::Transaction<'a> {
-        &self.tx
+    pub(crate) fn raw(&self) -> &rusqlite::Connection {
+        match &self.tx {
+            WriteScope::Transaction(tx) => tx,
+            WriteScope::Savepoint(tx) => tx,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_open_refuses_held_lifecycle_and_recovers_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = greppy_core::cache::ensure_workspace_store(root.path()).unwrap();
+        let path = store_dir.join("graph.db");
+        drop(Store::open(&path).unwrap());
+        let exclusive = greppy_core::cache::acquire_workspace_lifecycle(
+            root.path(),
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let error = Store::open_with(&path, OpenOptions::read_only()).unwrap_err();
+        assert!(matches!(&error, Error::Lock(message) if message.contains("retry this query")));
+        let core_error: greppy_core::Error = error.into();
+        assert!(matches!(core_error, greppy_core::Error::Lock(_)));
+        drop(exclusive);
+        drop(Store::open_with(&path, OpenOptions::read_only()).unwrap());
+        std::fs::remove_dir_all(store_dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_pre_override_schema_overlay_stays_readable_until_writer_upgrade() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        drop(Store::open(&base_path).unwrap());
+        {
+            let delta = Store::open(&delta_path).unwrap();
+            delta.conn().execute_batch("DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+        }
+        let overlay = Store::open_overlay_read_only(
+            &base_path,
+            &delta_path,
+            &crate::VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(overlay.list_nodes("p", "", "", 0, 10).unwrap().is_empty());
+        assert_eq!(overlay.schema_version().unwrap(), 16);
+        drop(overlay);
+        let upgraded = Store::open(&delta_path).unwrap();
+        assert_eq!(
+            upgraded.schema_version().unwrap(),
+            crate::migrate::CURRENT_VERSION
+        );
+    }
 
     #[test]
     fn open_memory_creates_db_with_schema() {

@@ -2,11 +2,13 @@
 //! command `search` (the replacement for the retired `semantic-search`)
 //! and for `brief`, plus the retirement pin for the dead verb.
 //!
-//! 0.3.0 CLI contract (normative; navigation law 1: no justification, no
-//! instruction):
-//! * While the embedding index is still building, `search` prints ONE status
-//!   line with progress and ETA and exits 1 (grep's convention). Never
-//!   partial hits, never `try:` fallback instructions.
+//! Semantic search waits for a real embedding owner to publish a complete
+//! generation. A progress record alone is not a live owner. This fixture
+//! disables inference and must not claim a build is running from a synthetic
+//! record. Live publication and compact progress/ETA formatting are covered by
+//! cli_hardening and lib_tests respectively.
+//!
+//! Missing-asset and retired-command contracts:
 //! * When the embedding assets cannot be resolved, `search` prints ONE line
 //!   naming the unavailable semantic index and exits 1 — a message, not a
 //!   different exit code, distinguishes it from zero hits.
@@ -103,15 +105,110 @@ fn index_graph(repo: &Path, store: &Path) {
 }
 
 #[test]
-fn search_building_status_is_one_line_with_progress_and_eta() {
+fn scoped_embedding_job_reuses_standalone_linked_graph_without_global_completion() {
+    let (primary, store, _scratch) = fixture("scoped-linked", "pub fn person_record() {}\n");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&primary, &["init"]);
+    git(&primary, &["add", "lib.rs"]);
+    git(
+        &primary,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = primary.parent().unwrap().join("linked");
+    git(
+        &primary,
+        &["worktree", "add", "-b", "scoped", linked.to_str().unwrap()],
+    );
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "1")],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    let db = graph_db(&store);
+    let graph = greppy_store::Store::open(&db).unwrap();
+    let generation = graph
+        .get_workspace_state(linked.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    drop(graph);
+    let (code, out, err) = run(
+        &["index", "."],
+        &linked,
+        &store,
+        &[
+            ("GREPPY_BACKGROUND_KIND", "embedding"),
+            ("GREPPY_BACKGROUND_EMBED_PATHS", "[\"lib.rs\"]"),
+            ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
+            ("GREPPY_DISABLE_AUTO_LINKED_WORKTREE_COW", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(
+        !err.contains("linked worktree uses shared Base"),
+        "scoped embedding must not migrate the Base: {err}"
+    );
+    let graph = greppy_store::Store::open(&db).unwrap();
+    assert_eq!(
+        graph
+            .get_workspace_state(linked.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap()
+            .graph_generation,
+        generation
+    );
+    let stamps: Vec<(String, String)> = graph
+        .conn()
+        .prepare("SELECT key, value FROM schema_meta WHERE key LIKE 'embedding_complete:%'")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "must publish only the scoped completion stamp: {stamps:?}"
+    );
+    assert!(stamps[0].0.ends_with(":scope:[\"lib.rs\"]"), "{stamps:?}");
+    assert!(
+        stamps[0].1.starts_with(&format!("{generation}|")),
+        "{stamps:?}"
+    );
+}
+
+#[test]
+fn search_does_not_report_ownerless_metadata_as_live_embedding_progress() {
     let (repo, store, _scratch) = fixture(
         "building",
         "pub fn semantic_progress_marker() -> i32 { 7 }\n",
     );
     index_graph(&repo, &store);
 
-    // Publish a deterministic live embedding job so `search` reports build
-    // progress without spawning a model process during this test.
+    // Metadata with a live PID is not an embedding owner: this process holds
+    // no workspace writer lease. Inference is deliberately disabled by run(),
+    // so the query cannot start a replacement or promise that work is underway.
     let job = graph_db(&store).parent().unwrap().join("index.job");
     std::fs::write(
         &job,
@@ -137,14 +234,22 @@ fn search_building_status_is_one_line_with_progress_and_eta() {
         &[],
     );
     assert_eq!(
-        code, 75,
-        "a building semantic index is a retryable temporary failure; stdout={stdout}\nstderr={stderr}"
+        code, 73,
+        "disabled inference cannot start a real embedding owner; stdout={stdout}\nstderr={stderr}"
     );
-    assert!(stderr.is_empty(), "status belongs on stdout: {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "no answer or fabricated progress: {stdout:?}"
+    );
+    assert!(
+        stderr.starts_with("greppy: index error: semantic embedding failed for ")
+            && stderr.ends_with(": the embedding process could not be started\n"),
+        "the launch failure must be explicit, not a stale PID's progress or retry promise: {stderr:?}"
+    );
     assert_eq!(
-        stdout,
-        "semantic search temporarily unavailable — semantic index building — 3/12 spans, ETA ~9s (backend cuda); retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit 75)\n",
-        "exactly ONE actionable status line with progress, ETA and retry gate — never partial hits; got: {stdout:?}"
+        stderr.lines().count(),
+        1,
+        "one precise diagnostic: {stderr:?}"
     );
 }
 
@@ -155,6 +260,60 @@ fn search_missing_asset_names_the_unavailable_backend() {
         "pub fn asset_fallback_marker() -> i32 { 11 }\n",
     );
     index_graph(&repo, &store);
+
+    // This tests missing query assets on a published vector snapshot. A cold
+    // graph with inference disabled must fail the owner launch earlier instead.
+    let mut graph = greppy_store::Store::open(&graph_db(&store)).unwrap();
+    let generation = graph
+        .get_workspace_state(repo.to_string_lossy().as_ref())
+        .unwrap()
+        .unwrap()
+        .graph_generation;
+    let node = graph.list_nodes("repo", "", "", 0, 1).unwrap().remove(0);
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    for (name, value) in [
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    let model_id = format!("google/embeddinggemma-300m@sha256:{:x}", digest.finalize());
+    graph
+        .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+            project: node.project.clone(),
+            model_id: model_id.clone(),
+            prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+            task: greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE.into(),
+            node_id: Some(node.id),
+            chunk_idx: 0,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
+            graph_generation: generation,
+            vector: vec![1.0, 0.0],
+        })
+        .unwrap();
+    graph
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("embedding_complete:{}", node.project),
+                format!("{generation}|{model_id}")
+            ],
+        )
+        .unwrap();
+    drop(graph);
 
     let (code, stdout, stderr) = run(
         &["search", "find asset fallback marker"],

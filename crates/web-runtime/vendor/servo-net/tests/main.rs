@@ -100,6 +100,7 @@ fn receive_credential_prompt_msgs(
                     break;
                 },
                 NetToEmbedderMsg::WebResourceRequested(..) => {},
+                NetToEmbedderMsg::WebResourceResponseCompleted(..) => {},
                 _ => unreachable!(),
             }
         }

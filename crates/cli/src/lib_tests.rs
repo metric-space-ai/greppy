@@ -1,6 +1,268 @@
 use super::*;
 use clap::Parser;
 
+#[test]
+fn overlay_publication_refuses_rogue_staged_rows_and_preserves_active_snapshot() {
+    let root = test_tempdir("overlay-publication-invariant");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(source.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+    let base_path = root.join("base.db");
+    {
+        let mut base = greppy_store::Store::open(&base_path).unwrap();
+        greppy_indexer::index_with_options(
+            &mut base,
+            &source,
+            "fixture",
+            &greppy_indexer::IndexOptions::default(),
+        )
+        .unwrap();
+        crate::store_cow::mark_rust_caller_edges_repaired(&base).unwrap();
+    }
+    let active_path = root.join("active.db");
+    {
+        let mut active = greppy_store::Store::open(&active_path).unwrap();
+        active
+            .upsert_project(&greppy_store::Project {
+                name: "fixture".into(),
+                indexed_at: "now".into(),
+                root_path: source.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        active
+            .insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "fixture".into(),
+                file_path: "src/rogue.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "rogue".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            }])
+            .unwrap();
+    }
+    let before = std::fs::read(&active_path).unwrap();
+    let overlay = crate::store_cow::OverlaySpec {
+        base_path,
+        base_commit: "a".repeat(40),
+        visibility: greppy_store::VisibilityIndex::new(
+            ["src/lib.rs".to_string()],
+            Vec::<String>::new(),
+        )
+        .unwrap(),
+    };
+    let error = crate::indexing::index_overlay_snapshot(
+        &active_path,
+        &source,
+        "fixture",
+        &overlay,
+        None,
+        &greppy_indexer::IndexOptions::default(),
+        false,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("src/rogue.ts"), "{error}");
+    assert_eq!(std::fs::read(&active_path).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
+    let root = test_tempdir("output-cleanup-no-migration");
+    let graph = root.join("graph.db");
+    let mut store = greppy_store::Store::open(&graph).unwrap();
+    store
+        .upsert_project(&greppy_store::Project {
+            name: "fixture".into(),
+            indexed_at: "2026-10-03T00:00:00Z".into(),
+            root_path: root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    store.conn().execute_batch("INSERT INTO expand_packs(id,project,command,query,graph_generation,created_at,expires_at,summary_json,payload_text) VALUES ('expired','fixture','bash-smart','',0,1,2,'{}','expired'),('live','fixture','bash-smart','',0,1,999999999999,'{}','live'); DROP TABLE definition_identity_overrides; DROP TABLE js_ts_reference_override_files; UPDATE schema_meta SET value='16' WHERE key='schema_version';").unwrap();
+    drop(store);
+    let held = rusqlite::Connection::open(&graph).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 0);
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    held.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(prune_expired_evidence_packs_in_existing_store(&graph, 3), 1);
+    let schema: String = held
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema, "16");
+    let overrides: i64 = held
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='definition_identity_overrides'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(overrides, 0, "output cleanup must not migrate the graph");
+    let remaining: String = held
+        .query_row("SELECT id FROM expand_packs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, "live");
+    drop(held);
+    let missing = root.join("missing.db");
+    assert_eq!(
+        prune_expired_evidence_packs_in_existing_store(&missing, 3),
+        0
+    );
+    assert!(!missing.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn disposable_initializers_use_ensured_path_after_late_durable_store() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let volume = std::path::Path::new("/Volumes/tmp");
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(volume) else {
+        return;
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() == std::fs::metadata("/Volumes").unwrap().dev()
+    {
+        return;
+    }
+    let _restore = EnvRestore::capture(&["HOME", "GREPPY_STORE_DIR"]);
+    let base = tempfile::tempdir().unwrap();
+    assert!(
+        base.path().starts_with(volume),
+        "fixture TMPDIR must use disposable volume"
+    );
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("HOME", base.path().join("home"));
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let repo = base.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    // Reproduce the review interleaving before any tmp ownership is established.
+    let cached_lookup = workspace_locator::store_path(&repo);
+    assert!(!cached_lookup.exists());
+    let durable_data = greppy_core::cache::data_root();
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &durable_data);
+    }
+    let old_store = ensured_workspace_store_path(&repo).unwrap();
+    unsafe {
+        std::env::remove_var("GREPPY_STORE_DIR");
+    }
+    let ensured = ensured_workspace_store_path(&repo).unwrap();
+    assert_eq!(ensured, old_store);
+    assert_ne!(ensured, cached_lookup);
+    // Initialization locks and opens the returned authoritative path. The
+    // writer identity remains the workspace hash even across path selection.
+    let writer = greppy_freshness::try_acquire(&ensured).unwrap();
+    assert_eq!(writer.path(), greppy_freshness::lock_path_for(&ensured));
+    assert_eq!(
+        writer.path(),
+        greppy_freshness::lock_path_for(&cached_lookup)
+    );
+    assert!(matches!(
+        greppy_freshness::try_acquire(&cached_lookup),
+        Err(greppy_freshness::LockError::Held { .. })
+    ));
+    let store = open_default_store_pack_writer(Some(repo.to_str().unwrap())).unwrap();
+    let opened: String = store
+        .conn()
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(&opened).canonicalize().unwrap(),
+        ensured.canonicalize().unwrap()
+    );
+    assert!(!cached_lookup.exists());
+    assert!(!cached_lookup.parent().unwrap().exists());
+    drop(store);
+    drop(writer);
+}
+
+struct InterruptedOnce {
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for InterruptedOnce {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if read == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            let _ = buffer;
+            Ok(0)
+        }
+    }
+}
+
+#[test]
+fn base_build_owner_watchdog_retries_interrupted_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut cancelled = false;
+    watch_base_build_owner(
+        InterruptedOnce {
+            reads: reads.clone(),
+        },
+        || cancelled = true,
+    );
+    assert!(cancelled);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[cfg(not(feature = "cpu-only"))]
+#[test]
+fn product_build_contains_embedding_and_summary_gpu_backends() {
+    assert!(greppy_embed_native::HAS_GPU_BACKEND);
+    assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+}
+
+#[cfg(unix)]
+#[test]
+fn query_path_filters_normalize_alias_roots_for_existing_and_missing_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_root = temp.path().join("real-root");
+    std::fs::create_dir_all(real_root.join("src")).unwrap();
+    std::fs::write(real_root.join("src/existing.rs"), "fn existing() {}\n").unwrap();
+    let alias_root = temp.path().join("alias-root");
+    symlink(&real_root, &alias_root).unwrap();
+
+    for (raw, expected) in [
+        ("src/existing.rs".to_owned(), "src/existing.rs"),
+        ("src/deleted.rs".to_owned(), "src/deleted.rs"),
+        (
+            alias_root
+                .join("src/existing.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/existing.rs",
+        ),
+        (
+            alias_root
+                .join("src/deleted.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "src/deleted.rs",
+        ),
+    ] {
+        assert_eq!(
+            normalize_query_filter_path(&alias_root, &raw).as_deref(),
+            Some(expected),
+            "failed to normalize {raw} through alias root {}",
+            alias_root.display()
+        );
+    }
+}
+
 fn drift_json(reason: &str) -> serde_json::Value {
     serde_json::json!({ "reasons": [reason] })
 }
@@ -41,10 +303,172 @@ fn transient_freshness_states_never_trigger_reindex() {
 }
 
 #[test]
+fn rejected_background_admission_returns_no_live_launch() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_HEAVY_GATE", "GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let gate = scratch.path().join("reject.py");
+    std::fs::write(
+        &gate,
+        "import sys\nprint('Capacity gate: test rejection', file=sys.stderr)\nsys.exit(75)\n",
+    )
+    .unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore these values.
+    unsafe {
+        std::env::set_var("GREPPY_HEAVY_GATE", &gate);
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+    }
+    assert!(
+        spawn_background_job_handle(Some(root.to_str().unwrap()), "test", "index", None).is_none()
+    );
+    let job = read_background_job(&background_job_path(&root)).unwrap();
+    assert_eq!(job["state"], "failed", "{job}");
+    assert!(
+        job["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("Capacity gate"),
+        "{job}"
+    );
+    assert!(!background_job_writer_active(&root));
+}
+
+#[test]
+fn indexed_refusal_recovery_matches_observed_freshness_state() {
+    let refreshing = serde_json::json!({
+        "state": "refreshing", "fresh": false,
+        "reasons": ["head_oid changed", "index signature changed", "files modified since last index"]
+    });
+    assert_eq!(freshness_refusal_exit(&refreshing), 75);
+    let message = indexed_stale_skip_message("search-symbol", &refreshing);
+    assert!(message.contains("publication is in progress"), "{message}");
+    assert!(message.contains("greppy index status --json"), "{message}");
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("run `greppy index .` first"), "{message}");
+    assert!(
+        message.contains("files modified since last index"),
+        "{message}"
+    );
+    let unknown = serde_json::json!({
+        "state": "unknown", "reasons": ["Store-CoW freshness proof failed: private row absent from Delta visibility manifest"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &unknown);
+    assert!(
+        message.contains("freshness could not be verified"),
+        "{message}"
+    );
+    assert!(message.contains("retrying this command"), "{message}");
+    assert!(
+        message.contains("resolve the reported freshness failure"),
+        "{message}"
+    );
+    assert!(message.contains("Delta visibility manifest"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
+    let failed = serde_json::json!({
+        "state": "failed", "reasons": ["files modified since last index"]
+    });
+    let message = indexed_stale_skip_message("search-symbol", &failed);
+    assert!(
+        message.contains("automatic index preparation failed"),
+        "{message}"
+    );
+    assert!(message.contains("retry this command"), "{message}");
+    assert!(!message.contains("host capacity"), "{message}");
+    assert!(!message.contains("publication is in progress"), "{message}");
+    let drift = serde_json::json!({
+        "state": "drift", "reasons": ["files modified since last index"]
+    });
+    assert!(indexed_stale_skip_message("search-symbol", &drift).contains(STALE_REMEDIATION));
+}
+
+#[test]
+fn semantic_refusal_preserves_admission_reason_and_selected_root() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("selected repo's root");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let store = scratch.path().join("selected store");
+    // SAFETY: this test holds TEST_ENV_LOCK and restores the environment.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", &store);
+    }
+    let error = "Automatic indexing deferred by shared host admission; no index work started. Capacity gate: another thread owns the heavy-job lease";
+    start_background_job_record(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": error}),
+    )
+    .unwrap();
+    let freshness = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false, "reasons": ["head_oid changed"]}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&freshness), 75);
+    assert_eq!(freshness["preparation_failure_kind"], "admission_deferred");
+    assert_eq!(freshness["preparation_error"], error);
+    let diagnostics = freshness["diagnostics_command"].as_str().unwrap();
+    assert!(
+        diagnostics.contains(&format!(
+            "--root {}",
+            shell_quote_cli(&root.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.starts_with(&format!(
+            "GREPPY_STORE_DIR={}",
+            shell_quote_cli(&store.to_string_lossy())
+        )),
+        "{diagnostics}"
+    );
+    for message in [
+        vector_stale_skip_message("semantic-search", &freshness),
+        indexed_stale_skip_message("who-calls", &freshness),
+    ] {
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains(diagnostics), "{message}");
+        assert!(!message.contains(STALE_REMEDIATION), "{message}");
+        assert!(!message.contains("publication is in progress"), "{message}");
+    }
+    let refreshing = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "refreshing", "fresh": false}),
+        root.to_str(),
+    );
+    assert!(
+        refreshing.get("preparation_error").is_none(),
+        "{refreshing}"
+    );
+    let fresh = serde_json::json!({"state": "fresh", "fresh": true});
+    assert_eq!(
+        preparation_refusal_diagnostics(fresh.clone(), root.to_str()),
+        fresh
+    );
+    start_background_job_record(
+        &background_job_path(&root),
+        &serde_json::json!({"state": "failed", "last_error": "fixture extraction error"}),
+    )
+    .unwrap();
+    let broken = preparation_refusal_diagnostics(
+        serde_json::json!({"state": "failed", "fresh": false}),
+        root.to_str(),
+    );
+    assert_eq!(freshness_refusal_exit(&broken), EXIT_IO as i32);
+    assert!(
+        vector_stale_skip_message("semantic-search", &broken).contains("fixture extraction error")
+    );
+}
+
+#[test]
 fn inline_auto_reindex_never_hides_model_loading_or_large_full_rebuilds() {
     assert!(auto_reindex_inline_allowed(false, 128, false));
     assert!(!auto_reindex_inline_allowed(false, 129, false));
-    assert!(auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(!auto_reindex_inline_allowed(false, 10_000, true));
+    assert!(auto_reindex_inline_allowed(false, 128, true));
+    assert!(!auto_reindex_inline_allowed(false, 129, true));
+    assert!(!auto_reindex_inline_allowed(false, -1, true));
     assert!(!auto_reindex_inline_allowed(true, 1, false));
     assert!(!auto_reindex_inline_allowed(true, 1, true));
 }
@@ -166,13 +590,558 @@ fn edit_symbol_replaces_indexed_typescript_and_kotlin_bodies() {
     std::fs::remove_dir_all(store_root).unwrap();
 }
 
+const RENAME_IDENTITY_HELPER_STORE: &str = "GREPPY_TEST_RENAME_IDENTITY_HELPER_STORE";
+
+fn index_rename_fixture(root: &std::path::Path) -> (String, std::path::PathBuf) {
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(
+        root.join("selected.rs"),
+        "struct Scheduler;\nimpl Scheduler { fn next(&mut self) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("caller.rs"),
+        "fn caller(value: &mut Scheduler) { value.next(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unrelated_a.rs"),
+        "struct Other;\nimpl Other { fn next(&mut self) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unrelated_b.rs"),
+        "struct Another;\nimpl Another { fn next(&mut self) {} }\nfn another_call(value: &mut Another) { value.next(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("stale.rs"), "fn stale_candidate() {}\n").unwrap();
+    let store_path = workspace_locator::store_path(root);
+    std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+    let mut store = greppy_store::Store::open(&store_path).unwrap();
+    let project = workspace_locator::project_identity(root);
+    let report = greppy_indexer::index(&mut store, root, &project).unwrap();
+    assert!(report.is_clean(), "rename fixture index report: {report:?}");
+    (project, store_path)
+}
+
+#[test]
+fn rename_identity_planner_subprocess_helper() {
+    let Some(store_root) = std::env::var_os(RENAME_IDENTITY_HELPER_STORE) else {
+        return;
+    };
+    assert_eq!(std::env::var_os("GREPPY_STORE_DIR"), Some(store_root));
+
+    let success_root = test_tempdir("rename-identity-success");
+    let (project, store_path) = index_rename_fixture(&success_root);
+    #[cfg(unix)]
+    let external_root = {
+        use std::os::unix::fs::symlink;
+        let external = test_tempdir("rename-identity-external");
+        std::fs::write(
+            external.join("outside.rs"),
+            "fn outside(value: UnknownOwner) { value.next(); }\n",
+        )
+        .unwrap();
+        symlink(&external, success_root.join("external-link")).unwrap();
+        symlink(&success_root, success_root.join("ancestor-loop")).unwrap();
+        external
+    };
+    {
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let stale_source = store
+            .insert_node(&greppy_store::NewNode {
+                project: project.clone(),
+                label: "Function".into(),
+                name: "stale_candidate".into(),
+                qualified_name: "stale.rs::Function::stale_candidate".into(),
+                file_path: "stale.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                properties: serde_json::json!({}),
+            })
+            .unwrap();
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project: project.clone(),
+                source_id: stale_source,
+                target_id: target,
+                edge_type: "CALLS".into(),
+                // Deliberately missing identity: the live AST span has zero
+                // `next` identifiers, so this stale candidate is ignorable.
+                properties: serde_json::json!({"callee_form": "receiver"}),
+            })
+            .unwrap();
+    }
+    let preview_before = [
+        "selected.rs",
+        "caller.rs",
+        "unrelated_a.rs",
+        "unrelated_b.rs",
+    ]
+    .map(|file| (file, std::fs::read(success_root.join(file)).unwrap()));
+    let preview = run_trained_rename(
+        &success_root,
+        success_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(!preview.published);
+    let preview_json = edit_record_json(&preview, false, None);
+    let operations = preview_json["operations"].as_array().unwrap();
+    assert!(!operations.is_empty());
+    assert!(
+        operations
+            .iter()
+            .map(|operation| operation["changed_byte_ranges"].as_array().unwrap().len())
+            .sum::<usize>()
+            >= 2
+    );
+    for (file, bytes) in &preview_before {
+        assert_eq!(std::fs::read(success_root.join(file)).unwrap(), *bytes);
+    }
+    for operation in operations {
+        let file = operation["file"].as_str().unwrap();
+        let before = preview_before
+            .iter()
+            .find(|(path, _)| *path == file)
+            .unwrap();
+        assert_eq!(operation["file_sha256_before"], edit_sha256_hex(&before.1));
+        assert!(operation.get("handle").is_none());
+        assert!(operation.get("result_span").is_none());
+    }
+    let outcome = run_trained_rename(
+        &success_root,
+        success_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(outcome.published);
+    let applied_json = edit_record_json(&outcome, false, None);
+    assert!(!applied_json["operations"].as_array().unwrap().is_empty());
+    for operation in applied_json["operations"].as_array().unwrap() {
+        let file = operation["file"].as_str().unwrap();
+        assert_eq!(
+            operation["file_sha256_after"],
+            edit_sha256_hex(&std::fs::read(success_root.join(file)).unwrap())
+        );
+    }
+    assert!(std::fs::read_to_string(success_root.join("selected.rs"))
+        .unwrap()
+        .contains("fn advance"));
+    assert!(std::fs::read_to_string(success_root.join("caller.rs"))
+        .unwrap()
+        .contains("value.advance()"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_a.rs"))
+        .unwrap()
+        .contains("fn next"));
+    assert!(std::fs::read_to_string(success_root.join("unrelated_b.rs"))
+        .unwrap()
+        .contains("value.next()"));
+
+    let omitted_root = test_tempdir("rename-identity-omitted");
+    let (_project, _store_path) = index_rename_fixture(&omitted_root);
+    // Add a live caller after publication so no Base or Delta relation can
+    // legitimately plan its identifier. Deleting only a main-table edge is
+    // not an omission in the composed store: the matching Base edge remains
+    // visible until an overlay triple shadows it.
+    std::fs::write(
+        omitted_root.join("omitted.rs"),
+        "fn omitted(value: &mut Scheduler) { value.next(); }\n",
+    )
+    .unwrap();
+    let omitted_before = ["selected.rs", "caller.rs", "omitted.rs"]
+        .map(|path| (path, std::fs::read(omitted_root.join(path)).unwrap()));
+    let omitted = run_trained_rename(
+        &omitted_root,
+        omitted_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .err()
+    .expect("omitted caller edge must refuse");
+    assert_eq!(omitted.code, "unresolved_reference");
+    assert!(omitted
+        .message
+        .contains("absent from the graph rename plan"));
+    for (path, expected) in omitted_before {
+        assert_eq!(std::fs::read(omitted_root.join(path)).unwrap(), expected);
+    }
+
+    let refusal_root = test_tempdir("rename-identity-refusal");
+    let (project, store_path) = index_rename_fixture(&refusal_root);
+    {
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let target = resolve_symbol_nodes(&store, Some("Scheduler::next")).unwrap()[0];
+        let caller = resolve_symbol_nodes(&store, Some("caller")).unwrap()[0];
+        store
+            .insert_edge(&greppy_store::NewEdge {
+                project,
+                source_id: caller,
+                target_id: target,
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({
+                    "callee_name": "next",
+                    "callee_form": "receiver"
+                }),
+            })
+            .unwrap();
+    }
+    let before = [
+        "selected.rs",
+        "caller.rs",
+        "unrelated_a.rs",
+        "unrelated_b.rs",
+    ]
+    .map(|path| (path, std::fs::read(refusal_root.join(path)).unwrap()));
+    let refusal = run_trained_rename(
+        &refusal_root,
+        refusal_root.to_str(),
+        "Scheduler::next",
+        "advance",
+        false,
+        false,
+    )
+    .unwrap()
+    .err()
+    .expect("unidentified caller edge must refuse");
+    assert_eq!(refusal.code, "unresolved_reference_identity");
+    for (path, expected) in before {
+        assert_eq!(std::fs::read(refusal_root.join(path)).unwrap(), expected);
+    }
+
+    // Rust types retain the original whole-definition/incoming-span planner;
+    // the method-only identity inventory must not capture a Class node merely
+    // because its qualified name also has an owner-like segment.
+    let type_root = test_tempdir("rename-identity-type-fallback");
+    std::fs::create_dir(type_root.join(".git")).unwrap();
+    std::fs::write(
+        type_root.join("types.rs"),
+        "struct Widget;\nfn consume(value: Widget) { let _ = value; }\n",
+    )
+    .unwrap();
+    let type_store_path = workspace_locator::store_path(&type_root);
+    std::fs::create_dir_all(type_store_path.parent().unwrap()).unwrap();
+    let mut type_store = greppy_store::Store::open(&type_store_path).unwrap();
+    let type_project = workspace_locator::project_identity(&type_root);
+    let type_report = greppy_indexer::index(&mut type_store, &type_root, &type_project).unwrap();
+    assert!(
+        type_report.is_clean(),
+        "type fixture index report: {type_report:?}"
+    );
+    drop(type_store);
+    let type_outcome = run_trained_rename(
+        &type_root,
+        type_root.to_str(),
+        "Widget",
+        "Gadget",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(type_outcome.published);
+    assert_eq!(
+        std::fs::read_to_string(type_root.join("types.rs")).unwrap(),
+        "struct Gadget;\nfn consume(value: Gadget) { let _ = value; }\n"
+    );
+
+    // A resolved free-function caller may contain several calls in one indexed
+    // function span. Each edge's persisted source line identifies its exact
+    // call without sweeping the unrelated copy of the same function name.
+    let free_root = test_tempdir("rename-identity-free-multiple");
+    std::fs::create_dir(free_root.join(".git")).unwrap();
+    std::fs::write(
+        free_root.join("selected_free.rs"),
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_lit_str(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_lit_str(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_lit_str(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n",
+    )
+    .unwrap();
+    let unrelated_free = "pub fn get_lit_str() {}\npub fn unrelated_caller() { get_lit_str(); }\n";
+    std::fs::write(free_root.join("unrelated_free.rs"), unrelated_free).unwrap();
+    let free_store_path = workspace_locator::store_path(&free_root);
+    std::fs::create_dir_all(free_store_path.parent().unwrap()).unwrap();
+    let mut free_store = greppy_store::Store::open(&free_store_path).unwrap();
+    let free_project = workspace_locator::project_identity(&free_root);
+    let free_report = greppy_indexer::index(&mut free_store, &free_root, &free_project).unwrap();
+    assert!(
+        free_report.is_clean(),
+        "free rename fixture: {free_report:?}"
+    );
+    drop(free_store);
+    let free_outcome = run_trained_rename(
+        &free_root,
+        free_root.to_str(),
+        "selected_free.rs::get_lit_str",
+        "get_str_literal",
+        false,
+        false,
+    )
+    .unwrap()
+    .unwrap_or_else(|refusal| panic!("{}: {}", refusal.code, refusal.message));
+    assert!(free_outcome.published);
+    assert_eq!(
+        std::fs::read_to_string(free_root.join("selected_free.rs")).unwrap(),
+        "use crate::internals::symbol::*;\nstruct Container;\nimpl Container {\n    fn from_ast(cx: &Ctxt, meta: &Meta) -> Result<(), Error> {\n        if let Some(s) = get_str_literal(cx, TAG, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, CONTENT, &meta)? { let _ = s; }\n        if let Some(s) = get_str_literal(cx, EXPECTING, &meta)? { let _ = s; }\n        Ok(())\n    }\n}\npub fn get_str_literal(cx: &Ctxt, attr_name: Symbol, meta: &Meta) -> Result<Option<String>, Error> { unimplemented!() }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(free_root.join("unrelated_free.rs")).unwrap(),
+        unrelated_free
+    );
+
+    // One proven local edge must not sweep a distinct qualified call or a
+    // closure-bound call merely because they share the same identifier text.
+    for (name, source) in [
+        (
+            "mixed-qualified",
+            "pub fn get_lit_str() {}\nfn caller() { get_lit_str(); other::get_lit_str(); }\n",
+        ),
+        (
+            "closure-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { let invoke = |get_lit_str| get_lit_str(); invoke(|| {}); }\n",
+        ),
+        (
+            "block-glob-shadow",
+            "pub fn get_lit_str() {}\nfn caller() { use other::*; get_lit_str(); get_lit_str(); }\n",
+        ),
+    ] {
+        let root = test_tempdir(name);
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("selected_free.rs"), source).unwrap();
+        if name == "mixed-qualified" {
+            std::fs::write(root.join("other.rs"), "pub fn get_lit_str() {}\n").unwrap();
+        }
+        let store_path = workspace_locator::store_path(&root);
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let mut store = greppy_store::Store::open(&store_path).unwrap();
+        let project = workspace_locator::project_identity(&root);
+        let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
+        assert!(report.is_clean(), "{name} fixture: {report:?}");
+        drop(store);
+        let before = std::fs::read(root.join("selected_free.rs")).unwrap();
+        let refusal = run_trained_rename(
+            &root,
+            root.to_str(),
+            "selected_free.rs::get_lit_str",
+            "get_str_literal",
+            false,
+            false,
+        )
+        .unwrap()
+        .err()
+        .expect("mixed-identity caller must refuse");
+        assert!(
+            matches!(
+                refusal.code,
+                "ambiguous_reference" | "unresolved_reference_identity"
+            ),
+            "{}: {}",
+            refusal.code,
+            refusal.message
+        );
+        assert_eq!(std::fs::read(root.join("selected_free.rs")).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Removing an exact IMPORTS edge must be caught by the live Rust
+    // inventory before either the definition or import is published.
+    let import_root = test_tempdir("rename-identity-free-missing-import");
+    std::fs::create_dir(import_root.join(".git")).unwrap();
+    let import_selected = "pub fn get_lit_str() {}\n";
+    let import_user = "pub use crate::selected_free::get_lit_str;\n";
+    std::fs::write(import_root.join("selected_free.rs"), import_selected).unwrap();
+    std::fs::write(import_root.join("import_user.rs"), import_user).unwrap();
+    let import_store_path = workspace_locator::store_path(&import_root);
+    std::fs::create_dir_all(import_store_path.parent().unwrap()).unwrap();
+    let mut import_store = greppy_store::Store::open(&import_store_path).unwrap();
+    let import_project = workspace_locator::project_identity(&import_root);
+    let import_report =
+        greppy_indexer::index(&mut import_store, &import_root, &import_project).unwrap();
+    assert!(
+        import_report.is_clean(),
+        "import rename fixture: {import_report:?}"
+    );
+    let import_target =
+        resolve_symbol_nodes(&import_store, Some("selected_free.rs::get_lit_str")).unwrap()[0];
+    import_store
+        .conn()
+        .execute(
+            "DELETE FROM edges WHERE target_id = ?1 AND edge_type = 'IMPORTS'",
+            [import_target],
+        )
+        .unwrap();
+    drop(import_store);
+    let import_before = ["selected_free.rs", "import_user.rs"]
+        .map(|path| (path, std::fs::read(import_root.join(path)).unwrap()));
+    let import_refusal = run_trained_rename(
+        &import_root,
+        import_root.to_str(),
+        "selected_free.rs::get_lit_str",
+        "get_str_literal",
+        false,
+        false,
+    )
+    .unwrap()
+    .err()
+    .expect("omitted exact import edge must refuse");
+    assert_eq!(import_refusal.code, "unresolved_reference_identity");
+    for (path, expected) in import_before {
+        assert_eq!(std::fs::read(import_root.join(path)).unwrap(), expected);
+    }
+
+    std::fs::remove_dir_all(success_root).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_dir_all(external_root).unwrap();
+    std::fs::remove_dir_all(omitted_root).unwrap();
+    std::fs::remove_dir_all(refusal_root).unwrap();
+    std::fs::remove_dir_all(type_root).unwrap();
+    std::fs::remove_dir_all(free_root).unwrap();
+    std::fs::remove_dir_all(import_root).unwrap();
+}
+
+#[test]
+fn rename_identity_planner_runs_against_fixture_graph() {
+    let store_root = test_tempdir("rename-identity-store");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::rename_identity_planner_subprocess_helper")
+        .arg("--nocapture")
+        .env(RENAME_IDENTITY_HELPER_STORE, &store_root)
+        .env("GREPPY_STORE_DIR", &store_root)
+        .output()
+        .expect("spawn isolated rename-identity helper");
+    assert!(
+        output.status.success(),
+        "isolated rename-identity helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    std::fs::remove_dir_all(store_root).unwrap();
+}
+
 #[test]
 fn embedding_eta_uses_backend_prior_then_measured_throughput() {
     assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
     assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));
     assert_eq!(initial_embedding_eta_seconds(1_200, "cuda"), Some(100));
+    assert_eq!(
+        initial_embedding_eta_seconds(19_786, "shared-daemon:auto"),
+        None
+    );
+    assert_eq!(initial_embedding_eta_seconds(19_786, "unknown"), None);
+    assert_eq!(initial_embedding_eta_seconds(0, "unknown"), Some(0));
     assert_eq!(observed_embedding_eta_seconds(10, 100, 5_000), Some(45));
     assert_eq!(observed_embedding_rate_milli(10, 5_000), Some(2_000));
+}
+
+#[test]
+fn embedding_eta_does_not_treat_cached_documents_as_gpu_inference() {
+    // A fast cached prefix followed by uncached documents must not predict
+    // that the GPU processes documents at the cache-copy rate.
+    let (inferred, workload) = embedding_inference_workload(1_000, 2_000, 400, 500);
+    assert_eq!((inferred, workload), (100, 1_100));
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 10_000),
+        Some(100)
+    );
+    assert_eq!(
+        observed_embedding_rate_milli(inferred, 10_000),
+        Some(10_000)
+    );
+
+    let (inferred, workload) = embedding_inference_workload(900, 2_000, 400, 500);
+    assert_eq!(
+        observed_embedding_eta_seconds(inferred, workload, 1_000),
+        None
+    );
+    assert_eq!(observed_embedding_rate_milli(inferred, 1_000), None);
+    assert_eq!(embedding_inference_workload(100, 200, 150, 50), (0, 100));
+    assert_eq!(
+        embedding_inference_workload(2_000, 2_000, 400, 500),
+        (1_100, 1_100)
+    );
+}
+
+#[test]
+fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[
+        "GREPPY_STORE_DIR",
+        "GREPPY_BACKGROUND_JOB",
+        ENV_DELEGATED_BACKGROUND_JOB,
+    ]);
+    let scratch = tempfile::tempdir().unwrap();
+    // SAFETY: env-mutating tests hold TEST_ENV_LOCK and restore their variables.
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", scratch.path().join("store"));
+        std::env::remove_var("GREPPY_BACKGROUND_JOB");
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+    let path = scratch.path().join("index.job");
+    let mut job = BackgroundJobGuard::from_env();
+    job.attach_foreground(path.clone());
+    job.device = Some("metal:0".into());
+    job.embedding_started("metal", 19_786);
+    let initial = read_background_job(&path).unwrap();
+    assert_eq!(initial["eta_seconds"], 2_474);
+    assert_eq!(initial["eta_basis"], "backend_prior");
+
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 2_249,
+        total_documents: 19_786,
+        local_store_reuse: 2_249,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let cached = read_background_job(&path).unwrap();
+    assert_eq!(cached["state"], "embedding");
+    assert_eq!(cached["backend"], "metal");
+    assert_eq!(cached["device"], "metal:0");
+    assert_eq!(cached["eta_seconds"], 2_193);
+    assert_eq!(cached["eta_basis"], "backend_prior");
+    assert!(cached["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 19_786,
+        total_documents: 19_786,
+        local_store_reuse: 19_786,
+        global_cache_hits: 0,
+        global_cache_misses: 0,
+        current_symbol: None,
+    });
+    let finished = read_background_job(&path).unwrap();
+    assert_eq!(finished["eta_seconds"], 0);
+    assert_eq!(finished["eta_basis"], "completed_embedding_work");
+    assert!(finished["rate_milli_spans_per_second"].is_null());
+
+    job.embedding_started("metal", 20);
+    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    job.last_progress_write = None;
+    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
+        completed_documents: 1,
+        total_documents: 20,
+        local_store_reuse: 0,
+        global_cache_hits: 0,
+        global_cache_misses: 1,
+        current_symbol: None,
+    });
+    let slow = read_background_job(&path).unwrap();
+    assert_eq!(slow["rate_milli_spans_per_second"], 0);
+    assert_eq!(slow["eta_basis"], "observed_inference");
+    assert!(slow["eta_seconds"].as_u64().unwrap() >= 38_019);
+    job.complete();
 }
 
 #[test]
@@ -186,6 +1155,73 @@ fn embedding_progress_message_names_backend_counts_and_eta() {
     assert_eq!(
         embedding_progress_text(&progress),
         "semantic index building — 412/2443 spans, ETA ~2m 14s (backend metal)"
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_propagates_recorded_failure() {
+    let failure = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "GPU inference stopped",
+    });
+    assert_eq!(
+        background_embedding_failure(failure).as_deref(),
+        Some("GPU inference stopped")
+    );
+    assert!(background_embedding_failure(serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding",
+        "last_error": null,
+    }))
+    .is_none());
+}
+
+#[test]
+fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
+    let active = serde_json::json!({"kind": "embedding", "state": "embedding"});
+    assert_eq!(
+        observe_background_embedding(Some(&active), true, false, false),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, true, false),
+        BackgroundEmbeddingObservation::Published
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_propagates_failed_owner_after_release() {
+    let failed = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "model execution failed",
+    });
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, false, false),
+        BackgroundEmbeddingObservation::Failed("model execution failed".into())
+    );
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, true, false),
+        BackgroundEmbeddingObservation::Published,
+        "verified publication outranks a stale failed job record"
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_follows_structural_owner_into_embedding() {
+    let index = serde_json::json!({"kind": "index", "state": "refreshing"});
+    assert_eq!(
+        observe_background_embedding(Some(&index), true, false, true),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, true),
+        BackgroundEmbeddingObservation::FollowIndex
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, false),
+        BackgroundEmbeddingObservation::MissingPublication
     );
 }
 
@@ -664,6 +1700,32 @@ fn parse_path_disambiguation_and_hyphen_values() {
 }
 
 #[test]
+fn ambiguous_read_failure_respects_explicit_stdout_budget() {
+    let cli = Cli::try_parse_from(["greppy", "read", "main", "--max-bytes", "3000"])
+        .expect("read accepts a global byte budget");
+    let spec = output_budget_spec(&cli).expect("read must enable shared output capture");
+    assert_eq!(spec.command, "read");
+    assert_eq!(spec.max_bytes, Some(3000));
+
+    let mut output = String::from("`main` is 83 definitions\n");
+    for index in 0..83 {
+        output.push_str(&format!(
+            "crates/example/src/long_module_name_{index}/implementation.rs:{}\n",
+            index + 1
+        ));
+    }
+    let rendered = budget_text_output(output.as_bytes(), &spec, 1);
+    assert!(rendered.len() <= 3000, "{} bytes", rendered.len());
+    let rendered = String::from_utf8(rendered).unwrap();
+    assert!(rendered.contains("truncated: true"), "{rendered}");
+    assert!(
+        rendered.contains("try: greppy read --offset "),
+        "{rendered}"
+    );
+    assert!(rendered.contains("`main` is 83 definitions"), "{rendered}");
+}
+
+#[test]
 fn parse_plus_uses_vectors_without_a_public_flag() {
     let cli =
         Cli::try_parse_from(["greppy", "plus", "--json", "--k", "5", "refund workflow"]).unwrap();
@@ -696,7 +1758,7 @@ fn embedding_config_defaults_to_bundled_embeddinggemma_when_no_flags() {
     // ran on the lexical/algorithmic path with no vectors at all.
     let cfg = embedding_config_required(EmbeddingCliArgs {
         device: None,
-        no_gpu: true,
+        no_gpu: false,
     })
     .expect("no-flags embedding config must resolve to the embedded model, not error");
     assert!(
@@ -726,6 +1788,45 @@ fn cli_device_flags_parse_on_embedding_commands() {
         "refund workflow",
     ])
     .is_err());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inference_daemon_status_uses_cli_device_for_endpoint_identity() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&[
+        ENV_DEVICE,
+        ENV_NO_GPU,
+        ENV_EMBED_CUDA_DEVICE,
+        ENV_QWEN_CUDA_DEVICE,
+    ]);
+    // Keep the environment backend-neutral so the two explicit arguments are
+    // the only inputs that choose the endpoint identity.
+    unsafe {
+        std::env::set_var(ENV_DEVICE, "auto");
+        std::env::remove_var(ENV_NO_GPU);
+    }
+
+    let auto = inference_daemon_status(EmbeddingCliArgs {
+        device: Some("auto"),
+        no_gpu: false,
+    });
+    let cuda = inference_daemon_status(EmbeddingCliArgs {
+        device: Some("cuda"),
+        no_gpu: false,
+    });
+    let endpoint = |status: &serde_json::Value| {
+        status["embedding"]["endpoint"]
+            .as_str()
+            .expect("daemon probe should report its endpoint")
+            .to_owned()
+    };
+
+    assert_ne!(
+        endpoint(&auto),
+        endpoint(&cuda),
+        "explicit --device must select the matching daemon endpoint"
+    );
 }
 
 #[test]
@@ -771,19 +1872,77 @@ fn embedding_device_preference_obeys_cli_and_env() {
         inference_device_identity(&greppy_embed_native::DevicePreference::Cuda),
         "cuda:2"
     );
-    assert_eq!(
-        embedding_device_preference(Some("cpu"), true).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let explicit_cpu = embedding_device_preference(Some("cpu"), false);
+    let no_gpu_cpu = embedding_device_preference(None, true);
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+        assert!(matches!(
+            no_gpu_cpu,
+            Err(Error::Invalid(message)) if message.contains("platform GPU")
+        ));
+    } else {
+        assert_eq!(
+            explicit_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+        assert_eq!(
+            no_gpu_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+    }
+
+    // Summary inference shares the product GPU contract and must reject
+    // an explicit CPU selector independently of the no-GPU switch.
+    unsafe {
+        std::env::set_var(ENV_DEVICE, "cpu");
+    }
+    let summary_explicit_cpu = qwen_summary_device_preference();
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            summary_explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("GREPPY_DEVICE=cpu")
+        ));
+    } else {
+        assert_eq!(
+            summary_explicit_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_NO_GPU, "1");
     }
-    assert_eq!(
-        embedding_device_preference(Some("cuda"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let env_cpu = embedding_device_preference(Some("cuda"), false);
+    let summary_env_cpu = qwen_summary_device_preference();
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
+        assert!(matches!(
+            env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+        assert!(matches!(
+            summary_env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+    } else {
+        assert_eq!(env_cpu.unwrap(), greppy_embed_native::DevicePreference::Cpu);
+        assert_eq!(
+            summary_env_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
@@ -1196,6 +2355,48 @@ fn ten_agents_reuse_published_summary_without_private_duplicates() {
 
 #[cfg(any(unix, windows))]
 #[test]
+fn grounded_bit_writes_outrank_false_workspace_base_and_global_summaries() {
+    let root = test_tempdir("grounded-bit-writes-cache");
+    let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
+    let base = greppy_store::SummaryCache::open(&root.join("base")).unwrap();
+    let global = greppy_store::SummaryCache::open(&root.join("global")).unwrap();
+    let path = "reference/audio-aot-state.rs";
+    let source = "pub fn and_word(s: &mut Core, value: u16) { s.m_isr = s.m_sr & 0x10; if value == 0 { s.m_isr |= 4; } if value & 0x8000 != 0 { s.m_isr |= 8; } s.m_aluo = value; }";
+    let key = "missing-model-must-not-load";
+    let cache_key = format!("{key}#{SUMMARY_CACHE_GENERATION}");
+    let hash = greppy_store::span_hash(path, source);
+    let wrong = vec!["Sets the AOT word value and clears the interrupt flag".to_owned()];
+    for cache in [&workspace, &base, &global] {
+        cache.put(&cache_key, &hash, &wrong).unwrap();
+    }
+    let config = QwenSummaryConfig {
+        model_id: key.into(),
+        gguf: root.join("missing.gguf"),
+        tokenizer: root.join("missing-tokenizer.json"),
+        device: greppy_qwen35_native::DevicePreference::Cpu,
+    };
+    assert_eq!(
+        summarize_source_cached(
+            &config,
+            key,
+            (Some(&workspace), Some(&base), Some(&global)),
+            path,
+            source,
+            false
+        ),
+        Some(vec![
+            "Updates s.m_isr and s.m_aluo with bitwise operations and conditional writes"
+                .to_owned()
+        ])
+    );
+    // Repair the returned description without globally flushing independent caches.
+    for cache in [&workspace, &base, &global] {
+        assert_eq!(cache.get(&cache_key, &hash).unwrap(), Some(wrong.clone()));
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
 fn global_summary_hit_populates_workspace_without_daemon() {
     let root = test_tempdir("global-summary-hit");
     let workspace = greppy_store::SummaryCache::open(&root.join("workspace")).unwrap();
@@ -1362,13 +2563,52 @@ fn dispatch_to_code_maps_errors() {
 }
 
 #[test]
+fn automatic_index_worker_cap_preserves_only_lower_valid_override() {
+    use std::ffi::OsStr;
+
+    assert_eq!(automatic_index_worker_count(None), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("1"))), 1);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("2"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("8"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("0"))), 2);
+    assert_eq!(automatic_index_worker_count(Some(OsStr::new("invalid"))), 2);
+}
+
+#[test]
+fn automatic_index_child_command_receives_effective_worker_cap() {
+    use std::ffi::{OsStr, OsString};
+
+    let mut command = std::process::Command::new("greppy");
+    assert_eq!(
+        configure_automatic_index_workers(&mut command, Some(OsStr::new("8"))),
+        2
+    );
+    let worker_env = command
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("GREPPY_WORKERS"))
+        .and_then(|(_, value)| value.map(OsString::from));
+    assert_eq!(worker_env.as_deref(), Some(OsStr::new("2")));
+
+    let mut embedding = std::process::Command::new("greppy");
+    assert_eq!(
+        configure_automatic_index_workers(&mut embedding, Some(OsStr::new("8"))),
+        2
+    );
+    let embedding_worker_env = embedding
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("GREPPY_WORKERS"))
+        .and_then(|(_, value)| value.map(OsString::from));
+    assert_eq!(embedding_worker_env.as_deref(), Some(OsStr::new("2")));
+}
+
+#[test]
 fn delegated_base_index_progress_preserves_outer_job_owner() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
     let root = test_tempdir("delegated-base-progress");
     let job_path = root.join("index.job");
     let outer_pid = 424_242u32;
-    write_background_job(
+    start_background_job_record(
         &job_path,
         &serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
@@ -1404,6 +2644,10 @@ fn delegated_base_index_progress_preserves_outer_job_owner() {
 
     let job = read_background_job(&job_path).expect("delegated job remains for outer indexer");
     assert_eq!(job["pid"], outer_pid);
+    assert_eq!(job["target_generation"], 1);
+    assert_eq!(job["started_at_unix_secs"], 1);
+    assert_eq!(job["cause"], "foreground-index");
+    assert_eq!(job["kind"], "index");
     assert_eq!(job["state"], "base_graph_ready");
     assert_eq!(job["completed_spans"], 4);
     assert_eq!(job["total_spans"], 10);
@@ -1420,7 +2664,7 @@ fn graph_index_progress_publishes_real_phase_and_file_counts() {
     let root = test_tempdir("graph-index-progress");
     let job_path = root.join("index.job");
     let pid = std::process::id();
-    write_background_job(
+    start_background_job_record(
         &job_path,
         &serde_json::json!({
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
@@ -1459,6 +2703,46 @@ fn graph_index_progress_publishes_real_phase_and_file_counts() {
     assert!(job["updated_at_unix_secs"].as_u64().unwrap() > 1);
 
     guard.complete();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn degraded_overlay_retains_exact_background_failure() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestore::capture(&["GREPPY_BACKGROUND_JOB", ENV_DELEGATED_BACKGROUND_JOB]);
+    let root = test_tempdir("overlay-embedding-degraded");
+    let job_path = root.join("index.job");
+    start_background_job_record(
+        &job_path,
+        &serde_json::json!({
+            "pid": std::process::id(),
+            "target_generation": 1,
+            "started_at_unix_secs": 1,
+            "state": "embedding"
+        }),
+    )
+    .unwrap();
+    // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
+    unsafe {
+        std::env::set_var("GREPPY_BACKGROUND_JOB", &job_path);
+        std::env::remove_var(ENV_DELEGATED_BACKGROUND_JOB);
+    }
+
+    let mut guard = BackgroundJobGuard::from_env();
+    record_overlay_job_outcome(
+        &mut guard,
+        &Ok(OverlayIndexOutcome::Degraded(
+            "2 of 2 embedding documents failed inference".into(),
+        )),
+    );
+    drop(guard);
+
+    let job = read_background_job(&job_path).expect("degraded overlay keeps failure record");
+    assert_eq!(job["state"], "failed");
+    assert_eq!(
+        job["last_error"],
+        "2 of 2 embedding documents failed inference"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1723,6 +3007,7 @@ fn internal_source_search_is_literal_line_numbered_and_binary_safe() {
         "needle.*literal",
         &root,
         &["source.rs".into(), "binary.bin".into()],
+        None,
     )
     .unwrap();
     assert_eq!(hits.len(), 1);
@@ -1991,6 +3276,31 @@ fn qualified_query_resolves_to_owner_node() {
     );
 }
 
+#[test]
+fn file_qualified_single_and_multi_resolvers_agree() {
+    let store = store_with_defs(&[
+        ("Function", "src/first.rs", "Function", "run"),
+        ("Function", "src/second.rs", "Function", "run"),
+    ]);
+    let first = id_of(&store, "src/first.rs", "Function", "run");
+    for selector in ["src/first.rs::run", "src/first.rs::Function::run"] {
+        assert_eq!(
+            resolve_symbol_nodes(&store, Some(selector)).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            resolve_symbol_id(&store, Some(selector)).unwrap(),
+            Some(first)
+        );
+    }
+    for selector in ["missing.rs::run", "src/first.rs::missing"] {
+        assert!(resolve_symbol_nodes(&store, Some(selector))
+            .unwrap()
+            .is_empty());
+        assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
+    }
+}
+
 /// REGRESSION 2: never-guess. A qualified query whose `Owner.member`
 /// matches MORE THAN ONE node (same owner in two files) returns the
 /// full candidate set — never one arbitrary pick — and a query whose
@@ -2050,6 +3360,58 @@ fn bare_name_query_is_unchanged_and_aggregates() {
     assert_eq!(got, want);
     // And a bare name still enters neither qualified branch.
     assert_eq!(split_qualified("get"), None);
+}
+
+#[test]
+fn path_qualified_value_definitions_are_addressable_without_broadening_bare_aggregation() {
+    let store = store_with_defs(&[
+        (
+            "Variable",
+            "src/core/gateway.rs",
+            "Variable",
+            "EMAIL_RUNTIME_ENV_KEYS",
+        ),
+        ("Field", "src/model.rs", "Config", "email"),
+        ("Method", "src/service.rs", "Service", "email"),
+    ]);
+    let variable = id_of(
+        &store,
+        "src/core/gateway.rs",
+        "Variable",
+        "EMAIL_RUNTIME_ENV_KEYS",
+    );
+    let field = id_of(&store, "src/model.rs", "Config", "email");
+
+    assert_eq!(
+        resolve_symbol_nodes(
+            &store,
+            Some("src/core/gateway.rs::Variable::EMAIL_RUNTIME_ENV_KEYS")
+        )
+        .unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/core/gateway.rs::EMAIL_RUNTIME_ENV_KEYS")).unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Config::email")).unwrap(),
+        vec![field]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Field::email")).unwrap(),
+        vec![field]
+    );
+    assert!(
+        resolve_symbol_nodes(&store, Some("missing/model.rs::email"))
+            .unwrap()
+            .is_empty(),
+        "a missing path must not fall back to a same-named definition"
+    );
+
+    let bare = resolve_symbol_nodes(&store, Some("email")).unwrap();
+    assert_eq!(bare.len(), 1, "bare aggregation remains primary-only");
+    assert_ne!(bare[0], field);
 }
 
 /// Seed a provider_state row so the completeness helpers have data.
@@ -2133,16 +3495,6 @@ fn impact_total_excludes_noncode_files() {
     // remain available through doctor/diagnostics.
     assert_eq!(incomplete_provider_json(&store, "p").unwrap().len(), 2);
 
-    // impact's code-only set drops the four non-code providers.
-    let code = code_incomplete_provider_json(&store, "p").unwrap();
-    let langs: Vec<&str> = code
-        .iter()
-        .map(|p| p["language"].as_str().unwrap())
-        .collect();
-    assert_eq!(code.len(), 2, "only java + protobuf remain: {langs:?}");
-    assert!(langs.contains(&"java"));
-    assert!(langs.contains(&"protobuf"));
-
     // Direct predicate coverage.
     assert!(is_noncode_provider("unsupported", "file extension .snap"));
     assert!(is_noncode_provider("accepted", "no file extension"));
@@ -2182,4 +3534,85 @@ fn cache_commands_parse_with_stable_public_flags() {
             }
         })
     ));
+}
+
+#[test]
+fn workspace_query_demand_is_shared_across_structural_and_embedding_waiters() {
+    let root = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let name = background_job_demand_name(root.path());
+    let structural = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let embedding = greppy_core::cache::acquire_named_lock_in(
+        locks.path(),
+        &name,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the automatic writer must see demand from both job kinds"
+    );
+    drop(structural);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_none(),
+        "the remaining cross-kind waiter must preserve the writer"
+    );
+    drop(embedding);
+    assert!(
+        greppy_core::cache::acquire_named_lock_in(
+            locks.path(),
+            &name,
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        )
+        .unwrap()
+        .is_some(),
+        "the writer may stop only after the final workspace waiter exits"
+    );
+}
+
+#[test]
+fn completed_publication_and_successor_identity_block_demand_cancellation() {
+    let job = serde_json::json!({
+        "pid": 41,
+        "target_generation": 9,
+        "state": "syncing_snapshot"
+    });
+    assert!(background_demand_may_cancel(Some(&job), false, 41, 9));
+    assert!(
+        !background_demand_may_cancel(Some(&job), true, 41, 9),
+        "the in-process publication latch wins before terminal record cleanup"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 42, 9),
+        "a reused PID cannot authorize cancellation"
+    );
+    assert!(
+        !background_demand_may_cancel(Some(&job), false, 41, 10),
+        "a successor generation cannot be overwritten"
+    );
+    assert!(!background_demand_may_cancel(None, false, 41, 9));
 }

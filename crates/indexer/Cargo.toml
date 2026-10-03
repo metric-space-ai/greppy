@@ -19,7 +19,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
 serde_json = { workspace = true }
+toml_edit = { workspace = true }
 rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default = []

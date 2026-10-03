@@ -49,7 +49,7 @@ use servo_base::id::CookieStoreId;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::async_runtime::{init_async_runtime, spawn_task};
+use crate::async_runtime::{init_async_runtime, reuse_async_runtime, spawn_task};
 use crate::connector::{
     CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
 };
@@ -97,8 +97,56 @@ pub fn new_resource_threads(
     protocols: Arc<ProtocolRegistry>,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
-    let async_runtime = init_async_runtime();
+    new_resource_threads_with_runtime(
+        devtools_sender,
+        time_profiler_chan,
+        mem_profiler_chan,
+        embedder_proxy,
+        config_dir,
+        certificate_path,
+        ignore_certificate_errors,
+        protocols,
+        init_async_runtime(),
+    )
+}
 
+/// Creates resource threads that reuse the process-wide async runtime.
+#[expect(clippy::too_many_arguments)]
+pub fn new_resource_threads_with_shared_async_runtime(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    certificate_path: Option<String>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
+    new_resource_threads_with_runtime(
+        devtools_sender,
+        time_profiler_chan,
+        mem_profiler_chan,
+        embedder_proxy,
+        config_dir,
+        certificate_path,
+        ignore_certificate_errors,
+        protocols,
+        reuse_async_runtime(),
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn new_resource_threads_with_runtime(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    certificate_path: Option<String>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+    async_runtime: Box<dyn AsyncRuntime>,
+) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     let ca_certificates = certificate_path
         .and_then(|path| {
             Some(CACertificates::Override(
