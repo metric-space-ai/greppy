@@ -45,7 +45,7 @@ static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     // Fatal severity requires a diagnostic header separator, like error: above.
     // Wrapped help prose such as "fatal errors" is not a diagnostic.
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal(?:[\t ]+error)?:(?:[\t ]|$)|fatal[\t ]*$|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|[0-9]+:[0-9]+[\t ]+error[\t ]+|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal(?:[\t ]+error)?:(?:[\t ]|$)|fatal[\t ]+error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|fatal[\t ]*$|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|[0-9]+:[0-9]+[\t ]+error[\t ]+|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -2724,7 +2724,7 @@ mod tests {
 
     #[test]
     fn fatal_help_prose_requires_a_diagnostic_header() {
-        let help = split_lines(b"Usage: pnpm install [options]\n  --reporter <name>\n      fatal errors are always printed\n      fatal error handling is configurable\n");
+        let help = split_lines(b"Usage: pnpm install [options]\n  --reporter <name>\n      fatal errors are always printed\n      fatal error handling is configurable\n      fatal error C1083 handling is configurable\n");
         for blocks in [detect_blocks(&help, &[]), detect_blocks(&[], &help)] {
             assert!(blocks.is_empty());
             assert_eq!(verdict_line(0, blocks.len(), 0, None), "ok — exit 0");
@@ -2733,6 +2733,8 @@ mod tests {
             "fatal: not a git repository\n",
             "  FATAL: connection unavailable\n",
             "fatal error: missing.h: No such file\n",
+            "fatal error C1083: Cannot open include file: missing.h\n",
+            "  FATAL ERROR C1001: Internal compiler error\n",
             "fatal\n",
             "src/main.c:12:4: fatal error: missing.h: No such file\n",
         ] {
