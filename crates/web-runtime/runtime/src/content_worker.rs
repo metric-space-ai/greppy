@@ -10,7 +10,7 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, Preferences, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
+    MouseMoveEvent, Preferences, PromoteDeferredImageDecode, RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog,
     SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, TouchPointerType,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
@@ -1201,6 +1201,12 @@ impl ContentEngine {
             self.pages
                 .insert(page_id.to_owned(), PageSlot::Disposed { generation });
         }
+    }
+
+    fn has_live_pages(&self) -> bool {
+        self.pages
+            .values()
+            .any(|slot| matches!(slot, PageSlot::Live { .. }))
     }
 
     fn dispose_all_pages(&mut self) {
@@ -3242,14 +3248,20 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                    MouseButtonAction::Down,
-                    MouseButton::Left,
-                    point,
-                )));
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Down,
+                        MouseButton::Left,
+                        point,
+                    ))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.down after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             "page.mouse.wheel" => {
@@ -3258,33 +3270,42 @@ impl ContentEngine {
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                    WheelDelta {
-                        x: delta_x,
-                        y: delta_y,
-                        z: 0.0,
-                        mode: WheelMode::DeltaPixel,
-                    },
-                    point,
-                )));
-                self.servo.spin_event_loop();
+                let delta = WheelDelta {
+                    x: delta_x,
+                    y: delta_y,
+                    z: 0.0,
+                    mode: WheelMode::DeltaPixel,
+                };
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::Wheel(WheelEvent::new(delta, point))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.wheel after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             "page.mouse.up" => {
                 let page_id = required_str(&params, "page")?;
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
                 self.present_exclusively(&webview);
                 let point = WebViewPoint::Device(DevicePoint::new(x as f32, y as f32));
-                webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                    MouseButtonAction::Up,
-                    MouseButton::Left,
-                    point,
-                )));
+                if !self.notify_input_confirmed(&webview, &delegate, &move || {
+                    InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Up,
+                        MouseButton::Left,
+                        point,
+                    ))
+                }) {
+                    return Err(io::Error::other(
+                        "input delivery failed: painter dropped mouse.up after retries",
+                    ));
+                }
                 Ok(json!({}))
             }
             other => Err(io::Error::new(
@@ -3525,6 +3546,15 @@ impl ContentEngine {
         webview: &WebView,
         clip: Option<(u32, u32, u32, u32)>,
     ) -> io::Result<Vec<u8>> {
+        // Header-only rasters complete as Loaded with no WebRender key, so the
+        // HTML element keeps a placeholder Arc. Promote on the layout thread
+        // and dirty style so the next display list attaches real keys. The
+        // custom property is visual-path only; default screenshots never set it.
+        let _promote = PromoteDeferredImageDecode::enter();
+        let _ = self.evaluate(
+            webview.clone(),
+            r#"(function(){var i=document.querySelector("img");if(i){var w=i.width;i.width=w+1;void i.offsetWidth;i.width=w;}document.documentElement.style.setProperty("--greppy-visual","1");return document.documentElement.offsetHeight;})()"#,
+        );
         webview.paint();
         self.rendering_context.present();
         let saved = Rc::new(RefCell::new(None));
@@ -4972,11 +5002,13 @@ pub fn run() -> io::Result<()> {
         if engine.parent_dead() {
             return Ok(());
         }
-        // Protocol first. Spinning Servo before recv starved engine calls when
-        // browser.close left a wake bit with no pages and spin_event_loop
-        // blocked; the supervisor then sat in session.setProfile until the
-        // client Unix read deadline expired as EAGAIN.
-        let wait = if engine.pages.is_empty() {
+        // Protocol first. Spin only while a live WebView exists.
+        // dispose_page keeps Disposed tombstones in `pages` for generation
+        // checks, so `pages.is_empty()` stays false after browser.close.
+        // Spinning in that state blocked on a wake bit with no pages, and
+        // the next web.run sat in session.setProfile until the client Unix
+        // read deadline expired as EAGAIN.
+        let wait = if !engine.has_live_pages() {
             Duration::from_millis(200)
         } else if engine.wake.take_pending() {
             Duration::ZERO
@@ -5041,15 +5073,26 @@ pub fn run() -> io::Result<()> {
             Ok(Err(error)) if is_parent_eof(&error) => return Ok(()),
             Ok(Err(error)) => return Err(error),
             Err(RecvTimeoutError::Timeout) => {
-                if !engine.pages.is_empty() {
+                if engine.has_live_pages() {
                     let started = Instant::now();
-                    engine.servo.spin_event_loop();
+                    let more = engine.servo.spin_event_loop_idle();
                     let elapsed = started.elapsed();
                     if elapsed >= Duration::from_millis(200) {
                         if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase content-spin elapsed_ms={} pages={}",
                             elapsed.as_millis(),
                             engine.pages.len()
                         ); }
+                    }
+                    // Yield to protocol between batches. Layout after goto
+                    // can drain thousands of paint messages inside one
+                    // unlimited spin; page.close / the next web.run sit on
+                    // `rx` until that drain finishes (Fund 026).
+                    if more {
+                        engine.wake.wake();
+                        continue;
+                    }
+                    if elapsed >= Duration::from_millis(50) {
+                        continue;
                     }
                 }
             }

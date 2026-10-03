@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-
 /// Emit one lifecycle line, but only when someone asked for them.
 ///
 /// These nine lines per session -- spawn, two handshakes, two readies,
@@ -183,9 +182,9 @@ impl Config {
                     let value = value
                         .into_string()
                         .map_err(|value| format!("invalid --idle-ttl-ms {value:?}"))?;
-                    let parsed = value.parse::<u64>().map_err(|_| {
-                        format!("invalid --idle-ttl-ms {value}")
-                    })?;
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --idle-ttl-ms {value}"))?;
                     let ttl = Duration::from_millis(parsed.clamp(20, 3_600_000));
                     if idle_ttl.replace(ttl).is_some() {
                         return Err("duplicate --idle-ttl-ms".to_owned());
@@ -278,9 +277,7 @@ pub fn run(config: Config) -> io::Result<()> {
                 run_id,
                 fixture_url: config.fixture_url,
                 search_endpoint: config.search_endpoint,
-                idle_ttl: config
-                    .idle_ttl
-                    .unwrap_or(Duration::from_secs(5 * 60)),
+                idle_ttl: config.idle_ttl.unwrap_or(Duration::from_secs(5 * 60)),
             });
         }
         #[cfg(not(unix))]
@@ -500,8 +497,10 @@ pub(crate) fn route_until_script_complete_gated(
                 }) => {
                     let Some((method, params)) = pending.remove(&request_id) else {
                         gate.note_discarded_engine_result(request_id, ok, error);
-                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
-                        ); }
+                        if crate::supervisor::phase_trace_enabled() {
+                            eprintln!("web-runtime: discarded unmatched EngineResult id={request_id} wait={wait_point}"
+                        );
+                        }
                         continue;
                     };
                     if ok && tally_after(&method) {
@@ -641,7 +640,9 @@ fn sidecar_engine_call(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("timed out after {timeout:?} waiting for {method} sidecar"));
+            return Err(format!(
+                "timed out after {timeout:?} waiting for {method} sidecar"
+            ));
         }
         match content.recv(remaining) {
             Ok(Message::EngineResult {
@@ -737,13 +738,21 @@ fn recv_any(
 
 #[cfg(unix)]
 fn poll_writable(fd: i32, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
     let mut fds = [libc::pollfd {
         fd,
         events: libc::POLLOUT,
         revents: 0,
     }];
-    let ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} writing worker protocol"),
+            ));
+        }
+        let ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
         if n > 0 {
             if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
@@ -767,6 +776,41 @@ fn poll_writable(fd: i32, timeout: Duration) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn set_snd_timeout(fd: i32, timeout: Option<Duration>) -> io::Result<()> {
+    let tv = match timeout {
+        None => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        Some(duration) => {
+            let sec = duration.as_secs() as libc::time_t;
+            let mut usec = duration.subsec_micros() as libc::suseconds_t;
+            if sec == 0 && usec == 0 {
+                usec = 1;
+            }
+            libc::timeval {
+                tv_sec: sec,
+                tv_usec: usec,
+            }
+        }
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            std::ptr::addr_of!(tv).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn write_all_timeout(
     writer: &mut BufWriter<File>,
     bytes: &[u8],
@@ -775,10 +819,40 @@ fn write_all_timeout(
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        poll_writable(writer.get_mut().as_raw_fd(), timeout)?;
+        let deadline = Instant::now() + timeout;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {timeout:?} writing worker protocol"),
+            )
+        };
+        let fd = writer.get_mut().as_raw_fd();
+        poll_writable(fd, remaining())?;
+        if remaining().is_zero() {
+            return Err(timed_out());
+        }
+        set_snd_timeout(fd, Some(remaining()))?;
+        let result = writer.write_all(bytes).and_then(|_| writer.flush());
+        let _ = set_snd_timeout(fd, None);
+        return match result {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Err(timed_out())
+            }
+            Err(error) => Err(error),
+        };
     }
-    writer.write_all(bytes)?;
-    writer.flush()
+    #[cfg(not(unix))]
+    {
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
 }
 
 pub(crate) struct WorkerProcess {
@@ -791,6 +865,7 @@ pub(crate) struct WorkerProcess {
     #[allow(dead_code)]
     stdout_log: Arc<Mutex<Vec<u8>>>,
     stdout_drain: Option<JoinHandle<()>>,
+    stderr_drain: Option<JoinHandle<()>>,
     reaped: bool,
 }
 
@@ -818,6 +893,7 @@ fn inherited_worker_env() -> Vec<(OsString, OsString)> {
         // Opt-in navigation phase tracing (finding 020); read by the content
         // worker, harmless to leak, and useless if scrubbed here.
         "GREPPY_WEB_TRACE_NAV",
+        "GREPPY_WEB_TRACE_PHASE",
     ];
     std::env::vars_os()
         .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOW.contains(&name)))
@@ -843,189 +919,225 @@ impl WorkerProcess {
 
 #[cfg(unix)]
 fn spawn_unix(worker: WorkerKind, capability: String) -> io::Result<WorkerProcess> {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
 
-        let path = std::env::current_exe().map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to resolve current executable for {worker:?} re-exec: {error}"),
-            )
-        })?;
-        let role = match worker {
-            WorkerKind::Controller => "controller",
-            WorkerKind::Content => "content",
-        };
-        let mut cap = [0; 2];
-        if unsafe { libc::pipe(cap.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let cap_read = unsafe { OwnedFd::from_raw_fd(cap[0]) };
-        let cap_write = unsafe { OwnedFd::from_raw_fd(cap[1]) };
+    let path = std::env::current_exe().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to resolve current executable for {worker:?} re-exec: {error}"),
+        )
+    })?;
+    let role = match worker {
+        WorkerKind::Controller => "controller",
+        WorkerKind::Content => "content",
+    };
+    let mut cap = [0; 2];
+    if unsafe { libc::pipe(cap.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let cap_read = unsafe { OwnedFd::from_raw_fd(cap[0]) };
+    let cap_write = unsafe { OwnedFd::from_raw_fd(cap[1]) };
+    unsafe {
+        libc::fcntl(cap_read.as_raw_fd(), libc::F_SETFD, 0);
+        libc::fcntl(cap_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let cap_read_fd = cap_read.into_raw_fd();
+    let mut cap_write = std::fs::File::from(cap_write);
+
+    let mut proto = [0; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, proto.as_mut_ptr()) } != 0 {
         unsafe {
-            libc::fcntl(cap_read.as_raw_fd(), libc::F_SETFD, 0);
-            libc::fcntl(cap_write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::close(cap_read_fd);
         }
-        let cap_read_fd = cap_read.into_raw_fd();
-        let mut cap_write = std::fs::File::from(cap_write);
+        return Err(io::Error::last_os_error());
+    }
+    let proto_child = unsafe { OwnedFd::from_raw_fd(proto[0]) };
+    let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
+    unsafe {
+        libc::fcntl(proto_child.as_raw_fd(), libc::F_SETFD, 0);
+        libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let proto_child_fd = proto_child.into_raw_fd();
+    let proto_parent_fd = proto_parent.into_raw_fd();
 
-        let mut proto = [0; 2];
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, proto.as_mut_ptr()) } != 0
-        {
-            unsafe {
+    let mut command = Command::new(&path);
+    command
+        .arg("--internal-role")
+        .arg(role)
+        .env_clear()
+        .envs(inherited_worker_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.process_group(0);
+    let sandbox_exe = path.clone();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if cap_read_fd != crate::worker::CAPABILITY_FD {
                 libc::close(cap_read_fd);
             }
-            return Err(io::Error::last_os_error());
-        }
-        let proto_child = unsafe { OwnedFd::from_raw_fd(proto[0]) };
-        let proto_parent = unsafe { OwnedFd::from_raw_fd(proto[1]) };
-        unsafe {
-            libc::fcntl(proto_child.as_raw_fd(), libc::F_SETFD, 0);
-            libc::fcntl(proto_parent.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        let proto_child_fd = proto_child.into_raw_fd();
-        let proto_parent_fd = proto_parent.into_raw_fd();
-
-        let mut command = Command::new(&path);
-        command
-            .arg("--internal-role")
-            .arg(role)
-            .env_clear()
-            .envs(inherited_worker_env())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        command.process_group(0);
-        let sandbox_exe = path.clone();
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(cap_read_fd, crate::worker::CAPABILITY_FD) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if cap_read_fd != crate::worker::CAPABILITY_FD {
-                    libc::close(cap_read_fd);
-                }
-                if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if proto_child_fd != crate::worker::PROTOCOL_FD {
-                    libc::close(proto_child_fd);
-                }
-                let _ = sandbox_exe;
-                Ok(())
-            });
-        }
-        let image = crate::worker::apply_same_image_reexec(&mut command)?;
-        // Cache parent identity before exec so the first child cannot race the digest.
-        let _ = parent_image()?;
-        let mut child = command.spawn().map_err(|error| {
-            unsafe {
-                libc::close(cap_read_fd);
+            if libc::dup2(proto_child_fd, crate::worker::PROTOCOL_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if proto_child_fd != crate::worker::PROTOCOL_FD {
                 libc::close(proto_child_fd);
-                libc::close(proto_parent_fd);
             }
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to spawn {worker:?} worker at {}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
+            let _ = sandbox_exe;
+            Ok(())
+        });
+    }
+    let image = crate::worker::apply_same_image_reexec(&mut command)?;
+    // Cache parent identity before exec so the first child cannot race the digest.
+    let _ = parent_image()?;
+    let mut child = command.spawn().map_err(|error| {
         unsafe {
             libc::close(cap_read_fd);
             libc::close(proto_child_fd);
+            libc::close(proto_parent_fd);
         }
-        use std::io::Write as _;
-        cap_write.write_all(capability.as_bytes())?;
-        cap_write.write_all(b"\n")?;
-        drop(cap_write);
-        image.prove_child_or_kill(&mut child)?;
-        if let Err(error) = prove_same_executable(child.id()) {
-            unsafe {
-                libc::close(proto_parent_fd);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-
-        let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
-        if proto_read_fd < 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                libc::close(proto_parent_fd);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to spawn {worker:?} worker at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    unsafe {
+        libc::close(cap_read_fd);
+        libc::close(proto_child_fd);
+    }
+    use std::io::Write as _;
+    cap_write.write_all(capability.as_bytes())?;
+    cap_write.write_all(b"\n")?;
+    drop(cap_write);
+    image.prove_child_or_kill(&mut child)?;
+    if let Err(error) = prove_same_executable(child.id()) {
         unsafe {
-            libc::fcntl(proto_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::close(proto_parent_fd);
         }
-        let protocol_write = File::from(unsafe { OwnedFd::from_raw_fd(proto_parent_fd) });
-        let protocol_read = File::from(unsafe { OwnedFd::from_raw_fd(proto_read_fd) });
-        let stdout = child.stdout.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped")
-        })?;
-        let stdout_log = Arc::new(Mutex::new(Vec::new()));
-        let drain_buf = Arc::clone(&stdout_log);
-        let stdout_drain = match thread::Builder::new()
-            .name(format!("web-runtime-{worker:?}-stdout-drain"))
-            .spawn(move || drain_worker_stdout(stdout, drain_buf))
-        {
-            Ok(stdout_drain) => stdout_drain,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("failed to spawn {worker:?} stdout drain: {error}"),
-                ));
-            }
-        };
-        let (message_sender, messages) = mpsc::channel();
-        let reader_thread = match thread::Builder::new()
-            .name(format!("web-runtime-{worker:?}-protocol-reader"))
-            .spawn(move || {
-                let mut output = BufReader::new(protocol_read);
-                loop {
-                    match read_message(&mut output) {
-                        Ok(message) => {
-                            if message_sender.send(Ok(message)).is_err() {
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = message_sender.send(Err(error));
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let proto_read_fd = unsafe { libc::dup(proto_parent_fd) };
+    if proto_read_fd < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(proto_parent_fd);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    unsafe {
+        libc::fcntl(proto_read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let protocol_write = File::from(unsafe { OwnedFd::from_raw_fd(proto_parent_fd) });
+    let protocol_read = File::from(unsafe { OwnedFd::from_raw_fd(proto_read_fd) });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker stdout was not piped"))?;
+    let stdout_log = Arc::new(Mutex::new(Vec::new()));
+    let drain_buf = Arc::clone(&stdout_log);
+    let stdout_drain = match thread::Builder::new()
+        .name(format!("web-runtime-{worker:?}-stdout-drain"))
+        .spawn(move || drain_worker_stdout(stdout, drain_buf))
+    {
+        Ok(stdout_drain) => stdout_drain,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to spawn {worker:?} stdout drain: {error}"),
+            ));
+        }
+    };
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker stderr was not piped"))?;
+    let echo_stderr = phase_trace_enabled();
+    let stderr_drain = match thread::Builder::new()
+        .name(format!("web-runtime-{worker:?}-stderr-drain"))
+        .spawn(move || drain_worker_stderr(stderr, echo_stderr))
+    {
+        Ok(stderr_drain) => stderr_drain,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to spawn {worker:?} stderr drain: {error}"),
+            ));
+        }
+    };
+    let (message_sender, messages) = mpsc::channel();
+    let reader_thread = match thread::Builder::new()
+        .name(format!("web-runtime-{worker:?}-protocol-reader"))
+        .spawn(move || {
+            let mut output = BufReader::new(protocol_read);
+            loop {
+                match read_message(&mut output) {
+                    Ok(message) => {
+                        if message_sender.send(Ok(message)).is_err() {
                             return;
                         }
                     }
+                    Err(error) => {
+                        let _ = message_sender.send(Err(error));
+                        return;
+                    }
                 }
-            }) {
-            Ok(reader_thread) => reader_thread,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("failed to spawn {worker:?} protocol reader: {error}"),
-                ));
             }
-        };
+        }) {
+        Ok(reader_thread) => reader_thread,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to spawn {worker:?} protocol reader: {error}"),
+            ));
+        }
+    };
 
-        register_owned_worker(child.id());
-        Ok(WorkerProcess {
-            worker,
-            capability,
-            child,
-            input: Some(BufWriter::new(protocol_write)),
-            messages,
-            reader_thread: Some(reader_thread),
-            stdout_log,
-            stdout_drain: Some(stdout_drain),
-            reaped: false,
-        })
+    register_owned_worker(child.id());
+    Ok(WorkerProcess {
+        worker,
+        capability,
+        child,
+        input: Some(BufWriter::new(protocol_write)),
+        messages,
+        reader_thread: Some(reader_thread),
+        stdout_log,
+        stdout_drain: Some(stdout_drain),
+        stderr_drain: Some(stderr_drain),
+        reaped: false,
+    })
+}
+
+fn drain_worker_stderr(mut stderr: std::process::ChildStderr, echo: bool) {
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if echo {
+                    let _ = io::stderr().write_all(&buf[..n]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 fn drain_worker_stdout(mut stdout: std::process::ChildStdout, log: Arc<Mutex<Vec<u8>>>) {
@@ -1046,10 +1158,13 @@ fn drain_worker_stdout(mut stdout: std::process::ChildStdout, log: Arc<Mutex<Vec
     }
 }
 
-
 #[cfg(target_os = "macos")]
 fn sbpl_subpath(path: &Path) -> String {
-    let text = path.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+    let text = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     format!("(subpath \"{text}\")")
 }
 
@@ -1172,7 +1287,6 @@ struct ImageId {
     sha256: String,
 }
 
-
 #[cfg(unix)]
 fn image_digest_cache_path(_path: &Path, meta: &std::fs::Metadata) -> PathBuf {
     use std::os::unix::fs::MetadataExt;
@@ -1213,7 +1327,10 @@ fn prefill_digest_cache_from_dist(exe: &Path, meta: &std::fs::Metadata) {
     let Some(parent) = exe.parent() else {
         return;
     };
-    for sums in [parent.join("SHA256SUMS"), parent.join("..").join("SHA256SUMS")] {
+    for sums in [
+        parent.join("SHA256SUMS"),
+        parent.join("..").join("SHA256SUMS"),
+    ] {
         let Ok(text) = fs::read_to_string(&sums) else {
             continue;
         };
@@ -1355,7 +1472,10 @@ fn parent_image() -> io::Result<&'static ImageId> {
     if loaded.sha256.len() != 64 || !loaded.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("parent image digest is not a SHA-256 hex: {}", loaded.sha256),
+            format!(
+                "parent image digest is not a SHA-256 hex: {}",
+                loaded.sha256
+            ),
         ));
     }
     let _ = PARENT.set(loaded);
@@ -1413,7 +1533,10 @@ fn child_executable_path(pid: u32) -> io::Result<PathBuf> {
         }
         buf.truncate(n as usize);
         Ok(PathBuf::from(String::from_utf8(buf).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "worker executable path is not UTF-8")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker executable path is not UTF-8",
+            )
         })?))
     }
     #[cfg(target_os = "linux")]
@@ -1495,9 +1618,9 @@ impl WorkerProcess {
 
     fn kill_tree_wait(&mut self, reap_wait: Duration, reader_wait: Duration) {
         let pid = self.child.id();
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-reap start pid={pid}",
-            self.worker
-        ); }
+        if crate::supervisor::phase_trace_enabled() {
+            eprintln!("web-runtime: phase {:?}-reap start pid={pid}", self.worker);
+        }
         unregister_owned_worker(pid);
         kill_process_tree(pid);
         let deadline = Instant::now() + reap_wait;
@@ -1521,9 +1644,9 @@ impl WorkerProcess {
 
     pub(crate) fn shutdown_or_kill(&mut self) {
         let pid = self.child.id();
-        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof start pid={pid}",
-            self.worker
-        ); }
+        if crate::supervisor::phase_trace_enabled() {
+            eprintln!("web-runtime: phase {:?}-eof start pid={pid}", self.worker);
+        }
         if self.send(&Message::shutdown()).is_ok() {
             let deadline = Instant::now() + WORKER_EOF_WAIT;
             while Instant::now() < deadline {
@@ -1532,9 +1655,9 @@ impl WorkerProcess {
                         self.reaped = true;
                         self.input.take();
                         self.join_reader_bounded(READER_JOIN_WAIT);
-                        if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-eof done pid={pid}",
-                            self.worker
-                        ); }
+                        if crate::supervisor::phase_trace_enabled() {
+                            eprintln!("web-runtime: phase {:?}-eof done pid={pid}", self.worker);
+                        }
                         return;
                     }
                     Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
@@ -1553,11 +1676,7 @@ impl WorkerProcess {
         self.send_timeout(message, PROCESS_TIMEOUT)
     }
 
-    pub(crate) fn send_timeout(
-        &mut self,
-        message: &Message,
-        timeout: Duration,
-    ) -> io::Result<()> {
+    pub(crate) fn send_timeout(&mut self, message: &Message, timeout: Duration) -> io::Result<()> {
         let input = self.input.as_mut().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1654,6 +1773,14 @@ impl WorkerProcess {
             });
             let _ = rx.recv_timeout(timeout);
         }
+        if let Some(drain) = self.stderr_drain.take() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = drain.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(timeout);
+        }
         let Some(reader) = self.reader_thread.take() else {
             return;
         };
@@ -1663,9 +1790,9 @@ impl WorkerProcess {
             let _ = tx.send(());
         });
         if rx.recv_timeout(timeout).is_err() {
-            if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: phase {:?}-reader-join timeout",
-                self.worker
-            ); }
+            if crate::supervisor::phase_trace_enabled() {
+                eprintln!("web-runtime: phase {:?}-reader-join timeout", self.worker);
+            }
         }
     }
 
@@ -1680,8 +1807,10 @@ impl WorkerProcess {
                     ..
                 })) => {
                     discarded += 1;
-                    if crate::supervisor::phase_trace_enabled() { eprintln!("web-runtime: discarded stale EngineResult id={request_id} ok={ok} err={error:?}"
-                    ); }
+                    if crate::supervisor::phase_trace_enabled() {
+                        eprintln!("web-runtime: discarded stale EngineResult id={request_id} ok={ok} err={error:?}"
+                    );
+                    }
                 }
                 Ok(Ok(other)) => {
                     discarded += 1;
@@ -1721,7 +1850,8 @@ mod tests {
 
     #[test]
     fn digest_from_sha256sums_reads_bin_web_runtime() {
-        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bin/web-runtime\n";
+        let text =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bin/web-runtime\n";
         assert_eq!(
             digest_from_sha256sums(text).as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -1752,7 +1882,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_worker_sandbox_allows_public_network_outbound() {
-        let profile = macos_sandbox_profile(Path::new("/tmp/exe"), Path::new("/tmp"), Path::new("/tmp"));
+        let profile =
+            macos_sandbox_profile(Path::new("/tmp/exe"), Path::new("/tmp"), Path::new("/tmp"));
         assert!(
             profile.contains("(allow network-outbound)\n"),
             "policy proxy must be able to dial non-loopback hosts; seatbelt is not the policy layer: {profile}"
@@ -1826,8 +1957,8 @@ mod tests {
         let same_len_after = observe_image(&path, false).unwrap();
         assert_eq!(same_len_after.ino, same_len_before.ino);
         assert_eq!(same_len_after.size, same_len_before.size);
-        let reason =
-            identity_mismatch(&same_len_before, &same_len_after).expect("same-length in-place rewrite");
+        let reason = identity_mismatch(&same_len_before, &same_len_after)
+            .expect("same-length in-place rewrite");
         assert!(
             reason.contains("mtime") || reason.contains("ctime"),
             "{reason}"
@@ -1926,5 +2057,28 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("web-runtime"), "{error}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_all_timeout_returns_when_peer_does_not_read() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (writer_end, _reader_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let file = unsafe { File::from_raw_fd(writer_end.into_raw_fd()) };
+        let mut writer = BufWriter::new(file);
+        let payload = vec![0_u8; 1024 * 1024];
+        let started = Instant::now();
+        let error =
+            write_all_timeout(&mut writer, &payload, Duration::from_millis(80)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "write_all_timeout must not block past the deadline, elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            error.to_string().contains("timed out after 80ms"),
+            "{error}"
+        );
     }
 }

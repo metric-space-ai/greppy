@@ -39,6 +39,9 @@ pub enum ResultsCommand {
         session: Option<String>,
         #[arg(long)]
         output: Option<String>,
+        /// Decode images and wait for finished rendering instead of the instant framebuffer.
+        #[arg(long)]
+        render_complete: bool,
         #[arg(long)]
         json: bool,
     },
@@ -210,8 +213,9 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
         ResultsCommand::Screenshot {
             session,
             output,
+            render_complete,
             json,
-        } => screenshot(root, session, output, json),
+        } => screenshot(root, session, output, render_complete, json),
         ResultsCommand::Search {
             query,
             domain,

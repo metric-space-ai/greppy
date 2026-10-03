@@ -502,8 +502,11 @@ fn accept_loop(
             Ok(stream) => stream,
             Err(_) => continue,
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+        // Keep this well under the 5s client close budget. A probe connect
+        // that never sends a frame used to occupy accept for 30s, so the next
+        // web.session.close expired as "timed out after 5s".
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let request: Request = match read_frame(&mut stream) {
             Ok(request) => request,
             Err(_) => continue,
@@ -803,8 +806,14 @@ impl Daemon {
         // click, observe -- reported nothing about what they cost. Time the
         // dispatch here and fill in whatever the handler left empty.
         let dispatch_started = Instant::now();
-        let content_before = sample_cpu_ms(self.content.pid());
-        let controller_before = sample_cpu_ms(self.controller.pid());
+        let (content_before, controller_before) = if touches_page {
+            (
+                sample_cpu_ms(self.content.pid()),
+                sample_cpu_ms(self.controller.pid()),
+            )
+        } else {
+            (0, 0)
+        };
         // The engine keeps a running total of bytes relayed through the policy
         // proxy. Sampling it around the dispatch turns that into the traffic
         // this one operation caused; the session field it used to report was
@@ -820,14 +829,14 @@ impl Daemon {
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
         }
-        if response.metrics.peak_rss_bytes == 0 {
+        if touches_page && response.metrics.peak_rss_bytes == 0 {
             response.metrics.peak_rss_bytes = sample_rss_bytes(self.content.pid());
         }
-        if response.metrics.content_cpu_ms == 0 {
+        if touches_page && response.metrics.content_cpu_ms == 0 {
             response.metrics.content_cpu_ms =
                 sample_cpu_ms(self.content.pid()).saturating_sub(content_before);
         }
-        if response.metrics.controller_cpu_ms == 0 {
+        if touches_page && response.metrics.controller_cpu_ms == 0 {
             response.metrics.controller_cpu_ms =
                 sample_cpu_ms(self.controller.pid()).saturating_sub(controller_before);
         }
@@ -1227,9 +1236,7 @@ impl Daemon {
                 let _ = self.profile_locks.remove(&session_id);
                 let _ = session.transition(SessionState::Closing);
                 if let Some(page) = session.page_id.take() {
-                    if self.content.is_running() {
-                        let _ = self.engine_call("page.close", json!({ "page": page }));
-                    }
+                    self.close_engine_page(&page);
                 }
                 let _ = session.transition(SessionState::Closed);
                 self.run_control
@@ -1833,7 +1840,16 @@ impl Daemon {
         match self.with_session_page(request, "web.screenshot") {
             Err(response) => response,
             Ok((session_id, page)) => {
-                match self.engine_call("page.screenshot", json!({ "page": page })) {
+                let mut params = json!({ "page": page });
+                if request
+                    .payload
+                    .get("renderComplete")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+                {
+                    params["renderComplete"] = json!(true);
+                }
+                match self.engine_call("page.screenshot", params) {
                     Ok(result) => {
                         let bytes = match screenshot_png_bytes(&result) {
                             Ok(bytes) => bytes,
@@ -3207,6 +3223,46 @@ impl Daemon {
         }
     }
 
+    fn close_engine_page(&mut self, page: &str) {
+        if !self.content.is_running() {
+            return;
+        }
+        // web.run / goto can return while Servo is still inside
+        // spin_event_loop on that page. The 60s engine_call budget is how
+        // `close N: timed out after 5s` happened: the client deadline is 5s
+        // and the supervisor was waiting for layout to finish. Do not recover
+        // workers here — spawn+handshake of the 400MB image overruns the same
+        // deadline and reparents process groups to PID 1.
+        let timeout = Duration::from_millis(250);
+        let request_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
+        let _ = self.content.discard_stale_engine_results();
+        if self
+            .content
+            .send_timeout(
+                &Message::engine_call(request_id, "page.close".to_owned(), json!({ "page": page })),
+                timeout,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.content.recv(remaining.min(Duration::from_millis(50))) {
+                Ok(Message::EngineResult {
+                    request_id: got, ..
+                }) if got == request_id => return,
+                Ok(Message::EngineResult { .. }) => continue,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+                Ok(_) | Err(_) => return,
+            }
+        }
+    }
+
     fn engine_call(
         &mut self,
         method: &str,
@@ -3544,7 +3600,7 @@ impl Daemon {
                 let ephemeral = session.persistent_profile.is_none();
                 let _ = self.profile_locks.remove(&session_id);
                 if let Some(page) = session.page_id.take() {
-                    let _ = self.engine_call("page.close", json!({ "page": page }));
+                    self.close_engine_page(&page);
                 }
                 if ephemeral {
                     self.remove_ephemeral_session_dir(&session_id);

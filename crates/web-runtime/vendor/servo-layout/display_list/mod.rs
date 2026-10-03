@@ -8,6 +8,7 @@ use std::sync::Arc;
 use app_units::{AU_PER_PX, Au};
 use clip::Clip;
 pub(crate) use clip::ClipId;
+use embedder_traits::promote_deferred_image_decode;
 use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
@@ -818,7 +819,21 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             .to_webrender();
         let common = self.common_properties(state, clip, &style);
 
-        if let Some(image_key) = fragment.image_key {
+        let image_key = fragment.image_key.or_else(|| {
+            if !promote_deferred_image_decode() {
+                return None;
+            }
+            let url = fragment.url.as_ref()?;
+            match self.image_resolver.image_cache.get_image(
+                url.clone(),
+                self.image_resolver.origin.clone(),
+                None,
+            )? {
+                CachedImage::Raster(raster) => raster.id,
+                _ => None,
+            }
+        });
+        if let Some(image_key) = image_key {
             self.wr().push_image(
                 &common,
                 rect,
@@ -848,6 +863,13 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                     fragment.url.clone(),
                 );
             }
+        } else if !fragment.showing_broken_image_icon {
+            // Agent-lazy default paint: layout-sized box, no RGBA. A frame
+            // and filename stand in for the pixels so a screenshot can
+            // answer "where is what" without decoding. Bounding box and
+            // visibility stay the header metrics. Visual screenshots take
+            // the image_key branch above via promote_deferred_image_decode.
+            Fragment::build_display_list_for_deferred_image_placeholder(self, fragment, rect, &common);
         }
 
         if fragment.showing_broken_image_icon {
@@ -1272,6 +1294,59 @@ impl Fragment {
                 do_aa: true,
             }),
         );
+    }
+
+    /// Paint a layout-sized stand-in for a header-only raster: fill, 1px
+    /// frame, and the URL filename. No WebRender image key, no RGBA, so
+    /// `getBoundingClientRect` / hit-tests keep the header box.
+    fn build_display_list_for_deferred_image_placeholder(
+        builder: &mut DisplayListBuilder,
+        fragment: &ImageFragment,
+        rect: LayoutRect,
+        common: &CommonItemProperties,
+    ) {
+        if rect.width() <= 1.0 || rect.height() <= 1.0 {
+            return;
+        }
+        builder.wr().push_rect(
+            common,
+            rect,
+            ColorF::new(208.0 / 255.0, 208.0 / 255.0, 216.0 / 255.0, 1.0),
+        );
+        let border_side = BorderSide {
+            color: ColorF::BLACK,
+            style: wr::BorderStyle::Solid,
+        };
+        builder.wr().push_border(
+            common,
+            rect,
+            LayoutSideOffsets::new_all_same(1.0),
+            BorderDetails::Normal(NormalBorder {
+                left: border_side,
+                right: border_side,
+                top: border_side,
+                bottom: border_side,
+                radius: BorderRadius::zero(),
+                do_aa: false,
+            }),
+        );
+
+        let label = fragment.url.as_ref().and_then(placeholder_label_from_url);
+        let Some(label) = label else {
+            return;
+        };
+        if rect.height() < 16.0 || rect.width() < 24.0 {
+            return;
+        }
+        let bar_h = rect.height().min(14.0);
+        let bar = LayoutRect::from_origin_and_size(
+            LayoutPoint::new(rect.min.x, rect.min.y),
+            LayoutSize::new(rect.width(), bar_h),
+        );
+        builder.wr().push_rect(common, bar, ColorF::new(0.35, 0.35, 0.40, 1.0));
+        if rect.height() >= 24.0 && rect.width() >= 40.0 {
+            paint_placeholder_filename(builder, common, &label, bar);
+        }
     }
 
     // TODO: This caret/text selection implementation currently does not account for vertical text
@@ -2320,6 +2395,79 @@ fn glyphs(
         }
     }
     (glyphs, largest_advance)
+}
+
+fn placeholder_label_from_url(url: &ServoUrl) -> Option<String> {
+    let name = url.path().rsplit('/').next().unwrap_or("");
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.chars().take(24).collect())
+    }
+}
+
+fn placeholder_glyph(ch: char) -> [u8; 7] {
+    match ch.to_ascii_lowercase() {
+        'a' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'b' => [0b11110, 0b10001, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'd' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'e' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'g' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'n' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'p' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'r' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        '.' => [0, 0, 0, 0, 0, 0, 0b00100],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        '_' => [0, 0, 0, 0, 0, 0, 0b11111],
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
+    }
+}
+
+fn paint_placeholder_filename(
+    builder: &mut DisplayListBuilder<'_>,
+    common: &CommonItemProperties,
+    label: &str,
+    bar: LayoutRect,
+) {
+    let scale = if bar.height() >= 12.0 { 2.0 } else { 1.0 };
+    let mut x = bar.min.x + 3.0;
+    let y0 = bar.min.y + ((bar.height() - 7.0 * scale) / 2.0).max(1.0);
+    let x_limit = bar.max.x - 2.0;
+    let color = ColorF::WHITE;
+    for ch in label.chars() {
+        if x + 6.0 * scale > x_limit {
+            break;
+        }
+        let glyph = placeholder_glyph(ch);
+        for (row, bits) in glyph.into_iter().enumerate() {
+            let mut col = 0u8;
+            while col < 5 {
+                if bits & (1u8 << (4 - col)) == 0 {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                col += 1;
+                while col < 5 && bits & (1u8 << (4 - col)) != 0 {
+                    col += 1;
+                }
+                let run = f32::from(col - start);
+                builder.wr().push_rect(
+                    common,
+                    LayoutRect::from_origin_and_size(
+                        LayoutPoint::new(x + f32::from(start) * scale, y0 + row as f32 * scale),
+                        LayoutSize::new(run * scale, scale),
+                    ),
+                    color,
+                );
+            }
+        }
+        x += 6.0 * scale;
+    }
 }
 
 /// Given a set of corner radii for a rectangle, this function returns the corresponding radii

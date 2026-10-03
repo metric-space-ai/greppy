@@ -19,6 +19,7 @@ use std::ffi::c_void;
 use std::fmt::{Debug, Display, Error, Formatter};
 use std::hash::Hash;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use accesskit::TreeUpdate;
@@ -53,6 +54,36 @@ pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
 use crate::user_contents::UserContentManagerId;
 pub use crate::webdriver::*;
+
+static PROMOTE_DEFERRED_IMAGE_DECODE: AtomicBool = AtomicBool::new(false);
+
+/// When true, layout display lists decode header-only raster placeholders
+/// into WebRender keys. `page.screenshot` with `renderComplete` turns this
+/// on so the agent sees real pixels; the default screenshot path leaves it
+/// off, so paint stays empty layout boxes.
+pub fn set_promote_deferred_image_decode(on: bool) {
+    PROMOTE_DEFERRED_IMAGE_DECODE.store(on, Ordering::Relaxed);
+}
+
+pub fn promote_deferred_image_decode() -> bool {
+    PROMOTE_DEFERRED_IMAGE_DECODE.load(Ordering::Relaxed)
+}
+
+/// Turns deferred-raster promotion on for the lifetime of the guard.
+pub struct PromoteDeferredImageDecode;
+
+impl PromoteDeferredImageDecode {
+    pub fn enter() -> Self {
+        set_promote_deferred_image_decode(true);
+        Self
+    }
+}
+
+impl Drop for PromoteDeferredImageDecode {
+    fn drop(&mut self) {
+        set_promote_deferred_image_decode(false);
+    }
+}
 
 /// A point in a `WebView`, either expressed in device pixels or page pixels.
 /// Page pixels are CSS pixels, which take into account device pixel scale,

@@ -1,0 +1,52 @@
+{
+  "reference": {
+    "engine": "HTML width/height attributes plus header metrics on the pinned red.png fixture",
+    "value": {
+      "w": 200.0,
+      "h": 200.0,
+      "ow": 200.0,
+      "oh": 200.0,
+      "vis": "visible",
+      "tag": "IMG",
+      "complete": true,
+      "nw": 32.0,
+      "nh": 32.0
+    }
+  },
+  "candidate": {
+    "engine": "greppy-web-runtime+servo-0.5.0",
+    "status": "ok",
+    "placeholder": {
+      "oh": 200.0,
+      "disp": "inline",
+      "nw": 32.0,
+      "nh": 32.0,
+      "h": 200.0,
+      "tag": "IMG",
+      "vis": "visible",
+      "ow": 200.0,
+      "w": 200.0,
+      "complete": true
+    },
+    "renderComplete": {
+      "disp": "inline",
+      "oh": 200.0,
+      "vis": "visible",
+      "nw": 32.0,
+      "h": 200.0,
+      "ow": 200.0,
+      "complete": true,
+      "nh": 32.0,
+      "w": 200.0,
+      "tag": "IMG"
+    }
+  },
+  "match": true,
+  "scope": "Agent-lazy default vs renderComplete on the same document: boundingBox, offset box, computed visibility/display, img.complete, naturalWidth/Height, and elementFromPoint stay identical. Not a Chromium pixel comparison.",
+  "provenance": {
+    "commit": "698bd038",
+    "verified_at": "2026-09-23",
+    "verified_by": "cargo test -p web-runtime --test session-daemon --exact deferred_image_placeholder_preserves_img_bounding_box",
+    "note": "Die Aussage dieses Receipts wurde an diesem Commit durch den benannten Test bestaetigt. Placeholder-Werte werden vom Test nachgemessen und hier eingetragen; die Provenance bleibt stehen."
+  }
+}

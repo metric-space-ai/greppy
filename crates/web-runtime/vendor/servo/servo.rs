@@ -261,21 +261,43 @@ impl ServoInner {
             .and_then(WebView::from_weak_handle)
     }
 
-    #[servo_tracing::instrument(level = "debug", skip_all)]
     fn spin_event_loop(&self) -> bool {
+        self.spin_event_loop_limited(usize::MAX, usize::MAX).0
+    }
+
+    /// Drain at most `max_paint` paint messages and `max_embedder` embedder
+    /// messages. Returns `(keep_running, more_pending)`.
+    ///
+    /// The unlimited caller still empties both queues. Idle pumping uses a
+    /// small batch so the embedder can read IPC between turns: otherwise
+    /// post-navigation layout drains thousands of paint messages inside one
+    /// call and the next web.run waits on a full Unix buffer until the
+    /// client deadline (Fund 026).
+    #[servo_tracing::instrument(level = "debug", skip_all)]
+    fn spin_event_loop_limited(
+        &self,
+        max_paint: usize,
+        max_embedder: usize,
+    ) -> (bool, bool) {
         if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
-            return false;
+            return (false, false);
         }
 
+        let mut more = false;
         {
             let paint = self.paint.borrow();
             let mut messages = Vec::new();
-            while let Ok(message) = paint.receiver().try_recv() {
-                match message {
-                    Ok(message) => messages.push(message),
-                    Err(error) => {
+            loop {
+                if messages.len() >= max_paint {
+                    more = true;
+                    break;
+                }
+                match paint.receiver().try_recv() {
+                    Ok(Ok(message)) => messages.push(message),
+                    Ok(Err(error)) => {
                         warn!("Router deserialization error: {error}. Ignoring this PaintMessage.")
                     },
+                    Err(_) => break,
                 }
             }
             paint.handle_messages(messages);
@@ -287,17 +309,27 @@ impl ServoInner {
             &self.constellation_embedder_receiver,
         );
         // Only handle incoming embedder messages if `Paint` hasn't already started shutting down.
-        while let Some(message) = selector.try_recv_one_message() {
-            match message {
-                Message::FromUnknown(message) => self.handle_embedder_message(message),
-                Message::FromNet(message) => self.handle_net_embedder_message(message),
-                Message::FromConstellation(message) => {
-                    self.handle_constellation_embedder_message(message)
+        let mut embedder_n = 0;
+        while embedder_n < max_embedder {
+            match selector.try_recv_one_message() {
+                Some(message) => {
+                    embedder_n += 1;
+                    match message {
+                        Message::FromUnknown(message) => self.handle_embedder_message(message),
+                        Message::FromNet(message) => self.handle_net_embedder_message(message),
+                        Message::FromConstellation(message) => {
+                            self.handle_constellation_embedder_message(message)
+                        },
+                    }
+                    if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
+                        break;
+                    }
                 },
+                None => break,
             }
-            if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
-                break;
-            }
+        }
+        if embedder_n >= max_embedder {
+            more = true;
         }
         let pending_handled_input_events =
             std::mem::take(&mut *self.pending_handled_input_events.borrow_mut());
@@ -332,10 +364,10 @@ impl ServoInner {
         self.clean_up_destroyed_webview_handles();
 
         if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
-            return false;
+            return (false, false);
         }
 
-        true
+        (true, more)
     }
 
     fn send_new_frame_ready_messages(&self) {
@@ -1057,6 +1089,15 @@ impl Servo {
     ///   - Maybe update the rendered `Paint` output, but *without* swapping buffers.
     pub fn spin_event_loop(&self) {
         self.0.spin_event_loop();
+    }
+
+    /// One idle turn: drain a bounded batch of pending paint/embedder work.
+    ///
+    /// Returns true if more messages were waiting, so the embedder should
+    /// poll IPC and spin again instead of sleeping.
+    pub fn spin_event_loop_idle(&self) -> bool {
+        const IDLE_BATCH: usize = 4;
+        self.0.spin_event_loop_limited(IDLE_BATCH, IDLE_BATCH).1
     }
 
     pub fn setup_logging(&self) {
