@@ -1826,6 +1826,10 @@ pub(crate) fn dispatch_read_files(
                     "source_bytes_read": end,
                     "source_bytes_at_open": size_at_open,
                     "next_line": resume,
+                    "handle": serde_json::Value::Null,
+                    "handle_unavailable": with_handle.then_some(
+                        "byte-truncated previews cannot produce an edit handle; request an explicit --lines A:B span"
+                    ),
                 }));
                 continue;
             }
@@ -1862,6 +1866,10 @@ pub(crate) fn dispatch_read_files(
                         "path": shown,
                         "kind": "outline",
                         "content": outline,
+                        "handle": serde_json::Value::Null,
+                        "handle_unavailable": with_handle.then_some(
+                            "outlines cannot produce an edit handle; request an explicit --lines A:B span"
+                        ),
                     }));
                     continue;
                 }
@@ -1931,12 +1939,20 @@ pub(crate) fn dispatch_read_files(
             )));
         }
         if json_output {
+            let handle = group.lines().find_map(|line| line.strip_prefix("handle: "));
+            let continuation = continuation.as_ref().map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "next_line": end_line + 1,
+                    "remaining_lines": line_count - end_line,
+                })
+            });
             json_files.push(serde_json::json!({
                 "path": shown,
                 "start_line": start_line,
                 "end_line": end_line,
                 "content": read_line_slice(&content, start_line, end_line),
-                "rendered": group,
+                "handle": handle,
                 "continuation": continuation,
             }));
             continue;
