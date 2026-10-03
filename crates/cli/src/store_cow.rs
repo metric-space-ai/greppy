@@ -4996,6 +4996,16 @@ mod tests {
     }
 
     #[test]
+    fn overlay_publication_allows_complete_unchanged_js_repair() {
+        for with_base_edges in [false, true] {
+            let visibility = VisibilityIndex::default();
+            let (_scratch, overlay) =
+                unchanged_repair_edges_fixture(&visibility, true, with_base_edges);
+            validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        }
+    }
+
+    #[test]
     fn private_delta_paths_allow_only_complete_unchanged_repair_edges() {
         let (_scratch, overlay) =
             unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);

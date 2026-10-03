@@ -2190,7 +2190,23 @@ fn validate_overlay_snapshot_visibility(
             snapshot,
             &overlay.visibility,
         )?;
-        crate::store_cow::validate_overlay_delta_visibility(&store, &overlay.visibility)?;
+        let persisted =
+            crate::store_cow::cached_visibility_from_connection(store.conn(), &overlay.base_commit)
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "staged Store-CoW snapshot has no matching visibility manifest".into(),
+                    )
+                })??;
+        if !persisted.dirty_paths().eq(overlay.visibility.dirty_paths())
+            || !persisted
+                .deleted_paths()
+                .eq(overlay.visibility.deleted_paths())
+        {
+            return Err(Error::Invalid(
+                "staged Store-CoW visibility differs from the intended publication".into(),
+            ));
+        }
+        crate::store_cow::validate_overlay_delta_visibility(&store, &persisted)?;
     }
     Ok(())
 }

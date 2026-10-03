@@ -2,6 +2,72 @@ use super::*;
 use clap::Parser;
 
 #[test]
+fn overlay_publication_refuses_rogue_staged_rows_and_preserves_active_snapshot() {
+    let root = test_tempdir("overlay-publication-invariant");
+    let source = root.join("source");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(source.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+    let base_path = root.join("base.db");
+    {
+        let mut base = greppy_store::Store::open(&base_path).unwrap();
+        greppy_indexer::index_with_options(
+            &mut base,
+            &source,
+            "fixture",
+            &greppy_indexer::IndexOptions::default(),
+        )
+        .unwrap();
+        crate::store_cow::mark_rust_caller_edges_repaired(&base).unwrap();
+    }
+    let active_path = root.join("active.db");
+    {
+        let mut active = greppy_store::Store::open(&active_path).unwrap();
+        active
+            .upsert_project(&greppy_store::Project {
+                name: "fixture".into(),
+                indexed_at: "now".into(),
+                root_path: source.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        active
+            .insert_raw_edges(&[greppy_store::NewRawEdge {
+                project: "fixture".into(),
+                file_path: "src/rogue.ts".into(),
+                source_qname: "run".into(),
+                target_qname: "rogue".into(),
+                edge_type: "CALLS".into(),
+                properties: serde_json::json!({}),
+            }])
+            .unwrap();
+    }
+    let before = std::fs::read(&active_path).unwrap();
+    let overlay = crate::store_cow::OverlaySpec {
+        base_path,
+        base_commit: "a".repeat(40),
+        visibility: greppy_store::VisibilityIndex::new(
+            ["src/lib.rs".to_string()],
+            Vec::<String>::new(),
+        )
+        .unwrap(),
+    };
+    let error = crate::indexing::index_overlay_snapshot(
+        &active_path,
+        &source,
+        "fixture",
+        &overlay,
+        None,
+        &greppy_indexer::IndexOptions::default(),
+        false,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("src/rogue.ts"), "{error}");
+    assert_eq!(std::fs::read(&active_path).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn expired_output_cleanup_preserves_old_schema_and_skips_busy_writers() {
     let root = test_tempdir("output-cleanup-no-migration");
     let graph = root.join("graph.db");
