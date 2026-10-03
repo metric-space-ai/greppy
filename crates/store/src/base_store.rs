@@ -1168,7 +1168,6 @@ fn write_digest_proof(directory: &fs::File, proof: &DigestProof) -> io::Result<(
             return stage("rename pending", Err(io::Error::last_os_error()));
         }
         stage("sync directory", directory.sync_all())
-
     })();
 
     unsafe {
