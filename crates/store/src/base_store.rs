@@ -1023,7 +1023,7 @@ fn reject_mutating_acl_fd(fd: libc::c_int) -> io::Result<()> {
         value if value > 0 => {}
         _ => return Err(invalid_data("unknown digest proof ACL presence")),
     }
-    let mut acl = std::ptr::null_mut();
+    let mut acl: *mut libc::c_void = std::ptr::null_mut();
     if unsafe {
         filesec_get_property(
             security.0,
