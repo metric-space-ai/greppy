@@ -1157,14 +1157,13 @@ fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_j
                 }
             }
         }
-        if matches!(node.kind(), "closure_expression" | "for_expression") {
-            if node
+        if matches!(node.kind(), "closure_expression" | "for_expression")
+            && node
                 .child_by_field_name("pattern")
                 .or_else(|| node.child_by_field_name("parameters"))
                 .is_some_and(|pattern| binds(source, pattern, name))
-            {
-                return None;
-            }
+        {
+            return None;
         }
         let pair = if node.kind() == "match_arm" {
             node.child_by_field_name("pattern").zip(
@@ -3095,7 +3094,6 @@ fn js_ts_binds_effect(pattern: Node<'_>, source: &[u8]) -> bool {
 }
 
 /// First direct child of `node` whose kind is `kind`, if any.
-
 fn find_child_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let found = node.children(&mut cursor).find(|c| c.kind() == kind);
