@@ -284,6 +284,29 @@ impl Store {
         Ok(rows)
     }
 
+    /// Read import context without expanding reference repair arrays in the
+    /// overlay view. Those arrays contain CALLS/USAGE only; their window
+    /// functions otherwise scan all repairs before applying a file filter.
+    pub fn list_raw_import_edges_for_file(
+        &self,
+        project: &str,
+        file_path: &str,
+    ) -> Result<Vec<RawEdge>> {
+        let sql = if self.is_overlay() {
+            RAW_OVERLAY_IMPORTS_FOR_FILE_SQL
+        } else {
+            "SELECT id, project, file_path, source_qname, target_qname, edge_type, properties
+             FROM main.raw_edges
+             WHERE project = ?1 AND file_path = ?2 AND edge_type = 'IMPORTS'
+             ORDER BY id"
+        };
+        let mut stmt = self.conn().prepare_cached(sql)?;
+        let rows = stmt
+            .query_map(params![project, file_path], row_to_raw_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Delete every raw edge for `(project, file_path)` and return the number
     /// of rows removed. Called before re-inserting a re-extracted file's
     /// edges and for deleted files (per-file delete-then-insert).
@@ -322,6 +345,24 @@ impl Store {
         Ok(row)
     }
 }
+
+const RAW_OVERLAY_IMPORTS_FOR_FILE_SQL: &str = "
+SELECT id, project, file_path, source_qname, target_qname, edge_type, properties
+FROM main.raw_edges
+WHERE project = ?1 AND file_path = ?2 AND edge_type = 'IMPORTS'
+UNION ALL
+SELECT -b.id, b.project, b.file_path, b.source_qname, b.target_qname,
+       b.edge_type, b.properties
+FROM greppy_base.raw_edges b
+WHERE b.project = ?1 AND b.file_path = ?2 AND b.edge_type = 'IMPORTS'
+  AND NOT EXISTS (
+      SELECT 1 FROM js_ts_reference_override_files f
+      WHERE f.project = b.project AND f.file_path = b.file_path
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
+  )
+ORDER BY id";
 
 fn row_to_raw_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEdge> {
     let props_str: String = row.get(6)?;
@@ -363,6 +404,75 @@ mod tests {
             edge_type: ty.into(),
             properties: serde_json::json!({"line": 1}),
         }
+    }
+
+    #[test]
+    fn import_context_matches_overlay_visibility_without_repair_expansion() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            base.upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "cached".into(),
+                root_path: "/root".into(),
+            })
+            .unwrap();
+            base.insert_raw_edges(&[
+                new_raw_edge("p", "module.rs", "source", "base", "IMPORTS"),
+                new_raw_edge("p", "module.rs", "source", "reference", "USAGE"),
+                new_raw_edge("p", "hidden.rs", "source", "hidden", "IMPORTS"),
+                new_raw_edge("p", "masked.rs", "source", "masked", "IMPORTS"),
+            ])
+            .unwrap();
+            assert_eq!(
+                base.list_raw_import_edges_for_file("p", "module.rs")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let visibility =
+            crate::VisibilityIndex::new(vec!["hidden.rs".to_string()], Vec::<String>::new())
+                .unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        overlay
+            .insert_raw_edges(&[new_raw_edge("p", "module.rs", "source", "delta", "IMPORTS")])
+            .unwrap();
+        overlay.conn().execute(
+            "INSERT INTO main.js_ts_reference_override_files(project,file_path) VALUES ('p','masked.rs')",
+            [],
+        ).unwrap();
+        let repaired = vec![new_raw_edge("p", "module.rs", "source", "repair", "USAGE")];
+        overlay
+            .replace_validated_rust_usages("p", &["module.rs".into()], &repaired)
+            .unwrap();
+        for file in ["module.rs", "hidden.rs", "masked.rs"] {
+            let expected = overlay
+                .list_raw_edges_for_file("p", file)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.edge_type == "IMPORTS")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                overlay.list_raw_import_edges_for_file("p", file).unwrap(),
+                expected
+            );
+        }
+        // A per-file import read must not execute the windowed synthetic
+        // reference branches, even with a type predicate on the general view.
+        let plan_sql = format!("EXPLAIN QUERY PLAN {RAW_OVERLAY_IMPORTS_FOR_FILE_SQL}");
+        let mut stmt = overlay.conn().prepare(&plan_sql).unwrap();
+        let plan = stmt
+            .query_map(params!["p", "module.rs"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().all(|line| !line.contains("CO-ROUTINE")),
+            "{plan:?}"
+        );
     }
 
     #[test]
