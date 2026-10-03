@@ -4594,6 +4594,40 @@ mod patch_rollback_tests {
     }
 
     #[test]
+    fn guarded_c_header_write_and_invalid_replacement_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = include_bytes!("../../edit/tests/fixtures/guarded-protocol.h").to_vec();
+        run_trained_write(
+            dir.path(),
+            dir.path(),
+            "protocol.h",
+            valid.clone(),
+            false,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(std::fs::read(dir.path().join("protocol.h")).unwrap(), valid);
+        let malformed = String::from_utf8(valid.clone()).unwrap().replacen(
+            "fma_codec_name(uint32_t codec);",
+            "fma_codec_name(uint32_t codec;",
+            1,
+        );
+        let refusal = match run_trained_write(
+            dir.path(),
+            dir.path(),
+            "protocol.h",
+            malformed.into_bytes(),
+            false,
+            false,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed header accepted"),
+        };
+        assert_eq!(refusal.code, "invalid_result");
+        assert_eq!(std::fs::read(dir.path().join("protocol.h")).unwrap(), valid);
+    }
+
+    #[test]
     fn duplicate_patch_targets_are_refused_before_any_publish() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("example.txt");

@@ -219,6 +219,9 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// expressions, and unrelated malformed code cannot qualify. The substituted
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
+    if matches!(language, Language::C | Language::Cpp) {
+        return guarded_linkage_validation_content(language, content);
+    }
     if language.name() == "json" {
         return json_validation_content(content);
     }
@@ -508,6 +511,92 @@ fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     normalized.map_or(Cow::Borrowed(content), Cow::Owned)
 }
 
+/// Validate only a complete unique conventional linkage pair. The body and
+/// other directives stay parsed; spaces preserve diagnostic coordinates.
+fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
+    const OPEN: &[u8] = b"#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    const CLOSE: &[u8] = b"#ifdef __cplusplus\n}\n#endif\n";
+    let unique_line = |needle: &[u8]| {
+        let mut matches = content
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(i, bytes)| {
+                (bytes == needle && (i == 0 || content[i - 1] == b'\n')).then_some(i)
+            });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    };
+    let (Some(open), Some(close)) = (unique_line(OPEN), unique_line(CLOSE)) else {
+        return Cow::Borrowed(content);
+    };
+    if open + OPEN.len() > close {
+        return Cow::Borrowed(content);
+    }
+    let Ok(tree) = greppy_parser::parse(language, content) else {
+        return Cow::Borrowed(content);
+    };
+    for offset in [open, close] {
+        let Some(mut node) = tree
+            .root_node()
+            .descendant_for_byte_range(offset, offset + 1)
+        else {
+            return Cow::Borrowed(content);
+        };
+        loop {
+            if matches!(
+                node.kind(),
+                "comment" | "string_literal" | "raw_string_literal"
+            ) {
+                return Cow::Borrowed(content);
+            }
+            let Some(parent) = node.parent() else { break };
+            node = parent;
+        }
+    }
+    let mut normalized = content.to_vec();
+    for (start, len) in [(open, OPEN.len()), (close, CLOSE.len())] {
+        for byte in &mut normalized[start..start + len] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    // Linkage specifications are only allowed at namespace scope. Erasing
+    // these wrappers inside a function/struct must not make invalid C++ valid.
+    let Ok(view) = greppy_parser::parse(language, &normalized) else {
+        return Cow::Borrowed(content);
+    };
+    let mut enclosing = Vec::new();
+    for offset in [open, close] {
+        let mut ancestors = Vec::new();
+        let Some(mut node) = view
+            .root_node()
+            .descendant_for_byte_range(offset, offset + 1)
+        else {
+            return Cow::Borrowed(content);
+        };
+        loop {
+            if !matches!(
+                node.kind(),
+                "translation_unit"
+                    | "preproc_if"
+                    | "preproc_ifdef"
+                    | "preproc_else"
+                    | "preproc_elif"
+            ) {
+                return Cow::Borrowed(content);
+            }
+            ancestors.push((node.kind(), node.start_byte(), node.end_byte()));
+            let Some(parent) = node.parent() else { break };
+            node = parent;
+        }
+        enclosing.push(ancestors);
+    }
+    if enclosing[0] != enclosing[1] {
+        return Cow::Borrowed(content);
+    }
+    Cow::Owned(normalized)
+}
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
@@ -628,6 +717,44 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_linkage_lookalikes_keep_valid_comment_and_string_bytes() {
+        let pair = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint value;\n#ifdef __cplusplus\n}\n#endif\n";
+        let comment = format!("/*\n{pair}*/\nint value;\n");
+        let raw_string = format!("const char *value = R\"guard(\n{pair})guard\";\n");
+        // Ordinary strings encode newlines and quotes; they must remain literal
+        // data, independently of the raw-string/comment ancestor exclusions.
+        let escaped = pair
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let string = format!("const char *value = \"{escaped}\";\n");
+        for (language, source) in [
+            (Language::C, comment),
+            (Language::Cpp, string),
+            (Language::Cpp, raw_string),
+        ] {
+            let tree = greppy_parser::parse(language, source.as_bytes()).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{source}\n{}",
+                tree.root_node().to_sexp()
+            );
+            let view = guarded_linkage_validation_content(language, source.as_bytes());
+            assert!(
+                matches!(view, Cow::Borrowed(_)),
+                "lookalike normalized: {source}"
+            );
+            assert_eq!(view.as_ref(), source.as_bytes());
+            assert_eq!(
+                syntax_counts(language, source.as_bytes()).unwrap(),
+                SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }
+            );
+        }
+    }
     use super::*;
 
     #[test]
