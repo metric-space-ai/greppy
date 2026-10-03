@@ -277,6 +277,63 @@ mod rust_repair_recovery_tests {
     use super::*;
 
     #[test]
+    fn standalone_embedding_reuse_accepts_fresh_graph_and_refuses_changed_source() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, "pub fn target() {}\n").unwrap();
+        let active = scratch.path().join("active.db");
+        let mut store = greppy_store::Store::open(&active).unwrap();
+        greppy_indexer::index(&mut store, &root, "p").unwrap();
+        let options = greppy_indexer::IndexOptions::default();
+        validate_standalone_embedding_store(&store, &active, &root, "p", &options).unwrap();
+        let generation = store
+            .get_workspace_state(root.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .graph_generation;
+        // The same validator is used before embedding and just before publish.
+        std::fs::write(&source, "pub fn changed_after_admission() {}\n").unwrap();
+        assert!(
+            validate_standalone_embedding_store(&store, &active, &root, "p", &options).is_err()
+        );
+        assert_eq!(
+            store
+                .get_workspace_state(root.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .graph_generation,
+            generation
+        );
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn standalone_embedding_reuse_refuses_unpublished_and_wrong_root_graphs() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        let active = scratch.path().join("active.db");
+        let mut store = greppy_store::Store::open(&active).unwrap();
+        let options = greppy_indexer::IndexOptions::default();
+        assert!(
+            validate_standalone_embedding_store(&store, &active, &root, "p", &options).is_err()
+        );
+        greppy_indexer::index(&mut store, &root, "p").unwrap();
+        assert!(
+            validate_standalone_embedding_store(&store, &active, &root, "missing", &options)
+                .is_err()
+        );
+        let other = scratch.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(
+            validate_standalone_embedding_store(&store, &active, &other, "p", &options).is_err()
+        );
+    }
+
+    #[test]
     fn recovery_requires_actual_rust_repair_certification() {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().join("repo");
@@ -324,6 +381,18 @@ fn validate_index_recovery_candidate(
 ) -> Result<()> {
     checkpoint_store_path(candidate)?;
     let store = greppy_store::Store::open_with(candidate, greppy_store::OpenOptions::read_only())?;
+    validate_index_snapshot(&store, candidate, target, project, options)
+}
+
+// Read-only validation shared by recovery and standalone semantic reuse. The
+// writer lease serializes database publication, not external source edits.
+fn validate_index_snapshot(
+    store: &greppy_store::Store,
+    candidate: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    options: &greppy_indexer::IndexOptions,
+) -> Result<()> {
     store.integrity_check().map_err(|error| {
         Error::Store(format!(
             "recovery candidate {} failed integrity_check: {error}",
@@ -1387,12 +1456,16 @@ pub(crate) fn dispatch_index(
     };
     let embedding_job =
         std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
-    let scoped_embedding_job = !background_embedding_path_prefixes()?.is_empty();
     let had_overlay_binding = embedding_job
         && crate::store_cow::overlay_environment_for_recovery(&effective_root)?.is_some();
-    // A cold scoped query can already have a complete standalone graph. Do
-    // not migrate it to a new repository-wide Base merely to embed its scope.
-    let _embedding_overlay = if embedding_job && (!scoped_embedding_job || had_overlay_binding) {
+    // Both scoped and unscoped semantic queries can reuse a freshly published
+    // standalone graph. Validate in the child after admission; the caller's
+    // earlier freshness result cannot protect against intervening source edits.
+    let standalone_embedding_reuse = embedding_job
+        && !had_overlay_binding
+        && validate_standalone_embedding_path(&store_path, &target, &project, &index_options)
+            .is_ok();
+    let _embedding_overlay = if embedding_job && !standalone_embedding_reuse {
         match crate::store_cow::prepare_auto_linked_worktree_overlay(
             &effective_root,
             &greppy_core::cache::data_root(),
@@ -1422,7 +1495,7 @@ pub(crate) fn dispatch_index(
         && store_path.is_file()
         && (!effective_root.join(".git").is_file()
             || embedding_overlay.is_some()
-            || (scoped_embedding_job && !had_overlay_binding));
+            || standalone_embedding_reuse);
     if embedding_only {
         let cfg = embedding_config.as_ref().ok_or_else(|| {
             Error::Invalid("background embedding job has no embedding configuration".into())
@@ -1983,6 +2056,35 @@ pub(crate) fn index_atomic_snapshot_attempt(
     }))
 }
 
+fn validate_standalone_embedding_path(
+    path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    options: &greppy_indexer::IndexOptions,
+) -> Result<()> {
+    let store = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    validate_standalone_embedding_store(&store, path, target, project, options)
+}
+
+fn validate_standalone_embedding_store(
+    store: &greppy_store::Store,
+    path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    options: &greppy_indexer::IndexOptions,
+) -> Result<()> {
+    validate_index_snapshot(store, path, target, project, options)?;
+    // Preserve semantic search's coverage policy. Metadata mode keeps its
+    // explicit partial-provider diagnostics; this shortcut does not certify
+    // missing extraction as complete. Strict callers still refuse it.
+    if provider_policy_blocks_query(&incomplete_provider_json(store, project)?)? {
+        return Err(Error::Store(
+            "standalone graph requires provider completion under strict coverage policy".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn complete_embeddings_from_published_graph(
     active_path: &std::path::Path,
     target: &std::path::Path,
@@ -2001,6 +2103,19 @@ fn complete_embeddings_from_published_graph(
     } else {
         greppy_store::Store::open(&temp_path)?
     };
+    let standalone_options = greppy_indexer::IndexOptions {
+        discover_overrides: discover_overrides_from_env()?,
+        only_paths: None,
+    };
+    if overlay.is_none() {
+        validate_standalone_embedding_store(
+            &store,
+            &temp_path,
+            target,
+            project,
+            &standalone_options,
+        )?;
+    }
     let generation = store
         .get_workspace_state(effective_root.to_string_lossy().as_ref())?
         .ok_or_else(|| Error::Invalid("published graph has no workspace state".into()))?
@@ -2023,12 +2138,24 @@ fn complete_embeddings_from_published_graph(
     drop(store);
     let integrity =
         greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
-    integrity.integrity_check().map_err(|error| {
-        Error::Store(format!(
-            "embedding snapshot integrity_check failed for {}: {error}",
-            temp_path.display()
-        ))
-    })?;
+    if overlay.is_none() {
+        // Recheck after inference: a writer lease cannot freeze source files.
+        // A stale staged result must never replace the active graph.
+        validate_standalone_embedding_store(
+            &integrity,
+            &temp_path,
+            target,
+            project,
+            &standalone_options,
+        )?;
+    } else {
+        integrity.integrity_check().map_err(|error| {
+            Error::Store(format!(
+                "embedding snapshot integrity_check failed for {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+    }
     drop(integrity);
     cleanup_sqlite_sidecars(&temp_path)?;
     sync_file(&temp_path)?;
