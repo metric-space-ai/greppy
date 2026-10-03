@@ -339,10 +339,20 @@ pub fn index_code_embeddings_for_project_with_progress(
         project,
         provider,
         options,
-        total_documents,
-        progress,
+        EmbeddingIndexProgressContext {
+            total_documents,
+            callback: progress,
+        },
         &[],
     )
+}
+
+/// Progress reporting configuration for a scoped embedding pass.
+/// The count comes from `count_code_embedding_documents_for_scope` with the
+/// same prefixes/options as the pass; the callback receives the existing events.
+pub struct EmbeddingIndexProgressContext<'a> {
+    pub total_documents: usize,
+    pub callback: &'a mut dyn FnMut(EmbeddingIndexProgress),
 }
 
 /// Scoped passes reuse the same vectors/cache and never prune unrelated rows.
@@ -352,10 +362,13 @@ pub fn index_code_embeddings_for_scope_with_progress(
     project: &str,
     provider: &mut dyn CodeEmbeddingProvider,
     options: EmbeddingIndexOptions,
-    total_documents: usize,
-    progress: &mut dyn FnMut(EmbeddingIndexProgress),
+    progress_context: EmbeddingIndexProgressContext<'_>,
     prefixes: &[String],
 ) -> Result<EmbeddingIndexReport> {
+    let EmbeddingIndexProgressContext {
+        total_documents,
+        callback: progress,
+    } = progress_context;
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = 0usize;
@@ -1629,19 +1642,30 @@ mod tests {
                 total, 1,
                 "a sparse Delta must include the requested Base definitions"
             );
+            let mut scoped_progress = Vec::new();
             let report = index_code_embeddings_for_scope_with_progress(
                 &mut overlay,
                 &root,
                 "p",
                 &mut provider,
                 options,
-                total,
-                &mut |_| {},
+                EmbeddingIndexProgressContext {
+                    total_documents: total,
+                    callback: &mut |value| scoped_progress.push(value),
+                },
                 &prefixes,
             )
             .unwrap();
             assert_eq!(report.nodes_considered, 1);
             assert_eq!(report.nodes_reused, usize::from(warm));
+            assert_eq!(scoped_progress.first().unwrap().completed_documents, 0);
+            assert!(scoped_progress
+                .iter()
+                .all(|event| event.total_documents == total));
+            let last = scoped_progress.last().unwrap();
+            assert_eq!(last.completed_documents, 1);
+            assert_eq!(last.local_store_reuse, usize::from(warm));
+            assert_eq!(last.current_symbol.as_deref(), Some("p.person"));
             let query = VectorSearchQuery {
                 project: "p",
                 model_id: "test-code-embedder",
@@ -1679,8 +1703,10 @@ mod tests {
                 "p",
                 &mut provider,
                 EmbeddingIndexOptions::for_generation(3),
-                2,
-                &mut |_| {},
+                EmbeddingIndexProgressContext {
+                    total_documents: 2,
+                    callback: &mut |_| {},
+                },
                 &all_visible,
             )
             .unwrap();
@@ -1744,18 +1770,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cold_total, 1);
+        let mut cold_progress = Vec::new();
         let cold = index_code_embeddings_for_scope_with_progress(
             &mut store,
             &root,
             "p",
             &mut provider,
             cold_options,
-            cold_total,
-            &mut |_| {},
+            EmbeddingIndexProgressContext {
+                total_documents: cold_total,
+                callback: &mut |value| cold_progress.push(value),
+            },
             &cold_prefixes,
         )
         .unwrap();
         assert_eq!(cold.nodes_considered, 1);
+        assert_eq!(cold_progress.first().unwrap().completed_documents, 0);
+        assert!(cold_progress
+            .iter()
+            .all(|event| event.total_documents == cold_total));
+        let last = cold_progress.last().unwrap();
+        assert_eq!(last.completed_documents, 1);
+        assert_eq!(last.local_store_reuse, 0);
+        assert_eq!(last.current_symbol.as_deref(), Some("p.person"));
         assert_eq!(
             store
                 .count_vector_embeddings(
@@ -1783,14 +1820,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(total, 1, "overlapping filters must not duplicate documents");
+        let mut reused_progress = Vec::new();
         let report = index_code_embeddings_for_scope_with_progress(
             &mut store,
             &root,
             "p",
             &mut provider,
             options,
-            total,
-            &mut |_| {},
+            EmbeddingIndexProgressContext {
+                total_documents: total,
+                callback: &mut |value| reused_progress.push(value),
+            },
             &prefixes,
         )
         .unwrap();
@@ -1798,6 +1838,14 @@ mod tests {
         assert_eq!(report.nodes_considered, 1);
         assert_eq!(report.nodes_reused, 1);
         assert_eq!(report.stale_rows_pruned, 0);
+        assert_eq!(reused_progress.first().unwrap().completed_documents, 0);
+        assert!(reused_progress
+            .iter()
+            .all(|event| event.total_documents == total));
+        let last = reused_progress.last().unwrap();
+        assert_eq!(last.completed_documents, 1);
+        assert_eq!(last.local_store_reuse, 1);
+        assert_eq!(last.current_symbol.as_deref(), Some("p.person"));
         assert_eq!(
             store
                 .count_vector_embeddings(

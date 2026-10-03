@@ -132,7 +132,8 @@ pub use embedding::{
     count_embedding_candidate_nodes, embedding_path_matches, index_code_embeddings_for_project,
     index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
     CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
-    EmbeddingIndexProgress, EmbeddingIndexReport, EmbeddingProviderCacheStats,
+    EmbeddingIndexProgress, EmbeddingIndexProgressContext, EmbeddingIndexReport,
+    EmbeddingProviderCacheStats,
 };
 
 /// Fraction of the process RAM budget the indexer initialises
