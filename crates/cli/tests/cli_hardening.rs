@@ -15,6 +15,40 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[test]
+fn c11_thread_local_write_preserves_bytes_and_refuses_invalid_syntax_atomically() {
+    let (repo, store, _scratch) = make_repo("c11-thread-local", "marker");
+    let valid =
+        "#include <stdbool.h>\nstatic _Thread_local bool inside;\nint main(void){return inside;}\n";
+    let (exit, stdout, stderr) = run(&["write", "repro.c", valid], &repo, &store);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("repro.c")).unwrap(),
+        valid
+    );
+    for invalid in [
+        "#include <stdbool.h>\nstatic _Thread_local bool inside = ;\n",
+        "#include <stdbool.h>\nstatic _Thread_local bool inside;\nint main(void) { return +; }\n",
+    ] {
+        let (exit, stdout, stderr) = run(&["write", "repro.c", invalid], &repo, &store);
+        assert_eq!(exit, 13, "{stdout}\n{stderr}");
+        assert!(stderr.contains("syntax validation failed"), "{stderr}");
+        assert!(stderr.contains("repro.c:"), "{stderr}");
+        assert!(stderr.contains("nothing written"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("repro.c")).unwrap(),
+            valid
+        );
+    }
+    let (exit, stdout, stderr) = run(
+        &["write", "absent.c", "static _Thread_local int invalid = ;"],
+        &repo,
+        &store,
+    );
+    assert_eq!(exit, 13, "{stdout}\n{stderr}");
+    assert!(!repo.join("absent.c").exists());
+}
+
+#[test]
 fn json_write_accepts_positive_exponent_and_refuses_invalid_replacement_atomically() {
     let (repo, store, _scratch) = make_repo("json-exponent", "marker");
     let payload = r#"{"finite_max_error": 2.842105616405627e+18}"#;
