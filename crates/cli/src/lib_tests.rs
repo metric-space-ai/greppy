@@ -220,8 +220,10 @@ fn base_build_owner_watchdog_retries_interrupted_reads() {
 #[cfg(not(feature = "cpu-only"))]
 #[test]
 fn product_build_contains_embedding_and_summary_gpu_backends() {
-    assert!(greppy_embed_native::HAS_GPU_BACKEND);
-    assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+    const {
+        assert!(greppy_embed_native::HAS_GPU_BACKEND);
+        assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+    }
 }
 
 #[cfg(unix)]
