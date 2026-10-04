@@ -2974,7 +2974,11 @@ pub fn recover_persisted_js_ts_usages(
                 edge.line,
                 edge.source_qualified_name,
                 edge.properties
-                    .get("ref_name")
+                    .get(if edge.edge_type == "CALLS" {
+                        "callee_name"
+                    } else {
+                        "ref_name"
+                    })
                     .and_then(|value| value.as_str())
                     .unwrap_or("<unknown>")
             )));
