@@ -375,11 +375,11 @@ fn callees_factory_pattern_coverage_is_safe_and_targeted() {
         assert_eq!(code, 0, "JSON failed; {err}\n{out}");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
-            value["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hit| hit["name"] == "upsert"),
+            value["hits"].as_array().unwrap().iter().any(|hit| {
+                hit["qualified_name"]
+                    .as_str()
+                    .is_some_and(|name| name.rsplit("::").next() == Some("upsert"))
+            }),
             expected_edge
         );
         assert_eq!(
@@ -434,11 +434,11 @@ fn callees_factory_diagnostics_are_compact_and_share_a_batch_budget() {
         assert_eq!(value["unresolved_factory_omitted"], total - shown);
         assert_eq!(value["unresolved_factory_truncated"], total > shown);
         assert_eq!(value["callees_incomplete"], true);
-        assert!(value["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|hit| hit["name"] == "open"));
+        assert!(value["hits"].as_array().unwrap().iter().any(|hit| {
+            hit["qualified_name"]
+                .as_str()
+                .is_some_and(|name| name.rsplit("::").next() == Some("open"))
+        }));
         if args.contains(&"peer") {
             let peer = value["targets"]
                 .as_array()
@@ -500,6 +500,14 @@ fn callees_factory_diagnostics_respect_path_before_counts_and_paging() {
         vec![
             "callees",
             "leaf",
+            "--path",
+            "src/mid.rs",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "callees",
+            "leaf",
             "direct",
             "--path",
             "src/mid.rs",
@@ -522,11 +530,16 @@ fn callees_factory_diagnostics_respect_path_before_counts_and_paging() {
                 value.get(field).is_none(),
                 "out-of-scope accounting leaked: {out}"
             );
-            assert!(value["targets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|target| target.get(field).is_none()));
+            if args.contains(&"direct") || args.contains(&"--diagnostics") {
+                assert!(value["targets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|target| target.get(field).is_none()));
+            } else {
+                // Default compact singleton JSON carries accounting at the top level.
+                assert!(value.get("targets").is_none(), "{out}");
+            }
         }
     }
     let (code, out, err) = run(
