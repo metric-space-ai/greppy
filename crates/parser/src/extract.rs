@@ -2961,6 +2961,7 @@ fn extract_js_ts(
     let root = tree.root_node();
     let effect_import = js_ts_has_effect_import(root, source);
     extract_js_ts_variables(root, source, file_path, effect_import, &mut result);
+    let definition_identities = disambiguate_js_ts_definitions(&mut result);
 
     // CALLS — the shared spec engine hangs a call's source endpoint off the
     // nearest ancestor whose *kind* matches a callable `DefRule`. For JS/TS
@@ -2974,7 +2975,14 @@ fn extract_js_ts(
     // `method_definition` / `arrow_function` / `function_expression`, named the
     // way the def pass named it, with a `__file__` fallback at module scope.
     result.edges.retain(|e| e.edge_type != "CALLS");
-    extract_js_ts_calls(root, source, file_path, effect_import, &mut result);
+    extract_js_ts_calls(
+        root,
+        source,
+        file_path,
+        effect_import,
+        &definition_identities,
+        &mut result,
+    );
 
     // USAGE — a per-language reference pass: every bare
     // `identifier` / `type_identifier` that is NOT the callee/argument of a
@@ -2984,8 +2992,136 @@ fn extract_js_ts(
     // shared indexer resolves `ref_name` to any registered symbol and drops it
     // unless unique, so unresolved references never become edges (no
     // over-emission).
-    extract_js_ts_usages(root, source, file_path, effect_import, &mut result);
+    extract_js_ts_usages(
+        root,
+        source,
+        file_path,
+        effect_import,
+        &definition_identities,
+        &mut result,
+    );
     Ok(result)
+}
+
+type JsTsDefinitionIdentities = std::collections::BTreeMap<(String, usize), String>;
+
+#[cfg(test)]
+mod js_scoped_identity_tests {
+    use super::*;
+
+    #[test]
+    fn same_line_object_methods_keep_distinct_call_and_usage_sources() {
+        let source = b"class Marker {} function alpha() {} function beta() {} const a={finish(){alpha(); return Marker;}}; const b={finish(){beta(); return Marker;}};";
+        for language in [Language::JavaScript, Language::TypeScript { tsx: false }] {
+            let result = extract(language, source, "identity.ts").unwrap();
+            let methods: Vec<_> = result
+                .nodes
+                .iter()
+                .filter(|node| node.name == "finish")
+                .collect();
+            assert_eq!(methods.len(), 2);
+            assert_ne!(methods[0].qualified_name, methods[1].qualified_name);
+            assert!(methods
+                .iter()
+                .all(|node| node.qualified_name != "identity.ts::Function::finish"));
+            for (method, callee) in methods.iter().zip(["alpha", "beta"]) {
+                assert!(result.edges.iter().any(|edge| edge.edge_type == "CALLS"
+                    && edge.source_qualified_name == method.qualified_name
+                    && edge.properties["callee_name"] == callee));
+                assert!(result.edges.iter().any(|edge| edge.edge_type == "USAGE"
+                    && edge.source_qualified_name == method.qualified_name
+                    && edge.properties["ref_name"] == "Marker"));
+            }
+            assert!(result
+                .nodes
+                .iter()
+                .any(|node| node.qualified_name == "identity.ts::Function::alpha"));
+            let again = extract(language, source, "identity.ts").unwrap();
+            assert_eq!(
+                result
+                    .nodes
+                    .iter()
+                    .map(|node| &node.qualified_name)
+                    .collect::<Vec<_>>(),
+                again
+                    .nodes
+                    .iter()
+                    .map(|node| &node.qualified_name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_declarations_and_arrows_keep_their_own_call_sources() {
+        let source = b"function alpha() {} function beta() {} function left(){function task(){alpha();} const step=()=>alpha();} function right(){function task(){beta();} const step=()=>beta();}";
+        let result = extract(Language::JavaScript, source, "nested.js").unwrap();
+        for name in ["task", "step"] {
+            let definitions: Vec<_> = result
+                .nodes
+                .iter()
+                .filter(|node| node.name == name)
+                .collect();
+            assert_eq!(definitions.len(), 2);
+            assert_ne!(definitions[0].qualified_name, definitions[1].qualified_name);
+            for (definition, callee) in definitions.iter().zip(["alpha", "beta"]) {
+                assert!(result.edges.iter().any(|edge| edge.edge_type == "CALLS"
+                    && edge.source_qualified_name == definition.qualified_name
+                    && edge.properties["callee_name"] == callee));
+            }
+        }
+    }
+}
+
+/// Preserve each same-named definition, including same-line object methods.
+/// Every collision receives a source-generation byte anchor: leaving one flat
+/// name would let exact-target resolution choose that arbitrary winner.
+/// CALLS/USAGE source endpoints consume the same map; names stay searchable.
+fn disambiguate_js_ts_definitions(result: &mut ExtractionResult) -> JsTsDefinitionIdentities {
+    let mut groups = std::collections::BTreeMap::<String, std::collections::BTreeSet<usize>>::new();
+    for node in &result.nodes {
+        if let Some(byte) = node
+            .properties
+            .get("definition_start_byte")
+            .and_then(serde_json::Value::as_u64)
+        {
+            groups
+                .entry(node.qualified_name.clone())
+                .or_default()
+                .insert(byte as usize);
+        }
+    }
+    let mut identities = JsTsDefinitionIdentities::new();
+    for node in &mut result.nodes {
+        let Some(byte) = node
+            .properties
+            .get("definition_start_byte")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        let byte = byte as usize;
+        let old = node.qualified_name.clone();
+        if groups.get(&old).is_some_and(|spans| spans.len() > 1) {
+            let prefix = format!("{}::", node.file_path);
+            if let Some(local) = old.strip_prefix(&prefix) {
+                node.qualified_name = format!("{}::scope@{byte}::{local}", node.file_path);
+            }
+        }
+        identities.insert((old, byte), node.qualified_name.clone());
+    }
+    identities
+}
+
+fn js_ts_definition_identity(
+    identities: &JsTsDefinitionIdentities,
+    qname: String,
+    definition: Node<'_>,
+) -> String {
+    identities
+        .get(&(qname.clone(), definition.start_byte()))
+        .cloned()
+        .unwrap_or(qname)
 }
 
 /// JS/TS grammar node kinds treated as an *enclosing function*. A call's /
@@ -3123,6 +3259,7 @@ fn js_ts_enclosing_qname(
     source: &[u8],
     file_path: &str,
     effect_import: bool,
+    identities: &JsTsDefinitionIdentities,
 ) -> String {
     let file_qname = format!("{file_path}::__file__");
     let mut module_variable = None;
@@ -3136,10 +3273,11 @@ fn js_ts_enclosing_qname(
                 } else {
                     js_ts_enclosing_class_name(node_for_owner, source)
                 };
-                return match owner {
+                let qname = match owner {
                     Some(class) => format!("{file_path}::{class}::{name}"),
                     None => format!("{file_path}::Function::{name}"),
                 };
+                return js_ts_definition_identity(identities, qname, node_for_owner);
             }
             // An unnamed enclosing function (anonymous inline callback).
             // Rather than attributing the call to the file node — which would
@@ -3157,7 +3295,7 @@ fn js_ts_enclosing_qname(
                 } else {
                     "Variable"
                 };
-                format!("{file_path}::{label}::{name}")
+                js_ts_definition_identity(identities, format!("{file_path}::{label}::{name}"), cur)
             });
         }
         p = cur.parent();
@@ -3256,6 +3394,7 @@ fn extract_js_ts_calls(
     source: &[u8],
     file_path: &str,
     effect_import: bool,
+    identities: &JsTsDefinitionIdentities,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
@@ -3263,7 +3402,8 @@ fn extract_js_ts_calls(
         if JS_TS_CALL_KINDS.contains(&node.kind()) {
             if let Some(callee) = js_ts_callee_name(node, source) {
                 if !callee.is_empty() && callee != "require" {
-                    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
+                    let src =
+                        js_ts_enclosing_qname(node, source, file_path, effect_import, identities);
                     result.edges.push(ExtractedEdge {
                         edge_type: "CALLS".into(),
                         source_qualified_name: src,
@@ -3319,11 +3459,12 @@ fn extract_js_ts_usages(
     source: &[u8],
     file_path: &str,
     effect_import: bool,
+    identities: &JsTsDefinitionIdentities,
     result: &mut ExtractionResult,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        try_emit_js_ts_usage(node, source, file_path, effect_import, result);
+        try_emit_js_ts_usage(node, source, file_path, effect_import, identities, result);
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
@@ -3336,6 +3477,7 @@ fn try_emit_js_ts_usage(
     source: &[u8],
     file_path: &str,
     effect_import: bool,
+    identities: &JsTsDefinitionIdentities,
     result: &mut ExtractionResult,
 ) {
     if !matches!(node.kind(), "identifier" | "type_identifier") {
@@ -3362,7 +3504,7 @@ fn try_emit_js_ts_usage(
                     {
                         result.edges.push(ExtractedEdge {
                             edge_type: "USAGE".into(),
-                            source_qualified_name: js_ts_enclosing_qname(node, source, file_path, effect_import),
+                            source_qualified_name: js_ts_enclosing_qname(node, source, file_path, effect_import, identities),
                             target_qualified_name: format!("{file_path}::__ref__::{name}"),
                             file_path: file_path.to_owned(),
                             line: node.start_position().row as u32 + 1,
@@ -3399,7 +3541,7 @@ fn try_emit_js_ts_usage(
     if node.kind() == "identifier" && js_ts_jsx_locally_bound(node, source, name) {
         return;
     }
-    let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
+    let src = js_ts_enclosing_qname(node, source, file_path, effect_import, identities);
     result.edges.push(ExtractedEdge {
         edge_type: "USAGE".into(),
         source_qualified_name: src,
@@ -3793,7 +3935,7 @@ fn emit_js_ts_enum_members(
             file_path: file_path.to_string(),
             start_line: member.start_position().row as u32 + 1,
             end_line: member.end_position().row as u32 + 1,
-            properties: serde_json::json!({}),
+            properties: serde_json::json!({"definition_start_byte": member.start_byte()}),
         });
     }
 }
@@ -3823,7 +3965,7 @@ fn push_js_ts_variable(
         file_path: file_path.to_string(),
         start_line: decl.start_position().row as u32 + 1,
         end_line: decl.end_position().row as u32 + 1,
-        properties: serde_json::json!({}),
+        properties: serde_json::json!({"definition_start_byte": decl.start_byte()}),
     });
 }
 

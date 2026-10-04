@@ -556,7 +556,15 @@ pub fn spec_extract(
     let mut result = ExtractionResult::default();
     let file_qname = format!("{file_path}::__file__");
 
-    spec_definitions(spec, queries, root, source, file_path, &mut result);
+    spec_definitions(
+        language,
+        spec,
+        queries,
+        root,
+        source,
+        file_path,
+        &mut result,
+    );
     spec_calls(spec, queries, root, source, file_path, &mut result);
     spec_imports(
         spec,
@@ -615,6 +623,7 @@ fn def_label_and_qname(
 }
 
 fn spec_definitions(
+    language: Language,
     spec: &LangSpec,
     queries: &[CompiledQuery],
     root: Node<'_>,
@@ -678,6 +687,9 @@ fn spec_definitions(
                     def_label_and_qname(spec, &rule, source, def_node, &name, file_path);
 
                 let mut properties = serde_json::Map::new();
+                if matches!(language, Language::JavaScript | Language::TypeScript { .. }) {
+                    properties.insert("definition_start_byte".into(), def_node.start_byte().into());
+                }
                 if let Some(doc) = extract_doc(spec.docs, source, def_node) {
                     let summary = docstring_summary(&doc).to_string();
                     properties.insert("doc".into(), serde_json::Value::String(summary));
