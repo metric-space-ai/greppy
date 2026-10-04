@@ -1071,7 +1071,8 @@ fn print_search_pattern_rows(
         *per_file.entry(&row.hit.file).or_insert(0) += 1;
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
-    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
+    let default_shown =
+        cli_result_limit_raw().unwrap_or(if summarize { SUMMARY_ROWS } else { rows.len() });
     let offset = cli_result_offset();
     let start = offset.min(rows.len());
     let shown = default_shown
