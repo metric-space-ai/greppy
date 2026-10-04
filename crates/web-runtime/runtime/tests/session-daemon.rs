@@ -1175,8 +1175,15 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     path if path.ends_with(".png") => ("image/png", Vec::new()),
                     _ => ("text/plain", b"not found".to_vec()),
                 };
+                // These navigation controls count document requests. A fresh document
+                // may otherwise reuse cached bytes without contacting this fixture.
+                let cache_control = if path == "/landed" || path.starts_with("/landed?") {
+                    "Cache-Control: no-store\r\n"
+                } else {
+                    ""
+                };
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{cache_control}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 if let Err(error) = stream.write_all(header.as_bytes()) {
