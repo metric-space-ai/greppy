@@ -2501,9 +2501,11 @@ fn range_callback(value: i32) { if let 1..=LIMIT = value {} }
         for caller in ["::conditional_callback", "::constructor_callback"] {
             let references = references(caller);
             assert_eq!(references.len(), 2, "{caller}: {references:?}");
-            assert!(references
-                .iter()
-                .all(|edge| edge.properties["ref_local_binding"] == true));
+            assert!(
+                references
+                    .iter()
+                    .all(|edge| edge.properties["ref_local_binding"] == true)
+            );
         }
         let constructor = extracted
             .edges
@@ -2945,7 +2947,7 @@ fn extract_js_ts(
             return Err(greppy_core::Error::Parse(format!(
                 "extract_js_ts called with non-JS/TS language: {}",
                 other.name()
-            )))
+            )));
         }
     };
     // The shared spec engine covers Function / Class / Method / Interface /
@@ -4442,6 +4444,46 @@ fn collect_python_import_modules(
 /// Rust macro arguments are token trees, not call expressions. Reparse the
 /// expression-list macros whose arguments preserve Rust expression syntax;
 /// never infer calls from arbitrary DSL tokens or string contents.
+fn rust_expression_macro_shadowed_bindings(
+    source: &[u8],
+    root: Node<'_>,
+    macros: &[&str],
+    conservative_globs: bool,
+) -> std::collections::HashSet<String> {
+    let mut shadowed = std::collections::HashSet::new();
+    let mut scan = vec![root];
+    while let Some(node) = scan.pop() {
+        if matches!(node.kind(), "macro_definition" | "mod_item") {
+            if let Some(name) = node.child_by_field_name("name") {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                for import in expand_use_tree(source, argument, "") {
+                    let known = import.path == "anyhow::ensure"
+                        || import
+                            .path
+                            .strip_prefix("std::")
+                            .is_some_and(|n| macros.contains(&n))
+                        || import
+                            .path
+                            .strip_prefix("core::")
+                            .is_some_and(|n| macros.contains(&n));
+                    if import.is_glob && conservative_globs {
+                        shadowed.extend(macros.iter().map(|name| (*name).to_string()));
+                    }
+                    if !import.is_glob && !known {
+                        shadowed.insert(import.imported_name);
+                    }
+                }
+            }
+        }
+        scan.extend(node.named_children(&mut node.walk()));
+    }
+    shadowed
+}
+
 fn rust_expression_macro_calls(
     source: &[u8],
     root: Node<'_>,
@@ -4467,37 +4509,8 @@ fn rust_expression_macro_calls(
     ];
     let queries = crate::query::cached_query_set(&Language::Rust)
         .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
-    // Local definitions and explicit imports override familiar macro names.
-    // A qualified custom macro is never admitted just because its suffix matches.
-    let mut shadowed = std::collections::HashSet::new();
-    let mut scan = vec![root];
-    while let Some(node) = scan.pop() {
-        if matches!(node.kind(), "macro_definition" | "mod_item") {
-            if let Some(name) = node.child_by_field_name("name") {
-                shadowed.insert(node_text(source, name).to_string());
-            }
-        }
-        if node.kind() == "use_declaration" {
-            if let Some(argument) = node.child_by_field_name("argument") {
-                for import in expand_use_tree(source, argument, "") {
-                    let known = import.path == "anyhow::ensure"
-                        || import
-                            .path
-                            .strip_prefix("std::")
-                            .is_some_and(|n| MACROS.contains(&n))
-                        || import
-                            .path
-                            .strip_prefix("core::")
-                            .is_some_and(|n| MACROS.contains(&n));
-                    if !import.is_glob && !known {
-                        shadowed.insert(import.imported_name);
-                    }
-                }
-            }
-        }
-        scan.extend(node.named_children(&mut node.walk()));
-    }
-    let admitted = |path: &str| {
+    let shadowed = rust_expression_macro_shadowed_bindings(source, root, MACROS, false);
+    let admitted = |path: &str, shadowed: &std::collections::HashSet<String>| {
         if let Some((owner, name)) = path.rsplit_once("::") {
             !shadowed.contains(owner)
                 && ((owner == "anyhow" && name == "ensure")
@@ -4517,7 +4530,7 @@ fn rust_expression_macro_calls(
                 enclosing_function_qname(source, node, file_path),
             ) {
                 let name = node_text(source, name);
-                if admitted(name) && tokens.end_byte() > tokens.start_byte() + 1 {
+                if admitted(name, &shadowed) && tokens.end_byte() > tokens.start_byte() + 1 {
                     pending.push((
                         source[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
                         tokens.start_position().row,
@@ -4527,6 +4540,7 @@ fn rust_expression_macro_calls(
                         node,
                         std::collections::HashSet::<String>::new(),
                         std::collections::HashSet::<String>::new(),
+                        shadowed.clone(),
                     ));
                 }
             }
@@ -4535,8 +4549,17 @@ fn rust_expression_macro_calls(
     }
     let mut edges = Vec::new();
     let mut budget = source.len().saturating_mul(16);
-    while let Some((body, row, caller, macro_name, depth, context, visible_values, visible_types)) =
-        pending.pop()
+    while let Some((
+        body,
+        row,
+        caller,
+        macro_name,
+        depth,
+        context,
+        visible_values,
+        visible_types,
+        mut macro_bindings,
+    )) = pending.pop()
     {
         if depth >= 16 || body.len() > budget {
             return Err(greppy_core::Error::Parse(
@@ -4609,6 +4632,15 @@ fn rust_expression_macro_calls(
                 }
             }
         }
+        // Local macro bindings introduced in this token tree must survive its
+        // destruction before a queued child is reparsed. Unknown glob imports
+        // cannot establish a standard macro identity.
+        macro_bindings.extend(rust_expression_macro_shadowed_bindings(
+            &wrapped,
+            tree.root_node(),
+            MACROS,
+            true,
+        ));
         // A nested expression macro remains a token tree after the first parse.
         let mut nested = vec![tree.root_node()];
         while let Some(node) = nested.pop() {
@@ -4622,7 +4654,9 @@ fn rust_expression_macro_calls(
                         .find(|n| n.kind() == "token_tree"),
                 ) {
                     let name = node_text(&wrapped, name);
-                    if admitted(name) && tokens.end_byte() > tokens.start_byte() + 1 {
+                    if admitted(name, &macro_bindings)
+                        && tokens.end_byte() > tokens.start_byte() + 1
+                    {
                         // A queued child loses this parse tree. Preserve only
                         // bindings that are visible at the nested macro site,
                         // using candidate names from its token tree.
@@ -4653,6 +4687,7 @@ fn rust_expression_macro_calls(
                             context,
                             values,
                             types,
+                            macro_bindings.clone(),
                         ));
                     }
                 }
@@ -7042,7 +7077,7 @@ fn extract_c_cpp(
             return Err(greppy_core::Error::Parse(format!(
                 "extract_c_cpp called with non-C/C++ language: {}",
                 other.name()
-            )))
+            )));
         }
     };
     let mut result = crate::spec::spec_extract(language, spec, queries, source, file_path)?;
@@ -15814,11 +15849,7 @@ fn extract_fortran(
 fn fortran_call_callee<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> {
     let name = find_child_of_kind(call, "identifier")?;
     let text = node_text(source, name);
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// CALLS pass for Fortran (call kinds =
@@ -17950,30 +17981,60 @@ fn caller() {
 }
 "#;
         let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-        assert!(!result
-            .edges
-            .iter()
-            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
-        assert!(result
-            .edges
-            .iter()
-            .any(|e| e.properties["callee_path"] == "T::run"
-                && e.properties["rust_local_type_owner"] == true));
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback")
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|e| e.properties["callee_path"] == "T::run"
+                    && e.properties["rust_local_type_owner"] == true)
+        );
+    }
+
+    #[test]
+    fn rust_expression_macros_preserve_nested_macro_binding_identity() {
+        for body in [
+            "macro_rules! ensure { ($($tokens:tt)*) => {} } ensure!(decoy());",
+            "use custom::ensure; ensure!(decoy());",
+            "use custom::dsl as ensure; assert!({ ensure!(decoy()); true });",
+            "use custom::*; ensure!(decoy());",
+        ] {
+            let source = format!(
+                "use anyhow::ensure; fn decoy() -> bool {{ true }} fn caller() {{ assert!({{ {body} true }}); }}"
+            );
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "nested custom macro invented a call: {source}"
+            );
+        }
     }
 
     #[test]
     fn rust_expression_macros_keep_original_generic_and_local_callee_scope() {
         let source = "fn caller<T>(callback: fn()) { assert!(T::run()); assert!(callback()); }";
         let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-        assert!(result
-            .edges
-            .iter()
-            .any(|e| e.properties["callee_path"] == "T::run"
-                && e.properties["rust_local_type_owner"] == true));
-        assert!(!result
-            .edges
-            .iter()
-            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|e| e.properties["callee_path"] == "T::run"
+                    && e.properties["rust_local_type_owner"] == true)
+        );
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback")
+        );
     }
 
     #[test]
@@ -18006,12 +18067,16 @@ fn caller() {
             .iter()
             .filter(|e| e.edge_type == "CALLS")
             .collect();
-        assert!(calls
-            .iter()
-            .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2));
-        assert!(calls
-            .iter()
-            .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3));
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2)
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3)
+        );
     }
 
     #[test]
@@ -18092,30 +18157,83 @@ fn caller() {
     #[test]
     fn rust_slice_iterator_receiver_requires_transparent_typed_binding() {
         let cases = [
-            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }", false),
-            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }", false),
-            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
-            ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
+            (
+                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }",
+                false,
+            ),
+            (
+                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }",
+                false,
+            ),
+            (
+                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }",
+                false,
+            ),
+            (
+                "struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }",
+                false,
+            ),
             ("fn f(items: &[i32]) { items.iter().next(); }", true),
             ("fn f(items: &[i32; 2]) { items.iter().next(); }", false),
-
             ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
-            ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
-            ("fn f(items: &[i32]) { let items = custom(); items.iter().next(); }", false),
-            ("fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }", false),
-            ("fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }", false),
-            ("fn f(items: &[i32]) { let f = |items| items.iter().next(); }", false),
-            ("fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }", false),
-            ("fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }", false),
+            (
+                "fn f() { let items: &[i32] = &[]; items.iter().next(); }",
+                true,
+            ),
+            (
+                "fn f(items: &[i32]) { let items = custom(); items.iter().next(); }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { let f = |items| items.iter().next(); }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }",
+                false,
+            ),
             ("fn f(items: Custom) { items.iter().next(); }", false),
-            ("type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }", false),
+            (
+                "type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }",
+                false,
+            ),
             ("fn f() { let items = &[1,2]; items.iter().next(); }", false),
-            ("fn f(items: &[i32]) { items.iter().map(custom).next(); }", false),
-            ("fn f(items: &mut [i32]) { items.iter_mut().next(); }", false),
-            ("use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }", false),
-            ("trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }", false),
-            ("fn f(items: &[i32]) { inject!(); items.iter().next(); }", false),
-            ("#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }", false),
+            (
+                "fn f(items: &[i32]) { items.iter().map(custom).next(); }",
+                false,
+            ),
+            (
+                "fn f(items: &mut [i32]) { items.iter_mut().next(); }",
+                false,
+            ),
+            (
+                "use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }",
+                false,
+            ),
+            (
+                "trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }",
+                false,
+            ),
+            (
+                "fn f(items: &[i32]) { inject!(); items.iter().next(); }",
+                false,
+            ),
+            (
+                "#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }",
+                false,
+            ),
         ];
         for (source, proven) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
@@ -18201,31 +18319,60 @@ fn f(manifest: Manifest) {
                     format!("field.uniform(); {declaration}")
                 };
                 for source in [
-                    format!("fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"),
-                    format!("fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                    format!(
+                        "fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"
+                    ),
+                    format!(
+                        "fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"
+                    ),
                 ] {
                     let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-                    let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
-                        && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+                    let call = result
+                        .edges
+                        .iter()
+                        .find(|edge| {
+                            edge.edge_type == "CALLS"
+                                && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                                    == Some("uniform")
+                        })
+                        .unwrap();
                     assert!(call.properties.get("receiver_owner").is_none(), "{source}");
-                    assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
+                    assert!(
+                        call.properties.get("receiver_provenance").is_none(),
+                        "{source}"
+                    );
                 }
             }
         }
         for (opaque, provenance) in [
             ("use custom::*;", Some("custom")),
-            ("trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }", None),
-            ("inject_some_and_adapter!();", Some("inject_some_and_adapter")),
+            (
+                "trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }",
+                None,
+            ),
+            (
+                "inject_some_and_adapter!();",
+                Some("inject_some_and_adapter"),
+            ),
             ("helper::assert!();", Some("helper::assert")),
             ("#[custom::allow]", Some("custom::allow")),
             ("macro_rules! println { () => {}; }", Some("println")),
             ("#[unknown_attribute]", Some("unknown_attribute")),
             ("use custom::Some;", None),
         ] {
-            let source = format!("{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}");
+            let source = format!(
+                "{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}"
+            );
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
-                && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
+            let call = result
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str())
+                            == Some("uniform")
+                })
+                .unwrap();
             let fact = call.properties.get("receiver_provenance");
             assert_eq!(fact.is_some(), provenance.is_some(), "{source}");
             if let Some(marker) = provenance {
@@ -18238,16 +18385,46 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_option_field_patterns_preserve_only_explicit_provenance() {
         let cases = [
-            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("wasm_bindgen::prelude")),
-            ("use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("crate::scene::Manifest")),
-            ("#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { println!(\"load\"); field.uniform(); } }", Some("")),
-            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("")),
-            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", None),
-            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
-            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            (
+                "use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
+                Some("wasm_bindgen::prelude"),
+            ),
+            (
+                "use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
+                Some("crate::scene::Manifest"),
+            ),
+            (
+                "#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { println!(\"load\"); field.uniform(); } }",
+                Some(""),
+            ),
+            (
+                "fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
+                Some(""),
+            ),
+            (
+                "fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }",
+                None,
+            ),
+            (
+                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }",
+                None,
+            ),
+            (
+                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
         ];
         for (source, marker) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/gpu.rs").unwrap();
@@ -18306,22 +18483,96 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_factory_option_patterns_use_explicit_signatures_without_guessing_wrappers() {
         for (signature, extra, body, expected, diagnostic) in [
-            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", Some("Writer"), false),
-            ("Result<Option<Self>, ()>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
-            ("FactoryResult<Option<Self>>", "type FactoryResult<T> = Result<T, ()>;", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
-            ("anyhow::Result<Option<Self>>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
-            ("Option<Other>", "struct Other;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
-            ("Option<Self>", "use custom::Some;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
-            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }", None, false),
-            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }", None, false),
-            ("Option<Self>", "enum Option<T> { Some(T), None }", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
-            ("Result<Option<Self>, ()>", "enum Result<T,E> { Ok(T), Err(E) }", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+            (
+                "Option<Self>",
+                "",
+                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
+                Some("Writer"),
+                false,
+            ),
+            (
+                "Result<Option<Self>, ()>",
+                "",
+                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
+                Some("Writer"),
+                false,
+            ),
+            (
+                "FactoryResult<Option<Self>>",
+                "type FactoryResult<T> = Result<T, ()>;",
+                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
+                Some("Writer"),
+                false,
+            ),
+            (
+                "anyhow::Result<Option<Self>>",
+                "",
+                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
+                None,
+                true,
+            ),
+            (
+                "Option<Other>",
+                "struct Other;",
+                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
+                None,
+                true,
+            ),
+            (
+                "Option<Self>",
+                "use custom::Some;",
+                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
+                None,
+                true,
+            ),
+            (
+                "Option<Self>",
+                "",
+                "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }",
+                None,
+                false,
+            ),
+            (
+                "Option<Self>",
+                "",
+                "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }",
+                None,
+                false,
+            ),
+            (
+                "Option<Self>",
+                "enum Option<T> { Some(T), None }",
+                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
+                None,
+                true,
+            ),
+            (
+                "Result<Option<Self>, ()>",
+                "enum Result<T,E> { Ok(T), Err(E) }",
+                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
+                None,
+                true,
+            ),
         ] {
-            let source = format!("{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}");
+            let source = format!(
+                "{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}"
+            );
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
-            assert_eq!(call.properties["receiver_owner"].as_str(), expected, "{source}");
-            assert_eq!(call.properties.get("receiver_factory_pattern").is_some(), diagnostic, "{source}");
+            let call = result
+                .edges
+                .iter()
+                .find(|edge| edge.properties["callee_name"] == "upsert")
+                .unwrap();
+            assert_eq!(
+                call.properties["receiver_owner"].as_str(),
+                expected,
+                "{source}"
+            );
+            assert_eq!(
+                call.properties.get("receiver_factory_pattern").is_some(),
+                diagnostic,
+                "{source}"
+            );
         }
     }
 
@@ -18360,15 +18611,19 @@ fn f(manifest: Manifest) {
             );
         }
         let shadow = source.replace("writer.upsert();", "let writer = unknown; writer.upsert();");
-        assert!(extract_calls(&shadow)[0]
-            .properties
-            .get("receiver_anyhow_factory_owner")
-            .is_none());
+        assert!(
+            extract_calls(&shadow)[0]
+                .properties
+                .get("receiver_anyhow_factory_owner")
+                .is_none()
+        );
         let wrapper = source.replace("anyhow::Result", "external::Result");
-        assert!(extract_calls(&wrapper)[0]
-            .properties
-            .get("receiver_anyhow_factory_owner")
-            .is_none());
+        assert!(
+            extract_calls(&wrapper)[0]
+                .properties
+                .get("receiver_anyhow_factory_owner")
+                .is_none()
+        );
     }
 
     #[test]
@@ -18380,10 +18635,17 @@ fn f(manifest: Manifest) {
             "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { let f = |writer| writer.upsert(); } }",
         ] {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            let call = result
+                .edges
+                .iter()
+                .find(|edge| edge.properties["callee_name"] == "upsert")
+                .unwrap();
             assert!(call.properties.get("receiver_owner").is_none(), "{source}");
             if source.contains("|writer|") {
-                assert!(call.properties.get("receiver_factory_pattern").is_none(), "{source}");
+                assert!(
+                    call.properties.get("receiver_factory_pattern").is_none(),
+                    "{source}"
+                );
             }
         }
     }
@@ -18391,21 +18653,66 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_option_patterns_require_explicit_unshadowed_type_evidence() {
         let cases = [
-            ("fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
-            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("crate::lighting::Field")),
-            ("fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }", Some("Field")),
-            ("fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
-            ("fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
-            ("fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }", None),
-            ("fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }", None),
-            ("fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", None),
-            ("enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
-            ("use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
-            ("struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
-            ("fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }", Some("Wrong")),
+            (
+                "fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
+                Some("Field"),
+            ),
+            (
+                "fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }",
+                Some("crate::lighting::Field"),
+            ),
+            (
+                "fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }",
+                Some("Field"),
+            ),
+            (
+                "fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }",
+                Some("Field"),
+            ),
+            (
+                "fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }",
+                None,
+            ),
+            (
+                "fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }",
+                None,
+            ),
+            (
+                "fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }",
+                None,
+            ),
+            (
+                "fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
+                None,
+            ),
+            (
+                "enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
+                None,
+            ),
+            (
+                "fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }",
+                Some("Wrong"),
+            ),
         ];
         for (source, expected) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
@@ -18637,9 +18944,11 @@ fn shadowed<Response>() { parse::<Response>(); }
                 assert_eq!(edge.properties["ref_path"], "crate::Response");
             }
         }
-        assert!(!usages
-            .iter()
-            .any(|edge| edge.properties["ref_name"] == "parse"));
+        assert!(
+            !usages
+                .iter()
+                .any(|edge| edge.properties["ref_name"] == "parse")
+        );
         assert_eq!(
             result
                 .edges
@@ -19466,12 +19775,14 @@ fn plain() {}
                 .and_then(|value| value.as_str()),
             Some("pub fn rename_by_rules(&mut self, rules: RenameAllRules)")
         );
-        assert!(!node
-            .properties
-            .get("source_signature")
-            .and_then(|value| value.as_str())
-            .unwrap()
-            .contains("-> ()"));
+        assert!(
+            !node
+                .properties
+                .get("source_signature")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .contains("-> ()")
+        );
     }
 
     #[test]
@@ -20472,11 +20783,12 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "import { type Effect } from 'effect';",
             "import { Effect } from 'effect'; function shadow() { const { Effect } = local; }",
             "import { Effect } from 'effect'; function shadow() { const { local: Effect } = local; }",
-
             "import { Effect } from 'effect'; function unrelated(Effect: unknown) {}",
             "import { Effect } from 'elsewhere';",
         ] {
-            let source = format!("{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}");
+            let source = format!(
+                "{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}"
+            );
             let result = ts(&source, "shadow.ts");
             assert!(
                 result
@@ -20485,10 +20797,12 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
                     .any(|node| node.name == "value" && node.label == "Variable"),
                 "unproven or shadowed factory must remain a Variable: {prefix}"
             );
-            assert!(!result
-                .nodes
-                .iter()
-                .any(|node| node.name == "value" && node.label == "Function"));
+            assert!(
+                !result
+                    .nodes
+                    .iter()
+                    .any(|node| node.name == "value" && node.label == "Function")
+            );
         }
     }
 
@@ -20627,14 +20941,18 @@ export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
             2,
             "opening and self-closing tags count once: {usages:?}"
         );
-        assert!(usages
-            .iter()
-            .all(|edge| edge.properties["ref_name"] == "Boundary"
-                && edge.source_qualified_name == "view.tsx::Function::Render"));
-        assert!(!result
-            .edges
-            .iter()
-            .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
+        assert!(
+            usages
+                .iter()
+                .all(|edge| edge.properties["ref_name"] == "Boundary"
+                    && edge.source_qualified_name == "view.tsx::Function::Render")
+        );
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI")
+        );
     }
 
     #[test]
@@ -22802,20 +23120,23 @@ contract C is IThing {
         assert!(has("Enum", "State"));
         // struct member → Field only (no Variable twin).
         assert!(has("Field", "amount"));
-        assert!(!r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Variable" && n.name == "amount"));
+        assert!(
+            !r.nodes
+                .iter()
+                .any(|n| n.label == "Variable" && n.name == "amount")
+        );
         // contract state variable → Field + Variable twin.
         assert!(has("Field", "total"));
         assert!(has("Variable", "total"));
         // owned function/modifier → Method + Function twin + DEFINES_METHOD.
         assert!(has("Method", "go") && has("Function", "go"));
         assert!(has("Method", "guard") && has("Function", "guard"));
-        assert!(r
-            .edges
-            .iter()
-            .any(|e| e.edge_type == "DEFINES_METHOD" && e.target_qualified_name == "a.sol::C::go"));
+        assert!(
+            r.edges
+                .iter()
+                .any(|e| e.edge_type == "DEFINES_METHOD"
+                    && e.target_qualified_name == "a.sol::C::go")
+        );
     }
 
     #[test]
@@ -22830,14 +23151,16 @@ function freeHelper(uint256 x) pure returns (uint256) { return x; }
         let r = solidity(src, "a.sol");
         // Free (top-level) function → exactly one Function node, no Method twin.
         assert_eq!(r.nodes.iter().filter(|n| n.name == "freeHelper").count(), 1);
-        assert!(r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Function" && n.name == "freeHelper"));
-        assert!(!r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Method" && n.name == "freeHelper"));
+        assert!(
+            r.nodes
+                .iter()
+                .any(|n| n.label == "Function" && n.name == "freeHelper")
+        );
+        assert!(
+            !r.nodes
+                .iter()
+                .any(|n| n.label == "Method" && n.name == "freeHelper")
+        );
         // Same-file CALLS: `a` calls `b`; source is the enclosing Method qname.
         assert!(r.edges.iter().any(|e| e.edge_type == "CALLS"
             && e.source_qualified_name == "a.sol::C::a"
@@ -22922,10 +23245,11 @@ double helper(double v) { return v; }
         assert!(!r.nodes.iter().any(|n| n.name == "helper"));
         assert!(!r.nodes.iter().any(|n| n.label == "Function"));
         // no Field/Variable nodes for objc properties/ivars.
-        assert!(!r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Field" || n.label == "Variable"));
+        assert!(
+            !r.nodes
+                .iter()
+                .any(|n| n.label == "Field" || n.label == "Variable")
+        );
         // DEFINES_METHOD from the Class node to each owned method.
         assert!(r.edges.iter().any(|e| e.edge_type == "DEFINES_METHOD"
             && e.source_qualified_name == "Shape.m::Class::Shape"
@@ -22963,12 +23287,14 @@ double helper(double v) { return v; }
     fn extract_ok_for_batch_onboarded_extensions() {
         assert!(extract(Language::Lua, b"function f() end", "a.lua").is_ok());
         assert!(extract(Language::Kotlin, b"fun f() {}", "a.kt").is_ok());
-        assert!(extract(
-            Language::Scala,
-            b"object O { def f(): Unit = {} }",
-            "a.scala"
-        )
-        .is_ok());
+        assert!(
+            extract(
+                Language::Scala,
+                b"object O { def f(): Unit = {} }",
+                "a.scala"
+            )
+            .is_ok()
+        );
         assert!(extract(Language::Swift, b"func f() {}", "a.swift").is_ok());
         assert!(extract(Language::Zig, b"fn f() void {}", "a.zig").is_ok());
         assert!(extract(Language::R, b"f <- function() { 1 }", "a.r").is_ok());
@@ -23033,10 +23359,11 @@ helper n = doubled
         // into a function body).
         assert_eq!(names_of("Function"), vec!["area", "describe", "helper"]);
         // Class node qname uses the free `{file}::Class::{name}` scheme.
-        assert!(r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Class" && n.qualified_name == "M.hs::Class::Shape"));
+        assert!(
+            r.nodes
+                .iter()
+                .any(|n| n.label == "Class" && n.qualified_name == "M.hs::Class::Shape")
+        );
     }
 
     #[test]
@@ -23757,10 +24084,11 @@ end
                     == Some("ocaml_compilation_unit")
         }));
         assert!(!r.nodes.iter().any(|n| n.name == "Fib"));
-        assert!(r
-            .nodes
-            .iter()
-            .any(|n| n.label == "Type" && n.name == "widget"));
+        assert!(
+            r.nodes
+                .iter()
+                .any(|n| n.label == "Type" && n.name == "widget")
+        );
         assert!(r.edges.iter().any(|edge| {
             edge.edge_type == "IMPORTS"
                 && edge
@@ -24661,10 +24989,11 @@ scale <- function(x) {
             "k.py",
         );
         assert!(r.nodes.iter().any(|n| n.qualified_name == "k.py::K::m"));
-        assert!(r
-            .nodes
-            .iter()
-            .any(|n| n.qualified_name == "k.py::Function::g"));
+        assert!(
+            r.nodes
+                .iter()
+                .any(|n| n.qualified_name == "k.py::Function::g")
+        );
 
         // Go: receiver-owned method qname (the nuance the generic spec must
         // express via Owner::GoReceiver).
