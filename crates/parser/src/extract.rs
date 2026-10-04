@@ -1404,6 +1404,50 @@ fn field_option_payload_is_generic(source: &[u8], field_name: Node<'_>, declared
 /// inherent as_ref adapter. A named import is not proof; the indexer accepts
 /// it only when the imported item cannot override Option::as_ref. Wildcard
 /// scopes, item macros and unknown attributes remain unresolved candidates.
+fn rust_direct_self_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
+    let method = callee.parent()?;
+    let access = method.child_by_field_name("value")?;
+    if access.kind() != "field_expression" {
+        return None;
+    }
+    let base = access.child_by_field_name("value")?;
+    let field = access.child_by_field_name("field")?;
+    if node_text(source, base) != "self" || field.kind() != "field_identifier" {
+        return None;
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "closure_expression" || node.kind() == "trait_item" {
+            return None;
+        }
+        if node.kind() == "function_item" {
+            let parameters = node.child_by_field_name("parameters")?;
+            if !(0..parameters.named_child_count())
+                .filter_map(|i| parameters.named_child(i))
+                .any(|parameter| parameter.kind() == "self_parameter")
+            {
+                return None;
+            }
+        }
+        if node.kind() == "impl_item" {
+            if node.child_by_field_name("trait").is_some()
+                || node.child_by_field_name("type_parameters").is_some()
+            {
+                return None;
+            }
+            let ty = node.child_by_field_name("type")?;
+            if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+                return None;
+            }
+            return Some(
+                serde_json::json!({"kind":"direct_self_field", "base_type":node_text(source, ty), "field":node_text(source, field)}),
+            );
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 fn rust_option_field_receiver(source: &[u8], callee: Node<'_>) -> Option<serde_json::Value> {
     fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
         (pattern.kind() == "identifier" && node_text(source, pattern) == name)
@@ -4829,7 +4873,10 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                     .and_then(|_| rust_anyhow_factory_scope_globs(source, node));
                 let anyhow_factory_owner = anyhow_factory_owner.filter(|_| anyhow_globs.is_some());
                 let receiver_provenance = (callee_form == "receiver" && receiver_owner.is_none())
-                    .then(|| rust_option_field_receiver(source, node))
+                    .then(|| {
+                        rust_direct_self_field_receiver(source, node)
+                            .or_else(|| rust_option_field_receiver(source, node))
+                    })
                     .flatten();
                 // The scoped path a direct call names (`store::f` for
                 // `store::f()`), so the indexer can honour an explicit module

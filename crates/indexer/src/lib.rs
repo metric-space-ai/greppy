@@ -573,7 +573,9 @@ pub fn index_with_options_and_progress(
 
     if !store.is_overlay() {
         if incremental
-            && (!rust_caller_edges_repaired(store)? || !anyhow_factory_edges_repaired(store)?)
+            && (!rust_caller_edges_repaired(store)?
+                || !anyhow_factory_edges_repaired(store)?
+                || !direct_self_field_edges_repaired(store)?)
         {
             report.edges_extracted += rebuild_single_store_rust_edges(store, project_name)?;
         }
@@ -2000,6 +2002,7 @@ fn resolve_edges_with_replacement(
         )?;
     }
     store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![anyhow_factory_repair_key(project),index.anyhow_dependency_binding]).map_err(sqlite_err)?;
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.{project}")]).map_err(sqlite_err)?;
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
 }
@@ -2418,6 +2421,36 @@ pub fn anyhow_factory_edges_repaired(store: &Store) -> Result<bool> {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value=?2)",
                 rusqlite::params![anyhow_factory_repair_key(&project), expected],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if !present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const DIRECT_SELF_FIELD_REPAIR_KEY: &str = "greppy.rust_direct_self_field_repair.v1";
+
+pub fn direct_self_field_edges_repaired(store: &Store) -> Result<bool> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT name FROM projects")
+        .map_err(sqlite_err)?;
+    let projects = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_err)?;
+    for project in projects {
+        let key = format!(
+            "{DIRECT_SELF_FIELD_REPAIR_KEY}.{}",
+            project.map_err(sqlite_err)?
+        );
+        let present: bool = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value='complete')",
+                [key],
                 |row| row.get(0),
             )
             .map_err(sqlite_err)?;
@@ -4004,6 +4037,7 @@ struct GraphIndex {
     anyhow_factory_files: std::collections::HashSet<String>,
     anyhow_dependency_binding: String,
     anyhow_glob_proofs: std::collections::HashSet<String>,
+    direct_field_trait_owners: std::collections::HashSet<String>,
     rust_libraries: Vec<RustPackage>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
@@ -4809,6 +4843,14 @@ impl GraphIndex {
                 }
             }
         }
+        let direct_field_trait_owners = {
+            let mut stmt = store.conn().prepare("SELECT DISTINCT json_extract(properties,'$.type_name') FROM raw_edges WHERE project=?1 AND edge_type='IMPLEMENTS' AND json_type(properties,'$.type_name')='text'").map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![project], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?;
+            rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+                .map_err(sqlite_err)?
+        };
         Ok(GraphIndex {
             by_qname,
             by_id,
@@ -4823,6 +4865,7 @@ impl GraphIndex {
             anyhow_factory_files,
             anyhow_dependency_binding,
             anyhow_glob_proofs,
+            direct_field_trait_owners,
             rust_libraries,
             id_to_file,
             id_to_qname,
@@ -5311,6 +5354,9 @@ impl GraphIndex {
             == Some("receiver")
         {
             if let Some(fact) = edge.properties.get("receiver_provenance") {
+                if fact.get("kind").and_then(|value| value.as_str()) == Some("direct_self_field") {
+                    return self.resolve_direct_self_field_receiver(src_id, fact, name);
+                }
                 return self.resolve_option_field_receiver(src_id, edge, fact, name);
             }
             let owner = edge
@@ -5559,6 +5605,41 @@ impl GraphIndex {
             [id] => Some(*id),
             _ => None,
         }
+    }
+
+    fn resolve_direct_self_field_receiver(
+        &self,
+        src_id: i64,
+        fact: &serde_json::Value,
+        name: &str,
+    ) -> Option<i64> {
+        let file = self.file_of(src_id)?;
+        let base = self.resolve_rust_type_path(file, fact.get("base_type")?.as_str()?)?;
+        let owner = self.qname_for_id(base)?;
+        let field = self.by_qname(&format!("{owner}::{}", fact.get("field")?.as_str()?))?;
+        if field.label != "Field" {
+            return None;
+        }
+        let declared = field.declared_type.as_deref()?.trim();
+        // No wrapper, reference, generic substitution or opaque inference.
+        if declared.is_empty()
+            || declared.split("::").any(|segment| {
+                segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            })
+        {
+            return None;
+        }
+        let payload = self.resolve_rust_type_path(&field.file_path, declared)?;
+        let payload_file = self.file_of(payload)?;
+        let payload_name = self.qname_for_id(payload)?.rsplit("::").next()?;
+        // Method nodes do not distinguish inherent and trait implementations.
+        // Conservatively refuse represented trait owners rather than assigning
+        // a trait method by its coincidentally matching qname.
+        if self.direct_field_trait_owners.contains(payload_name) {
+            return None;
+        }
+        let method = self.by_qname(&format!("{payload_file}::{payload_name}::{name}"))?;
+        (method.label == "Method").then_some(method.id)
     }
 
     fn resolve_option_field_receiver(
@@ -11327,6 +11408,162 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             large < small * 5,
             "4x receiver calls/graph grew from {small} to {large} work; global scans grow quadratically"
         );
+    }
+
+    #[test]
+    fn direct_self_field_receiver_uses_declared_type_and_repairs_completed_cache() {
+        let source = "mod recovery; mod other; struct GameRuntime { recovery: recovery::Recovery } impl GameRuntime { fn frame(&mut self, reason: String) { self.recovery.device_lost(reason); } }";
+        let repo = setup_repo("direct-self-field", source);
+        fs::write(repo.join("src/recovery.rs"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }").unwrap();
+        fs::write(repo.join("src/other.rs"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let method = store
+            .get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost")
+            .unwrap()
+            .unwrap();
+        let namesake = store
+            .get_node_by_qname("test", "src/other.rs::Recovery::device_lost")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .incoming_edges(namesake.id, Some("CALLS"), 20)
+            .unwrap()
+            .is_empty());
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = store.list_file_states("test").unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type='CALLS' AND target_id=?1",
+                [method.id],
+            )
+            .unwrap();
+        store.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.test")],
+            )
+            .unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(!direct_self_field_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(direct_self_field_edges_repaired(&store).unwrap());
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(states, store.list_file_states("test").unwrap());
+        for (label, changed, recovery) in [
+            ("opaque", source.replace("recovery::Recovery", "Unknown"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
+            ("ambiguous", source.replace("mod other;", "mod other; use recovery::Recovery; use other::Recovery;").replace("recovery: recovery::Recovery", "recovery: Recovery"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
+            ("trait-method", source.to_string(), "pub struct Recovery; pub trait Lost { fn device_lost(&mut self, reason: String); } impl Lost for Recovery { fn device_lost(&mut self, reason: String) {} }"),
+            ("opaque-expression", source.replace("self.recovery.device_lost", "opaque().device_lost"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
+        ] {
+            fs::write(repo.join("src/lib.rs"), changed).unwrap();
+            fs::write(repo.join("src/recovery.rs"), recovery).unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let method = store.get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost").unwrap().unwrap();
+            assert!(store.incoming_edges(method.id, Some("CALLS"), 20).unwrap().is_empty(), "{label}");
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn direct_self_field_overlay_recovery_preserves_base_and_refuses_stale_source() {
+        let source = "mod recovery; struct GameRuntime { recovery: recovery::Recovery } impl GameRuntime { fn frame(&mut self, reason: String) { self.recovery.device_lost(reason); } }";
+        let repo = setup_repo("direct-self-field-overlay", source);
+        fs::write(repo.join("src/recovery.rs"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS' AND target_id IN (SELECT id FROM nodes WHERE name='device_lost')", []).unwrap();
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance') WHERE edge_type='CALLS'", []).unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.test")],
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let nodes = format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", overlay.list_file_states("test").unwrap());
+        let workspace = format!(
+            "{:?}",
+            overlay.get_workspace_state(repo.to_str().unwrap()).unwrap()
+        );
+        assert!(!direct_self_field_edges_repaired(&overlay).unwrap());
+        recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap();
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        assert!(direct_self_field_edges_repaired(&overlay).unwrap());
+        let method = overlay
+            .get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", overlay.list_file_states("test").unwrap())
+        );
+        assert_eq!(
+            workspace,
+            format!(
+                "{:?}",
+                overlay.get_workspace_state(repo.to_str().unwrap()).unwrap()
+            )
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+        overlay
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [format!("{DIRECT_SELF_FIELD_REPAIR_KEY}.test")],
+            )
+            .unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            source.replace("recovery::Recovery", "Unknown"),
+        )
+        .unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(!direct_self_field_edges_repaired(&overlay).unwrap());
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+        fs::remove_dir_all(repo).unwrap();
     }
 
     const OPTION_FIELD_CALLER: &str = r#"
