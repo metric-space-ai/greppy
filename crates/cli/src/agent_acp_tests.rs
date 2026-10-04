@@ -1,3 +1,7 @@
+#[path = "agent_acp_import_tests.rs"]
+mod imported_history;
+#[path = "agent_acp_import_durability_tests.rs"]
+mod imported_history_durability;
 #[test]
 fn rejected_model_changes_preserve_the_active_and_persisted_model() {
     let root = tempfile::tempdir().unwrap();
@@ -123,6 +127,7 @@ fn fixture(root: &Path) -> (Server, Receiver<Value>) {
         max_turns: 2,
         data_root: Some(root.join("state")),
         after_messages: None,
+        after_import_rename: None,
         tool_env: None,
     };
     (

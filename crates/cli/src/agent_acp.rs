@@ -33,7 +33,8 @@ mod tests;
 
 use crate::agent::{EXIT_OK, EXIT_USAGE};
 use crate::agent_tui::{
-    messages_from_protocol, new_session_id, protocol_from_persisted, SessionRecord, SessionStore,
+    messages_from_protocol, new_session_id, protocol_from_persisted, ImportAck, SessionRecord,
+    SessionStore,
 };
 
 const PROTOCOL_VERSION: u64 = 1;
@@ -60,6 +61,8 @@ pub(crate) struct AcpConfig {
     pub data_root: Option<PathBuf>,
     #[cfg(test)]
     pub after_messages: Option<PersistenceFault>,
+    #[cfg(test)]
+    pub after_import_rename: Option<PersistenceFault>,
     pub tool_env: Option<ToolEnvFactory>,
 }
 
@@ -76,6 +79,8 @@ impl Default for AcpConfig {
             data_root: None,
             #[cfg(test)]
             after_messages: None,
+            #[cfg(test)]
+            after_import_rename: None,
             tool_env: None,
         }
     }
@@ -169,7 +174,9 @@ struct Session {
     project: String,
     model: String,
     messages: Vec<Message>,
+    import_ack: Vec<ImportAck>,
     cancel: Arc<AtomicBool>,
+
     busy: bool,
     closed: bool,
     perms: Arc<Mutex<PermMemory>>,
@@ -385,6 +392,8 @@ impl Server {
             "session/list" => Some(self.session_list(id, params)),
             "session/close" => Some(self.session_close(id, params)),
             "session/set_model" => Some(self.session_set_model(id, params)),
+            "_workjet/import_history" => Some(self.import_history(id, params)),
+
             "session/set_config_option" => Some(self.session_set_config(id, params)),
             "session/prompt" => {
                 self.session_prompt(id, params);
@@ -410,7 +419,9 @@ impl Server {
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
+                    "_meta": {"workjetImportHistory": {"version": 1}},
                     "loadSession": true,
+
                     "promptCapabilities": {
                         "image": false,
                         "audio": false,
@@ -447,6 +458,117 @@ impl Server {
         }
     }
 
+    fn import_history(&self, id: &Value, params: &Value) -> Value {
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return rpc_error(id, -32602, "sessionId is required");
+        };
+        let Some(input) = params.get("messages").and_then(Value::as_array) else {
+            return rpc_error(id, -32602, "messages must be an array");
+        };
+        let mut ids = HashSet::new();
+        let mut acknowledgements = Vec::with_capacity(input.len());
+        let mut imported = Vec::with_capacity(input.len());
+        for message in input {
+            let (Some(message_id), Some(role), Some(text)) = (
+                message.get("id").and_then(Value::as_str),
+                message.get("role").and_then(Value::as_str),
+                message.get("text").and_then(Value::as_str),
+            ) else {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "imported messages require id, role and text strings",
+                );
+            };
+            if message_id.trim().is_empty() || message_id.len() > 512 || !ids.insert(message_id) {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "imported message ids must be nonempty and unique",
+                );
+            }
+            let native_role = match role {
+                "user" => greppy_agent::Role::User,
+                "assistant" => greppy_agent::Role::Assistant,
+                _ => {
+                    return rpc_error(
+                        id,
+                        -32602,
+                        "imported message role must be user or assistant",
+                    )
+                }
+            };
+            acknowledgements.push(ImportAck::new(message_id.to_owned(), role.to_owned(), text));
+            imported.push(Message {
+                role: native_role,
+                content: vec![greppy_agent::ContentPart::Text {
+                    text: text.to_owned(),
+                }],
+            });
+        }
+        let mut state = lock_state(&self.state);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return rpc_error(id, -32002, "session not found");
+        };
+        if session.closed || session.busy {
+            return rpc_error(id, -32600, "session is closed or busy");
+        }
+        if !acknowledgements.starts_with(&session.import_ack) {
+            return rpc_error(
+                id,
+                -32602,
+                "imported history changed or lost its acknowledged prefix",
+            );
+        }
+        let accepted = acknowledgements
+            .iter()
+            .map(|ack| ack.id.clone())
+            .collect::<Vec<_>>();
+        let mut history = session.messages.clone();
+        history.extend(imported.into_iter().skip(session.import_ack.len()));
+        let store = SessionStore::new(&session.data_root, &session.project);
+        let saved = store.commit_import_history(
+            session_id,
+            &messages_from_protocol(&session.messages),
+            &session.import_ack,
+            &messages_from_protocol(&history),
+            &acknowledgements,
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &self.config.after_messages {
+                    hook()?;
+                }
+                Ok(())
+            },
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &self.config.after_import_rename {
+                    hook()?;
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = saved {
+            if error.renamed {
+                // The replacement is visible but durability was not confirmed.
+                // Do not prompt with stale live state or acknowledge IDs. Loading
+                // the saved session reestablishes a single authoritative history.
+                session.closed = true;
+                return rpc_error(id, -32603, &format!(
+                    "imported history durability was not confirmed; reload the session before continuing: {error}"
+                ));
+            }
+            return rpc_error(
+                id,
+                -32603,
+                &format!("cannot persist imported history: {error}"),
+            );
+        }
+        session.messages = history;
+        session.import_ack = acknowledgements;
+        rpc_ok(id, json!({"acceptedMessageIds": accepted}))
+    }
+
     fn session_new(&self, id: &Value, params: &Value) -> Value {
         if let Err(message) = require_empty_mcp(params, true) {
             return rpc_error(id, -32602, &message);
@@ -477,7 +599,9 @@ impl Server {
             project,
             model: model.clone(),
             messages: Vec::new(),
+            import_ack: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+
             busy: false,
             closed: false,
             perms: Arc::new(Mutex::new(PermMemory {
@@ -538,7 +662,9 @@ impl Server {
             project,
             model: model.clone(),
             messages,
+            import_ack: record.import_ack,
             cancel: Arc::new(AtomicBool::new(false)),
+
             busy: false,
             closed: false,
             perms: Arc::new(Mutex::new(PermMemory {
