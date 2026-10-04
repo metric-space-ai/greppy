@@ -2,8 +2,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use greppy_agent::{ContentPart, Message, Role, Usage};
@@ -145,7 +145,9 @@ impl SessionStore {
     /// unlink this file: an open old inode would split competing writer leases.
     fn writer_lease(&self, session_id: &str) -> io::Result<File> {
         self.path_for(session_id)?;
-        let path = self.project_dir().join(format!(".{session_id}.writer-lock"));
+        let path = self
+            .project_dir()
+            .join(format!(".{session_id}.writer-lock"));
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -178,21 +180,41 @@ impl SessionStore {
         let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
         if previous.recovered {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "cannot commit over a corrupt session log"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot commit over a corrupt session log",
+            ));
         }
         if previous.messages != expected {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "saved session history changed"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "saved session history changed",
+            ));
         }
         let total_usage = Usage {
-            input_tokens: previous.usage.input_tokens.saturating_add(usage.input_tokens),
-            output_tokens: previous.usage.output_tokens.saturating_add(usage.output_tokens),
-            cache_read_input_tokens: previous.usage.cache_read_input_tokens.saturating_add(usage.cache_read_input_tokens),
-            cache_creation_input_tokens: previous.usage.cache_creation_input_tokens.saturating_add(usage.cache_creation_input_tokens),
+            input_tokens: previous
+                .usage
+                .input_tokens
+                .saturating_add(usage.input_tokens),
+            output_tokens: previous
+                .usage
+                .output_tokens
+                .saturating_add(usage.output_tokens),
+            cache_read_input_tokens: previous
+                .usage
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens),
+            cache_creation_input_tokens: previous
+                .usage
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
         };
         let path = self.path_for(session_id)?;
         let temporary = self.project_dir().join(format!(
             ".{session_id}-turn-{}-{}-{}.pending",
-            std::process::id(), now_ms(), NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
+            std::process::id(),
+            now_ms(),
+            NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
         ));
         let mut created = false;
         let result = (|| {
@@ -207,7 +229,10 @@ impl SessionStore {
                 source.rewind()?;
                 last[0] != b'\n'
             };
-            let mut target = OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+            let mut target = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
             created = true;
             greppy_core::cache::secure_private_file(&temporary)?;
             io::copy(&mut source, &mut target)?;
@@ -219,23 +244,35 @@ impl SessionStore {
                     writeln!(target, "{}", message_line(message))?;
                 }
             } else {
-                writeln!(target, "{}", json!({
-                    "v": SESSION_FORMAT, "type": "message_checkpoint",
-                    "messages": messages.iter().map(message_line).collect::<Vec<_>>()
-                }))?;
+                writeln!(
+                    target,
+                    "{}",
+                    json!({
+                        "v": SESSION_FORMAT, "type": "message_checkpoint",
+                        "messages": messages.iter().map(message_line).collect::<Vec<_>>()
+                    })
+                )?;
             }
             after_messages()?;
-            writeln!(target, "{}", json!({
-                "v": SESSION_FORMAT, "type": "usage",
-                "input": total_usage.input_tokens, "output": total_usage.output_tokens,
-                "cache_read": total_usage.cache_read_input_tokens,
-                "cache_write": total_usage.cache_creation_input_tokens,
-                "turns": previous.turns.saturating_add(1), "stop": stop,
-            }))?;
+            writeln!(
+                target,
+                "{}",
+                json!({
+                    "v": SESSION_FORMAT, "type": "usage",
+                    "input": total_usage.input_tokens, "output": total_usage.output_tokens,
+                    "cache_read": total_usage.cache_read_input_tokens,
+                    "cache_write": total_usage.cache_creation_input_tokens,
+                    "turns": previous.turns.saturating_add(1), "stop": stop,
+                })
+            )?;
             if let Some(title) = title {
-                writeln!(target, "{}", json!({
-                    "v": SESSION_FORMAT, "type": "title", "title": redact_text(title),
-                }))?;
+                writeln!(
+                    target,
+                    "{}",
+                    json!({
+                        "v": SESSION_FORMAT, "type": "title", "title": redact_text(title),
+                    })
+                )?;
             }
             target.flush()?;
             target.sync_all()?;
