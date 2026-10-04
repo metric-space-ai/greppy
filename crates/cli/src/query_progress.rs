@@ -691,7 +691,7 @@ mod tests {
         let mut reporter = ProgressReporter::default();
         let first = reporter.observe("search", None, Duration::ZERO).unwrap();
         assert!(
-            first.contains("no detailed progress is available"),
+            first.contains("no live index progress is reported"),
             "{first}"
         );
         assert!(reporter
