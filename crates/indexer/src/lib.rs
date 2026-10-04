@@ -2670,9 +2670,29 @@ pub fn recover_persisted_js_ts_usages(
             "JS/TS usage repair requires indexed source fingerprints".into(),
         ));
     }
+    // A Store-CoW Delta retains fingerprints for discovery-filtered files,
+    // although those files deliberately have no graph definitions. Do not
+    // re-extract them as if their absent definitions were cache corruption.
+    let discovery_filtered: std::collections::BTreeMap<_, _> = store
+        .list_index_skips(project)?
+        .into_iter()
+        .filter(|skip| skip.reason == "discovery_filtered")
+        .map(|skip| (skip.rel_path.clone(), skip))
+        .collect();
+    let indexed_paths: std::collections::BTreeSet<_> =
+        indexed.iter().map(|node| node.file_path.as_str()).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
     for state in states.iter().filter(|state| relevant(&state.rel_path)) {
+        if !indexed_paths.contains(state.rel_path.as_str())
+            && discovery_filtered.get(&state.rel_path).is_some_and(|skip| {
+                skip.last_indexed_generation == state.last_indexed_generation
+                    && skip.size == state.size
+                    && skip.mtime_ns == state.mtime_ns
+            })
+        {
+            continue;
+        }
         let relative = Path::new(&state.rel_path);
         if relative
             .components()
@@ -2708,10 +2728,19 @@ pub fn recover_persisted_js_ts_usages(
                 "JS/TS usage repair extraction incomplete".into(),
             ));
         }
-        for node in &extraction.nodes {
+        // Persistence upserts in extraction order by (project, qualified_name).
+        // Object-literal methods can share a qualified name: validate the final
+        // stored definition, rather than rejecting the overwritten earlier span.
+        let definitions: std::collections::BTreeMap<_, _> = extraction
+            .nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect();
+        for node in definitions.values() {
             let cached = store.get_node_by_qname(project, &node.qualified_name)?;
             if cached.as_ref().is_none_or(|cached| {
                 cached.label != node.label
+                    || cached.file_path != state.rel_path
                     || cached.start_line != i64::from(node.start_line)
                     || cached.end_line != i64::from(node.end_line)
             }) {
@@ -7760,6 +7789,368 @@ export function invalidCalls() { plainValue(); effectValue(); }
         }
     }
 
+    fn jsx_discovery_filtered_fixture() -> (tempfile::TempDir, IndexOptions) {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/package")).unwrap();
+        fs::write(
+            repo.path().join("node_modules/package/media-controls.js"),
+            "(() => { class MediaControls { render() { return 1; } } new MediaControls(); })();\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "boundary.tsx".to_string(),
+                "view.tsx".to_string(),
+                "node_modules/package/media-controls.js".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        (repo, options)
+    }
+
+    #[test]
+    fn jsx_usage_recovery_respects_current_discovery_filtered_identity() {
+        let (repo, options) = jsx_discovery_filtered_fixture();
+        let mut store = Store::open_memory().unwrap();
+        assert_eq!(
+            index_with_options(&mut store, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            2
+        );
+        let skip = store
+            .get_index_skip("test", "node_modules/package/media-controls.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.reason, "discovery_filtered");
+        assert!(store
+            .get_node_by_qname(
+                "test",
+                "node_modules/package/media-controls.js::Class::MediaControls"
+            )
+            .unwrap()
+            .is_none());
+        store.conn().execute_batch(
+            "DELETE FROM main.raw_edges WHERE edge_type='USAGE'; DELETE FROM main.edges WHERE edge_type='USAGE';"
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", store.list_file_states("test").unwrap());
+        // An unrelated failure or stale skip row cannot excuse missing definitions.
+        for case in 0..4 {
+            let mut stale = skip.clone();
+            match case {
+                0 => stale.reason = "parse_failed".into(),
+                1 => {
+                    stale.last_indexed_generation = stale.last_indexed_generation.saturating_sub(1)
+                }
+                2 => stale.size += 1,
+                _ => stale.mtime_ns += 1,
+            }
+            store.upsert_index_skip(&stale).unwrap();
+            let error =
+                recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap_err();
+            assert!(error.to_string().contains("MediaControls"), "{error}");
+            assert!(!js_ts_usages_repaired(&store).unwrap());
+            assert_eq!(
+                nodes,
+                format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+            );
+            assert_eq!(
+                states,
+                format!("{:?}", store.list_file_states("test").unwrap())
+            );
+        }
+        store.upsert_index_skip(&skip).unwrap();
+        let filtered_qname = "node_modules/package/media-controls.js::Class::MediaControls";
+        store.conn().execute(
+            "INSERT INTO main.nodes(project,label,name,qualified_name,file_path,start_line,end_line,properties) VALUES('test','Class','MediaControls',?1,?2,999,999,'{}')",
+            [filtered_qname, skip.rel_path.as_str()],
+        ).unwrap();
+        let error = recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap_err();
+        assert!(error.to_string().contains("MediaControls"), "{error}");
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+        assert_eq!(
+            store
+                .get_node_by_qname("test", filtered_qname)
+                .unwrap()
+                .unwrap()
+                .start_line,
+            999
+        );
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.nodes WHERE project='test' AND qualified_name=?1",
+                [filtered_qname],
+            )
+            .unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        let boundary = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(boundary.id, Some("USAGE"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", store.list_file_states("test").unwrap())
+        );
+    }
+
+    #[test]
+    fn jsx_usage_recovery_respects_filtered_delta_and_preserves_base() {
+        let (repo, _) = jsx_discovery_filtered_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            assert!(base
+                .get_file_state("test", "node_modules/package/media-controls.js")
+                .unwrap()
+                .is_none());
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM main.schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "node_modules/package/media-controls.js".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        assert_eq!(
+            index_with_options(&mut overlay, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        let skip = overlay
+            .get_index_skip("test", "node_modules/package/media-controls.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.reason, "discovery_filtered");
+        assert!(js_ts_usages_repaired(&overlay).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        let boundary = overlay
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(boundary.id, Some("USAGE"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+    }
+
+    #[test]
+    fn jsx_usage_recovery_indexes_original_observe_fixture_without_manual_repair() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("observe_choices_test.cjs"),
+            include_str!("../../../bench/web_study/basic_fixture/observe_choices_test.cjs"),
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("graph.db")).unwrap();
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            1
+        );
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        let method = store
+            .get_node_by_qname("test", "observe_choices_test.cjs::Function::getAttribute")
+            .unwrap()
+            .unwrap();
+        assert_eq!(method.start_line, 65);
+    }
+
+    #[test]
+    fn jsx_usage_recovery_validates_persisted_last_definition_for_colliding_methods() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = "function first() { return { getAttribute(name) { return name; } }; }\n\
+                      function second() { return { getAttribute() { return null; } }; }\n\
+                      function third() { return { getAttribute(name) { return name === 'x'; } }; }\n";
+        fs::write(repo.path().join("fixture.cjs"), source).unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let extraction =
+            parser_extract(Language::JavaScript, source.as_bytes(), "fixture.cjs").unwrap();
+        let methods: Vec<_> = extraction
+            .nodes
+            .iter()
+            .filter(|node| node.qualified_name == "fixture.cjs::Function::getAttribute")
+            .collect();
+        assert!(
+            methods.len() >= 2,
+            "fixture must exercise the actual parser collision"
+        );
+        assert_ne!(methods[0].start_line, methods.last().unwrap().start_line);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("graph.db");
+        let mut store = Store::open(&path).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let qname = "fixture.cjs::Function::getAttribute";
+        let cached = store.get_node_by_qname("test", qname).unwrap().unwrap();
+        assert_eq!(
+            cached.start_line,
+            i64::from(methods.last().unwrap().start_line)
+        );
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", store.list_file_states("test").unwrap());
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        store.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", store.list_file_states("test").unwrap())
+        );
+        let boundary = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let usages = store
+            .incoming_edges(boundary.id, Some("USAGE"), 100)
+            .unwrap();
+        assert_eq!(usages.len(), 1);
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE main.nodes SET start_line=999 WHERE project='test' AND qualified_name=?1",
+                [qname],
+            )
+            .unwrap();
+        let raw = store.list_raw_edges("test").unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
+        assert_eq!(raw, store.list_raw_edges("test").unwrap());
+        assert_eq!(
+            usages,
+            store
+                .incoming_edges(boundary.id, Some("USAGE"), 100)
+                .unwrap()
+        );
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+    }
+
+    #[test]
+    fn jsx_usage_recovery_colliding_methods_preserves_immutable_base() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("fixture.cjs"), "const a = { getAttribute() { return 'a'; } };\nconst b = { getAttribute() { return 'b'; } };\n").unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM main.schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let nodes = format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap());
+        assert!(recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        assert_eq!(
+            nodes,
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        let boundary = overlay
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(boundary.id, Some("USAGE"), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+    }
+
     #[test]
     fn jsx_usage_migrates_completed_private_and_overlay_cache_without_identity_rewrite() {
         let repo = tempfile::tempdir().unwrap();
@@ -7787,7 +8178,8 @@ export function invalidCalls() { plainValue(); effectValue(); }
         .unwrap();
         overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_files.test','[\"retained.rs\"]'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_rows.test','[]');").unwrap();
         let rust_metadata: String = overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |r| r.get(0)).unwrap();
-        for store in [&mut overlay] {
+        {
+            let store = &mut overlay;
             let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
             let states = format!("{:?}", store.list_file_states("test").unwrap());
             let workspace = format!(
