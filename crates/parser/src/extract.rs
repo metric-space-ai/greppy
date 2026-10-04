@@ -1767,7 +1767,7 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
     while let Some(parent) = pattern_ancestor {
         if matches!(
             parent.kind(),
-            "scoped_identifier" | "scoped_type_identifier"
+            "scoped_identifier" | "scoped_type_identifier" | "range_pattern" | "const_block"
         ) {
             break;
         }
@@ -2014,6 +2014,8 @@ fn constructor_callback(value: Option<i32>, candidate: Callback) {
     let Callback(predicate) = candidate;
     value.map(predicate);
 }
+const LIMIT: i32 = 9;
+fn range_callback(value: i32) { if let 1..=LIMIT = value {} }
 "#;
         let extracted = extract_rust(source, "callbacks.rs").unwrap();
         let references = |caller: &str| {
@@ -2056,6 +2058,16 @@ fn constructor_callback(value: Option<i32>, candidate: Callback) {
             })
             .expect("a destructuring constructor is a type reference");
         assert_ne!(constructor.properties["ref_local_binding"], true);
+        let range_limit = extracted
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "USAGE"
+                    && edge.source_qualified_name.ends_with("::range_callback")
+                    && edge.properties["ref_name"] == "LIMIT"
+            })
+            .expect("a range endpoint is a constant reference, not a binding");
+        assert_ne!(range_limit.properties["ref_local_binding"], true);
     }
 }
 
