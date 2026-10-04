@@ -2311,7 +2311,7 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
-pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v1";
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v2";
 
 pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
     store
@@ -4122,6 +4122,13 @@ impl GraphIndex {
         path: &str,
         imported_items: Option<&serde_json::Value>,
     ) -> Option<i64> {
+        if matches!(
+            greppy_parser::language_for_path(Path::new(file)),
+            Language::JavaScript | Language::TypeScript { .. }
+        ) && path.starts_with('.')
+        {
+            return self.resolve_relative_js_import(file, name, path);
+        }
         if !file.ends_with(".rs") {
             return self.unique_def_named_with_path(
                 &greppy_resolver::IMPORTABLE_LABELS,
@@ -4168,6 +4175,60 @@ impl GraphIndex {
         let files = self.rust_module_files_for_path(file, path, name);
         let targets =
             self.rust_module_export_targets(&files, name, &greppy_resolver::IMPORTABLE_LABELS);
+        match targets.as_slice() {
+            [target] => Some(*target),
+            _ => None,
+        }
+    }
+
+    fn resolve_relative_js_import(&self, file: &str, name: &str, path: &str) -> Option<i64> {
+        if !path.starts_with("./") && !path.starts_with("../") {
+            return None;
+        }
+        let parent = Path::new(file).parent().unwrap_or_else(|| Path::new(""));
+        let mut base = std::path::PathBuf::new();
+        for part in parent.join(path).components() {
+            match part {
+                std::path::Component::Normal(part) => base.push(part),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !base.pop() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let mut files = Vec::new();
+        if base.extension().is_some() {
+            files.push(base.to_string_lossy().replace('\\', "/"));
+        } else {
+            for extension in ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"] {
+                files.push(
+                    base.with_extension(extension)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                files.push(
+                    base.join(format!("index.{extension}"))
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        let visible = files
+            .iter()
+            .filter(|file| self.known_files.contains(*file))
+            .collect::<Vec<_>>();
+        let [file] = visible.as_slice() else {
+            return None;
+        };
+        let targets = self
+            .defs_named(&greppy_resolver::IMPORTABLE_LABELS, name)
+            .into_iter()
+            .filter(|node| &node.file_path == *file)
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
         match targets.as_slice() {
             [target] => Some(*target),
             _ => None,
@@ -4389,6 +4450,46 @@ impl GraphIndex {
     }
 
     fn record_import_items(&mut self, edge: &ExtractedEdge, file: &str) {
+        if matches!(
+            greppy_parser::language_for_path(Path::new(file)),
+            Language::JavaScript | Language::TypeScript { .. }
+        ) {
+            let name = edge
+                .properties
+                .get("original_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let alias = edge
+                .properties
+                .get("imported_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let path = edge
+                .properties
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !name.is_empty() && !alias.is_empty() && path.starts_with('.') {
+                // Preserve the explicit binding even if its module or export
+                // is unresolved: a project-wide namesake is not that import.
+                self.import_alias_sources_by_file
+                    .entry(file.to_string())
+                    .or_default()
+                    .entry(alias.to_string())
+                    .or_default()
+                    .push((path.to_string(), name.to_string()));
+                if let Some(target) = self.resolve_relative_js_import(file, name, path) {
+                    self.record_import(file, target);
+                    self.import_aliases_by_file
+                        .entry(file.to_string())
+                        .or_default()
+                        .entry(alias.to_string())
+                        .or_default()
+                        .insert(target);
+                }
+            }
+            return;
+        }
         let Some(items) = edge
             .properties
             .get("imported_items")
@@ -7171,7 +7272,7 @@ export function invalidCalls() { plainValue(); effectValue(); }
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, repo.path(), "test").unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v1'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v2'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
             mark_rust_caller_edges_repaired(&base).unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
@@ -7275,7 +7376,7 @@ export function invalidCalls() { plainValue(); effectValue(); }
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());
         fs::write(repo.path().join("view.tsx"), source).unwrap();
-        store.conn().execute_batch("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.js_ts_usage_repair_v1' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;").unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.js_ts_usage_repair_v2' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;").unwrap();
         assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
         assert_eq!(raw, store.list_raw_edges("test").unwrap());
         assert!(!js_ts_usages_repaired(&store).unwrap());
@@ -7317,6 +7418,63 @@ export function invalidCalls() { plainValue(); effectValue(); }
             .incoming_edges(other.id, Some("USAGE"), 100)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn jsx_relative_imports_keep_alias_identity_and_reject_missing_or_ambiguous_modules() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join("components")).unwrap();
+        fs::create_dir(repo.path().join("views")).unwrap();
+        fs::write(
+            repo.path().join("components/boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("other.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("views/good.tsx"), "import { Boundary as Guard } from '../components/boundary';\nexport function Render() { return <Guard />; }\n").unwrap();
+        fs::write(repo.path().join("views/missing.tsx"), "import { Boundary } from './missing';\nexport function Missing() { return <Boundary />; }\n").unwrap();
+        fs::write(repo.path().join("views/ambiguous.tsx"), "import { Boundary } from '../components/ambiguous';\nexport function Ambiguous() { return <Boundary />; }\n").unwrap();
+        fs::write(
+            repo.path().join("components/ambiguous.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("components/ambiguous.ts"),
+            "export function Boundary() { return null; }\n",
+        )
+        .unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&stores.path().join("graph.db")).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let target = store
+            .get_node_by_qname("test", "components/boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let render = store
+            .get_node_by_qname("test", "views/good.tsx::Function::Render")
+            .unwrap()
+            .unwrap();
+        let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_id, render.id);
+        for (file, name) in [
+            ("views/missing.tsx", "Missing"),
+            ("views/ambiguous.tsx", "Ambiguous"),
+        ] {
+            let source = store
+                .get_node_by_qname("test", &format!("{file}::Function::{name}"))
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .outgoing_edges(source.id, Some("USAGE"), 100)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
