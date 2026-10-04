@@ -7966,7 +7966,8 @@ export function invalidCalls() { plainValue(); effectValue(); }
         .unwrap();
         overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_files.test','[\"retained.rs\"]'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_rows.test','[]');").unwrap();
         let rust_metadata: String = overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |r| r.get(0)).unwrap();
-        for store in [&mut overlay] {
+        {
+            let store = &mut overlay;
             let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
             let states = format!("{:?}", store.list_file_states("test").unwrap());
             let workspace = format!(
