@@ -11303,6 +11303,11 @@ fn compact_nav_json(value: &mut serde_json::Value) {
         "warning",
         "hits",
         "unresolved_receivers",
+        "unresolved_factory_receivers",
+        "unresolved_factory_total",
+        "unresolved_factory_omitted",
+        "unresolved_factory_truncated",
+        "callees_incomplete",
         "callers_incomplete",
         "unresolved_omitted",
         "unresolved_truncated",
@@ -11312,6 +11317,36 @@ fn compact_nav_json(value: &mut serde_json::Value) {
         }
     }
     *value = serde_json::Value::Object(compact);
+}
+
+#[cfg(test)]
+mod factory_diagnostic_compaction_tests {
+    #[test]
+    fn compact_callees_preserves_factory_coverage_and_budget() {
+        let rows = serde_json::json!([{"file": "src/leaf.rs", "line": 2, "method": "upsert"}]);
+        let mut value = serde_json::json!({
+            "symbol_found": true,
+            "hits": [],
+            "unresolved_factory_receivers": rows,
+            "unresolved_factory_total": 45,
+            "unresolved_factory_omitted": 44,
+            "unresolved_factory_truncated": true,
+            "callees_incomplete": true,
+            "next": "greppy read leaf"
+        });
+        super::compact_nav_json(&mut value);
+        assert_eq!(value["unresolved_factory_receivers"], rows);
+        assert_eq!(value["unresolved_factory_total"], 45);
+        assert_eq!(value["unresolved_factory_omitted"], 44);
+        assert_eq!(value["unresolved_factory_truncated"], true);
+        assert_eq!(value["callees_incomplete"], true);
+        assert_eq!(value["next"], "greppy read leaf");
+
+        let mut direct = serde_json::json!({"symbol_found": true, "hits": []});
+        super::compact_nav_json(&mut direct);
+        assert!(direct.get("callees_incomplete").is_none());
+        assert!(direct.get("unresolved_factory_receivers").is_none());
+    }
 }
 
 fn compact_search_symbol_json(value: &mut serde_json::Value) {
