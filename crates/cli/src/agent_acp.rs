@@ -42,8 +42,12 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8317";
 const DEFAULT_MAX_TURNS: usize = 40;
 
 thread_local! {
-    static ACTIVE_TOOL_CALL: RefCell<Option<String>> = RefCell::new(None);
+    static ACTIVE_TOOL_CALL: RefCell<Option<String>> = const { RefCell::new(None) };
 }
+
+type ToolEnvFactory = Arc<dyn Fn(&Path) -> Box<dyn ExecutionEnv + Send> + Send + Sync>;
+#[cfg(test)]
+type PersistenceFault = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 /// Process-wide ACP settings. The tool factory is optional so tests can
 /// substitute a sandbox that records calls without invoking greppy.
@@ -55,8 +59,8 @@ pub(crate) struct AcpConfig {
     pub max_turns: usize,
     pub data_root: Option<PathBuf>,
     #[cfg(test)]
-    pub after_messages: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
-    pub tool_env: Option<Arc<dyn Fn(&Path) -> Box<dyn ExecutionEnv + Send> + Send + Sync>>,
+    pub after_messages: Option<PersistenceFault>,
+    pub tool_env: Option<ToolEnvFactory>,
 }
 
 impl Default for AcpConfig {
@@ -120,12 +124,13 @@ pub(crate) fn run(rest: &[std::ffi::OsString]) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let mut config = AcpConfig::default();
-    config.endpoint = args.endpoint;
-    if let Some(model) = args.model {
-        config.model = model;
-    }
-    config.max_turns = args.max_turns;
+    let defaults = AcpConfig::default();
+    let config = AcpConfig {
+        endpoint: args.endpoint,
+        model: args.model.unwrap_or(defaults.model),
+        max_turns: args.max_turns,
+        ..defaults
+    };
     let stdin = io::stdin();
     serve(stdin.lock(), io::stdout(), config)
 }
