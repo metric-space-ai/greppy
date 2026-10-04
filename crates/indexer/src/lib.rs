@@ -7770,6 +7770,36 @@ export function invalidCalls() { plainValue(); effectValue(); }
     }
 
     #[test]
+    fn jsx_usage_recovery_indexes_original_observe_fixture_without_manual_repair() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("observe_choices_test.cjs"),
+            include_str!("../../../bench/web_study/basic_fixture/observe_choices_test.cjs"),
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("graph.db")).unwrap();
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            1
+        );
+        assert!(js_ts_usages_repaired(&store).unwrap());
+        assert_eq!(
+            index(&mut store, repo.path(), "test")
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        let method = store
+            .get_node_by_qname("test", "observe_choices_test.cjs::Function::getAttribute")
+            .unwrap()
+            .unwrap();
+        assert_eq!(method.start_line, 65);
+    }
+
+    #[test]
     fn jsx_usage_recovery_validates_persisted_last_definition_for_colliding_methods() {
         let repo = tempfile::tempdir().unwrap();
         let source = "function first() { return { getAttribute(name) { return name; } }; }\n\
