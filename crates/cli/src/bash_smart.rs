@@ -42,8 +42,10 @@ static HEX_TEMPLATE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static DIGITS_TEMPLATE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\d+").expect("bash-smart digits template regex"));
 static ERROR_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    // Fatal severity requires a diagnostic header separator, like error: above.
+    // Wrapped help prose such as "fatal errors" is not a diagnostic.
     regex::bytes::Regex::new(
-        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal\b|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|[0-9]+:[0-9]+[\t ]+error[\t ]+|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
+        r"(?i-u)^[\t ]*(?:error(?:\[[a-z0-9_-]+\])?:(?:[\t ]|$)|error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|error[\t ]*$|fatal(?:[\t ]+error)?:(?:[\t ]|$)|fatal[\t ]+error[\t ]+[a-z][a-z_-]*[0-9]+:(?:[\t ]|$)|fatal[\t ]*$|panic|FAIL(?:ED)?\b|Traceback|Exception\b|(?:Syntax|Type|Reference|Range|URI|Eval|Aggregate|Internal)Error:(?:[\t ]|$)|AssertionError\b|assert(?:ion)?(?:[\t ]+.*)?[\t ]+(?:failed|error)\b|E:|[0-9]+:[0-9]+[\t ]+error[\t ]+|test .+ \.\.\. FAILED\b|thread .+ panicked at\b)",
     )
     .expect("bash-smart error marker regex")
 });
@@ -2716,6 +2718,31 @@ mod tests {
             for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
                 assert_eq!(blocks.len(), 1, "{diagnostic}");
                 assert_eq!(blocks[0].kind, BlockKind::Error);
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_help_prose_requires_a_diagnostic_header() {
+        let help = split_lines(b"Usage: pnpm install [options]\n  --reporter <name>\n      fatal errors are always printed\n      fatal error handling is configurable\n      fatal error C1083 handling is configurable\n");
+        for blocks in [detect_blocks(&help, &[]), detect_blocks(&[], &help)] {
+            assert!(blocks.is_empty());
+            assert_eq!(verdict_line(0, blocks.len(), 0, None), "ok — exit 0");
+        }
+        for diagnostic in [
+            "fatal: not a git repository\n",
+            "  FATAL: connection unavailable\n",
+            "fatal error: missing.h: No such file\n",
+            "fatal error C1083: Cannot open include file: missing.h\n",
+            "  FATAL ERROR C1001: Internal compiler error\n",
+            "fatal\n",
+            "src/main.c:12:4: fatal error: missing.h: No such file\n",
+        ] {
+            let lines = split_lines(diagnostic.as_bytes());
+            for blocks in [detect_blocks(&lines, &[]), detect_blocks(&[], &lines)] {
+                assert_eq!(blocks.len(), 1, "{diagnostic}");
+                assert_eq!(blocks[0].kind, BlockKind::Error);
+                assert_eq!(verdict_line(0, 1, 0, None), "ok — exit 0, 1 error");
             }
         }
     }
