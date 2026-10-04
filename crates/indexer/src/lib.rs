@@ -4785,8 +4785,14 @@ impl GraphIndex {
         let [file] = visible.as_slice() else {
             return None;
         };
+        // ES modules import value bindings as well as types and functions.
+        // Keep this language-specific and fenced to the exact visible module.
+        let labels = greppy_resolver::IMPORTABLE_LABELS
+            .into_iter()
+            .chain(["Variable"])
+            .collect::<Vec<_>>();
         let targets = self
-            .defs_named(&greppy_resolver::IMPORTABLE_LABELS, name)
+            .defs_named(&labels, name)
             .into_iter()
             .filter(|node| &node.file_path == *file)
             .map(|node| node.id)
@@ -8410,6 +8416,11 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
 "#,
         )
         .unwrap();
+        fs::write(
+            repo.path().join("other.ts"),
+            "export const Boundary = 7; export function helper() { return 7; }\n",
+        )
+        .unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let base_path = scratch.path().join("base.db");
         {
@@ -8464,6 +8475,14 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                 .incoming_edges(boundary.id, Some("USAGE"), 100)
                 .unwrap();
             assert_eq!(incoming.len(), 4, "{incoming:?}");
+            let unrelated = store
+                .get_node_by_qname("test", "other.ts::Variable::Boundary")
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .incoming_edges(unrelated.id, Some("USAGE"), 100)
+                .unwrap()
+                .is_empty());
             for suffix in ["Variable::make", "Function::exposed", "__file__"] {
                 let owner = store
                     .get_node_by_qname("test", &format!("app.ts::{suffix}"))
