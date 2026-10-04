@@ -451,7 +451,7 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
         // A repair marker alone cannot authorize arbitrary private edges.
         "WITH candidates AS (
              SELECT o.project, o.file_path FROM main.js_ts_reference_override_files o
-             JOIN main.schema_meta m ON m.key='greppy.effect_fn_repair_v9.' || o.project
+             JOIN main.schema_meta m ON m.key='greppy.effect_fn_repair_v8.' || o.project
                AND m.value='complete'
              WHERE NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path=o.file_path)
                AND EXISTS (SELECT 1 FROM greppy_base.file_state s
@@ -5142,7 +5142,7 @@ mod tests {
              INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
              SELECT project,file_path,source_qname,target_qname,edge_type,properties FROM greppy_base.raw_edges;
              INSERT INTO main.js_ts_reference_override_files VALUES('p','src/lib.ts');
-             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.p','complete');"
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');"
         ).unwrap();
         (scratch, overlay)
     }
@@ -5169,7 +5169,7 @@ mod tests {
             "UPDATE main.raw_edges SET target_qname='rogue'",
             "UPDATE main.raw_edges SET properties='{}'",
             "DELETE FROM main.js_ts_reference_override_files",
-            "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.p'",
+            "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
         ] {
             let (_scratch, overlay) = unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
             overlay.conn().execute(mutation, []).unwrap();
@@ -5204,7 +5204,7 @@ mod tests {
         overlay
             .conn()
             .execute(
-                "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.p'",
+                "DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p'",
                 [],
             )
             .unwrap();
@@ -5214,7 +5214,7 @@ mod tests {
 
         let (_scratch, overlay) =
             unchanged_repair_edges_fixture(&VisibilityIndex::default(), true, true);
-        overlay.conn().execute_batch("DELETE FROM main.raw_edges; DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.p';").unwrap();
+        overlay.conn().execute_batch("DELETE FROM main.raw_edges; DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v8.p';").unwrap();
         assert!(private_delta_paths(&overlay)
             .unwrap()
             .contains("src/lib.ts"));
@@ -5315,7 +5315,7 @@ mod tests {
         greppy_indexer::mark_rust_caller_edges_repaired(&overlay).unwrap();
         assert!(greppy_indexer::anyhow_factory_edges_repaired(&overlay).unwrap());
         assert!(!greppy_indexer::js_ts_usages_repaired(&overlay).unwrap());
-        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.p','complete');").unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');").unwrap();
         assert!(persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
         assert!(
             greppy_indexer::recover_persisted_js_ts_usages(&mut overlay, "p", repo.path()).unwrap()

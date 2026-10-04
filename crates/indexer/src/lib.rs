@@ -2963,7 +2963,10 @@ pub fn recover_persisted_js_ts_usages(
     }
     let mut resolved = Vec::new();
 
-    for edge in extracted.iter().filter(|edge| edge.edge_type == "USAGE") {
+    for edge in extracted
+        .iter()
+        .filter(|edge| matches!(edge.edge_type.as_str(), "USAGE" | "CALLS"))
+    {
         let Some(source) = index.by_qname(&edge.source_qualified_name) else {
             return Err(greppy_core::Error::Invalid(format!(
                 "JS/TS usage repair source identity unavailable: {}:{} source={} reference={}",
@@ -2976,16 +2979,29 @@ pub fn recover_persisted_js_ts_usages(
                     .unwrap_or("<unknown>")
             )));
         };
-        if let Some(target) = index.resolve_usage_target(edge, source.id) {
+        let target = if edge.edge_type == "CALLS" {
+            index.resolve_call_target(edge)
+        } else {
+            index.resolve_usage_target(edge, source.id)
+        };
+        if let Some(target) =
+            target.filter(|target| edge.edge_type == "CALLS" || *target != source.id)
+        {
             resolved.push((
                 source.id,
                 target,
                 edge.source_qualified_name.clone(),
                 index.qname_for_id(target).unwrap().to_owned(),
                 edge.properties.clone(),
+                edge.edge_type.clone(),
             ));
         }
     }
+    let calls = extracted
+        .iter()
+        .filter(|edge| edge.edge_type == "CALLS")
+        .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
+        .collect::<Vec<_>>();
     let raw = extracted
         .iter()
         .filter(|edge| edge.edge_type == "USAGE")
@@ -2997,25 +3013,26 @@ pub fn recover_persisted_js_ts_usages(
         .map_err(sqlite_err)?;
     let result = (|| -> Result<()> {
         store.replace_validated_js_ts_usages(project, &files, &raw)?;
+        store.replace_validated_js_ts_calls(project, &files, &calls)?;
         for file in &files {
             if store.is_overlay() {
-                store.conn().execute("DELETE FROM main.overlay_edges WHERE project=?1 AND edge_type='USAGE' AND source_qualified_name IN (SELECT qualified_name FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
+                store.conn().execute("DELETE FROM main.overlay_edges WHERE project=?1 AND edge_type IN ('USAGE','CALLS') AND source_qualified_name IN (SELECT qualified_name FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
             } else {
-                store.conn().execute("DELETE FROM main.edges WHERE project=?1 AND edge_type='USAGE' AND source_id IN (SELECT id FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
+                store.conn().execute("DELETE FROM main.edges WHERE project=?1 AND edge_type IN ('USAGE','CALLS') AND source_id IN (SELECT id FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
             }
         }
-        for (source, target, source_name, target_name, mut properties) in resolved {
+        for (source, target, source_name, target_name, mut properties, kind) in resolved {
             if store.is_overlay() {
                 properties["greppy_base_repair_v2"] = serde_json::json!(1);
                 store.insert_overlay_edges(&[NewOverlayEdge {
                     project: project.into(),
                     source_qualified_name: source_name,
                     target_qualified_name: target_name,
-                    edge_type: "USAGE".into(),
+                    edge_type: kind.clone(),
                     properties,
                 }])?;
             } else {
-                store.conn().execute("INSERT INTO main.edges(project,source_id,target_id,edge_type,properties) VALUES(?1,?2,?3,'USAGE',?4) ON CONFLICT(source_id,target_id,edge_type) DO UPDATE SET properties=excluded.properties", rusqlite::params![project,source,target,properties.to_string()]).map_err(sqlite_err)?;
+                store.conn().execute("INSERT INTO main.edges(project,source_id,target_id,edge_type,properties) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(source_id,target_id,edge_type) DO UPDATE SET properties=excluded.properties", rusqlite::params![project,source,target,kind,properties.to_string()]).map_err(sqlite_err)?;
             }
         }
         store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [JS_TS_USAGE_REPAIR_KEY]).map_err(sqlite_err)?;
@@ -3081,7 +3098,7 @@ fn recover_visible_effect_fn_bindings_inner(
     if !store.is_overlay() {
         return Ok(false);
     }
-    let marker = format!("greppy.effect_fn_repair_v9.{project}");
+    let marker = format!("greppy.effect_fn_repair_v8.{project}");
     let completed: i64 = store
         .conn()
         .query_row(
@@ -8374,18 +8391,18 @@ export function invalidCalls() { plainValue(); effectValue(); }
         let repo = tempfile::tempdir().unwrap();
         fs::write(
             repo.path().join("boundary.ts"),
-            "export const Boundary = 42;\n",
+            "export const Boundary = 42; export function helper() { return 42; }\n",
         )
         .unwrap();
         fs::write(
             repo.path().join("app.ts"),
             r#"
 import { Effect } from "effect";
-import { Boundary } from "./boundary";
-export const make = Effect.gen(function* PreviewManagerMake() { return Boundary; });
-export const exposed = function Internal() { return Boundary; };
+import { Boundary, helper } from "./boundary";
+export const make = Effect.gen(function* PreviewManagerMake() { return helper() + Boundary; });
+export const exposed = function Internal() { return helper() + Boundary; };
 function* UnsupportedDeclaration() { yield Boundary; }
-module.exports = function ExportedInternal() { return Boundary; };
+module.exports = function ExportedInternal() { return helper() + Boundary; };
 "#,
         )
         .unwrap();
@@ -8400,7 +8417,7 @@ module.exports = function ExportedInternal() { return Boundary; };
                     [JS_TS_USAGE_REPAIR_KEY],
                 )
                 .unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
         let mut overlay = Store::open_overlay(
@@ -8410,7 +8427,8 @@ module.exports = function ExportedInternal() { return Boundary; };
         )
         .unwrap();
         overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
-        let mut private = Store::open_memory().unwrap();
+        let private_path = scratch.path().join("private.db");
+        let mut private = Store::open(&private_path).unwrap();
         index(&mut private, repo.path(), "test").unwrap();
         private
             .conn()
@@ -8419,7 +8437,7 @@ module.exports = function ExportedInternal() { return Boundary; };
                 [JS_TS_USAGE_REPAIR_KEY],
             )
             .unwrap();
-        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
         for store in [&mut overlay, &mut private] {
             let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
             let states = format!("{:?}", store.list_file_states("test").unwrap());
@@ -8452,6 +8470,50 @@ module.exports = function ExportedInternal() { return Boundary; };
                     "{suffix}: {incoming:?}"
                 );
             }
+            let helper = store
+                .get_node_by_qname("test", "boundary.ts::Function::helper")
+                .unwrap()
+                .unwrap();
+            let callers = store.incoming_edges(helper.id, Some("CALLS"), 100).unwrap();
+            assert_eq!(callers.len(), 3, "{callers:?}");
+            for suffix in ["Variable::make", "Function::exposed", "__file__"] {
+                let owner = store
+                    .get_node_by_qname("test", &format!("app.ts::{suffix}"))
+                    .unwrap()
+                    .unwrap();
+                assert!(callers.iter().any(|edge| edge.source_id == owner.id));
+                assert!(store
+                    .outgoing_edges(owner.id, Some("CALLS"), 100)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.target_id == helper.id));
+            }
+        }
+        drop(overlay);
+        drop(private);
+        let mut reopened = Store::open(&private_path).unwrap();
+        assert!(!recover_persisted_js_ts_usages(&mut reopened, "test", repo.path()).unwrap());
+        let mut reopened_overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        assert!(
+            !recover_persisted_js_ts_usages(&mut reopened_overlay, "test", repo.path()).unwrap()
+        );
+        for store in [&reopened, &reopened_overlay] {
+            let helper = store
+                .get_node_by_qname("test", "boundary.ts::Function::helper")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .incoming_edges(helper.id, Some("CALLS"), 100)
+                    .unwrap()
+                    .len(),
+                3
+            );
         }
         assert_eq!(base_bytes, fs::read(&base_path).unwrap());
     }
@@ -8611,7 +8673,7 @@ module.exports = function ExportedInternal() { return Boundary; };
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, repo.path(), "test").unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v3'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v9.test','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v3'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
             mark_rust_caller_edges_repaired(&base).unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
@@ -8621,7 +8683,7 @@ module.exports = function ExportedInternal() { return Boundary; };
             &greppy_store::VisibilityIndex::default(),
         )
         .unwrap();
-        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.test','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_files.test','[\"retained.rs\"]'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_rows.test','[]');").unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_files.test','[\"retained.rs\"]'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_rows.test','[]');").unwrap();
         let rust_metadata: String = overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |r| r.get(0)).unwrap();
         {
             let store = &mut overlay;

@@ -333,6 +333,12 @@ WITH candidate_edges AS (
       AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
           SELECT 1 FROM main.schema_meta m,
                json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+          WHERE m.key = CASE e.edge_type WHEN 'CALLS' THEN 'greppy.js_ts_caller_override_files.' ELSE 'greppy.js_ts_usage_override_files.' END || e.project
+            AND f.value = base_source.file_path
+      ))
+      AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
+          SELECT 1 FROM main.schema_meta m,
+               json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
           WHERE m.key = CASE e.edge_type WHEN 'CALLS' THEN 'greppy.rust_caller_override_files.' ELSE 'greppy.rust_usage_override_files.' END || e.project
             AND f.value = base_source.file_path
       ))
@@ -372,6 +378,12 @@ WITH candidate_edges AS (
           SELECT 1 FROM greppy_hidden_paths h
           WHERE h.path = base_source.file_path
       )
+      AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
+          SELECT 1 FROM main.schema_meta m,
+               json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
+          WHERE m.key = CASE e.edge_type WHEN 'CALLS' THEN 'greppy.js_ts_caller_override_files.' ELSE 'greppy.js_ts_usage_override_files.' END || e.project
+            AND f.value = base_source.file_path
+      ))
       AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
           SELECT 1 FROM main.schema_meta m,
                json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f

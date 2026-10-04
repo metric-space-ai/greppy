@@ -417,9 +417,9 @@ WHERE NOT EXISTS (
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path
 )
-AND NOT (b.edge_type='USAGE' AND EXISTS (
+AND NOT (b.edge_type IN ('USAGE','CALLS') AND EXISTS (
  SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
- WHERE m.key='greppy.js_ts_usage_override_files.' || b.project AND f.value=b.file_path
+ WHERE m.key=CASE b.edge_type WHEN 'CALLS' THEN 'greppy.js_ts_caller_override_files.' ELSE 'greppy.js_ts_usage_override_files.' END || b.project AND f.value=b.file_path
 ))
 AND NOT (b.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
     SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
@@ -434,6 +434,18 @@ SELECT -2305843009213693951 + row_number() OVER (ORDER BY m.key, CAST(r.key AS I
        'USAGE' AS edge_type, json_extract(r.value, '$.properties') AS properties
 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) r
 WHERE substr(m.key, 1, length('greppy.js_ts_usage_override_rows.')) = 'greppy.js_ts_usage_override_rows.'
+  AND NOT EXISTS (
+      SELECT 1 FROM greppy_hidden_paths h WHERE h.path = json_extract(r.value, '$.file_path')
+  )
+UNION ALL
+SELECT -1152921504606846975 + row_number() OVER (ORDER BY m.key, CAST(r.key AS INTEGER)) AS id,
+       substr(m.key, length('greppy.js_ts_caller_override_rows.') + 1) AS project,
+       json_extract(r.value, '$.file_path') AS file_path,
+       json_extract(r.value, '$.source_qname') AS source_qname,
+       json_extract(r.value, '$.target_qname') AS target_qname,
+       'CALLS' AS edge_type, json_extract(r.value, '$.properties') AS properties
+FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) r
+WHERE substr(m.key, 1, length('greppy.js_ts_caller_override_rows.')) = 'greppy.js_ts_caller_override_rows.'
   AND NOT EXISTS (
       SELECT 1 FROM greppy_hidden_paths h WHERE h.path = json_extract(r.value, '$.file_path')
   )
@@ -493,9 +505,9 @@ WHERE NOT EXISTS (
 AND NOT EXISTS (
     SELECT 1 FROM greppy_hidden_paths h WHERE h.path = base_source.file_path
 )
-AND NOT (e.edge_type='USAGE' AND EXISTS (
+AND NOT (e.edge_type IN ('USAGE','CALLS') AND EXISTS (
  SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
- WHERE m.key='greppy.js_ts_usage_override_files.' || e.project AND f.value=base_source.file_path
+ WHERE m.key=CASE e.edge_type WHEN 'CALLS' THEN 'greppy.js_ts_caller_override_files.' ELSE 'greppy.js_ts_usage_override_files.' END || e.project AND f.value=base_source.file_path
 ))
 AND NOT (e.edge_type IN ('USAGE', 'CALLS') AND EXISTS (
     SELECT 1 FROM main.schema_meta m, json_each(CASE WHEN json_valid(m.value) THEN m.value ELSE '[]' END) f
