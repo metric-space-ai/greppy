@@ -3549,6 +3549,10 @@ fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
         if depth >= 10 {
             break;
         }
+        // Callback references belong to their own body, not the outer factory.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
+        }
         if kinds.contains(&cur.kind()) {
             return true;
         }
