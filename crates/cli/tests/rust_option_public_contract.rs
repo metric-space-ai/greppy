@@ -40,7 +40,12 @@ pub fn invoke(value: Option<i32>) -> bool { direct_callback(value) }
         }
         let impact = f.query(&["impact", "predicate", "--depth", "2", "--json"]);
         let impact = impact.to_string();
-        for name in ["direct_callback", "qualified_callback", "actual_call", "invoke"] {
+        for name in [
+            "direct_callback",
+            "qualified_callback",
+            "actual_call",
+            "invoke",
+        ] {
             assert!(impact.contains(name), "{impact}");
         }
     }
