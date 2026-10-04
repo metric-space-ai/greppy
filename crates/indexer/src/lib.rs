@@ -5547,17 +5547,12 @@ impl GraphIndex {
             .get("rust_expression_macro")
             .and_then(|v| v.as_str())
         {
-            if self
-                .rust_expression_macro_identity(
-                    &edge.file_path,
-                    name,
-                    true,
-                    &mut std::collections::HashSet::new(),
-                )
-                .is_none()
-            {
-                return None;
-            }
+            self.rust_expression_macro_identity(
+                &edge.file_path,
+                name,
+                true,
+                &mut std::collections::HashSet::new(),
+            )?;
         }
         if edge
             .properties
