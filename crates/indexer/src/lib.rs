@@ -2670,9 +2670,29 @@ pub fn recover_persisted_js_ts_usages(
             "JS/TS usage repair requires indexed source fingerprints".into(),
         ));
     }
+    // A Store-CoW Delta retains fingerprints for discovery-filtered files,
+    // although those files deliberately have no graph definitions. Do not
+    // re-extract them as if their absent definitions were cache corruption.
+    let discovery_filtered: std::collections::BTreeMap<_, _> = store
+        .list_index_skips(project)?
+        .into_iter()
+        .filter(|skip| skip.reason == "discovery_filtered")
+        .map(|skip| (skip.rel_path.clone(), skip))
+        .collect();
+    let indexed_paths: std::collections::BTreeSet<_> =
+        indexed.iter().map(|node| node.file_path.as_str()).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
     for state in states.iter().filter(|state| relevant(&state.rel_path)) {
+        if !indexed_paths.contains(state.rel_path.as_str())
+            && discovery_filtered.get(&state.rel_path).is_some_and(|skip| {
+                skip.last_indexed_generation == state.last_indexed_generation
+                    && skip.size == state.size
+                    && skip.mtime_ns == state.mtime_ns
+            })
+        {
+            continue;
+        }
         let relative = Path::new(&state.rel_path);
         if relative
             .components()
@@ -7767,6 +7787,174 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    fn jsx_discovery_filtered_fixture() -> (tempfile::TempDir, IndexOptions) {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/package")).unwrap();
+        fs::write(
+            repo.path().join("node_modules/package/media-controls.js"),
+            "(() => { class MediaControls { render() { return 1; } } new MediaControls(); })();\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "boundary.tsx".to_string(),
+                "view.tsx".to_string(),
+                "node_modules/package/media-controls.js".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        (repo, options)
+    }
+
+    #[test]
+    fn jsx_usage_recovery_respects_current_discovery_filtered_identity() {
+        let (repo, options) = jsx_discovery_filtered_fixture();
+        let mut store = Store::open_memory().unwrap();
+        assert_eq!(
+            index_with_options(&mut store, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            2
+        );
+        let skip = store
+            .get_index_skip("test", "node_modules/package/media-controls.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.reason, "discovery_filtered");
+        assert!(store
+            .get_node_by_qname(
+                "test",
+                "node_modules/package/media-controls.js::Class::MediaControls"
+            )
+            .unwrap()
+            .is_none());
+        store.conn().execute_batch(
+            "DELETE FROM main.raw_edges WHERE edge_type='USAGE'; DELETE FROM main.edges WHERE edge_type='USAGE';"
+        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", store.list_file_states("test").unwrap());
+        // An unrelated failure or stale skip row cannot excuse missing definitions.
+        for case in 0..4 {
+            let mut stale = skip.clone();
+            match case {
+                0 => stale.reason = "parse_failed".into(),
+                1 => {
+                    stale.last_indexed_generation = stale.last_indexed_generation.saturating_sub(1)
+                }
+                2 => stale.size += 1,
+                _ => stale.mtime_ns += 1,
+            }
+            store.upsert_index_skip(&stale).unwrap();
+            let error =
+                recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap_err();
+            assert!(error.to_string().contains("MediaControls"), "{error}");
+            assert!(!js_ts_usages_repaired(&store).unwrap());
+            assert_eq!(
+                nodes,
+                format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+            );
+            assert_eq!(
+                states,
+                format!("{:?}", store.list_file_states("test").unwrap())
+            );
+        }
+        store.upsert_index_skip(&skip).unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        let boundary = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(boundary.id, Some("USAGE"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", store.list_file_states("test").unwrap())
+        );
+    }
+
+    #[test]
+    fn jsx_usage_recovery_respects_filtered_delta_and_preserves_base() {
+        let (repo, _) = jsx_discovery_filtered_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            assert!(base
+                .get_file_state("test", "node_modules/package/media-controls.js")
+                .unwrap()
+                .is_none());
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM main.schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "node_modules/package/media-controls.js".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        assert_eq!(
+            index_with_options(&mut overlay, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        let skip = overlay
+            .get_index_skip("test", "node_modules/package/media-controls.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.reason, "discovery_filtered");
+        assert!(js_ts_usages_repaired(&overlay).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        let boundary = overlay
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(boundary.id, Some("USAGE"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
     }
 
     #[test]
