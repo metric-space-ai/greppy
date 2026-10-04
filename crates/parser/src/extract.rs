@@ -4467,6 +4467,45 @@ fn rust_expression_macro_calls(
     ];
     let queries = crate::query::cached_query_set(&Language::Rust)
         .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
+    // Local definitions and explicit imports override familiar macro names.
+    // A qualified custom macro is never admitted just because its suffix matches.
+    let mut shadowed = std::collections::HashSet::new();
+    let mut scan = vec![root];
+    while let Some(node) = scan.pop() {
+        if matches!(node.kind(), "macro_definition" | "mod_item") {
+            if let Some(name) = node.child_by_field_name("name") {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                for import in expand_use_tree(source, argument, "") {
+                    let known = import.path == "anyhow::ensure"
+                        || import
+                            .path
+                            .strip_prefix("std::")
+                            .is_some_and(|n| MACROS.contains(&n))
+                        || import
+                            .path
+                            .strip_prefix("core::")
+                            .is_some_and(|n| MACROS.contains(&n));
+                    if !import.is_glob && !known {
+                        shadowed.insert(import.imported_name);
+                    }
+                }
+            }
+        }
+        scan.extend(node.named_children(&mut node.walk()));
+    }
+    let admitted = |path: &str| {
+        if let Some((owner, name)) = path.rsplit_once("::") {
+            !shadowed.contains(owner)
+                && ((owner == "anyhow" && name == "ensure")
+                    || (matches!(owner, "std" | "core") && MACROS.contains(&name)))
+        } else {
+            MACROS.contains(&path) && !shadowed.contains(path)
+        }
+    };
     let mut pending = Vec::new();
     let mut nodes = vec![root];
     while let Some(node) = nodes.pop() {
@@ -4477,8 +4516,8 @@ fn rust_expression_macro_calls(
                     .find(|n| n.kind() == "token_tree"),
                 enclosing_function_qname(source, node, file_path),
             ) {
-                let name = node_text(source, name).rsplit("::").next().unwrap_or("");
-                if MACROS.contains(&name) && tokens.end_byte() > tokens.start_byte() + 1 {
+                let name = node_text(source, name);
+                if admitted(name) && tokens.end_byte() > tokens.start_byte() + 1 {
                     pending.push((
                         source[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
                         tokens.start_position().row,
@@ -4527,9 +4566,14 @@ fn rust_expression_macro_calls(
                     let receiver = node
                         .parent()
                         .is_some_and(|n| n.kind() == "field_expression");
+                    // The synthetic context has no surrounding receiver/type
+                    // provenance. Do not manufacture unresolved or wrong method calls.
+                    if receiver {
+                        continue;
+                    }
                     let mut properties = serde_json::json!({
                         "callee_text": name, "callee_name": name,
-                        "callee_form": if receiver { "receiver" } else { "direct" },
+                        "callee_form": "direct",
                         "rust_expression_macro": macro_name,
                     });
                     if !receiver {
@@ -4560,8 +4604,8 @@ fn rust_expression_macro_calls(
                     node.named_children(&mut node.walk())
                         .find(|n| n.kind() == "token_tree"),
                 ) {
-                    let name = node_text(&wrapped, name).rsplit("::").next().unwrap_or("");
-                    if MACROS.contains(&name) && tokens.end_byte() > tokens.start_byte() + 1 {
+                    let name = node_text(&wrapped, name);
+                    if admitted(name) && tokens.end_byte() > tokens.start_byte() + 1 {
                         pending.push((
                             wrapped[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
                             row + tokens.start_position().row,
@@ -17846,10 +17890,33 @@ async fn caller() {
             1
         );
         assert!(!calls.iter().any(|e| e.properties["callee_name"] == "decoy"));
-        assert!(calls
-            .iter()
-            .any(|e| e.properties["callee_name"] == "is_empty"
-                && e.properties["callee_form"] == "receiver"));
+        assert!(
+            !calls
+                .iter()
+                .any(|e| e.properties["callee_name"] == "is_empty"),
+            "receiver provenance is unavailable in a synthetic macro context"
+        );
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_admit_shadowed_or_qualified_custom_macros() {
+        for source in [
+            "macro_rules! assert { ($($tokens:tt)*) => {} } fn caller() { assert!(decoy()); }",
+            "use custom::dsl as ensure; fn caller() { ensure!(decoy()); }",
+            "use custom::assert; fn caller() { assert!(decoy()); }",
+            "fn caller() { custom::assert!(decoy()); }",
+            "mod anyhow {} fn caller() { anyhow::ensure!(decoy()); }",
+            "use custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+        ] {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "custom macro invented a call: {source}"
+            );
+        }
     }
 
     #[test]
