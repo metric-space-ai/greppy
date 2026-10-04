@@ -807,9 +807,9 @@ fn rust_option_factory_owner_with_anyhow<'a>(
         }
         let wrapper = node_text(source, ty.child_by_field_name("type")?);
         let arguments = ty.child_by_field_name("type_arguments")?;
-        if allow_anyhow && wrapper == "anyhow::Result" && arguments.named_child_count() == 1 {
-            ty = arguments.named_child(0)?;
-        } else if wrapper == "Result" && arguments.named_child_count() == 2 {
+        if (allow_anyhow && wrapper == "anyhow::Result" && arguments.named_child_count() == 1)
+            || (wrapper == "Result" && arguments.named_child_count() == 2)
+        {
             ty = arguments.named_child(0)?;
         } else {
             // A local alias is evidence only when its single generic parameter
