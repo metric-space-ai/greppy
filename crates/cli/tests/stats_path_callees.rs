@@ -472,6 +472,83 @@ fn callees_factory_diagnostics_are_compact_and_share_a_batch_budget() {
 }
 
 #[test]
+fn callees_factory_diagnostics_respect_path_before_counts_and_paging() {
+    let (repo, store) = make_chain_repo("callees-factory-path");
+    std::fs::write(repo.join("src/leaf.rs"),
+        "struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} }\n\
+         pub fn leaf() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }\n\
+         pub fn direct() { Writer::open(); }\n"
+    ).unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed; {err}\n{out}");
+    for args in [
+        vec!["callees", "leaf", "--path", "src/mid.rs"],
+        vec!["callees", "leaf", "--path", "src/mid.rs", "--all"],
+        vec!["callees", "leaf", "direct", "--path", "src/mid.rs", "--all"],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "filtered text failed; {err}\n{out}");
+        assert!(
+            !out.contains("unresolved receiver upsert"),
+            "out-of-scope call leaked: {out}"
+        );
+        assert!(!out.contains("unresolved factory receivers omitted"));
+    }
+    for args in [
+        vec!["callees", "leaf", "--path", "src/mid.rs", "--json"],
+        vec!["callees", "leaf", "--path", "src/mid.rs", "--json", "--all"],
+        vec![
+            "callees",
+            "leaf",
+            "direct",
+            "--path",
+            "src/mid.rs",
+            "--json",
+            "--all",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "filtered JSON failed; {err}\n{out}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["total_exact"], 0);
+        for field in [
+            "unresolved_factory_receivers",
+            "unresolved_factory_total",
+            "unresolved_factory_omitted",
+            "unresolved_factory_truncated",
+            "callees_incomplete",
+        ] {
+            assert!(
+                value.get(field).is_none(),
+                "out-of-scope accounting leaked: {out}"
+            );
+            assert!(value["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|target| target.get(field).is_none()));
+        }
+    }
+    let (code, out, err) = run(
+        &[
+            "callees",
+            "leaf",
+            "--path",
+            "src/leaf.rs",
+            "--json",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "in-scope JSON failed; {err}\n{out}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["unresolved_factory_total"], 1);
+    assert_eq!(value["unresolved_factory_omitted"], 0);
+    assert_eq!(value["callees_incomplete"], true);
+}
+
+#[test]
 fn callees_reports_missing_symbol() {
     let (repo, store) = index_fixture("callees-missing");
     let (code, out, _err) = run(&["callees", "does_not_exist_xyz"], &repo, &store);

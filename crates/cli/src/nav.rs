@@ -3611,6 +3611,7 @@ pub(crate) fn dispatch_who_calls(
                 Vec::new(),
                 None,
                 &unresolved_report,
+                None,
             )?;
             return Ok(0);
         }
@@ -3689,6 +3690,7 @@ pub(crate) fn dispatch_who_calls(
                 Vec::new(),
                 None,
                 &unresolved_report,
+                None,
             )?;
             return Ok(0);
         }
@@ -3802,6 +3804,7 @@ pub(crate) fn dispatch_who_calls(
             hits,
             expand.as_ref(),
             &unresolved_report,
+            None,
         )?;
         return Ok(0);
     }
@@ -3853,12 +3856,16 @@ impl FactoryReceiverCache {
         store: &greppy_store::Store,
         ids: &[i64],
         limit: usize,
+        matches_path: impl Fn(&str) -> bool,
     ) -> Result<FactoryReceiverPage> {
         let mut page = FactoryReceiverPage::default();
         for id in ids {
             let Some(node) = store.get_node(*id)? else {
                 continue;
             };
+            if !matches_path(&node.file_path) {
+                continue;
+            }
             let key = (node.project.clone(), node.file_path.clone());
             if !self.by_file.contains_key(&key) {
                 self.by_file.insert(
@@ -3974,14 +3981,25 @@ mod factory_receiver_cache_tests {
         facts.push(usage);
         store.insert_raw_edges(&facts).unwrap();
         let mut cache = FactoryReceiverCache::default();
-        let one = cache.page(&store, &ids[..1], 40).unwrap();
+        let excluded = cache
+            .page(&store, &ids[..1], 40, |path| path == "src/other.rs")
+            .unwrap();
+        assert_eq!(
+            (excluded.total, excluded.rows.len(), excluded.omitted),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            cache.file_loads, 0,
+            "out-of-scope sources are rejected before hydration"
+        );
+        let one = cache.page(&store, &ids[..1], 40, |_| true).unwrap();
         assert_eq!((one.total, one.rows.len(), one.omitted), (45, 40, 5));
-        let two_hidden = cache.page(&store, &ids[1..], 0).unwrap();
+        let two_hidden = cache.page(&store, &ids[1..], 0, |_| true).unwrap();
         assert_eq!(
             (two_hidden.total, two_hidden.rows.len(), two_hidden.omitted),
             (45, 0, 45)
         );
-        let two_all = cache.page(&store, &ids[1..], usize::MAX).unwrap();
+        let two_all = cache.page(&store, &ids[1..], usize::MAX, |_| true).unwrap();
         assert_eq!(
             (two_all.total, two_all.rows.len(), two_all.omitted),
             (45, 45, 0)
@@ -4084,11 +4102,12 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
-    let unresolved_factories = if json {
-        FactoryReceiverPage::default()
-    } else {
-        FactoryReceiverCache::default().page(&store, &sources, factory_receiver_limit(code, all))?
-    };
+    let unresolved_factories = FactoryReceiverCache::default().page(
+        &store,
+        &sources,
+        factory_receiver_limit(code, all),
+        |path| path_filters.matches(path),
+    )?;
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep
@@ -4107,7 +4126,7 @@ pub(crate) fn dispatch_callees(
     if callees.is_empty() {
         if json {
             let project = project_for(root)?;
-            nav_counts_json(
+            nav_counts_json_with_expand(
                 &store,
                 root,
                 "callees",
@@ -4118,6 +4137,9 @@ pub(crate) fn dispatch_callees(
                 0,
                 all,
                 Vec::new(),
+                None,
+                &UnresolvedReceiverReport::none(),
+                Some(&unresolved_factories),
             )?;
             return Ok(0);
         }
@@ -4175,6 +4197,7 @@ pub(crate) fn dispatch_callees(
             hits,
             expand.as_ref(),
             &UnresolvedReceiverReport::none(),
+            Some(&unresolved_factories),
         )?;
         return Ok(0);
     }
