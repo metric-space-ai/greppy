@@ -3613,11 +3613,23 @@ fn nav_counts_json_with_expand(
     });
     if command == "callees" && symbol_found {
         let ids = resolve_symbol_nodes(store, Some(symbol))?;
-        let unresolved = crate::nav::unresolved_factory_receivers(store, &ids)?;
-        if !unresolved.is_empty() {
-            v["unresolved_factory_receivers"] = serde_json::json!(unresolved);
+        let unresolved = crate::nav::FactoryReceiverCache::default().page(
+            store,
+            &ids,
+            crate::nav::factory_receiver_limit(false, all),
+        )?;
+        if unresolved.total > 0 {
+            v["unresolved_factory_receivers"] = serde_json::json!(unresolved.rows);
+            v["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+            v["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+            v["unresolved_factory_truncated"] = serde_json::json!(unresolved.omitted > 0);
             v["callees_incomplete"] = serde_json::json!(true);
             v["next"] = serde_json::json!(format!("greppy read {symbol}"));
+            v["targets"][0]["callees_incomplete"] = serde_json::json!(true);
+            v["targets"][0]["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+            v["targets"][0]["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+            v["targets"][0]["unresolved_factory_truncated"] =
+                serde_json::json!(unresolved.omitted > 0);
         }
     }
     if !symbol_found {
@@ -7627,13 +7639,17 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+    let mut factory_cache = crate::nav::FactoryReceiverCache::default();
+    let mut factory_remaining = crate::nav::factory_receiver_limit(req.code, req.all);
     let unresolved_factories = resolved
         .iter()
         .map(|ids| {
             if req.kind == NavKind::Callees {
-                crate::nav::unresolved_factory_receivers(&store, ids)
+                let page = factory_cache.page(&store, ids, factory_remaining)?;
+                factory_remaining = factory_remaining.saturating_sub(page.rows.len());
+                Ok(page)
             } else {
-                Ok(Vec::new())
+                Ok(crate::nav::FactoryReceiverPage::default())
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -7756,16 +7772,39 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             .iter()
             .enumerate()
             .flat_map(|(index, rows)| {
-                rows.iter().cloned().map(move |mut row| {
+                rows.rows.iter().cloned().map(move |mut row| {
                     row["target"] = serde_json::json!(req.targets[index]);
                     row["next"] = serde_json::json!(format!("greppy read {}", req.targets[index]));
                     row
                 })
             })
             .collect::<Vec<_>>();
-        if !factory_rows.is_empty() {
+        let factory_total = unresolved_factories
+            .iter()
+            .map(|page| page.total)
+            .sum::<usize>();
+        let factory_omitted = unresolved_factories
+            .iter()
+            .map(|page| page.omitted)
+            .sum::<usize>();
+        if factory_total > 0 {
             value["unresolved_factory_receivers"] = serde_json::json!(factory_rows);
+            value["unresolved_factory_total"] = serde_json::json!(factory_total);
+            value["unresolved_factory_omitted"] = serde_json::json!(factory_omitted);
+            value["unresolved_factory_truncated"] = serde_json::json!(factory_omitted > 0);
             value["callees_incomplete"] = serde_json::json!(true);
+            for (index, page) in unresolved_factories
+                .iter()
+                .enumerate()
+                .filter(|(_, page)| page.total > 0)
+            {
+                value["targets"][index]["callees_incomplete"] = serde_json::json!(true);
+                value["targets"][index]["unresolved_factory_total"] = serde_json::json!(page.total);
+                value["targets"][index]["unresolved_factory_omitted"] =
+                    serde_json::json!(page.omitted);
+                value["targets"][index]["unresolved_factory_truncated"] =
+                    serde_json::json!(page.omitted > 0);
+            }
         }
         let unresolved_json = unresolved_by_target
             .iter()

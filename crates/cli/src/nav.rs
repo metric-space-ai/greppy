@@ -3833,46 +3833,171 @@ pub(crate) fn dispatch_who_calls(
     }
     Ok(0)
 }
-pub(crate) fn unresolved_factory_receivers(
-    store: &greppy_store::Store,
-    ids: &[i64],
-) -> Result<Vec<serde_json::Value>> {
-    let mut rows = Vec::new();
-    for id in ids {
-        let Some(node) = store.get_node(*id)? else {
-            continue;
-        };
-        for edge in store.list_raw_edges_for_file(&node.project, &node.file_path)? {
-            if edge.source_qname != node.qualified_name
-                || edge.edge_type != "CALLS"
-                || edge.properties.get("receiver_owner").is_some()
-            {
+#[derive(Default)]
+pub(crate) struct FactoryReceiverPage {
+    pub rows: Vec<serde_json::Value>,
+    pub total: usize,
+    pub omitted: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct FactoryReceiverCache {
+    by_file: std::collections::HashMap<(String, String), Vec<greppy_store::RawEdge>>,
+    #[cfg(test)]
+    file_loads: usize,
+}
+
+impl FactoryReceiverCache {
+    pub(crate) fn page(
+        &mut self,
+        store: &greppy_store::Store,
+        ids: &[i64],
+        limit: usize,
+    ) -> Result<FactoryReceiverPage> {
+        let mut page = FactoryReceiverPage::default();
+        for id in ids {
+            let Some(node) = store.get_node(*id)? else {
                 continue;
+            };
+            let key = (node.project.clone(), node.file_path.clone());
+            if !self.by_file.contains_key(&key) {
+                self.by_file.insert(
+                    key.clone(),
+                    store
+                        .list_raw_factory_receiver_edges_for_file(&node.project, &node.file_path)?,
+                );
+                #[cfg(test)]
+                {
+                    self.file_loads += 1;
+                }
             }
-            if let Some(factory) = edge
-                .properties
-                .get("receiver_factory_pattern")
-                .and_then(|value| value.as_str())
+            for edge in self.by_file[&key]
+                .iter()
+                .filter(|edge| edge.source_qname == node.qualified_name)
             {
-                rows.push(serde_json::json!({
+                page.total += 1;
+                if page.rows.len() >= limit {
+                    continue;
+                }
+                let line = edge
+                    .properties
+                    .get("line")
+                    .and_then(|value| value.as_u64())
+                    .filter(|line| *line > 0 && *line <= u32::MAX as u64);
+                page.rows.push(serde_json::json!({
                     "file": edge.file_path,
-                    "line": edge.properties.get("line").cloned().unwrap_or(serde_json::json!(0)),
+                    "line": line,
                     "callee": edge.properties.get("callee_name").cloned().unwrap_or(serde_json::json!("")),
-                    "factory": factory,
+                    "factory": edge.properties["receiver_factory_pattern"],
                     "reason": "factory_pattern_owner_unproven",
                 }));
             }
         }
+        page.omitted = page.total.saturating_sub(page.rows.len());
+        Ok(page)
     }
-    Ok(rows)
 }
 
-pub(crate) fn print_unresolved_factory_receivers(rows: &[serde_json::Value], symbol: &str) {
-    for row in rows {
+pub(crate) fn factory_receiver_limit(code: bool, all: bool) -> usize {
+    if all {
+        usize::MAX
+    } else {
+        cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, false)
+    }
+}
+
+pub(crate) fn print_unresolved_factory_receivers(page: &FactoryReceiverPage, symbol: &str) {
+    for row in &page.rows {
+        let location = match row["line"].as_u64() {
+            Some(line) => format!("{}:{line}", row["file"].as_str().unwrap_or("")),
+            None => format!(
+                "{} (call-site line unavailable)",
+                row["file"].as_str().unwrap_or("")
+            ),
+        };
         println!(
-            "{}:{}  unresolved receiver {}; factory {} return type or pattern scope is unproven; greppy read {symbol}",
-            row["file"].as_str().unwrap_or(""), row["line"],
+            "{location}  unresolved receiver {}; factory {} return type or pattern scope is unproven; greppy read {symbol}",
             row["callee"].as_str().unwrap_or(""), row["factory"].as_str().unwrap_or("")
+        );
+    }
+    if page.omitted > 0 {
+        println!("… {} unresolved factory receivers omitted ({} total); callees incomplete — greppy callees {symbol} --all", page.omitted, page.total);
+    }
+}
+
+#[cfg(test)]
+mod factory_receiver_cache_tests {
+    use super::*;
+
+    #[test]
+    fn factory_receiver_pages_count_exactly_and_load_same_file_once() {
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        store
+            .upsert_project(&greppy_store::Project {
+                name: "factory-pages".into(),
+                indexed_at: "test".into(),
+                root_path: "/repo".into(),
+            })
+            .unwrap();
+        let nodes = ["one", "two"].map(|name| greppy_store::NewNode {
+            project: "factory-pages".into(),
+            label: "Function".into(),
+            name: name.into(),
+            qualified_name: format!("src/lib.rs::Function::{name}"),
+            file_path: "src/lib.rs".into(),
+            start_line: 1,
+            end_line: 100,
+            properties: serde_json::json!({}),
+        });
+        let ids = store.insert_nodes(&nodes).unwrap();
+        let mut facts = Vec::new();
+        for name in ["one", "two"] {
+            for line in 1..=45 {
+                facts.push(greppy_store::NewRawEdge {
+                    project: "factory-pages".into(),
+                    file_path: "src/lib.rs".into(),
+                    source_qname: format!("src/lib.rs::Function::{name}"),
+                    target_qname: "unresolved".into(),
+                    edge_type: "CALLS".into(),
+                    properties: serde_json::json!({
+                        "receiver_factory_pattern": "Writer::open", "callee_name": "upsert",
+                        "line": if name == "two" && line == 1 { None } else { Some(line) },
+                    }),
+                });
+            }
+        }
+        let mut resolved = facts[0].clone();
+        resolved.properties["receiver_owner"] = serde_json::json!("Writer");
+        facts.push(resolved);
+        let mut usage = facts[0].clone();
+        usage.edge_type = "USAGE".into();
+        facts.push(usage);
+        store.insert_raw_edges(&facts).unwrap();
+        let mut cache = FactoryReceiverCache::default();
+        let one = cache.page(&store, &ids[..1], 40).unwrap();
+        assert_eq!((one.total, one.rows.len(), one.omitted), (45, 40, 5));
+        let two_hidden = cache.page(&store, &ids[1..], 0).unwrap();
+        assert_eq!(
+            (two_hidden.total, two_hidden.rows.len(), two_hidden.omitted),
+            (45, 0, 45)
+        );
+        let two_all = cache.page(&store, &ids[1..], usize::MAX).unwrap();
+        assert_eq!(
+            (two_all.total, two_all.rows.len(), two_all.omitted),
+            (45, 45, 0)
+        );
+        assert!(
+            two_all.rows[0]["line"].is_null(),
+            "missing coordinates must never become file:0"
+        );
+        assert_eq!(
+            cache.file_loads, 1,
+            "a same-file batch hydrates its relevant facts once"
+        );
+        assert_eq!(
+            cache.by_file.values().next().unwrap().len(),
+            90,
+            "resolved receivers and unrelated usages were filtered before hydration"
         );
     }
 }
@@ -3959,7 +4084,11 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
-    let unresolved_factories = unresolved_factory_receivers(&store, &sources)?;
+    let unresolved_factories = if json {
+        FactoryReceiverPage::default()
+    } else {
+        FactoryReceiverCache::default().page(&store, &sources, factory_receiver_limit(code, all))?
+    };
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep

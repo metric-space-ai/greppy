@@ -368,6 +368,9 @@ fn callees_factory_pattern_coverage_is_safe_and_targeted() {
             out.contains("unresolved receiver upsert"),
             expected_incomplete
         );
+        if expected_incomplete {
+            assert!(out.lines().any(|line| line == "src/leaf.rs:2  unresolved receiver upsert; factory Writer::open return type or pattern scope is unproven; greppy read leaf"), "exact persisted call-site line is required: {out}");
+        }
         let (code, out, err) = run(&["callees", "leaf", "--json"], &repo, &store);
         assert_eq!(code, 0, "JSON failed; {err}\n{out}");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -397,6 +400,74 @@ fn callees_factory_pattern_coverage_is_safe_and_targeted() {
         let (code, out, err) = run(&["callees", "direct"], &repo, &store);
         assert_eq!(code, 0, "direct failed; {err}\n{out}");
         assert!(!out.contains("unresolved receiver"));
+    }
+}
+
+#[test]
+fn callees_factory_diagnostics_are_compact_and_share_a_batch_budget() {
+    let (repo, store) = make_chain_repo("callees-factory-cap");
+    let calls = "writer.upsert();\n".repeat(45);
+    std::fs::write(repo.join("src/leaf.rs"), format!(
+        "struct Writer; impl Writer {{ fn open() -> anyhow::Result<Option<Self>> {{ loop {{}} }} fn upsert(&mut self) {{}} }}\n\
+         pub fn leaf() {{ if let Some(mut writer) = Writer::open()? {{\n{calls}}} }}\n\
+         pub fn peer() {{ if let Some(mut writer) = Writer::open()? {{\n{calls}}} }}\n"
+    )).unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed; {err}\n{out}");
+    for (args, shown, total) in [
+        (vec!["callees", "leaf", "--json"], 40, 45),
+        (vec!["callees", "leaf", "--json", "--all"], 45, 45),
+        (vec!["callees", "leaf", "peer", "--json"], 40, 90),
+        (vec!["callees", "leaf", "peer", "--json", "--all"], 90, 90),
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "callees failed; {err}\n{out}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["unresolved_factory_receivers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            shown
+        );
+        assert_eq!(value["unresolved_factory_total"], total);
+        assert_eq!(value["unresolved_factory_omitted"], total - shown);
+        assert_eq!(value["unresolved_factory_truncated"], total > shown);
+        assert_eq!(value["callees_incomplete"], true);
+        assert!(value["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["name"] == "open"));
+        if args.contains(&"peer") {
+            let peer = value["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|target| target["symbol"] == "peer")
+                .unwrap();
+            assert_eq!(peer["unresolved_factory_total"], 45);
+            assert_eq!(peer["callees_incomplete"], true);
+        }
+    }
+    for (args, shown) in [
+        (vec!["callees", "leaf"], 40),
+        (vec!["callees", "leaf", "--code"], 6),
+        (vec!["callees", "leaf", "--all"], 45),
+        (vec!["callees", "leaf", "peer"], 40),
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "text failed; {err}\n{out}");
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("unresolved receiver upsert;"))
+                .count(),
+            shown
+        );
+        assert_eq!(
+            out.contains("unresolved factory receivers omitted"),
+            shown < if args.contains(&"peer") { 90 } else { 45 }
+        );
     }
 }
 
