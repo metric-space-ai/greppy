@@ -4644,33 +4644,36 @@ impl GraphIndex {
                 .is_some_and(|name| name == "anyhow.rs")
                 || file.ends_with("anyhow/mod.rs")
         });
-        let anyhow_factory_files = anyhow_context
+        let anyhow_factory_files: std::collections::HashSet<String> = anyhow_context
             .into_iter()
             .filter(|(scope_project, _)| scope_project == project && !namespace_shadowed)
             .map(|(_, file)| file)
             .collect();
         let mut anyhow_glob_proofs = std::collections::HashSet::new();
         let mut observed_globs = std::collections::HashSet::new();
-        if let Some(project_info) = store.get_project(project)? {
+        if let Some(project_info) = store
+            .get_project(project)?
+            .filter(|_| !anyhow_factory_files.is_empty())
+        {
             let root = Path::new(&project_info.root_path);
             let states = store.list_file_states(project)?;
-            for edge in store.list_raw_edges(project)?.iter().filter(|edge| {
-                edge.properties
-                    .get("receiver_anyhow_factory_owner")
-                    .is_some()
-            }) {
-                let Some(globs) = edge
-                    .properties
-                    .get("receiver_anyhow_glob_files")
-                    .and_then(|value| value.as_array())
+            let facts = {
+                let mut stmt = store.conn().prepare("SELECT file_path, json_extract(properties,'$.receiver_anyhow_glob_files') FROM raw_edges WHERE project=?1 AND json_type(properties,'$.receiver_anyhow_factory_owner')='text' AND json_type(properties,'$.receiver_anyhow_glob_files')='array'").map_err(sqlite_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(sqlite_err)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sqlite_err)?
+            };
+            for (file_path, encoded_globs) in facts {
+                let Ok(globs) = serde_json::from_str::<Vec<serde_json::Value>>(&encoded_globs)
                 else {
                     continue;
                 };
-                let proof_key = format!(
-                    "{}:{}",
-                    edge.file_path,
-                    serde_json::Value::Array(globs.clone())
-                );
+                let proof_key =
+                    format!("{}:{}", file_path, serde_json::Value::Array(globs.clone()));
                 if !observed_globs.insert(proof_key.clone()) {
                     continue;
                 }
@@ -4678,7 +4681,7 @@ impl GraphIndex {
                     let Some(path) = value.as_str() else {
                         return false;
                     };
-                    let relative = Path::new(&edge.file_path)
+                    let relative = Path::new(&file_path)
                         .parent()
                         .unwrap_or_else(|| Path::new(""))
                         .join(path);
@@ -5214,14 +5217,23 @@ impl GraphIndex {
                 .get("receiver_owner")
                 .and_then(|value| value.as_str())
                 .or_else(|| {
-                    self.anyhow_factory_files
-                        .contains(&edge.file_path)
-                        .then(|| {
-                            edge.properties
-                                .get("receiver_anyhow_factory_owner")
-                                .and_then(|value| value.as_str())
-                        })
-                        .flatten()
+                    let globs = edge
+                        .properties
+                        .get("receiver_anyhow_glob_files")?
+                        .as_array()?;
+                    let proof_key = format!(
+                        "{}:{}",
+                        edge.file_path,
+                        serde_json::Value::Array(globs.clone())
+                    );
+                    (self.anyhow_factory_files.contains(&edge.file_path)
+                        && self.anyhow_glob_proofs.contains(&proof_key))
+                    .then(|| {
+                        edge.properties
+                            .get("receiver_anyhow_factory_owner")
+                            .and_then(|value| value.as_str())
+                    })
+                    .flatten()
                 })?;
             if edge
                 .properties
@@ -12257,7 +12269,7 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             &greppy_store::VisibilityIndex::default(),
         )
         .unwrap();
-        mark_anyhow_factory_edges_repaired(&overlay).unwrap();
+        mark_rust_caller_edges_repaired(&overlay).unwrap();
         assert!(!anyhow_factory_edges_repaired(&overlay).unwrap());
         let nodes = format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap());
         let states = format!("{:?}", overlay.list_file_states("test").unwrap());
@@ -12267,7 +12279,7 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         );
         recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap();
         rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
-        mark_anyhow_factory_edges_repaired(&overlay).unwrap();
+        mark_rust_caller_edges_repaired(&overlay).unwrap();
         assert!(anyhow_factory_edges_repaired(&overlay).unwrap());
         let method = overlay
             .get_node_by_qname("test", "src/lib.rs::Writer::upsert")
