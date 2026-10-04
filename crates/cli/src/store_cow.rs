@@ -1531,10 +1531,12 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                         inherited_leases,
                     );
                     Some(prepare_base_store_paths(
-                        &primary,
-                        clean.path(),
-                        clean.path(),
-                        &base_commit,
+                        BaseSourcePaths {
+                            repo_root: &primary,
+                            source_path: clean.path(),
+                            worktree_path: clean.path(),
+                            base_commit: &base_commit,
+                        },
                         shared_data_root,
                         embedding_args,
                         progress_path,
@@ -1989,10 +1991,12 @@ pub(crate) fn prepare_base_store(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
     prepare_base_store_paths(
-        workspace.repo_root(),
-        workspace.repository_path(),
-        workspace.worktree_path(),
-        workspace.base_commit(),
+        BaseSourcePaths {
+            repo_root: workspace.repo_root(),
+            source_path: workspace.repository_path(),
+            worktree_path: workspace.worktree_path(),
+            base_commit: workspace.base_commit(),
+        },
         shared_data_root,
         embedding_args,
         None,
@@ -2001,17 +2005,27 @@ pub(crate) fn prepare_base_store(
     )
 }
 
+struct BaseSourcePaths<'a> {
+    repo_root: &'a Path,
+    source_path: &'a Path,
+    worktree_path: &'a Path,
+    base_commit: &'a str,
+}
+
 fn prepare_base_store_paths(
-    repo_root: &Path,
-    source_path: &Path,
-    worktree_path: &Path,
-    base_commit: &str,
+    source: BaseSourcePaths<'_>,
     shared_data_root: &Path,
     embedding_args: crate::EmbeddingCliArgs<'_>,
     progress_path: Option<&Path>,
     deadline: Option<std::time::Instant>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PreparedBase> {
+    let BaseSourcePaths {
+        repo_root,
+        source_path,
+        worktree_path,
+        base_commit,
+    } = source;
     let structural_first_use = std::env::var_os(crate::ENV_STRUCTURAL_FIRST_USE).is_some();
     let identity = base_identity_parts(repo_root, base_commit)?;
     let identity_hash = identity

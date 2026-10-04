@@ -713,8 +713,12 @@ fn bounded_index_status(json: bool, root: Option<&str>) -> Result<i32> {
     command
         .args(std::env::args_os().skip(1))
         .env(STATUS_WORKER_ENV, "1");
-    let (terminal, bytes, errors, phase) =
-        run_status_inspection(command, std::time::Duration::from_millis(BUDGET_MS))?;
+    let StatusInspection {
+        terminal,
+        bytes,
+        errors,
+        phase,
+    } = run_status_inspection(command, std::time::Duration::from_millis(BUDGET_MS))?;
     if let Some(status) = terminal {
         std::io::stdout()
             .write_all(&bytes)
@@ -740,10 +744,18 @@ fn bounded_index_status(json: bool, root: Option<&str>) -> Result<i32> {
 }
 
 #[cfg(unix)]
+struct StatusInspection {
+    terminal: Option<std::process::ExitStatus>,
+    bytes: Vec<u8>,
+    errors: Vec<u8>,
+    phase: String,
+}
+
+#[cfg(unix)]
 fn run_status_inspection(
     mut command: std::process::Command,
     budget: std::time::Duration,
-) -> Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, String)> {
+) -> Result<StatusInspection> {
     use std::io::{ErrorKind, Read};
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -849,7 +861,12 @@ fn run_status_inspection(
             errors.extend_from_slice(line);
         }
     }
-    Ok((terminal, bytes, errors, phase))
+    Ok(StatusInspection {
+        terminal,
+        bytes,
+        errors,
+        phase,
+    })
 }
 
 // Advisory only: a large cache must not consume the readiness watchdog.
@@ -892,8 +909,12 @@ fn status_watchdog_includes_descendant_pipe_drain_after_worker_exit() {
     let mut command = std::process::Command::new("/bin/sh");
     command.args(["-c", "/bin/sleep 30 & printf 'worker finished\\n'; printf 'greppy-status-phase:pipe_drain\\n' >&2"]);
     let start = std::time::Instant::now();
-    let (terminal, output, errors, phase) =
-        run_status_inspection(command, std::time::Duration::from_millis(500)).unwrap();
+    let StatusInspection {
+        terminal,
+        bytes: output,
+        errors,
+        phase,
+    } = run_status_inspection(command, std::time::Duration::from_millis(500)).unwrap();
     assert!(
         terminal.is_none(),
         "a retained pipe must exhaust the inspection budget"
