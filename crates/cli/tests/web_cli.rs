@@ -84,16 +84,17 @@ fn action_expect_help_distinguishes_query_type_from_shell_quoting() {
 }
 
 #[test]
-fn session_new_refusal_names_create_and_nested_usage() {
-    let (code, stdout, stderr) = run(&["web", "session", "new", "--profile", "project"]);
-    assert_eq!(code, 64, "stdout={stdout} stderr={stderr}");
-    let text = format!("{stdout}{stderr}");
+fn session_new_alias_has_the_same_help_as_create_without_starting_runtime() {
+    let alias = run(&["web", "session", "new", "--profile", "project", "--help"]);
+    let canonical = run(&["web", "session", "create", "--profile", "project", "--help"]);
+    assert_eq!(alias.0, 0, "stdout={} stderr={}", alias.1, alias.2);
+    assert_eq!(alias, canonical, "alias and canonical help must agree");
     assert!(
-        text.contains("greppy web session create --profile project"),
-        "{text}"
+        alias.1.contains("project: public web plus loopback"),
+        "{}",
+        alias.1
     );
-    assert!(text.contains("usage: greppy web session"), "{text}");
-    assert!(!text.contains("usage: greppy web status|doctor"), "{text}");
+    assert!(!alias.1.contains("runtime_unavailable"), "{}", alias.1);
 }
 
 #[test]

@@ -35,6 +35,13 @@ pub fn invoke(value: Option<i32>) -> bool { direct_callback(value) }
         let callers = f.query(&["who-calls", "predicate", "--all", "--json"]);
         assert_eq!(hits(&callers), 3, "{callers}");
         let callers = callers.to_string();
+        for shadowed in [
+            "shadowed_callback",
+            "local_callback",
+            "conditional_callback",
+        ] {
+            assert!(!callers.contains(shadowed), "{callers}");
+        }
         for name in ["direct_callback", "qualified_callback", "actual_call"] {
             assert!(callers.contains(name), "{callers}");
         }
@@ -601,7 +608,7 @@ fn v9_inline_namespace_proof_is_reextracted_on_normal_query() {
     );
     assert!(db.exists(), "fixture graph missing: {}", db.display());
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v10'; INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v9','complete'); UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance.limits.standard_namespace_bindings') WHERE edge_type='CALLS'; UPDATE edges SET edge_type='CALLS' WHERE edge_type='UNRESOLVED_CALLS';").unwrap();
+    conn.execute_batch("DELETE FROM schema_meta WHERE key IN ('greppy.rust_caller_edges_repair.v10','greppy.rust_caller_edges_repair.v11','greppy.rust_caller_edges_repair.v12'); INSERT OR REPLACE INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v9','complete'); UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_provenance.limits.standard_namespace_bindings') WHERE edge_type='CALLS'; UPDATE edges SET edge_type='CALLS' WHERE edge_type='UNRESOLVED_CALLS';").unwrap();
     assert!(
         conn.query_row(
             "SELECT count(*) FROM edges WHERE edge_type='CALLS'",
@@ -618,7 +625,7 @@ fn v9_inline_namespace_proof_is_reextracted_on_normal_query() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT value FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v10'",
+            "SELECT value FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v12'",
             [],
             |row| row.get::<_, String>(0)
         )

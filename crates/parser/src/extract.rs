@@ -1759,6 +1759,43 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
             .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
             .any(|child| binds(source, child, name))
     }
+    // A pattern's declaration is not a read of a same-named module value.
+    // Unlike body references, it occurs before the binding becomes visible.
+    // Keep constructor/type paths as references while marking only bare binding
+    // identifiers in let/if-let/while-let patterns.
+    let mut pattern_ancestor = reference.parent();
+    while let Some(parent) = pattern_ancestor {
+        if matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            break;
+        }
+        if matches!(parent.kind(), "tuple_struct_pattern" | "struct_pattern")
+            && parent
+                .child_by_field_name("type")
+                .or_else(|| parent.child_by_field_name("name"))
+                .is_some_and(|constructor| node_contains(constructor, reference))
+        {
+            break;
+        }
+        if matches!(parent.kind(), "let_declaration" | "let_condition") {
+            if parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| node_contains(pattern, reference))
+            {
+                return true;
+            }
+            break;
+        }
+        if matches!(
+            parent.kind(),
+            "block" | "function_item" | "closure_expression"
+        ) {
+            break;
+        }
+        pattern_ancestor = parent.parent();
+    }
     let mut ancestor = reference.parent();
     while let Some(scope) = ancestor {
         if scope.kind() == "block" {
@@ -1959,6 +1996,66 @@ pub fn state(value: Instruction) -> u8 {
             constructor_field_labels.is_empty(),
             "named field labels are not unqualified value reads"
         );
+    }
+
+    #[test]
+    fn callback_binding_declarations_are_local_but_initializers_and_constructors_are_reads() {
+        let source = br#"
+fn predicate(value: i32) -> bool { value > 0 }
+struct Callback(fn(i32) -> bool);
+fn local_callback(value: Option<i32>) {
+    let predicate = predicate;
+    value.map(predicate).unwrap_or(false);
+}
+fn conditional_callback(value: Option<i32>, candidate: Option<fn(i32) -> bool>) {
+    if let Some(predicate) = candidate { value.map(predicate); }
+}
+fn constructor_callback(value: Option<i32>, candidate: Callback) {
+    let Callback(predicate) = candidate;
+    value.map(predicate);
+}
+"#;
+        let extracted = extract_rust(source, "callbacks.rs").unwrap();
+        let references = |caller: &str| {
+            extracted
+                .edges
+                .iter()
+                .filter(move |edge| {
+                    edge.edge_type == "USAGE"
+                        && edge.source_qualified_name.ends_with(caller)
+                        && edge.properties["ref_name"] == "predicate"
+                })
+                .collect::<Vec<_>>()
+        };
+        let local = references("::local_callback");
+        assert_eq!(local.len(), 3);
+        assert_eq!(
+            local
+                .iter()
+                .filter(|edge| edge.properties["ref_local_binding"] == true)
+                .count(),
+            2,
+            "the declaration and callback are local; the initializer still reads the global"
+        );
+        for caller in ["::conditional_callback", "::constructor_callback"] {
+            let references = references(caller);
+            assert_eq!(references.len(), 2, "{caller}: {references:?}");
+            assert!(references
+                .iter()
+                .all(|edge| edge.properties["ref_local_binding"] == true));
+        }
+        let constructor = extracted
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "USAGE"
+                    && edge
+                        .source_qualified_name
+                        .ends_with("::constructor_callback")
+                    && edge.properties["ref_name"] == "Callback"
+            })
+            .expect("a destructuring constructor is a type reference");
+        assert_ne!(constructor.properties["ref_local_binding"], true);
     }
 }
 
