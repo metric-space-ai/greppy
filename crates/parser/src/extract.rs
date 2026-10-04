@@ -2501,11 +2501,9 @@ fn range_callback(value: i32) { if let 1..=LIMIT = value {} }
         for caller in ["::conditional_callback", "::constructor_callback"] {
             let references = references(caller);
             assert_eq!(references.len(), 2, "{caller}: {references:?}");
-            assert!(
-                references
-                    .iter()
-                    .all(|edge| edge.properties["ref_local_binding"] == true)
-            );
+            assert!(references
+                .iter()
+                .all(|edge| edge.properties["ref_local_binding"] == true));
         }
         let constructor = extracted
             .edges
@@ -15849,7 +15847,11 @@ fn extract_fortran(
 fn fortran_call_callee<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str> {
     let name = find_child_of_kind(call, "identifier")?;
     let text = node_text(source, name);
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// CALLS pass for Fortran (call kinds =
@@ -17981,19 +17983,15 @@ fn caller() {
 }
 "#;
         let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-        assert!(
-            !result
-                .edges
-                .iter()
-                .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback")
-        );
-        assert!(
-            result
-                .edges
-                .iter()
-                .any(|e| e.properties["callee_path"] == "T::run"
-                    && e.properties["rust_local_type_owner"] == true)
-        );
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
     }
 
     #[test]
@@ -18022,19 +18020,15 @@ fn caller() {
     fn rust_expression_macros_keep_original_generic_and_local_callee_scope() {
         let source = "fn caller<T>(callback: fn()) { assert!(T::run()); assert!(callback()); }";
         let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-        assert!(
-            result
-                .edges
-                .iter()
-                .any(|e| e.properties["callee_path"] == "T::run"
-                    && e.properties["rust_local_type_owner"] == true)
-        );
-        assert!(
-            !result
-                .edges
-                .iter()
-                .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback")
-        );
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
     }
 
     #[test]
@@ -18067,16 +18061,12 @@ fn caller() {
             .iter()
             .filter(|e| e.edge_type == "CALLS")
             .collect();
-        assert!(
-            calls
-                .iter()
-                .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2)
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3)
-        );
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2));
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3));
     }
 
     #[test]
@@ -18611,19 +18601,15 @@ fn f(manifest: Manifest) {
             );
         }
         let shadow = source.replace("writer.upsert();", "let writer = unknown; writer.upsert();");
-        assert!(
-            extract_calls(&shadow)[0]
-                .properties
-                .get("receiver_anyhow_factory_owner")
-                .is_none()
-        );
+        assert!(extract_calls(&shadow)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
         let wrapper = source.replace("anyhow::Result", "external::Result");
-        assert!(
-            extract_calls(&wrapper)[0]
-                .properties
-                .get("receiver_anyhow_factory_owner")
-                .is_none()
-        );
+        assert!(extract_calls(&wrapper)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
     }
 
     #[test]
@@ -18944,11 +18930,9 @@ fn shadowed<Response>() { parse::<Response>(); }
                 assert_eq!(edge.properties["ref_path"], "crate::Response");
             }
         }
-        assert!(
-            !usages
-                .iter()
-                .any(|edge| edge.properties["ref_name"] == "parse")
-        );
+        assert!(!usages
+            .iter()
+            .any(|edge| edge.properties["ref_name"] == "parse"));
         assert_eq!(
             result
                 .edges
@@ -19775,14 +19759,12 @@ fn plain() {}
                 .and_then(|value| value.as_str()),
             Some("pub fn rename_by_rules(&mut self, rules: RenameAllRules)")
         );
-        assert!(
-            !node
-                .properties
-                .get("source_signature")
-                .and_then(|value| value.as_str())
-                .unwrap()
-                .contains("-> ()")
-        );
+        assert!(!node
+            .properties
+            .get("source_signature")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .contains("-> ()"));
     }
 
     #[test]
@@ -20941,18 +20923,14 @@ export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
             2,
             "opening and self-closing tags count once: {usages:?}"
         );
-        assert!(
-            usages
-                .iter()
-                .all(|edge| edge.properties["ref_name"] == "Boundary"
-                    && edge.source_qualified_name == "view.tsx::Function::Render")
-        );
-        assert!(
-            !result
-                .edges
-                .iter()
-                .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI")
-        );
+        assert!(usages
+            .iter()
+            .all(|edge| edge.properties["ref_name"] == "Boundary"
+                && edge.source_qualified_name == "view.tsx::Function::Render"));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
     }
 
     #[test]
@@ -23120,23 +23098,20 @@ contract C is IThing {
         assert!(has("Enum", "State"));
         // struct member → Field only (no Variable twin).
         assert!(has("Field", "amount"));
-        assert!(
-            !r.nodes
-                .iter()
-                .any(|n| n.label == "Variable" && n.name == "amount")
-        );
+        assert!(!r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Variable" && n.name == "amount"));
         // contract state variable → Field + Variable twin.
         assert!(has("Field", "total"));
         assert!(has("Variable", "total"));
         // owned function/modifier → Method + Function twin + DEFINES_METHOD.
         assert!(has("Method", "go") && has("Function", "go"));
         assert!(has("Method", "guard") && has("Function", "guard"));
-        assert!(
-            r.edges
-                .iter()
-                .any(|e| e.edge_type == "DEFINES_METHOD"
-                    && e.target_qualified_name == "a.sol::C::go")
-        );
+        assert!(r
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "DEFINES_METHOD" && e.target_qualified_name == "a.sol::C::go"));
     }
 
     #[test]
@@ -23151,16 +23126,14 @@ function freeHelper(uint256 x) pure returns (uint256) { return x; }
         let r = solidity(src, "a.sol");
         // Free (top-level) function → exactly one Function node, no Method twin.
         assert_eq!(r.nodes.iter().filter(|n| n.name == "freeHelper").count(), 1);
-        assert!(
-            r.nodes
-                .iter()
-                .any(|n| n.label == "Function" && n.name == "freeHelper")
-        );
-        assert!(
-            !r.nodes
-                .iter()
-                .any(|n| n.label == "Method" && n.name == "freeHelper")
-        );
+        assert!(r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Function" && n.name == "freeHelper"));
+        assert!(!r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Method" && n.name == "freeHelper"));
         // Same-file CALLS: `a` calls `b`; source is the enclosing Method qname.
         assert!(r.edges.iter().any(|e| e.edge_type == "CALLS"
             && e.source_qualified_name == "a.sol::C::a"
@@ -23245,11 +23218,10 @@ double helper(double v) { return v; }
         assert!(!r.nodes.iter().any(|n| n.name == "helper"));
         assert!(!r.nodes.iter().any(|n| n.label == "Function"));
         // no Field/Variable nodes for objc properties/ivars.
-        assert!(
-            !r.nodes
-                .iter()
-                .any(|n| n.label == "Field" || n.label == "Variable")
-        );
+        assert!(!r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Field" || n.label == "Variable"));
         // DEFINES_METHOD from the Class node to each owned method.
         assert!(r.edges.iter().any(|e| e.edge_type == "DEFINES_METHOD"
             && e.source_qualified_name == "Shape.m::Class::Shape"
@@ -23287,14 +23259,12 @@ double helper(double v) { return v; }
     fn extract_ok_for_batch_onboarded_extensions() {
         assert!(extract(Language::Lua, b"function f() end", "a.lua").is_ok());
         assert!(extract(Language::Kotlin, b"fun f() {}", "a.kt").is_ok());
-        assert!(
-            extract(
-                Language::Scala,
-                b"object O { def f(): Unit = {} }",
-                "a.scala"
-            )
-            .is_ok()
-        );
+        assert!(extract(
+            Language::Scala,
+            b"object O { def f(): Unit = {} }",
+            "a.scala"
+        )
+        .is_ok());
         assert!(extract(Language::Swift, b"func f() {}", "a.swift").is_ok());
         assert!(extract(Language::Zig, b"fn f() void {}", "a.zig").is_ok());
         assert!(extract(Language::R, b"f <- function() { 1 }", "a.r").is_ok());
@@ -23359,11 +23329,10 @@ helper n = doubled
         // into a function body).
         assert_eq!(names_of("Function"), vec!["area", "describe", "helper"]);
         // Class node qname uses the free `{file}::Class::{name}` scheme.
-        assert!(
-            r.nodes
-                .iter()
-                .any(|n| n.label == "Class" && n.qualified_name == "M.hs::Class::Shape")
-        );
+        assert!(r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Class" && n.qualified_name == "M.hs::Class::Shape"));
     }
 
     #[test]
@@ -24084,11 +24053,10 @@ end
                     == Some("ocaml_compilation_unit")
         }));
         assert!(!r.nodes.iter().any(|n| n.name == "Fib"));
-        assert!(
-            r.nodes
-                .iter()
-                .any(|n| n.label == "Type" && n.name == "widget")
-        );
+        assert!(r
+            .nodes
+            .iter()
+            .any(|n| n.label == "Type" && n.name == "widget"));
         assert!(r.edges.iter().any(|edge| {
             edge.edge_type == "IMPORTS"
                 && edge
@@ -24989,11 +24957,10 @@ scale <- function(x) {
             "k.py",
         );
         assert!(r.nodes.iter().any(|n| n.qualified_name == "k.py::K::m"));
-        assert!(
-            r.nodes
-                .iter()
-                .any(|n| n.qualified_name == "k.py::Function::g")
-        );
+        assert!(r
+            .nodes
+            .iter()
+            .any(|n| n.qualified_name == "k.py::Function::g"));
 
         // Go: receiver-owned method qname (the nuance the generic spec must
         // express via Owner::GoReceiver).
