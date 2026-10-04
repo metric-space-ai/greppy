@@ -468,9 +468,40 @@ impl Store {
     }
 
     /// Change an owned definition identity without dropping its graph node ID.
+    /// Repair a source range without replacing node identity or cached vectors.
+    /// Immutable Base rows keep their negative composed IDs and receive only a
+    /// guarded, additive span override in the private Delta.
+    pub fn update_node_spans(&mut self, spans: &[(i64,i64,i64)]) -> Result<()> {
+      let mut override_changed = false;
+      for &(id,start_line,end_line) in spans {
+        if start_line < 1 || end_line < start_line {
+            return Err(Error::Store("invalid repaired node span".into()));
+        }
+        let old = self.get_node(id)?.ok_or_else(|| Error::Store(format!("missing span repair node {id}")))?;
+        if id < 0 && self.is_overlay() {
+            override_changed = true;
+            self.conn().execute(
+                "INSERT INTO temp.base_node_span_overrides(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(project,node_id) DO UPDATE SET start_line=excluded.start_line,end_line=excluded.end_line",
+                params![old.project, -id, old.qualified_name, old.start_line, old.end_line, start_line, end_line],
+            )?;
+        } else {
+            self.conn().execute("UPDATE main.nodes SET start_line=?2,end_line=?3 WHERE id=?1", params![id,start_line,end_line])?;
+        }
+      }
+      if override_changed {
+        self.conn().execute(
+          "INSERT INTO main.schema_meta(key,value)
+           SELECT 'greppy.base_node_span_overrides.v1',json_group_array(json_array(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line))
+           FROM temp.base_node_span_overrides WHERE true
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
+      }
+        Ok(())
+    }
+
     /// Updates contentless FTS postings and retires kind-dependent embeddings.
-    /// Immutable Base identities receive a private override; their old node and
-    /// kind-dependent embedding become invisible without mutating the Base.
+    /// Immutable Base identities receive a private override.
     pub fn update_node_identity(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
         self.conn()
             .execute_batch("SAVEPOINT greppy_node_identity")?;

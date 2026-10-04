@@ -5131,6 +5131,7 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
         let impl_type_idx = cq.capture_index("impl_type");
         let enum_name_idx = cq.capture_index("enum_name");
         let enum_variant_idx = cq.capture_index("enum_variant");
+        let enum_variant_item_idx = cq.capture_index("enum_variant_item");
         let assoc_const_idx = cq.capture_index("assoc_const");
         let assoc_type_idx = cq.capture_index("assoc_type");
 
@@ -5170,15 +5171,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             }
 
             // ---- enum variants ----
-            if let (Some(eni), Some(evi)) = (enum_name_idx, enum_variant_idx) {
+            if let (Some(eni), Some(evi), Some(item_idx)) = (enum_name_idx, enum_variant_idx, enum_variant_item_idx) {
                 let enum_cap = m.captures.iter().find(|c| c.index == eni);
                 let variant_cap = m.captures.iter().find(|c| c.index == evi);
-                if let (Some(enum_cap), Some(variant_cap)) = (enum_cap, variant_cap) {
+                let item_cap = m.captures.iter().find(|c| c.index == item_idx);
+                if let (Some(enum_cap), Some(variant_cap), Some(item_cap)) = (enum_cap, variant_cap, item_cap) {
                     let enum_name = node_text(source, enum_cap.node);
                     let variant_name = node_text(source, variant_cap.node);
                     if !enum_name.is_empty() && !variant_name.is_empty() {
-                        let start_line = variant_cap.node.start_position().row as u32 + 1;
-                        let end_line = variant_cap.node.end_position().row as u32 + 1;
+                        let start_line = item_cap.node.start_position().row as u32 + 1;
+                        let end_line = item_cap.node.end_position().row as u32 + 1;
                         let variant_qname = format!("{file_path}::{enum_name}::{variant_name}");
                         let enum_qname = format!("{file_path}::Enum::{enum_name}");
                         result.nodes.push(ExtractedNode {
@@ -18869,6 +18871,19 @@ fn plain() {}
                 defines.contains(&("src/lib.rs::Enum::Color".to_string(), qname.to_string())),
                 "missing DEFINES edge Enum::Color -> {qname}: {defines:?}"
             );
+        }
+    }
+
+    #[test]
+    fn enum_variant_spans_cover_complete_items_without_adjacent_variants() {
+        let source = "enum Kind {\n    Unit,\n    Tuple(\n        u32,\n        u64,\n    ),\n    Inline { value: u32 },\n    Branch {\n        condition: bool,\n    },\n    Discriminant =\n        7,\n    Tail,\n}\n";
+        let extraction = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        for (name,start,end) in [("Unit",2,2),("Tuple",3,6),("Inline",7,7),("Branch",8,10),("Discriminant",11,12),("Tail",13,13)] {
+            let node = extraction.nodes.iter().find(|n| n.label == "EnumVariant" && n.name == name).unwrap();
+            assert_eq!(node.qualified_name, format!("src/lib.rs::Kind::{name}"));
+            assert_eq!((node.start_line,node.end_line),(start,end),"{name}");
+            let returned = source.lines().skip(start as usize-1).take((end-start+1) as usize).collect::<Vec<_>>().join("\n");
+            if name == "Branch" { assert!(returned.contains("condition: bool")); assert!(returned.ends_with("    },")); assert!(!returned.contains("Discriminant")); }
         }
     }
 
