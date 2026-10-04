@@ -425,28 +425,46 @@ fn failed_post_message_commit_preserves_history_and_retry_does_not_duplicate() {
                 .find(|path| path.extension().is_some_and(|ext| ext == "pending"))
                 .expect("messages physically staged before the injected failure");
             let staged = std::fs::read_to_string(staged)?;
-            assert_eq!(staged.lines().filter(|line| {
-                serde_json::from_str::<Value>(line).unwrap()["type"] == "message"
-            }).count(), 2);
+            assert_eq!(
+                staged
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<Value>(line).unwrap()["type"] == "message"
+                    })
+                    .count(),
+                2
+            );
             assert_eq!(hook_store.load(&hook_id)?, hook_original);
             return Err(io::Error::other("injected failure after staging messages"));
         }
         Ok(())
     }));
     let done = completed_fixture(&prepared.history, "first");
-    assert!(finish_prompt(&server.state, &prepared, &server.config, &done)
-        .unwrap_err().contains("injected failure after staging messages"));
+    assert!(
+        finish_prompt(&server.state, &prepared, &server.config, &done)
+            .unwrap_err()
+            .contains("injected failure after staging messages")
+    );
     assert_eq!(store.load(&id).unwrap(), original);
-    assert_eq!(std::fs::read(store.path_for(&id).unwrap()).unwrap(), original_bytes);
+    assert_eq!(
+        std::fs::read(store.path_for(&id).unwrap()).unwrap(),
+        original_bytes
+    );
     {
         let state = lock_state(&server.state);
         assert!(state.sessions[&id].messages.is_empty());
         assert_eq!(state.sessions[&id].usage_in, 0);
         assert_eq!(state.sessions[&id].usage_out, 0);
     }
-    assert!(std::fs::read_dir(store.project_dir()).unwrap().all(|entry| {
-        entry.unwrap().path().extension().is_none_or(|ext| ext != "pending")
-    }));
+    assert!(std::fs::read_dir(store.project_dir())
+        .unwrap()
+        .all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "pending")
+        }));
 
     finish_prompt(&server.state, &prepared, &server.config, &done).unwrap();
     let saved = store.load(&id).unwrap();
@@ -459,12 +477,18 @@ fn failed_post_message_commit_preserves_history_and_retry_does_not_duplicate() {
     assert_eq!(store.load(&id).unwrap(), saved);
 
     let continuation = prepared_for(&server, &id);
-    assert_eq!(messages_from_protocol(&continuation.history), saved.messages);
+    assert_eq!(
+        messages_from_protocol(&continuation.history),
+        saved.messages
+    );
     let next = completed_fixture(&continuation.history, "second");
     finish_prompt(&server.state, &continuation, &server.config, &next).unwrap();
     let reopened = store.load(&id).unwrap();
     let state = lock_state(&server.state);
-    assert_eq!(reopened.messages, messages_from_protocol(&state.sessions[&id].messages));
+    assert_eq!(
+        reopened.messages,
+        messages_from_protocol(&state.sessions[&id].messages)
+    );
     assert_eq!(reopened.messages.len(), 4);
     assert_eq!(reopened.title, "first request");
     assert_eq!(reopened.turns, 2);
@@ -482,14 +506,23 @@ fn concurrent_sessions_keep_captured_store_identity() {
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "agent_acp::tests::concurrent_sessions_keep_captured_store_identity",
-                "--test-threads=1", "--nocapture"])
+            .args([
+                "--exact",
+                "agent_acp::tests::concurrent_sessions_keep_captured_store_identity",
+                "--test-threads=1",
+                "--nocapture",
+            ])
             .env(CHILD, root.path())
             .env("GREPPY_STORE_DIR", root.path().join("captured"))
             .env("GREPPY_PROJECT_IDENTITY", "ambient-sentinel")
-            .output().unwrap();
-        assert!(output.status.success(), "isolated routing test: {}{}",
-            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated routing test: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
 
@@ -517,20 +550,29 @@ fn concurrent_sessions_keep_captured_store_identity() {
     assert_eq!(first_prepared.data_root, root.join("captured"));
     assert_eq!(second_prepared.data_root, root.join("captured"));
     // This test is the only test in its child process; no concurrent environment writers.
-    unsafe { std::env::set_var("GREPPY_STORE_DIR", root.join("decoy")); }
+    unsafe {
+        std::env::set_var("GREPPY_STORE_DIR", root.join("decoy"));
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let hook_release = Arc::clone(&release);
     server.config.after_messages = Some(Arc::new(move || {
-        assert_eq!(std::env::var("GREPPY_PROJECT_IDENTITY").unwrap(), "ambient-sentinel");
+        assert_eq!(
+            std::env::var("GREPPY_PROJECT_IDENTITY").unwrap(),
+            "ambient-sentinel"
+        );
         ready_tx.send(()).unwrap();
         let (lock, cv) = &*hook_release;
-        let (released, timeout) = cv.wait_timeout_while(
-            lock.lock().unwrap(), Duration::from_secs(5), |released| !*released
-        ).unwrap();
+        let (released, timeout) = cv
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |released| {
+                !*released
+            })
+            .unwrap();
         if timeout.timed_out() && !*released {
-            return Err(io::Error::other("bounded concurrent routing fixture timed out"));
+            return Err(io::Error::other(
+                "bounded concurrent routing fixture timed out",
+            ));
         }
         Ok(())
     }));
@@ -550,30 +592,60 @@ fn concurrent_sessions_keep_captured_store_identity() {
     let third = new_session(&server, &rx, &alpha);
     let list = request(&server, &rx, "list", "session/list", json!({"cwd": alpha}));
     assert!(list.get("result").is_some(), "{list}");
-    let changed = request(&server, &rx, "model", "session/set_model",
-        json!({"sessionId": third, "modelId": "captured-model"}));
+    let changed = request(
+        &server,
+        &rx,
+        "model",
+        "session/set_model",
+        json!({"sessionId": third, "modelId": "captured-model"}),
+    );
     assert!(changed.get("result").is_some(), "{changed}");
-    let loaded = request(&server, &rx, "load", "session/load",
-        json!({"sessionId": third, "cwd": alpha, "mcpServers":[]}));
+    let loaded = request(
+        &server,
+        &rx,
+        "load",
+        "session/load",
+        json!({"sessionId": third, "cwd": alpha, "mcpServers":[]}),
+    );
     assert!(loaded.get("result").is_some(), "{loaded}");
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    for job in jobs { job.join().unwrap().unwrap(); }
+    for job in jobs {
+        job.join().unwrap().unwrap();
+    }
 
     let state = lock_state(&server.state);
     for (id, project, label) in [(&first, "alpha", "alpha"), (&second, "beta", "beta")] {
-        let saved = SessionStore::new(root.join("captured"), project).load(id).unwrap();
-        assert_eq!(saved.messages, messages_from_protocol(&state.sessions[id].messages));
+        let saved = SessionStore::new(root.join("captured"), project)
+            .load(id)
+            .unwrap();
+        assert_eq!(
+            saved.messages,
+            messages_from_protocol(&state.sessions[id].messages)
+        );
         assert_eq!(saved.messages.len(), 2);
         assert_eq!(saved.title, format!("{label} request"));
         assert_eq!(saved.usage.input_tokens, 7);
-        assert!(!SessionStore::new(root.join("captured"),
-            if project == "alpha" { "beta" } else { "alpha" }).path_for(id).unwrap().exists());
+        assert!(!SessionStore::new(
+            root.join("captured"),
+            if project == "alpha" { "beta" } else { "alpha" }
+        )
+        .path_for(id)
+        .unwrap()
+        .exists());
     }
-    assert_eq!(SessionStore::new(root.join("captured"), "alpha").load(&third).unwrap().model,
-        "captured-model");
+    assert_eq!(
+        SessionStore::new(root.join("captured"), "alpha")
+            .load(&third)
+            .unwrap()
+            .model,
+        "captured-model"
+    );
     assert!(!root.join("decoy").exists());
-    assert_eq!(std::env::var("GREPPY_PROJECT_IDENTITY").unwrap(), "ambient-sentinel");
+    assert_eq!(
+        std::env::var("GREPPY_PROJECT_IDENTITY").unwrap(),
+        "ambient-sentinel"
+    );
 }
 
 #[test]
@@ -584,15 +656,22 @@ fn same_session_cross_process_writer_cannot_overwrite_a_successful_turn() {
         let id = std::env::var("GREPPY_ACP_SAME_SESSION_ID").unwrap();
         let (server, rx) = fixture(&root);
         initialize(&server, &rx);
-        let loaded = request(&server, &rx, "load", "session/load",
-            json!({"sessionId":id, "cwd":root, "mcpServers":[]}));
+        let loaded = request(
+            &server,
+            &rx,
+            "load",
+            "session/load",
+            json!({"sessionId":id, "cwd":root, "mcpServers":[]}),
+        );
         assert!(loaded.get("result").is_some(), "{loaded}");
         let prepared = prepared_for(&server, &id);
         assert!(prepared.history.is_empty());
         let done = completed_fixture(&prepared.history, "competing");
         let error = finish_prompt(&server.state, &prepared, &server.config, &done).unwrap_err();
         assert!(error.contains("session is busy"), "{error}");
-        let saved = SessionStore::new(&prepared.data_root, &prepared.project).load(&id).unwrap();
+        let saved = SessionStore::new(&prepared.data_root, &prepared.project)
+            .load(&id)
+            .unwrap();
         assert!(saved.messages.is_empty());
         assert_eq!(saved.turns, 0);
         assert!(lock_state(&server.state).sessions[&id].messages.is_empty());
@@ -617,8 +696,12 @@ fn same_session_cross_process_writer_cannot_overwrite_a_successful_turn() {
             .env(CHILD, &hook_root)
             .env("GREPPY_ACP_SAME_SESSION_ID", &hook_id)
             .output()?;
-        assert!(output.status.success(), "overlapping process: {}{}",
-            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "overlapping process: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(hook_store.load(&hook_id)?, original);
         // Model and append-only writers use the same lease, too.
         let error = hook_store.set_model(&hook_id, "racing-model").unwrap_err();

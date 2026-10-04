@@ -5048,6 +5048,7 @@ struct BackgroundJobGuard {
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
     index_phase_started: Option<std::time::Instant>,
+    index_phase_completed_base: usize,
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
@@ -5172,6 +5173,7 @@ impl BackgroundJobGuard {
             rate_milli_documents_per_second: None,
             embedding_started: None,
             index_phase_started: None,
+            index_phase_completed_base: 0,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -5234,6 +5236,7 @@ impl BackgroundJobGuard {
             || progress.total_files != self.total_documents;
         if phase_changed {
             self.index_phase_started = Some(now);
+            self.index_phase_completed_base = progress.completed_files;
         }
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
@@ -5255,14 +5258,16 @@ impl BackgroundJobGuard {
             let elapsed_ms = u64::try_from(now.duration_since(started).as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
-            self.eta_seconds = observed_embedding_eta_seconds(
-                self.completed_documents,
-                self.total_documents,
-                elapsed_ms,
-            );
+            let measured = self
+                .completed_documents
+                .saturating_sub(self.index_phase_completed_base);
+            let workload = self
+                .total_documents
+                .saturating_sub(self.index_phase_completed_base);
+            self.eta_seconds = observed_embedding_eta_seconds(measured, workload, elapsed_ms);
             self.eta_basis = self.eta_seconds.map(|_| "observed_graph_phase");
             self.rate_milli_documents_per_second =
-                observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+                observed_embedding_rate_milli(measured, elapsed_ms);
         }
 
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
@@ -5497,8 +5502,36 @@ mod background_progress_tests {
 
     #[test]
     fn graph_phase_forecast_is_measured_and_resets_before_new_work() {
-        let _env = super::TEST_ENV_LOCK.lock().unwrap();
-        let mut guard = super::BackgroundJobGuard::from_env();
+        let mut guard = super::BackgroundJobGuard {
+            path: None,
+            detached: false,
+            delegated: false,
+            owner_pid: 0,
+            cause: "test".into(),
+            kind: "index".into(),
+            path_prefixes: Vec::new(),
+            started_at_unix_secs: 0,
+            target_generation: 0,
+            worker_count: None,
+            backend: None,
+            device: None,
+            completed_documents: 0,
+            total_documents: 0,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 0,
+            eta_seconds: None,
+            eta_basis: None,
+            rate_milli_documents_per_second: None,
+            embedding_started: None,
+            index_phase_started: None,
+            index_phase_completed_base: 0,
+            last_progress_write: None,
+            progress_phase: None,
+            current_detail: None,
+            demand_terminal: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            complete: true,
+        };
         guard.indexing_progress(greppy_indexer::IndexBuildProgress {
             phase: "writing_graph",
             completed_files: 0,
@@ -5522,6 +5555,16 @@ mod background_progress_tests {
         });
         assert_eq!(guard.eta_seconds, None);
         assert_eq!(guard.rate_milli_documents_per_second, None);
+        for (completed, total) in [(20, 100), (20, 200), (5, 200)] {
+            guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+                phase: "writing_graph",
+                completed_files: completed,
+                total_files: total,
+            });
+            assert_eq!(guard.eta_seconds, None);
+            assert_eq!(guard.rate_milli_documents_per_second, None);
+            assert_eq!(guard.index_phase_completed_base, completed);
+        }
         guard.finalization_phase("publishing_snapshot");
         assert_eq!(guard.eta_seconds, None);
         assert_eq!(guard.index_phase_started, None);
