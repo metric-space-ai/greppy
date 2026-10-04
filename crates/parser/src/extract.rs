@@ -3263,6 +3263,11 @@ fn try_emit_js_ts_usage(
     if name.is_empty() || JS_TS_KEYWORDS.contains(&name) {
         return;
     }
+    // Parameters and active local value bindings are not references to a
+    // same-named imported/project symbol. Type annotations remain usages.
+    if node.kind() == "identifier" && js_ts_jsx_locally_bound(node, source, name) {
+        return;
+    }
     let src = js_ts_enclosing_qname(node, source, file_path, effect_import);
     result.edges.push(ExtractedEdge {
         edge_type: "USAGE".into(),
