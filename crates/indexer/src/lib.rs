@@ -2525,58 +2525,140 @@ pub fn recover_persisted_rust_enum_variant_spans(
     root: &Path,
 ) -> Result<usize> {
     let variants = store.list_nodes_by_label(project, "EnumVariant", usize::MAX)?;
-    if variants.is_empty() { return Ok(0); }
-    let root = std::fs::canonicalize(root).map_err(|e| greppy_core::Error::Invalid(format!("Rust variant span repair root unavailable: {e}")))?;
+    if variants.is_empty() {
+        return Ok(0);
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| {
+        greppy_core::Error::Invalid(format!("Rust variant span repair root unavailable: {e}"))
+    })?;
     let states = store.list_file_states(project)?;
-    let files: std::collections::BTreeSet<_> = variants.iter().map(|n| n.file_path.as_str()).collect();
+    let files: std::collections::BTreeSet<_> =
+        variants.iter().map(|n| n.file_path.as_str()).collect();
     let mut prepared = Vec::new();
     let mut fingerprints = Vec::new();
     for file in files {
-        let state = states.iter().find(|s| s.rel_path == file).ok_or_else(|| greppy_core::Error::Invalid(format!("Rust variant span repair requires indexed fingerprint: {file}")))?;
+        let state = states.iter().find(|s| s.rel_path == file).ok_or_else(|| {
+            greppy_core::Error::Invalid(format!(
+                "Rust variant span repair requires indexed fingerprint: {file}"
+            ))
+        })?;
         let relative = Path::new(file);
-        if !file.ends_with(".rs") || relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-            return Err(greppy_core::Error::Invalid("unsafe Rust variant span repair path".into()));
+        if !file.ends_with(".rs")
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe Rust variant span repair path".into(),
+            ));
         }
-        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| greppy_core::Error::Invalid(format!("Rust variant span repair source {file} unavailable: {e}")))?;
-        if !path.starts_with(&root) { return Err(greppy_core::Error::Invalid("Rust variant span repair source escapes root".into())); }
-        let (bytes, _) = read_stable_file(&path).map_err(|e| greppy_core::Error::Invalid(format!("Rust variant span repair source {file} unreadable: {e}")))?;
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
+            greppy_core::Error::Invalid(format!(
+                "Rust variant span repair source {file} unavailable: {e}"
+            ))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "Rust variant span repair source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!(
+                "Rust variant span repair source {file} unreadable: {e}"
+            ))
+        })?;
         if file_state::sha256_hex(&bytes) != state.sha256 {
-            return Err(greppy_core::Error::Invalid(format!("Rust variant span repair source {file} changed since indexing")));
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust variant span repair source {file} changed since indexing"
+            )));
         }
         let extraction = parser_extract(Language::Rust, &bytes, file)?;
         let (extraction, dropped, error) = validate_or_degrade(Language::Rust, file, extraction);
-        if dropped != 0 || error.is_some() { return Err(greppy_core::Error::Invalid(format!("Rust variant span repair extraction incomplete: {file}"))); }
-        let definitions: std::collections::BTreeMap<_,_> = extraction.nodes.iter().map(|n| (n.qualified_name.as_str(), n)).collect();
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(format!(
+                "Rust variant span repair extraction incomplete: {file}"
+            )));
+        }
+        let definitions: std::collections::BTreeMap<_, _> = extraction
+            .nodes
+            .iter()
+            .map(|n| (n.qualified_name.as_str(), n))
+            .collect();
         for cached in variants.iter().filter(|n| n.file_path == file) {
-            let node = definitions.get(cached.qualified_name.as_str()).ok_or_else(|| greppy_core::Error::Invalid(format!("Rust variant span repair definition unavailable: {}",cached.qualified_name)))?;
-            if node.label != "EnumVariant" || node.name != cached.name || node.properties != cached.properties
+            let node = definitions
+                .get(cached.qualified_name.as_str())
+                .ok_or_else(|| {
+                    greppy_core::Error::Invalid(format!(
+                        "Rust variant span repair definition unavailable: {}",
+                        cached.qualified_name
+                    ))
+                })?;
+            if node.label != "EnumVariant"
+                || node.name != cached.name
+                || node.properties != cached.properties
                 || cached.start_line != i64::from(node.start_line)
-                || (cached.end_line != cached.start_line && cached.end_line != i64::from(node.end_line)) {
-                return Err(greppy_core::Error::Invalid(format!("Rust variant span repair definition mismatch: {}",cached.qualified_name)));
+                || (cached.end_line != cached.start_line
+                    && cached.end_line != i64::from(node.end_line))
+            {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust variant span repair definition mismatch: {}",
+                    cached.qualified_name
+                )));
             }
-            if cached.end_line != i64::from(node.end_line) { prepared.push((cached.id, i64::from(node.start_line), i64::from(node.end_line))); }
+            if cached.end_line != i64::from(node.end_line) {
+                prepared.push((
+                    cached.id,
+                    i64::from(node.start_line),
+                    i64::from(node.end_line),
+                ));
+            }
         }
         for node in definitions.values().filter(|n| n.label == "EnumVariant") {
-            if !variants.iter().any(|cached| cached.qualified_name == node.qualified_name && cached.file_path == file) {
-                return Err(greppy_core::Error::Invalid(format!("Rust variant span repair stored definition missing: {}",node.qualified_name)));
+            if !variants.iter().any(|cached| {
+                cached.qualified_name == node.qualified_name && cached.file_path == file
+            }) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "Rust variant span repair stored definition missing: {}",
+                    node.qualified_name
+                )));
             }
         }
-        fingerprints.push((path,state.sha256.clone()));
+        fingerprints.push((path, state.sha256.clone()));
     }
     // Recheck source just before publication. A failed validation publishes no
     // partially repaired spans and never certifies caller recovery.
-    for (path,sha) in fingerprints {
-        let (bytes,_) = read_stable_file(&path).map_err(|e| greppy_core::Error::Invalid(format!("Rust variant span repair source changed: {e}")))?;
-        if file_state::sha256_hex(&bytes) != sha { return Err(greppy_core::Error::Invalid("Rust variant span repair source changed before publication".into())); }
+    for (path, sha) in fingerprints {
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!("Rust variant span repair source changed: {e}"))
+        })?;
+        if file_state::sha256_hex(&bytes) != sha {
+            return Err(greppy_core::Error::Invalid(
+                "Rust variant span repair source changed before publication".into(),
+            ));
+        }
     }
-    store.conn().execute_batch("SAVEPOINT greppy_rust_variant_spans").map_err(sqlite_err)?;
+    store
+        .conn()
+        .execute_batch("SAVEPOINT greppy_rust_variant_spans")
+        .map_err(sqlite_err)?;
     let result = (|| -> Result<()> {
         store.update_node_spans(&prepared)?;
         Ok(())
     })();
     match result {
-        Ok(()) => store.conn().execute_batch("RELEASE greppy_rust_variant_spans").map_err(sqlite_err)?,
-        Err(error) => { store.conn().execute_batch("ROLLBACK TO greppy_rust_variant_spans; RELEASE greppy_rust_variant_spans").map_err(sqlite_err)?; return Err(error); }
+        Ok(()) => store
+            .conn()
+            .execute_batch("RELEASE greppy_rust_variant_spans")
+            .map_err(sqlite_err)?,
+        Err(error) => {
+            store
+                .conn()
+                .execute_batch(
+                    "ROLLBACK TO greppy_rust_variant_spans; RELEASE greppy_rust_variant_spans",
+                )
+                .map_err(sqlite_err)?;
+            return Err(error);
+        }
     }
     Ok(prepared.len())
 }
@@ -13433,46 +13515,123 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
 
     #[test]
     fn rust_enum_variant_span_repair_preserves_private_and_base_identity() {
-        for overlay_mode in [false,true] {
-            let source = "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n    Tail,\n}\n";
-            let repo = setup_repo("variant-span-repair",source);
+        for overlay_mode in [false, true] {
+            let source =
+                "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n    Tail,\n}\n";
+            let repo = setup_repo("variant-span-repair", source);
             let scratch = tempfile::tempdir().unwrap();
             let base_path = scratch.path().join("base.db");
             {
                 let mut base = Store::open(&base_path).unwrap();
-                let report = index(&mut base,&repo,"test").unwrap();
-                base.conn().execute("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",[]).unwrap();
-                let node = base.get_node_by_qname("test","src/lib.rs::Kind::Branch").unwrap().unwrap();
+                let report = index(&mut base, &repo, "test").unwrap();
+                base.conn()
+                    .execute(
+                        "UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",
+                        [],
+                    )
+                    .unwrap();
+                let node = base
+                    .get_node_by_qname("test", "src/lib.rs::Kind::Branch")
+                    .unwrap()
+                    .unwrap();
                 base.upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
-                    project:"test".into(),model_id:"test-model".into(),prompt_version:"v1".into(),task:"definition".into(),node_id:Some(node.id),chunk_idx:0,
-                    qualified_name:node.qualified_name,file_path:node.file_path,start_line:node.start_line,end_line:node.end_line,
-                    content_sha256:file_state::sha256_hex(source.as_bytes()),graph_generation:report.graph_generation,vector:vec![1.0,0.0],
-                }).unwrap();
+                    project: "test".into(),
+                    model_id: "test-model".into(),
+                    prompt_version: "v1".into(),
+                    task: "definition".into(),
+                    node_id: Some(node.id),
+                    chunk_idx: 0,
+                    qualified_name: node.qualified_name,
+                    file_path: node.file_path,
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    content_sha256: file_state::sha256_hex(source.as_bytes()),
+                    graph_generation: report.graph_generation,
+                    vector: vec![1.0, 0.0],
+                })
+                .unwrap();
             }
             let original_base = fs::read(&base_path).unwrap();
             let delta_path = scratch.path().join("delta.db");
-            let mut store = if overlay_mode { Store::open_overlay(&base_path,&delta_path,&greppy_store::VisibilityIndex::default()).unwrap() } else { Store::open(&base_path).unwrap() };
-            let before = store.get_node_by_qname("test","src/lib.rs::Kind::Branch").unwrap().unwrap();
+            let mut store = if overlay_mode {
+                Store::open_overlay(
+                    &base_path,
+                    &delta_path,
+                    &greppy_store::VisibilityIndex::default(),
+                )
+                .unwrap()
+            } else {
+                Store::open(&base_path).unwrap()
+            };
+            let before = store
+                .get_node_by_qname("test", "src/lib.rs::Kind::Branch")
+                .unwrap()
+                .unwrap();
             let states = store.list_file_states("test").unwrap();
-            let edges = format!("{:?}",store.outgoing_edges(before.id,None,100).unwrap());
-            let vectors: i64 = store.conn().query_row("SELECT COUNT(*) FROM vector_embeddings",[],|row|row.get(0)).unwrap();
-            assert_eq!(recover_persisted_rust_enum_variant_spans(&mut store,"test",&repo).unwrap(),1);
-            let after = store.get_node_by_qname("test","src/lib.rs::Kind::Branch").unwrap().unwrap();
-            assert_eq!(after.id,before.id);
-            assert_eq!((after.start_line,after.end_line),(2,4));
-            assert_eq!(after.properties,before.properties);
-            assert_eq!(store.list_file_states("test").unwrap(),states);
-            assert_eq!(format!("{:?}",store.outgoing_edges(after.id,None,100).unwrap()),edges);
-            assert_eq!(store.conn().query_row("SELECT COUNT(*) FROM vector_embeddings",[],|row|row.get::<_,i64>(0)).unwrap(),vectors);
-            assert_eq!(recover_persisted_rust_enum_variant_spans(&mut store,"test",&repo).unwrap(),0);
+            let edges = format!("{:?}", store.outgoing_edges(before.id, None, 100).unwrap());
+            let vectors: i64 = store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                recover_persisted_rust_enum_variant_spans(&mut store, "test", &repo).unwrap(),
+                1
+            );
+            let after = store
+                .get_node_by_qname("test", "src/lib.rs::Kind::Branch")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.id, before.id);
+            assert_eq!((after.start_line, after.end_line), (2, 4));
+            assert_eq!(after.properties, before.properties);
+            assert_eq!(store.list_file_states("test").unwrap(), states);
+            assert_eq!(
+                format!("{:?}", store.outgoing_edges(after.id, None, 100).unwrap()),
+                edges
+            );
+            assert_eq!(
+                store
+                    .conn()
+                    .query_row("SELECT COUNT(*) FROM vector_embeddings", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                vectors
+            );
+            assert_eq!(
+                recover_persisted_rust_enum_variant_spans(&mut store, "test", &repo).unwrap(),
+                0
+            );
             if overlay_mode {
-                assert_eq!(fs::read(&base_path).unwrap(),original_base);
-                assert_eq!(store.conn().query_row("SELECT COUNT(*) FROM main.nodes",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+                assert_eq!(fs::read(&base_path).unwrap(), original_base);
+                assert_eq!(
+                    store
+                        .conn()
+                        .query_row("SELECT COUNT(*) FROM main.nodes", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
                 drop(store);
-                let reopened = Store::open_overlay_read_only(&base_path,&delta_path,&greppy_store::VisibilityIndex::default()).unwrap();
-                assert_eq!(reopened.get_node(before.id).unwrap().unwrap().end_line,4);
+                let reopened = Store::open_overlay_read_only(
+                    &base_path,
+                    &delta_path,
+                    &greppy_store::VisibilityIndex::default(),
+                )
+                .unwrap();
+                assert_eq!(reopened.get_node(before.id).unwrap().unwrap().end_line, 4);
                 drop(reopened);
-                let hidden = Store::open_overlay_read_only(&base_path,&delta_path,&greppy_store::VisibilityIndex::new(vec!["src/lib.rs".into()],Vec::<String>::new()).unwrap()).unwrap();
+                let hidden = Store::open_overlay_read_only(
+                    &base_path,
+                    &delta_path,
+                    &greppy_store::VisibilityIndex::new(
+                        vec!["src/lib.rs".into()],
+                        Vec::<String>::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
                 assert!(hidden.get_node(before.id).unwrap().is_none());
             }
             fs::remove_dir_all(repo).unwrap();
@@ -13481,24 +13640,58 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
 
     #[test]
     fn rust_enum_variant_span_repair_refuses_stale_or_corrupt_source_atomically() {
-        for changed_source in [false,true] {
-            let repo = setup_repo("variant-span-refusal","pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n}\n");
-            fs::write(repo.join("src/second.rs"),"pub enum Second {\n    Other {\n        value: u32,\n    },\n}\n").unwrap();
+        for changed_source in [false, true] {
+            let repo = setup_repo(
+                "variant-span-refusal",
+                "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n}\n",
+            );
+            fs::write(
+                repo.join("src/second.rs"),
+                "pub enum Second {\n    Other {\n        value: u32,\n    },\n}\n",
+            )
+            .unwrap();
             let mut store = Store::open_memory().unwrap();
-            index(&mut store,&repo,"test").unwrap();
-            store.conn().execute("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",[]).unwrap();
-            if changed_source { fs::write(repo.join("src/second.rs"),"pub enum Second { Other }\n").unwrap(); }
-            else { store.conn().execute("UPDATE nodes SET end_line=999 WHERE name='Other' AND label='EnumVariant'",[]).unwrap(); }
-            let before = format!("{:?}",store.list_nodes_by_label("test","EnumVariant",100).unwrap());
-            assert!(recover_persisted_rust_enum_variant_spans(&mut store,"test",&repo).is_err());
-            assert_eq!(format!("{:?}",store.list_nodes_by_label("test","EnumVariant",100).unwrap()),before);
+            index(&mut store, &repo, "test").unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",
+                    [],
+                )
+                .unwrap();
+            if changed_source {
+                fs::write(repo.join("src/second.rs"), "pub enum Second { Other }\n").unwrap();
+            } else {
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE nodes SET end_line=999 WHERE name='Other' AND label='EnumVariant'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let before = format!(
+                "{:?}",
+                store
+                    .list_nodes_by_label("test", "EnumVariant", 100)
+                    .unwrap()
+            );
+            assert!(recover_persisted_rust_enum_variant_spans(&mut store, "test", &repo).is_err());
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    store
+                        .list_nodes_by_label("test", "EnumVariant", 100)
+                        .unwrap()
+                ),
+                before
+            );
             fs::remove_dir_all(repo).unwrap();
         }
     }
 
     #[test]
     fn rust_anyhow_factory_overlay_replay_preserves_base_and_refuses_changed_source() {
-
         let source = "#[path=\"projection.rs\"] mod projection; use projection::*; use std::path::Path; struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }";
         let repo = setup_repo("anyhow-overlay-repair", source);
         fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
