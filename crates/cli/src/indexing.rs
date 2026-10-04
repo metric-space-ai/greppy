@@ -628,7 +628,8 @@ fn background_health_observation(
         "admission_deferred" => "Shared host admission deferred preparation; wait for capacity, then retry the original command. Do not start duplicate preparation.",
         "cancelled" => "Preparation was cancelled; retry the original work when it is requested again.",
         "failed" => "Inspect background_job.last_error and the original invocation before choosing recovery; do not rebuild merely because a prior job failed.",
-        "refreshing" | "starting" | "process_alive" => "Observe the existing job and its owner before starting another index; retry this status command. PID liveness alone does not prove it is making progress.",
+        "refreshing" | "starting" => "Observe the existing job and its owner before starting another index; retry this status command. PID liveness alone does not prove it is making progress.",
+        "process_alive" => "No writer or startup lease was observed. The recorded PID is alive, but its job identity is unconfirmed; retry the original command rather than waiting for that PID or starting duplicate preparation.",
         _ => "No writer or startup lease and no live recorded process were observed. Inspect the prior job and current store diagnostics before choosing recovery; a stale journal alone does not require rebuilding a healthy graph.",
     };
     let progress_age_seconds = job
@@ -659,7 +660,7 @@ fn background_health_guidance_does_not_request_duplicate_or_unnecessary_preparat
         ("cancelled", "when it is requested again"),
         ("failed", "background_job.last_error"),
         ("abandoned", "healthy graph"),
-        ("process_alive", "Observe the existing job"),
+        ("process_alive", "retry the original command"),
     ] {
         let job = serde_json::json!({"updated_at_unix_secs": 1});
         let observation =

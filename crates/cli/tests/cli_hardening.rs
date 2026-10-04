@@ -3933,7 +3933,23 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
     let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
     assert_eq!(status["writer_active"], false);
     assert_eq!(status["startup_active"], false);
-    assert_eq!(status["background_state"], "abandoned");
+    assert_eq!(status["background_state"], "process_alive");
+    assert_eq!(
+        status["background_observation"]["recorded_process_alive"],
+        true
+    );
+    assert_eq!(
+        status["background_observation"]["process_identity_confirmed"],
+        false
+    );
+    let recovery = status["background_observation"]["recovery"]
+        .as_str()
+        .unwrap();
+    assert!(
+        recovery.contains("retry the original command"),
+        "{recovery}"
+    );
+    assert!(!recovery.contains("Observe the existing job"), "{recovery}");
 
     let (code, out, err) = run(&["search-symbol", "stale_pid_marker"], &repo, &store);
     assert_eq!(
