@@ -2316,8 +2316,10 @@ fn index_embeddings_into_temp_store_scoped(
             project,
             &mut provider,
             options,
-            total_documents,
-            &mut progress,
+            greppy_indexer::EmbeddingIndexProgressContext {
+                total_documents,
+                callback: &mut progress,
+            },
             index_prefixes,
         )?
     } else {
@@ -2327,8 +2329,10 @@ fn index_embeddings_into_temp_store_scoped(
             project,
             &mut provider,
             options,
-            0,
-            &mut |_| {},
+            greppy_indexer::EmbeddingIndexProgressContext {
+                total_documents: 0,
+                callback: &mut |_| {},
+            },
             index_prefixes,
         )?
     };
