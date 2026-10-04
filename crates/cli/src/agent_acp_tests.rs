@@ -575,3 +575,79 @@ fn concurrent_sessions_keep_captured_store_identity() {
     assert!(!root.join("decoy").exists());
     assert_eq!(std::env::var("GREPPY_PROJECT_IDENTITY").unwrap(), "ambient-sentinel");
 }
+
+#[test]
+fn same_session_cross_process_writer_cannot_overwrite_a_successful_turn() {
+    const CHILD: &str = "GREPPY_ACP_SAME_SESSION_WRITER_TEST";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = PathBuf::from(root);
+        let id = std::env::var("GREPPY_ACP_SAME_SESSION_ID").unwrap();
+        let (server, rx) = fixture(&root);
+        initialize(&server, &rx);
+        let loaded = request(&server, &rx, "load", "session/load",
+            json!({"sessionId":id, "cwd":root, "mcpServers":[]}));
+        assert!(loaded.get("result").is_some(), "{loaded}");
+        let prepared = prepared_for(&server, &id);
+        assert!(prepared.history.is_empty());
+        let done = completed_fixture(&prepared.history, "competing");
+        let error = finish_prompt(&server.state, &prepared, &server.config, &done).unwrap_err();
+        assert!(error.contains("session is busy"), "{error}");
+        let saved = SessionStore::new(&prepared.data_root, &prepared.project).load(&id).unwrap();
+        assert!(saved.messages.is_empty());
+        assert_eq!(saved.turns, 0);
+        assert!(lock_state(&server.state).sessions[&id].messages.is_empty());
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let (mut server, rx) = fixture(root.path());
+    initialize(&server, &rx);
+    let id = new_session(&server, &rx, root.path());
+    let prepared = prepared_for(&server, &id);
+    let store = SessionStore::new(&prepared.data_root, &prepared.project);
+    let original = store.load(&id).unwrap();
+    let hook_store = store.clone();
+    let hook_id = id.clone();
+    let hook_root = root.path().to_owned();
+    server.config.after_messages = Some(Arc::new(move || {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact",
+                "agent_acp::tests::same_session_cross_process_writer_cannot_overwrite_a_successful_turn",
+                "--test-threads=1", "--nocapture"])
+            .env(CHILD, &hook_root)
+            .env("GREPPY_ACP_SAME_SESSION_ID", &hook_id)
+            .output()?;
+        assert!(output.status.success(), "overlapping process: {}{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(hook_store.load(&hook_id)?, original);
+        // Model and append-only writers use the same lease, too.
+        let error = hook_store.set_model(&hook_id, "racing-model").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        Ok(())
+    }));
+    let done = completed_fixture(&prepared.history, "committed");
+    finish_prompt(&server.state, &prepared, &server.config, &done).unwrap();
+    let saved = store.load(&id).unwrap();
+    assert_eq!(saved.messages, messages_from_protocol(&done.messages));
+    assert_eq!(saved.messages.len(), 2);
+    assert_eq!(saved.turns, 1);
+    assert_eq!(saved.title, "committed request");
+    assert_eq!(saved.model, "fixture-model");
+    assert_eq!(saved.usage, done.usage);
+
+    // A writer that was prepared before the winning commit cannot retry stale history.
+    let competing = completed_fixture(&prepared.history, "competing");
+    let error = finish_prompt(&server.state, &prepared, &server.config, &competing).unwrap_err();
+    assert!(error.contains("saved session history changed"), "{error}");
+    assert_eq!(store.load(&id).unwrap(), saved);
+    server.config.after_messages = None;
+    store.set_model(&id, "after-release").unwrap();
+    let continuation = prepared_for(&server, &id);
+    let next = completed_fixture(&continuation.history, "continued");
+    finish_prompt(&server.state, &continuation, &server.config, &next).unwrap();
+    let reopened = store.load(&id).unwrap();
+    assert_eq!(reopened.messages, messages_from_protocol(&next.messages));
+    assert_eq!(reopened.messages.len(), 4);
+    assert_eq!(reopened.turns, 2);
+    assert_eq!(reopened.model, "after-release");
+}

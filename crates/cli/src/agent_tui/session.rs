@@ -122,6 +122,7 @@ impl SessionStore {
         let project_dir = self.project_dir();
         fs::create_dir_all(&project_dir)?;
         greppy_core::cache::secure_private_directory(&project_dir)?;
+        let _lease = self.writer_lease(&record.id)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -132,11 +133,34 @@ impl SessionStore {
     }
 
     pub fn append(&self, session_id: &str, line: &Value) -> io::Result<()> {
+        let _lease = self.writer_lease(session_id)?;
         let path = self.path_for(session_id)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(())
+    }
+
+    /// Lock a stable sidecar inode, not the log replaced by commit_turn. Never
+    /// unlink this file: an open old inode would split competing writer leases.
+    fn writer_lease(&self, session_id: &str) -> io::Result<File> {
+        self.path_for(session_id)?;
+        let path = self.project_dir().join(format!(".{session_id}.writer-lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        greppy_core::cache::secure_private_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "session is busy: another writer holds the session lease",
+            )),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
     }
 
     /// Commit one ACP turn with load-atomic visibility using the existing JSONL
@@ -151,6 +175,7 @@ impl SessionStore {
         title: Option<&str>,
         after_messages: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
         if previous.recovered {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "cannot commit over a corrupt session log"));
