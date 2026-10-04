@@ -3611,6 +3611,15 @@ fn nav_counts_json_with_expand(
         "all": all,
         "hits": hits,
     });
+    if command == "callees" && symbol_found {
+        let ids = resolve_symbol_nodes(store, Some(symbol))?;
+        let unresolved = crate::nav::unresolved_factory_receivers(store, &ids)?;
+        if !unresolved.is_empty() {
+            v["unresolved_factory_receivers"] = serde_json::json!(unresolved);
+            v["callees_incomplete"] = serde_json::json!(true);
+            v["next"] = serde_json::json!(format!("greppy read {symbol}"));
+        }
+    }
     if !symbol_found {
         let miss = symbol_miss_json(store, project, symbol);
         v["suggestions"] = miss["suggestions"].clone();
@@ -7618,6 +7627,16 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+    let unresolved_factories = resolved
+        .iter()
+        .map(|ids| {
+            if req.kind == NavKind::Callees {
+                crate::nav::unresolved_factory_receivers(&store, ids)
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
@@ -7733,6 +7752,21 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             "all": req.all,
             "hits": hits,
         });
+        let factory_rows = unresolved_factories
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rows)| {
+                rows.iter().cloned().map(move |mut row| {
+                    row["target"] = serde_json::json!(req.targets[index]);
+                    row["next"] = serde_json::json!(format!("greppy read {}", req.targets[index]));
+                    row
+                })
+            })
+            .collect::<Vec<_>>();
+        if !factory_rows.is_empty() {
+            value["unresolved_factory_receivers"] = serde_json::json!(factory_rows);
+            value["callees_incomplete"] = serde_json::json!(true);
+        }
         let unresolved_json = unresolved_by_target
             .iter()
             .enumerate()
@@ -7792,6 +7826,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             println!();
         }
         println!("{symbol}");
+        crate::nav::print_unresolved_factory_receivers(&unresolved_factories[index], symbol);
         let unresolved_page = &unresolved_by_target[index];
         let unresolved_incomplete =
             unresolved_page.total > 0 || unresolved_page.omitted > 0 || unresolved_page.truncated;

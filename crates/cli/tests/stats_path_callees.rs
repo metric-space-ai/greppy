@@ -348,6 +348,59 @@ external, unresolved or filtered calls may still exist; inspect source with: gre
 }
 
 #[test]
+fn callees_factory_pattern_coverage_is_safe_and_targeted() {
+    for (signature, expected_edge, expected_incomplete) in [
+        ("Result<Option<Self>, ()>", true, false),
+        ("anyhow::Result<Option<Self>>", false, true),
+    ] {
+        let (repo, store) = make_chain_repo("callees-factory-pattern");
+        std::fs::write(repo.join("src/leaf.rs"), format!(
+            "struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }}\n\
+             pub fn leaf() {{ if let Some(mut writer) = Writer::open()? {{ writer.upsert(); }} }}\n\
+             pub fn direct() {{ Writer::open(); }}\n"
+        )).unwrap();
+        let (code, out, err) = run(&["index", "."], &repo, &store);
+        assert_eq!(code, 0, "index failed; {err}\n{out}");
+        let (code, out, err) = run(&["callees", "leaf"], &repo, &store);
+        assert_eq!(code, 0, "callees failed; {err}\n{out}");
+        assert!(out.contains("open"));
+        assert_eq!(
+            out.contains("unresolved receiver upsert"),
+            expected_incomplete
+        );
+        let (code, out, err) = run(&["callees", "leaf", "--json"], &repo, &store);
+        assert_eq!(code, 0, "JSON failed; {err}\n{out}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["name"] == "upsert"),
+            expected_edge
+        );
+        assert_eq!(
+            value["callees_incomplete"].as_bool().unwrap_or(false),
+            expected_incomplete
+        );
+        let (code, out, err) = run(&["callees", "leaf", "direct", "--json"], &repo, &store);
+        assert_eq!(code, 0, "batch failed; {err}\n{out}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        if expected_incomplete {
+            let rows = value["unresolved_factory_receivers"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["target"], "leaf");
+            assert_eq!(rows[0]["factory"], "Writer::open");
+        } else {
+            assert!(value.get("unresolved_factory_receivers").is_none());
+        }
+        let (code, out, err) = run(&["callees", "direct"], &repo, &store);
+        assert_eq!(code, 0, "direct failed; {err}\n{out}");
+        assert!(!out.contains("unresolved receiver"));
+    }
+}
+
+#[test]
 fn callees_reports_missing_symbol() {
     let (repo, store) = index_fixture("callees-missing");
     let (code, out, _err) = run(&["callees", "does_not_exist_xyz"], &repo, &store);

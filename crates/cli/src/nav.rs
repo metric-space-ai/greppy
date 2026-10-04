@@ -3833,15 +3833,51 @@ pub(crate) fn dispatch_who_calls(
     }
     Ok(0)
 }
-/// `greppy callees S` — what `S` calls: every node reached by a direct
-/// outgoing CALLS edge from `S`. Printed as `qualified_name file:line` so
-/// an agent can jump straight to each callee's definition. Backed by the
-/// search `callees_of` helper.
-///
-/// Like who-calls, this aggregates across ALL nodes sharing the name + a
-/// primary label (e.g. a Struct and its Impl) so callees are not lost to
-/// a name resolving to the wrong single node. Output is de-duplicated and
-/// deterministically ordered by node id.
+pub(crate) fn unresolved_factory_receivers(
+    store: &greppy_store::Store,
+    ids: &[i64],
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for id in ids {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        for edge in store.list_raw_edges_for_file(&node.project, &node.file_path)? {
+            if edge.source_qname != node.qualified_name
+                || edge.edge_type != "CALLS"
+                || edge.properties.get("receiver_owner").is_some()
+            {
+                continue;
+            }
+            if let Some(factory) = edge
+                .properties
+                .get("receiver_factory_pattern")
+                .and_then(|value| value.as_str())
+            {
+                rows.push(serde_json::json!({
+                    "file": edge.file_path,
+                    "line": edge.properties.get("line").cloned().unwrap_or(serde_json::json!(0)),
+                    "callee": edge.properties.get("callee_name").cloned().unwrap_or(serde_json::json!("")),
+                    "factory": factory,
+                    "reason": "factory_pattern_owner_unproven",
+                }));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn print_unresolved_factory_receivers(rows: &[serde_json::Value], symbol: &str) {
+    for row in rows {
+        println!(
+            "{}:{}  unresolved receiver {}; factory {} return type or pattern scope is unproven; greppy read {symbol}",
+            row["file"].as_str().unwrap_or(""), row["line"],
+            row["callee"].as_str().unwrap_or(""), row["factory"].as_str().unwrap_or("")
+        );
+    }
+}
+
+/// `greppy callees S` lists resolved direct callees and retained unresolved factory receivers.
 pub(crate) fn dispatch_callees(
     symbol: Option<&str>,
     paths: &[String],
@@ -3923,6 +3959,7 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
+    let unresolved_factories = unresolved_factory_receivers(&store, &sources)?;
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep
@@ -3955,6 +3992,7 @@ pub(crate) fn dispatch_callees(
             )?;
             return Ok(0);
         }
+        print_unresolved_factory_receivers(&unresolved_factories, query_symbol);
         if path_filters.is_empty() {
             println!("no resolved indexed callees; external or unresolved calls may still exist");
             println!("inspect source with: greppy read {query_symbol}");
@@ -4036,6 +4074,7 @@ pub(crate) fn dispatch_callees(
         });
     }
     print_nav_rows(&repo_root, "callees", &mut rows, code, all);
+    print_unresolved_factory_receivers(&unresolved_factories, query_symbol);
     Ok(0)
 }
 

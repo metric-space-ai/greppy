@@ -2132,7 +2132,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v11";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v12";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -11087,6 +11087,51 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .outgoing_edges(shadowed.id, Some("USAGE"), 20)
             .unwrap()
             .is_empty());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rust_factory_option_call_repair_rejects_v11_and_recovers_same_source() {
+        let repo = setup_repo("factory-option-repair", "struct Writer; impl Writer { fn open() -> Result<Option<Self>, ()> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }");
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let method = store
+            .get_node_by_qname("test", "src/lib.rs::Writer::upsert")
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/lib.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .incoming_edges(method.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type='CALLS' AND target_id=?1",
+                [method.id],
+            )
+            .unwrap();
+        store.conn().execute("UPDATE raw_edges SET properties=json_remove(properties, '$.receiver_owner') WHERE edge_type='CALLS' AND json_extract(properties,'$.callee_name')='upsert'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v11','complete')", []).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(store
+            .incoming_edges(method.id, Some("CALLS"), 20)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
         fs::remove_dir_all(repo).unwrap();
     }
 
