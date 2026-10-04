@@ -2943,21 +2943,23 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    struct TmpdirRestore(Option<std::ffi::OsString>);
+    struct TmpdirRestore {
+        _environment: EnvRestore,
+    }
 
     impl TmpdirRestore {
         fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("TMPDIR");
+            let environment = EnvRestore::capture(&[
+                "TMPDIR",
+                "GREPPY_BASE_BUILD_STAGING_ROOT",
+                greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
+            ]);
             std::env::set_var("TMPDIR", path);
-            Self(previous)
-        }
-    }
-
-    impl Drop for TmpdirRestore {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var("TMPDIR", value),
-                None => std::env::remove_var("TMPDIR"),
+            // These fixtures exercise TMPDIR placement, not an inherited override.
+            std::env::remove_var("GREPPY_BASE_BUILD_STAGING_ROOT");
+            std::env::remove_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES);
+            Self {
+                _environment: environment,
             }
         }
     }
