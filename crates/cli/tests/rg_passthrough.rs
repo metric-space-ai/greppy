@@ -113,35 +113,34 @@ fn rg_placeholder_token_routes_to_rg_mode() {
 }
 
 #[test]
-fn rg_without_path_returns_guidance_on_idle_stdin() {
+fn rg_without_path_waits_for_slow_implicit_stdin() {
+    use std::io::Write;
     let d = fixture_dir();
     let mut command = Command::new(binary_path());
     command
-        .args(["rg", "alpha"])
+        .args(["rg", "RxConflictHandler"])
         .current_dir(&d)
-        .env("GREPPY_STORE_DIR", unique_tempdir("idle-rg-store"))
+        .env("GREPPY_REAL_RG", "")
+        .env("GREPPY_STORE_DIR", unique_tempdir("slow-rg-store"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn greppy");
-    let stdin = child.stdin.take().expect("open child stdin");
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
-    let output = match receive.recv_timeout(std::time::Duration::from_secs(45)) {
-        Ok(output) => output.expect("collect greppy output"),
-        Err(_) => {
-            drop(stdin);
-            let _ = receive.recv_timeout(std::time::Duration::from_secs(1));
-            panic!("greppy rg alpha waited indefinitely on an idle stdin pipe");
-        }
-    };
-    drop(stdin);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(64), "stdout: {stdout}");
-    assert!(
-        stdout.contains("path argument or data on stdin"),
-        "{stdout}"
-    );
+    let mut stdin = child.stdin.take().expect("open child stdin");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let result = stdin.write_all(b"RxConflictHandler\n");
+        drop(stdin);
+        result
+    });
+    let output = child.wait_with_output().expect("collect greppy output");
+    writer
+        .join()
+        .unwrap()
+        .expect("producer must not get a broken pipe");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"RxConflictHandler\n");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

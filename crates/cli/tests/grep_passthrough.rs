@@ -326,43 +326,32 @@ fn passthrough_explicit_stdin_waits_beyond_implicit_startup_grace() {
 }
 
 #[test]
-fn passthrough_idle_stdin_pipe_returns_guidance_instead_of_hanging() {
-    let root = unique_tempdir("idle-stdin");
-    std::fs::create_dir(root.join("edit-src")).unwrap();
-
-    for pattern in [".", "edit-src"] {
-        let mut command = greppy_command(&format!("idle-{pattern}"));
-        command
-            .arg(pattern)
-            .current_dir(&root)
+fn passthrough_implicit_stdin_waits_beyond_old_timeout() {
+    for pattern in ["RxConflictHandler", ".", "edit-src"] {
+        let mut ours = greppy_command("slow-implicit-stdin");
+        ours.args(["-n", pattern])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn greppy");
-        // Keeping the writer open with zero bytes reproduces agent runners:
-        // real grep waits forever because EOF never arrives.
-        let stdin = child.stdin.take().expect("open child stdin");
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || send.send(child.wait_with_output()).unwrap());
-        let output = match receive.recv_timeout(std::time::Duration::from_secs(45)) {
-            Ok(output) => output.expect("collect greppy output"),
-            Err(_) => {
-                drop(stdin);
-                let _ = receive.recv_timeout(std::time::Duration::from_secs(1));
-                panic!("greppy {pattern} waited indefinitely on an idle stdin pipe");
-            }
-        };
-        drop(stdin);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(output.status.code(), Some(64), "stdout: {stdout}");
-        assert!(
-            stdout.contains("file/path argument or data on stdin"),
-            "{stdout}"
+        let mut child = ours.spawn().expect("spawn greppy");
+        let mut stdin = child.stdin.take().expect("open child stdin");
+        let writer = std::thread::spawn(move || {
+            // A live pipe is valid input even before its producer writes.
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            let result = stdin.write_all(b"RxConflictHandler\nedit-src\n");
+            drop(stdin);
+            result
+        });
+        let actual = child.wait_with_output().expect("collect greppy output");
+        writer
+            .join()
+            .unwrap()
+            .expect("producer must not get a broken pipe");
+        let expected = run_with_stdin(
+            Command::new(real_grep_path()).args(["-n", pattern]),
+            b"RxConflictHandler\nedit-src\n",
         );
-        assert!(
-            stdout.contains(&format!("greppy index {pattern}")),
-            "directory guidance missing: {stdout}"
-        );
+        diff_outputs("slow-implicit-stdin", &actual, &expected);
     }
 }
 

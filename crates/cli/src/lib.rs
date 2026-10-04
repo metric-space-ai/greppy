@@ -10213,9 +10213,6 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
             "status: invalid_invocation\nargument: `{argument}`\nmessage: this is neither a recognized greppy option nor supported grep syntax; nothing was passed to grep\nnext: run `greppy --help`, or put `--` before a literal pattern that begins with `-`"
         )));
     }
-    if let Some(message) = missing_stdin_message(grep_stdin_demand(grep_args), "grep") {
-        return Err(Error::Invalid(message));
-    }
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(grep_args);
@@ -10235,9 +10232,6 @@ fn dispatch_rg_os(
 ) -> Result<i32> {
     let rooted = add_root_default_path(args, working_dir, rg_stdin_demand(args));
     let args = rooted.as_deref().unwrap_or(args);
-    if let Some(message) = missing_stdin_message(rg_stdin_demand(args), "ripgrep") {
-        return Err(Error::Invalid(message));
-    }
     if let Some(real_rg) = greppy_passthrough::discover_ripgrep()? {
         let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
         rebuilt.push(std::ffi::OsString::from("rg"));
