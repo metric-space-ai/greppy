@@ -7874,7 +7874,31 @@ export function invalidCalls() { plainValue(); effectValue(); }
             );
         }
         store.upsert_index_skip(&skip).unwrap();
+        let filtered_qname = "node_modules/package/media-controls.js::Class::MediaControls";
+        store.conn().execute(
+            "INSERT INTO main.nodes(project,label,name,qualified_name,file_path,start_line,end_line,properties) VALUES('test','Class','MediaControls',?1,?2,999,999,'{}')",
+            [filtered_qname, skip.rel_path.as_str()],
+        ).unwrap();
+        let error = recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap_err();
+        assert!(error.to_string().contains("MediaControls"), "{error}");
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+        assert_eq!(
+            store
+                .get_node_by_qname("test", filtered_qname)
+                .unwrap()
+                .unwrap()
+                .start_line,
+            999
+        );
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.nodes WHERE project='test' AND qualified_name=?1",
+                [filtered_qname],
+            )
+            .unwrap();
         assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+
         assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
         let boundary = store
             .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
