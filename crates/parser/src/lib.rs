@@ -63,6 +63,16 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
+        // An explicit macro definition owns this spelling; do not reinterpret
+        // its uses as a built-in storage class without preprocessing evidence.
+        if matches!(node.kind(), "preproc_def" | "preproc_function_def")
+            && node.child_by_field_name("name").is_some_and(|name| {
+                source.get(name.byte_range()) == Some(b"_Thread_local".as_slice())
+            })
+        {
+            drop(cursor);
+            return Ok(tree);
+        }
         if matches!(node.kind(), "identifier" | "type_identifier")
             && source.get(node.byte_range()) == Some(b"_Thread_local".as_slice())
         {
@@ -96,6 +106,7 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
                 break;
             }
             if !cursor.goto_parent() {
+                drop(cursor);
                 if replacements.is_empty() {
                     return Ok(tree);
                 }
@@ -123,16 +134,49 @@ mod c11_tests {
             );
             let bytes = source.as_bytes().to_vec();
             let tree = parse(Language::C, &bytes).unwrap();
-            assert!(!tree.root_node().has_error(), "{}", tree.root_node().to_sexp());
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
             let at = source.find("counter").unwrap();
-            let name = tree.root_node().descendant_for_byte_range(at, at + 7).unwrap();
+            let name = tree
+                .root_node()
+                .descendant_for_byte_range(at, at + 7)
+                .unwrap();
             assert_eq!(name.kind(), "identifier");
             assert_eq!(name.utf8_text(&bytes).unwrap(), "counter");
             let at = source.find("_Thread_local_suffix").unwrap();
-            let name = tree.root_node().descendant_for_byte_range(at, at + 20).unwrap();
+            let name = tree
+                .root_node()
+                .descendant_for_byte_range(at, at + 20)
+                .unwrap();
             assert_eq!(name.utf8_text(&bytes).unwrap(), "_Thread_local_suffix");
             assert_eq!(bytes, source.as_bytes());
         }
+    }
+
+    #[test]
+    fn c11_thread_local_macro_binding_remains_opaque() {
+        let source = b"#define _Thread_local int\n_Thread_local counter;\n";
+        let tree = parse(Language::C, source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let at = source
+            .windows(7)
+            .position(|word| word == b"counter")
+            .unwrap();
+        assert_eq!(
+            tree.root_node()
+                .descendant_for_byte_range(at, at + 7)
+                .unwrap()
+                .utf8_text(source)
+                .unwrap(),
+            "counter"
+        );
     }
 
     #[test]
