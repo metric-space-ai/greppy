@@ -1,5 +1,50 @@
 //! Public Rust Option-field caller contracts. Every query starts a fresh CLI
 //! process, exercising persisted graphs rather than private resolver helpers.
+#[test]
+fn chained_callback_references_survive_public_query_reopen() {
+    let f = Fixture::new();
+    f.write("src/lib.rs", "mod callbacks; mod scene;\n");
+    f.write(
+        "src/callbacks.rs",
+        r#"
+pub fn predicate(value: i32) -> bool { value > 0 }
+pub fn direct_callback(value: Option<i32>) -> bool {
+    value.map(predicate).unwrap_or(false)
+}
+pub fn qualified_callback(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
+    value.map(crate::callbacks::predicate).unwrap_or(false)
+}
+pub fn actual_call(value: i32) -> bool { predicate(value) }
+pub fn shadowed_callback(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
+    value.map(predicate).unwrap_or(false)
+}
+pub fn local_callback(value: Option<i32>) -> bool {
+    let predicate = |value: i32| value > 1;
+    value.map(predicate).unwrap_or(false)
+}
+pub fn conditional_callback(value: Option<i32>, candidate: Option<fn(i32) -> bool>) -> bool {
+    if let Some(predicate) = candidate {
+        value.map(predicate).unwrap_or(false)
+    } else { false }
+}
+pub fn invoke(value: Option<i32>) -> bool { direct_callback(value) }
+"#,
+    );
+    f.index();
+    for _ in 0..2 {
+        let callers = f.query(&["who-calls", "predicate", "--all", "--json"]);
+        assert_eq!(hits(&callers), 3, "{callers}");
+        let callers = callers.to_string();
+        for name in ["direct_callback", "qualified_callback", "actual_call"] {
+            assert!(callers.contains(name), "{callers}");
+        }
+        let impact = f.query(&["impact", "predicate", "--depth", "2", "--json"]);
+        let impact = impact.to_string();
+        for name in ["direct_callback", "qualified_callback", "actual_call", "invoke"] {
+            assert!(impact.contains(name), "{impact}");
+        }
+    }
+}
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;

@@ -2132,7 +2132,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v10";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v11";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -5069,6 +5069,11 @@ impl GraphIndex {
     }
 
     fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
+        if edge.properties.get("ref_local_binding").and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return None;
+        }
         let name = edge
             .properties
             .get("ref_name")

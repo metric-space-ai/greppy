@@ -1717,6 +1717,10 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
     const MAX_PARENT_DEPTH: usize = 10;
     let mut cur = node.parent();
     let mut depth = 0;
+    // A callback argument belongs to its nearest call. An outer chained
+    // method's receiver also contains the inner arguments, but does not turn
+    // those arguments into callees.
+    let mut nearest_call_seen = false;
     while let Some(n) = cur {
         if depth >= MAX_PARENT_DEPTH {
             break;
@@ -1724,14 +1728,93 @@ fn rust_usage_is_suppressed(node: Node<'_>) -> bool {
         if RUST_USAGE_IMPORT_SUPPRESSORS.contains(&n.kind()) {
             return true;
         }
-        if n.kind() == "call_expression" && rust_node_is_call_target(node, n) {
-            return true;
+        if n.kind() == "call_expression" && !nearest_call_seen {
+            nearest_call_seen = true;
+            if rust_node_is_call_target(node, n) {
+                return true;
+            }
         }
         if n.kind() == "macro_invocation" {
             return true;
         }
         cur = n.parent();
         depth += 1;
+    }
+    false
+}
+
+/// Bare value names bound in an active local scope do not name a module
+/// function. Only patterns bind; initializer calls and parameter types do not.
+fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: &str) -> bool {
+    fn binds(source: &[u8], pattern: Node<'_>, name: &str) -> bool {
+        if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier") {
+            return node_text(source, pattern) == name;
+        }
+        let constructor = pattern.child_by_field_name("type");
+        let field_label = (pattern.kind() == "field_pattern")
+            .then(|| pattern.child_by_field_name("name"))
+            .flatten();
+        (0..pattern.named_child_count())
+            .filter_map(|index| pattern.named_child(index))
+            .filter(|child| Some(*child) != constructor && Some(*child) != field_label)
+            .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "block" {
+            for index in 0..scope.named_child_count() {
+                let Some(declaration) = scope.named_child(index) else { continue };
+                if declaration.kind() == "let_declaration"
+                    && declaration.end_byte() <= reference.start_byte()
+                    && declaration.child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if matches!(scope.kind(), "function_item" | "closure_expression") {
+            if let Some(parameters) = scope.child_by_field_name("parameters") {
+                for index in 0..parameters.named_child_count() {
+                    let Some(parameter) = parameters.named_child(index) else { continue };
+                    let pattern = parameter.child_by_field_name("pattern")
+                        .or_else(|| (parameter.kind() == "identifier").then_some(parameter));
+                    if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                        return true;
+                    }
+                }
+            }
+            if scope.kind() == "function_item" {
+                break;
+            }
+        }
+        if scope.kind() == "for_expression"
+            && scope.child_by_field_name("body")
+                .is_some_and(|body| node_contains(body, reference))
+            && scope.child_by_field_name("pattern")
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        if scope.kind() == "match_arm"
+            && scope.child_by_field_name("pattern")
+                .is_some_and(|pattern| !node_contains(pattern, reference)
+                    && binds(source, pattern, name))
+        {
+            return true;
+        }
+        if matches!(scope.kind(), "if_expression" | "while_expression")
+            && scope.child_by_field_name("consequence")
+                .or_else(|| scope.child_by_field_name("body"))
+                .is_some_and(|body| node_contains(body, reference))
+            && scope.child_by_field_name("condition")
+                .filter(|condition| condition.kind() == "let_condition")
+                .and_then(|condition| condition.child_by_field_name("pattern"))
+                .is_some_and(|pattern| binds(source, pattern, name))
+        {
+            return true;
+        }
+        ancestor = scope.parent();
     }
     false
 }
@@ -1790,6 +1873,40 @@ fn walk_rust_usages<'t, F: FnMut(Node<'t>, &str, Option<&str>)>(
 #[cfg(test)]
 mod rust_constructor_reference_tests {
     use super::*;
+
+    #[test]
+    fn chained_rust_calls_keep_callback_argument_usages() {
+        let code = r#"
+fn predicate(value: i32) -> bool { value > 0 }
+fn callbacks(value: Option<i32>) -> bool {
+    value.map(predicate).unwrap_or(false);
+    value.map(crate::predicate).unwrap_or(false);
+    value.map(|item| predicate(item)).unwrap_or(false);
+    predicate(1)
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut references = Vec::new();
+        walk_rust_usages(
+            code.as_bytes(),
+            tree.root_node(),
+            &mut |node, name, path| {
+                if name == "predicate" {
+                    references.push((node.start_position().row, path.map(str::to_owned)));
+                }
+            },
+        );
+        assert_eq!(
+            references,
+            vec![(3, None), (4, Some("crate::predicate".into()))],
+            "callback arguments remain usages; declarations and direct callees do not"
+        );
+    }
 
     #[test]
     fn structured_rust_value_paths_are_usages_not_definitions() {
@@ -4086,6 +4203,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 line: node.start_position().row as u32 + 1,
                 properties: {
                     let mut properties = serde_json::json!({ "ref_name": text });
+                    if ref_path.is_none()
+                        && node.kind() == "identifier"
+                        && rust_usage_has_local_value_binding(source, node, text)
+                    {
+                        // Keep the raw reference, but never bind a proven local
+                        // value to a same-named module function or type.
+                        properties["ref_local_binding"] = serde_json::json!(true);
+                    }
                     if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
                         object.insert(
                             "ref_path".into(),
