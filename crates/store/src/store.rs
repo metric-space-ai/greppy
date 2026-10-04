@@ -291,6 +291,19 @@ impl Store {
                 self.conn.execute_batch(&format!("CREATE TEMP TABLE {table}(project TEXT NOT NULL, {column} TEXT NOT NULL, PRIMARY KEY(project,{column}));"))?;
             }
         }
+        // Indexed TEMP facts keep schema17 Base IDs and vectors immutable.
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE base_node_span_overrides (
+                project TEXT NOT NULL,node_id INTEGER NOT NULL,qualified_name TEXT NOT NULL,
+                old_start_line INTEGER NOT NULL,old_end_line INTEGER NOT NULL,
+                start_line INTEGER NOT NULL,end_line INTEGER NOT NULL,
+                PRIMARY KEY(project,node_id));
+             INSERT INTO base_node_span_overrides
+             SELECT json_extract(j.value,'$[0]'),json_extract(j.value,'$[1]'),json_extract(j.value,'$[2]'),
+                    json_extract(j.value,'$[3]'),json_extract(j.value,'$[4]'),json_extract(j.value,'$[5]'),json_extract(j.value,'$[6]')
+             FROM main.schema_meta m,json_each(m.value) j
+             WHERE m.key='greppy.base_node_span_overrides.v1';"
+        )?;
         let base_uri = sqlite_read_only_uri(base_path)?;
         self.conn
             .execute("ATTACH DATABASE ?1 AS greppy_base", [base_uri])?;
@@ -373,8 +386,12 @@ CREATE TEMP VIEW nodes AS
 SELECT * FROM main.nodes
 UNION ALL
 SELECT -b.id AS id, b.project, b.label, b.name, b.qualified_name,
-       b.file_path, b.start_line, b.end_line, b.properties
+       b.file_path, COALESCE(s.start_line,b.start_line),
+       COALESCE(s.end_line,b.end_line), b.properties
 FROM greppy_base.nodes b
+LEFT JOIN base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+ AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line
+ AND s.old_end_line=b.end_line
 WHERE NOT EXISTS (
     SELECT 1 FROM definition_identity_overrides q
     WHERE q.project = b.project AND q.qualified_name = b.qualified_name

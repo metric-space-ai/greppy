@@ -3,6 +3,77 @@
 use std::path::{Path, PathBuf};
 
 #[test]
+fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
+    let (repo, store) = fresh_workspace("enum-variant-span");
+    let original =
+        "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n    Tail,\n}\n";
+    std::fs::write(repo.join("lib.rs"), original).unwrap();
+    index(&repo, &store);
+    let database = only_graph_db_below(&store);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM nodes WHERE qualified_name='lib.rs::Kind::Branch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before: String = conn
+        .query_row("SELECT group_concat(sha256) FROM file_state", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v14'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v13','complete');").unwrap();
+    drop(conn);
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read", "lib.rs::Kind::Branch", "--handle", "--json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    let source = value["source"].as_str().unwrap();
+    assert!(source.contains("condition: bool"), "{value}");
+    assert!(source.contains("    },"), "{value}");
+    assert!(!source.contains("Tail"), "{value}");
+    let handle = value["handle"].as_str().unwrap();
+    let replacement = "    Branch {\n        condition: bool,\n        cycles: u32,\n    },\n";
+    let (edit_code, edit_out, edit_err) = run(
+        &repo,
+        &store,
+        &["replace-span", handle, replacement, "--dry-run"],
+    );
+    assert_eq!(edit_code, 0, "{edit_out}\n{edit_err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("lib.rs")).unwrap(),
+        original
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM nodes WHERE qualified_name='lib.rs::Kind::Branch'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        id
+    );
+    assert_eq!(
+        conn.query_row("SELECT end_line FROM nodes WHERE id=?1", [id], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        conn.query_row("SELECT group_concat(sha256) FROM file_state", [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
 fn read_file_json_source_text_cannot_fabricate_or_override_handles() {
     let (repo, store) = fresh_workspace("json-handle-source-collision");
     let content = format!("handle: bogus\n{}", "ordinary\n".repeat(400));

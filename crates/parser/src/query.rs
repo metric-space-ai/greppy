@@ -264,7 +264,7 @@ pub mod rust_queries {
             name: (type_identifier) @enum_name
             body: (enum_variant_list
                 (enum_variant
-                    name: (identifier) @enum_variant)))
+                    name: (identifier) @enum_variant) @enum_variant_item))
 
         (const_item
             name: (identifier) @assoc_const) @assoc_const_item

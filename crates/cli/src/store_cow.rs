@@ -434,10 +434,12 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
          WHERE d.file_path <> '' AND d.label <> 'Folder'
          AND NOT EXISTS (
              SELECT 1 FROM greppy_base.nodes b
+             LEFT JOIN temp.base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+               AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line AND s.old_end_line=b.end_line
              WHERE b.project = d.project AND b.qualified_name = d.qualified_name
                AND b.label = d.label AND b.name = d.name
-               AND b.file_path = d.file_path AND b.start_line = d.start_line
-               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND b.file_path = d.file_path AND COALESCE(s.start_line,b.start_line) = d.start_line
+               AND COALESCE(s.end_line,b.end_line) = d.end_line AND b.properties = d.properties
                AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
          )"
     } else {
@@ -490,11 +492,13 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
          WHERE v.file_path <> '' AND NOT EXISTS (
              SELECT 1 FROM nodes d JOIN greppy_base.nodes b
                ON b.project = d.project AND b.qualified_name = d.qualified_name
+             LEFT JOIN temp.base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+               AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line AND s.old_end_line=b.end_line
              WHERE (v.node_id IS NULL OR d.id = v.node_id) AND d.project = v.project
                AND d.qualified_name = v.qualified_name AND d.file_path = v.file_path
                AND b.label = d.label AND b.name = d.name
-               AND b.file_path = d.file_path AND b.start_line = d.start_line
-               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND b.file_path = d.file_path AND COALESCE(s.start_line,b.start_line) = d.start_line
+               AND COALESCE(s.end_line,b.end_line) = d.end_line AND b.properties = d.properties
                AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
                AND v.start_line >= d.start_line AND v.end_line >= v.start_line
                AND (v.end_line <= d.end_line OR d.end_line = d.start_line)
@@ -3205,6 +3209,119 @@ mod tests {
                 .files_indexed,
             0
         );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn rust_enum_variant_span_repair_keeps_vector_backed_base_copy_derived() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "pub enum Kind {\n    Branch {\n        condition: bool,\n    },\n}\n",
+        )
+        .unwrap();
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            base.conn()
+                .execute(
+                    "UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'",
+                    [],
+                )
+                .unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let visibility = VisibilityIndex::default();
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let original = overlay
+            .get_node_by_qname("p", "src/a.rs::Kind::Branch")
+            .unwrap()
+            .unwrap();
+        let project = overlay.get_project("p").unwrap().unwrap();
+        overlay.upsert_project(&project).unwrap();
+        let copied_id = overlay
+            .insert_writable_node(&greppy_store::NewNode {
+                project: original.project.clone(),
+                label: original.label.clone(),
+                name: original.name.clone(),
+                qualified_name: original.qualified_name.clone(),
+                file_path: original.file_path.clone(),
+                start_line: original.start_line,
+                end_line: original.end_line,
+                properties: original.properties.clone(),
+            })
+            .unwrap();
+        assert!(copied_id > 0, "vectors require a writable Delta identity");
+        overlay
+            .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
+                project: "p".into(),
+                model_id: "test-model".into(),
+                prompt_version: "v1".into(),
+                task: "definition".into(),
+                node_id: Some(copied_id),
+                chunk_idx: 0,
+                qualified_name: original.qualified_name.clone(),
+                file_path: original.file_path.clone(),
+                start_line: original.start_line,
+                end_line: original.end_line,
+                content_sha256: "a".repeat(64),
+                graph_generation: 1,
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert_eq!(
+            greppy_indexer::recover_persisted_rust_enum_variant_spans(
+                &mut overlay,
+                "p",
+                repo.path()
+            )
+            .unwrap(),
+            1
+        );
+        let repaired = overlay.get_node(copied_id).unwrap().unwrap();
+        assert_eq!(
+            (repaired.id, repaired.start_line, repaired.end_line),
+            (copied_id, 2, 4)
+        );
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert_eq!(
+            overlay
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.vector_embeddings WHERE node_id=?1",
+                    [copied_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        drop(overlay);
+        let reopened =
+            greppy_store::Store::open_overlay_read_only(&base_path, &delta_path, &visibility)
+                .unwrap();
+        assert!(private_delta_paths(&reopened).unwrap().is_empty());
+        assert_eq!(reopened.get_node(copied_id).unwrap().unwrap().end_line, 4);
+        drop(reopened);
+        // Removing a derived vector copy reveals the repaired Base definition,
+        // with its original negative ID and unchanged physical Base bytes.
+        let mut reopened =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        reopened.delete_node(copied_id).unwrap();
+        assert_eq!(reopened.get_node(original.id).unwrap().unwrap().end_line, 4);
+        drop(reopened);
+        let hidden = greppy_store::Store::open_overlay_read_only(
+            &base_path,
+            &delta_path,
+            &VisibilityIndex::new(vec!["src/a.rs".to_string()], Vec::<String>::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(hidden.get_node(original.id).unwrap().is_none());
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
     }
 
