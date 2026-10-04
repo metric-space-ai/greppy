@@ -3242,7 +3242,7 @@ mod tests {
         let project = overlay.get_project("p").unwrap().unwrap();
         overlay.upsert_project(&project).unwrap();
         let copied_id = overlay
-            .insert_node(&greppy_store::NewNode {
+            .insert_writable_node(&greppy_store::NewNode {
                 project: original.project.clone(),
                 label: original.label.clone(),
                 name: original.name.clone(),
@@ -3253,6 +3253,7 @@ mod tests {
                 properties: original.properties.clone(),
             })
             .unwrap();
+        assert!(copied_id > 0, "vectors require a writable Delta identity");
         overlay
             .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
                 project: "p".into(),
