@@ -3549,6 +3549,10 @@ fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
         if depth >= 10 {
             break;
         }
+        // Callback references belong to their own body, not the outer factory.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
+        }
         if kinds.contains(&cur.kind()) {
             return true;
         }
@@ -3570,6 +3574,11 @@ fn js_ts_inside_import(node: Node<'_>) -> bool {
     while let Some(cur) = p {
         if depth >= 10 {
             break;
+        }
+        // Function bodies/signatures do not become import bindings just
+        // because the function is stored in an outer const declaration.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
         }
         if JS_TS_IMPORT_KINDS.contains(&cur.kind())
             && !(cur.kind() == "export_statement" && js_ts_export_of_declaration(cur))
