@@ -171,6 +171,13 @@ pub(crate) struct TurnCommit<'a> {
     pub title: Option<&'a str>,
 }
 
+pub(crate) struct ImportHistoryCommit<'a> {
+    pub expected: &'a [PersistedMessage],
+    pub expected_ack: &'a [ImportAck],
+    pub messages: &'a [PersistedMessage],
+    pub acknowledgements: &'a [ImportAck],
+}
+
 impl SessionStore {
     pub fn new(data_root: impl Into<PathBuf>, project: impl Into<String>) -> Self {
         Self {
@@ -387,13 +394,16 @@ impl SessionStore {
     pub(crate) fn commit_import_history(
         &self,
         session_id: &str,
-        expected: &[PersistedMessage],
-        expected_ack: &[ImportAck],
-        messages: &[PersistedMessage],
-        acknowledgements: &[ImportAck],
+        import: ImportHistoryCommit<'_>,
         before_commit: impl FnOnce() -> io::Result<()>,
         after_rename: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), ImportHistoryCommitError> {
+        let ImportHistoryCommit {
+            expected,
+            expected_ack,
+            messages,
+            acknowledgements,
+        } = import;
         let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
         if previous.recovered

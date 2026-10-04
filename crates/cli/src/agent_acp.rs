@@ -529,10 +529,12 @@ impl Server {
         let store = SessionStore::new(&session.data_root, &session.project);
         let saved = store.commit_import_history(
             session_id,
-            &messages_from_protocol(&session.messages),
-            &session.import_ack,
-            &messages_from_protocol(&history),
-            &acknowledgements,
+            crate::agent_tui::session::ImportHistoryCommit {
+                expected: &messages_from_protocol(&session.messages),
+                expected_ack: &session.import_ack,
+                messages: &messages_from_protocol(&history),
+                acknowledgements: &acknowledgements,
+            },
             || {
                 #[cfg(test)]
                 if let Some(hook) = &self.config.after_messages {

@@ -9465,7 +9465,7 @@ mod embeddinggemma_assets {
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
             let gguf = extract(&root, GGUF_SHA, GGUF_NAME, GGUF)?;
             let tok = extract(&root, TOK_SHA, TOK_NAME, TOK)?;
-            return Some((gguf, tok));
+            Some((gguf, tok))
         }
         #[cfg(debug_assertions)]
         {
@@ -9572,7 +9572,7 @@ mod qwen35_assets {
             static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
             let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
             let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
-            return Some((gguf, tok));
+            Some((gguf, tok))
         }
         #[cfg(debug_assertions)]
         {
