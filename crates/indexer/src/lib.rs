@@ -2505,7 +2505,6 @@ pub fn recover_persisted_js_ts_usages(
 }
 
 /// Repair Effect.fn identities in a private overlay without mutating its Base
-
 /// or copying Base file-state/content/vector ownership into Delta.
 pub fn recover_visible_effect_fn_bindings(
     store: &mut Store,
