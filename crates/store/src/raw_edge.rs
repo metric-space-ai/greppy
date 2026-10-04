@@ -284,6 +284,27 @@ impl Store {
         Ok(rows)
     }
 
+    /// Read only unresolved factory receiver facts for one file. The visible
+    /// raw_edges relation retains immutable-Base repair masking; filtering in
+    /// SQL avoids hydrating unrelated calls, imports and usages for navigation.
+    pub fn list_raw_factory_receiver_edges_for_file(
+        &self,
+        project: &str,
+        file_path: &str,
+    ) -> Result<Vec<RawEdge>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, project, file_path, source_qname, target_qname, edge_type, properties
+             FROM raw_edges WHERE project=?1 AND file_path=?2 AND edge_type='CALLS'
+               AND json_type(properties,'$.receiver_factory_pattern') = 'text'
+               AND json_extract(properties,'$.receiver_owner') IS NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![project, file_path], row_to_raw_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Read import context without expanding reference repair arrays in the
     /// overlay view. Those arrays contain CALLS/USAGE only; their window
     /// functions otherwise scan all repairs before applying a file filter.

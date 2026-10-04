@@ -519,10 +519,265 @@ fn rust_block_item_shadows_binding(source: &[u8], block: Node<'_>, name: &str) -
         })
 }
 
+/// Raw provenance for an unresolved if-let factory receiver. It is diagnostic
+/// evidence only: neither Some spelling nor a factory name establishes a type.
+fn rust_option_factory_pattern_path<'a>(
+    source: &'a [u8],
+    callee: Node<'_>,
+    name: &str,
+) -> Option<&'a str> {
+    fn binds(source: &[u8], node: Node<'_>, name: &str) -> bool {
+        (node.kind() == "identifier" && node_text(source, node) == name)
+            || (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .any(|child| binds(source, child, name))
+    }
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            for binding in (0..node.named_child_count()).filter_map(|i| node.named_child(i)) {
+                if binding.kind() == "let_declaration"
+                    && binding.end_byte() <= callee.start_byte()
+                    && binding
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| binds(source, pattern, name))
+                {
+                    return None;
+                }
+            }
+        }
+        if matches!(node.kind(), "closure_expression" | "for_expression") {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("parameters"));
+            if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
+                return None;
+            }
+        }
+        if node.kind() == "if_expression" {
+            let body = node.child_by_field_name("consequence")?;
+            if !(body.start_byte() <= callee.start_byte() && callee.end_byte() <= body.end_byte()) {
+                return None;
+            }
+            let condition = node.child_by_field_name("condition")?;
+            if condition.kind() == "let_condition" {
+                let pattern = condition.child_by_field_name("pattern")?;
+                if binds(source, pattern, name) {
+                    if pattern.kind() != "tuple_struct_pattern"
+                        || pattern.named_child_count() != 2
+                        || node_text(source, pattern.named_child(0)?) != "Some"
+                    {
+                        return None;
+                    }
+                    let text = node_text(source, pattern.named_child(1)?);
+                    if text != name && text.strip_prefix("mut ") != Some(name) {
+                        return None;
+                    }
+                    let value = condition.child_by_field_name("value")?;
+                    let call = if value.kind() == "try_expression" {
+                        value.named_child(0)?
+                    } else {
+                        value
+                    };
+                    if call.kind() != "call_expression" {
+                        return None;
+                    }
+                    let target = call.child_by_field_name("function")?;
+                    return (target.kind() == "scoped_identifier")
+                        .then(|| node_text(source, target));
+                }
+            }
+        }
+        if node.kind() == "function_item" {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// Prove the payload of a same-file inherent factory from its authored return
+/// signature. Only standard Option/Result (or one explicit local Result alias)
+/// are interpreted; arbitrary qualified wrappers never imply Try::Output.
+fn rust_option_factory_owner<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'a str> {
+    let uses_try = value.kind() == "try_expression";
+    let call = if uses_try {
+        value.named_child(0)?
+    } else {
+        value
+    };
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let target = call.child_by_field_name("function")?;
+    if target.kind() != "scoped_identifier" {
+        return None;
+    }
+    let path = node_text(source, target);
+    let (factory_owner, factory_name) = path.split_once("::")?;
+    if factory_owner.is_empty() || factory_name.contains("::") {
+        return None;
+    }
+    let mut root = value;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut pending = vec![root];
+    let mut factories = Vec::new();
+    let mut aliases = Vec::new();
+    let mut owner_declarations = 0;
+    while let Some(node) = pending.pop() {
+        let declared_name = node
+            .child_by_field_name("name")
+            .map(|name| node_text(source, name));
+        if uses_try
+            && declared_name == Some("Result")
+            && matches!(
+                node.kind(),
+                "struct_item" | "enum_item" | "type_item" | "type_parameter" | "mod_item"
+            )
+        {
+            return None;
+        }
+        if matches!(
+            node.kind(),
+            "struct_item" | "enum_item" | "type_item" | "type_parameter" | "mod_item"
+        ) && declared_name == Some(factory_owner)
+        {
+            if !matches!(node.kind(), "struct_item" | "enum_item") {
+                return None;
+            }
+            owner_declarations += 1;
+        }
+        if node.kind() == "type_item" {
+            aliases.push(node);
+        }
+        if node.kind() == "function_item" && declared_name == Some(factory_name) {
+            let Some(body) = node
+                .parent()
+                .filter(|node| node.kind() == "declaration_list")
+            else {
+                continue;
+            };
+            let Some(implementation) = body.parent().filter(|node| node.kind() == "impl_item")
+            else {
+                continue;
+            };
+            if implementation.child_by_field_name("trait").is_none()
+                && implementation
+                    .child_by_field_name("type_parameters")
+                    .is_none()
+                && implementation
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| node_text(source, ty) == factory_owner)
+            {
+                // Attributes/macros in the factory's impl can replace or inject
+                // its signature; the call-site transparency guard is insufficient.
+                if (0..body.named_child_count())
+                    .filter_map(|i| body.named_child(i))
+                    .any(|item| {
+                        matches!(
+                            item.kind(),
+                            "attribute_item" | "macro_invocation" | "use_declaration"
+                        )
+                    })
+                {
+                    return None;
+                }
+                factories.push(node);
+            }
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+    }
+    if owner_declarations != 1 || factories.len() != 1 {
+        return None;
+    }
+    let factory = factories[0];
+    if (0..factory.named_child_count())
+        .filter_map(|i| factory.named_child(i))
+        .any(|child| {
+            child.kind() == "function_modifiers"
+                && node_text(source, child)
+                    .split_whitespace()
+                    .any(|word| word == "async")
+        })
+    {
+        return None;
+    }
+    if factory.child_by_field_name("type_parameters").is_some()
+        || factory
+            .child_by_field_name("parameters")
+            .is_some_and(|parameters| {
+                (0..parameters.named_child_count())
+                    .filter_map(|i| parameters.named_child(i))
+                    .any(|item| item.kind() == "self_parameter")
+            })
+    {
+        return None;
+    }
+    let mut ty = factory.child_by_field_name("return_type")?;
+    if uses_try {
+        if ty.kind() != "generic_type" {
+            return None;
+        }
+        let wrapper = node_text(source, ty.child_by_field_name("type")?);
+        let arguments = ty.child_by_field_name("type_arguments")?;
+        if wrapper == "Result" && arguments.named_child_count() == 2 {
+            ty = arguments.named_child(0)?;
+        } else {
+            // A local alias is evidence only when its single generic parameter
+            // is precisely the standard Result success payload.
+            let matching = aliases
+                .iter()
+                .filter(|alias| {
+                    alias
+                        .child_by_field_name("name")
+                        .is_some_and(|name| node_text(source, name) == wrapper)
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 || arguments.named_child_count() != 1 {
+                return None;
+            }
+            let alias = *matching[0];
+            let params = alias.child_by_field_name("type_parameters")?;
+            if params.named_child_count() != 1 {
+                return None;
+            }
+            let parameter = params.named_child(0)?;
+            if parameter.kind() != "type_parameter" {
+                return None;
+            }
+            let name = node_text(source, parameter.child_by_field_name("name")?);
+            let aliased = alias.child_by_field_name("type")?;
+            if aliased.kind() != "generic_type"
+                || node_text(source, aliased.child_by_field_name("type")?) != "Result"
+            {
+                return None;
+            }
+            let args = aliased.child_by_field_name("type_arguments")?;
+            if args.named_child_count() != 2 || node_text(source, args.named_child(0)?) != name {
+                return None;
+            }
+            ty = arguments.named_child(0)?;
+        }
+    }
+    if ty.kind() != "generic_type" || node_text(source, ty.child_by_field_name("type")?) != "Option"
+    {
+        return None;
+    }
+    let args = ty.child_by_field_name("type_arguments")?;
+    if args.named_child_count() != 1 {
+        return None;
+    }
+    let payload = node_text(source, args.named_child(0)?);
+    matches!(payload, "Self").then_some(factory_owner)
+}
+
 /// Resolve only a transparent prelude Option pattern over an explicitly typed
 /// identifier. The outer Option records shadowing even when ownership is unknown.
-/// Field access, adapters (including as_ref), return-type inference and custom
+/// Field access, adapters (including as_ref), opaque return wrappers and custom
 /// variants remain unresolved rather than borrowing a same-named method.
+/// Same-file inherent factories require explicit unshadowed return signatures.
 fn rust_option_pattern_owner<'a>(
     source: &'a [u8],
     callee: Node<'_>,
@@ -555,7 +810,7 @@ fn rust_option_pattern_owner<'a>(
             }
             return None;
         }
-        if pattern.kind() != "tuple_struct_pattern" || value.kind() != "identifier" {
+        if pattern.kind() != "tuple_struct_pattern" {
             return None;
         }
         let constructor = pattern
@@ -565,8 +820,12 @@ fn rust_option_pattern_owner<'a>(
             return None;
         }
         let binding = pattern.named_child(1)?;
-        if binding.kind() != "identifier" || node_text(source, binding) != name {
+        let binding_text = node_text(source, binding);
+        if binding_text != name && binding_text.strip_prefix("mut ") != Some(name) {
             return None;
+        }
+        if value.kind() != "identifier" {
+            return rust_option_factory_owner(source, value);
         }
         // Lookup at the scrutinee, outside the new pattern's scope.
         let ty = rust_visible_binding_type(source, value, node_text(source, value))?;
@@ -4281,6 +4540,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             .is_some()
                     });
                 let receiver_owner = rust_receiver_owner(source, node);
+                let receiver_factory_pattern = (callee_form == "receiver"
+                    && receiver_owner.is_none())
+                .then(|| node.parent()?.child_by_field_name("value"))
+                .flatten()
+                .filter(|receiver| receiver.kind() == "identifier")
+                .and_then(|receiver| {
+                    rust_option_factory_pattern_path(source, node, node_text(source, receiver))
+                });
                 let receiver_provenance = (callee_form == "receiver" && receiver_owner.is_none())
                     .then(|| rust_option_field_receiver(source, node))
                     .flatten();
@@ -4319,6 +4586,9 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             "callee_name": text,
                             "callee_form": callee_form,
                             });
+                            if let Some(factory) = receiver_factory_pattern {
+                                properties["receiver_factory_pattern"] = serde_json::json!(factory);
+                            }
                             if receiver_option_pattern {
                                 properties.as_object_mut().unwrap().insert(
                                     "receiver_option_pattern".into(),
@@ -17344,6 +17614,45 @@ fn f(manifest: Manifest) {
                 } else {
                     assert!(limits.contains(marker), "{source}: {limits}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_factory_option_patterns_use_explicit_signatures_without_guessing_wrappers() {
+        for (signature, extra, body, expected, diagnostic) in [
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", Some("Writer"), false),
+            ("Result<Option<Self>, ()>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("FactoryResult<Option<Self>>", "type FactoryResult<T> = Result<T, ()>;", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("anyhow::Result<Option<Self>>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+            ("Option<Other>", "struct Other;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "use custom::Some;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }", None, false),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }", None, false),
+            ("Option<Self>", "enum Option<T> { Some(T), None }", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Result<Option<Self>, ()>", "enum Result<T,E> { Ok(T), Err(E) }", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+        ] {
+            let source = format!("{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}");
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            assert_eq!(call.properties["receiver_owner"].as_str(), expected, "{source}");
+            assert_eq!(call.properties.get("receiver_factory_pattern").is_some(), diagnostic, "{source}");
+        }
+    }
+
+    #[test]
+    fn rust_factory_option_patterns_reject_async_generic_and_nearest_shadow() {
+        for source in [
+            "struct Writer; impl Writer { async fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open<T>() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller<Writer>() { if let Some(mut writer) = Writer::open() { writer.upsert(); } }",
+            "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { let f = |writer| writer.upsert(); } }",
+        ] {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            assert!(call.properties.get("receiver_owner").is_none(), "{source}");
+            if source.contains("|writer|") {
+                assert!(call.properties.get("receiver_factory_pattern").is_none(), "{source}");
             }
         }
     }

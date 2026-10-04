@@ -3556,6 +3556,7 @@ fn nav_counts_json(
         hits,
         None,
         &crate::nav::UnresolvedReceiverReport::none(),
+        None,
     )
 }
 
@@ -3573,6 +3574,7 @@ fn nav_counts_json_with_expand(
     hits: Vec<serde_json::Value>,
     expand: Option<&ExpandHandle>,
     unresolved_receivers: &crate::nav::UnresolvedReceiverReport,
+    unresolved_factories: Option<&crate::nav::FactoryReceiverPage>,
 ) -> Result<()> {
     let omitted = total_exact.saturating_sub(shown);
     let freshness = nav_freshness_json(store, root, project);
@@ -3612,6 +3614,18 @@ fn nav_counts_json_with_expand(
         "all": all,
         "hits": hits,
     });
+    if let Some(unresolved) = unresolved_factories.filter(|page| page.total > 0) {
+        v["unresolved_factory_receivers"] = serde_json::json!(unresolved.rows);
+        v["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+        v["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+        v["unresolved_factory_truncated"] = serde_json::json!(unresolved.omitted > 0);
+        v["callees_incomplete"] = serde_json::json!(true);
+        v["next"] = serde_json::json!(format!("greppy read {symbol}"));
+        v["targets"][0]["callees_incomplete"] = serde_json::json!(true);
+        v["targets"][0]["unresolved_factory_total"] = serde_json::json!(unresolved.total);
+        v["targets"][0]["unresolved_factory_omitted"] = serde_json::json!(unresolved.omitted);
+        v["targets"][0]["unresolved_factory_truncated"] = serde_json::json!(unresolved.omitted > 0);
+    }
     if !symbol_found {
         let miss = symbol_miss_json(store, project, symbol);
         v["suggestions"] = miss["suggestions"].clone();
@@ -7728,6 +7742,22 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+    let mut factory_cache = crate::nav::FactoryReceiverCache::default();
+    let mut factory_remaining = crate::nav::factory_receiver_limit(req.code, req.all);
+    let unresolved_factories = resolved
+        .iter()
+        .map(|ids| {
+            if req.kind == NavKind::Callees {
+                let page = factory_cache.page(&store, ids, factory_remaining, |path| {
+                    path_filters.matches(path)
+                })?;
+                factory_remaining = factory_remaining.saturating_sub(page.rows.len());
+                Ok(page)
+            } else {
+                Ok(crate::nav::FactoryReceiverPage::default())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
@@ -7843,6 +7873,44 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             "all": req.all,
             "hits": hits,
         });
+        let factory_rows = unresolved_factories
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rows)| {
+                rows.rows.iter().cloned().map(move |mut row| {
+                    row["target"] = serde_json::json!(req.targets[index]);
+                    row["next"] = serde_json::json!(format!("greppy read {}", req.targets[index]));
+                    row
+                })
+            })
+            .collect::<Vec<_>>();
+        let factory_total = unresolved_factories
+            .iter()
+            .map(|page| page.total)
+            .sum::<usize>();
+        let factory_omitted = unresolved_factories
+            .iter()
+            .map(|page| page.omitted)
+            .sum::<usize>();
+        if factory_total > 0 {
+            value["unresolved_factory_receivers"] = serde_json::json!(factory_rows);
+            value["unresolved_factory_total"] = serde_json::json!(factory_total);
+            value["unresolved_factory_omitted"] = serde_json::json!(factory_omitted);
+            value["unresolved_factory_truncated"] = serde_json::json!(factory_omitted > 0);
+            value["callees_incomplete"] = serde_json::json!(true);
+            for (index, page) in unresolved_factories
+                .iter()
+                .enumerate()
+                .filter(|(_, page)| page.total > 0)
+            {
+                value["targets"][index]["callees_incomplete"] = serde_json::json!(true);
+                value["targets"][index]["unresolved_factory_total"] = serde_json::json!(page.total);
+                value["targets"][index]["unresolved_factory_omitted"] =
+                    serde_json::json!(page.omitted);
+                value["targets"][index]["unresolved_factory_truncated"] =
+                    serde_json::json!(page.omitted > 0);
+            }
+        }
         let unresolved_json = unresolved_by_target
             .iter()
             .enumerate()
@@ -7902,6 +7970,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             println!();
         }
         println!("{symbol}");
+        crate::nav::print_unresolved_factory_receivers(&unresolved_factories[index], symbol);
         let unresolved_page = &unresolved_by_target[index];
         let unresolved_incomplete =
             unresolved_page.total > 0 || unresolved_page.omitted > 0 || unresolved_page.truncated;
