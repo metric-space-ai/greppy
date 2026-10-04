@@ -1763,10 +1763,13 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
     while let Some(scope) = ancestor {
         if scope.kind() == "block" {
             for index in 0..scope.named_child_count() {
-                let Some(declaration) = scope.named_child(index) else { continue };
+                let Some(declaration) = scope.named_child(index) else {
+                    continue;
+                };
                 if declaration.kind() == "let_declaration"
                     && declaration.end_byte() <= reference.start_byte()
-                    && declaration.child_by_field_name("pattern")
+                    && declaration
+                        .child_by_field_name("pattern")
                         .is_some_and(|pattern| binds(source, pattern, name))
                 {
                     return true;
@@ -1776,8 +1779,11 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
         if matches!(scope.kind(), "function_item" | "closure_expression") {
             if let Some(parameters) = scope.child_by_field_name("parameters") {
                 for index in 0..parameters.named_child_count() {
-                    let Some(parameter) = parameters.named_child(index) else { continue };
-                    let pattern = parameter.child_by_field_name("pattern")
+                    let Some(parameter) = parameters.named_child(index) else {
+                        continue;
+                    };
+                    let pattern = parameter
+                        .child_by_field_name("pattern")
                         .or_else(|| (parameter.kind() == "identifier").then_some(parameter));
                     if pattern.is_some_and(|pattern| binds(source, pattern, name)) {
                         return true;
@@ -1789,25 +1795,29 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
             }
         }
         if scope.kind() == "for_expression"
-            && scope.child_by_field_name("body")
+            && scope
+                .child_by_field_name("body")
                 .is_some_and(|body| node_contains(body, reference))
-            && scope.child_by_field_name("pattern")
+            && scope
+                .child_by_field_name("pattern")
                 .is_some_and(|pattern| binds(source, pattern, name))
         {
             return true;
         }
         if scope.kind() == "match_arm"
-            && scope.child_by_field_name("pattern")
-                .is_some_and(|pattern| !node_contains(pattern, reference)
-                    && binds(source, pattern, name))
+            && scope.child_by_field_name("pattern").is_some_and(|pattern| {
+                !node_contains(pattern, reference) && binds(source, pattern, name)
+            })
         {
             return true;
         }
         if matches!(scope.kind(), "if_expression" | "while_expression")
-            && scope.child_by_field_name("consequence")
+            && scope
+                .child_by_field_name("consequence")
                 .or_else(|| scope.child_by_field_name("body"))
                 .is_some_and(|body| node_contains(body, reference))
-            && scope.child_by_field_name("condition")
+            && scope
+                .child_by_field_name("condition")
                 .filter(|condition| condition.kind() == "let_condition")
                 .and_then(|condition| condition.child_by_field_name("pattern"))
                 .is_some_and(|pattern| binds(source, pattern, name))

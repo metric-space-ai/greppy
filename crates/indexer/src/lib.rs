@@ -5069,7 +5069,10 @@ impl GraphIndex {
     }
 
     fn resolve_usage_target(&self, edge: &ExtractedEdge, src_id: i64) -> Option<i64> {
-        if edge.properties.get("ref_local_binding").and_then(|value| value.as_bool())
+        if edge
+            .properties
+            .get("ref_local_binding")
+            .and_then(|value| value.as_bool())
             == Some(true)
         {
             return None;
@@ -11021,6 +11024,69 @@ pub fn load_scene() {
             "UNRESOLVED_CALLS"
         )
         .contains(&"uniform".to_string()));
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn callback_v10_store_recovers_omitted_usages_without_shadow_callers() {
+        let repo = setup_repo(
+            "callback-v10-repair",
+            r#"
+pub fn predicate(value: i32) -> bool { value > 0 }
+pub fn chained(value: Option<i32>) -> bool {
+    value.map(predicate).unwrap_or(false)
+}
+pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
+    value.map(predicate).unwrap_or(false)
+}
+"#,
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let predicate = store
+            .get_node_by_qname("test", "src/lib.rs::Function::predicate")
+            .unwrap()
+            .unwrap();
+        let chained = store
+            .get_node_by_qname("test", "src/lib.rs::Function::chained")
+            .unwrap()
+            .unwrap();
+        let shadowed = store
+            .get_node_by_qname("test", "src/lib.rs::Function::shadowed")
+            .unwrap()
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM raw_edges WHERE edge_type='USAGE'", [])
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v10','complete')", []).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        assert!(store
+            .incoming_edges(predicate.id, Some("USAGE"), 20)
+            .unwrap()
+            .is_empty());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        let callers = store
+            .incoming_edges(predicate.id, Some("USAGE"), 20)
+            .unwrap();
+        assert_eq!(callers.len(), 1, "{callers:?}");
+        assert_eq!(callers[0].source_id, chained.id);
+        assert!(store
+            .outgoing_edges(shadowed.id, Some("USAGE"), 20)
+            .unwrap()
+            .is_empty());
         fs::remove_dir_all(repo).unwrap();
     }
 
