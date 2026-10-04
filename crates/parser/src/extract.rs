@@ -4497,6 +4497,39 @@ fn rust_expression_macro_shadowed_bindings(
     shadowed
 }
 
+/// Preserve block-local type items when a nested token tree loses its AST.
+/// Rust items are block-scoped and hoisted, unlike value let bindings.
+fn rust_expression_macro_has_local_type_binding(
+    source: &[u8],
+    reference: Node<'_>,
+    name: &str,
+) -> bool {
+    if rust_usage_has_local_type_binding(source, reference, name) {
+        return true;
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if scope.kind() == "block" {
+            let mut cursor = scope.walk();
+            if scope.named_children(&mut cursor).any(|item| {
+                matches!(
+                    item.kind(),
+                    "type_item" | "struct_item" | "enum_item" | "union_item"
+                ) && item
+                    .child_by_field_name("name")
+                    .is_some_and(|binding| node_text(source, binding) == name)
+            }) {
+                return true;
+            }
+        }
+        if scope.kind() == "function_item" {
+            break;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
 fn rust_expression_macro_calls(
     source: &[u8],
     root: Node<'_>,
@@ -4621,8 +4654,12 @@ fn rust_expression_macro_calls(
                         if let Some(path) = rust_scoped_call_path(&wrapped, node) {
                             let owner = path.split("::").next().unwrap_or("");
                             if visible_types.contains(owner)
-                                || rust_usage_has_local_type_binding(source, context, owner)
-                                || rust_usage_has_local_type_binding(&wrapped, node, owner)
+                                || rust_expression_macro_has_local_type_binding(
+                                    source, context, owner,
+                                )
+                                || rust_expression_macro_has_local_type_binding(
+                                    &wrapped, node, owner,
+                                )
                             {
                                 properties["rust_local_type_owner"] = serde_json::json!(true);
                             }
@@ -4687,7 +4724,9 @@ fn rust_expression_macro_calls(
                             if rust_usage_has_local_value_binding(&wrapped, node, candidate) {
                                 values.insert(candidate.to_string());
                             }
-                            if rust_usage_has_local_type_binding(&wrapped, node, candidate) {
+                            if rust_expression_macro_has_local_type_binding(
+                                &wrapped, node, candidate,
+                            ) {
                                 types.insert(candidate.to_string());
                             }
                         }
@@ -17995,6 +18034,9 @@ fn caller() {
     assert!({ let callback = || true; callback() });
     assert!({ let callback = || true; ensure!(callback()); true });
     assert!({ type T = Local; ensure!(T::run()); true });
+    assert!({ ensure!(U::run()); type U = Local; true });
+    { type Outside = Local; }
+    assert!(Outside::run());
 }
 "#;
         let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
@@ -18007,6 +18049,16 @@ fn caller() {
             .iter()
             .any(|e| e.properties["callee_path"] == "T::run"
                 && e.properties["rust_local_type_owner"] == true));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "U::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "Outside::run"
+                && e.properties.get("rust_local_type_owner").is_none()));
     }
 
     #[test]
