@@ -2573,7 +2573,16 @@ pub fn recover_persisted_rust_usages(
         // Receiver provenance depends on persisted Field declarations as well
         // as raw calls. Never certify an older Base whose field facts are
         // absent or differ from the fingerprint-validated source extraction.
-        for field in extraction.nodes.iter().filter(|node| node.label == "Field") {
+        // Enum variants (and repeated cfg declarations) can share a qualified
+        // name. Persistence upserts in extraction order, so only the final
+        // definition can describe the visible stored facts. Earlier overwritten
+        // declarations must not make a freshly indexed file fail recovery.
+        let definitions: std::collections::BTreeMap<_, _> = extraction
+            .nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect();
+        for field in definitions.values().filter(|node| node.label == "Field") {
             let cached = store.get_node_by_qname(project, &field.qualified_name)?;
             if cached.as_ref().is_none_or(|node| {
                 node.label != "Field"
@@ -2587,9 +2596,8 @@ pub fn recover_persisted_rust_usages(
                 )));
             }
         }
-        for trait_node in extraction
-            .nodes
-            .iter()
+        for trait_node in definitions
+            .values()
             .filter(|node| node.label == "Interface")
         {
             let cached = store.get_node_by_qname(project, &trait_node.qualified_name)?;
@@ -9621,6 +9629,103 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
     }
 
     #[test]
+    fn persisted_rust_recovery_validates_winning_enum_fields_in_sparse_overlay() {
+        let repo = setup_repo(
+            "enum-field-recovery",
+            "pub enum Command { Index { path: Option<String> }, Write { path: String } }\npub fn invoke(command: Command) { let _ = command; }\n",
+        );
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            let field = base
+                .get_node_by_qname("test", "src/lib.rs::Enum::Command::path")
+                .unwrap()
+                .unwrap();
+            assert_eq!(field.properties["return_type"], "String");
+            base.conn()
+                .execute("DELETE FROM raw_edges WHERE edge_type='USAGE'", [])
+                .unwrap();
+        }
+        let base_before = fs::read(&base_path).unwrap();
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
+        let states_before = overlay.list_file_states("test").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        assert_eq!(
+            recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
+            0
+        );
+        assert_eq!(overlay.list_file_states("test").unwrap(), states_before);
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        assert_eq!(
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()),
+            nodes_before
+        );
+        drop(overlay);
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_rust_recovery_rejects_missing_or_corrupt_winning_enum_fields() {
+        let repo = setup_repo(
+            "enum-field-recovery-negative",
+            "pub enum Command { Index { path: Option<String> }, Write { path: String } }\npub fn invoke(command: Command) { let _ = command; }\n",
+        );
+        for sql in [
+            "UPDATE nodes SET properties=json_set(properties, '$.return_type', 'Option<String>') WHERE label='Field' AND name='path'",
+            "DELETE FROM nodes WHERE label='Field' AND name='path'",
+        ] {
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            store.conn().execute(sql, []).unwrap();
+            let raw_before = format!("{:?}", store.list_raw_edges("test").unwrap());
+            let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("declared field facts"), "{error}");
+            assert_eq!(
+                format!("{:?}", store.list_raw_edges("test").unwrap()),
+                raw_before
+            );
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_rust_recovery_validates_winning_cfg_trait_facts() {
+        let repo = setup_repo(
+            "cfg-trait-recovery",
+            "#[cfg(feature=\"first\")] pub trait View { fn as_ref(&self); }\n#[cfg(not(feature=\"first\"))] pub trait View: core::fmt::Debug { fn as_ref(self); }\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let winner = store
+            .get_node_by_qname("test", "src/lib.rs::Interface::View")
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.properties["has_bounds"], 1);
+        recover_persisted_rust_usages(&mut store, "test", &repo).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE nodes SET properties=json_remove(properties, '$.has_bounds') WHERE id=?1",
+                [winner.id],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trait receiver facts"), "{error}");
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
         let repo = setup_repo(
             "constructor-recovery",
@@ -11863,16 +11968,46 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         );
         assert_eq!(states, store.list_file_states("test").unwrap());
         for (label, changed, recovery) in [
-            ("opaque", source.replace("recovery::Recovery", "Unknown"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
-            ("ambiguous", source.replace("mod other;", "mod other; use recovery::Recovery; use other::Recovery;").replace("recovery: recovery::Recovery", "recovery: Recovery"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
-            ("trait-method", source.to_string(), "pub struct Recovery; pub trait Lost { fn device_lost(&mut self, reason: String); } impl Lost for Recovery { fn device_lost(&mut self, reason: String) {} }"),
-            ("opaque-expression", source.replace("self.recovery.device_lost", "opaque().device_lost"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
+            (
+                "opaque",
+                source.replace("recovery::Recovery", "Unknown"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "ambiguous",
+                source
+                    .replace(
+                        "mod other;",
+                        "mod other; use recovery::Recovery; use other::Recovery;",
+                    )
+                    .replace("recovery: recovery::Recovery", "recovery: Recovery"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "trait-method",
+                source.to_string(),
+                "pub struct Recovery; pub trait Lost { fn device_lost(&mut self, reason: String); } impl Lost for Recovery { fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "opaque-expression",
+                source.replace("self.recovery.device_lost", "opaque().device_lost"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
         ] {
             fs::write(repo.join("src/lib.rs"), changed).unwrap();
             fs::write(repo.join("src/recovery.rs"), recovery).unwrap();
             index(&mut store, &repo, "test").unwrap();
-            let method = store.get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost").unwrap().unwrap();
-            assert!(store.incoming_edges(method.id, Some("CALLS"), 20).unwrap().is_empty(), "{label}");
+            let method = store
+                .get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .incoming_edges(method.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty(),
+                "{label}"
+            );
         }
         fs::remove_dir_all(repo).unwrap();
     }
@@ -12921,7 +13056,10 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         let repo = setup_repo("anyhow-factory-repair", source);
         fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
         fs::write(repo.join("Cargo.toml"), "[package]\nname='factory_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nanyhow='1'\n[target.'cfg(windows)'.dependencies]\nother='1'\n[patch.crates-io]\nother={path='other'}\n").unwrap();
-        let lock = format!("version = 3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64));
+        let lock = format!(
+            "version = 3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
+            "a".repeat(64)
+        );
         fs::write(repo.join("Cargo.lock"), &lock).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
@@ -13124,7 +13262,10 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
 
     #[test]
     fn rust_factory_option_call_repair_rejects_v11_and_recovers_same_source() {
-        let repo = setup_repo("factory-option-repair", "struct Writer; impl Writer { fn open() -> Result<Option<Self>, ()> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }");
+        let repo = setup_repo(
+            "factory-option-repair",
+            "struct Writer; impl Writer { fn open() -> Result<Option<Self>, ()> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }",
+        );
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
         let method = store
