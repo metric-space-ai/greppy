@@ -115,14 +115,23 @@ fn write_names_an_absent_workspace_root_and_preserves_the_calling_workspace() {
         }
         args.extend(["write", "client/run.py", "# harmless fixture\n"]);
         let output = fixture.run(&args);
-        assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
+        assert_eq!(output.status.code(), Some(20), "{}", combined(&output));
         let body = combined(&output);
         assert!(body.contains("does not exist"), "{body}");
-        assert!(body.contains("Create this directory"), "{body}");
+        assert!(
+            body.contains("create that directory before retrying"),
+            "{body}"
+        );
         assert!(!body.contains("is outside"), "{body}");
         if json {
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert!(value.get("error").is_some(), "{value}");
+            assert_eq!(value["schema_version"], "greppy.edit-record.v1");
+            assert_eq!(value["status"], "refused");
+            assert_eq!(value["published"], false);
+            assert_eq!(value["exit_code"], 20);
+            assert_eq!(value["error"]["code"], "INVALID_REQUEST");
+            assert_eq!(value["operations"], serde_json::json!([]));
+            assert!(output.stderr.is_empty(), "{}", combined(&output));
         }
         assert!(!missing.exists());
         assert!(!fixture.repo.join("client/run.py").exists());

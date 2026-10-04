@@ -9,7 +9,12 @@ use super::*;
 pub(crate) fn dispatch_edit(command: EditCommand, json: bool, root: Option<&str>) -> Result<i32> {
     match dispatch_edit_inner(command, json, root) {
         Err(error @ Error::Invalid(_)) => {
-            eprintln!("greppy: {error}");
+            if json {
+                let refusal = EditRefusal::new("INVALID_REQUEST", error.to_string(), 20);
+                println!("{}", edit_refusal_json(&refusal, None));
+            } else {
+                eprintln!("greppy: {error}");
+            }
             Ok(20)
         }
         result => result,
