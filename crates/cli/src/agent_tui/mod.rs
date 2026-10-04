@@ -13,7 +13,7 @@ mod preview;
 mod redaction;
 mod render;
 mod session;
-pub(crate) use session::TurnCommit;
+pub(crate) use session::{ImportHistoryCommit, TurnCommit};
 mod settings;
 mod state;
 mod terminal;
