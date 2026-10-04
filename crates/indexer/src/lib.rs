@@ -6953,6 +6953,44 @@ export function invalidCalls() { plainValue(); effectValue(); }
     }
 
     #[test]
+    fn jsx_imported_component_usage_resolves_to_exact_definition() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("other.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary><Boundary /></Boundary>; }\nexport function Shadow(Boundary: unknown) { return <Boundary />; }\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&stores.path().join("graph.db")).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let target = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let other = store
+            .get_node_by_qname("test", "other.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let render = store
+            .get_node_by_qname("test", "view.tsx::Function::Render")
+            .unwrap()
+            .unwrap();
+        let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.iter().all(|edge| edge.source_id == render.id));
+        assert!(store
+            .incoming_edges(other.id, Some("USAGE"), 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn effect_fn_repair_keeps_current_base_sparse_but_repairs_old_resolver_edges() {
         let repo = tempfile::tempdir().unwrap();
         fs::write(repo.path().join("routing.ts"),

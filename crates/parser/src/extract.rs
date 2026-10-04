@@ -2948,7 +2948,45 @@ fn try_emit_js_ts_usage(
     effect_import: bool,
     result: &mut ExtractionResult,
 ) {
+    if !matches!(node.kind(), "identifier" | "type_identifier") {
+        return;
+    }
+    // JSX tag names are references, despite the grammar naming their field
+
+    // `name`. Handle them before call-ancestor suppression (render callbacks
+    // often sit inside map calls), and suppress closing/member/intrinsic tags.
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element" | "jsx_closing_element"
+        ) {
+            if let Some(tag) = parent.child_by_field_name("name") {
+                if node.start_byte() >= tag.start_byte() && node.end_byte() <= tag.end_byte() {
+                    let name = node_text(source, node);
+                    if parent.kind() != "jsx_closing_element"
+                        && tag.kind() == "identifier"
+                        && node.id() == tag.id()
+                        && name.chars().next().is_some_and(char::is_uppercase)
+                        && !js_ts_jsx_locally_bound(node, source, name)
+                    {
+                        result.edges.push(ExtractedEdge {
+                            edge_type: "USAGE".into(),
+                            source_qualified_name: js_ts_enclosing_qname(node, source, file_path, effect_import),
+                            target_qualified_name: format!("{file_path}::__ref__::{name}"),
+                            file_path: file_path.to_owned(),
+                            line: node.start_position().row as u32 + 1,
+                            properties: serde_json::json!({ "ref_name": name, "jsx_component": true }),
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+        ancestor = parent.parent();
+    }
     // JS/TS references are `identifier` / `type_identifier`.
+
     if !matches!(node.kind(), "identifier" | "type_identifier") {
         return;
     }
@@ -2979,7 +3017,66 @@ fn try_emit_js_ts_usage(
     });
 }
 
+/// Conservatively refuse a component name shadowed within an enclosing
+/// function. Module definitions/imports remain available to the resolver.
+fn js_ts_jsx_locally_bound(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut parent = node.parent();
+    while let Some(scope) = parent {
+        if JS_TS_FUNC_KINDS.contains(&scope.kind()) {
+            let mut stack = vec![scope];
+            while let Some(binding) = stack.pop() {
+                if matches!(
+                    binding.kind(),
+                    "formal_parameters" | "required_parameter" | "optional_parameter"
+                ) {
+                    let mut patterns = vec![binding];
+                    while let Some(pattern) = patterns.pop() {
+                        if matches!(
+                            pattern.kind(),
+                            "identifier" | "shorthand_property_identifier_pattern"
+                        ) && node_text(source, pattern) == name
+                        {
+                            return true;
+                        }
+                        // Type annotations do not introduce value bindings.
+                        if pattern.kind() != "type_annotation" {
+                            let mut cursor = pattern.walk();
+                            patterns.extend(pattern.named_children(&mut cursor));
+                        }
+                    }
+                }
+                if binding.id() != scope.id()
+                    && matches!(
+                        binding.kind(),
+                        "variable_declarator" | "function_declaration" | "class_declaration"
+                    )
+                {
+                    if let Some(pattern) = binding.child_by_field_name("name") {
+                        let mut patterns = vec![pattern];
+                        while let Some(pattern) = patterns.pop() {
+                            if matches!(
+                                pattern.kind(),
+                                "identifier" | "shorthand_property_identifier_pattern"
+                            ) && node_text(source, pattern) == name
+                            {
+                                return true;
+                            }
+                            let mut cursor = pattern.walk();
+                            patterns.extend(pattern.named_children(&mut cursor));
+                        }
+                    }
+                }
+                let mut cursor = binding.walk();
+                stack.extend(binding.named_children(&mut cursor));
+            }
+        }
+        parent = scope.parent();
+    }
+    false
+}
+
 /// Whether any ancestor of `node` within 10 levels has a kind in `kinds`.
+
 fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
     let mut p = node.parent();
     let mut depth = 0;
@@ -19530,6 +19627,38 @@ class FileRepo implements Repo {
     fn ts(src: &str, path: &str) -> crate::extract::ExtractionResult {
         let lang = crate::language::language_for_path(std::path::Path::new(path));
         extract(lang, src.as_bytes(), path).unwrap()
+    }
+
+    #[test]
+    fn jsx_components_are_usages_without_intrinsic_member_or_shadow_guesses() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+export function Render() { return items.map(() => <Boundary><Boundary /></Boundary>); }
+export function Shadow(Boundary: unknown) { return <Boundary />; }
+export function Local() { const Boundary = custom; return <Boundary />; }
+export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
+"#,
+            "view.tsx",
+        );
+        let usages: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .collect();
+        assert_eq!(
+            usages.len(),
+            2,
+            "opening and self-closing tags count once: {usages:?}"
+        );
+        assert!(usages
+            .iter()
+            .all(|edge| edge.properties["ref_name"] == "Boundary"
+                && edge.source_qualified_name == "view.tsx::Function::Render"));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
     }
 
     #[test]
