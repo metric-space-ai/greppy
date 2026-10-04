@@ -125,11 +125,9 @@ fn long_json_match_has_bounded_preview_and_executable_full_line_recovery() {
             "{}",
             String::from_utf8_lossy(&recovered.stderr)
         );
-        assert!(
-            String::from_utf8(recovered.stdout)
-                .unwrap()
-                .contains(source.trim_end())
-        );
+        assert!(String::from_utf8(recovered.stdout)
+            .unwrap()
+            .contains(source.trim_end()));
         assert_eq!(std::fs::read(&file).unwrap(), source.as_bytes());
     }
 }
@@ -230,11 +228,9 @@ fn text_pattern_offset_pages_complete_matches_without_repeats() {
         beyond.extend(["--offset", "20"]);
         let empty = fixture.run(&beyond);
         assert!(page_headers(&empty).is_empty());
-        assert!(
-            String::from_utf8(empty.stdout)
-                .unwrap()
-                .contains("shown: 0\ntotal: 12\noffset: 20\ntruncated: false")
-        );
+        assert!(String::from_utf8(empty.stdout)
+            .unwrap()
+            .contains("shown: 0\ntotal: 12\noffset: 20\ntruncated: false"));
     }
 }
 
