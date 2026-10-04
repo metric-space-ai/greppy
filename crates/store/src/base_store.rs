@@ -1221,12 +1221,11 @@ fn file_is_known_hfs(file: &fs::File) -> bool {
             return false;
         }
         let info = unsafe { info.assume_init() };
-        return info
-            .f_fstypename
+        info.f_fstypename
             .iter()
             .map(|c| *c as u8)
             .take_while(|c| *c != 0)
-            .eq(b"hfs".iter().copied());
+            .eq(b"hfs".iter().copied())
     }
     #[cfg(not(target_os = "macos"))]
     {
