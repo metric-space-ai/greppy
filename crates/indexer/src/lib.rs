@@ -2237,6 +2237,8 @@ fn rust_anyhow_context(
             doc.get("patch").is_some_and(cargo_item_mentions_anyhow)
                 || doc.get("replace").is_some_and(cargo_item_mentions_anyhow)
         });
+        let mut manifest_decisions = std::collections::HashMap::new();
+        let mut nearest_manifests = std::collections::HashMap::new();
         for state in store
             .list_file_states(&project)?
             .into_iter()
@@ -2250,9 +2252,12 @@ fn rust_anyhow_context(
                 continue;
             }
             let file_path = root.join(relative);
+            let parent_directory = file_path.parent().unwrap_or(root).to_path_buf();
             let mut directory = file_path.parent();
-            let mut selected = None;
-            while let Some(dir) = directory.filter(|dir| dir.starts_with(root)) {
+            let mut selected = nearest_manifests.get(&parent_directory).cloned().flatten();
+            let cached_directory = nearest_manifests.contains_key(&parent_directory);
+            while let Some(dir) = directory.filter(|dir| !cached_directory && dir.starts_with(root))
+            {
                 let manifest = dir.join("Cargo.toml");
                 if manifest.is_file() {
                     selected = Some(manifest);
@@ -2260,9 +2265,18 @@ fn rust_anyhow_context(
                 }
                 directory = dir.parent();
             }
+            nearest_manifests.insert(parent_directory, selected.clone());
             let Some(manifest) = selected else {
                 continue;
             };
+            if let Some(proven) = manifest_decisions.get(&manifest).copied() {
+                if proven {
+                    allowed.insert((project.clone(), state.rel_path));
+                }
+                continue;
+            }
+            // Record a conservative failed decision before fallible checks.
+            manifest_decisions.insert(manifest.clone(), false);
             let text = documents
                 .entry(manifest.to_string_lossy().into_owned())
                 .or_insert_with(|| std::fs::read_to_string(&manifest).unwrap_or_default());
@@ -2338,6 +2352,7 @@ fn rust_anyhow_context(
                         .and_then(|item| item.as_str())
                         .is_none_or(|name| name == "anyhow")
             });
+            manifest_decisions.insert(manifest, proven);
             if proven {
                 allowed.insert((project.clone(), state.rel_path));
             }
