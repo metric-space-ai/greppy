@@ -1,3 +1,5 @@
+#[path = "agent_acp_import_tests.rs"]
+mod imported_history;
 #[test]
 fn rejected_model_changes_preserve_the_active_and_persisted_model() {
     let root = tempfile::tempdir().unwrap();

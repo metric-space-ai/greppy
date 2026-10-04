@@ -8,12 +8,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use greppy_agent::{ContentPart, Message, Role, Usage};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::redaction::{redact_json, redact_text};
 
 pub const SESSION_FORMAT: u32 = 1;
 
 static NEXT_TURN_CHECKPOINT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportAck {
+    pub id: String,
+    pub role: String,
+    pub text_hash: String,
+}
+
+impl ImportAck {
+    pub(crate) fn new(id: String, role: String, text: &str) -> Self {
+        Self {
+            id,
+            role,
+            text_hash: format!("{:x}", Sha256::digest(text.as_bytes())),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedMessage {
@@ -43,6 +61,7 @@ pub struct SessionRecord {
     pub proposal_ref: String,
     pub source: String,
     pub messages: Vec<PersistedMessage>,
+    pub import_ack: Vec<ImportAck>,
     pub usage: Usage,
     pub turns: u64,
     pub stop: String,
@@ -63,6 +82,7 @@ impl SessionRecord {
             proposal_ref: String::new(),
             source: String::new(),
             messages: Vec::new(),
+            import_ack: Vec::new(),
             usage: Usage::default(),
             turns: 0,
             stop: String::new(),
@@ -278,6 +298,99 @@ impl SessionStore {
             target.sync_all()?;
             drop(target);
             // No fallible operation follows the visible commit point.
+            fs::rename(&temporary, &path)
+        })();
+        if created && result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    /// Append imported messages and their acknowledgement at one visible commit point.
+    pub(crate) fn commit_import_history(
+        &self,
+        session_id: &str,
+        expected: &[PersistedMessage],
+        expected_ack: &[ImportAck],
+        messages: &[PersistedMessage],
+        acknowledgements: &[ImportAck],
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let _lease = self.writer_lease(session_id)?;
+        let previous = self.load(session_id)?;
+        if previous.recovered
+            || previous.messages != expected
+            || previous.import_ack != expected_ack
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "saved session history changed or is corrupt",
+            ));
+        }
+        let added = messages.strip_prefix(expected).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "import must preserve native history",
+            )
+        })?;
+        if !acknowledgements.starts_with(expected_ack)
+            || added.len() != acknowledgements.len() - expected_ack.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "import acknowledgement does not match appended history",
+            ));
+        }
+        if added.is_empty() {
+            return Ok(());
+        }
+        let path = self.path_for(session_id)?;
+        let temporary = self.project_dir().join(format!(
+            ".{session_id}-import-{}-{}-{}.pending",
+            std::process::id(),
+            now_ms(),
+            NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut created = false;
+        let result = (|| {
+            let mut source = File::open(&path)?;
+            let length = source.metadata()?.len();
+            let needs_newline = if length == 0 {
+                false
+            } else {
+                source.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                source.read_exact(&mut last)?;
+                source.rewind()?;
+                last[0] != b'\n'
+            };
+            let mut target = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            created = true;
+            greppy_core::cache::secure_private_file(&temporary)?;
+            io::copy(&mut source, &mut target)?;
+            if needs_newline {
+                target.write_all(b"\n")?;
+            }
+            for message in added {
+                writeln!(target, "{}", message_line(message))?;
+            }
+            writeln!(
+                target,
+                "{}",
+                json!({
+                    "v": SESSION_FORMAT, "type": "import_ack",
+                    "messages": acknowledgements.iter().map(|ack| json!({
+                        "id": ack.id, "role": ack.role, "text_hash": ack.text_hash
+                    })).collect::<Vec<_>>()
+                })
+            )?;
+            before_commit()?;
+            target.flush()?;
+            target.sync_all()?;
+            drop(target);
             fs::rename(&temporary, &path)
         })();
         if created && result.is_err() {
@@ -594,6 +707,21 @@ pub fn load_path(path: &Path) -> io::Result<SessionRecord> {
                     record.messages.push(message);
                 }
             }
+            Some("import_ack") => {
+                let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+                    recovered = true;
+                    break;
+                };
+                let replacement = messages
+                    .iter()
+                    .map(import_ack_from_value)
+                    .collect::<Option<Vec<_>>>();
+                let Some(replacement) = replacement else {
+                    recovered = true;
+                    break;
+                };
+                record.import_ack = replacement;
+            }
             Some("message_checkpoint") => {
                 let Some(messages) = value.get("messages").and_then(Value::as_array) else {
                     recovered = true;
@@ -793,6 +921,24 @@ fn meta_line(record: &SessionRecord) -> Value {
         "branch": record.branch,
         "proposal_ref": record.proposal_ref,
         "source": record.source,
+    })
+}
+
+fn import_ack_from_value(value: &Value) -> Option<ImportAck> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let role = value.get("role")?.as_str()?.to_string();
+    let text_hash = value.get("text_hash")?.as_str()?.to_string();
+    if id.is_empty()
+        || !matches!(role.as_str(), "user" | "assistant")
+        || text_hash.len() != 64
+        || !text_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(ImportAck {
+        id,
+        role,
+        text_hash,
     })
 }
 
