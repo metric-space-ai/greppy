@@ -492,11 +492,13 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
          WHERE v.file_path <> '' AND NOT EXISTS (
              SELECT 1 FROM nodes d JOIN greppy_base.nodes b
                ON b.project = d.project AND b.qualified_name = d.qualified_name
+             LEFT JOIN temp.base_node_span_overrides s ON s.project=b.project AND s.node_id=b.id
+               AND s.qualified_name=b.qualified_name AND s.old_start_line=b.start_line AND s.old_end_line=b.end_line
              WHERE (v.node_id IS NULL OR d.id = v.node_id) AND d.project = v.project
                AND d.qualified_name = v.qualified_name AND d.file_path = v.file_path
                AND b.label = d.label AND b.name = d.name
-               AND b.file_path = d.file_path AND b.start_line = d.start_line
-               AND b.end_line = d.end_line AND b.properties = d.properties
+               AND b.file_path = d.file_path AND COALESCE(s.start_line,b.start_line) = d.start_line
+               AND COALESCE(s.end_line,b.end_line) = d.end_line AND b.properties = d.properties
                AND NOT EXISTS (SELECT 1 FROM greppy_hidden_paths h WHERE h.path = b.file_path)
                AND v.start_line >= d.start_line AND v.end_line >= v.start_line
                AND (v.end_line <= d.end_line OR d.end_line = d.start_line)
