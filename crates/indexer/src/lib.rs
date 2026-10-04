@@ -7412,7 +7412,11 @@ export function invalidCalls() { plainValue(); effectValue(); }
             .unwrap()
             .unwrap();
         let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
-        assert_eq!(incoming.len(), 1);
+        assert_eq!(
+            incoming.len(),
+            2,
+            "opening and self-closing sites both resolve"
+        );
         assert!(incoming.iter().all(|edge| edge.source_id == render.id));
         assert!(store
             .incoming_edges(other.id, Some("USAGE"), 100)
