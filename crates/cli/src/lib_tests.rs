@@ -3641,6 +3641,7 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
             "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
             "kind": "index",
             "pid": wrapper_pid,
+            "started_at_unix_secs": 1,
             "target_generation": 17,
             "state": "refreshing"
         }),
@@ -3674,6 +3675,7 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
     assert_eq!(status.code(), Some(130));
     let job = read_background_job(&job_path).unwrap();
     assert_eq!(job["pid"], wrapper_pid);
+    assert_eq!(job["started_at_unix_secs"], 1);
     assert_eq!(job["target_generation"], 17);
     assert_eq!(job["state"], "cancelled");
     assert!(job["last_error"]
