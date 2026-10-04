@@ -4439,6 +4439,273 @@ fn collect_python_import_modules(
     }
 }
 
+/// Rust macro arguments are token trees, not call expressions. Reparse the
+/// expression-list macros whose arguments preserve Rust expression syntax;
+/// never infer calls from arbitrary DSL tokens or string contents.
+fn rust_expression_macro_shadowed_bindings(
+    source: &[u8],
+    root: Node<'_>,
+    macros: &[&str],
+    conservative_globs: bool,
+) -> std::collections::HashSet<String> {
+    let mut shadowed = std::collections::HashSet::new();
+    let mut scan = vec![root];
+    while let Some(node) = scan.pop() {
+        if matches!(node.kind(), "macro_definition" | "mod_item") {
+            if let Some(name) = node.child_by_field_name("name") {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "extern_crate_declaration" {
+            // An extern-prelude dependency does not prove the identity of an
+            // explicitly rebound crate namespace (including macro_use crates).
+            if let Some(name) = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
+        if node.kind() == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                for import in expand_use_tree(source, argument, "") {
+                    let known = import.path == "anyhow::ensure"
+                        || import
+                            .path
+                            .strip_prefix("std::")
+                            .is_some_and(|n| macros.contains(&n))
+                        || import
+                            .path
+                            .strip_prefix("core::")
+                            .is_some_and(|n| macros.contains(&n));
+                    if import.is_glob && conservative_globs {
+                        shadowed.extend(macros.iter().map(|name| (*name).to_string()));
+                    }
+                    if !import.is_glob && !known {
+                        shadowed.insert(import.imported_name);
+                    }
+                }
+            }
+        }
+        scan.extend(node.named_children(&mut node.walk()));
+    }
+    shadowed
+}
+
+fn rust_expression_macro_calls(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+) -> greppy_core::Result<Vec<ExtractedEdge>> {
+    const PREFIX: &str = "async fn __greppy_macro_arguments__() { let _ = (";
+    const MACROS: &[&str] = &[
+        "ensure",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "format",
+        "format_args",
+        "print",
+        "println",
+        "eprint",
+        "eprintln",
+        "write",
+        "writeln",
+    ];
+    let queries = crate::query::cached_query_set(&Language::Rust)
+        .map_err(|e| greppy_core::Error::Parse(format!("compile rust queries: {e}")))?;
+    let shadowed = rust_expression_macro_shadowed_bindings(source, root, MACROS, false);
+    let admitted = |path: &str, shadowed: &std::collections::HashSet<String>| {
+        if let Some((owner, name)) = path.rsplit_once("::") {
+            !shadowed.contains(owner)
+                && ((owner == "anyhow" && name == "ensure")
+                    || (matches!(owner, "std" | "core") && MACROS.contains(&name)))
+        } else {
+            MACROS.contains(&path) && !shadowed.contains(path)
+        }
+    };
+    let mut pending = Vec::new();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "macro_invocation" {
+            if let (Some(name), Some(tokens), Some(caller)) = (
+                node.child_by_field_name("macro"),
+                node.named_children(&mut node.walk())
+                    .find(|n| n.kind() == "token_tree"),
+                enclosing_function_qname(source, node, file_path),
+            ) {
+                let name = node_text(source, name);
+                if admitted(name, &shadowed) && tokens.end_byte() > tokens.start_byte() + 1 {
+                    pending.push((
+                        source[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
+                        tokens.start_position().row,
+                        caller,
+                        name.to_string(),
+                        0usize,
+                        node,
+                        std::collections::HashSet::<String>::new(),
+                        std::collections::HashSet::<String>::new(),
+                        shadowed.clone(),
+                    ));
+                }
+            }
+        }
+        nodes.extend(node.named_children(&mut node.walk()));
+    }
+    let mut edges = Vec::new();
+    let mut budget = source.len().saturating_mul(16);
+    while let Some((
+        body,
+        row,
+        caller,
+        macro_name,
+        depth,
+        context,
+        visible_values,
+        visible_types,
+        mut macro_bindings,
+    )) = pending.pop()
+    {
+        if depth >= 16 || body.len() > budget {
+            return Err(greppy_core::Error::Parse(
+                "Rust expression-macro call extraction exceeded its bounded nesting budget".into(),
+            ));
+        }
+        budget -= body.len();
+        let mut wrapped = PREFIX.as_bytes().to_vec();
+        wrapped.extend_from_slice(&body);
+        wrapped.extend_from_slice(b"); }");
+        let tree = crate::parse(Language::Rust, &wrapped)?;
+        // Unknown/invalid macro-specific syntax is not evidence of a call.
+        if tree.root_node().has_error() {
+            continue;
+        }
+        for cq in queries.iter().filter(|cq| cq.kind == QueryKind::Calls) {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&cq.query, tree.root_node(), &wrapped);
+            while let Some(m) = matches.next() {
+                for cap in m.captures {
+                    let node = cap.node;
+                    if cq.capture_names.get(cap.index as usize).map(String::as_str)
+                        != Some("callee")
+                        || node.start_byte() < PREFIX.len()
+                        || node.end_byte() > PREFIX.len() + body.len()
+                        || enclosing_function_qname(&wrapped, node, file_path)
+                            != Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+                    {
+                        continue;
+                    }
+                    let name = node_text(&wrapped, node);
+                    let receiver = node
+                        .parent()
+                        .is_some_and(|n| n.kind() == "field_expression");
+                    // The synthetic context has no surrounding receiver/type
+                    // provenance. Do not manufacture unresolved or wrong method calls.
+                    if receiver {
+                        continue;
+                    }
+                    let mut properties = serde_json::json!({
+                        "callee_text": name, "callee_name": name,
+                        "callee_form": "direct",
+                        "rust_expression_macro": macro_name,
+                    });
+                    if !receiver {
+                        if let Some(path) = rust_scoped_call_path(&wrapped, node) {
+                            let owner = path.split("::").next().unwrap_or("");
+                            if visible_types.contains(owner)
+                                || rust_usage_has_local_type_binding(source, context, owner)
+                                || rust_usage_has_local_type_binding(&wrapped, node, owner)
+                            {
+                                properties["rust_local_type_owner"] = serde_json::json!(true);
+                            }
+                            properties["callee_path"] = serde_json::json!(path);
+                        } else if visible_values.contains(name)
+                            || rust_usage_has_local_value_binding(source, context, name)
+                            || rust_usage_has_local_value_binding(&wrapped, node, name)
+                        {
+                            continue;
+                        }
+                    }
+                    edges.push(ExtractedEdge {
+                        edge_type: "CALLS".into(),
+                        source_qualified_name: caller.clone(),
+                        target_qualified_name: format!("{file_path}::Function::{name}"),
+                        file_path: file_path.to_string(),
+                        line: (row + node.start_position().row) as u32 + 1,
+                        properties,
+                    });
+                }
+            }
+        }
+        // Local macro bindings introduced in this token tree must survive its
+        // destruction before a queued child is reparsed. Unknown glob imports
+        // cannot establish a standard macro identity.
+        macro_bindings.extend(rust_expression_macro_shadowed_bindings(
+            &wrapped,
+            tree.root_node(),
+            MACROS,
+            true,
+        ));
+        // A nested expression macro remains a token tree after the first parse.
+        let mut nested = vec![tree.root_node()];
+        while let Some(node) = nested.pop() {
+            if node.kind() == "macro_invocation"
+                && enclosing_function_qname(&wrapped, node, file_path)
+                    == Some(format!("{file_path}::Function::__greppy_macro_arguments__"))
+            {
+                if let (Some(name), Some(tokens)) = (
+                    node.child_by_field_name("macro"),
+                    node.named_children(&mut node.walk())
+                        .find(|n| n.kind() == "token_tree"),
+                ) {
+                    let name = node_text(&wrapped, name);
+                    if admitted(name, &macro_bindings)
+                        && tokens.end_byte() > tokens.start_byte() + 1
+                    {
+                        // A queued child loses this parse tree. Preserve only
+                        // bindings that are visible at the nested macro site,
+                        // using candidate names from its token tree.
+                        let mut values = visible_values.clone();
+                        let mut types = visible_types.clone();
+                        let mut candidates = vec![tokens];
+                        let mut names = std::collections::HashSet::new();
+                        while let Some(candidate) = candidates.pop() {
+                            if matches!(candidate.kind(), "identifier" | "type_identifier") {
+                                names.insert(node_text(&wrapped, candidate));
+                            }
+                            candidates.extend(candidate.named_children(&mut candidate.walk()));
+                        }
+                        for candidate in names {
+                            if rust_usage_has_local_value_binding(&wrapped, node, candidate) {
+                                values.insert(candidate.to_string());
+                            }
+                            if rust_usage_has_local_type_binding(&wrapped, node, candidate) {
+                                types.insert(candidate.to_string());
+                            }
+                        }
+                        pending.push((
+                            wrapped[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
+                            row + tokens.start_position().row,
+                            caller.clone(),
+                            name.to_string(),
+                            depth + 1,
+                            context,
+                            values,
+                            types,
+                            macro_bindings.clone(),
+                        ));
+                    }
+                }
+            }
+            nested.extend(node.named_children(&mut node.walk()));
+        }
+    }
+    Ok(edges)
+}
+
 fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
     let tree = crate::parse(Language::Rust, source)?;
     let queries = crate::query::cached_query_set(&Language::Rust)
@@ -4966,6 +5233,12 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
             }
         }
     }
+
+    result.edges.extend(rust_expression_macro_calls(
+        source,
+        tree.root_node(),
+        file_path,
+    )?);
 
     // PASS 4+5 — usages (the unified reference model). There are NO separate
     // `TYPE_REF`/`USES` passes: every non-call, non-import identifier
@@ -17666,6 +17939,147 @@ mod tests {
             new_qnames.contains(&"src/lib.rs::Bar::new"),
             "missing Bar::new qname; got {new_qnames:?}"
         );
+    }
+
+    #[test]
+    fn rust_expression_macros_capture_calls_without_inventing_dsl_or_string_calls() {
+        let source = r#"fn callee<T>(value: &T) -> bool { true }
+fn nested() -> bool { true }
+fn decoy() {}
+#[cfg(target_os = "linux")]
+async fn caller() {
+    ensure!(
+        callee(&driver).await == Err(Unavailable),
+        "decoy() is text"
+    );
+    assert!(format!("{}", nested()).is_empty());
+    custom_dsl!(decoy());
+    assert!({ fn hidden() { decoy(); } true });
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/tests.rs").unwrap();
+        let calls: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "CALLS")
+            .collect();
+        assert!(calls.iter().any(|e| e.properties["callee_name"] == "callee"
+            && e.line == 7
+            && e.source_qualified_name == "src/tests.rs::Function::caller"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|e| e.properties["callee_name"] == "nested")
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|e| e.properties["callee_name"] == "decoy"));
+        assert!(
+            !calls
+                .iter()
+                .any(|e| e.properties["callee_name"] == "is_empty"),
+            "receiver provenance is unavailable in a synthetic macro context"
+        );
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_call_global_namesakes_of_inner_bindings() {
+        let source = r#"
+fn callback() -> bool { true }
+fn caller() {
+    assert!({ let callback = || true; callback() });
+    assert!({ let callback = || true; ensure!(callback()); true });
+    assert!({ type T = Local; ensure!(T::run()); true });
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+    }
+
+    #[test]
+    fn rust_expression_macros_preserve_nested_macro_binding_identity() {
+        for body in [
+            "macro_rules! ensure { ($($tokens:tt)*) => {} } ensure!(decoy());",
+            "use custom::ensure; ensure!(decoy());",
+            "use custom::dsl as ensure; assert!({ ensure!(decoy()); true });",
+            "use custom::*; ensure!(decoy());",
+            "extern crate custom as anyhow; anyhow::ensure!(decoy());",
+        ] {
+            let source = format!(
+                "use anyhow::ensure; fn decoy() -> bool {{ true }} fn caller() {{ assert!({{ {body} true }}); }}"
+            );
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "nested custom macro invented a call: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_expression_macros_keep_original_generic_and_local_callee_scope() {
+        let source = "fn caller<T>(callback: fn()) { assert!(T::run()); assert!(callback()); }";
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_admit_shadowed_or_qualified_custom_macros() {
+        for source in [
+            "macro_rules! assert { ($($tokens:tt)*) => {} } fn caller() { assert!(decoy()); }",
+            "use custom::dsl as ensure; fn caller() { ensure!(decoy()); }",
+            "use custom::assert; fn caller() { assert!(decoy()); }",
+            "fn caller() { custom::assert!(decoy()); }",
+            "mod anyhow {} fn caller() { anyhow::ensure!(decoy()); }",
+            "use custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate anyhow as real_anyhow; extern crate custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate custom as std; fn caller() { std::assert!(decoy()); }",
+        ] {
+            let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert!(
+                !result
+                    .edges
+                    .iter()
+                    .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "decoy"),
+                "custom macro invented a call: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_expression_macros_preserve_scoped_turbofish_and_original_lines() {
+        let source = "fn caller() {\n anyhow::ensure!(crate::worker::run::<u8>() &&\n crate::worker::check(), \"message\");\n}\n";
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        let calls: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "CALLS")
+            .collect();
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::run" && e.line == 2));
+        assert!(calls
+            .iter()
+            .any(|e| e.properties["callee_path"] == "crate::worker::check" && e.line == 3));
     }
 
     #[test]

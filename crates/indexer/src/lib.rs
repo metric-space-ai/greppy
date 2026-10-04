@@ -2153,7 +2153,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v14";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v15";
 const ANYHOW_FACTORY_REPAIR_KEY: &str = "greppy.rust_anyhow_factory_repair.v1";
 
 /// Bind known anyhow semantics to authored Cargo dependency identity, never to
@@ -5542,6 +5542,23 @@ impl GraphIndex {
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
         clear_option_field_unresolved();
+        if let Some(name) = edge
+            .properties
+            .get("rust_expression_macro")
+            .and_then(|v| v.as_str())
+        {
+            if self
+                .rust_expression_macro_identity(
+                    &edge.file_path,
+                    name,
+                    true,
+                    &mut std::collections::HashSet::new(),
+                )
+                .is_none()
+            {
+                return None;
+            }
+        }
         if edge
             .properties
             .get("rust_local_type_owner")
@@ -6078,6 +6095,87 @@ impl GraphIndex {
         reasons.sort();
         reasons.dedup();
         Some(reasons)
+    }
+
+    /// Raw macro-argument calls are provisional until the actual import
+    /// binding proves an expression macro. Follow explicit bindings before
+    /// globs; an unresolved/custom/cyclic parent is not anyhow::ensure.
+    fn rust_expression_macro_identity(
+        &self,
+        file: &str,
+        path: &str,
+        prelude: bool,
+        seen: &mut std::collections::HashSet<(String, String)>,
+    ) -> Option<String> {
+        if seen.len() >= 32 || !seen.insert((file.to_string(), path.to_string())) {
+            return None;
+        }
+        if let Some((owner, name)) = path.rsplit_once("::") {
+            if matches!(owner, "std" | "core") && self.rust_standard_import(file, path) {
+                return Some(format!("std::{name}"));
+            }
+            if owner == "anyhow"
+                && name == "ensure"
+                && self.anyhow_factory_files.contains(file)
+                && !self.standard_namespace_is_shadowed(file, owner, false)
+            {
+                return Some("anyhow::ensure".to_string());
+            }
+            return None;
+        }
+        if let Some(bindings) = self
+            .import_alias_sources_by_file
+            .get(file)
+            .and_then(|aliases| aliases.get(path))
+        {
+            let [(import_path, original)] = bindings.as_slice() else {
+                return None;
+            };
+            if let Some(identity) =
+                self.rust_expression_macro_identity(file, import_path, false, &mut seen.clone())
+            {
+                return Some(identity);
+            }
+            let modules = self
+                .rust_module_files_for_path(file, import_path, original)
+                .into_iter()
+                .filter(|m| self.known_files.contains(m))
+                .collect::<Vec<_>>();
+            let [module] = modules.as_slice() else {
+                return None;
+            };
+            return self.rust_expression_macro_identity(module, original, false, seen);
+        }
+        if let Some(globs) = self
+            .import_globs_by_file
+            .get(file)
+            .filter(|g| !g.is_empty())
+        {
+            let mut identities = std::collections::HashSet::new();
+            for glob in globs {
+                let modules = self
+                    .rust_module_files_for_module_path(file, glob)
+                    .into_iter()
+                    .filter(|m| self.known_files.contains(m))
+                    .collect::<Vec<_>>();
+                let [module] = modules.as_slice() else {
+                    return None;
+                };
+                identities.insert(self.rust_expression_macro_identity(
+                    module,
+                    path,
+                    false,
+                    &mut seen.clone(),
+                )?);
+            }
+            if identities.len() != 1 {
+                return None;
+            }
+            return identities.into_iter().next();
+        }
+        // ensure is not in the Rust prelude. Only the standard expression
+        // macros can use an unshadowed, import-free prelude binding.
+        (prelude && path != "ensure").then(|| format!("std::{path}"))
     }
 
     fn classify_rust_import(&self, file: &str, path: &str, name: &str) -> RustImportClass {
@@ -9191,6 +9289,128 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
         fs::write(tmp.join("src/lib.rs"), lib_rs).unwrap();
         fs::write(tmp.join("src/helper.rs"), helper_rs).unwrap();
         tmp
+    }
+
+    #[test]
+    fn rust_expression_macro_parent_custom_binding_does_not_invent_calls() {
+        for parent in [
+            "pub use custom::ensure;",
+            "pub use custom::dsl as ensure;",
+            "macro_rules! ensure { ($($tokens:tt)*) => {} }",
+            "pub use self::tests::ensure;",
+        ] {
+            let repo = setup_multifile_repo(
+                "rust-custom-expression-macro",
+                "mod channel;\n",
+                "// placeholder\n",
+            );
+            fs::create_dir_all(repo.join("src/channel")).unwrap();
+            fs::write(
+                repo.join("src/channel/mod.rs"),
+                format!("{parent}\nmod tests; pub fn decoy() {{}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                repo.join("src/channel/tests.rs"),
+                "use super::*; fn caller() { ensure!(decoy()); }\n",
+            )
+            .unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let target = store
+                .get_node_by_qname("test", "src/channel/mod.rs::Function::decoy")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "unproved parent macro binding invented a caller: {parent}"
+            );
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn rust_expression_macro_generic_cfg_call_is_resolved_and_repaired() {
+        let repo = setup_multifile_repo(
+            "rust-expression-macro-call",
+            "mod channel;\n",
+            "// placeholder\n",
+        );
+        fs::write(repo.join("Cargo.toml"), "[package]\nname='macro_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nanyhow='1'\n").unwrap();
+        fs::write(repo.join("Cargo.lock"), format!("version=3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64))).unwrap();
+        fs::create_dir_all(repo.join("src/channel")).unwrap();
+        fs::write(
+            repo.join("src/channel/mod.rs"),
+            "use anyhow::ensure; mod implementation; mod tests; pub use implementation::run_guest_desktop_effects;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channel/implementation.rs"),
+            "pub async fn run_guest_desktop_effects<T>(driver: &T) -> bool { true }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/channel/tests.rs"), "use super::*;\n#[cfg(target_os = \"linux\")]\nasync fn caller() { ensure!(run_guest_desktop_effects(&driver).await == Err(Unavailable), \"no endpoint\"); }\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let target = store
+            .get_node_by_qname(
+                "test",
+                "src/channel/implementation.rs::Function::run_guest_desktop_effects",
+            )
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/channel/tests.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|e| e.source_id == caller.id));
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type='CALLS' AND target_id=?1",
+                [target.id],
+            )
+            .unwrap();
+        store.conn().execute("DELETE FROM raw_edges WHERE edge_type='CALLS' AND json_extract(properties,'$.callee_name')='run_guest_desktop_effects'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v14','complete')", []).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|e| e.source_id == caller.id));
+        for dependency in [
+            "anyhow={package='custom_dsl',version='1'}",
+            "anyhow={path='custom_dsl'}",
+            "anyhow='1'\n[patch.crates-io]\nanyhow={path='custom_dsl'}",
+        ] {
+            fs::write(repo.join("Cargo.toml"), format!("[package]\nname='macro_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n{dependency}\n")).unwrap();
+            rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "custom/overridden anyhow package invented macro calls: {dependency}"
+            );
+        }
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
