@@ -6965,7 +6965,7 @@ export function invalidCalls() { plainValue(); effectValue(); }
             "export function Boundary() { return <div />; }\n",
         )
         .unwrap();
-        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary><Boundary /></Boundary>; }\nexport function Shadow(Boundary: unknown) { return <Boundary />; }\n").unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return (<Boundary>\n<Boundary />\n</Boundary>); }\nexport function Shadow(Boundary: unknown) { return <Boundary />; }\n").unwrap();
         let stores = tempfile::tempdir().unwrap();
         let mut store = Store::open(&stores.path().join("graph.db")).unwrap();
         index(&mut store, repo.path(), "test").unwrap();
