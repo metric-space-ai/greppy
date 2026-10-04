@@ -181,6 +181,11 @@ pub fn project_identity(start: &Path) -> String {
             return identity.to_string();
         }
     }
+    project_identity_from_workspace(start)
+}
+
+/// Logical workspace identity without consulting or changing a process override.
+pub fn project_identity_from_workspace(start: &Path) -> String {
     let root = resolve_workspace_root(start);
     linked_worktree_project_identity(&root)
         .or_else(|| {

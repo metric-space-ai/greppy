@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 #[path = "agent_acp_tests.rs"]
 mod tests;
 
-use crate::agent::{agent_session_store_identity, EXIT_OK, EXIT_USAGE};
+use crate::agent::{EXIT_OK, EXIT_USAGE};
 use crate::agent_tui::{
     messages_from_protocol, new_session_id, protocol_from_persisted, SessionRecord, SessionStore,
 };
@@ -54,6 +54,8 @@ pub(crate) struct AcpConfig {
     pub api_key: Option<String>,
     pub max_turns: usize,
     pub data_root: Option<PathBuf>,
+    #[cfg(test)]
+    pub after_messages: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
     pub tool_env: Option<Arc<dyn Fn(&Path) -> Box<dyn ExecutionEnv + Send> + Send + Sync>>,
 }
 
@@ -68,6 +70,8 @@ impl Default for AcpConfig {
                 .filter(|key| !key.is_empty()),
             max_turns: DEFAULT_MAX_TURNS,
             data_root: None,
+            #[cfg(test)]
+            after_messages: None,
             tool_env: None,
         }
     }
@@ -140,6 +144,7 @@ where
 }
 
 struct Server {
+    data_root: PathBuf,
     out: Out,
     state: Arc<Mutex<State>>,
     pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
@@ -155,6 +160,7 @@ struct State {
 struct Session {
     id: String,
     cwd: PathBuf,
+    data_root: PathBuf,
     project: String,
     model: String,
     messages: Vec<Message>,
@@ -199,7 +205,9 @@ impl Server {
     where
         W: Write + Send + 'static,
     {
+        let data_root = config.data_root.clone().unwrap_or_else(greppy_core::cache::data_root);
         Self {
+            data_root,
             out: Out {
                 inner: Arc::new(Mutex::new(output)),
             },
@@ -457,6 +465,7 @@ impl Server {
         let session = Session {
             id: session_id.clone(),
             cwd,
+            data_root,
             project,
             model: model.clone(),
             messages: Vec::new(),
@@ -517,6 +526,7 @@ impl Server {
         let session = Session {
             id: session_id.to_string(),
             cwd,
+            data_root,
             project,
             model: model.clone(),
             messages,
@@ -689,8 +699,7 @@ impl Server {
         if session.busy {
             return rpc_error(id, -32600, "session is busy");
         }
-        let (data_root, _) = self.store_identity(&session.cwd);
-        let store = SessionStore::new(data_root, session.project.clone());
+        let store = SessionStore::new(session.data_root.clone(), session.project.clone());
         if let Err(error) = store.set_model(session_id, model_id) {
             return rpc_error(id, -32603, &format!("cannot persist model: {error}"));
         }
@@ -756,6 +765,7 @@ impl Server {
             PreparedPrompt {
                 session_id: session.id.clone(),
                 cwd: session.cwd.clone(),
+                data_root: session.data_root.clone(),
                 project: session.project.clone(),
                 model: session.model.clone(),
                 history: session.messages.clone(),
@@ -787,20 +797,10 @@ impl Server {
             }));
             let reply = match result {
                 Ok(Ok(done)) => {
-                    if let Err(error) = persist_turn(&prepared, &config, &done) {
+                    if let Err(error) = finish_prompt(&state, &prepared, &config, &done) {
                         drop(busy);
                         let _ = out.send(&rpc_error(&request_id, -32603, &error));
                         return;
-                    }
-                    {
-                        let mut state = lock_state(&state);
-                        if let Some(session) = state.sessions.get_mut(&prepared.session_id) {
-                            session.messages = done.messages;
-                            session.usage_in =
-                                session.usage_in.saturating_add(done.usage.input_tokens);
-                            session.usage_out =
-                                session.usage_out.saturating_add(done.usage.output_tokens);
-                        }
                     }
                     let mut response = json!({
                         "stopReason": done.stop_reason,
@@ -838,8 +838,10 @@ impl Server {
     }
 
     fn store_identity(&self, cwd: &Path) -> (PathBuf, String) {
-        let (data_root, project) = agent_session_store_identity(cwd);
-        (self.config.data_root.clone().unwrap_or(data_root), project)
+        (
+            self.data_root.clone(),
+            greppy_core::workspace::project_identity_from_workspace(cwd),
+        )
     }
 }
 
@@ -854,6 +856,7 @@ impl Clone for Out {
 struct PreparedPrompt {
     session_id: String,
     cwd: PathBuf,
+    data_root: PathBuf,
     project: String,
     model: String,
     history: Vec<Message>,
@@ -1009,34 +1012,45 @@ impl ModelStream for CancelModel {
 
 fn persist_turn(
     prepared: &PreparedPrompt,
+    _config: &AcpConfig,
+    done: &PromptDone,
+) -> Result<(), String> {
+    let store = SessionStore::new(prepared.data_root.clone(), prepared.project.clone());
+    let title = prepared.history.is_empty().then(|| {
+        done.messages.iter().flat_map(|message| message.content.iter()).find_map(|part| match part {
+            greppy_agent::ContentPart::Text { text } => Some(truncate_chars(text, 80)),
+            _ => None,
+        }).unwrap_or_else(|| "untitled".to_string())
+    });
+    store.commit_turn(
+        &prepared.session_id,
+        &messages_from_protocol(&prepared.history),
+        &messages_from_protocol(&done.messages),
+        &done.usage,
+        done.stop_reason,
+        title.as_deref(),
+        || {
+            #[cfg(test)]
+            if let Some(hook) = &_config.after_messages {
+                hook()?;
+            }
+            Ok(())
+        },
+    ).map_err(|error| format!("cannot persist session history: {error}"))
+}
+
+fn finish_prompt(
+    state: &Mutex<State>,
+    prepared: &PreparedPrompt,
     config: &AcpConfig,
     done: &PromptDone,
 ) -> Result<(), String> {
-    let (data_root, project) = agent_session_store_identity(&prepared.cwd);
-    let data_root = config.data_root.clone().unwrap_or(data_root);
-    let store = SessionStore::new(data_root.as_path(), project.as_str());
-    let new_messages = done
-        .messages
-        .get(prepared.history.len()..)
-        .unwrap_or(&done.messages);
-    store
-        .append_messages(&prepared.session_id, &messages_from_protocol(new_messages))
-        .map_err(|error| format!("cannot persist session history: {error}"))?;
-    store
-        .append_usage(&prepared.session_id, &done.usage, 1, done.stop_reason)
-        .map_err(|error| format!("cannot persist session usage: {error}"))?;
-    if prepared.history.is_empty() {
-        let title: String = new_messages
-            .iter()
-            .flat_map(|message| message.content.iter())
-            .find_map(|part| match part {
-                greppy_agent::ContentPart::Text { text } => Some(truncate_chars(text, 80)),
-                _ => None,
-            })
-            .unwrap_or_else(|| "untitled".to_string());
-        store
-            .set_title(&prepared.session_id, &title)
-            .map_err(|error| format!("cannot persist session title: {error}"))?;
+    persist_turn(prepared, config, done)?;
+    let mut state = lock_state(state);
+    if let Some(session) = state.sessions.get_mut(&prepared.session_id) {
+        session.messages = done.messages.clone();
+        session.usage_in = session.usage_in.saturating_add(done.usage.input_tokens);
+        session.usage_out = session.usage_out.saturating_add(done.usage.output_tokens);
     }
     Ok(())
 }

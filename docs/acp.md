@@ -41,9 +41,14 @@ connection loss, and unrecognized options deny execution. Permission memory
 and cancellation are scoped to the session. Closing stdin cancels outstanding
 prompts and permission waits before process shutdown.
 
-Session history and model metadata use Greppy's existing session store. A
-restarted host can load the same session id. Replayed updates carry
-`_meta.isReplay` so the host can distinguish restored history from a new turn.
+Session history and model metadata use Greppy's existing session store. Each
+session captures its data root and logical project when created or loaded;
+concurrent prompts do not change process-wide project environment variables.
+Completed turns stage messages, cumulative usage, stop reason, and initial title
+in a private file, then replace the session log atomically. Failed staging keeps
+both saved and live history unchanged. A restarted host can load the same session
+id. Replayed updates carry `_meta.isReplay` so the host can distinguish restored
+history from a new turn.
 
 ## Wire shape and limits
 

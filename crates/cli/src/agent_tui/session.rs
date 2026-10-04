@@ -1,7 +1,8 @@
 //! Versioned, append-safe interactive session persistence.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,8 @@ use serde_json::{json, Value};
 use super::redaction::{redact_json, redact_text};
 
 pub const SESSION_FORMAT: u32 = 1;
+
+static NEXT_TURN_CHECKPOINT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedMessage {
@@ -134,6 +137,91 @@ impl SessionStore {
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(())
+    }
+
+    /// Commit one ACP turn with load-atomic visibility using the existing JSONL
+    /// records. Readers see the old log or the complete new log after rename.
+    pub(crate) fn commit_turn(
+        &self,
+        session_id: &str,
+        expected: &[PersistedMessage],
+        messages: &[PersistedMessage],
+        usage: &Usage,
+        stop: &str,
+        title: Option<&str>,
+        after_messages: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let previous = self.load(session_id)?;
+        if previous.recovered {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "cannot commit over a corrupt session log"));
+        }
+        if previous.messages != expected {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "saved session history changed"));
+        }
+        let total_usage = Usage {
+            input_tokens: previous.usage.input_tokens.saturating_add(usage.input_tokens),
+            output_tokens: previous.usage.output_tokens.saturating_add(usage.output_tokens),
+            cache_read_input_tokens: previous.usage.cache_read_input_tokens.saturating_add(usage.cache_read_input_tokens),
+            cache_creation_input_tokens: previous.usage.cache_creation_input_tokens.saturating_add(usage.cache_creation_input_tokens),
+        };
+        let path = self.path_for(session_id)?;
+        let temporary = self.project_dir().join(format!(
+            ".{session_id}-turn-{}-{}-{}.pending",
+            std::process::id(), now_ms(), NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut created = false;
+        let result = (|| {
+            let mut source = File::open(&path)?;
+            let length = source.metadata()?.len();
+            let needs_newline = if length == 0 {
+                false
+            } else {
+                source.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                source.read_exact(&mut last)?;
+                source.rewind()?;
+                last[0] != b'\n'
+            };
+            let mut target = OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+            created = true;
+            greppy_core::cache::secure_private_file(&temporary)?;
+            io::copy(&mut source, &mut target)?;
+            if needs_newline {
+                target.write_all(b"\n")?;
+            }
+            if let Some(added) = messages.strip_prefix(expected) {
+                for message in added {
+                    writeln!(target, "{}", message_line(message))?;
+                }
+            } else {
+                writeln!(target, "{}", json!({
+                    "v": SESSION_FORMAT, "type": "message_checkpoint",
+                    "messages": messages.iter().map(message_line).collect::<Vec<_>>()
+                }))?;
+            }
+            after_messages()?;
+            writeln!(target, "{}", json!({
+                "v": SESSION_FORMAT, "type": "usage",
+                "input": total_usage.input_tokens, "output": total_usage.output_tokens,
+                "cache_read": total_usage.cache_read_input_tokens,
+                "cache_write": total_usage.cache_creation_input_tokens,
+                "turns": previous.turns.saturating_add(1), "stop": stop,
+            }))?;
+            if let Some(title) = title {
+                writeln!(target, "{}", json!({
+                    "v": SESSION_FORMAT, "type": "title", "title": redact_text(title),
+                }))?;
+            }
+            target.flush()?;
+            target.sync_all()?;
+            drop(target);
+            // No fallible operation follows the visible commit point.
+            fs::rename(&temporary, &path)
+        })();
+        if created && result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn append_messages(

@@ -263,13 +263,7 @@ struct ServeArgs {
 /// `GREPPY_PROJECT_IDENTITY` so worktree cache names cannot leak in.
 pub fn agent_session_store_identity(repo_root: &Path) -> (PathBuf, String) {
     let data_root = greppy_core::cache::data_root();
-    let saved = std::env::var_os(greppy_core::PROJECT_IDENTITY_ENV);
-    std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
-    let logical_project = greppy_core::project_identity(repo_root);
-    match saved {
-        Some(value) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, value),
-        None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
-    }
+    let logical_project = greppy_core::workspace::project_identity_from_workspace(repo_root);
     (data_root, logical_project)
 }
 
