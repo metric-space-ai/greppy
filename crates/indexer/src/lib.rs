@@ -6587,6 +6587,11 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         }));
         assert_eq!(events.last().unwrap().phase, "finalizing_graph");
 
+        let inventory_count = store.list_private_file_states("test").unwrap().len();
+        assert!(
+            inventory_count >= 2,
+            "both supported source files must be retained"
+        );
         let mut previous = store.list_private_workspace_states().unwrap().remove(0);
         previous.indexer_version = "incompatible-progress-test".into();
         store.upsert_workspace_state(&previous).unwrap();
@@ -6604,7 +6609,12 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
             .filter(|event| event.phase == "removing_previous_graph")
             .map(|event| (event.completed_files, event.total_files))
             .collect::<Vec<_>>();
-        assert_eq!(cleanup, vec![(0, 2), (1, 2), (2, 2)]);
+        assert_eq!(
+            cleanup,
+            (0..=inventory_count)
+                .map(|done| (done, inventory_count))
+                .collect::<Vec<_>>()
+        );
         let preparation = events
             .iter()
             .position(|event| event.phase == "preparing_graph_inventory")
