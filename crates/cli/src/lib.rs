@@ -2779,7 +2779,6 @@ fn dispatch_subcommand(
             all,
             path_opts,
         } => {
-            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_search_code(
                 query.as_deref(),
@@ -2800,7 +2799,6 @@ fn dispatch_subcommand(
             all,
             path_opts,
         } => {
-            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_search_symbols(
                 query.as_deref(),
@@ -2837,7 +2835,6 @@ fn dispatch_subcommand(
             path_opts,
         } => {
             let query = query_parts.join(" ");
-            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_semantic(
                 (!query.trim().is_empty()).then_some(query.as_str()),
@@ -8872,6 +8869,7 @@ fn prepare_query_path_filters(
     paths: &[String],
 ) -> Result<QueryPathFilters> {
     validate_query_root_usage(root, command, subject)?;
+    validate_search_path_scope(root, paths)?;
     Ok(QueryPathFilters::from_args(&resolve_root(root)?, paths))
 }
 

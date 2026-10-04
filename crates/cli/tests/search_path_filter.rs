@@ -66,6 +66,26 @@ fn existing_absolute_outside_paths_are_rejected_before_index_preparation() {
     let external = repo.parent().unwrap().join("terminal_report.py");
     std::fs::write(&external, "def record(): pass\n").unwrap();
     std::fs::write(repo.join("lib.rs"), "pub fn record() {}\n").unwrap();
+    for (command, missing) in [
+        ("search-symbol", "search-symbol requires a name"),
+        (
+            "search-pattern",
+            "search-pattern requires a regular expression",
+        ),
+        ("search", "search requires a plain-English query"),
+    ] {
+        for query in [None, Some(" ")] {
+            let mut args = vec![command];
+            if let Some(query) = query {
+                args.push(query);
+            }
+            args.extend(["--path", external.to_str().unwrap()]);
+            let (code, out, err) = run(&repo, &store, &args);
+            assert_eq!(code, 64, "stdout={out}; stderr={err}");
+            assert!(err.contains(missing), "{err}");
+            assert!(!err.contains("outside the repository"), "{err}");
+        }
+    }
     for command in ["search-symbol", "search-pattern", "search"] {
         let (code, out, err) = run(
             &repo,
