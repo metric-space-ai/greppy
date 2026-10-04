@@ -9698,6 +9698,34 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
     }
 
     #[test]
+    fn persisted_rust_recovery_validates_winning_cfg_trait_facts() {
+        let repo = setup_repo(
+            "cfg-trait-recovery",
+            "#[cfg(feature=\"first\")] pub trait View { fn as_ref(&self); }\n#[cfg(not(feature=\"first\"))] pub trait View: core::fmt::Debug { fn as_ref(self); }\n",
+        );
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let winner = store
+            .get_node_by_qname("test", "src/lib.rs::Interface::View")
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.properties["has_bounds"], 1);
+        recover_persisted_rust_usages(&mut store, "test", &repo).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE nodes SET properties=json_remove(properties, '$.has_bounds') WHERE id=?1",
+                [winner.id],
+            )
+            .unwrap();
+        let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trait receiver facts"), "{error}");
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
         let repo = setup_repo(
             "constructor-recovery",
