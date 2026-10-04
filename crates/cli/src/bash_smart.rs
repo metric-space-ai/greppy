@@ -965,8 +965,9 @@ pub(crate) fn expand(
     pack: greppy_store::ExpandPack,
     json: bool,
 ) -> Result<i32> {
+    let reason = pack_decode_failure(&pack);
     let Some((pack, raw)) = relocate_or_refuse(store, pack)? else {
-        println!("expand: bash-smart pack hash drift; refusing unverified output");
+        println!("expand: bash-smart pack {reason}; refusing unverified output");
         return Ok(1);
     };
     let stream = pack
@@ -1385,6 +1386,54 @@ fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
+// Retain bounded, byte-exact capture in the same TTL-managed row as its handle.
+// The capture paths remain provenance only for new packs: a gate or sandbox can
+// clean its TMPDIR as soon as the command completes, before expansion runs.
+fn encode_capture_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_capture_stream(stream: &serde_json::Value) -> std::result::Result<Vec<u8>, String> {
+    if let Some(encoded) = stream.get("bytes_hex") {
+        let encoded = encoded
+            .as_str()
+            .ok_or("invalid retained capture encoding")?;
+        // Capture is already capped to head + tail + the small gap marker.
+        // Reject oversized/corrupt payloads before allocating decoded bytes.
+        let max_bytes = PACK_HEAD_BYTES + PACK_TAIL_BYTES + 256;
+        if encoded.len() % 2 != 0 || encoded.len() as u64 > max_bytes * 2 {
+            return Err("invalid retained capture length".into());
+        }
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        return encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = nibble(pair[0]).ok_or("invalid retained capture hex")?;
+                let low = nibble(pair[1]).ok_or("invalid retained capture hex")?;
+                Ok((high << 4) | low)
+            })
+            .collect();
+    }
+    // Compatibility for existing path-only packs. Never fall back to a spool
+    // if retained bytes exist but are invalid: that would mask tampering.
+    let path = stream
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("capture path missing from legacy pack")?;
+    std::fs::read(path).map_err(|error| format!("legacy capture unavailable at {path}: {error}; rerun the command with a retained-output Greppy"))
+}
+
 impl StoredRaw {
     fn from_capture(stdout: CapturedStream, stderr: CapturedStream) -> Result<Self> {
         // Capture itself is always disk-backed. The bounded delivery pass reads
@@ -1400,6 +1449,7 @@ impl StoredRaw {
             "content_sha256": content_sha256,
             "stdout": {
                 "sha256": stdout.sha256,
+                "bytes_hex": encode_capture_bytes(&stdout_bytes),
                 "byte_len": stdout.byte_len,
                 "line_count": stdout.line_count,
                 "path": stdout.path,
@@ -1408,6 +1458,7 @@ impl StoredRaw {
             },
             "stderr": {
                 "sha256": stderr.sha256,
+                "bytes_hex": encode_capture_bytes(&stderr_bytes),
                 "byte_len": stderr.byte_len,
                 "line_count": stderr.line_count,
                 "path": stderr.path,
@@ -1430,10 +1481,8 @@ impl StoredRaw {
         {
             return None;
         }
-        let stdout_path = Path::new(payload.get("stdout")?.get("path")?.as_str()?);
-        let stderr_path = Path::new(payload.get("stderr")?.get("path")?.as_str()?);
-        let stdout = std::fs::read(stdout_path).ok()?;
-        let stderr = std::fs::read(stderr_path).ok()?;
+        let stdout = decode_capture_stream(payload.get("stdout")?).ok()?;
+        let stderr = decode_capture_stream(payload.get("stderr")?).ok()?;
         let content_sha256 = combined_sha256(&stdout, &stderr);
         let claimed = payload.get("content_sha256")?.as_str()?;
         let stdout_claimed = payload.get("stdout")?.get("sha256")?.as_str()?;
@@ -1530,6 +1579,31 @@ fn insert_continuation_pack(
         payload_json: Some(raw.payload.clone()),
         ttl_secs: previous.expires_at.saturating_sub(unix_now_secs()).max(1),
     })
+}
+
+fn pack_decode_failure(pack: &greppy_store::ExpandPack) -> String {
+    let Some(payload) = pack.payload_json.as_ref() else {
+        return "metadata missing or malformed; rerun the command".into();
+    };
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(PACK_SCHEMA_VERSION)
+        || payload.get("kind").and_then(serde_json::Value::as_str) != Some("bash-smart")
+    {
+        return "unsupported or malformed capture schema; rerun the command".into();
+    }
+    for name in ["stdout", "stderr"] {
+        let Some(stream) = payload.get(name) else {
+            return format!("{name} metadata missing; rerun the command");
+        };
+        if stream.get("bytes_hex").is_none() {
+            if let Err(error) = decode_capture_stream(stream) {
+                return format!("{name} {error}");
+            }
+        }
+    }
+    "hash drift or malformed retained bytes/hash metadata; rerun the command".into()
 }
 
 fn relocate_or_refuse(
@@ -2333,6 +2407,71 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn retained_capture_survives_spool_cleanup_and_rejects_tampering() {
+        let dir = std::env::temp_dir().join(format!("greppy-retention-{}", spool_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let capture = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            CapturedStream {
+                path,
+                timestamps_path: dir.join(format!("{name}.times")),
+                byte_len: bytes.len() as u64,
+                line_count: 1,
+                sha256: sha256(bytes),
+            }
+        };
+        let raw = StoredRaw::from_capture(
+            capture("stdout", b"\0\xff\r\n"),
+            capture("stderr", b"error[E0308]: mismatch\n"),
+        )
+        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&raw.payload).unwrap()).unwrap();
+        let mut legacy = payload.clone();
+        legacy["stdout"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bytes_hex");
+        legacy["stderr"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bytes_hex");
+        assert!(StoredRaw::decode(&legacy).is_some());
+        std::fs::write(dir.join("stdout"), b"changed spool").unwrap();
+        assert!(
+            StoredRaw::decode(&legacy).is_none(),
+            "legacy drift must remain refused"
+        );
+        std::fs::write(dir.join("stdout"), b"\0\xff\r\n").unwrap();
+        let mut invalid_retained = payload.clone();
+        invalid_retained["stdout"]["bytes_hex"] = serde_json::json!("not hex");
+        assert!(
+            StoredRaw::decode(&invalid_retained).is_none(),
+            "invalid retained bytes must not fall back to valid spool"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let decoded = StoredRaw::decode(&payload).expect("retained bytes outlive capture TMPDIR");
+        assert_eq!(decoded.stdout, b"\0\xff\r\n");
+        assert_eq!(decoded.stderr, b"error[E0308]: mismatch\n");
+        assert!(StoredRaw::decode(&legacy).is_none());
+        assert!(decode_capture_stream(&legacy["stderr"])
+            .unwrap_err()
+            .contains("legacy capture unavailable"));
+        let mut tampered = payload.clone();
+        tampered["stdout"]["bytes_hex"] = serde_json::json!("00ff0a0a");
+        assert!(
+            StoredRaw::decode(&tampered).is_none(),
+            "same-length retained tamper must fail hashes"
+        );
+        tampered["stdout"]["bytes_hex"] = serde_json::json!("not hex");
+        assert!(StoredRaw::decode(&tampered).is_none());
+        tampered = payload;
+        tampered["content_sha256"] = serde_json::json!("wrong combined hash");
+        assert!(StoredRaw::decode(&tampered).is_none());
     }
 
     #[test]
