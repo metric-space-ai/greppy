@@ -916,6 +916,7 @@ pub(crate) fn complete_visible_overlay_rust_repair(
     let js_repaired = greppy_indexer::recover_persisted_js_ts_usages(overlay, project, root)?;
     if greppy_indexer::rust_caller_edges_repaired(overlay)?
         && greppy_indexer::anyhow_factory_edges_repaired(overlay)?
+        && greppy_indexer::direct_self_field_edges_repaired(overlay)?
     {
         return Ok(effect_repaired || js_repaired);
     }
@@ -1008,6 +1009,7 @@ pub(crate) fn ensure_persisted_single_store_repaired(
             greppy_indexer::recover_persisted_js_ts_usages(&mut store, project, root)?;
             if !greppy_indexer::rust_caller_edges_repaired(&store)?
                 || !greppy_indexer::anyhow_factory_edges_repaired(&store)?
+                || !greppy_indexer::direct_self_field_edges_repaired(&store)?
             {
                 greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
             }
@@ -1108,7 +1110,8 @@ pub(crate) fn persisted_v7_delta_needs_repair(
         })
         && (marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE)
             || !greppy_indexer::js_ts_usages_repaired(delta)?
-            || !greppy_indexer::anyhow_factory_edges_repaired(delta)?))
+            || !greppy_indexer::anyhow_factory_edges_repaired(delta)?
+            || !greppy_indexer::direct_self_field_edges_repaired(delta)?))
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
