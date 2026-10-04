@@ -2951,12 +2951,13 @@ mod tests {
         fn set(path: &Path) -> Self {
             let environment = EnvRestore::capture(&[
                 "TMPDIR",
-                "GREPPY_BASE_BUILD_STAGING_ROOT",
+                "GREPPY_STORE_DIR",
                 greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
             ]);
             std::env::set_var("TMPDIR", path);
-            // These fixtures exercise TMPDIR placement, not an inherited override.
-            std::env::remove_var("GREPPY_BASE_BUILD_STAGING_ROOT");
+            // Mac defaults intentionally ignore TMPDIR. These fixtures exercise
+            // caller-supplied TMPDIR placement with an explicit isolated store.
+            std::env::set_var("GREPPY_STORE_DIR", path.join("isolated-store"));
             std::env::remove_var(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES);
             Self {
                 _environment: environment,
