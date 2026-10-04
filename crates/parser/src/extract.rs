@@ -4524,6 +4524,7 @@ fn rust_expression_macro_calls(
                         caller,
                         name.to_string(),
                         0usize,
+                        node,
                     ));
                 }
             }
@@ -4532,7 +4533,7 @@ fn rust_expression_macro_calls(
     }
     let mut edges = Vec::new();
     let mut budget = source.len().saturating_mul(16);
-    while let Some((body, row, caller, macro_name, depth)) = pending.pop() {
+    while let Some((body, row, caller, macro_name, depth, context)) = pending.pop() {
         if depth >= 16 || body.len() > budget {
             return Err(greppy_core::Error::Parse(
                 "Rust expression-macro call extraction exceeded its bounded nesting budget".into(),
@@ -4578,7 +4579,16 @@ fn rust_expression_macro_calls(
                     });
                     if !receiver {
                         if let Some(path) = rust_scoped_call_path(&wrapped, node) {
+                            if rust_usage_has_local_type_binding(
+                                source,
+                                context,
+                                path.split("::").next().unwrap_or(""),
+                            ) {
+                                properties["rust_local_type_owner"] = serde_json::json!(true);
+                            }
                             properties["callee_path"] = serde_json::json!(path);
+                        } else if rust_usage_has_local_value_binding(source, context, name) {
+                            continue;
                         }
                     }
                     edges.push(ExtractedEdge {
@@ -4612,6 +4622,7 @@ fn rust_expression_macro_calls(
                             caller.clone(),
                             name.to_string(),
                             depth + 1,
+                            context,
                         ));
                     }
                 }
@@ -17896,6 +17907,21 @@ async fn caller() {
                 .any(|e| e.properties["callee_name"] == "is_empty"),
             "receiver provenance is unavailable in a synthetic macro context"
         );
+    }
+
+    #[test]
+    fn rust_expression_macros_keep_original_generic_and_local_callee_scope() {
+        let source = "fn caller<T>(callback: fn()) { assert!(T::run()); assert!(callback()); }";
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
     }
 
     #[test]

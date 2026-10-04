@@ -6116,6 +6116,7 @@ impl GraphIndex {
             }
             if owner == "anyhow"
                 && name == "ensure"
+                && self.anyhow_factory_files.contains(file)
                 && !self.standard_namespace_is_shadowed(file, owner, false)
             {
                 return Some("anyhow::ensure".to_string());
@@ -9338,6 +9339,8 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
             "mod channel;\n",
             "// placeholder\n",
         );
+        fs::write(repo.join("Cargo.toml"), "[package]\nname='macro_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nanyhow='1'\n").unwrap();
+        fs::write(repo.join("Cargo.lock"), format!("version=3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64))).unwrap();
         fs::create_dir_all(repo.join("src/channel")).unwrap();
         fs::write(
             repo.join("src/channel/mod.rs"),
@@ -9392,6 +9395,21 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
             .unwrap()
             .iter()
             .any(|e| e.source_id == caller.id));
+        for dependency in [
+            "anyhow={package='custom_dsl',version='1'}",
+            "anyhow={path='custom_dsl'}",
+            "anyhow='1'\n[patch.crates-io]\nanyhow={path='custom_dsl'}",
+        ] {
+            fs::write(repo.join("Cargo.toml"), format!("[package]\nname='macro_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n{dependency}\n")).unwrap();
+            rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "custom/overridden anyhow package invented macro calls: {dependency}"
+            );
+        }
         fs::remove_dir_all(repo).unwrap();
     }
 
