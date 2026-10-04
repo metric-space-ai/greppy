@@ -207,6 +207,77 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// C11's reserved storage-class keyword is omitted by tree-sitter-c 0.24.2.
+/// Recover only raw identifier leaves that become an actual storage-class
+/// specifier in the equivalent grammar spelling. Comments, strings, macro
+/// bodies and expression lookalikes cannot qualify. The view is length-stable;
+/// proposed bytes and diagnostic coordinates are never rewritten.
+fn c11_thread_local_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
+    if !content.windows(13).any(|bytes| bytes == b"_Thread_local") {
+        return Cow::Borrowed(content);
+    }
+    let Ok(raw) = greppy_parser::parse(Language::C, content) else {
+        return Cow::Borrowed(content);
+    };
+    let mut starts = Vec::new();
+    let mut cursor = raw.walk();
+    loop {
+        let node = cursor.node();
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && node.child_count() == 0
+            && content.get(node.start_byte()..node.end_byte()) == Some(b"_Thread_local")
+        {
+            starts.push(node.start_byte());
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break;
+            }
+        }
+        if cursor.node() == raw.root_node() {
+            break;
+        }
+    }
+    if starts.is_empty() {
+        return Cow::Borrowed(content);
+    }
+    let mut view = content.to_vec();
+    for start in &starts {
+        view[*start..*start + 13].copy_from_slice(b"thread_local ");
+    }
+    let Ok(recovered) = greppy_parser::parse(Language::C, &view) else {
+        return Cow::Borrowed(content);
+    };
+    let mut accepted = false;
+    for start in starts {
+        let specifier = recovered
+            .root_node()
+            .named_descendant_for_byte_range(start, start + 1)
+            .is_some_and(|node| {
+                node.kind() == "storage_class_specifier"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "declaration")
+            });
+        if specifier {
+            accepted = true;
+        } else {
+            view[start..start + 13].copy_from_slice(b"_Thread_local");
+        }
+    }
+    if accepted {
+        Cow::Owned(view)
+    } else {
+        Cow::Borrowed(content)
+    }
+}
+
 /// Build a validation-only view for the exact import-type recovery shape
 /// emitted by the bundled TypeScript grammar.
 ///
@@ -220,7 +291,15 @@ fn bash_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 /// span preserves length and every newline.
 fn syntax_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     if matches!(language, Language::C | Language::Cpp) {
-        return guarded_linkage_validation_content(language, content);
+        let linkage = guarded_linkage_validation_content(language, content);
+        return if language == Language::C {
+            match c11_thread_local_validation_content(&linkage) {
+                Cow::Owned(view) => Cow::Owned(view),
+                Cow::Borrowed(_) => linkage,
+            }
+        } else {
+            linkage
+        };
     }
     if language.name() == "json" {
         return json_validation_content(content);
@@ -717,6 +796,63 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c11_thread_local_recovers_only_storage_class_tokens() {
+        let valid = b"#include <stdbool.h>\nstatic _Thread_local bool inside;\nint main(void){return inside;}\n";
+        let raw = greppy_parser::parse(Language::C, valid).unwrap();
+        assert!(
+            raw.root_node().has_error(),
+            "raw grammar omission must be explicit"
+        );
+        let view = c11_thread_local_validation_content(valid);
+        assert_ne!(view.as_ref(), valid);
+        assert_eq!(view.len(), valid.len());
+        assert_eq!(
+            syntax_counts(Language::C, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert!(first_syntax_diagnostic(Language::C, valid).is_none());
+        for valid in [
+            b"_Thread_local int first;\n".as_slice(),
+            b"extern _Thread_local int second;\n".as_slice(),
+            b"void f(void) { static _Thread_local int local; }\n".as_slice(),
+        ] {
+            assert_eq!(
+                syntax_counts(Language::C, valid),
+                Some(SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                })
+            );
+        }
+        for literal in [
+            b"/* _Thread_local */ int ordinary;\n".as_slice(),
+            b"const char *text = \"_Thread_local\";\n".as_slice(),
+            b"#define STORAGE _Thread_local\nint ordinary;\n".as_slice(),
+            b"int main(void) { return _Thread_local; }\n".as_slice(),
+        ] {
+            assert_eq!(
+                c11_thread_local_validation_content(literal).as_ref(),
+                literal
+            );
+        }
+        for invalid in [
+            b"static _Thread_local bool inside = ;\n".as_slice(),
+            b"static _Thread_local bool inside;\nint main(void) { return ; + }\n".as_slice(),
+        ] {
+            let counts = syntax_counts(Language::C, invalid).unwrap();
+            assert!(
+                counts.errors > 0 || counts.missing > 0,
+                "{}",
+                String::from_utf8_lossy(invalid)
+            );
+            assert!(first_syntax_diagnostic(Language::C, invalid).is_some());
+        }
+    }
+
     #[test]
     fn guarded_linkage_lookalikes_keep_valid_comment_and_string_bytes() {
         let pair = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint value;\n#ifdef __cplusplus\n}\n#endif\n";
