@@ -3017,60 +3017,128 @@ fn try_emit_js_ts_usage(
     });
 }
 
-/// Conservatively refuse a component name shadowed within an enclosing
-/// function. Module definitions/imports remain available to the resolver.
+/// Check active lexical scopes only. Lexical declarations bind throughout
+/// their scope (including the temporal dead zone); var binds throughout the
+/// enclosing function. Sibling blocks and nested functions cannot shadow it.
 fn js_ts_jsx_locally_bound(node: Node<'_>, source: &[u8], name: &str) -> bool {
     let mut parent = node.parent();
     while let Some(scope) = parent {
-        if JS_TS_FUNC_KINDS.contains(&scope.kind()) {
+        let function = JS_TS_FUNC_KINDS.contains(&scope.kind());
+        let lexical = matches!(
+            scope.kind(),
+            "statement_block"
+                | "switch_body"
+                | "catch_clause"
+                | "for_statement"
+                | "for_in_statement"
+        );
+        if function {
+            for field in ["parameters", "parameter"] {
+                if scope
+                    .child_by_field_name(field)
+                    .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if lexical || function {
             let mut stack = vec![scope];
             while let Some(binding) = stack.pop() {
-                if matches!(
-                    binding.kind(),
-                    "formal_parameters" | "required_parameter" | "optional_parameter"
-                ) {
-                    let mut patterns = vec![binding];
-                    while let Some(pattern) = patterns.pop() {
-                        if matches!(
-                            pattern.kind(),
-                            "identifier" | "shorthand_property_identifier_pattern"
-                        ) && node_text(source, pattern) == name
-                        {
-                            return true;
-                        }
-                        // Type annotations do not introduce value bindings.
-                        if pattern.kind() != "type_annotation" {
-                            let mut cursor = pattern.walk();
-                            patterns.extend(pattern.named_children(&mut cursor));
-                        }
-                    }
-                }
-                if binding.id() != scope.id()
+                let nested_function =
+                    binding.id() != scope.id() && JS_TS_FUNC_KINDS.contains(&binding.kind());
+                let nested_scope = binding.id() != scope.id()
                     && matches!(
                         binding.kind(),
-                        "variable_declarator" | "function_declaration" | "class_declaration"
-                    )
-                {
-                    if let Some(pattern) = binding.child_by_field_name("name") {
-                        let mut patterns = vec![pattern];
-                        while let Some(pattern) = patterns.pop() {
-                            if matches!(
-                                pattern.kind(),
-                                "identifier" | "shorthand_property_identifier_pattern"
-                            ) && node_text(source, pattern) == name
-                            {
-                                return true;
-                            }
-                            let mut cursor = pattern.walk();
-                            patterns.extend(pattern.named_children(&mut cursor));
+                        "statement_block"
+                            | "switch_body"
+                            | "catch_clause"
+                            | "for_statement"
+                            | "for_in_statement"
+                    );
+                let declaration = binding.kind() == "variable_declarator"
+                    && binding.parent().is_some_and(|p| {
+                        if function {
+                            p.kind() == "variable_declaration"
+                        } else {
+                            p.kind() == "lexical_declaration"
                         }
+                    });
+                if declaration
+                    || (!function
+                        && matches!(binding.kind(), "function_declaration" | "class_declaration"))
+                {
+                    if binding
+                        .child_by_field_name("name")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                    {
+                        return true;
                     }
+                }
+                if binding.kind() == "catch_clause" && binding.id() == scope.id() {
+                    if binding
+                        .child_by_field_name("parameter")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                    {
+                        return true;
+                    }
+                }
+                // Function-level var discovery crosses blocks, but never
+                // crosses a nested function or class. Lexical discovery stops
+                // at every child scope; that scope is checked only if active.
+                if nested_function
+                    || matches!(binding.kind(), "class_declaration" | "class")
+                    || (!function && nested_scope)
+                {
+                    continue;
                 }
                 let mut cursor = binding.walk();
                 stack.extend(binding.named_children(&mut cursor));
             }
         }
         parent = scope.parent();
+    }
+    false
+}
+
+fn js_ts_pattern_binds(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut patterns = vec![pattern];
+    while let Some(pattern) = patterns.pop() {
+        if matches!(
+            pattern.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && node_text(source, pattern) == name
+        {
+            return true;
+        }
+        if matches!(pattern.kind(), "required_parameter" | "optional_parameter") {
+            if let Some(binding) = pattern
+                .child_by_field_name("pattern")
+                .or_else(|| pattern.child_by_field_name("name"))
+            {
+                patterns.push(binding);
+                continue;
+            }
+        }
+        // Defaults and types reference values/types, rather than binding them.
+
+        if matches!(
+            pattern.kind(),
+            "type_annotation" | "call_expression" | "member_expression"
+        ) {
+            continue;
+        }
+        if matches!(
+            pattern.kind(),
+            "assignment_pattern" | "object_assignment_pattern"
+        ) {
+            if let Some(left) = pattern.child_by_field_name("left") {
+                patterns.push(left);
+            }
+            continue;
+        }
+        let mut cursor = pattern.walk();
+        patterns.extend(pattern.named_children(&mut cursor));
     }
     false
 }
@@ -19659,6 +19727,42 @@ export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
             .edges
             .iter()
             .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
+    }
+
+    #[test]
+    fn jsx_shadowing_follows_active_lexical_scopes_and_hoisting() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+function NestedFunction() { function inner(Boundary: unknown) { return <Boundary />; } return <Boundary />; }
+function NestedBlock() { { const Boundary = local; } return <Boundary />; }
+function SiblingBlock() { { const Boundary = local; } { return <Boundary />; } }
+function LaterSibling() { const result = <Boundary />; { const Boundary = local; } return result; }
+function LaterLexical() { const result = <Boundary />; const Boundary = local; return result; }
+function TrueLocal() { const Boundary = local; return <Boundary />; }
+function ActiveBlock() { { const Boundary = local; return <Boundary />; } }
+function HoistedVar() { const result = <Boundary />; { var Boundary = local; } return result; }
+function Parameter(Boundary: unknown) { return <Boundary />; }
+"#,
+            "view.tsx",
+        );
+        let owners: std::collections::BTreeSet<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .map(|edge| edge.source_qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            [
+                "view.tsx::Function::NestedFunction",
+                "view.tsx::Function::NestedBlock",
+                "view.tsx::Function::SiblingBlock",
+                "view.tsx::Function::LaterSibling"
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]

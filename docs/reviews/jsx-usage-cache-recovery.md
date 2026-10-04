@@ -49,5 +49,5 @@ All executable tests remain unrun. Formatting and diff checks passed. Original
 Workjet store acceptance remains pending; no reporter store was opened/mutated.
 The implementation makes one admitted source-validation pass over visible JS/TS
 files and project definitions. Member/namespace tags are still not guessed;
-local shadow analysis conservatively includes nested declarations. The Store
+shadow analysis follows active lexical scopes, function parameters and hoisted var bindings; later same-scope lexical declarations shadow through their temporal dead zone. The Store
 completion marker follows the existing single-project query-open convention.
