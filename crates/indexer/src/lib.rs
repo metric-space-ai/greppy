@@ -8004,15 +8004,20 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 .files_indexed,
             0
         );
-        let method = store
-            .get_node_by_qname("test", "observe_choices_test.cjs::Function::getAttribute")
-            .unwrap()
-            .unwrap();
-        assert_eq!(method.start_line, 65);
+        let source = include_str!("../../../bench/web_study/basic_fixture/observe_choices_test.cjs");
+        let extraction = parser_extract(Language::JavaScript, source.as_bytes(), "observe_choices_test.cjs").unwrap();
+        let methods: Vec<_> = extraction.nodes.iter().filter(|node| node.name == "getAttribute").collect();
+        assert!(methods.len() > 1);
+        assert!(methods.iter().any(|node| node.start_line == 65));
+        for method in methods {
+            let cached = store.get_node_by_qname("test", &method.qualified_name).unwrap().unwrap();
+            assert_eq!(cached.start_line, i64::from(method.start_line));
+        }
+        assert!(store.get_node_by_qname("test", "observe_choices_test.cjs::Function::getAttribute").unwrap().is_none());
     }
 
     #[test]
-    fn jsx_usage_recovery_validates_persisted_last_definition_for_colliding_methods() {
+    fn jsx_usage_recovery_preserves_all_colliding_method_definitions() {
         let repo = tempfile::tempdir().unwrap();
         let source = "function first() { return { getAttribute(name) { return name; } }; }\n\
                       function second() { return { getAttribute() { return null; } }; }\n\
@@ -8029,23 +8034,25 @@ export function invalidCalls() { plainValue(); effectValue(); }
         let methods: Vec<_> = extraction
             .nodes
             .iter()
-            .filter(|node| node.qualified_name == "fixture.cjs::Function::getAttribute")
+            .filter(|node| node.name == "getAttribute")
             .collect();
         assert!(
             methods.len() >= 2,
-            "fixture must exercise the actual parser collision"
+            "fixture must exercise separate same-named definitions"
         );
         assert_ne!(methods[0].start_line, methods.last().unwrap().start_line);
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("graph.db");
         let mut store = Store::open(&path).unwrap();
         index(&mut store, repo.path(), "test").unwrap();
-        let qname = "fixture.cjs::Function::getAttribute";
-        let cached = store.get_node_by_qname("test", qname).unwrap().unwrap();
-        assert_eq!(
-            cached.start_line,
-            i64::from(methods.last().unwrap().start_line)
-        );
+        let identities: std::collections::BTreeSet<_> = methods.iter().map(|node| &node.qualified_name).collect();
+        assert_eq!(identities.len(), methods.len());
+        for method in &methods {
+            let cached = store.get_node_by_qname("test", &method.qualified_name).unwrap().unwrap();
+            assert_eq!(cached.start_line, i64::from(method.start_line));
+        }
+        assert!(store.get_node_by_qname("test", "fixture.cjs::Function::getAttribute").unwrap().is_none());
+        let qname = methods[0].qualified_name.as_str();
         let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
         let states = format!("{:?}", store.list_file_states("test").unwrap());
         store
