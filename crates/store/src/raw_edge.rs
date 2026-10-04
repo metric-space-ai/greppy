@@ -141,6 +141,16 @@ impl Store {
         self.replace_validated_reference_edge_kind(project, files, edges, "USAGE", "js_ts")
     }
 
+    /// Refresh source-validated JS/TS callers in a separate compatibility mask.
+    pub fn replace_validated_js_ts_calls(
+        &mut self,
+        project: &str,
+        files: &[String],
+        edges: &[NewRawEdge],
+    ) -> Result<usize> {
+        self.replace_validated_reference_edge_kind(project, files, edges, "CALLS", "js_ts")
+    }
+
     fn replace_validated_reference_edge_kind(
         &mut self,
         project: &str,

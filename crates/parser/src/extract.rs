@@ -3191,44 +3191,49 @@ fn js_ts_module_variable_name<'a>(declarator: Node<'_>, source: &'a [u8]) -> Opt
     if !module_level {
         return None;
     }
+    // The variable pass deliberately omits direct generator bindings, while
+    // the definition query does not emit them either. Never invent their owner.
+    if declarator
+        .child_by_field_name("value")
+        .is_some_and(|value| {
+            matches!(
+                value.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            )
+        })
+    {
+        return None;
+    }
     let name = declarator.child_by_field_name("name")?;
     (name.kind() == "identifier")
         .then(|| node_text(source, name))
         .filter(|name| !name.is_empty())
 }
 
-/// The name of a JS/TS enclosing-function node plus the node whose ancestry
-/// decides class ownership. Returns `None` when the function is anonymous (so
-/// the caller falls back to the `__file__` node).
+/// Return only a name emitted by the definition pass. Internal names of
+/// callback expressions are lexical bindings, not standalone graph definitions.
 fn js_ts_func_name<'a, 't>(func: Node<'t>, source: &'a [u8]) -> Option<(&'a str, Node<'t>)> {
-    // A `name:` field covers `function_declaration`, `method_definition`, and a
-    // named `function_expression`.
-    if let Some(name_node) = func.child_by_field_name("name") {
-        let name = node_text(source, name_node);
-        if !name.is_empty() {
-            return Some((name, func));
-        }
-    }
-    // Arrow / anonymous function-expression bound to a declarator:
-    // `const f = () => {}` / `const f = function () {}`. The def pass emits
-    // this via the `variable_declarator` rule, named from the declarator.
     if matches!(func.kind(), "arrow_function" | "function_expression") {
-        if let Some(parent) = func.parent() {
-            if parent.kind() == "variable_declarator" {
-                if let Some(vname) = parent.child_by_field_name("name") {
-                    if vname.kind() == "identifier" {
-                        let name = node_text(source, vname);
-                        if !name.is_empty() {
-                            // Class ownership is decided from the declarator's
-                            // ancestry (same as the def pass).
-                            return Some((name, parent));
-                        }
-                    }
-                }
-            }
+        let parent = func.parent()?;
+        if parent.kind() != "variable_declarator"
+            || parent.child_by_field_name("value").map(|value| value.id()) != Some(func.id())
+        {
+            return None;
         }
+        let name = parent.child_by_field_name("name")?;
+        return (name.kind() == "identifier")
+            .then(|| node_text(source, name))
+            .filter(|name| !name.is_empty())
+            .map(|name| (name, parent));
     }
-    None
+    // Generator expressions/declarations are not emitted by the current
+    // definition query. Keep walking to their persisted enclosing owner.
+    if !matches!(func.kind(), "function_declaration" | "method_definition") {
+        return None;
+    }
+    let name = func.child_by_field_name("name")?;
+    let name = node_text(source, name);
+    (!name.is_empty()).then_some((name, func))
 }
 
 /// The name of the nearest enclosing `class` of `node`, if any (drives
@@ -20530,6 +20535,96 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "expected exactly one direct helper call: {calls:?}"
         );
         assert_eq!(calls[0].source_qualified_name, owner);
+    }
+
+    #[test]
+    fn js_ts_usage_owner_matches_persisted_named_callback_bindings() {
+        let source = r#"
+import { Effect } from "effect";
+export const make = Effect.gen(function* PreviewManagerMake() { return Boundary; });
+export const exposed = function Internal() { return Boundary; };
+export const task = Effect.fn("task")(function* InternalTask() { return Boundary; });
+function outer() { return wrap(function InternalCallback() { return Boundary; }); }
+function* UnsupportedDeclaration() { yield Boundary; }
+const unsupportedBinding = function* InternalGenerator() { yield Boundary; };
+module.exports = function ExportedInternal() { return Boundary; };
+"#;
+        for language in [Language::JavaScript, Language::TypeScript { tsx: false }] {
+            let r = extract(language, source.as_bytes(), "src/app.ts").unwrap();
+            let usages: Vec<_> = r
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.edge_type == "USAGE"
+                        && edge.properties.get("ref_name").and_then(|v| v.as_str())
+                            == Some("Boundary")
+                })
+                .collect();
+            assert_eq!(usages.len(), 7, "{language:?}: {usages:?}");
+            let expected = [
+                "Variable::make",
+                "Function::exposed",
+                "Function::task",
+                "Function::outer",
+            ];
+            for suffix in expected {
+                let qname = format!("src/app.ts::{suffix}");
+                assert!(
+                    usages
+                        .iter()
+                        .any(|edge| edge.source_qualified_name == qname),
+                    "{qname}: {usages:?}"
+                );
+                assert!(
+                    r.nodes.iter().any(|node| node.qualified_name == qname),
+                    "{qname}: {:?}",
+                    r.nodes
+                );
+            }
+            assert_eq!(
+                usages
+                    .iter()
+                    .filter(|edge| edge.source_qualified_name == "src/app.ts::__file__")
+                    .count(),
+                3
+            );
+            assert!(usages
+                .iter()
+                .all(|edge| edge.source_qualified_name == "src/app.ts::__file__"
+                    || r.nodes
+                        .iter()
+                        .any(|node| node.qualified_name == edge.source_qualified_name)));
+        }
+    }
+
+    #[test]
+    fn js_ts_usage_owner_call_attribution_keeps_binding_instead_of_internal_name() {
+        let r = ts(
+            r#"
+import { Effect } from "effect";
+export const make = Effect.gen(function* PreviewManagerMake() { return helper(); });
+const exposed = function Internal() { return helper(); };
+function outer() { return wrap(function InternalCallback() { return helper(); }); }
+"#,
+            "src/app.ts",
+        );
+        let calls: Vec<_> = r
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("helper")
+            })
+            .collect();
+        assert_eq!(calls.len(), 3);
+        for suffix in ["Variable::make", "Function::exposed", "Function::outer"] {
+            assert!(
+                calls
+                    .iter()
+                    .any(|edge| edge.source_qualified_name == format!("src/app.ts::{suffix}")),
+                "{calls:?}"
+            );
+        }
     }
 
     #[test]
