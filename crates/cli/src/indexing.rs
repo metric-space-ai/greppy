@@ -2109,7 +2109,9 @@ pub(crate) fn index_overlay_snapshot(
     }?;
     greppy_indexer::rebuild_overlay_edges(&mut store, project)?;
     crate::store_cow::mark_rust_caller_edges_repaired(&store)?;
-    if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+    if !greppy_indexer::rust_caller_edges_repaired(&store)?
+        || !greppy_indexer::js_ts_usages_repaired(&store)?
+    {
         if let Some(job) = progress.as_deref_mut() {
             job.finalization_phase("repairing_graph");
             maybe_index_test_failpoint("before-rust-repair", &temp_path)?;

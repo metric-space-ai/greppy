@@ -3207,7 +3207,45 @@ fn try_emit_js_ts_usage(
     effect_import: bool,
     result: &mut ExtractionResult,
 ) {
+    if !matches!(node.kind(), "identifier" | "type_identifier") {
+        return;
+    }
+    // JSX tag names are references, despite the grammar naming their field
+
+    // `name`. Handle them before call-ancestor suppression (render callbacks
+    // often sit inside map calls), and suppress closing/member/intrinsic tags.
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element" | "jsx_closing_element"
+        ) {
+            if let Some(tag) = parent.child_by_field_name("name") {
+                if node.start_byte() >= tag.start_byte() && node.end_byte() <= tag.end_byte() {
+                    let name = node_text(source, node);
+                    if parent.kind() != "jsx_closing_element"
+                        && tag.kind() == "identifier"
+                        && node.id() == tag.id()
+                        && name.chars().next().is_some_and(char::is_uppercase)
+                        && !js_ts_jsx_locally_bound(node, source, name)
+                    {
+                        result.edges.push(ExtractedEdge {
+                            edge_type: "USAGE".into(),
+                            source_qualified_name: js_ts_enclosing_qname(node, source, file_path, effect_import),
+                            target_qualified_name: format!("{file_path}::__ref__::{name}"),
+                            file_path: file_path.to_owned(),
+                            line: node.start_position().row as u32 + 1,
+                            properties: serde_json::json!({ "ref_name": name, "jsx_component": true }),
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+        ancestor = parent.parent();
+    }
     // JS/TS references are `identifier` / `type_identifier`.
+
     if !matches!(node.kind(), "identifier" | "type_identifier") {
         return;
     }
@@ -3238,7 +3276,134 @@ fn try_emit_js_ts_usage(
     });
 }
 
+/// Check active lexical scopes only. Lexical declarations bind throughout
+/// their scope (including the temporal dead zone); var binds throughout the
+/// enclosing function. Sibling blocks and nested functions cannot shadow it.
+fn js_ts_jsx_locally_bound(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut parent = node.parent();
+    while let Some(scope) = parent {
+        let function = JS_TS_FUNC_KINDS.contains(&scope.kind());
+        let lexical = matches!(
+            scope.kind(),
+            "statement_block"
+                | "switch_body"
+                | "catch_clause"
+                | "for_statement"
+                | "for_in_statement"
+        );
+        if function {
+            for field in ["parameters", "parameter"] {
+                if scope
+                    .child_by_field_name(field)
+                    .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                {
+                    return true;
+                }
+            }
+        }
+        if lexical || function {
+            let mut stack = vec![scope];
+            while let Some(binding) = stack.pop() {
+                let nested_function =
+                    binding.id() != scope.id() && JS_TS_FUNC_KINDS.contains(&binding.kind());
+                let nested_scope = binding.id() != scope.id()
+                    && matches!(
+                        binding.kind(),
+                        "statement_block"
+                            | "switch_body"
+                            | "catch_clause"
+                            | "for_statement"
+                            | "for_in_statement"
+                    );
+                let declaration = binding.kind() == "variable_declarator"
+                    && binding.parent().is_some_and(|p| {
+                        if function {
+                            p.kind() == "variable_declaration"
+                        } else {
+                            p.kind() == "lexical_declaration"
+                        }
+                    });
+                if declaration
+                    || (!function
+                        && matches!(binding.kind(), "function_declaration" | "class_declaration"))
+                {
+                    if binding
+                        .child_by_field_name("name")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                    {
+                        return true;
+                    }
+                }
+                if binding.kind() == "catch_clause" && binding.id() == scope.id() {
+                    if binding
+                        .child_by_field_name("parameter")
+                        .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
+                    {
+                        return true;
+                    }
+                }
+                // Function-level var discovery crosses blocks, but never
+                // crosses a nested function or class. Lexical discovery stops
+                // at every child scope; that scope is checked only if active.
+                if nested_function
+                    || matches!(binding.kind(), "class_declaration" | "class")
+                    || (!function && nested_scope)
+                {
+                    continue;
+                }
+                let mut cursor = binding.walk();
+                stack.extend(binding.named_children(&mut cursor));
+            }
+        }
+        parent = scope.parent();
+    }
+    false
+}
+
+fn js_ts_pattern_binds(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut patterns = vec![pattern];
+    while let Some(pattern) = patterns.pop() {
+        if matches!(
+            pattern.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && node_text(source, pattern) == name
+        {
+            return true;
+        }
+        if matches!(pattern.kind(), "required_parameter" | "optional_parameter") {
+            if let Some(binding) = pattern
+                .child_by_field_name("pattern")
+                .or_else(|| pattern.child_by_field_name("name"))
+            {
+                patterns.push(binding);
+                continue;
+            }
+        }
+        // Defaults and types reference values/types, rather than binding them.
+
+        if matches!(
+            pattern.kind(),
+            "type_annotation" | "call_expression" | "member_expression"
+        ) {
+            continue;
+        }
+        if matches!(
+            pattern.kind(),
+            "assignment_pattern" | "object_assignment_pattern"
+        ) {
+            if let Some(left) = pattern.child_by_field_name("left") {
+                patterns.push(left);
+            }
+            continue;
+        }
+        let mut cursor = pattern.walk();
+        patterns.extend(pattern.named_children(&mut cursor));
+    }
+    false
+}
+
 /// Whether any ancestor of `node` within 10 levels has a kind in `kinds`.
+
 fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
     let mut p = node.parent();
     let mut depth = 0;
@@ -19839,6 +20004,74 @@ class FileRepo implements Repo {
     fn ts(src: &str, path: &str) -> crate::extract::ExtractionResult {
         let lang = crate::language::language_for_path(std::path::Path::new(path));
         extract(lang, src.as_bytes(), path).unwrap()
+    }
+
+    #[test]
+    fn jsx_components_are_usages_without_intrinsic_member_or_shadow_guesses() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+export function Render() { return items.map(() => <Boundary><Boundary /></Boundary>); }
+export function Shadow(Boundary: unknown) { return <Boundary />; }
+export function Local() { const Boundary = custom; return <Boundary />; }
+export function Native() { return <div><svg:path /><UI.Boundary /></div>; }
+"#,
+            "view.tsx",
+        );
+        let usages: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .collect();
+        assert_eq!(
+            usages.len(),
+            2,
+            "opening and self-closing tags count once: {usages:?}"
+        );
+        assert!(usages
+            .iter()
+            .all(|edge| edge.properties["ref_name"] == "Boundary"
+                && edge.source_qualified_name == "view.tsx::Function::Render"));
+        assert!(!result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_type == "USAGE" && edge.properties["ref_name"] == "UI"));
+    }
+
+    #[test]
+    fn jsx_shadowing_follows_active_lexical_scopes_and_hoisting() {
+        let result = ts(
+            r#"
+import { Boundary } from './boundary';
+function NestedFunction() { function inner(Boundary: unknown) { return <Boundary />; } return <Boundary />; }
+function NestedBlock() { { const Boundary = local; } return <Boundary />; }
+function SiblingBlock() { { const Boundary = local; } { return <Boundary />; } }
+function LaterSibling() { const result = <Boundary />; { const Boundary = local; } return result; }
+function LaterLexical() { const result = <Boundary />; const Boundary = local; return result; }
+function TrueLocal() { const Boundary = local; return <Boundary />; }
+function ActiveBlock() { { const Boundary = local; return <Boundary />; } }
+function HoistedVar() { const result = <Boundary />; { var Boundary = local; } return result; }
+function Parameter(Boundary: unknown) { return <Boundary />; }
+"#,
+            "view.tsx",
+        );
+        let owners: std::collections::BTreeSet<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.properties["jsx_component"] == true)
+            .map(|edge| edge.source_qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            [
+                "view.tsx::Function::NestedFunction",
+                "view.tsx::Function::NestedBlock",
+                "view.tsx::Function::SiblingBlock",
+                "view.tsx::Function::LaterSibling"
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]

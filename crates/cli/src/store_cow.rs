@@ -913,8 +913,9 @@ pub(crate) fn complete_visible_overlay_rust_repair(
     }
     let effect_repaired =
         greppy_indexer::recover_visible_effect_fn_bindings(overlay, project, root)?;
+    let js_repaired = greppy_indexer::recover_persisted_js_ts_usages(overlay, project, root)?;
     if greppy_indexer::rust_caller_edges_repaired(overlay)? {
-        return Ok(effect_repaired);
+        return Ok(effect_repaired || js_repaired);
     }
     let raw_edges = overlay.list_raw_edges(project)?;
     if raw_edges.is_empty() {
@@ -1001,7 +1002,14 @@ pub(crate) fn ensure_persisted_single_store_repaired(
         let mut progress = crate::BackgroundJobGuard::from_env();
         progress.attach_foreground(crate::background_job_path(root));
         progress.finalization_phase("repairing_graph");
-        match greppy_indexer::rebuild_single_store_rust_edges(&mut store, project) {
+        let repair = (|| -> Result<()> {
+            greppy_indexer::recover_persisted_js_ts_usages(&mut store, project, root)?;
+            if !greppy_indexer::rust_caller_edges_repaired(&store)? {
+                greppy_indexer::rebuild_single_store_rust_edges(&mut store, project)?;
+            }
+            Ok(())
+        })();
+        match repair {
             Ok(_) => progress.complete(),
             Err(error) => {
                 progress.fail(&error);
@@ -1059,7 +1067,8 @@ fn refresh_persisted_graph_under_admission(path: &Path, root: &Path) -> Result<(
     let published = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
     if persisted_v7_delta_needs_repair(&published, root)? {
         return Err(Error::Index(
-            "admitted graph preparation did not publish the Rust compatibility repair".into(),
+            "admitted graph preparation did not publish the caller/usage compatibility repair"
+                .into(),
         ));
     }
     Ok(())
@@ -1093,7 +1102,8 @@ pub(crate) fn persisted_v7_delta_needs_repair(
             paths_resolve_equal(Path::new(&state.root_path), root)
                 && indexer_base == greppy_core::INDEXER_VERSION_BASE
         })
-        && marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE))
+        && (marker.as_deref() != Some(RUST_CALLER_EDGES_REPAIR_COMPLETE)
+            || !greppy_indexer::js_ts_usages_repaired(delta)?))
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
@@ -5135,6 +5145,78 @@ mod tests {
         )
         .unwrap());
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn completed_jsx_base_recovery_keeps_delta_visibility_and_has_independent_trigger() {
+        let repo = fixture();
+        std::fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "JSX source"]);
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let state;
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            state = base
+                .get_workspace_state(repo.path().to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        let visibility = VisibilityIndex::default();
+        let mut overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &visibility,
+        )
+        .unwrap();
+        overlay.upsert_workspace_state(&state).unwrap();
+        greppy_indexer::mark_rust_caller_edges_repaired(&overlay).unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');").unwrap();
+        assert!(persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        assert!(
+            greppy_indexer::recover_persisted_js_ts_usages(&mut overlay, "p", repo.path()).unwrap()
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert!(private_delta_paths(&overlay).unwrap().is_empty());
+        assert!(!persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        let target = overlay
+            .get_node_by_qname("p", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(target.id, Some("USAGE"), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(overlay);
+        let hidden = VisibilityIndex::new(Vec::<String>::new(), vec!["view.tsx".into()]).unwrap();
+        let overlay = greppy_store::Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &hidden,
+        )
+        .unwrap();
+        assert!(overlay
+            .list_raw_edges("p")
+            .unwrap()
+            .iter()
+            .all(|edge| edge.file_path != "view.tsx"));
+        assert!(overlay
+            .incoming_edges(target.id, Some("USAGE"), 100)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

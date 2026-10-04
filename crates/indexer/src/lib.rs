@@ -649,6 +649,7 @@ pub fn index_with_options_and_progress(
     if store.is_overlay() {
         recover_visible_effect_fn_bindings(store, project_name, &abs_root)?;
     }
+    recover_persisted_js_ts_usages(store, project_name, &abs_root)?;
     progress(IndexBuildProgress::new("finalizing_graph", 1, 1));
     Ok(report)
 }
@@ -2310,7 +2311,201 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v1";
+
+pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
+    store
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value='complete')",
+            [JS_TS_USAGE_REPAIR_KEY],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_err)
+}
+
+/// One-shot source-validated usage recovery, separately partitioned from Rust.
+/// Validate all visible source and definition identities before atomic publication.
+pub fn recover_persisted_js_ts_usages(
+    store: &mut Store,
+    project: &str,
+    root: &Path,
+) -> Result<bool> {
+    if js_ts_usages_repaired(store)? {
+        return Ok(false);
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| {
+        greppy_core::Error::Invalid(format!("JS/TS usage repair root unavailable: {e}"))
+    })?;
+    let states = store.list_file_states(project)?;
+    let indexed = store.list_nodes(project, "", "", 0, i64::MAX as usize)?;
+    let relevant = |path: &str| {
+        matches!(
+            greppy_parser::language_for_path(Path::new(path)),
+            Language::JavaScript | Language::TypeScript { .. }
+        )
+    };
+    if indexed.iter().any(|node| {
+        relevant(&node.file_path) && !states.iter().any(|state| state.rel_path == node.file_path)
+    }) {
+        return Err(greppy_core::Error::Invalid(
+            "JS/TS usage repair requires indexed source fingerprints".into(),
+        ));
+    }
+    let mut files = Vec::new();
+    let mut extracted = Vec::new();
+    for state in states.iter().filter(|state| relevant(&state.rel_path)) {
+        let relative = Path::new(&state.rel_path);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(greppy_core::Error::Invalid(
+                "unsafe JS/TS usage repair path".into(),
+            ));
+        }
+        let path = std::fs::canonicalize(root.join(relative)).map_err(|e| {
+            greppy_core::Error::Invalid(format!("JS/TS usage repair source unavailable: {e}"))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(greppy_core::Error::Invalid(
+                "JS/TS usage repair source escapes root".into(),
+            ));
+        }
+        let (bytes, _) = read_stable_file(&path).map_err(|e| {
+            greppy_core::Error::Invalid(format!("JS/TS usage repair source unreadable: {e}"))
+        })?;
+        if file_state::sha256_hex(&bytes) != state.sha256 {
+            return Err(greppy_core::Error::Invalid(format!(
+                "JS/TS usage repair source {} changed since indexing",
+                state.rel_path
+            )));
+        }
+        let language = greppy_parser::language_for_path(relative);
+        let extraction = parser_extract(language, &bytes, &state.rel_path)?;
+        let (extraction, dropped, error) =
+            validate_or_degrade(language, &state.rel_path, extraction);
+        if dropped != 0 || error.is_some() {
+            return Err(greppy_core::Error::Invalid(
+                "JS/TS usage repair extraction incomplete".into(),
+            ));
+        }
+        for node in &extraction.nodes {
+            let cached = store.get_node_by_qname(project, &node.qualified_name)?;
+            if cached.as_ref().is_none_or(|cached| {
+                cached.label != node.label
+                    || cached.start_line != i64::from(node.start_line)
+                    || cached.end_line != i64::from(node.end_line)
+            }) {
+                return Err(greppy_core::Error::Invalid(format!(
+                    "JS/TS usage repair definition unavailable: {}",
+                    node.qualified_name
+                )));
+            }
+        }
+        files.push(state.rel_path.clone());
+        extracted.extend(extraction.edges);
+    }
+    let mut index = GraphIndex::load(store, project)?;
+    for edge in extracted.iter().filter(|edge| edge.edge_type == "IMPORTS") {
+        if let Some(source) = index.by_qname(&edge.source_qualified_name) {
+            let file = source.file_path.clone();
+            let source_id = source.id;
+            index.record_import_items(edge, &file);
+            if let Some(name) = edge
+                .properties
+                .get("imported_name")
+                .and_then(|v| v.as_str())
+            {
+                let path = edge
+                    .properties
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(target) = index
+                    .resolve_import_target(&file, name, path, edge.properties.get("imported_items"))
+                    .filter(|target| *target != source_id)
+                {
+                    index.record_import(&file, target);
+                }
+            }
+        }
+    }
+    let mut resolved = Vec::new();
+
+    for edge in extracted.iter().filter(|edge| edge.edge_type == "USAGE") {
+        let Some(source) = index.by_qname(&edge.source_qualified_name) else {
+            return Err(greppy_core::Error::Invalid(
+                "JS/TS usage repair source identity unavailable".into(),
+            ));
+        };
+        if let Some(target) = index.resolve_usage_target(edge, source.id) {
+            resolved.push((
+                source.id,
+                target,
+                edge.source_qualified_name.clone(),
+                index.qname_for_id(target).unwrap().to_owned(),
+                edge.properties.clone(),
+            ));
+        }
+    }
+    let raw = extracted
+        .iter()
+        .filter(|edge| edge.edge_type == "USAGE")
+        .map(|edge| new_raw_edge_for(project, &edge.file_path, edge))
+        .collect::<Vec<_>>();
+    store
+        .conn()
+        .execute_batch("SAVEPOINT greppy_js_ts_usage_repair")
+        .map_err(sqlite_err)?;
+    let result = (|| -> Result<()> {
+        store.replace_validated_js_ts_usages(project, &files, &raw)?;
+        for file in &files {
+            if store.is_overlay() {
+                store.conn().execute("DELETE FROM main.overlay_edges WHERE project=?1 AND edge_type='USAGE' AND source_qualified_name IN (SELECT qualified_name FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
+            } else {
+                store.conn().execute("DELETE FROM main.edges WHERE project=?1 AND edge_type='USAGE' AND source_id IN (SELECT id FROM nodes WHERE project=?1 AND file_path=?2)", rusqlite::params![project,file]).map_err(sqlite_err)?;
+            }
+        }
+        for (source, target, source_name, target_name, mut properties) in resolved {
+            if store.is_overlay() {
+                properties["greppy_base_repair_v2"] = serde_json::json!(1);
+                store.insert_overlay_edges(&[NewOverlayEdge {
+                    project: project.into(),
+                    source_qualified_name: source_name,
+                    target_qualified_name: target_name,
+                    edge_type: "USAGE".into(),
+                    properties,
+                }])?;
+            } else {
+                store.conn().execute("INSERT INTO main.edges(project,source_id,target_id,edge_type,properties) VALUES(?1,?2,?3,'USAGE',?4) ON CONFLICT(source_id,target_id,edge_type) DO UPDATE SET properties=excluded.properties", rusqlite::params![project,source,target,properties.to_string()]).map_err(sqlite_err)?;
+            }
+        }
+        store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,'complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [JS_TS_USAGE_REPAIR_KEY]).map_err(sqlite_err)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            store
+                .conn()
+                .execute_batch("RELEASE greppy_js_ts_usage_repair")
+                .map_err(sqlite_err)?;
+            Ok(true)
+        }
+        Err(error) => {
+            store
+                .conn()
+                .execute_batch(
+                    "ROLLBACK TO greppy_js_ts_usage_repair; RELEASE greppy_js_ts_usage_repair",
+                )
+                .map_err(sqlite_err)?;
+            Err(error)
+        }
+    }
+}
+
 /// Repair Effect.fn identities in a private overlay without mutating its Base
+
 /// or copying Base file-state/content/vector ownership into Delta.
 pub fn recover_visible_effect_fn_bindings(
     store: &mut Store,
@@ -6960,6 +7155,169 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    #[test]
+    fn jsx_usage_migrates_completed_private_and_overlay_cache_without_identity_rewrite() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        fs::write(repo.path().join("retained.rs"), "pub fn retained() {}\n").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE'; DELETE FROM schema_meta WHERE key='greppy.js_ts_usage_repair_v1'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete');").unwrap();
+            mark_rust_caller_edges_repaired(&base).unwrap();
+        }
+        let base_bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.test','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_files.test','[\"retained.rs\"]'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.rust_usage_override_rows.test','[]');").unwrap();
+        let rust_metadata: String = overlay.conn().query_row("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |r| r.get(0)).unwrap();
+        for store in [&mut overlay] {
+            let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+            let states = format!("{:?}", store.list_file_states("test").unwrap());
+            let workspace = format!(
+                "{:?}",
+                store
+                    .get_workspace_state(repo.path().to_str().unwrap())
+                    .unwrap()
+            );
+            assert!(recover_persisted_js_ts_usages(store, "test", repo.path()).unwrap());
+            assert!(!recover_persisted_js_ts_usages(store, "test", repo.path()).unwrap());
+            assert_eq!(
+                nodes,
+                format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+            );
+            assert_eq!(
+                states,
+                format!("{:?}", store.list_file_states("test").unwrap())
+            );
+            assert_eq!(
+                workspace,
+                format!(
+                    "{:?}",
+                    store
+                        .get_workspace_state(repo.path().to_str().unwrap())
+                        .unwrap()
+                )
+            );
+            let target = store
+                .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .incoming_edges(target.id, Some("USAGE"), 100)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(store.list_delta_raw_edges("test").unwrap().is_empty());
+        }
+        assert_eq!(rust_metadata, overlay.conn().query_row::<String,_,_>("SELECT value FROM main.schema_meta WHERE key='greppy.rust_usage_override_files.test'", [], |r| r.get(0)).unwrap());
+        assert_eq!(base_bytes, fs::read(&base_path).unwrap());
+        let mut private = Store::open(&base_path).unwrap();
+        let nodes = format!("{:?}", private.list_nodes("test", "", "", 0, 1000).unwrap());
+        assert!(recover_persisted_js_ts_usages(&mut private, "test", repo.path()).unwrap());
+        assert_eq!(
+            nodes,
+            format!("{:?}", private.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        let target = private
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            private
+                .incoming_edges(target.id, Some("USAGE"), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn jsx_usage_recovery_refuses_changed_and_deleted_source_before_writing() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = "export function Render() { return <Boundary />; }\n";
+        fs::write(repo.path().join("view.tsx"), source).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&scratch.path().join("graph.db")).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        let raw = store.list_raw_edges("test").unwrap();
+        fs::write(
+            repo.path().join("view.tsx"),
+            "export function Render() { return <Changed />; }\n",
+        )
+        .unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
+        assert_eq!(raw, store.list_raw_edges("test").unwrap());
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+        fs::remove_file(repo.path().join("view.tsx")).unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
+        assert_eq!(raw, store.list_raw_edges("test").unwrap());
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+        fs::write(repo.path().join("view.tsx"), source).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_js_marker BEFORE INSERT ON main.schema_meta WHEN NEW.key='greppy.js_ts_usage_repair_v1' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END;").unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
+        assert_eq!(raw, store.list_raw_edges("test").unwrap());
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+    }
+
+    #[test]
+    fn jsx_imported_component_usage_resolves_to_exact_definition() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("other.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return (<Boundary>\n<Boundary />\n</Boundary>); }\nexport function Shadow(Boundary: unknown) { return <Boundary />; }\n").unwrap();
+        let stores = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&stores.path().join("graph.db")).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let target = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let other = store
+            .get_node_by_qname("test", "other.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let render = store
+            .get_node_by_qname("test", "view.tsx::Function::Render")
+            .unwrap()
+            .unwrap();
+        let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert!(incoming.iter().all(|edge| edge.source_id == render.id));
+        assert!(store
+            .incoming_edges(other.id, Some("USAGE"), 100)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

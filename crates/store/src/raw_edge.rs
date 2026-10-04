@@ -118,7 +118,7 @@ impl Store {
         files: &[String],
         edges: &[NewRawEdge],
     ) -> Result<usize> {
-        self.replace_validated_rust_edge_kind(project, files, edges, "USAGE")
+        self.replace_validated_reference_edge_kind(project, files, edges, "USAGE", "rust")
     }
 
     /// Refresh caller facts without claiming ownership of immutable Base files.
@@ -128,15 +128,26 @@ impl Store {
         files: &[String],
         edges: &[NewRawEdge],
     ) -> Result<usize> {
-        self.replace_validated_rust_edge_kind(project, files, edges, "CALLS")
+        self.replace_validated_reference_edge_kind(project, files, edges, "CALLS", "rust")
     }
 
-    fn replace_validated_rust_edge_kind(
+    /// Replace source-validated JS/TS usages without taking Base file ownership.
+    pub fn replace_validated_js_ts_usages(
+        &mut self,
+        project: &str,
+        files: &[String],
+        edges: &[NewRawEdge],
+    ) -> Result<usize> {
+        self.replace_validated_reference_edge_kind(project, files, edges, "USAGE", "js_ts")
+    }
+
+    fn replace_validated_reference_edge_kind(
         &mut self,
         project: &str,
         files: &[String],
         edges: &[NewRawEdge],
         kind: &str,
+        namespace: &str,
     ) -> Result<usize> {
         if edges.iter().any(|edge| {
             edge.edge_type != kind || edge.project != project || !files.contains(&edge.file_path)
@@ -148,7 +159,7 @@ impl Store {
         let overlay = self.is_overlay();
         let old = self.list_raw_edges(project)?;
         let prefix = if kind == "CALLS" { "caller" } else { "usage" };
-        let key = format!("greppy.rust_{prefix}_override_files.{project}");
+        let key = format!("greppy.{namespace}_{prefix}_override_files.{project}");
         let signature = |file: &str, source: &str, target: &str, properties: &serde_json::Value| {
             (
                 file.to_owned(),
@@ -230,7 +241,7 @@ impl Store {
                 "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![
-                    format!("greppy.rust_{prefix}_override_rows.{project}"),
+                    format!("greppy.{namespace}_{prefix}_override_rows.{project}"),
                     serde_json::to_string(&base_replacements)?
                 ],
             )?;
