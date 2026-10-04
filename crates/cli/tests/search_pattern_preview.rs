@@ -314,6 +314,12 @@ fn explicit_text_pattern_limit_overrides_large_result_preview() {
         assert_eq!(headers.first().unwrap(), "page.rs:1");
         assert_eq!(headers.last().unwrap(), "page.rs:28");
         let text = String::from_utf8(first.stdout).unwrap();
+        assert!(text.contains("32 matches in 1 files; showing 28"), "{text}");
+        let mut budgeted = args.clone();
+        budgeted.extend(["--max-bytes", "4096"]);
+        let buffered = fixture.run(&budgeted);
+        assert_eq!(page_headers(&buffered), headers);
+        let text = String::from_utf8(buffered.stdout).unwrap();
         assert!(
             text.contains("shown: 28\ntotal: 32\noffset: 0\ntruncated: true"),
             "{text}"
