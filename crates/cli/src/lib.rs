@@ -5120,7 +5120,9 @@ impl BackgroundJobGuard {
                 start_background_demand_monitor(
                     path,
                     demand_terminal.clone(),
-                    std::process::id(),
+                    // Admission wrappers publish their own PID as the job owner.
+                    // Fence cancellation against that same identity, not this child.
+                    owner_pid,
                     target_generation,
                 );
             }
