@@ -4525,6 +4525,8 @@ fn rust_expression_macro_calls(
                         name.to_string(),
                         0usize,
                         node,
+                        std::collections::HashSet::<String>::new(),
+                        std::collections::HashSet::<String>::new(),
                     ));
                 }
             }
@@ -4533,7 +4535,9 @@ fn rust_expression_macro_calls(
     }
     let mut edges = Vec::new();
     let mut budget = source.len().saturating_mul(16);
-    while let Some((body, row, caller, macro_name, depth, context)) = pending.pop() {
+    while let Some((body, row, caller, macro_name, depth, context, visible_values, visible_types)) =
+        pending.pop()
+    {
         if depth >= 16 || body.len() > budget {
             return Err(greppy_core::Error::Parse(
                 "Rust expression-macro call extraction exceeded its bounded nesting budget".into(),
@@ -4579,15 +4583,18 @@ fn rust_expression_macro_calls(
                     });
                     if !receiver {
                         if let Some(path) = rust_scoped_call_path(&wrapped, node) {
-                            if rust_usage_has_local_type_binding(
-                                source,
-                                context,
-                                path.split("::").next().unwrap_or(""),
-                            ) {
+                            let owner = path.split("::").next().unwrap_or("");
+                            if visible_types.contains(owner)
+                                || rust_usage_has_local_type_binding(source, context, owner)
+                                || rust_usage_has_local_type_binding(&wrapped, node, owner)
+                            {
                                 properties["rust_local_type_owner"] = serde_json::json!(true);
                             }
                             properties["callee_path"] = serde_json::json!(path);
-                        } else if rust_usage_has_local_value_binding(source, context, name) {
+                        } else if visible_values.contains(name)
+                            || rust_usage_has_local_value_binding(source, context, name)
+                            || rust_usage_has_local_value_binding(&wrapped, node, name)
+                        {
                             continue;
                         }
                     }
@@ -4616,6 +4623,27 @@ fn rust_expression_macro_calls(
                 ) {
                     let name = node_text(&wrapped, name);
                     if admitted(name) && tokens.end_byte() > tokens.start_byte() + 1 {
+                        // A queued child loses this parse tree. Preserve only
+                        // bindings that are visible at the nested macro site,
+                        // using candidate names from its token tree.
+                        let mut values = visible_values.clone();
+                        let mut types = visible_types.clone();
+                        let mut candidates = vec![tokens];
+                        let mut names = std::collections::HashSet::new();
+                        while let Some(candidate) = candidates.pop() {
+                            if matches!(candidate.kind(), "identifier" | "type_identifier") {
+                                names.insert(node_text(&wrapped, candidate));
+                            }
+                            candidates.extend(candidate.named_children(&mut candidate.walk()));
+                        }
+                        for candidate in names {
+                            if rust_usage_has_local_value_binding(&wrapped, node, candidate) {
+                                values.insert(candidate.to_string());
+                            }
+                            if rust_usage_has_local_type_binding(&wrapped, node, candidate) {
+                                types.insert(candidate.to_string());
+                            }
+                        }
                         pending.push((
                             wrapped[tokens.start_byte() + 1..tokens.end_byte() - 1].to_vec(),
                             row + tokens.start_position().row,
@@ -4623,6 +4651,8 @@ fn rust_expression_macro_calls(
                             name.to_string(),
                             depth + 1,
                             context,
+                            values,
+                            types,
                         ));
                     }
                 }
@@ -17907,6 +17937,28 @@ async fn caller() {
                 .any(|e| e.properties["callee_name"] == "is_empty"),
             "receiver provenance is unavailable in a synthetic macro context"
         );
+    }
+
+    #[test]
+    fn rust_expression_macros_do_not_call_global_namesakes_of_inner_bindings() {
+        let source = r#"
+fn callback() -> bool { true }
+fn caller() {
+    assert!({ let callback = || true; callback() });
+    assert!({ let callback = || true; ensure!(callback()); true });
+    assert!({ type T = Local; ensure!(T::run()); true });
+}
+"#;
+        let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+        assert!(!result
+            .edges
+            .iter()
+            .any(|e| e.edge_type == "CALLS" && e.properties["callee_name"] == "callback"));
+        assert!(result
+            .edges
+            .iter()
+            .any(|e| e.properties["callee_path"] == "T::run"
+                && e.properties["rust_local_type_owner"] == true));
     }
 
     #[test]
