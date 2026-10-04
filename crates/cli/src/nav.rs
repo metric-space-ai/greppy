@@ -3838,12 +3838,41 @@ pub(crate) fn dispatch_who_calls(
 pub(crate) const RUST_MACRO_CALL_COVERAGE_NOTE: &str =
     "Rust macro argument tokens (including assert_eq!) are not inspected for calls; inspect the caller source";
 
-pub(crate) fn has_rust_call_sources(store: &greppy_store::Store, ids: &[i64]) -> Result<bool> {
+pub(crate) fn has_rust_macro_call_candidates(
+    store: &greppy_store::Store,
+    root: &std::path::Path,
+    ids: &[i64],
+) -> Result<bool> {
+    use sha2::Digest;
     for id in ids {
-        if store
-            .get_node(*id)?
-            .is_some_and(|node| node.file_path.ends_with(".rs"))
-        {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if !node.file_path.ends_with(".rs") {
+            continue;
+        }
+        let absolute = root.join(&node.file_path);
+        let content = std::fs::read(&absolute).map_err(|error| {
+            Error::io(
+                format!("read macro coverage source {}", node.file_path),
+                error,
+            )
+        })?;
+        let state = store.get_file_state(&node.project, &node.file_path)?;
+        let hash = format!("{:x}", sha2::Sha256::digest(&content));
+        if state.is_none_or(|state| state.sha256 != hash) {
+            return Err(Error::Workspace(format!(
+                "callee macro coverage source {} changed since indexing; run greppy index . or inspect current bytes with greppy read-file {}",
+                node.file_path, node.file_path
+            )));
+        }
+        if greppy_parser::extract::rust_definition_has_macro_call_candidates(
+            &content,
+            &node.file_path,
+            &node.qualified_name,
+            node.start_line.max(1) as u32,
+            node.end_line.max(node.start_line).max(1) as u32,
+        )? {
             return Ok(true);
         }
     }
@@ -3940,7 +3969,8 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
-    let rust_macro_limit = has_rust_call_sources(&store, &sources)?;
+    let rust_macro_limit =
+        !json && has_rust_macro_call_candidates(&store, &resolve_root(root)?, &sources)?;
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep

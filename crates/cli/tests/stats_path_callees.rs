@@ -302,8 +302,7 @@ fn callees_reports_no_indexed_callees_for_leaf() {
     assert_eq!(code, 0);
     assert_eq!(
         out,
-        "Rust macro argument tokens (including assert_eq!) are not inspected for calls; inspect the caller source\n\
-no resolved indexed callees; external or unresolved calls may still exist\n\
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
 inspect source with: greppy read leaf\n",
         "an empty result must state the indexed scope and offer source inspection"
     );
@@ -324,8 +323,7 @@ fn callees_does_not_claim_external_calls_are_absent() {
     assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
     assert_eq!(
         out,
-        "Rust macro argument tokens (including assert_eq!) are not inspected for calls; inspect the caller source\n\
-no resolved indexed callees; external or unresolved calls may still exist\n\
+        "no resolved indexed callees; external or unresolved calls may still exist\n\
 inspect source with: greppy read leaf\n",
         "the unindexed standard-library call must not become a definitive no-calls claim"
     );
@@ -343,8 +341,7 @@ fn callees_reports_when_path_filter_excludes_known_call() {
     assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
     assert_eq!(
         out,
-        "Rust macro argument tokens (including assert_eq!) are not inspected for calls; inspect the caller source\n\
-no resolved indexed callees under path filter: src/leaf.rs\n\
+        "no resolved indexed callees under path filter: src/leaf.rs\n\
 external, unresolved or filtered calls may still exist; inspect source with: greppy read entry\n",
         "filtering out a known call must preserve the filter and uncertainty in the answer"
     );
@@ -386,11 +383,20 @@ fn callees_exposes_rust_macro_token_limit_in_single_and_batch_answers() {
         assert_eq!(code, 0, "callees failed; stderr={err}\nstdout={out}");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         let limits = value["call_extraction_limits"].as_array().unwrap();
+        assert_eq!(limits.len(), 1, "the direct-call target has no macro gap");
         assert!(limits.iter().any(|limit| {
             limit["reason"] == "rust_macro_argument_tokens"
                 && limit["next"] == "greppy read assertion"
         }));
     }
+    let (code, out, err) = run(&["callees", "direct"], &repo, &store);
+    assert_eq!(code, 0, "direct callees failed; stderr={err}\nstdout={out}");
+    assert!(out.contains("helper"));
+    assert!(!out.contains("Rust macro argument tokens"));
+    let (code, out, err) = run(&["callees", "direct", "--json"], &repo, &store);
+    assert_eq!(code, 0, "direct JSON failed; stderr={err}\nstdout={out}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(value.get("call_extraction_limits").is_none());
 }
 
 #[test]

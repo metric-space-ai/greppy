@@ -3613,7 +3613,7 @@ fn nav_counts_json_with_expand(
     });
     if command == "callees" && symbol_found {
         let ids = resolve_symbol_nodes(store, Some(symbol))?;
-        if crate::nav::has_rust_call_sources(store, &ids)? {
+        if crate::nav::has_rust_macro_call_candidates(store, &resolve_root(root)?, &ids)? {
             v["call_extraction_limits"] = serde_json::json!([{
                 "target": symbol,
                 "reason": "rust_macro_argument_tokens",
@@ -7633,7 +7633,7 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         .iter()
         .map(|ids| {
             if req.kind == NavKind::Callees {
-                crate::nav::has_rust_call_sources(&store, ids)
+                crate::nav::has_rust_macro_call_candidates(&store, &resolve_root(req.root)?, ids)
             } else {
                 Ok(false)
             }

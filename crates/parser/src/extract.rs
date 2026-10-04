@@ -744,6 +744,57 @@ fn rust_attribute_is_inert(name: &str) -> bool {
     )
 }
 
+/// Detect call-shaped tokens inside opaque macro arguments in one authored
+/// callable span. This supplies a coverage warning, never executable CALLS or
+/// proof of builtin identity. Strings/comments and nested callable bodies do
+/// not make the selected caller incomplete.
+pub fn rust_definition_has_macro_call_candidates(
+    source: &[u8],
+    file_path: &str,
+    qualified_name: &str,
+    start_line: u32,
+    end_line: u32,
+) -> greppy_core::Result<bool> {
+    fn tokens_have_candidate(source: &[u8], node: Node<'_>) -> bool {
+        for index in 0..node.child_count() {
+            let Some(child) = node.child(index) else {
+                continue;
+            };
+            if child.kind() == "token_tree" {
+                if node_text(source, child).starts_with('(')
+                    && index > 0
+                    && node.child(index - 1).is_some_and(|previous| {
+                        matches!(previous.kind(), "identifier" | "scoped_identifier")
+                    })
+                {
+                    return true;
+                }
+                if tokens_have_candidate(source, child) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let tree = crate::parse(Language::Rust, source)?;
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let line = node.start_position().row as u32 + 1;
+        if node.kind() == "macro_invocation"
+            && (start_line..=end_line).contains(&line)
+            && enclosing_function_qname(source, node, file_path).as_deref() == Some(qualified_name)
+            && (0..node.named_child_count())
+                .filter_map(|index| node.named_child(index))
+                .filter(|child| child.kind() == "token_tree")
+                .any(|tokens| tokens_have_candidate(source, tokens))
+        {
+            return Ok(true);
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+    }
+    Ok(false)
+}
+
 fn rust_macro_is_expression_only(name: &str) -> bool {
     // Only a bare name can match the expression-macro list. `helper::assert`
     // and `my_crate::println` are not the prelude macros.
@@ -16758,6 +16809,43 @@ mod tests {
             }
         }
     "#;
+
+    #[test]
+    fn rust_macro_coverage_is_targeted_to_call_shaped_tokens() {
+        for (source, expected) in [
+            ("fn caller() { helper(); }", false),
+            ("fn caller() { assert_eq!(1, 1); }", false),
+            (
+                r#"fn caller() { let _ = "assert_eq!(helper(), 1)"; }"#,
+                false,
+            ),
+            ("fn caller() { /* assert_eq!(helper(), 1); */ }", false),
+            (
+                "fn caller() { fn child() { assert_eq!(helper(), 1); } }",
+                false,
+            ),
+            (
+                "fn caller() { helper(); } fn other() { custom!(helper()); }",
+                false,
+            ),
+            ("fn caller() { assert_eq!(helper(), 1); }", true),
+            ("fn caller() { custom!(helper()); }", true),
+            ("fn caller() { custom!(other::helper()); }", true),
+        ] {
+            assert_eq!(
+                super::rust_definition_has_macro_call_candidates(
+                    source.as_bytes(),
+                    "src/lib.rs",
+                    "src/lib.rs::Function::caller",
+                    1,
+                    u32::MAX,
+                )
+                .unwrap(),
+                expected,
+                "only actual selected-caller macro call-shaped tokens warrant recovery: {source}"
+            );
+        }
+    }
 
     // Characterize the current syntax boundary rather than treating macro
     // tokens as executable expressions. A future expansion-aware repair must
