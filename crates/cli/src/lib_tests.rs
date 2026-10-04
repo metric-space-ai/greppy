@@ -3683,7 +3683,10 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(child.try_wait().unwrap().is_none());
-    assert_eq!(read_background_job(&job_path).unwrap()["state"], "refreshing");
+    assert_eq!(
+        read_background_job(&job_path).unwrap()["state"],
+        "refreshing"
+    );
     drop(demand);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
