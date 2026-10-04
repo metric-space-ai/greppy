@@ -4459,7 +4459,8 @@ fn rust_expression_macro_shadowed_bindings(
         if node.kind() == "extern_crate_declaration" {
             // An extern-prelude dependency does not prove the identity of an
             // explicitly rebound crate namespace (including macro_use crates).
-            if let Some(name) = node.child_by_field_name("alias")
+            if let Some(name) = node
+                .child_by_field_name("alias")
                 .or_else(|| node.child_by_field_name("name"))
             {
                 shadowed.insert(node_text(source, name).to_string());
