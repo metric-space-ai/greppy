@@ -5184,7 +5184,14 @@ mod tests {
         )
         .unwrap();
         overlay.upsert_workspace_state(&state).unwrap();
+        // Establish the independent Rust certificates through real resolution.
+        // JSX recovery must then clear its own pending state without relying
+        // on a synthetic Rust marker or completing unrelated repair work.
+        greppy_indexer::recover_persisted_rust_usages(&mut overlay, "p", repo.path()).unwrap();
+        greppy_indexer::rebuild_visible_overlay_edges(&mut overlay, "p").unwrap();
         greppy_indexer::mark_rust_caller_edges_repaired(&overlay).unwrap();
+        assert!(greppy_indexer::anyhow_factory_edges_repaired(&overlay).unwrap());
+        assert!(!greppy_indexer::js_ts_usages_repaired(&overlay).unwrap());
         overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');").unwrap();
         assert!(persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
         assert!(
