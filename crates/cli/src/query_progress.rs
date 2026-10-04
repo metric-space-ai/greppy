@@ -235,7 +235,7 @@ impl ProgressReporter {
                 .as_deref()
                 .unwrap_or("greppy index status --json");
             return Some(format!(
-                "greppy: {command} is pending; no detailed progress is available; inspect `{diagnostics}` for index ownership and publication state; this message does not confirm a live index job"
+                "greppy: {command} is still running; no live index progress is reported; this does not mean indexing is required; diagnostics: `{diagnostics}`"
             ));
         };
 
@@ -721,9 +721,10 @@ mod tests {
         };
         let message = reporter.observe("search", None, Duration::ZERO).unwrap();
         assert!(message.contains(diagnostics), "{message}");
-        assert!(message.contains("is pending"), "{message}");
+        assert!(message.contains("is still running"), "{message}");
+        assert!(!message.contains("is pending"), "{message}");
         assert!(
-            message.contains("does not confirm a live index job"),
+            message.contains("does not mean indexing is required"),
             "{message}"
         );
         assert!(reporter
