@@ -3323,24 +3323,22 @@ fn js_ts_jsx_locally_bound(node: Node<'_>, source: &[u8], name: &str) -> bool {
                             p.kind() == "lexical_declaration"
                         }
                     });
-                if declaration
+                if (declaration
                     || (!function
-                        && matches!(binding.kind(), "function_declaration" | "class_declaration"))
-                {
-                    if binding
+                        && matches!(binding.kind(), "function_declaration" | "class_declaration")))
+                    && binding
                         .child_by_field_name("name")
                         .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
-                    {
-                        return true;
-                    }
+                {
+                    return true;
                 }
-                if binding.kind() == "catch_clause" && binding.id() == scope.id() {
-                    if binding
+                if binding.kind() == "catch_clause"
+                    && binding.id() == scope.id()
+                    && binding
                         .child_by_field_name("parameter")
                         .is_some_and(|pattern| js_ts_pattern_binds(pattern, source, name))
-                    {
-                        return true;
-                    }
+                {
+                    return true;
                 }
                 // Function-level var discovery crosses blocks, but never
                 // crosses a nested function or class. Lexical discovery stops
@@ -3403,7 +3401,6 @@ fn js_ts_pattern_binds(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
 }
 
 /// Whether any ancestor of `node` within 10 levels has a kind in `kinds`.
-
 fn js_ts_ancestor_in(node: Node<'_>, kinds: &[&str]) -> bool {
     let mut p = node.parent();
     let mut depth = 0;
