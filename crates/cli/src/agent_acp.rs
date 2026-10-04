@@ -205,7 +205,10 @@ impl Server {
     where
         W: Write + Send + 'static,
     {
-        let data_root = config.data_root.clone().unwrap_or_else(greppy_core::cache::data_root);
+        let data_root = config
+            .data_root
+            .clone()
+            .unwrap_or_else(greppy_core::cache::data_root);
         Self {
             data_root,
             out: Out {
@@ -1017,26 +1020,34 @@ fn persist_turn(
 ) -> Result<(), String> {
     let store = SessionStore::new(prepared.data_root.clone(), prepared.project.clone());
     let title = prepared.history.is_empty().then(|| {
-        done.messages.iter().flat_map(|message| message.content.iter()).find_map(|part| match part {
-            greppy_agent::ContentPart::Text { text } => Some(truncate_chars(text, 80)),
-            _ => None,
-        }).unwrap_or_else(|| "untitled".to_string())
+        done.messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|part| match part {
+                greppy_agent::ContentPart::Text { text } => Some(truncate_chars(text, 80)),
+                _ => None,
+            })
+            .unwrap_or_else(|| "untitled".to_string())
     });
-    store.commit_turn(
-        &prepared.session_id,
-        &messages_from_protocol(&prepared.history),
-        &messages_from_protocol(&done.messages),
-        &done.usage,
-        done.stop_reason,
-        title.as_deref(),
-        || {
-            #[cfg(test)]
-            if let Some(hook) = &_config.after_messages {
-                hook()?;
-            }
-            Ok(())
-        },
-    ).map_err(|error| format!("cannot persist session history: {error}"))
+    store
+        .commit_turn(
+            &prepared.session_id,
+            crate::agent_tui::TurnCommit {
+                expected: &messages_from_protocol(&prepared.history),
+                messages: &messages_from_protocol(&done.messages),
+                usage: &done.usage,
+                stop: done.stop_reason,
+                title: title.as_deref(),
+            },
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &_config.after_messages {
+                    hook()?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("cannot persist session history: {error}"))
 }
 
 fn finish_prompt(

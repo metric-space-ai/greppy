@@ -77,6 +77,14 @@ pub struct SessionStore {
     project: String,
 }
 
+pub(crate) struct TurnCommit<'a> {
+    pub expected: &'a [PersistedMessage],
+    pub messages: &'a [PersistedMessage],
+    pub usage: &'a Usage,
+    pub stop: &'a str,
+    pub title: Option<&'a str>,
+}
+
 impl SessionStore {
     pub fn new(data_root: impl Into<PathBuf>, project: impl Into<String>) -> Self {
         Self {
@@ -170,13 +178,16 @@ impl SessionStore {
     pub(crate) fn commit_turn(
         &self,
         session_id: &str,
-        expected: &[PersistedMessage],
-        messages: &[PersistedMessage],
-        usage: &Usage,
-        stop: &str,
-        title: Option<&str>,
+        turn: TurnCommit<'_>,
         after_messages: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        let TurnCommit {
+            expected,
+            messages,
+            usage,
+            stop,
+            title,
+        } = turn;
         let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
         if previous.recovered {
