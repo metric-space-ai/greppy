@@ -76,6 +76,7 @@ use `greppy -e -p …` (or place `-p` later in the invocation).
 
 Usage:
   greppy agent [\"INITIAL TASK\"]
+  greppy agent stdio [--model M] [--endpoint URL]
   greppy -p \"TASK\" [--model M] [--endpoint URL] [--max-turns N]
                    [--deadline-secs N] [--apply] [--diff] [--keep-worktree]
                    [--no-sandbox] [--skip-selfcheck]
@@ -266,13 +267,7 @@ struct ServeArgs {
 /// `GREPPY_PROJECT_IDENTITY` so worktree cache names cannot leak in.
 pub fn agent_session_store_identity(repo_root: &Path) -> (PathBuf, String) {
     let data_root = greppy_core::cache::data_root();
-    let saved = std::env::var_os(greppy_core::PROJECT_IDENTITY_ENV);
-    std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV);
-    let logical_project = greppy_core::project_identity(repo_root);
-    match saved {
-        Some(value) => std::env::set_var(greppy_core::PROJECT_IDENTITY_ENV, value),
-        None => std::env::remove_var(greppy_core::PROJECT_IDENTITY_ENV),
-    }
+    let logical_project = greppy_core::workspace::project_identity_from_workspace(repo_root);
     (data_root, logical_project)
 }
 
@@ -296,6 +291,9 @@ pub fn run_agent_p(argv: &[std::ffi::OsString]) -> u8 {
 /// Parse and run `greppy agent …` in the full-screen interactive UI.
 pub fn run_agent_tui(argv: &[std::ffi::OsString]) -> u8 {
     let rest = super::grep_passthrough_args(argv);
+    if rest.get(1).is_some_and(|token| token == "stdio") {
+        return crate::agent_acp::run(rest);
+    }
     if rest.get(1).is_some_and(|token| token == "serve") {
         return run_agent_serve_invocation(rest);
     }

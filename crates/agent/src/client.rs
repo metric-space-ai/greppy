@@ -5,13 +5,19 @@
 //! assistant [`Message`] plus stop reason and usage.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::protocol::{ContentPart, Message, ModelRequest, Role, StopReason, StreamEvent, Usage};
 use crate::wire::{to_messages_request_body, SseItem, SseParser};
+
+#[cfg(test)]
+#[path = "client_cancel_tests.rs"]
+mod cancel_tests;
 
 /// Default hard cap on total SSE body bytes (64 MiB).
 pub const DEFAULT_STREAM_BYTE_CAP: usize = 64 * 1024 * 1024;
@@ -39,6 +45,8 @@ pub enum ClientError {
     Stream(String),
     /// Could not assemble a coherent assistant message from the stream.
     Incomplete(String),
+    /// The caller cancelled the request, including a blocked HTTP read.
+    Cancelled,
 }
 
 impl std::fmt::Display for ClientError {
@@ -50,6 +58,7 @@ impl std::fmt::Display for ClientError {
             }
             ClientError::Stream(m) => write!(f, "stream error: {m}"),
             ClientError::Incomplete(m) => write!(f, "incomplete turn: {m}"),
+            ClientError::Cancelled => write!(f, "turn cancelled"),
         }
     }
 }
@@ -257,6 +266,60 @@ impl Client {
         self.consume_sse(&mut reader, on_event)
     }
 
+    /// Stream a turn with cancellation during connect, headers, and body reads.
+    /// Dropping the request-local async transport closes the active response;
+    /// no detached blocking reader or model worker remains after cancellation.
+    pub fn stream_turn_interruptible(
+        &self,
+        req: &ModelRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+        cancel: &AtomicBool,
+    ) -> Result<TurnResult, ClientError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ClientError::Cancelled);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let _runtime_guard = runtime.enter();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let body = serde_json::to_string(&to_messages_request_body(req))
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let mut request = client
+            .post(self.messages_url())
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .body(body);
+        if let Some(key) = &self.api_key {
+            request = request.header("x-api-key", key).bearer_auth(key);
+        }
+        let response = interruptible_wait(&runtime, cancel, request.send())?
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = interruptible_wait(&runtime, cancel, response.text())?.unwrap_or_default();
+            return Err(ClientError::Http { status, body });
+        }
+        let mut reader = InterruptibleReader {
+            runtime: &runtime,
+            cancel,
+            response,
+            pending: Vec::new(),
+            offset: 0,
+        };
+        let result = self.consume_sse(&mut reader, on_event);
+        if cancel.load(Ordering::Relaxed) {
+            Err(ClientError::Cancelled)
+        } else {
+            result
+        }
+    }
+
     /// Parse an SSE body from any `Read` (production HTTP body or test fixture).
     ///
     /// Buffers raw bytes, splits on `\n`, UTF-8-decodes only complete lines
@@ -339,6 +402,61 @@ impl Client {
         }
 
         assembler.finish()
+    }
+}
+
+fn interruptible_wait<T>(
+    runtime: &tokio::runtime::Runtime,
+    cancel: &AtomicBool,
+    future: impl Future<Output = T>,
+) -> Result<T, ClientError> {
+    runtime.block_on(async {
+        tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    if cancel.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            } => Err(ClientError::Cancelled),
+            result = future => Ok(result),
+        }
+    })
+}
+
+struct InterruptibleReader<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    cancel: &'a AtomicBool,
+    response: reqwest::Response,
+    pending: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for InterruptibleReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "turn cancelled",
+            ));
+        }
+        while self.offset == self.pending.len() {
+            let chunk = interruptible_wait(self.runtime, self.cancel, self.response.chunk())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error))?
+                .map_err(std::io::Error::other)?;
+            let Some(chunk) = chunk else {
+                return Ok(0);
+            };
+            self.pending = chunk.to_vec();
+            self.offset = 0;
+        }
+        let count = buffer.len().min(self.pending.len() - self.offset);
+        buffer[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
     }
 }
 
