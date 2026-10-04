@@ -2153,7 +2153,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v14";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v15";
 const ANYHOW_FACTORY_REPAIR_KEY: &str = "greppy.rust_anyhow_factory_repair.v1";
 
 /// Bind known anyhow semantics to authored Cargo dependency identity, never to
@@ -9191,6 +9191,70 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
         fs::write(tmp.join("src/lib.rs"), lib_rs).unwrap();
         fs::write(tmp.join("src/helper.rs"), helper_rs).unwrap();
         tmp
+    }
+
+    #[test]
+    fn rust_expression_macro_generic_cfg_call_is_resolved_and_repaired() {
+        let repo = setup_multifile_repo(
+            "rust-expression-macro-call",
+            "mod channel;\n",
+            "// placeholder\n",
+        );
+        fs::create_dir_all(repo.join("src/channel")).unwrap();
+        fs::write(
+            repo.join("src/channel/mod.rs"),
+            "mod implementation; mod tests; pub use implementation::run_guest_desktop_effects;\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/channel/implementation.rs"),
+            "pub async fn run_guest_desktop_effects<T>(driver: &T) -> bool { true }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/channel/tests.rs"), "use super::*;\n#[cfg(target_os = \"linux\")]\nasync fn caller() { ensure!(run_guest_desktop_effects(&driver).await == Err(Unavailable), \"no endpoint\"); }\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let target = store
+            .get_node_by_qname(
+                "test",
+                "src/channel/implementation.rs::Function::run_guest_desktop_effects",
+            )
+            .unwrap()
+            .unwrap();
+        let caller = store
+            .get_node_by_qname("test", "src/channel/tests.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|e| e.source_id == caller.id));
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type='CALLS' AND target_id=?1",
+                [target.id],
+            )
+            .unwrap();
+        store.conn().execute("DELETE FROM raw_edges WHERE edge_type='CALLS' AND json_extract(properties,'$.callee_name')='run_guest_desktop_effects'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v14','complete')", []).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        assert!(store
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|e| e.source_id == caller.id));
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
