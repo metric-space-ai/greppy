@@ -845,7 +845,8 @@ pub(crate) fn repair_persisted_v7_delta(
     root: &Path,
     project: &str,
 ) -> Result<bool> {
-    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+        .attach_overlay(base_path, visibility)?;
     let pending = persisted_v7_delta_needs_repair(&delta, root)?;
     drop(delta);
     if !pending {
@@ -864,7 +865,8 @@ pub(crate) fn repair_persisted_v7_delta(
                 let observed = greppy_store::Store::open_with(
                     delta_path,
                     greppy_store::OpenOptions::read_only(),
-                )?;
+                )?
+                .attach_overlay(base_path, visibility)?;
                 if !persisted_v7_delta_needs_repair(&observed, root)? {
                     return Ok(false);
                 }
@@ -880,7 +882,8 @@ pub(crate) fn repair_persisted_v7_delta(
         }
     };
     let current =
-        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::query_writer())?;
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::query_writer())?
+            .attach_overlay(base_path, visibility)?;
     if !persisted_v7_delta_needs_repair(&current, root)? {
         return Ok(false);
     }
@@ -977,7 +980,7 @@ pub(crate) fn ensure_persisted_single_store_repaired(
     }
     drop(observed);
     if !crate::index_admission::inline_refresh_is_admitted() {
-        return refresh_persisted_graph_under_admission(path, root);
+        return refresh_persisted_graph_under_admission(path, root, None);
     }
     let deadline = std::time::Instant::now() + crate::NAV_FRESHNESS_BUDGET;
     let _lock = loop {
@@ -1037,7 +1040,8 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
     root: &Path,
     project: &str,
 ) -> Result<()> {
-    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+    let delta = greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+        .attach_overlay(base_path, visibility)?;
     if !persisted_v7_delta_needs_repair(&delta, root)? {
         return Ok(());
     }
@@ -1050,14 +1054,18 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
             return Ok(());
         }
         drop(visible);
-        return refresh_persisted_graph_under_admission(delta_path, root);
+        return refresh_persisted_graph_under_admission(
+            delta_path,
+            root,
+            Some((base_path, visibility)),
+        );
     }
     repair_persisted_v7_delta(delta_path, base_path, visibility, root, project)?;
     let repaired =
-        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?;
+        greppy_store::Store::open_with(delta_path, greppy_store::OpenOptions::read_only())?
+            .attach_overlay(base_path, visibility)?;
     if persisted_v7_delta_needs_repair(&repaired, root)? {
-        let visible = repaired.attach_overlay(base_path, visibility)?;
-        if rust_repair_requires_source_refresh(&visible, root, project) {
+        if rust_repair_requires_source_refresh(&repaired, root, project) {
             return Ok(());
         }
         return Err(Error::Lock(
@@ -1067,7 +1075,11 @@ pub(crate) fn ensure_persisted_v7_delta_repaired(
     Ok(())
 }
 
-fn refresh_persisted_graph_under_admission(path: &Path, root: &Path) -> Result<()> {
+fn refresh_persisted_graph_under_admission(
+    path: &Path,
+    root: &Path,
+    overlay: Option<(&Path, &VisibilityIndex)>,
+) -> Result<()> {
     let root_string = root.to_string_lossy();
     crate::freshness::wait_for_index_publication(
         Some(root_string.as_ref()),
@@ -1075,6 +1087,10 @@ fn refresh_persisted_graph_under_admission(path: &Path, root: &Path) -> Result<(
         "rust-graph-repair",
     )?;
     let published = greppy_store::Store::open_with(path, greppy_store::OpenOptions::read_only())?;
+    let published = match overlay {
+        Some((base, visibility)) => published.attach_overlay(base, visibility)?,
+        None => published,
+    };
     if persisted_v7_delta_needs_repair(&published, root)? {
         return Err(Error::Index(
             "admitted graph preparation did not publish the caller/usage compatibility repair"
@@ -3325,6 +3341,63 @@ mod tests {
         )
         .unwrap();
         assert!(hidden.get_node(original.id).unwrap().is_none());
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+    }
+
+    #[test]
+    fn persisted_overlay_repair_certifies_composed_manifest_context() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        std::fs::create_dir_all(repo.path().join("member/src")).unwrap();
+        std::fs::write(
+            repo.path().join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("member/src/lib.rs"),
+            "pub fn unchanged_member() {}\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "member base"]);
+        let base_path = scratch.path().join("base.db");
+        let delta_path = scratch.path().join("delta.db");
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "pub fn changed_delta() {}\n").unwrap();
+        let visibility =
+            VisibilityIndex::new(["src/a.rs".to_string()], Vec::<String>::new()).unwrap();
+        {
+            let mut overlay =
+                greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+            let options = greppy_indexer::IndexOptions {
+                only_paths: Some(["src/a.rs".to_string()].into_iter().collect()),
+                ..Default::default()
+            };
+            greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+            complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap();
+            assert!(!persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
+        }
+        // A physical Delta has no member file states, so its Cargo digest is
+        // deliberately different. Validate the published logical graph instead.
+        let delta =
+            greppy_store::Store::open_with(&delta_path, greppy_store::OpenOptions::read_only())
+                .unwrap();
+        assert!(!greppy_indexer::anyhow_factory_edges_repaired(&delta).unwrap());
+        drop(delta);
+        ensure_persisted_v7_delta_repaired(&delta_path, &base_path, &visibility, repo.path(), "p")
+            .unwrap();
+        assert!(
+            !repair_persisted_v7_delta(&delta_path, &base_path, &visibility, repo.path(), "p")
+                .unwrap()
+        );
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
     }
 
