@@ -114,26 +114,26 @@ mod structural;
 use std::path::Path;
 
 use greppy_core::Result;
-use greppy_discover::{read_stable_file, stable_metadata, InventoryEntry, StableFileMetadata};
+use greppy_discover::{InventoryEntry, StableFileMetadata, read_stable_file, stable_metadata};
 use greppy_parser::{
-    self, extract as parser_extract, manifest_for_language, ExtractedEdge, ExtractedNode, Language,
-    ProviderManifest, ProviderOutput, ProviderStatus,
+    self, ExtractedEdge, ExtractedNode, Language, ProviderManifest, ProviderOutput, ProviderStatus,
+    extract as parser_extract, manifest_for_language,
 };
 use greppy_store::{
-    self,
+    self, ContentRow, FileIdentity, IndexSkip, NewEdge, NewNode, NewOverlayEdge, NewRawEdge,
+    Project, ProviderState, RawEdge, Store, WorkspaceState,
     file_state::{self, FileState},
-    workspace_state as ws, ContentRow, FileIdentity, IndexSkip, NewEdge, NewNode, NewOverlayEdge,
-    NewRawEdge, Project, ProviderState, RawEdge, Store, WorkspaceState,
+    workspace_state as ws,
 };
 use rayon::prelude::*;
 
 pub use embedding::{
-    count_code_embedding_documents_for_project, count_code_embedding_documents_for_scope,
-    count_embedding_candidate_nodes, embedding_path_matches, index_code_embeddings_for_project,
-    index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
     CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
     EmbeddingIndexProgress, EmbeddingIndexProgressContext, EmbeddingIndexReport,
-    EmbeddingProviderCacheStats,
+    EmbeddingProviderCacheStats, count_code_embedding_documents_for_project,
+    count_code_embedding_documents_for_scope, count_embedding_candidate_nodes,
+    embedding_path_matches, index_code_embeddings_for_project,
+    index_code_embeddings_for_project_with_progress, index_code_embeddings_for_scope_with_progress,
 };
 
 /// Fraction of the process RAM budget the indexer initialises
@@ -2573,7 +2573,16 @@ pub fn recover_persisted_rust_usages(
         // Receiver provenance depends on persisted Field declarations as well
         // as raw calls. Never certify an older Base whose field facts are
         // absent or differ from the fingerprint-validated source extraction.
-        for field in extraction.nodes.iter().filter(|node| node.label == "Field") {
+        // Enum variants (and repeated cfg declarations) can share a qualified
+        // name. Persistence upserts in extraction order, so only the final
+        // definition can describe the visible stored facts. Earlier overwritten
+        // declarations must not make a freshly indexed file fail recovery.
+        let definitions: std::collections::BTreeMap<_, _> = extraction
+            .nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect();
+        for field in definitions.values().filter(|node| node.label == "Field") {
             let cached = store.get_node_by_qname(project, &field.qualified_name)?;
             if cached.as_ref().is_none_or(|node| {
                 node.label != "Field"
@@ -2587,9 +2596,8 @@ pub fn recover_persisted_rust_usages(
                 )));
             }
         }
-        for trait_node in extraction
-            .nodes
-            .iter()
+        for trait_node in definitions
+            .values()
             .filter(|node| node.label == "Interface")
         {
             let cached = store.get_node_by_qname(project, &trait_node.qualified_name)?;
@@ -7045,11 +7053,13 @@ mod tests {
             greppy_store::VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new())
                 .unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        assert!(overlay
-            .list_file_states("test")
-            .unwrap()
-            .iter()
-            .any(|state| state.rel_path == "src/clean.rs"));
+        assert!(
+            overlay
+                .list_file_states("test")
+                .unwrap()
+                .iter()
+                .any(|state| state.rel_path == "src/clean.rs")
+        );
         assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
         let report = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
         assert_eq!(
@@ -7103,8 +7113,7 @@ mod tests {
             "pub mod store; pub use crate::super_exports::*;\n",
         )
         .unwrap();
-        let caller_source =
-            "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
+        let caller_source = "use crate::{alias_chain, channels, glob_channels, parent::child, renamed_channels};\n\
 use crate::bare_glob::*;\n\
 use crate::alias_chain::outer;\n\
 use super::*;\n\
@@ -7298,10 +7307,12 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
             ..IndexOptions::default()
         };
         index_with_options(&mut store, &repo, "test", &initial).unwrap();
-        assert!(store
-            .get_index_skip("test", ".gitattributes")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_index_skip("test", ".gitattributes")
+                .unwrap()
+                .is_some()
+        );
         fs::remove_file(repo.join(".gitattributes")).unwrap();
         for mut state in store.list_workspace_states().unwrap() {
             state.indexer_version = "greppy-indexer-v5".into();
@@ -7317,14 +7328,18 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
             "all retained layer files need migration"
         );
         assert_eq!(upgraded.files_skipped, 0);
-        assert!(store
-            .get_index_skip("test", ".gitattributes")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_file_state("test", ".gitattributes")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_index_skip("test", ".gitattributes")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_file_state("test", ".gitattributes")
+                .unwrap()
+                .is_none()
+        );
         let nodes = store.list_nodes_by_label("test", "Function", 100).unwrap();
         assert!(nodes.iter().any(|node| node.name == "retained_path"));
         assert!(!nodes.iter().any(|node| node.name == "outside_layer"));
@@ -7366,18 +7381,24 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
             "override scope must be persisted in indexer_version, got {}",
             ws.indexer_version
         );
-        assert!(store
-            .get_file_state("test", "src/lib.rs")
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_file_state("test", "src/generated.rs")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_file_state("test", "tests/integration.rs")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_file_state("test", "src/lib.rs")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_file_state("test", "src/generated.rs")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_file_state("test", "tests/integration.rs")
+                .unwrap()
+                .is_none()
+        );
 
         let fns = store.list_nodes_by_label("test", "Function", 100).unwrap();
         let names: Vec<_> = fns.iter().map(|n| n.name.as_str()).collect();
@@ -7829,13 +7850,15 @@ export function invalidCalls() { plainValue(); effectValue(); }
             .unwrap()
             .unwrap();
         assert_eq!(skip.reason, "discovery_filtered");
-        assert!(store
-            .get_node_by_qname(
-                "test",
-                "node_modules/package/media-controls.js::Class::MediaControls"
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_node_by_qname(
+                    "test",
+                    "node_modules/package/media-controls.js::Class::MediaControls"
+                )
+                .unwrap()
+                .is_none()
+        );
         store.conn().execute_batch(
             "DELETE FROM main.raw_edges WHERE edge_type='USAGE'; DELETE FROM main.edges WHERE edge_type='USAGE';"
         ).unwrap();
@@ -7929,10 +7952,11 @@ export function invalidCalls() { plainValue(); effectValue(); }
         {
             let mut base = Store::open(&base_path).unwrap();
             index(&mut base, repo.path(), "test").unwrap();
-            assert!(base
-                .get_file_state("test", "node_modules/package/media-controls.js")
-                .unwrap()
-                .is_none());
+            assert!(
+                base.get_file_state("test", "node_modules/package/media-controls.js")
+                    .unwrap()
+                    .is_none()
+            );
             base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
             base.conn()
                 .execute(
@@ -8317,10 +8341,12 @@ export function invalidCalls() { plainValue(); effectValue(); }
             "incoming={incoming:?}; render={render:?}; raw={:?}",
             store.list_raw_edges("test").unwrap()
         );
-        assert!(store
-            .incoming_edges(other.id, Some("USAGE"), 100)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .incoming_edges(other.id, Some("USAGE"), 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8373,10 +8399,12 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 .get_node_by_qname("test", &format!("{file}::Function::{name}"))
                 .unwrap()
                 .unwrap();
-            assert!(store
-                .outgoing_edges(source.id, Some("USAGE"), 100)
-                .unwrap()
-                .is_empty());
+            assert!(
+                store
+                    .outgoing_edges(source.id, Some("USAGE"), 100)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -8406,10 +8434,12 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 .get_node_by_qname("test", "routing.ts::Function::target")
                 .unwrap()
                 .unwrap();
-            assert!(!overlay
-                .incoming_edges(target.id, Some("CALLS"), 10)
-                .unwrap()
-                .is_empty());
+            assert!(
+                !overlay
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty()
+            );
         }
         // An older resolver can have identical raw facts and missing resolved
         // edges. That case must still repair the immutable Base via the Delta.
@@ -8432,10 +8462,12 @@ export function invalidCalls() { plainValue(); effectValue(); }
             .get_node_by_qname("test", "routing.ts::Function::target")
             .unwrap()
             .unwrap();
-        assert!(!overlay
-            .incoming_edges(target.id, Some("CALLS"), 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !overlay
+                .incoming_edges(target.id, Some("CALLS"), 10)
+                .unwrap()
+                .is_empty()
+        );
         let repairs: i64 = overlay.conn().query_row("SELECT COUNT(*) FROM main.overlay_edges WHERE json_extract(properties,'$.greppy_base_repair_v2')=1", [], |r| r.get(0)).unwrap();
         assert!(repairs > 0, "old resolver recovery remains active");
     }
@@ -8552,15 +8584,19 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
                 .get_node_by_qname("test", "routing.ts::Function::caller")
                 .unwrap()
                 .unwrap();
-            assert!(overlay
-                .get_node_by_qname("test", "routing.ts::Variable::target")
-                .unwrap()
-                .is_none());
-            assert!(overlay
-                .incoming_edges(target.id, Some("CALLS"), 10)
-                .unwrap()
-                .iter()
-                .any(|e| e.source_id == caller.id));
+            assert!(
+                overlay
+                    .get_node_by_qname("test", "routing.ts::Variable::target")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                overlay
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.source_id == caller.id)
+            );
             assert_eq!(
                 overlay
                     .get_node_by_qname("test", "retained.py::Function::retained")
@@ -8587,14 +8623,18 @@ export const caller = Effect.fn('caller')(function* () { return yield* target();
             base_hash
         );
         let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        assert!(reopened
-            .get_node_by_qname("test", "routing.ts::Variable::target")
-            .unwrap()
-            .is_none());
-        assert!(reopened
-            .get_node_by_qname("test", "routing.ts::Function::target")
-            .unwrap()
-            .is_some());
+        assert!(
+            reopened
+                .get_node_by_qname("test", "routing.ts::Variable::target")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_node_by_qname("test", "routing.ts::Function::target")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -8768,10 +8808,12 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
                 .get_node_by_qname("test", "src/lib.rs::Function::Response")
                 .unwrap()
                 .unwrap();
-            assert!(store
-                .incoming_edges(callable.id, Some("USAGE"), 100)
-                .unwrap()
-                .is_empty());
+            assert!(
+                store
+                    .incoming_edges(callable.id, Some("USAGE"), 100)
+                    .unwrap()
+                    .is_empty()
+            );
             for caller in [
                 "generic_missing",
                 "generic_shadow",
@@ -9261,10 +9303,12 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
                 .is_none(),
             "a changed Rust file is also freshly extracted during the full refresh"
         );
-        assert!(store
-            .get_node_by_qname("test", "src/other.rs::Function::replacement")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_node_by_qname("test", "src/other.rs::Function::replacement")
+                .unwrap()
+                .is_some()
+        );
         let local_target_after = store
             .get_node_by_qname("test", &local_target.qualified_name)
             .unwrap()
@@ -9621,6 +9665,75 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
     }
 
     #[test]
+    fn persisted_rust_recovery_validates_winning_enum_fields_in_sparse_overlay() {
+        let repo = setup_repo(
+            "enum-field-recovery",
+            "pub enum Command { Index { path: Option<String> }, Write { path: String } }\npub fn invoke(command: Command) { let _ = command; }\n",
+        );
+        let base_path = repo.join("base.db");
+        let delta_path = repo.join("delta.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            let field = base
+                .get_node_by_qname("test", "src/lib.rs::Enum::Command::path")
+                .unwrap()
+                .unwrap();
+            assert_eq!(field.properties["return_type"], "String");
+            base.conn()
+                .execute("DELETE FROM raw_edges WHERE edge_type='USAGE'", [])
+                .unwrap();
+        }
+        let base_before = fs::read(&base_path).unwrap();
+        let visibility =
+            greppy_store::VisibilityIndex::new(Vec::<String>::new(), Vec::<String>::new()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let nodes_before = format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap());
+        let states_before = overlay.list_file_states("test").unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap() > 0);
+        assert_eq!(
+            recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap(),
+            0
+        );
+        assert_eq!(overlay.list_file_states("test").unwrap(), states_before);
+        assert!(overlay.list_private_file_states("test").unwrap().is_empty());
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        assert_eq!(
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 100).unwrap()),
+            nodes_before
+        );
+        drop(overlay);
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_rust_recovery_rejects_missing_or_corrupt_winning_enum_fields() {
+        let repo = setup_repo(
+            "enum-field-recovery-negative",
+            "pub enum Command { Index { path: Option<String> }, Write { path: String } }\npub fn invoke(command: Command) { let _ = command; }\n",
+        );
+        for sql in [
+            "UPDATE nodes SET properties=json_set(properties, '$.return_type', 'Option<String>') WHERE label='Field' AND name='path'",
+            "DELETE FROM nodes WHERE label='Field' AND name='path'",
+        ] {
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            store.conn().execute(sql, []).unwrap();
+            let raw_before = format!("{:?}", store.list_raw_edges("test").unwrap());
+            let error = recover_persisted_rust_usages(&mut store, "test", &repo)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("declared field facts"), "{error}");
+            assert_eq!(
+                format!("{:?}", store.list_raw_edges("test").unwrap()),
+                raw_before
+            );
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn persisted_rust_usage_recovery_validates_all_sources_and_preserves_sparse_base() {
         let repo = setup_repo(
             "constructor-recovery",
@@ -9695,11 +9808,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             .get_node_by_qname("test", "src/lib.rs::Function::decode")
             .unwrap()
             .unwrap();
-        assert!(overlay
-            .incoming_edges(target.id, Some("USAGE"), 20)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == caller.id));
+        assert!(
+            overlay
+                .incoming_edges(target.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id)
+        );
         let amount = overlay
             .get_node_by_qname("test", "src/lib.rs::Function::amount")
             .unwrap()
@@ -9729,11 +9844,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .all(|edge| edge.target_id != amount.id),
             "typed outgoing queries must honor the same repair mask as incoming queries"
         );
-        assert!(overlay
-            .outgoing_edges(valid.id, Some("USAGE"), 20)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.target_id == amount.id));
+        assert!(
+            overlay
+                .outgoing_edges(valid.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.target_id == amount.id)
+        );
         assert!(
             overlay.list_delta_raw_edges("test").unwrap().is_empty(),
             "Base compatibility repair must not enter sparse raw re-resolution"
@@ -9749,11 +9866,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             nodes_before
         );
         rebuild_overlay_edges(&mut overlay, "test").unwrap();
-        assert!(overlay
-            .incoming_edges(target.id, Some("USAGE"), 20)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == caller.id));
+        assert!(
+            overlay
+                .incoming_edges(target.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id)
+        );
         let usages = overlay
             .incoming_edges(amount.id, Some("USAGE"), 20)
             .unwrap();
@@ -9762,11 +9881,13 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         drop(overlay);
         // Persisted override works after a normal overlay reopen too.
         let reopened = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        assert!(reopened
-            .incoming_edges(amount.id, Some("USAGE"), 20)
-            .unwrap()
-            .iter()
-            .all(|edge| edge.source_id != caller.id));
+        assert!(
+            reopened
+                .incoming_edges(amount.id, Some("USAGE"), 20)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.source_id != caller.id)
+        );
         drop(reopened);
         let base = Store::open(&base_path).unwrap();
         assert_eq!(
@@ -9863,28 +9984,34 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .get_node_by_qname("test", "examples/qualified.rs::Function::function_item")
                 .unwrap()
                 .unwrap();
-            assert!(store
-                .outgoing_edges(item.id, Some("USAGE"), 20)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.target_id == reachable.id));
+            assert!(
+                store
+                    .outgoing_edges(item.id, Some("USAGE"), 20)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.target_id == reachable.id)
+            );
             let grouped = store
                 .get_node_by_qname("test", "tests/grouped.rs::Function::grouped")
                 .unwrap()
                 .unwrap();
-            assert!(store
-                .outgoing_edges(grouped.id, Some("CALLS"), 20)
-                .unwrap()
-                .iter()
-                .any(|edge| edge.target_id == reachable.id));
+            assert!(
+                store
+                    .outgoing_edges(grouped.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .iter()
+                    .any(|edge| edge.target_id == reachable.id)
+            );
             let root = store
                 .get_node_by_qname("test", &format!("{library_file}::Function::root_target"))
                 .unwrap()
                 .unwrap();
-            assert!(!store
-                .incoming_edges(root.id, Some("CALLS"), 20)
-                .unwrap()
-                .is_empty());
+            assert!(
+                !store
+                    .incoming_edges(root.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 index(&mut store, &repo, "test").unwrap().files_indexed,
                 0,
@@ -10029,10 +10156,12 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
             "binary/src/main.rs::Function::unrelated",
         ] {
             let caller = store.get_node_by_qname("test", qname).unwrap().unwrap();
-            assert!(store
-                .outgoing_edges(caller.id, Some("CALLS"), 20)
-                .unwrap()
-                .is_empty());
+            assert!(
+                store
+                    .outgoing_edges(caller.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty()
+            );
         }
         fs::remove_dir_all(repo).unwrap();
     }
@@ -11825,10 +11954,12 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
                 .len(),
             1
         );
-        assert!(store
-            .incoming_edges(namesake.id, Some("CALLS"), 20)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .incoming_edges(namesake.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty()
+        );
         let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
         let states = store.list_file_states("test").unwrap();
         store
@@ -11863,16 +11994,46 @@ pub fn aliased() -> Opcode { Opcode::AddImmediateByte { amount: 2 } }
         );
         assert_eq!(states, store.list_file_states("test").unwrap());
         for (label, changed, recovery) in [
-            ("opaque", source.replace("recovery::Recovery", "Unknown"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
-            ("ambiguous", source.replace("mod other;", "mod other; use recovery::Recovery; use other::Recovery;").replace("recovery: recovery::Recovery", "recovery: Recovery"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
-            ("trait-method", source.to_string(), "pub struct Recovery; pub trait Lost { fn device_lost(&mut self, reason: String); } impl Lost for Recovery { fn device_lost(&mut self, reason: String) {} }"),
-            ("opaque-expression", source.replace("self.recovery.device_lost", "opaque().device_lost"), "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }"),
+            (
+                "opaque",
+                source.replace("recovery::Recovery", "Unknown"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "ambiguous",
+                source
+                    .replace(
+                        "mod other;",
+                        "mod other; use recovery::Recovery; use other::Recovery;",
+                    )
+                    .replace("recovery: recovery::Recovery", "recovery: Recovery"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "trait-method",
+                source.to_string(),
+                "pub struct Recovery; pub trait Lost { fn device_lost(&mut self, reason: String); } impl Lost for Recovery { fn device_lost(&mut self, reason: String) {} }",
+            ),
+            (
+                "opaque-expression",
+                source.replace("self.recovery.device_lost", "opaque().device_lost"),
+                "pub struct Recovery; impl Recovery { pub fn device_lost(&mut self, reason: String) {} }",
+            ),
         ] {
             fs::write(repo.join("src/lib.rs"), changed).unwrap();
             fs::write(repo.join("src/recovery.rs"), recovery).unwrap();
             index(&mut store, &repo, "test").unwrap();
-            let method = store.get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost").unwrap().unwrap();
-            assert!(store.incoming_edges(method.id, Some("CALLS"), 20).unwrap().is_empty(), "{label}");
+            let method = store
+                .get_node_by_qname("test", "src/recovery.rs::Recovery::device_lost")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .incoming_edges(method.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty(),
+                "{label}"
+            );
         }
         fs::remove_dir_all(repo).unwrap();
     }
@@ -12097,10 +12258,12 @@ impl Other { pub fn uniform(&self, matrix: [f32;16]) {} }
                 .unwrap();
             state.indexer_version = prior_version.into();
             store.upsert_workspace_state(&state).unwrap();
-            assert!(recover_persisted_rust_usages(&mut store, "test", &repo)
-                .unwrap_err()
-                .to_string()
-                .contains("trait receiver facts"));
+            assert!(
+                recover_persisted_rust_usages(&mut store, "test", &repo)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("trait receiver facts")
+            );
 
             fs::write(
                 repo.join("src/changed.rs"),
@@ -12356,12 +12519,14 @@ pub fn load_scene() {
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
         assert_option_field_caller(&store, "src/scene.rs::Other::uniform", false);
-        assert!(option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .is_empty());
+        assert!(
+            option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .is_empty()
+        );
         fs::remove_dir_all(repo).unwrap();
 
         let alias = proven
@@ -12376,12 +12541,14 @@ pub fn load_scene() {
         index(&mut store, &repo, "test").unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", true);
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::storage", true);
-        assert!(option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .is_empty());
+        assert!(
+            option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .is_empty()
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -12555,12 +12722,14 @@ pub fn load_scene() {
             !option_edge_names(&store, "src/lib.rs::Function::load_scene", "CALLS")
                 .contains(&"uniform".to_string())
         );
-        assert!(option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .contains(&"uniform".to_string()));
+        assert!(
+            option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .contains(&"uniform".to_string())
+        );
         assert!(
             option_unresolved_reasons(&store).contains("wildcard import custom"),
             "{}",
@@ -12596,9 +12765,11 @@ pub fn load_scene() {
         set_option_field_unresolved(&option_edge, vec!["wildcard import custom".into()]);
         let matched = new_edge("p", 1, 3, &option_edge);
         assert_eq!(matched.edge_type, "UNRESOLVED_CALLS");
-        assert!(matched.properties["unresolved_reasons"]
-            .to_string()
-            .contains("wildcard import custom"));
+        assert!(
+            matched.properties["unresolved_reasons"]
+                .to_string()
+                .contains("wildcard import custom")
+        );
         clear_option_field_unresolved();
         let cleared = new_edge("p", 1, 3, &option_edge);
         assert_eq!(cleared.edge_type, "CALLS");
@@ -12731,12 +12902,14 @@ pub fn load_scene() {
         let raw = load_all_raw_edges(&store, "test").unwrap();
         resolve_edges_with_replacement(&mut store, "test", &raw, &mut |_| {}, &[], true).unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
-        assert!(!option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .contains(&"uniform".to_string()));
+        assert!(
+            !option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .contains(&"uniform".to_string())
+        );
         store.conn().execute(
             "UPDATE nodes SET properties=json_set(properties, '$.generic_payload', 1) WHERE label='Field' AND name='remaster_irradiance'",
             [],
@@ -12796,12 +12969,14 @@ pub fn load_scene() {
         .unwrap();
         index(&mut store, &repo, "test").unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
-        assert!(!option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .contains(&"uniform".to_string()));
+        assert!(
+            !option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .contains(&"uniform".to_string())
+        );
         fs::write(
             repo.join("src/adapter.rs"),
             "pub trait View { fn as_ref(&self); }\n",
@@ -12843,12 +13018,14 @@ pub fn load_scene() {
         )).unwrap();
         index(&mut store, &repo, "test").unwrap();
         assert_option_field_caller(&store, "src/scene.rs::IrradianceField::uniform", false);
-        assert!(!option_edge_names(
-            &store,
-            "src/lib.rs::Function::load_scene",
-            "UNRESOLVED_CALLS"
-        )
-        .contains(&"uniform".to_string()));
+        assert!(
+            !option_edge_names(
+                &store,
+                "src/lib.rs::Function::load_scene",
+                "UNRESOLVED_CALLS"
+            )
+            .contains(&"uniform".to_string())
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -12897,10 +13074,12 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .unwrap();
         store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v10','complete')", []).unwrap();
         assert!(!rust_caller_edges_repaired(&store).unwrap());
-        assert!(store
-            .incoming_edges(predicate.id, Some("USAGE"), 20)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .incoming_edges(predicate.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty()
+        );
         rebuild_single_store_rust_edges(&mut store, "test").unwrap();
         assert!(rust_caller_edges_repaired(&store).unwrap());
         let callers = store
@@ -12908,10 +13087,12 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .unwrap();
         assert_eq!(callers.len(), 1, "{callers:?}");
         assert_eq!(callers[0].source_id, chained.id);
-        assert!(store
-            .outgoing_edges(shadowed.id, Some("USAGE"), 20)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .outgoing_edges(shadowed.id, Some("USAGE"), 20)
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -12921,7 +13102,10 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         let repo = setup_repo("anyhow-factory-repair", source);
         fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
         fs::write(repo.join("Cargo.toml"), "[package]\nname='factory_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nanyhow='1'\n[target.'cfg(windows)'.dependencies]\nother='1'\n[patch.crates-io]\nother={path='other'}\n").unwrap();
-        let lock = format!("version = 3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64));
+        let lock = format!(
+            "version = 3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
+            "a".repeat(64)
+        );
         fs::write(repo.join("Cargo.lock"), &lock).unwrap();
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
@@ -13124,7 +13308,10 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
 
     #[test]
     fn rust_factory_option_call_repair_rejects_v11_and_recovers_same_source() {
-        let repo = setup_repo("factory-option-repair", "struct Writer; impl Writer { fn open() -> Result<Option<Self>, ()> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }");
+        let repo = setup_repo(
+            "factory-option-repair",
+            "struct Writer; impl Writer { fn open() -> Result<Option<Self>, ()> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }",
+        );
         let mut store = Store::open_memory().unwrap();
         index(&mut store, &repo, "test").unwrap();
         let method = store
@@ -13135,11 +13322,13 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .get_node_by_qname("test", "src/lib.rs::Function::caller")
             .unwrap()
             .unwrap();
-        assert!(store
-            .incoming_edges(method.id, Some("CALLS"), 20)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == caller.id));
+        assert!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id)
+        );
         store
             .conn()
             .execute(
@@ -13159,11 +13348,13 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
         assert!(!rust_caller_edges_repaired(&store).unwrap());
         rebuild_single_store_rust_edges(&mut store, "test").unwrap();
         assert!(rust_caller_edges_repaired(&store).unwrap());
-        assert!(store
-            .incoming_edges(method.id, Some("CALLS"), 20)
-            .unwrap()
-            .iter()
-            .any(|edge| edge.source_id == caller.id));
+        assert!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == caller.id)
+        );
         fs::remove_dir_all(repo).unwrap();
     }
 
