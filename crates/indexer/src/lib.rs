@@ -8572,7 +8572,9 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
             let incoming = store
                 .incoming_edges(boundary.id, Some("USAGE"), 100)
                 .unwrap();
-            assert_eq!(incoming.len(), 4, "{incoming:?}");
+            // The generator declaration and CommonJS callback both use the
+            // file owner. Graph edges are unique by owner, target and kind.
+            assert_eq!(incoming.len(), 3, "{incoming:?}");
             let unrelated = store
                 .get_node_by_qname("test", "other.ts::Variable::Boundary")
                 .unwrap()
