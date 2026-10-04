@@ -92,6 +92,57 @@ fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
 }
 
 #[test]
+fn rust_error_field_source_keeps_regex_output_and_child_exit_status() {
+    let workspace = fresh_workspace("rust-error-field-source");
+    let source = "error: ClaudeErrorDetail {\n";
+    for exit in [0, 7] {
+        let script = format!("printf '%s' \"$1\"; exit {exit}");
+        let output = run(
+            &workspace,
+            &[
+                "bash-smart",
+                "-e",
+                "^error:",
+                "--",
+                "sh",
+                "-c",
+                &script,
+                "rust-field-fixture",
+                source,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(exit));
+        let shown = text(&output.stdout);
+        let verdict = if exit == 0 {
+            "ok — exit 0\n"
+        } else {
+            "FAILED — exit 7: 0 errors, 0 warnings\n"
+        };
+        assert!(shown.starts_with(verdict), "{shown}");
+        assert!(
+            shown.contains(source),
+            "source-review bytes missing: {shown}"
+        );
+        assert!(
+            shown.contains("1  error: ClaudeErrorDetail {"),
+            "regex lift missing: {shown}"
+        );
+    }
+    let output = run(
+        &workspace,
+        &[
+            "bash-smart",
+            "--",
+            "printf",
+            "%s\\n",
+            "error: compiler failed",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(text(&output.stdout).starts_with("ok — exit 0, 1 error"));
+}
+
+#[test]
 fn cold_unavailable_daemon_does_not_materialize_embedded_model() {
     let workspace = fresh_workspace("cold-no-daemon");
     let fixture = workspace.repo.join("failed-output.txt");

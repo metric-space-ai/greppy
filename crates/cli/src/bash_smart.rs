@@ -67,6 +67,16 @@ static AAPT_XML_ELEMENT_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     .expect("bash-smart aapt XML element regex")
 });
 
+// A Rust struct field initializer printed by source-review commands is data,
+// even when its field is named `error`. Exempt only the complete initializer
+// header with an uppercase type name; diagnostic prose remains eligible.
+static RUST_ERROR_FIELD_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*error:[\t ]+(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Za-z0-9_]*[\t ]+\{[\t ]*$",
+    )
+    .expect("bash-smart Rust error field regex")
+});
+
 static WARNING_MARKER_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(
         r"(?i-u)^[\t ]*(?:warn(?:ing)?\b|deprecat|note:|[0-9]+:[0-9]+[\t ]+warning[\t ]+)",
@@ -751,6 +761,7 @@ fn detect_blocks(
                 || NODE_ERROR_RE.is_match(lines[index].content))
                 && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
                 && !AAPT_XML_ELEMENT_RE.is_match(lines[index].content)
+                && !RUST_ERROR_FIELD_RE.is_match(lines[index].content)
             {
                 Some(BlockKind::Error)
             } else if WARNING_MARKER_RE.is_match(lines[index].content)
@@ -2510,6 +2521,28 @@ mod tests {
                 blocks[0].lines[0].bytes,
                 b"error: real formatter failure after diff"
             );
+        }
+    }
+
+    #[test]
+    fn rust_error_field_initializers_are_source_but_diagnostics_remain() {
+        let source = split_lines(
+            b"error: ClaudeErrorDetail {\n    message: value,\n},\n  error: crate::ClaudeErrorDetail {\n",
+        );
+        assert!(detect_blocks(&source, &[]).is_empty());
+        assert!(detect_blocks(&[], &source).is_empty());
+        let matchers = compile_matchers(&["error:".into()]).unwrap();
+        assert_eq!(collect_matches(&source, &[], &matchers).len(), 2);
+
+        let diagnostics = split_lines(
+            b"error: compiler failed\nerror[E0308]: mismatched types\nerror: ClaudeErrorDetail { unexpected token\nerror: failed to parse {\nfatal error: missing.h: No such file\n",
+        );
+        for blocks in [
+            detect_blocks(&diagnostics, &[]),
+            detect_blocks(&[], &diagnostics),
+        ] {
+            assert_eq!(blocks.len(), 5);
+            assert!(blocks.iter().all(|block| block.kind == BlockKind::Error));
         }
     }
 
