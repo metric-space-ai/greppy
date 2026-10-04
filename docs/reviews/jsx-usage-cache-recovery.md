@@ -16,7 +16,7 @@ contributions, replaces differing contributions in `main.raw_edges`, records
 It preserves immutable Base bytes and uses a savepoint, but its storage model
 is a complete file-level raw override, not a usage-only compatibility mask.
 
-`crates/cli/src/store_cow.rs::validate_delta_visibility` permits off-manifest
+`crates/cli/src/store_cow.rs::validate_overlay_delta_visibility / private_delta_paths` permits off-manifest
 JS/TS overrides only when both complete raw-edge multisets are exactly equal
 between Delta and Base. A source-valid old TSX Base missing JSX facts necessarily
 has a different multiset after extraction. Invalidating v8 or adding a v9 marker
