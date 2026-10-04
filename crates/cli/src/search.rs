@@ -213,7 +213,9 @@ fn search_symbol_no_match_status(
             );
         }
         if unsupported_files.len() == path_filters.filters.len() {
-            println!("message: these files have no definition provider; reindexing does not add symbol coverage");
+            println!(
+                "message: these files have no definition provider; reindexing does not add symbol coverage"
+            );
             return;
         }
         println!(
@@ -1071,7 +1073,8 @@ fn print_search_pattern_rows(
         *per_file.entry(&row.hit.file).or_insert(0) += 1;
     }
     let summarize = !all && rows.len() > FULL_LIMIT;
-    let default_shown = if summarize { SUMMARY_ROWS } else { rows.len() };
+    let default_shown =
+        cli_result_limit_raw().unwrap_or(if summarize { SUMMARY_ROWS } else { rows.len() });
     let offset = cli_result_offset();
     let start = offset.min(rows.len());
     let shown = default_shown
@@ -1609,13 +1612,13 @@ pub(crate) fn dispatch_semantic(
             Err(error) if embedding_asset_missing_error(&error) => {
                 if json {
                     emit_semantic_backend_unavailable(
-                    &project,
-                    q,
-                    paths,
-                    root,
-                    true,
-                    "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
-                )?;
+                        &project,
+                        q,
+                        paths,
+                        root,
+                        true,
+                        "EmbeddingGemma assets could not be resolved; use one of the exact non-semantic fallbacks below.",
+                    )?;
                 } else {
                     println!("semantic index unavailable — embedding assets could not be resolved");
                 }

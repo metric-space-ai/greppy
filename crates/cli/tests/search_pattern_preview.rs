@@ -125,9 +125,11 @@ fn long_json_match_has_bounded_preview_and_executable_full_line_recovery() {
             "{}",
             String::from_utf8_lossy(&recovered.stderr)
         );
-        assert!(String::from_utf8(recovered.stdout)
-            .unwrap()
-            .contains(source.trim_end()));
+        assert!(
+            String::from_utf8(recovered.stdout)
+                .unwrap()
+                .contains(source.trim_end())
+        );
         assert_eq!(std::fs::read(&file).unwrap(), source.as_bytes());
     }
 }
@@ -228,9 +230,11 @@ fn text_pattern_offset_pages_complete_matches_without_repeats() {
         beyond.extend(["--offset", "20"]);
         let empty = fixture.run(&beyond);
         assert!(page_headers(&empty).is_empty());
-        assert!(String::from_utf8(empty.stdout)
-            .unwrap()
-            .contains("shown: 0\ntotal: 12\noffset: 20\ntruncated: false"));
+        assert!(
+            String::from_utf8(empty.stdout)
+                .unwrap()
+                .contains("shown: 0\ntotal: 12\noffset: 20\ntruncated: false")
+        );
     }
 }
 
@@ -294,4 +298,42 @@ fn text_pattern_all_preserves_explicit_limit_and_offset() {
         "2",
     ]);
     assert_eq!(page_headers(&output), ["page1.rs:1", "page1.rs:2"]);
+}
+
+#[test]
+fn explicit_text_pattern_limit_overrides_large_result_preview() {
+    let fixture = Fixture::new();
+    let source = (0..32)
+        .map(|index| format!("pub fn LIMIT_TOKEN_{index}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(fixture.repo.join("page.rs"), source).unwrap();
+    for code in [false, true] {
+        let mut args = vec!["search-pattern", "LIMIT_TOKEN", "--limit", "28"];
+        if code {
+            args.push("--code");
+        }
+        let first = fixture.run(&args);
+        let headers = page_headers(&first);
+        assert_eq!(headers.len(), 28);
+        assert_eq!(headers.first().unwrap(), "page.rs:1");
+        assert_eq!(headers.last().unwrap(), "page.rs:28");
+        let text = String::from_utf8(first.stdout).unwrap();
+        assert!(
+            text.contains("shown: 28\ntotal: 32\noffset: 0\ntruncated: true"),
+            "{text}"
+        );
+        args.extend(["--offset", "28"]);
+        let next = fixture.run(&args);
+        assert_eq!(
+            page_headers(&next),
+            ["page.rs:29", "page.rs:30", "page.rs:31", "page.rs:32"]
+        );
+        let text = String::from_utf8(next.stdout).unwrap();
+        assert!(
+            text.contains("shown: 4\ntotal: 32\noffset: 28\ntruncated: false"),
+            "{text}"
+        );
+    }
+    let default = fixture.run(&["search-pattern", "LIMIT_TOKEN"]);
+    assert_eq!(page_headers(&default).len(), 5);
 }
