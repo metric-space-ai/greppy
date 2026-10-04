@@ -16,6 +16,72 @@ pub const SESSION_FORMAT: u32 = 1;
 
 static NEXT_TURN_CHECKPOINT: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(not(windows))]
+fn durable_import_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn durable_import_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    // Canonical Windows paths retain the extended-length prefix. Both files
+    // already exist in the same session directory; cross-volume copy is disabled.
+    let wide = |path: &Path| -> io::Result<Vec<u16>> {
+        let value = fs::canonicalize(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains a NUL",
+            ));
+        }
+        Ok(value.into_iter().chain(std::iter::once(0)).collect())
+    };
+    let source = wide(source)?;
+    let destination = wide(destination)?;
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+    // SAFETY: both pointers address owned NUL-terminated UTF-16 buffers that
+    // remain alive for the call. Only documented same-volume move flags are used.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportHistoryCommitError {
+    source: io::Error,
+    pub renamed: bool,
+}
+
+impl From<io::Error> for ImportHistoryCommitError {
+    fn from(source: io::Error) -> Self {
+        Self {
+            source,
+            renamed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ImportHistoryCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportAck {
     pub id: String,
@@ -315,7 +381,8 @@ impl SessionStore {
         messages: &[PersistedMessage],
         acknowledgements: &[ImportAck],
         before_commit: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<()> {
+        after_rename: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), ImportHistoryCommitError> {
         let _lease = self.writer_lease(session_id)?;
         let previous = self.load(session_id)?;
         if previous.recovered
@@ -325,7 +392,8 @@ impl SessionStore {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "saved session history changed or is corrupt",
-            ));
+            )
+            .into());
         }
         let added = messages.strip_prefix(expected).ok_or_else(|| {
             io::Error::new(
@@ -339,12 +407,21 @@ impl SessionStore {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "import acknowledgement does not match appended history",
-            ));
+            )
+            .into());
         }
+        let path = self.path_for(session_id)?;
+        // Unix persists the directory entry; Windows uses write-through rename
+        // and flushes the already-visible file when validating a retry.
+        #[cfg(not(windows))]
+        let directory = File::open(self.project_dir())?;
+        #[cfg(not(windows))]
+        directory.sync_all()?;
+        #[cfg(windows)]
+        OpenOptions::new().write(true).open(&path)?.sync_all()?;
         if added.is_empty() {
             return Ok(());
         }
-        let path = self.path_for(session_id)?;
         let temporary = self.project_dir().join(format!(
             ".{session_id}-import-{}-{}-{}.pending",
             std::process::id(),
@@ -352,6 +429,7 @@ impl SessionStore {
             NEXT_TURN_CHECKPOINT.fetch_add(1, Ordering::Relaxed)
         ));
         let mut created = false;
+        let mut renamed = false;
         let result = (|| {
             let mut source = File::open(&path)?;
             let length = source.metadata()?.len();
@@ -391,12 +469,23 @@ impl SessionStore {
             target.flush()?;
             target.sync_all()?;
             drop(target);
-            fs::rename(&temporary, &path)
+            // A failed Windows write-through move can have uncertain visibility;
+            // require reload even when that API reports a failure.
+            #[cfg(windows)]
+            {
+                renamed = true;
+            }
+            durable_import_rename(&temporary, &path)?;
+            renamed = true;
+            after_rename()?;
+            #[cfg(not(windows))]
+            directory.sync_all()?;
+            Ok(())
         })();
         if created && result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result
+        result.map_err(|source| ImportHistoryCommitError { source, renamed })
     }
 
     pub fn append_messages(

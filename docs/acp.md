@@ -73,8 +73,17 @@ or shortened prefixes, unsupported roles, busy/closed sessions, and persistence
 failures return explicit errors. The host must receive the complete ordered
 acknowledgement before prompting.
 
-Messages and acknowledgement metadata commit atomically under the same
-per-session writer lease as native turns. Acknowledgements store IDs, roles,
+Messages and acknowledgement metadata replace the log atomically under the
+same per-session writer lease as native turns. Both staged contents and the
+containing directory are synchronized on Unix before IDs are acknowledged.
+Windows uses same-directory `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` and
+`MOVEFILE_REPLACE_EXISTING`, and flushes the visible log when validating retries.
+Failure
+before replacement leaves saved and live history unchanged. A directory-sync
+failure after replacement leaves a visible but unconfirmed log: the session
+closes without acknowledging IDs or changing live history, and must be loaded
+again before continuing. Retrying the loaded snapshot synchronizes its directory
+entry without duplicating messages. Acknowledgements store IDs, roles,
 and SHA-256 text hashes; ordinary message persistence retains its existing
 redaction policy. Loading or resuming a session restores accepted IDs so a host
 restart cannot duplicate the archive. Import synchronization does not add

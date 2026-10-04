@@ -57,6 +57,8 @@ pub(crate) struct AcpConfig {
     pub data_root: Option<PathBuf>,
     #[cfg(test)]
     pub after_messages: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    pub after_import_rename: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
     pub tool_env: Option<Arc<dyn Fn(&Path) -> Box<dyn ExecutionEnv + Send> + Send + Sync>>,
 }
 
@@ -73,6 +75,8 @@ impl Default for AcpConfig {
             data_root: None,
             #[cfg(test)]
             after_messages: None,
+            #[cfg(test)]
+            after_import_rename: None,
             tool_env: None,
         }
     }
@@ -531,8 +535,24 @@ impl Server {
                 }
                 Ok(())
             },
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &self.config.after_import_rename {
+                    hook()?;
+                }
+                Ok(())
+            },
         );
         if let Err(error) = saved {
+            if error.renamed {
+                // The replacement is visible but durability was not confirmed.
+                // Do not prompt with stale live state or acknowledge IDs. Loading
+                // the saved session reestablishes a single authoritative history.
+                session.closed = true;
+                return rpc_error(id, -32603, &format!(
+                    "imported history durability was not confirmed; reload the session before continuing: {error}"
+                ));
+            }
             return rpc_error(
                 id,
                 -32603,
