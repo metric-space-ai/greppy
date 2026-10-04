@@ -5542,6 +5542,23 @@ impl GraphIndex {
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
         clear_option_field_unresolved();
+        if let Some(name) = edge
+            .properties
+            .get("rust_expression_macro")
+            .and_then(|v| v.as_str())
+        {
+            if self
+                .rust_expression_macro_identity(
+                    &edge.file_path,
+                    name,
+                    true,
+                    &mut std::collections::HashSet::new(),
+                )
+                .is_none()
+            {
+                return None;
+            }
+        }
         if edge
             .properties
             .get("rust_local_type_owner")
@@ -6078,6 +6095,86 @@ impl GraphIndex {
         reasons.sort();
         reasons.dedup();
         Some(reasons)
+    }
+
+    /// Raw macro-argument calls are provisional until the actual import
+    /// binding proves an expression macro. Follow explicit bindings before
+    /// globs; an unresolved/custom/cyclic parent is not anyhow::ensure.
+    fn rust_expression_macro_identity(
+        &self,
+        file: &str,
+        path: &str,
+        prelude: bool,
+        seen: &mut std::collections::HashSet<(String, String)>,
+    ) -> Option<String> {
+        if seen.len() >= 32 || !seen.insert((file.to_string(), path.to_string())) {
+            return None;
+        }
+        if let Some((owner, name)) = path.rsplit_once("::") {
+            if matches!(owner, "std" | "core") && self.rust_standard_import(file, path) {
+                return Some(format!("std::{name}"));
+            }
+            if owner == "anyhow"
+                && name == "ensure"
+                && !self.standard_namespace_is_shadowed(file, owner, false)
+            {
+                return Some("anyhow::ensure".to_string());
+            }
+            return None;
+        }
+        if let Some(bindings) = self
+            .import_alias_sources_by_file
+            .get(file)
+            .and_then(|aliases| aliases.get(path))
+        {
+            let [(import_path, original)] = bindings.as_slice() else {
+                return None;
+            };
+            if let Some(identity) =
+                self.rust_expression_macro_identity(file, import_path, false, &mut seen.clone())
+            {
+                return Some(identity);
+            }
+            let modules = self
+                .rust_module_files_for_path(file, import_path, original)
+                .into_iter()
+                .filter(|m| self.known_files.contains(m))
+                .collect::<Vec<_>>();
+            let [module] = modules.as_slice() else {
+                return None;
+            };
+            return self.rust_expression_macro_identity(module, original, false, seen);
+        }
+        if let Some(globs) = self
+            .import_globs_by_file
+            .get(file)
+            .filter(|g| !g.is_empty())
+        {
+            let mut identities = std::collections::HashSet::new();
+            for glob in globs {
+                let modules = self
+                    .rust_module_files_for_module_path(file, glob)
+                    .into_iter()
+                    .filter(|m| self.known_files.contains(m))
+                    .collect::<Vec<_>>();
+                let [module] = modules.as_slice() else {
+                    return None;
+                };
+                identities.insert(self.rust_expression_macro_identity(
+                    module,
+                    path,
+                    false,
+                    &mut seen.clone(),
+                )?);
+            }
+            if identities.len() != 1 {
+                return None;
+            }
+            return identities.into_iter().next();
+        }
+        // ensure is not in the Rust prelude. Only the standard expression
+        // macros can use an unshadowed, import-free prelude binding.
+        (prelude && path != "ensure").then(|| format!("std::{path}"))
     }
 
     fn classify_rust_import(&self, file: &str, path: &str, name: &str) -> RustImportClass {
@@ -9194,6 +9291,47 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
     }
 
     #[test]
+    fn rust_expression_macro_parent_custom_binding_does_not_invent_calls() {
+        for parent in [
+            "pub use custom::ensure;",
+            "pub use custom::dsl as ensure;",
+            "macro_rules! ensure { ($($tokens:tt)*) => {} }",
+            "pub use self::tests::ensure;",
+        ] {
+            let repo = setup_multifile_repo(
+                "rust-custom-expression-macro",
+                "mod channel;\n",
+                "// placeholder\n",
+            );
+            fs::create_dir_all(repo.join("src/channel")).unwrap();
+            fs::write(
+                repo.join("src/channel/mod.rs"),
+                format!("{parent}\nmod tests; pub fn decoy() {{}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                repo.join("src/channel/tests.rs"),
+                "use super::*; fn caller() { ensure!(decoy()); }\n",
+            )
+            .unwrap();
+            let mut store = Store::open_memory().unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            let target = store
+                .get_node_by_qname("test", "src/channel/mod.rs::Function::decoy")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .incoming_edges(target.id, Some("CALLS"), 10)
+                    .unwrap()
+                    .is_empty(),
+                "unproved parent macro binding invented a caller: {parent}"
+            );
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
     fn rust_expression_macro_generic_cfg_call_is_resolved_and_repaired() {
         let repo = setup_multifile_repo(
             "rust-expression-macro-call",
@@ -9203,7 +9341,7 @@ fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple
         fs::create_dir_all(repo.join("src/channel")).unwrap();
         fs::write(
             repo.join("src/channel/mod.rs"),
-            "mod implementation; mod tests; pub use implementation::run_guest_desktop_effects;\n",
+            "use anyhow::ensure; mod implementation; mod tests; pub use implementation::run_guest_desktop_effects;\n",
         )
         .unwrap();
         fs::write(
