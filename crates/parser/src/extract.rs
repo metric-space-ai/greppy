@@ -596,10 +596,79 @@ fn rust_option_factory_pattern_path<'a>(
     None
 }
 
+/// Ordinary imports do not erase a qualified dependency's identity. Refuse
+/// imported shadow names, and allow wildcard evidence only through an authored
+/// local module path; the indexer validates that module's source exports.
+fn rust_anyhow_factory_scope_globs(source: &[u8], callee: Node<'_>) -> Option<Vec<String>> {
+    let mut root = callee;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut modules = std::collections::HashMap::new();
+    let mut path_attribute = None;
+    for child in (0..root.named_child_count()).filter_map(|i| root.named_child(i)) {
+        if child.kind() == "attribute_item" {
+            let text = node_text(source, child)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            path_attribute = text
+                .strip_prefix("#[path=\"")
+                .and_then(|text| text.strip_suffix("\"]"))
+                .map(str::to_owned);
+            continue;
+        }
+        if child.kind() == "mod_item" {
+            if let (Some(name), Some(path)) =
+                (child.child_by_field_name("name"), path_attribute.take())
+            {
+                modules.insert(node_text(source, name), path);
+            }
+        }
+        path_attribute = None;
+    }
+    let mut files = Vec::new();
+    let mut ancestor = callee.parent();
+    while let Some(scope) = ancestor {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            for declaration in (0..scope.named_child_count()).filter_map(|i| scope.named_child(i)) {
+                if declaration.kind() != "use_declaration" {
+                    continue;
+                }
+                let mut items = Vec::new();
+                expand_use_tree_into(
+                    source,
+                    declaration.child_by_field_name("argument")?,
+                    "",
+                    &mut items,
+                );
+                for item in items {
+                    if matches!(item.imported_name.as_str(), "anyhow" | "Option" | "Some") {
+                        return None;
+                    }
+                    if item.is_glob {
+                        files.push(modules.get(item.path.as_str())?.clone());
+                    }
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    Some(files)
+}
+
 /// Prove the payload of a same-file inherent factory from its authored return
 /// signature. Only standard Option/Result (or one explicit local Result alias)
 /// are interpreted; arbitrary qualified wrappers never imply Try::Output.
 fn rust_option_factory_owner<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'a str> {
+    rust_option_factory_owner_with_anyhow(source, value, false)
+}
+
+fn rust_option_factory_owner_with_anyhow<'a>(
+    source: &'a [u8],
+    value: Node<'_>,
+    allow_anyhow: bool,
+) -> Option<&'a str> {
     let uses_try = value.kind() == "try_expression";
     let call = if uses_try {
         value.named_child(0)?
@@ -630,6 +699,22 @@ fn rust_option_factory_owner<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'
         let declared_name = node
             .child_by_field_name("name")
             .map(|name| node_text(source, name));
+        if allow_anyhow
+            && ((matches!(declared_name, Some("anyhow" | "Option" | "Some"))
+                && matches!(
+                    node.kind(),
+                    "mod_item" | "type_item" | "struct_item" | "enum_item" | "type_parameter"
+                ))
+                || (matches!(node.kind(), "use_declaration" | "extern_crate_declaration") && {
+                    let text = node_text(source, node)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<String>();
+                    text.contains("asanyhow") || text.contains("::anyhow")
+                }))
+        {
+            return None;
+        }
         if uses_try
             && declared_name == Some("Result")
             && matches!(
@@ -722,7 +807,9 @@ fn rust_option_factory_owner<'a>(source: &'a [u8], value: Node<'_>) -> Option<&'
         }
         let wrapper = node_text(source, ty.child_by_field_name("type")?);
         let arguments = ty.child_by_field_name("type_arguments")?;
-        if wrapper == "Result" && arguments.named_child_count() == 2 {
+        if allow_anyhow && wrapper == "anyhow::Result" && arguments.named_child_count() == 1 {
+            ty = arguments.named_child(0)?;
+        } else if wrapper == "Result" && arguments.named_child_count() == 2 {
             ty = arguments.named_child(0)?;
         } else {
             // A local alias is evidence only when its single generic parameter
@@ -4715,6 +4802,32 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 .and_then(|receiver| {
                     rust_option_factory_pattern_path(source, node, node_text(source, receiver))
                 });
+                let anyhow_factory_owner = receiver_factory_pattern.and_then(|factory_path| {
+                    let mut parent = node.parent();
+                    while let Some(scope) = parent {
+                        if scope.kind() == "if_expression" {
+                            let value = scope
+                                .child_by_field_name("condition")?
+                                .child_by_field_name("value")?;
+                            let call = if value.kind() == "try_expression" {
+                                value.named_child(0)?
+                            } else {
+                                value
+                            };
+                            if call
+                                .child_by_field_name("function")
+                                .is_some_and(|target| node_text(source, target) == factory_path)
+                            {
+                                return rust_option_factory_owner_with_anyhow(source, value, true);
+                            }
+                        }
+                        parent = scope.parent();
+                    }
+                    None
+                });
+                let anyhow_globs = anyhow_factory_owner
+                    .and_then(|_| rust_anyhow_factory_scope_globs(source, node));
+                let anyhow_factory_owner = anyhow_factory_owner.filter(|_| anyhow_globs.is_some());
                 let receiver_provenance = (callee_form == "receiver" && receiver_owner.is_none())
                     .then(|| rust_option_field_receiver(source, node))
                     .flatten();
@@ -4753,10 +4866,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             "callee_name": text,
                             "callee_form": callee_form,
                             });
+                            if let Some(owner) = anyhow_factory_owner {
+                                properties["receiver_anyhow_factory_owner"] =
+                                    serde_json::json!(owner);
+                                properties["receiver_anyhow_glob_files"] =
+                                    serde_json::json!(anyhow_globs);
+                            }
                             if let Some(factory) = receiver_factory_pattern {
                                 properties["receiver_factory_pattern"] = serde_json::json!(factory);
                             }
-                            if receiver_option_pattern {
+                            if receiver_option_pattern || anyhow_factory_owner.is_some() {
                                 properties.as_object_mut().unwrap().insert(
                                     "receiver_option_pattern".into(),
                                     serde_json::json!(true),
@@ -17805,6 +17924,52 @@ fn f(manifest: Manifest) {
             assert_eq!(call.properties["receiver_owner"].as_str(), expected, "{source}");
             assert_eq!(call.properties.get("receiver_factory_pattern").is_some(), diagnostic, "{source}");
         }
+    }
+
+    #[test]
+    fn rust_anyhow_factory_evidence_is_provisional_and_rejects_namespace_shadows() {
+        let source = "struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }";
+        let extract_calls = |source: &str| {
+            extract(Language::Rust, source.as_bytes(), "src/lib.rs")
+                .unwrap()
+                .edges
+                .into_iter()
+                .filter(|edge| edge.properties["callee_name"] == "upsert")
+                .collect::<Vec<_>>()
+        };
+        let calls = extract_calls(source);
+        assert_eq!(
+            calls[0].properties["receiver_anyhow_factory_owner"],
+            "Writer"
+        );
+        assert!(
+            calls[0].properties.get("receiver_owner").is_none(),
+            "parser cannot certify external dependency identity"
+        );
+        for prefix in [
+            "mod anyhow {} ",
+            "use other as anyhow; ",
+            "use other::anyhow; ",
+            "use other::*; ",
+        ] {
+            assert!(
+                extract_calls(&format!("{prefix}{source}"))[0]
+                    .properties
+                    .get("receiver_anyhow_factory_owner")
+                    .is_none(),
+                "{prefix}"
+            );
+        }
+        let shadow = source.replace("writer.upsert();", "let writer = unknown; writer.upsert();");
+        assert!(extract_calls(&shadow)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
+        let wrapper = source.replace("anyhow::Result", "external::Result");
+        assert!(extract_calls(&wrapper)[0]
+            .properties
+            .get("receiver_anyhow_factory_owner")
+            .is_none());
     }
 
     #[test]

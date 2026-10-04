@@ -572,7 +572,9 @@ pub fn index_with_options_and_progress(
     }
 
     if !store.is_overlay() {
-        if incremental && !rust_caller_edges_repaired(store)? {
+        if incremental
+            && (!rust_caller_edges_repaired(store)? || !anyhow_factory_edges_repaired(store)?)
+        {
             report.edges_extracted += rebuild_single_store_rust_edges(store, project_name)?;
         }
         mark_rust_caller_edges_repaired(store)?;
@@ -1955,6 +1957,11 @@ fn resolve_edges_with_replacement(
     // transaction per edge). Determinism is unchanged — the edge order is
     // the same IMPORTS-then-references order resolved above.
     progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
+    if rust_anyhow_context(store, Some(project))?.1 != index.anyhow_dependency_binding {
+        return Err(greppy_core::Error::Invalid(
+            "Cargo dependency identity changed during caller resolution".into(),
+        ));
+    }
     if store.is_overlay() {
         let resolved_logical = resolved
             .iter()
@@ -1992,6 +1999,7 @@ fn resolve_edges_with_replacement(
             replace_single_rust_edges.then_some(project),
         )?;
     }
+    store.conn().execute("INSERT INTO main.schema_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![anyhow_factory_repair_key(project),index.anyhow_dependency_binding]).map_err(sqlite_err)?;
     progress(IndexBuildProgress::new("writing_resolved_edges", 1, 1));
     Ok(resolved.len())
 }
@@ -2143,6 +2151,283 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
 }
 
 pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v13";
+const ANYHOW_FACTORY_REPAIR_KEY: &str = "greppy.rust_anyhow_factory_repair.v1";
+
+/// Bind known anyhow semantics to authored Cargo dependency identity, never to
+/// an arbitrary external Result spelling. The returned digest also invalidates
+/// completed caller repair when manifests or lock identity change.
+fn cargo_item_mentions_anyhow(item: &toml_edit::Item) -> bool {
+    item.as_table_like().is_some_and(|table| {
+        table.iter().any(|(key, value)| {
+            key == "anyhow"
+                || key.starts_with("anyhow:")
+                || (key == "package" && value.as_str() == Some("anyhow"))
+                || cargo_item_mentions_anyhow(value)
+        })
+    })
+}
+
+fn rust_anyhow_context(
+    store: &Store,
+    only_project: Option<&str>,
+) -> Result<(std::collections::HashSet<(String, String)>, String)> {
+    let projects = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name,root_path FROM projects")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    let mut documents = std::collections::BTreeMap::<String, String>::new();
+    let mut allowed = std::collections::HashSet::new();
+    for (project, root) in projects
+        .into_iter()
+        .filter(|(project, _)| only_project.is_none_or(|selected| selected == project.as_str()))
+    {
+        let root = Path::new(&root);
+        let root_manifest_path = root.join("Cargo.toml");
+        let root_text = std::fs::read_to_string(&root_manifest_path).unwrap_or_default();
+        documents.insert(
+            root_manifest_path.to_string_lossy().into_owned(),
+            root_text.clone(),
+        );
+        let root_doc = root_text.parse::<toml_edit::DocumentMut>().ok();
+        let lock_path = root.join("Cargo.lock");
+        let lock_text = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        documents.insert(lock_path.to_string_lossy().into_owned(), lock_text.clone());
+        let lock_doc = lock_text.parse::<toml_edit::DocumentMut>().ok();
+        let identity = lock_doc
+            .as_ref()
+            .and_then(|doc| doc.get("package"))
+            .and_then(|item| item.as_array_of_tables())
+            .map(|packages| {
+                let packages = packages
+                    .iter()
+                    .filter(|package| {
+                        package.get("name").and_then(|item| item.as_str()) == Some("anyhow")
+                    })
+                    .collect::<Vec<_>>();
+                packages.len() == 1
+                    && packages[0]
+                        .get("version")
+                        .and_then(|item| item.as_str())
+                        .is_some_and(|version| {
+                            let parts = version.split('.').collect::<Vec<_>>();
+                            parts.len() == 3
+                                && parts[0] == "1"
+                                && parts.iter().all(|part| part.parse::<u64>().is_ok())
+                        })
+                    && packages[0].get("source").and_then(|item| item.as_str())
+                        == Some("registry+https://github.com/rust-lang/crates.io-index")
+                    && packages[0]
+                        .get("checksum")
+                        .and_then(|item| item.as_str())
+                        .is_some_and(|hash| {
+                            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+            })
+            .unwrap_or(false);
+        let patched = root_doc.as_ref().is_some_and(|doc| {
+            doc.get("patch").is_some_and(cargo_item_mentions_anyhow)
+                || doc.get("replace").is_some_and(cargo_item_mentions_anyhow)
+        });
+        let mut manifest_decisions = std::collections::HashMap::new();
+        let mut nearest_manifests = std::collections::HashMap::new();
+        for state in store
+            .list_file_states(&project)?
+            .into_iter()
+            .filter(|state| state.rel_path.ends_with(".rs"))
+        {
+            let relative = Path::new(&state.rel_path);
+            if relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let file_path = root.join(relative);
+            let parent_directory = file_path.parent().unwrap_or(root).to_path_buf();
+            let mut directory = file_path.parent();
+            let mut selected = nearest_manifests.get(&parent_directory).cloned().flatten();
+            let cached_directory = nearest_manifests.contains_key(&parent_directory);
+            while let Some(dir) = directory.filter(|dir| !cached_directory && dir.starts_with(root))
+            {
+                let manifest = dir.join("Cargo.toml");
+                if manifest.is_file() {
+                    selected = Some(manifest);
+                    break;
+                }
+                directory = dir.parent();
+            }
+            nearest_manifests.insert(parent_directory, selected.clone());
+            let Some(manifest) = selected else {
+                continue;
+            };
+            if let Some(proven) = manifest_decisions.get(&manifest).copied() {
+                if proven {
+                    allowed.insert((project.clone(), state.rel_path));
+                }
+                continue;
+            }
+            // Record a conservative failed decision before fallible checks.
+            manifest_decisions.insert(manifest.clone(), false);
+            let text = documents
+                .entry(manifest.to_string_lossy().into_owned())
+                .or_insert_with(|| std::fs::read_to_string(&manifest).unwrap_or_default());
+            let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+                continue;
+            };
+            if !identity
+                || patched
+                || doc.get("package").is_none()
+                || doc
+                    .get("package")
+                    .and_then(|item| item.as_table_like())
+                    .and_then(|table| table.get("name"))
+                    .and_then(|item| item.as_str())
+                    == Some("anyhow")
+                || doc.get("patch").is_some_and(cargo_item_mentions_anyhow)
+                || doc.get("replace").is_some_and(cargo_item_mentions_anyhow)
+                || doc.get("target").is_some_and(cargo_item_mentions_anyhow)
+            {
+                continue;
+            }
+            let mut dependency = doc
+                .get("dependencies")
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get("anyhow"));
+            if dependency
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get("optional"))
+                .and_then(|item| item.as_bool())
+                == Some(true)
+            {
+                continue;
+            }
+            if dependency
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get("package"))
+                .and_then(|item| item.as_str())
+                .is_some_and(|name| name != "anyhow")
+            {
+                continue;
+            }
+            if dependency
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get("workspace"))
+                .and_then(|item| item.as_bool())
+                == Some(true)
+            {
+                dependency = root_doc
+                    .as_ref()
+                    .and_then(|root| root.get("workspace"))
+                    .and_then(|item| item.as_table_like())
+                    .and_then(|table| table.get("dependencies"))
+                    .and_then(|item| item.as_table_like())
+                    .and_then(|table| table.get("anyhow"));
+            }
+            let proven = dependency.is_some_and(|item| {
+                if let Some(version) = item.as_str() {
+                    return matches!(version, "1" | "^1");
+                }
+                let Some(table) = item.as_table_like() else {
+                    return false;
+                };
+                table
+                    .get("version")
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|version| matches!(version, "1" | "^1"))
+                    && table.get("path").is_none()
+                    && table.get("git").is_none()
+                    && table.get("registry").is_none()
+                    && table.get("optional").and_then(|item| item.as_bool()) != Some(true)
+                    && table
+                        .get("package")
+                        .and_then(|item| item.as_str())
+                        .is_none_or(|name| name == "anyhow")
+            });
+            manifest_decisions.insert(manifest, proven);
+            if proven {
+                allowed.insert((project.clone(), state.rel_path));
+            }
+        }
+    }
+    // Authored glob exports participate in cache certification too. A normal
+    // source refresh that changes these file fingerprints must replay callers.
+    let globs = {
+        let mut stmt = store.conn().prepare("SELECT e.project,e.file_path,g.value FROM raw_edges e, json_each(CASE WHEN json_type(e.properties,'$.receiver_anyhow_glob_files')='array' THEN json_extract(e.properties,'$.receiver_anyhow_glob_files') ELSE '[]' END) g WHERE json_extract(e.properties,'$.receiver_anyhow_factory_owner') IS NOT NULL AND (?1 IS NULL OR e.project=?1)").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![only_project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    for (project, source, target) in globs {
+        let target = Path::new(&source)
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let state = store
+            .list_file_states(&project)?
+            .into_iter()
+            .find(|state| state.rel_path == target);
+        documents.insert(
+            format!("glob-source:{project}:{target}"),
+            state.map(|state| state.sha256).unwrap_or_default(),
+        );
+    }
+    let encoded = serde_json::to_vec(&documents)
+        .map_err(|error| greppy_core::Error::Store(format!("Cargo identity encoding: {error}")))?;
+    Ok((allowed, file_state::sha256_hex(&encoded)))
+}
+
+fn anyhow_factory_repair_key(project: &str) -> String {
+    format!("{ANYHOW_FACTORY_REPAIR_KEY}.{project}")
+}
+
+pub fn anyhow_factory_edges_repaired(store: &Store) -> Result<bool> {
+    let projects = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name FROM projects")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    for project in projects {
+        let (_, expected) = rust_anyhow_context(store, Some(&project))?;
+        let present: bool = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.schema_meta WHERE key=?1 AND value=?2)",
+                rusqlite::params![anyhow_factory_repair_key(&project), expected],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        if !present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -3716,6 +4001,9 @@ struct GraphIndex {
     /// Cargo manifest was available. Uncovered files retain the conventional
     /// source-layout fallback because target discovery is intentionally bounded.
     rust_crate_roots: Option<std::collections::HashSet<String>>,
+    anyhow_factory_files: std::collections::HashSet<String>,
+    anyhow_dependency_binding: String,
+    anyhow_glob_proofs: std::collections::HashSet<String>,
     rust_libraries: Vec<RustPackage>,
     /// `node id → file_path`, so a referrer's file (needed for the
     /// same-file preference) is an O(1) lookup from its id.
@@ -4409,6 +4697,118 @@ impl GraphIndex {
             Some((roots, libraries)) => (Some(roots), libraries),
             None => (None, Vec::new()),
         };
+        let (anyhow_context, anyhow_dependency_binding) =
+            rust_anyhow_context(store, Some(project))?;
+        let namespace_shadowed = known_files.iter().any(|file| {
+            Path::new(file)
+                .file_name()
+                .is_some_and(|name| name == "anyhow.rs")
+                || file.ends_with("anyhow/mod.rs")
+        });
+        let anyhow_factory_files: std::collections::HashSet<String> = anyhow_context
+            .into_iter()
+            .filter(|(scope_project, _)| scope_project == project && !namespace_shadowed)
+            .map(|(_, file)| file)
+            .collect();
+        let mut anyhow_glob_proofs = std::collections::HashSet::new();
+        let mut observed_globs = std::collections::HashSet::new();
+        if let Some(project_info) = store
+            .get_project(project)?
+            .filter(|_| !anyhow_factory_files.is_empty())
+        {
+            let root = Path::new(&project_info.root_path);
+            let states = store.list_file_states(project)?;
+            let facts = {
+                let mut stmt = store.conn().prepare("SELECT file_path, json_extract(properties,'$.receiver_anyhow_glob_files') FROM raw_edges WHERE project=?1 AND json_type(properties,'$.receiver_anyhow_factory_owner')='text' AND json_type(properties,'$.receiver_anyhow_glob_files')='array'").map_err(sqlite_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(sqlite_err)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sqlite_err)?
+            };
+            for (file_path, encoded_globs) in facts {
+                let Ok(globs) = serde_json::from_str::<Vec<serde_json::Value>>(&encoded_globs)
+                else {
+                    continue;
+                };
+                let proof_key =
+                    format!("{}:{}", file_path, serde_json::Value::Array(globs.clone()));
+                if !observed_globs.insert(proof_key.clone()) {
+                    continue;
+                }
+                let proof = globs.iter().all(|value| {
+                    let Some(path) = value.as_str() else {
+                        return false;
+                    };
+                    let relative = Path::new(&file_path)
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .join(path);
+                    if relative
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                    {
+                        return false;
+                    }
+                    let relative_text = relative.to_string_lossy().replace('\\', "/");
+                    let Some(state) = states.iter().find(|state| state.rel_path == relative_text)
+                    else {
+                        return false;
+                    };
+                    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+                        return false;
+                    };
+                    let Ok(canonical_path) = std::fs::canonicalize(root.join(&relative)) else {
+                        return false;
+                    };
+                    if !canonical_path.starts_with(&canonical_root) {
+                        return false;
+                    }
+                    let Ok((bytes, _)) = read_stable_file(&canonical_path) else {
+                        return false;
+                    };
+                    if file_state::sha256_hex(&bytes) != state.sha256 {
+                        return false;
+                    }
+                    let Ok(tree) = greppy_parser::parse(Language::Rust, &bytes) else {
+                        return false;
+                    };
+                    if tree.root_node().has_error() {
+                        return false;
+                    }
+                    let mut cursor = tree.root_node().walk();
+                    let clear = tree.root_node().named_children(&mut cursor).all(|item| {
+                        if item.kind() == "macro_invocation"
+                            || (item.kind() == "expression_statement"
+                                && (0..item.named_child_count())
+                                    .filter_map(|i| item.named_child(i))
+                                    .any(|child| child.kind() == "macro_invocation"))
+                        {
+                            return false;
+                        }
+                        if item.kind() == "use_declaration"
+                            && (0..item.named_child_count())
+                                .filter_map(|i| item.named_child(i))
+                                .any(|child| child.kind() == "visibility_modifier")
+                        {
+                            return false;
+                        }
+                        !item.child_by_field_name("name").is_some_and(|name| {
+                            matches!(
+                                std::str::from_utf8(&bytes[name.byte_range()]).unwrap_or(""),
+                                "anyhow" | "Option" | "Some"
+                            )
+                        })
+                    });
+                    clear
+                });
+                if proof {
+                    anyhow_glob_proofs.insert(proof_key);
+                }
+            }
+        }
         Ok(GraphIndex {
             by_qname,
             by_id,
@@ -4420,6 +4820,9 @@ impl GraphIndex {
             import_globs_by_file: std::collections::HashMap::new(),
             rust_namespaces_by_file: std::collections::HashMap::new(),
             rust_crate_roots,
+            anyhow_factory_files,
+            anyhow_dependency_binding,
+            anyhow_glob_proofs,
             rust_libraries,
             id_to_file,
             id_to_qname,
@@ -4913,7 +5316,26 @@ impl GraphIndex {
             let owner = edge
                 .properties
                 .get("receiver_owner")
-                .and_then(|value| value.as_str())?;
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    let globs = edge
+                        .properties
+                        .get("receiver_anyhow_glob_files")?
+                        .as_array()?;
+                    let proof_key = format!(
+                        "{}:{}",
+                        edge.file_path,
+                        serde_json::Value::Array(globs.clone())
+                    );
+                    (self.anyhow_factory_files.contains(&edge.file_path)
+                        && self.anyhow_glob_proofs.contains(&proof_key))
+                    .then(|| {
+                        edge.properties
+                            .get("receiver_anyhow_factory_owner")
+                            .and_then(|value| value.as_str())
+                    })
+                    .flatten()
+                })?;
             if edge
                 .properties
                 .get("receiver_option_pattern")
@@ -11861,6 +12283,213 @@ pub fn shadowed(value: Option<i32>, predicate: fn(i32) -> bool) -> bool {
             .outgoing_edges(shadowed.id, Some("USAGE"), 20)
             .unwrap()
             .is_empty());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rust_anyhow_factory_dependency_identity_and_completed_cache_replay() {
+        let source = "#[path=\"projection.rs\"] mod projection; use projection::*; use std::path::Path; struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }";
+        let repo = setup_repo("anyhow-factory-repair", source);
+        fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname='factory_fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nanyhow='1'\n[target.'cfg(windows)'.dependencies]\nother='1'\n[patch.crates-io]\nother={path='other'}\n").unwrap();
+        let lock = format!("version = 3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64));
+        fs::write(repo.join("Cargo.lock"), &lock).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let method = store
+            .get_node_by_qname("test", "src/lib.rs::Writer::upsert")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", store.list_file_states("test").unwrap());
+        store
+            .conn()
+            .execute(
+                "DELETE FROM edges WHERE edge_type='CALLS' AND target_id=?1",
+                [method.id],
+            )
+            .unwrap();
+        store.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_anyhow_factory_owner') WHERE json_extract(properties,'$.callee_name')='upsert'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [anyhow_factory_repair_key("test")],
+            )
+            .unwrap();
+        assert!(
+            !anyhow_factory_edges_repaired(&store).unwrap(),
+            "completed v13 alone cannot certify new external-wrapper provenance"
+        );
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(anyhow_factory_edges_repaired(&store).unwrap());
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", store.list_file_states("test").unwrap())
+        );
+        for exports in [
+            "pub use crate::hidden::Option;\n",
+            "pub struct Some;\n",
+            "generate_exports!();\n",
+        ] {
+            fs::write(repo.join("src/projection.rs"), exports).unwrap();
+            index(&mut store, &repo, "test").unwrap();
+            assert!(
+                store
+                    .incoming_edges(method.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty(),
+                "unproven or shadowing glob exports: {exports}"
+            );
+        }
+        fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        assert_eq!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(
+            repo.join("Cargo.lock"),
+            format!("{lock}{}", lock.strip_prefix("version = 3\n").unwrap()),
+        )
+        .unwrap();
+        assert!(!anyhow_factory_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(
+            store
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .is_empty(),
+            "ambiguous dependency identity must remove inferred caller"
+        );
+        fs::write(repo.join("Cargo.lock"), &lock).unwrap();
+        for dependency in [
+            "anyhow={path='local'}",
+            "anyhow={version='1',package='different'}",
+            "anyhow='2'",
+            "alias={version='1',package='anyhow'}",
+        ] {
+            fs::write(repo.join("Cargo.toml"), format!("[package]\nname='factory_fixture'\nversion='0.1.0'\n[dependencies]\n{dependency}\n")).unwrap();
+            rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+            assert!(
+                store
+                    .incoming_edges(method.id, Some("CALLS"), 20)
+                    .unwrap()
+                    .is_empty(),
+                "{dependency}"
+            );
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn rust_anyhow_factory_overlay_replay_preserves_base_and_refuses_changed_source() {
+        let source = "#[path=\"projection.rs\"] mod projection; use projection::*; use std::path::Path; struct Writer; impl Writer { fn open() -> anyhow::Result<Option<Self>> { loop {} } fn upsert(&mut self) {} } fn caller() { if let Some(mut writer) = Writer::open()? { writer.upsert(); } }";
+        let repo = setup_repo("anyhow-overlay-repair", source);
+        fs::write(repo.join("src/projection.rs"), "pub fn project() {}\n").unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='factory_fixture'\nversion='0.1.0'\n[dependencies]\nanyhow='1'\n",
+        )
+        .unwrap();
+        fs::write(repo.join("Cargo.lock"), format!("version=3\n[[package]]\nname='anyhow'\nversion='1.0.102'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64))).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, &repo, "test").unwrap();
+            base.conn().execute("DELETE FROM edges WHERE edge_type='CALLS' AND target_id IN (SELECT id FROM nodes WHERE name='upsert')", []).unwrap();
+            base.conn().execute("UPDATE raw_edges SET properties=json_remove(properties,'$.receiver_anyhow_factory_owner') WHERE json_extract(properties,'$.callee_name')='upsert'", []).unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM schema_meta WHERE key=?1",
+                    [anyhow_factory_repair_key("test")],
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        mark_rust_caller_edges_repaired(&overlay).unwrap();
+        assert!(!anyhow_factory_edges_repaired(&overlay).unwrap());
+        let nodes = format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", overlay.list_file_states("test").unwrap());
+        let workspace = format!(
+            "{:?}",
+            overlay.get_workspace_state(repo.to_str().unwrap()).unwrap()
+        );
+        recover_persisted_rust_usages(&mut overlay, "test", &repo).unwrap();
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        mark_rust_caller_edges_repaired(&overlay).unwrap();
+        assert!(anyhow_factory_edges_repaired(&overlay).unwrap());
+        let method = overlay
+            .get_node_by_qname("test", "src/lib.rs::Writer::upsert")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(method.id, Some("CALLS"), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", overlay.list_file_states("test").unwrap())
+        );
+        assert_eq!(
+            workspace,
+            format!(
+                "{:?}",
+                overlay.get_workspace_state(repo.to_str().unwrap()).unwrap()
+            )
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+        fs::write(
+            repo.join("src/lib.rs"),
+            source.replace("Writer::open()?", "unknown()?"),
+        )
+        .unwrap();
+        overlay
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [anyhow_factory_repair_key("test")],
+            )
+            .unwrap();
+        assert!(recover_persisted_rust_usages(&mut overlay, "test", &repo).is_err());
+        assert!(!anyhow_factory_edges_repaired(&overlay).unwrap());
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
+        drop(overlay);
         fs::remove_dir_all(repo).unwrap();
     }
 
