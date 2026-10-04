@@ -16776,6 +16776,8 @@ mod tests {
             ("helper();", "", 1),
             ("assert_eq!(helper(), 1);", "", 0),
             ("opaque!(helper());", "", 0),
+            ("assert_eq!(helper(), 1);", "#![no_implicit_prelude]", 0),
+            ("assert_eq!(helper(), 1);", "use other::assert_eq;", 0),
             (
                 "assert_eq!(helper(), 1);",
                 "macro_rules! assert_eq { ($($t:tt)*) => {}; }",
@@ -16784,7 +16786,7 @@ mod tests {
         ] {
             let source = format!(
                 "pub(super) fn helper() -> i32 {{ 1 }}\n\
-                 mod tests {{ use super::*; {macro_definition}\n\
+                 mod tests {{ {macro_definition} use super::*;\n\
                  fn caller() {{ {body} }} }}"
             );
             let tree = crate::parse(Language::Rust, source.as_bytes()).unwrap();
@@ -16817,7 +16819,6 @@ mod tests {
 
     #[test]
     fn extract_rust_finds_function_struct_impl() {
-
         let r = extract(Language::Rust, SIMPLE_RS.as_bytes(), "src/lib.rs").unwrap();
         let names: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(

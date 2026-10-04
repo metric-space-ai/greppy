@@ -3611,6 +3611,17 @@ fn nav_counts_json_with_expand(
         "all": all,
         "hits": hits,
     });
+    if command == "callees" && symbol_found {
+        let ids = resolve_symbol_nodes(store, Some(symbol))?;
+        if crate::nav::has_rust_call_sources(store, &ids)? {
+            v["call_extraction_limits"] = serde_json::json!([{
+                "target": symbol,
+                "reason": "rust_macro_argument_tokens",
+                "message": crate::nav::RUST_MACRO_CALL_COVERAGE_NOTE,
+                "next": format!("greppy read {symbol}"),
+            }]);
+        }
+    }
     if !symbol_found {
         let miss = symbol_miss_json(store, project, symbol);
         v["suggestions"] = miss["suggestions"].clone();
@@ -7618,6 +7629,16 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
         ensure_unambiguous_target(&store, &req.targets[index], ids)?;
     }
     let path_filters = prepare_query_path_filters(req.root, req.command, "", req.paths)?;
+    let rust_macro_limits = resolved
+        .iter()
+        .map(|ids| {
+            if req.kind == NavKind::Callees {
+                crate::nav::has_rust_call_sources(&store, ids)
+            } else {
+                Ok(false)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut rows: Vec<NavRow> = Vec::new();
     let mut totals = vec![0usize; req.targets.len()];
@@ -7733,6 +7754,23 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             "all": req.all,
             "hits": hits,
         });
+        let call_extraction_limits = req
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| rust_macro_limits[*index])
+            .map(|(_, symbol)| {
+                serde_json::json!({
+                    "target": symbol,
+                    "reason": "rust_macro_argument_tokens",
+                    "message": crate::nav::RUST_MACRO_CALL_COVERAGE_NOTE,
+                    "next": format!("greppy read {symbol}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !call_extraction_limits.is_empty() {
+            value["call_extraction_limits"] = serde_json::json!(call_extraction_limits);
+        }
         let unresolved_json = unresolved_by_target
             .iter()
             .enumerate()
@@ -7792,6 +7830,12 @@ fn dispatch_nav_multi(req: NavMultiRequest<'_>) -> Result<i32> {
             println!();
         }
         println!("{symbol}");
+        if rust_macro_limits[index] {
+            println!(
+                "{}; greppy read {symbol}",
+                crate::nav::RUST_MACRO_CALL_COVERAGE_NOTE
+            );
+        }
         let unresolved_page = &unresolved_by_target[index];
         let unresolved_incomplete =
             unresolved_page.total > 0 || unresolved_page.omitted > 0 || unresolved_page.truncated;

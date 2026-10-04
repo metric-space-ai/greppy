@@ -3833,6 +3833,23 @@ pub(crate) fn dispatch_who_calls(
     }
     Ok(0)
 }
+// This is a provider capability limit, not evidence that a particular macro
+// expands to a call. Do not infer prelude identity from an assertion's spelling.
+pub(crate) const RUST_MACRO_CALL_COVERAGE_NOTE: &str =
+    "Rust macro argument tokens (including assert_eq!) are not inspected for calls; inspect the caller source";
+
+pub(crate) fn has_rust_call_sources(store: &greppy_store::Store, ids: &[i64]) -> Result<bool> {
+    for id in ids {
+        if store
+            .get_node(*id)?
+            .is_some_and(|node| node.file_path.ends_with(".rs"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// `greppy callees S` — what `S` calls: every node reached by a direct
 /// outgoing CALLS edge from `S`. Printed as `qualified_name file:line` so
 /// an agent can jump straight to each callee's definition. Backed by the
@@ -3923,6 +3940,7 @@ pub(crate) fn dispatch_callees(
         nav_report_missing(&store, &project, query_symbol);
         return Ok(1);
     }
+    let rust_macro_limit = has_rust_call_sources(&store, &sources)?;
     // Aggregate direct callees across the resolved source nodes, keyed on
     // the callee node id so a callee reached from both a Struct and its
     // Impl is printed once. BTreeMap keeps the output id-ordered. We keep
@@ -3954,6 +3972,9 @@ pub(crate) fn dispatch_callees(
                 Vec::new(),
             )?;
             return Ok(0);
+        }
+        if rust_macro_limit {
+            println!("{RUST_MACRO_CALL_COVERAGE_NOTE}");
         }
         if path_filters.is_empty() {
             println!("no resolved indexed callees; external or unresolved calls may still exist");
@@ -4036,6 +4057,9 @@ pub(crate) fn dispatch_callees(
         });
     }
     print_nav_rows(&repo_root, "callees", &mut rows, code, all);
+    if rust_macro_limit {
+        println!("{RUST_MACRO_CALL_COVERAGE_NOTE}; greppy read {query_symbol}");
+    }
     Ok(0)
 }
 
