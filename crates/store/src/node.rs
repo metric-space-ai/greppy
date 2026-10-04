@@ -467,41 +467,51 @@ impl Store {
         Ok(n)
     }
 
-    /// Change an owned definition identity without dropping its graph node ID.
-    /// Repair a source range without replacing node identity or cached vectors.
-    /// Immutable Base rows keep their negative composed IDs and receive only a
-    /// guarded, additive span override in the private Delta.
-    pub fn update_node_spans(&mut self, spans: &[(i64,i64,i64)]) -> Result<()> {
-      let mut override_changed = false;
-      for &(id,start_line,end_line) in spans {
-        if start_line < 1 || end_line < start_line {
-            return Err(Error::Store("invalid repaired node span".into()));
+    /// Repair ranges inside the caller's transaction without replacing IDs,
+    /// graph relations or cached vectors. Exact vector-backed Base copies get
+    /// the same guarded span override as negative-ID Base definitions.
+    pub fn update_node_spans(&mut self, spans: &[(i64, i64, i64)]) -> Result<()> {
+        let mut override_changed = false;
+        for &(id, start_line, end_line) in spans {
+            if start_line < 1 || end_line < start_line {
+                return Err(Error::Store("invalid repaired node span".into()));
+            }
+            let old = self.get_node(id)?.ok_or_else(|| Error::Store(format!("missing span repair node {id}")))?;
+            let base = if self.is_overlay() {
+                if id < 0 { Some((-id, old.start_line, old.end_line)) }
+                else {
+                    self.conn().query_row(
+                        "SELECT id,start_line,end_line FROM greppy_base.nodes
+                         WHERE project=?1 AND qualified_name=?2 AND label=?3 AND name=?4
+                         AND file_path=?5 AND start_line=?6 AND end_line=?7 AND properties=?8",
+                        params![old.project,old.qualified_name,old.label,old.name,old.file_path,old.start_line,old.end_line,old.properties.to_string()],
+                        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)),
+                    ).optional()?
+                }
+            } else { None };
+            if id >= 0 {
+                self.conn().execute("UPDATE main.nodes SET start_line=?2,end_line=?3 WHERE id=?1",params![id,start_line,end_line])?;
+            }
+            if let Some((base_id,old_start,old_end)) = base {
+                override_changed = true;
+                self.conn().execute(
+                    "INSERT INTO temp.base_node_span_overrides(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(project,node_id) DO UPDATE SET start_line=excluded.start_line,end_line=excluded.end_line",
+                    params![old.project,base_id,old.qualified_name,old_start,old_end,start_line,end_line],
+                )?;
+            }
         }
-        let old = self.get_node(id)?.ok_or_else(|| Error::Store(format!("missing span repair node {id}")))?;
-        if id < 0 && self.is_overlay() {
-            override_changed = true;
+        if override_changed {
             self.conn().execute(
-                "INSERT INTO temp.base_node_span_overrides(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
-                 ON CONFLICT(project,node_id) DO UPDATE SET start_line=excluded.start_line,end_line=excluded.end_line",
-                params![old.project, -id, old.qualified_name, old.start_line, old.end_line, start_line, end_line],
+                "INSERT INTO main.schema_meta(key,value)
+                 SELECT 'greppy.base_node_span_overrides.v1',json_group_array(json_array(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line))
+                 FROM temp.base_node_span_overrides WHERE true
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",[],
             )?;
-        } else {
-            self.conn().execute("UPDATE main.nodes SET start_line=?2,end_line=?3 WHERE id=?1", params![id,start_line,end_line])?;
         }
-      }
-      if override_changed {
-        self.conn().execute(
-          "INSERT INTO main.schema_meta(key,value)
-           SELECT 'greppy.base_node_span_overrides.v1',json_group_array(json_array(project,node_id,qualified_name,old_start_line,old_end_line,start_line,end_line))
-           FROM temp.base_node_span_overrides WHERE true
-           ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
-      }
         Ok(())
     }
-
-    /// Updates contentless FTS postings and retires kind-dependent embeddings.
-    /// Immutable Base identities receive a private override.
     pub fn update_node_identity(&mut self, id: i64, label: &str, qname: &str) -> Result<()> {
         self.conn()
             .execute_batch("SAVEPOINT greppy_node_identity")?;
