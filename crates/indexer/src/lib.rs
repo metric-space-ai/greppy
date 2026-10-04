@@ -7414,8 +7414,8 @@ export function invalidCalls() { plainValue(); effectValue(); }
         let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
         assert_eq!(
             incoming.len(),
-            2,
-            "opening and self-closing sites both resolve"
+            1,
+            "distinct sites share one resolved symbol edge"
         );
         assert!(
             incoming.iter().all(|edge| edge.source_id == render.id),
