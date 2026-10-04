@@ -2945,7 +2945,7 @@ fn extract_js_ts(
             return Err(greppy_core::Error::Parse(format!(
                 "extract_js_ts called with non-JS/TS language: {}",
                 other.name()
-            )));
+            )))
         }
     };
     // The shared spec engine covers Function / Class / Method / Interface /
@@ -7075,7 +7075,7 @@ fn extract_c_cpp(
             return Err(greppy_core::Error::Parse(format!(
                 "extract_c_cpp called with non-C/C++ language: {}",
                 other.name()
-            )));
+            )))
         }
     };
     let mut result = crate::spec::spec_extract(language, spec, queries, source, file_path)?;
@@ -18147,83 +18147,30 @@ fn caller() {
     #[test]
     fn rust_slice_iterator_receiver_requires_transparent_typed_binding() {
         let cases = [
-            (
-                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }",
-                false,
-            ),
-            (
-                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }",
-                false,
-            ),
-            (
-                "struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }",
-                false,
-            ),
-            (
-                "struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }",
-                false,
-            ),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { const items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { items.iter().next(); const items: Custom = Custom; } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } struct Custom; impl Custom { fn iter(&self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { { static items: Custom = Custom; items.iter().next(); } }", false),
+            ("struct Scheduler; impl Scheduler { fn next(self) {} } fn f(items: &[i32]) { { struct items; impl items { fn iter(&self) -> Scheduler { Scheduler } } items.iter().next(); } }", false),
             ("fn f(items: &[i32]) { items.iter().next(); }", true),
             ("fn f(items: &[i32; 2]) { items.iter().next(); }", false),
+
             ("fn f(items: &mut [i32]) { items.iter().next(); }", true),
-            (
-                "fn f() { let items: &[i32] = &[]; items.iter().next(); }",
-                true,
-            ),
-            (
-                "fn f(items: &[i32]) { let items = custom(); items.iter().next(); }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { let f = |items| items.iter().next(); }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }",
-                false,
-            ),
+            ("fn f() { let items: &[i32] = &[]; items.iter().next(); }", true),
+            ("fn f(items: &[i32]) { let items = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { let (items, _) = custom(); items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { for items in custom() { items.iter().next(); } }", false),
+            ("fn f(items: &[i32]) { let f = |items| items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { match custom() { Some(items) => { items.iter().next(); }, _ => {} } }", false),
+            ("fn f(items: &[i32]) { if let Some(items) = custom() { items.iter().next(); } }", false),
             ("fn f(items: Custom) { items.iter().next(); }", false),
-            (
-                "type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }",
-                false,
-            ),
+            ("type Alias = &'static [i32]; fn f(items: Alias) { items.iter().next(); }", false),
             ("fn f() { let items = &[1,2]; items.iter().next(); }", false),
-            (
-                "fn f(items: &[i32]) { items.iter().map(custom).next(); }",
-                false,
-            ),
-            (
-                "fn f(items: &mut [i32]) { items.iter_mut().next(); }",
-                false,
-            ),
-            (
-                "use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }",
-                false,
-            ),
-            (
-                "trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }",
-                false,
-            ),
-            (
-                "fn f(items: &[i32]) { inject!(); items.iter().next(); }",
-                false,
-            ),
-            (
-                "#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }",
-                false,
-            ),
+            ("fn f(items: &[i32]) { items.iter().map(custom).next(); }", false),
+            ("fn f(items: &mut [i32]) { items.iter_mut().next(); }", false),
+            ("use custom::Iter; fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("trait Iter { fn iter(self) -> Scheduler; } impl Iter for &[i32] { fn iter(self) -> Scheduler { Scheduler } } fn f(items: &[i32]) { items.iter().next(); }", false),
+            ("fn f(items: &[i32]) { inject!(); items.iter().next(); }", false),
+            ("#[custom::inject] struct X; fn f(items: &[i32]) { items.iter().next(); }", false),
         ];
         for (source, proven) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
@@ -18309,60 +18256,31 @@ fn f(manifest: Manifest) {
                     format!("field.uniform(); {declaration}")
                 };
                 for source in [
-                    format!(
-                        "fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"
-                    ),
-                    format!(
-                        "fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"
-                    ),
+                    format!("fn f(value: Option<Field>) {{ match value {{ Some(field) => {{ {body} }}, _ => () }} }}"),
+                    format!("fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => {{ {body} }}, _ => () }} }}"),
                 ] {
                     let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-                    let call = result
-                        .edges
-                        .iter()
-                        .find(|edge| {
-                            edge.edge_type == "CALLS"
-                                && edge.properties.get("callee_name").and_then(|v| v.as_str())
-                                    == Some("uniform")
-                        })
-                        .unwrap();
+                    let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                        && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
                     assert!(call.properties.get("receiver_owner").is_none(), "{source}");
-                    assert!(
-                        call.properties.get("receiver_provenance").is_none(),
-                        "{source}"
-                    );
+                    assert!(call.properties.get("receiver_provenance").is_none(), "{source}");
                 }
             }
         }
         for (opaque, provenance) in [
             ("use custom::*;", Some("custom")),
-            (
-                "trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }",
-                None,
-            ),
-            (
-                "inject_some_and_adapter!();",
-                Some("inject_some_and_adapter"),
-            ),
+            ("trait Consume { fn as_ref(self) -> Option<Other>; } impl Consume for Option<Field> { fn as_ref(self) -> Option<Other> { None } }", None),
+            ("inject_some_and_adapter!();", Some("inject_some_and_adapter")),
             ("helper::assert!();", Some("helper::assert")),
             ("#[custom::allow]", Some("custom::allow")),
             ("macro_rules! println { () => {}; }", Some("println")),
             ("#[unknown_attribute]", Some("unknown_attribute")),
             ("use custom::Some;", None),
         ] {
-            let source = format!(
-                "{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}"
-            );
+            let source = format!("{opaque} fn f(manifest: crate::scene::Manifest) {{ match manifest.remaster_irradiance.as_ref() {{ Some(field) => field.uniform(), _ => () }} }}");
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result
-                .edges
-                .iter()
-                .find(|edge| {
-                    edge.edge_type == "CALLS"
-                        && edge.properties.get("callee_name").and_then(|v| v.as_str())
-                            == Some("uniform")
-                })
-                .unwrap();
+            let call = result.edges.iter().find(|edge| edge.edge_type == "CALLS"
+                && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("uniform")).unwrap();
             let fact = call.properties.get("receiver_provenance");
             assert_eq!(fact.is_some(), provenance.is_some(), "{source}");
             if let Some(marker) = provenance {
@@ -18375,46 +18293,16 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_option_field_patterns_preserve_only_explicit_provenance() {
         let cases = [
-            (
-                "use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
-                Some("wasm_bindgen::prelude"),
-            ),
-            (
-                "use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
-                Some("crate::scene::Manifest"),
-            ),
-            (
-                "#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { println!(\"load\"); field.uniform(); } }",
-                Some(""),
-            ),
-            (
-                "fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
-                Some(""),
-            ),
-            (
-                "fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }",
-                None,
-            ),
-            (
-                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }",
-                None,
-            ),
-            (
-                "fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
+            ("use crate::scene::Manifest; use wasm_bindgen::prelude::*; fn f(manifest: &Manifest, matrix: Option<Matrix>) { match (manifest.remaster_irradiance.as_ref(), matrix) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("wasm_bindgen::prelude")),
+            ("use crate::scene::Manifest; use std::collections::BTreeMap; fn f() { let manifest: Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("crate::scene::Manifest")),
+            ("#[allow(unused)] fn f(manifest: crate::scene::Manifest) { if let Some(field) = manifest.remaster_irradiance.as_ref() { println!(\"load\"); field.uniform(); } }", Some("")),
+            ("fn f() { let manifest: crate::scene::Manifest = opaque(); match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", Some("")),
+            ("fn f(manifest: Manifest) { let manifest = opaque(); match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => { let c = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(manifest: Manifest) { match manifest.remaster_irradiance.custom_adapter() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Manifest>(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(manifest: Manifest) { match manifest.remaster_irradiance.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
         ];
         for (source, marker) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/gpu.rs").unwrap();
@@ -18473,96 +18361,22 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_factory_option_patterns_use_explicit_signatures_without_guessing_wrappers() {
         for (signature, extra, body, expected, diagnostic) in [
-            (
-                "Option<Self>",
-                "",
-                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
-                Some("Writer"),
-                false,
-            ),
-            (
-                "Result<Option<Self>, ()>",
-                "",
-                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
-                Some("Writer"),
-                false,
-            ),
-            (
-                "FactoryResult<Option<Self>>",
-                "type FactoryResult<T> = Result<T, ()>;",
-                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
-                Some("Writer"),
-                false,
-            ),
-            (
-                "anyhow::Result<Option<Self>>",
-                "",
-                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
-                None,
-                true,
-            ),
-            (
-                "Option<Other>",
-                "struct Other;",
-                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
-                None,
-                true,
-            ),
-            (
-                "Option<Self>",
-                "use custom::Some;",
-                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
-                None,
-                true,
-            ),
-            (
-                "Option<Self>",
-                "",
-                "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }",
-                None,
-                false,
-            ),
-            (
-                "Option<Self>",
-                "",
-                "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }",
-                None,
-                false,
-            ),
-            (
-                "Option<Self>",
-                "enum Option<T> { Some(T), None }",
-                "if let Some(mut writer) = Writer::open() { writer.upsert(); }",
-                None,
-                true,
-            ),
-            (
-                "Result<Option<Self>, ()>",
-                "enum Result<T,E> { Ok(T), Err(E) }",
-                "if let Some(mut writer) = Writer::open()? { writer.upsert(); }",
-                None,
-                true,
-            ),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", Some("Writer"), false),
+            ("Result<Option<Self>, ()>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("FactoryResult<Option<Self>>", "type FactoryResult<T> = Result<T, ()>;", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", Some("Writer"), false),
+            ("anyhow::Result<Option<Self>>", "", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
+            ("Option<Other>", "struct Other;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "use custom::Some;", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { let writer = opaque(); writer.upsert(); }", None, false),
+            ("Option<Self>", "", "if let Some(mut writer) = Writer::open() { } else { writer.upsert(); }", None, false),
+            ("Option<Self>", "enum Option<T> { Some(T), None }", "if let Some(mut writer) = Writer::open() { writer.upsert(); }", None, true),
+            ("Result<Option<Self>, ()>", "enum Result<T,E> { Ok(T), Err(E) }", "if let Some(mut writer) = Writer::open()? { writer.upsert(); }", None, true),
         ] {
-            let source = format!(
-                "{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}"
-            );
+            let source = format!("{extra} struct Writer; impl Writer {{ fn open() -> {signature} {{ loop {{}} }} fn upsert(&mut self) {{}} }} fn caller() {{ {body} }}");
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result
-                .edges
-                .iter()
-                .find(|edge| edge.properties["callee_name"] == "upsert")
-                .unwrap();
-            assert_eq!(
-                call.properties["receiver_owner"].as_str(),
-                expected,
-                "{source}"
-            );
-            assert_eq!(
-                call.properties.get("receiver_factory_pattern").is_some(),
-                diagnostic,
-                "{source}"
-            );
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
+            assert_eq!(call.properties["receiver_owner"].as_str(), expected, "{source}");
+            assert_eq!(call.properties.get("receiver_factory_pattern").is_some(), diagnostic, "{source}");
         }
     }
 
@@ -18621,17 +18435,10 @@ fn f(manifest: Manifest) {
             "struct Writer; impl Writer { fn open() -> Option<Self> { loop {} } } fn caller() { if let Some(mut writer) = Writer::open() { let f = |writer| writer.upsert(); } }",
         ] {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
-            let call = result
-                .edges
-                .iter()
-                .find(|edge| edge.properties["callee_name"] == "upsert")
-                .unwrap();
+            let call = result.edges.iter().find(|edge| edge.properties["callee_name"] == "upsert").unwrap();
             assert!(call.properties.get("receiver_owner").is_none(), "{source}");
             if source.contains("|writer|") {
-                assert!(
-                    call.properties.get("receiver_factory_pattern").is_none(),
-                    "{source}"
-                );
+                assert!(call.properties.get("receiver_factory_pattern").is_none(), "{source}");
             }
         }
     }
@@ -18639,66 +18446,21 @@ fn f(manifest: Manifest) {
     #[test]
     fn rust_option_patterns_require_explicit_unshadowed_type_evidence() {
         let cases = [
-            (
-                "fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
-                Some("Field"),
-            ),
-            (
-                "fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }",
-                Some("crate::lighting::Field"),
-            ),
-            (
-                "fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }",
-                Some("Field"),
-            ),
-            (
-                "fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }",
-                Some("Field"),
-            ),
-            (
-                "fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }",
-                None,
-            ),
-            (
-                "fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }",
-                None,
-            ),
-            (
-                "fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }",
-                None,
-            ),
-            (
-                "fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }",
-                None,
-            ),
-            (
-                "enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }",
-                None,
-            ),
-            (
-                "fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }",
-                Some("Wrong"),
-            ),
+            ("fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Option<crate::lighting::Field>, other: Option<Matrix>) { match (value, other) { (Some(field), Some(matrix)) => field.uniform(), _ => () } }", Some("crate::lighting::Field")),
+            ("fn f(value: Option<Field>) { if let Some(field) = value { field.uniform(); } }", Some("Field")),
+            ("fn f() { let value: Option<Field> = opaque(); match value { Some(field) => field.uniform(), _ => () } }", Some("Field")),
+            ("fn f(value: Unknown, field: Wrong) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let field = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let (field, _) = opaque(); field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value { Some(field) => { let closure = |field| field.uniform(); }, _ => () } }", None),
+            ("fn f(value: Option<Field>) { match value.as_ref() { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(manifest: Manifest) { match (manifest.remaster_irradiance.as_ref(), opaque()) { (Some(field), Some(matrix)) => field.uniform(matrix), _ => () } }", None),
+            ("enum Option<T> { Some(T), None } fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("use custom::Some; fn f(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f<Option>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("struct Field; fn f<Field>(value: Option<Field>) { match value { Some(field) => field.uniform(), _ => () } }", None),
+            ("fn f(value: Option<Field>, field: Wrong) { if let Some(field) = value {} else { field.uniform(); } }", Some("Wrong")),
         ];
         for (source, expected) in cases {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
@@ -20765,12 +20527,11 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
             "import { type Effect } from 'effect';",
             "import { Effect } from 'effect'; function shadow() { const { Effect } = local; }",
             "import { Effect } from 'effect'; function shadow() { const { local: Effect } = local; }",
+
             "import { Effect } from 'effect'; function unrelated(Effect: unknown) {}",
             "import { Effect } from 'elsewhere';",
         ] {
-            let source = format!(
-                "{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}"
-            );
+            let source = format!("{prefix}\nconst value = Effect.fn('value')(function* () {{ return 42; }}); function caller() {{ value(); }}");
             let result = ts(&source, "shadow.ts");
             assert!(
                 result
@@ -20779,12 +20540,10 @@ export const resolveGatewayRoutedEnvironment = Effect.fn("resolveGatewayRoutedEn
                     .any(|node| node.name == "value" && node.label == "Variable"),
                 "unproven or shadowed factory must remain a Variable: {prefix}"
             );
-            assert!(
-                !result
-                    .nodes
-                    .iter()
-                    .any(|node| node.name == "value" && node.label == "Function")
-            );
+            assert!(!result
+                .nodes
+                .iter()
+                .any(|node| node.name == "value" && node.label == "Function"));
         }
     }
 
