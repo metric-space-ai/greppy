@@ -1947,6 +1947,7 @@ fn resolve_edges_with_replacement(
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
+        push_rust_enum_owner_usage(&index, project, src_id, target_id, edge, &mut resolved);
     }
 
     // Persist every resolved edge in a SINGLE transaction (was: one
@@ -2140,7 +2141,7 @@ fn load_all_raw_edges(store: &Store, project: &str) -> Result<Vec<ExtractedEdge>
     Ok(rows.into_iter().map(extracted_edge_from_raw).collect())
 }
 
-pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v12";
+pub const RUST_CALLER_EDGES_REPAIR_META_KEY: &str = "greppy.rust_caller_edges_repair.v13";
 pub const RUST_CALLER_EDGES_REPAIR_COMPLETE: &str = "complete";
 
 pub fn rust_caller_edges_repaired(store: &Store) -> Result<bool> {
@@ -3009,6 +3010,7 @@ fn resolve_edges_incremental(
             continue;
         }
         resolved.push(new_edge(project, src_id, target_id, edge));
+        push_rust_enum_owner_usage(&index, project, src_id, target_id, edge, &mut resolved);
     }
 
     progress(IndexBuildProgress::new("writing_resolved_edges", 0, 1));
@@ -3105,6 +3107,54 @@ fn take_option_field_unresolved_for(edge: &ExtractedEdge) -> Option<Vec<String>>
             None
         }
     })
+}
+
+/// An exact resolved variant also proves a dependency on its owning enum.
+fn push_rust_enum_owner_usage(
+    index: &GraphIndex,
+    project: &str,
+    source_id: i64,
+    target_id: i64,
+    edge: &ExtractedEdge,
+    resolved: &mut Vec<NewEdge>,
+) {
+    if !edge.file_path.ends_with(".rs") || !matches!(edge.edge_type.as_str(), "USAGE" | "CALLS") {
+        return;
+    }
+    // Only an already-resolved exact variant proves an enum dependency. Do
+    // not guess a type from an arbitrary module/associated-member prefix.
+    let Some(qname) = index.qname_for_id(target_id) else {
+        return;
+    };
+    let Some(variant) = index
+        .by_qname(qname)
+        .filter(|node| node.label == "EnumVariant")
+    else {
+        return;
+    };
+    let Some((prefix, _)) = qname.rsplit_once("::") else {
+        return;
+    };
+    let Some((file, owner_name)) = prefix.rsplit_once("::") else {
+        return;
+    };
+    if file != variant.file_path {
+        return;
+    }
+    let Some(owner) = index
+        .by_qname(&format!("{file}::Enum::{owner_name}"))
+        .filter(|node| node.label == "Enum")
+    else {
+        return;
+    };
+    if owner.id == source_id {
+        return;
+    }
+    resolved.push(NewEdge {
+        project: project.to_owned(), source_id, target_id: owner.id,
+        edge_type: "USAGE".into(),
+        properties: serde_json::json!({ "line": edge.line, "rust_enum_variant_owner": true, "variant": qname }),
+    });
 }
 
 /// Build a [`NewEdge`] from a resolved source/target pair, cloning the
@@ -4539,6 +4589,14 @@ impl GraphIndex {
     /// direct-qname, callable-name, then constructable fallback sequence.
     fn resolve_call_target(&self, edge: &ExtractedEdge) -> Option<i64> {
         clear_option_field_unresolved();
+        if edge
+            .properties
+            .get("rust_local_type_owner")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return None;
+        }
         let src = self.by_qname(&edge.source_qualified_name)?;
         let src_id = src.id;
         let name = edge
@@ -5085,6 +5143,16 @@ impl GraphIndex {
         {
             return None;
         }
+        let labels = if edge
+            .properties
+            .get("rust_type_reference")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            &TYPE_LABELS[..]
+        } else {
+            &USAGE_LABELS[..]
+        };
         let name = edge
             .properties
             .get("ref_name")
@@ -5112,7 +5180,7 @@ impl GraphIndex {
                     )
                 })
                 .unwrap_or_else(|| self.rust_module_files_for_path(referrer_file, ref_path, name));
-            let imported = self.rust_module_export_targets(&module_files, name, &USAGE_LABELS);
+            let imported = self.rust_module_export_targets(&module_files, name, labels);
             if let [id] = imported.as_slice() {
                 return Some(*id);
             }
@@ -5120,13 +5188,17 @@ impl GraphIndex {
                 .iter()
                 .any(|file| self.known_files.contains(file))
             {
-                return self.resolve_associated_member(src_id, ref_path, name, &["EnumVariant"]);
+                return (labels == &USAGE_LABELS[..])
+                    .then(|| {
+                        self.resolve_associated_member(src_id, ref_path, name, &["EnumVariant"])
+                    })
+                    .flatten();
             }
             // Never discard syntactic qualification and retry this as an
             // unqualified same-file/import lookup.
             return None;
         }
-        self.resolve_unique_with_imports(&USAGE_LABELS, name, src_id)
+        self.resolve_unique_with_imports(labels, name, src_id)
     }
 
     /// Resolve a receiver call only when its statically observed owner and
@@ -7194,6 +7266,135 @@ def Widget():
             calls.iter().all(|edge| edge.target_id != widget_class.id),
             "ambiguous callable `Widget` must not guess the class constructor target, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn rust_type_arguments_and_variant_owners_preserve_exact_import_and_shadow_resolution() {
+        let repo = setup_multifile_repo(
+            "type-inputs",
+            r#"
+mod helper; mod other;
+use helper::{Marker, Response as Imported};
+enum Response { Ready, Tuple(u8), Struct { count: u8 } }
+fn Response() {}
+fn parse<T>() {}
+fn generic_local() { parse::<Response>(); }
+fn generic_imported() { parse::<Imported>(); }
+fn generic_qualified() { parse::<other::Response>(); }
+fn generic_missing() { parse::<missing::Response>(); }
+fn generic_shadow<Response>() { parse::<Response>(); }
+fn value_shadow(Response: fn()) { let _ = Response; }
+fn variant_local() { let _ = Response::Ready; }
+fn variant_tuple() { let _ = Response::Tuple(1); }
+fn variant_struct() { let value = Response::Struct { count: 1 }; match value { Response::Struct { count } => count, _ => 0 }; }
+fn variant_imported() { let _ = Imported::Ready; }
+fn variant_qualified() { let _ = other::Response::Ready; }
+fn variant_missing() { let _ = missing::Response::Ready; }
+fn variant_wrong() { let _ = Response::Missing; }
+fn variant_shadow<Response>() { let _ = Response::Ready; let _ = Response::Tuple(1); }
+"#,
+            "pub struct Marker; pub enum Response { Ready }\n",
+        );
+        fs::write(repo.join("src/other.rs"), "pub enum Response { Ready }\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").unwrap();
+        let check = |store: &Store| {
+            for (file, callers) in [
+                (
+                    "src/lib.rs",
+                    vec![
+                        "generic_local",
+                        "variant_local",
+                        "variant_tuple",
+                        "variant_struct",
+                    ],
+                ),
+                (
+                    "src/helper.rs",
+                    vec!["generic_imported", "variant_imported"],
+                ),
+                (
+                    "src/other.rs",
+                    vec!["generic_qualified", "variant_qualified"],
+                ),
+            ] {
+                let target = store
+                    .get_node_by_qname("test", &format!("{file}::Enum::Response"))
+                    .unwrap()
+                    .unwrap();
+                let incoming = store.incoming_edges(target.id, Some("USAGE"), 100).unwrap();
+                let sources = incoming
+                    .iter()
+                    .map(|edge| store.get_node(edge.source_id).unwrap().unwrap().name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    sources,
+                    callers
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    "{file}: {incoming:?}"
+                );
+            }
+            let callable = store
+                .get_node_by_qname("test", "src/lib.rs::Function::Response")
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .incoming_edges(callable.id, Some("USAGE"), 100)
+                .unwrap()
+                .is_empty());
+            for caller in [
+                "generic_missing",
+                "generic_shadow",
+                "value_shadow",
+                "variant_missing",
+                "variant_wrong",
+                "variant_shadow",
+            ] {
+                let caller = store
+                    .get_node_by_qname("test", &format!("src/lib.rs::Function::{caller}"))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    store
+                        .outgoing_edges(caller.id, Some("USAGE"), 100)
+                        .unwrap()
+                        .is_empty(),
+                    "{}",
+                    caller.name
+                );
+            }
+        };
+        check(&store);
+        let states = store.list_file_states("test").unwrap();
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        store
+            .conn()
+            .execute("DELETE FROM edges WHERE edge_type='USAGE'", [])
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM raw_edges WHERE edge_type='USAGE'", [])
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM schema_meta WHERE key=?1",
+                [RUST_CALLER_EDGES_REPAIR_META_KEY],
+            )
+            .unwrap();
+        store.conn().execute("INSERT INTO schema_meta(key,value) VALUES('greppy.rust_caller_edges_repair.v12','complete')", []).unwrap();
+        assert!(!rust_caller_edges_repaired(&store).unwrap());
+        rebuild_single_store_rust_edges(&mut store, "test").unwrap();
+        assert!(rust_caller_edges_repaired(&store).unwrap());
+        check(&store);
+        assert_eq!(store.list_file_states("test").unwrap(), states);
+        assert_eq!(
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap()),
+            nodes
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     /// Write a repo with two source files: `src/lib.rs` and

@@ -1673,7 +1673,21 @@ fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {
 
 fn rust_node_is_call_target(node: Node<'_>, call: Node<'_>) -> bool {
     call.child_by_field_name("function")
-        .map(|function| node_contains(function, node))
+        .map(|function| {
+            // Turbofish arguments belong to the call's type/value inputs,
+            // not its callee. Suppressing the entire generic_function loses
+            // parse::<Response>() and parse::<module::Response>().
+            if function.kind() == "generic_function" {
+                for index in 0..function.named_child_count() {
+                    if function.named_child(index).is_some_and(|child| {
+                        child.kind() == "type_arguments" && node_contains(child, node)
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            node_contains(function, node)
+        })
         .unwrap_or(false)
 }
 
@@ -1860,6 +1874,61 @@ fn rust_usage_has_local_value_binding(source: &[u8], reference: Node<'_>, name: 
                 .is_some_and(|pattern| binds(source, pattern, name))
         {
             return true;
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
+// Tree-sitter also uses type_identifier for the owner/name of struct-style
+// enum construction and patterns. Those paths must keep variant resolution.
+fn rust_reference_is_type_usage(reference: Node<'_>) -> bool {
+    if reference.kind() != "type_identifier" {
+        return false;
+    }
+    let mut ancestor = reference.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "struct_expression" | "struct_pattern" | "tuple_struct_pattern"
+        ) && scope
+            .child_by_field_name("type")
+            .or_else(|| scope.child_by_field_name("name"))
+            .is_some_and(|constructor| node_contains(constructor, reference))
+        {
+            return false;
+        }
+        if scope.kind() == "function_item" {
+            break;
+        }
+        ancestor = scope.parent();
+    }
+    true
+}
+
+/// A generic type parameter is not a reference to a same-named project type.
+fn rust_usage_has_local_type_binding(source: &[u8], reference: Node<'_>, name: &str) -> bool {
+    let mut ancestor = reference.parent();
+    let mut function_seen = false;
+    while let Some(scope) = ancestor {
+        if scope.kind() == "function_item" {
+            if function_seen {
+                break;
+            }
+            function_seen = true;
+        }
+        if let Some(parameters) = scope.child_by_field_name("type_parameters") {
+            for index in 0..parameters.named_child_count() {
+                let Some(parameter) = parameters.named_child(index) else {
+                    continue;
+                };
+                if matches!(parameter.kind(), "type_parameter" | "const_parameter")
+                    && named_child_of_kinds(parameter, &["type_identifier", "identifier"])
+                        .is_some_and(|binding| node_text(source, binding) == name)
+                {
+                    return true;
+                }
+            }
         }
         ancestor = scope.parent();
     }
@@ -4272,6 +4341,16 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                             if let (Some(path), Some(object)) =
                                 (callee_path, properties.as_object_mut())
                             {
+                                if rust_usage_has_local_type_binding(
+                                    source,
+                                    node,
+                                    path.split("::").next().unwrap_or(""),
+                                ) {
+                                    object.insert(
+                                        "rust_local_type_owner".into(),
+                                        serde_json::json!(true),
+                                    );
+                                }
                                 object.insert(
                                     "callee_path".into(),
                                     serde_json::Value::String(path.to_string()),
@@ -4322,6 +4401,14 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                 line: node.start_position().row as u32 + 1,
                 properties: {
                     let mut properties = serde_json::json!({ "ref_name": text });
+                    if rust_reference_is_type_usage(node) {
+                        properties["rust_type_reference"] = serde_json::json!(true);
+                        if ref_path.is_none()
+                            && rust_usage_has_local_type_binding(source, node, text)
+                        {
+                            properties["ref_local_binding"] = serde_json::json!(true);
+                        }
+                    }
                     if ref_path.is_none()
                         && node.kind() == "identifier"
                         && rust_usage_has_local_value_binding(source, node, text)
@@ -4331,6 +4418,13 @@ fn extract_rust(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
                         properties["ref_local_binding"] = serde_json::json!(true);
                     }
                     if let (Some(path), Some(object)) = (ref_path, properties.as_object_mut()) {
+                        if rust_usage_has_local_type_binding(
+                            source,
+                            node,
+                            path.split("::").next().unwrap_or(""),
+                        ) {
+                            object.insert("ref_local_binding".into(), serde_json::json!(true));
+                        }
                         object.insert(
                             "ref_path".into(),
                             serde_json::Value::String(path.to_string()),
@@ -17461,6 +17555,58 @@ fn f(manifest: Manifest) {
         assert!(
             us.contains(&("src/lib.rs::Function::build".into(), "Config".into())),
             "let-binding type Config missing: {us:?}"
+        );
+    }
+
+    #[test]
+    fn rust_turbofish_types_are_usages_but_callee_and_type_parameter_are_not_globals() {
+        let result = extract(
+            Language::Rust,
+            br#"
+enum Response { Ready }
+fn parse<T>() {}
+fn plain() { parse::<Response>(); }
+fn scoped() { parse::<crate::Response>(); }
+fn shadowed<Response>() { parse::<Response>(); }
+"#,
+            "src/lib.rs",
+        )
+        .unwrap();
+        let usages = result
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_type == "USAGE")
+            .collect::<Vec<_>>();
+        for caller in ["plain", "scoped", "shadowed"] {
+            let edge = usages
+                .iter()
+                .find(|edge| {
+                    edge.source_qualified_name == format!("src/lib.rs::Function::{caller}")
+                        && edge.properties["ref_name"] == "Response"
+                })
+                .unwrap();
+            assert_eq!(edge.properties["rust_type_reference"], true);
+            assert_eq!(
+                edge.properties
+                    .get("ref_local_binding")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                caller == "shadowed"
+            );
+            if caller == "scoped" {
+                assert_eq!(edge.properties["ref_path"], "crate::Response");
+            }
+        }
+        assert!(!usages
+            .iter()
+            .any(|edge| edge.properties["ref_name"] == "parse"));
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_type == "CALLS")
+                .count(),
+            3
         );
     }
 
