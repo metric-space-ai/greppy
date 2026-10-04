@@ -932,7 +932,11 @@ pub(crate) fn complete_visible_overlay_rust_repair(
         let existing_edges: i64 = overlay
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM main.overlay_edges WHERE project = ?1",
+                // The structural spine has no parser raw facts. Its presence
+                // is valid even in a fresh graph containing only definitions.
+                "SELECT COUNT(*) FROM main.overlay_edges
+                 WHERE project = ?1
+                   AND edge_type NOT IN ('CONTAINS_FILE', 'CONTAINS_FOLDER', 'DEFINES')",
                 [project],
                 |row| row.get(0),
             )
@@ -3382,6 +3386,35 @@ mod tests {
                 ..Default::default()
             };
             greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+            // A genuinely legacy resolved reference without raw facts must
+            // still be refused; structural edges alone are safe to certify.
+            let caller = overlay
+                .get_node_by_qname("p", "src/a.rs::Function::changed_delta")
+                .unwrap()
+                .unwrap();
+            let target = overlay
+                .get_node_by_qname("p", "member/src/lib.rs::Function::unchanged_member")
+                .unwrap()
+                .unwrap();
+            overlay
+                .insert_edge(&greppy_store::NewEdge {
+                    project: "p".into(),
+                    source_id: caller.id,
+                    target_id: target.id,
+                    edge_type: "CALLS".into(),
+                    properties: Default::default(),
+                })
+                .unwrap();
+            let error =
+                complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap_err();
+            assert!(error.to_string().contains("no persisted raw edges"));
+            overlay
+                .conn()
+                .execute(
+                    "DELETE FROM main.overlay_edges WHERE project='p' AND edge_type='CALLS'",
+                    [],
+                )
+                .unwrap();
             complete_visible_overlay_rust_repair(&mut overlay, repo.path(), "p").unwrap();
             assert!(!persisted_v7_delta_needs_repair(&overlay, repo.path()).unwrap());
         }
