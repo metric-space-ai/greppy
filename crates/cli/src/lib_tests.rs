@@ -3625,6 +3625,8 @@ fn gated_index_demand_child() {
         return;
     }
     let _guard = BackgroundJobGuard::from_env();
+    let ready = std::env::var_os("GREPPY_TEST_GATED_DEMAND_READY").unwrap();
+    std::fs::write(ready, b"monitor started").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(5));
     panic!("the index child did not stop after its last query waiter exited");
 }
@@ -3635,6 +3637,16 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
     let root = tempfile::tempdir().unwrap();
     let job_path = root.path().join("index.job");
     let wrapper_pid = std::process::id();
+    let store = root.path().join("store");
+    let ready = root.path().join("ready");
+    let demand = greppy_core::cache::acquire_named_lock_in(
+        &store,
+        "isolated-query-demand",
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .unwrap()
+    .unwrap();
     start_background_job_record(
         &job_path,
         &serde_json::json!({
@@ -3651,16 +3663,28 @@ fn gated_index_demand_cancels_the_published_wrapper_identity() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "tests::gated_index_demand_child", "--nocapture"])
         .env("GREPPY_TEST_GATED_DEMAND_CHILD", "1")
+        .env("GREPPY_TEST_GATED_DEMAND_READY", &ready)
         .env("GREPPY_BACKGROUND_JOB", &job_path)
         .env_remove(ENV_DELEGATED_BACKGROUND_JOB)
         .env(ENV_BACKGROUND_DEMAND_LOCK, "isolated-query-demand")
-        .env("GREPPY_STORE_DIR", root.path().join("store"))
+        .env("GREPPY_STORE_DIR", &store)
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()
         .unwrap();
     assert_ne!(child.id(), wrapper_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !ready.exists() {
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("owned demand-monitor fixture did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(read_background_job(&job_path).unwrap()["state"], "refreshing");
+    drop(demand);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
