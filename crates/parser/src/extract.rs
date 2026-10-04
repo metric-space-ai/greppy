@@ -4456,6 +4456,15 @@ fn rust_expression_macro_shadowed_bindings(
                 shadowed.insert(node_text(source, name).to_string());
             }
         }
+        if node.kind() == "extern_crate_declaration" {
+            // An extern-prelude dependency does not prove the identity of an
+            // explicitly rebound crate namespace (including macro_use crates).
+            if let Some(name) = node.child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                shadowed.insert(node_text(source, name).to_string());
+            }
+        }
         if node.kind() == "use_declaration" {
             if let Some(argument) = node.child_by_field_name("argument") {
                 for import in expand_use_tree(source, argument, "") {
@@ -18001,6 +18010,7 @@ fn caller() {
             "use custom::ensure; ensure!(decoy());",
             "use custom::dsl as ensure; assert!({ ensure!(decoy()); true });",
             "use custom::*; ensure!(decoy());",
+            "extern crate custom as anyhow; anyhow::ensure!(decoy());",
         ] {
             let source = format!(
                 "use anyhow::ensure; fn decoy() -> bool {{ true }} fn caller() {{ assert!({{ {body} true }}); }}"
@@ -18040,6 +18050,8 @@ fn caller() {
             "fn caller() { custom::assert!(decoy()); }",
             "mod anyhow {} fn caller() { anyhow::ensure!(decoy()); }",
             "use custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate anyhow as real_anyhow; extern crate custom as anyhow; fn caller() { anyhow::ensure!(decoy()); }",
+            "extern crate custom as std; fn caller() { std::assert!(decoy()); }",
         ] {
             let result = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
             assert!(
