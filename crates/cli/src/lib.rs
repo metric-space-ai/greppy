@@ -5046,6 +5046,7 @@ struct BackgroundJobGuard {
     eta_basis: Option<&'static str>,
     rate_milli_documents_per_second: Option<u64>,
     embedding_started: Option<std::time::Instant>,
+    index_phase_started: Option<std::time::Instant>,
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
@@ -5169,6 +5170,7 @@ impl BackgroundJobGuard {
             eta_basis: None,
             rate_milli_documents_per_second: None,
             embedding_started: None,
+            index_phase_started: None,
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
@@ -5210,6 +5212,7 @@ impl BackgroundJobGuard {
         self.global_cache_misses = 0;
         let now = std::time::Instant::now();
         self.embedding_started = Some(now);
+        self.index_phase_started = None;
         self.progress_phase = Some("embedding");
         self.rate_milli_documents_per_second = None;
         self.current_detail = None;
@@ -5224,7 +5227,13 @@ impl BackgroundJobGuard {
     }
 
     fn indexing_progress(&mut self, progress: greppy_indexer::IndexBuildProgress) {
-        let phase_changed = self.progress_phase != Some(progress.phase);
+        let now = std::time::Instant::now();
+        let phase_changed = self.progress_phase != Some(progress.phase)
+            || progress.completed_files < self.completed_documents
+            || progress.total_files != self.total_documents;
+        if phase_changed {
+            self.index_phase_started = Some(now);
+        }
         self.progress_phase = Some(progress.phase);
         self.completed_documents = progress.completed_files;
         self.total_documents = progress.total_files;
@@ -5237,8 +5246,24 @@ impl BackgroundJobGuard {
         self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
+        self.current_detail = Some(format!(
+            "{}; measured remaining time applies to this phase, not the whole index",
+            progress.phase.replace('_', " ")
+        ));
+        if let Some(started) = self.index_phase_started {
+            let elapsed_ms = u64::try_from(now.duration_since(started).as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            self.eta_seconds = observed_embedding_eta_seconds(
+                self.completed_documents,
+                self.total_documents,
+                elapsed_ms,
+            );
+            self.eta_basis = self.eta_seconds.map(|_| "observed_graph_phase");
+            self.rate_milli_documents_per_second =
+                observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+        }
 
-        let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
         let publish = phase_changed
             || finished
@@ -5264,6 +5289,8 @@ impl BackgroundJobGuard {
         self.eta_basis = None;
         self.rate_milli_documents_per_second = None;
         self.embedding_started = None;
+        self.index_phase_started = None;
+        self.current_detail = Some(phase.replace('_', " "));
         self.write_state(phase, None);
         self.last_progress_write = Some(std::time::Instant::now());
     }
@@ -5330,9 +5357,13 @@ impl BackgroundJobGuard {
         };
         let progress_unit = match self.progress_phase {
             Some("embedding") => Some("spans"),
-            Some("classifying_files" | "extracting_files" | "writing_graph" | "building_files") => {
-                Some("files")
-            }
+            Some(
+                "classifying_files"
+                | "extracting_files"
+                | "writing_graph"
+                | "building_files"
+                | "removing_previous_graph",
+            ) => Some("files"),
             Some("building_folders") => Some("folders"),
             Some("resolving_edges" | "writing_resolved_edges" | "writing_structure_edges") => {
                 Some("edges")
@@ -5363,6 +5394,7 @@ impl BackgroundJobGuard {
             "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
             "eta_seconds": self.eta_seconds,
             "eta_basis": self.eta_basis,
+            "eta_scope": self.eta_seconds.map(|_| "phase"),
             "eta_minutes": eta_minutes,
             "eta_unix_secs": eta_unix_secs,
             "current_detail": self.current_detail,
@@ -5461,6 +5493,40 @@ fn background_progress_should_publish(
 #[cfg(test)]
 mod background_progress_tests {
     use super::background_progress_should_publish;
+
+    #[test]
+    fn graph_phase_forecast_is_measured_and_resets_before_new_work() {
+        let _env = super::TEST_ENV_LOCK.lock().unwrap();
+        let mut guard = super::BackgroundJobGuard::from_env();
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "writing_graph",
+            completed_files: 0,
+            total_files: 100,
+        });
+        assert_eq!(guard.eta_seconds, None);
+        guard.index_phase_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "writing_graph",
+            completed_files: 10,
+            total_files: 100,
+        });
+        assert!((90..=91).contains(&guard.eta_seconds.unwrap()));
+        assert_eq!(guard.eta_basis, Some("observed_graph_phase"));
+        assert!(guard.rate_milli_documents_per_second.unwrap() > 0);
+        guard.indexing_progress(greppy_indexer::IndexBuildProgress {
+            phase: "extracting_files",
+            completed_files: 0,
+            total_files: 100,
+        });
+        assert_eq!(guard.eta_seconds, None);
+        assert_eq!(guard.rate_milli_documents_per_second, None);
+        guard.finalization_phase("publishing_snapshot");
+        assert_eq!(guard.eta_seconds, None);
+        assert_eq!(guard.index_phase_started, None);
+        assert_eq!(guard.current_detail.as_deref(), Some("publishing snapshot"));
+        guard.complete = true;
+    }
 
     #[test]
     fn phase_change_bypasses_progress_throttle() {

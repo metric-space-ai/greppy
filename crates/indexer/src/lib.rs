@@ -324,11 +324,9 @@ pub fn index_with_options_and_progress(
     } else {
         (discovered_entries, Vec::new())
     };
-    progress(IndexBuildProgress::new(
-        "classifying_files",
-        0,
-        all_entries.len(),
-    ));
+    // Store inventory preparation is not file classification. Incompatible
+    // generations can spend substantial time here before any file is parsed.
+    progress(IndexBuildProgress::new("preparing_graph_inventory", 0, 0));
 
     let mut report = IndexReport {
         project: project_name.to_string(),
@@ -441,9 +439,19 @@ pub fn index_with_options_and_progress(
         // Reuse the ordinary per-file cleanup, including files removed or
         // excluded since the old snapshot, before full extraction. This stays
         // inside the unpublished snapshot used by CLI indexing.
-        for state in &prior_state {
+        progress(IndexBuildProgress::new(
+            "removing_previous_graph",
+            0,
+            prior_state.len(),
+        ));
+        for (position, state) in prior_state.iter().enumerate() {
             drop_indexed_rows_for_skip(store, project_name, &state.rel_path)?;
             store.delete_index_skip(project_name, &state.rel_path)?;
+            progress(IndexBuildProgress::new(
+                "removing_previous_graph",
+                position + 1,
+                prior_state.len(),
+            ));
         }
     }
     let incremental = !incompatible_index && !prior_state.is_empty() && raw_edges_present;
@@ -6506,6 +6514,38 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
             event.phase == "writing_graph" && event.total_files == 2 && event.completed_files == 2
         }));
         assert_eq!(events.last().unwrap().phase, "finalizing_graph");
+
+        let mut previous = store.list_private_workspace_states().unwrap().remove(0);
+        previous.indexer_version = "incompatible-progress-test".into();
+        store.upsert_workspace_state(&previous).unwrap();
+        events.clear();
+        index_with_options_and_progress(
+            &mut store,
+            &repo,
+            "test",
+            &IndexOptions::default(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        let cleanup = events
+            .iter()
+            .filter(|event| event.phase == "removing_previous_graph")
+            .map(|event| (event.completed_files, event.total_files))
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup, vec![(0, 2), (1, 2), (2, 2)]);
+        let preparation = events
+            .iter()
+            .position(|event| event.phase == "preparing_graph_inventory")
+            .unwrap();
+        let cleanup_done = events
+            .iter()
+            .rposition(|event| event.phase == "removing_previous_graph")
+            .unwrap();
+        let classification = events
+            .iter()
+            .position(|event| event.phase == "classifying_files")
+            .unwrap();
+        assert!(preparation < cleanup_done && cleanup_done < classification);
     }
 
     #[test]
