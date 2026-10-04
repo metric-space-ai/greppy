@@ -16759,8 +16759,65 @@ mod tests {
         }
     "#;
 
+    // Characterize the current syntax boundary rather than treating macro
+    // tokens as executable expressions. A future expansion-aware repair must
+    // retain the opaque/shadowed controls while improving the prelude case.
+    #[test]
+    fn rust_macro_argument_call_gap_precedes_name_resolution() {
+        fn count_kind(node: tree_sitter::Node<'_>, kind: &str) -> usize {
+            usize::from(node.kind() == kind)
+                + (0..node.named_child_count())
+                    .filter_map(|index| node.named_child(index))
+                    .map(|child| count_kind(child, kind))
+                    .sum::<usize>()
+        }
+
+        for (body, macro_definition, expected_calls) in [
+            ("helper();", "", 1),
+            ("assert_eq!(helper(), 1);", "", 0),
+            ("opaque!(helper());", "", 0),
+            (
+                "assert_eq!(helper(), 1);",
+                "macro_rules! assert_eq { ($($t:tt)*) => {}; }",
+                0,
+            ),
+        ] {
+            let source = format!(
+                "pub(super) fn helper() -> i32 {{ 1 }}\n\
+                 mod tests {{ use super::*; {macro_definition}\n\
+                 fn caller() {{ {body} }} }}"
+            );
+            let tree = crate::parse(Language::Rust, source.as_bytes()).unwrap();
+            assert_eq!(
+                count_kind(tree.root_node(), "call_expression"),
+                expected_calls,
+                "the parser supplies no call_expression inside macro token trees: {body}"
+            );
+            assert_eq!(
+                count_kind(tree.root_node(), "macro_invocation"),
+                usize::from(expected_calls == 0),
+                "the omitted expression remains a macro invocation: {body}"
+            );
+            let extracted = extract(Language::Rust, source.as_bytes(), "src/lib.rs").unwrap();
+            assert_eq!(
+                extracted
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.edge_type == "CALLS"
+                            && edge.source_qualified_name == "src/lib.rs::Function::caller"
+                            && edge.properties["callee_name"] == "helper"
+                    })
+                    .count(),
+                expected_calls,
+                "raw extraction already has the gap before indexer resolution: {body}"
+            );
+        }
+    }
+
     #[test]
     fn extract_rust_finds_function_struct_impl() {
+
         let r = extract(Language::Rust, SIMPLE_RS.as_bytes(), "src/lib.rs").unwrap();
         let names: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(
