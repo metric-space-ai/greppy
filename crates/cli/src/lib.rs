@@ -2779,6 +2779,7 @@ fn dispatch_subcommand(
             all,
             path_opts,
         } => {
+            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_search_code(
                 query.as_deref(),
@@ -2799,6 +2800,7 @@ fn dispatch_subcommand(
             all,
             path_opts,
         } => {
+            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_search_symbols(
                 query.as_deref(),
@@ -2835,6 +2837,7 @@ fn dispatch_subcommand(
             path_opts,
         } => {
             let query = query_parts.join(" ");
+            validate_search_path_scope(root, &path_opts)?;
             let kind = effective_search_kind(kind, json);
             dispatch_semantic(
                 (!query.trim().is_empty()).then_some(query.as_str()),
@@ -7311,6 +7314,21 @@ fn collect_piped_targets(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+// Relative and absent search filters retain grep's bounded no-match contract.
+// A canonical, existing absolute path can prove a wrong graph root before any
+// index or embedding work is started.
+fn validate_search_path_scope(root: Option<&str>, paths: &[String]) -> Result<()> {
+    let existing_absolute = paths
+        .iter()
+        .filter(|raw| {
+            let path = std::path::Path::new(raw.as_str());
+            path.is_absolute() && path.exists()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_path_filters(root, &existing_absolute, "--path")
+}
+
 /// Rule 2: `--path` is the only path filter, so a `--path` that cannot narrow
 /// anything is a mistake, not an empty scope. Answering "nothing found" would
 /// confirm a typo as a fact about the repository.
@@ -7351,7 +7369,7 @@ fn validate_path_filters(root: Option<&str>, paths: &[String], label: &str) -> R
         };
         if !canonical.starts_with(&canonical_root) {
             return Err(Error::Invalid(format!(
-                "{label} `{trimmed}` is outside the repository {}; it cannot narrow anything in it",
+                "{label} `{trimmed}` is outside the repository {}; it cannot narrow anything in it; choose --root for the repository containing the target, or use greppy read-file for a direct file read",
                 root_path.display()
             )));
         }

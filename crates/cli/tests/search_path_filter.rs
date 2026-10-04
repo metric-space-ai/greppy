@@ -61,6 +61,43 @@ fn indexed_two_tree_repo(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+fn existing_absolute_outside_paths_are_rejected_before_index_preparation() {
+    let (repo, store) = fresh_workspace("outside-absolute");
+    let external = repo.parent().unwrap().join("terminal_report.py");
+    std::fs::write(&external, "def record(): pass\n").unwrap();
+    std::fs::write(repo.join("lib.rs"), "pub fn record() {}\n").unwrap();
+    for command in ["search-symbol", "search-pattern", "search"] {
+        let (code, out, err) = run(
+            &repo,
+            &store,
+            &[command, "record", "--path", external.to_str().unwrap()],
+        );
+        assert_eq!(code, 64, "{command}: stdout={out}; stderr={err}");
+        assert!(err.contains("outside the repository"), "{err}");
+        assert!(err.contains("--root") && err.contains("read-file"), "{err}");
+        assert!(!out.contains("greppy index"), "{out}");
+        assert!(
+            !store.join("workspaces").exists(),
+            "wrong-root search started an index"
+        );
+    }
+    let source = repo.join("lib.rs");
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &[
+            "search-symbol",
+            "record",
+            "--path",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "inside path: stdout={out}; stderr={err}");
+    assert!(out.contains("lib.rs"), "{out}");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn search_pattern_relative_filter_uses_selected_root_from_another_checkout() {
     let (repo, store) = fresh_workspace("external-cwd-filter");
     let caller = repo.parent().unwrap().join("other-checkout");
