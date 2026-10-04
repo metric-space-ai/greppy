@@ -3571,6 +3571,11 @@ fn js_ts_inside_import(node: Node<'_>) -> bool {
         if depth >= 10 {
             break;
         }
+        // Function bodies/signatures do not become import bindings just
+        // because the function is stored in an outer const declaration.
+        if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            return false;
+        }
         if JS_TS_IMPORT_KINDS.contains(&cur.kind())
             && !(cur.kind() == "export_statement" && js_ts_export_of_declaration(cur))
         {
