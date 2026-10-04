@@ -4585,7 +4585,7 @@ fn rust_expression_macro_calls(
         }
         for cq in queries.iter().filter(|cq| cq.kind == QueryKind::Calls) {
             let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&cq.query, tree.root_node(), &wrapped);
+            let mut matches = cursor.matches(&cq.query, tree.root_node(), wrapped.as_slice());
             while let Some(m) = matches.next() {
                 for cap in m.captures {
                     let node = cap.node;
