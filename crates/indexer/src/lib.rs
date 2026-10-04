@@ -7417,7 +7417,11 @@ export function invalidCalls() { plainValue(); effectValue(); }
             2,
             "opening and self-closing sites both resolve"
         );
-        assert!(incoming.iter().all(|edge| edge.source_id == render.id));
+        assert!(
+            incoming.iter().all(|edge| edge.source_id == render.id),
+            "incoming={incoming:?}; render={render:?}; raw={:?}",
+            store.list_raw_edges("test").unwrap()
+        );
         assert!(store
             .incoming_edges(other.id, Some("USAGE"), 100)
             .unwrap()
