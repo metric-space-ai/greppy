@@ -315,11 +315,23 @@ fn semantic_no_match_status(query: &str, path_filters: &QueryPathFilters) {
     println!("next: refresh semantic definitions after source changes: greppy index .");
 }
 
+fn search_definition_start_line(content: &str, stored_start: i64) -> i64 {
+    usize::try_from(stored_start)
+        .ok()
+        .map(|line| crate::read::read_definition_start(content, line))
+        .and_then(|line| i64::try_from(line).ok())
+        .unwrap_or(stored_start)
+}
+
 fn search_print_node_source(root_path: &std::path::Path, node: &greppy_store::Node) {
+    let start_line = std::fs::read_to_string(root_path.join(&node.file_path))
+        .ok()
+        .map(|content| search_definition_start_line(&content, node.start_line))
+        .unwrap_or(node.start_line);
     if let Some(span) = read_span_with_meta(
         root_path,
         &node.file_path,
-        node.start_line,
+        start_line,
         node.end_line,
         usize::MAX,
         false,
@@ -733,10 +745,14 @@ pub(crate) fn search_code_definition_entry(
             });
         }
     };
+    let start_line = std::str::from_utf8(&content)
+        .ok()
+        .map(|text| search_definition_start_line(text, row.start_line))
+        .unwrap_or(row.start_line);
     let Some(span) = read_span_with_meta(
         root_path,
         &row.file_path,
-        row.start_line,
+        start_line,
         row.end_line,
         usize::MAX,
         false,
@@ -744,7 +760,7 @@ pub(crate) fn search_code_definition_entry(
         return Ok(None);
     };
     let (byte_start, byte_end) =
-        line_range_to_bytes(&content, row.start_line as usize, span.end_line as usize);
+        line_range_to_bytes(&content, start_line as usize, span.end_line as usize);
     let mut handle = greppy_edit::EditHandle::for_range(
         root_path,
         std::path::Path::new(&row.file_path),
@@ -760,7 +776,7 @@ pub(crate) fn search_code_definition_entry(
     Ok(Some(SearchCodeDefinitionEntry {
         qualified_name: row.qualified_name.clone(),
         file: row.file_path.clone(),
-        start_line: row.start_line,
+        start_line,
         end_line: span.end_line,
         source: span.text,
         handle: handle.encode(),

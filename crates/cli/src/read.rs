@@ -235,7 +235,7 @@ fn read_attribute_group_start(lines: &[&str], end: usize) -> Option<usize> {
 /// Documentation and attributes are part of the definition's read span. The
 /// parser/index address remains the definition head; this live-byte scan extends
 /// only across contiguous authored interface lines immediately above it.
-fn read_definition_start(content: &str, definition_start: usize) -> usize {
+pub(crate) fn read_definition_start(content: &str, definition_start: usize) -> usize {
     let lines = content.lines().collect::<Vec<_>>();
     let mut cursor = definition_start.saturating_sub(1).min(lines.len());
     loop {

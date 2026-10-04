@@ -1497,3 +1497,65 @@ fn replace_rust_attributed_method_keeps_indentation_and_body_edits() {
     assert!(!text.contains("#[inline]"), "{text}");
     assert!(text.contains("let _ = 3;"), "{text}");
 }
+
+#[test]
+fn rust_source_views_and_handles_own_outer_attributes_but_not_the_next_definition() {
+    let fixture = Fixture::new("rust-attribute-source-handle");
+    let file = fixture.repo.join("probe.rs");
+    let original = "struct Runtime;\nimpl Runtime {\n    #[cfg(feature = \"audio\")]\n    #[wasm_bindgen(\n        js_name = takeAudio\n    )]\n    pub fn take_audio(&mut self) {\n        self.flush();\n    }\n    #[inline]\n    fn neighbor(&self) {}\n}\n";
+    std::fs::write(&file, original).unwrap();
+
+    let search = fixture.run(&[
+        "search-symbol",
+        "take_audio",
+        "--path",
+        "probe.rs",
+        "--code",
+    ]);
+    let search_text = combined(&search);
+    assert_eq!(search.status.code(), Some(0), "{search_text}");
+    assert!(
+        search_text.contains("#[cfg(feature = \"audio\")]"),
+        "{search_text}"
+    );
+    assert!(search_text.contains("js_name = takeAudio"), "{search_text}");
+    assert!(!search_text.contains("fn neighbor"), "{search_text}");
+
+    let structured = fixture.run(&[
+        "search-pattern",
+        "take_audio",
+        "--fixed",
+        "--path",
+        "probe.rs",
+        "--code",
+        "--json",
+    ]);
+    assert_eq!(
+        structured.status.code(),
+        Some(0),
+        "{}",
+        combined(&structured)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    let definition = &value["hits"][0];
+    assert_eq!(definition["span"]["start_line"], 3);
+    assert_eq!(definition["span"]["end_line"], 9);
+    assert!(definition["source"]
+        .as_str()
+        .unwrap()
+        .contains("js_name = takeAudio"));
+    assert!(!definition["source"]
+        .as_str()
+        .unwrap()
+        .contains("fn neighbor"));
+    let handle = definition["handle"].as_str().expect("definition handle");
+    let replacement = "    #[cold]\n    fn take_audio(&mut self) { self.flush(); }\n";
+    let replaced = fixture.run(&["replace-span", handle, replacement]);
+    assert_eq!(replaced.status.code(), Some(0), "{}", combined(&replaced));
+    let expected = "struct Runtime;\nimpl Runtime {\n    #[cold]\n    fn take_audio(&mut self) { self.flush(); }\n    #[inline]\n    fn neighbor(&self) {}\n}\n";
+    assert_file(&file, expected);
+
+    let stale = fixture.run(&["replace-span", handle, "    fn take_audio(&mut self) {}\n"]);
+    assert!(!stale.status.success(), "{}", combined(&stale));
+    assert_file(&file, expected);
+}
