@@ -2708,10 +2708,19 @@ pub fn recover_persisted_js_ts_usages(
                 "JS/TS usage repair extraction incomplete".into(),
             ));
         }
-        for node in &extraction.nodes {
+        // Persistence upserts in extraction order by (project, qualified_name).
+        // Object-literal methods can share a qualified name: validate the final
+        // stored definition, rather than rejecting the overwritten earlier span.
+        let definitions: std::collections::BTreeMap<_, _> = extraction
+            .nodes
+            .iter()
+            .map(|node| (node.qualified_name.as_str(), node))
+            .collect();
+        for node in definitions.values() {
             let cached = store.get_node_by_qname(project, &node.qualified_name)?;
             if cached.as_ref().is_none_or(|cached| {
                 cached.label != node.label
+                    || cached.file_path != state.rel_path
                     || cached.start_line != i64::from(node.start_line)
                     || cached.end_line != i64::from(node.end_line)
             }) {
@@ -7758,6 +7767,146 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    #[test]
+    fn jsx_usage_recovery_validates_persisted_last_definition_for_colliding_methods() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = "function first() { return { getAttribute(name) { return name; } }; }\n\
+                      function second() { return { getAttribute() { return null; } }; }\n\
+                      function third() { return { getAttribute(name) { return name === 'x'; } }; }\n";
+        fs::write(repo.path().join("fixture.cjs"), source).unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let extraction =
+            parser_extract(Language::JavaScript, source.as_bytes(), "fixture.cjs").unwrap();
+        let methods: Vec<_> = extraction
+            .nodes
+            .iter()
+            .filter(|node| node.qualified_name == "fixture.cjs::Function::getAttribute")
+            .collect();
+        assert!(
+            methods.len() >= 2,
+            "fixture must exercise the actual parser collision"
+        );
+        assert_ne!(methods[0].start_line, methods.last().unwrap().start_line);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("graph.db");
+        let mut store = Store::open(&path).unwrap();
+        index(&mut store, repo.path(), "test").unwrap();
+        let qname = "fixture.cjs::Function::getAttribute";
+        let cached = store.get_node_by_qname("test", qname).unwrap().unwrap();
+        assert_eq!(
+            cached.start_line,
+            i64::from(methods.last().unwrap().start_line)
+        );
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
+        let states = format!("{:?}", store.list_file_states("test").unwrap());
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        store.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut store, "test", repo.path()).unwrap());
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        assert_eq!(
+            states,
+            format!("{:?}", store.list_file_states("test").unwrap())
+        );
+        let boundary = store
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        let usages = store
+            .incoming_edges(boundary.id, Some("USAGE"), 100)
+            .unwrap();
+        assert_eq!(usages.len(), 1);
+        store
+            .conn()
+            .execute(
+                "DELETE FROM main.schema_meta WHERE key=?1",
+                [JS_TS_USAGE_REPAIR_KEY],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE main.nodes SET start_line=999 WHERE project='test' AND qualified_name=?1",
+                [qname],
+            )
+            .unwrap();
+        let raw = store.list_raw_edges("test").unwrap();
+        assert!(recover_persisted_js_ts_usages(&mut store, "test", repo.path()).is_err());
+        assert_eq!(raw, store.list_raw_edges("test").unwrap());
+        assert_eq!(
+            usages,
+            store
+                .incoming_edges(boundary.id, Some("USAGE"), 100)
+                .unwrap()
+        );
+        assert!(!js_ts_usages_repaired(&store).unwrap());
+    }
+
+    #[test]
+    fn jsx_usage_recovery_colliding_methods_preserves_immutable_base() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("fixture.cjs"), "const a = { getAttribute() { return 'a'; } };\nconst b = { getAttribute() { return 'b'; } };\n").unwrap();
+        fs::write(
+            repo.path().join("boundary.tsx"),
+            "export function Boundary() { return <div />; }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("view.tsx"), "import { Boundary } from './boundary';\nexport function Render() { return <Boundary />; }\n").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM main.schema_meta WHERE key=?1",
+                    [JS_TS_USAGE_REPAIR_KEY],
+                )
+                .unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='USAGE'; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let nodes = format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap());
+        assert!(recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        assert!(!recover_persisted_js_ts_usages(&mut overlay, "test", repo.path()).unwrap());
+        assert_eq!(
+            nodes,
+            format!("{:?}", overlay.list_nodes("test", "", "", 0, 1000).unwrap())
+        );
+        let boundary = overlay
+            .get_node_by_qname("test", "boundary.tsx::Function::Boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overlay
+                .incoming_edges(boundary.id, Some("USAGE"), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
     }
 
     #[test]
