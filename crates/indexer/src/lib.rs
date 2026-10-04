@@ -2491,6 +2491,31 @@ pub fn mark_rust_caller_edges_repaired(store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn discovery_filtered_recovery_identities(
+    store: &Store,
+    project: &str,
+) -> Result<std::collections::BTreeMap<String, IndexSkip>> {
+    Ok(store
+        .list_index_skips(project)?
+        .into_iter()
+        .filter(|skip| skip.reason == "discovery_filtered")
+        .map(|skip| (skip.rel_path.clone(), skip))
+        .collect())
+}
+
+fn current_discovery_filtered_recovery_identity(
+    state: &FileState,
+    skips: &std::collections::BTreeMap<String, IndexSkip>,
+    indexed_paths: &std::collections::BTreeSet<&str>,
+) -> bool {
+    !indexed_paths.contains(state.rel_path.as_str())
+        && skips.get(&state.rel_path).is_some_and(|skip| {
+            skip.last_indexed_generation == state.last_indexed_generation
+                && skip.size == state.size
+                && skip.mtime_ns == state.mtime_ns
+        })
+}
+
 /// Recover references and caller provenance omitted by older Rust extractors without rebuilding nodes
 /// or embeddings. Validate every visible Rust source before writing anything.
 /// Private usage overrides also work for immutable Base files: no file-state ownership
@@ -2520,6 +2545,11 @@ pub fn recover_persisted_rust_usages(
     {
         return Err(greppy_core::Error::Invalid("Rust reference repair requires indexed source fingerprints for every visible Rust file".into()));
     }
+    let discovery_filtered = discovery_filtered_recovery_identities(store, project)?;
+    let indexed_paths = indexed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
     let root = std::fs::canonicalize(root).map_err(|error| {
         greppy_core::Error::Invalid(format!("Rust reference repair cannot read root: {error}"))
     })?;
@@ -2529,6 +2559,13 @@ pub fn recover_persisted_rust_usages(
         .iter()
         .filter(|state| state.rel_path.ends_with(".rs"))
     {
+        // CoW retains identities for deliberately excluded files without
+        // graph definitions. Apply the same narrow eligibility rule as JS/TS;
+        // stale skips or any visible nodes still require full validation.
+        if current_discovery_filtered_recovery_identity(state, &discovery_filtered, &indexed_paths)
+        {
+            continue;
+        }
         let relative = Path::new(&state.rel_path);
         if relative
             .components()
@@ -2681,23 +2718,13 @@ pub fn recover_persisted_js_ts_usages(
     // A Store-CoW Delta retains fingerprints for discovery-filtered files,
     // although those files deliberately have no graph definitions. Do not
     // re-extract them as if their absent definitions were cache corruption.
-    let discovery_filtered: std::collections::BTreeMap<_, _> = store
-        .list_index_skips(project)?
-        .into_iter()
-        .filter(|skip| skip.reason == "discovery_filtered")
-        .map(|skip| (skip.rel_path.clone(), skip))
-        .collect();
+    let discovery_filtered = discovery_filtered_recovery_identities(store, project)?;
     let indexed_paths: std::collections::BTreeSet<_> =
         indexed.iter().map(|node| node.file_path.as_str()).collect();
     let mut files = Vec::new();
     let mut extracted = Vec::new();
     for state in states.iter().filter(|state| relevant(&state.rel_path)) {
-        if !indexed_paths.contains(state.rel_path.as_str())
-            && discovery_filtered.get(&state.rel_path).is_some_and(|skip| {
-                skip.last_indexed_generation == state.last_indexed_generation
-                    && skip.size == state.size
-                    && skip.mtime_ns == state.mtime_ns
-            })
+        if current_discovery_filtered_recovery_identity(state, &discovery_filtered, &indexed_paths)
         {
             continue;
         }
@@ -7795,6 +7822,174 @@ export function invalidCalls() { plainValue(); effectValue(); }
                 "noncallable values must not resolve as call targets"
             );
         }
+    }
+
+    fn rust_discovery_filtered_fixture() -> (tempfile::TempDir, IndexOptions) {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/package")).unwrap();
+        fs::write(
+            repo.path().join("node_modules/package/vendor.rs"),
+            "pub struct Vendor { pub load_data: String }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("lib.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "lib.rs".to_string(),
+                "node_modules/package/vendor.rs".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        (repo, options)
+    }
+
+    #[test]
+    fn rust_usage_recovery_respects_current_discovery_filtered_identity() {
+        let (repo, options) = rust_discovery_filtered_fixture();
+        let mut store = Store::open_memory().unwrap();
+        assert_eq!(
+            index_with_options(&mut store, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            1
+        );
+        let skip = store
+            .get_index_skip("test", "node_modules/package/vendor.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.reason, "discovery_filtered");
+        let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 100).unwrap());
+        let states = store.list_file_states("test").unwrap();
+        let raw = format!("{:?}", store.list_raw_edges("test").unwrap());
+        for case in 0..4 {
+            let mut stale = skip.clone();
+            match case {
+                0 => stale.reason = "parse_failed".into(),
+                1 => {
+                    stale.last_indexed_generation = stale.last_indexed_generation.saturating_sub(1)
+                }
+                2 => stale.size += 1,
+                _ => stale.mtime_ns += 1,
+            }
+            store.upsert_index_skip(&stale).unwrap();
+            let error = recover_persisted_rust_usages(&mut store, "test", repo.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("declared field facts"),
+                "{error}"
+            );
+            assert_eq!(
+                nodes,
+                format!("{:?}", store.list_nodes("test", "", "", 0, 100).unwrap())
+            );
+            assert_eq!(states, store.list_file_states("test").unwrap());
+            assert_eq!(raw, format!("{:?}", store.list_raw_edges("test").unwrap()));
+        }
+        store.upsert_index_skip(&skip).unwrap();
+        let qname = "node_modules/package/vendor.rs::Class::Vendor::load_data";
+        store.conn().execute(
+            "INSERT INTO main.nodes(project,label,name,qualified_name,file_path,start_line,end_line,properties) VALUES('test','Field','load_data',?1,?2,1,1,'{\"return_type\":\"Wrong\"}')",
+            [qname, skip.rel_path.as_str()],
+        ).unwrap();
+        assert!(
+            recover_persisted_rust_usages(&mut store, "test", repo.path())
+                .unwrap_err()
+                .to_string()
+                .contains("declared field facts")
+        );
+        store
+            .conn()
+            .execute("DELETE FROM main.nodes WHERE qualified_name=?1", [qname])
+            .unwrap();
+        recover_persisted_rust_usages(&mut store, "test", repo.path()).unwrap();
+        assert_eq!(
+            recover_persisted_rust_usages(&mut store, "test", repo.path()).unwrap(),
+            0
+        );
+        assert_eq!(
+            nodes,
+            format!("{:?}", store.list_nodes("test", "", "", 0, 100).unwrap())
+        );
+        assert_eq!(states, store.list_file_states("test").unwrap());
+    }
+
+    #[test]
+    fn rust_usage_recovery_respects_filtered_delta_and_preserves_base() {
+        let (repo, _) = rust_discovery_filtered_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        {
+            let mut base = Store::open(&base_path).unwrap();
+            index(&mut base, repo.path(), "test").unwrap();
+            assert!(base
+                .get_file_state("test", "node_modules/package/vendor.rs")
+                .unwrap()
+                .is_none());
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type='CALLS'; DELETE FROM edges WHERE edge_type='CALLS';").unwrap();
+            base.conn()
+                .execute(
+                    "DELETE FROM main.schema_meta WHERE key=?1",
+                    [RUST_CALLER_EDGES_REPAIR_META_KEY],
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &scratch.path().join("delta.db"),
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        let options = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "node_modules/package/vendor.rs".to_string(),
+            ])),
+            ..IndexOptions::default()
+        };
+        assert_eq!(
+            index_with_options(&mut overlay, repo.path(), "test", &options)
+                .unwrap()
+                .files_indexed,
+            0
+        );
+        assert_eq!(
+            overlay
+                .get_index_skip("test", "node_modules/package/vendor.rs")
+                .unwrap()
+                .unwrap()
+                .reason,
+            "discovery_filtered"
+        );
+        recover_persisted_rust_usages(&mut overlay, "test", repo.path()).unwrap();
+        rebuild_visible_overlay_edges(&mut overlay, "test").unwrap();
+        let target = overlay
+            .get_node_by_qname("test", "lib.rs::Function::target")
+            .unwrap()
+            .unwrap();
+        let caller = overlay
+            .get_node_by_qname("test", "lib.rs::Function::caller")
+            .unwrap()
+            .unwrap();
+        assert!(overlay
+            .incoming_edges(target.id, Some("CALLS"), 10)
+            .unwrap()
+            .iter()
+            .any(|edge| edge.source_id == caller.id));
+        assert_eq!(
+            recover_persisted_rust_usages(&mut overlay, "test", repo.path()).unwrap(),
+            0
+        );
+        assert!(overlay.list_delta_raw_edges("test").unwrap().is_empty());
+        assert_eq!(
+            overlay.list_private_file_states("test").unwrap().len(),
+            1,
+            "only filtered identity belongs to Delta"
+        );
+        drop(overlay);
+        assert_eq!(bytes, fs::read(&base_path).unwrap());
     }
 
     fn jsx_discovery_filtered_fixture() -> (tempfile::TempDir, IndexOptions) {
