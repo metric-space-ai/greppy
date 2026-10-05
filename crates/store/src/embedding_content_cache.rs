@@ -320,53 +320,66 @@ impl EmbeddingContentCache {
         if max_bytes <= 0 {
             return Ok(());
         }
-        let count: i64 = self
-            .conn
+        let live_bytes = |connection: &Connection| -> Result<i64> {
+            let page_count: i64 = connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .map_err(|error| Error::Store(format!("embedding cache page count: {error}")))?;
+            let freelist_count: i64 = connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|error| Error::Store(format!("embedding cache freelist: {error}")))?;
+            let page_size: i64 = connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(|error| Error::Store(format!("embedding cache page size: {error}")))?;
+            Ok(page_count
+                .saturating_sub(freelist_count)
+                .saturating_mul(page_size))
+        };
+        // Free pages are reusable capacity, not live cache data. The normal
+        // under-budget path does not acquire a writer transaction.
+        if live_bytes(&self.conn)? <= max_bytes {
+            return Ok(());
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| Error::Store(format!("begin embedding cache trim: {error}")))?;
+        let mut count: i64 = transaction
             .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
                 row.get(0)
             })
             .map_err(|error| Error::Store(format!("embedding cache count: {error}")))?;
-        let page_count: i64 = self
-            .conn
-            .query_row("PRAGMA page_count", [], |row| row.get(0))
-            .unwrap_or(0);
-        let freelist_count: i64 = self
-            .conn
-            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
-            .unwrap_or(0);
-        let page_size: i64 = self
-            .conn
-            .query_row("PRAGMA page_size", [], |row| row.get(0))
-            .unwrap_or(4096);
-        // SQLite keeps deleted pages in the database freelist for reuse. They
-        // are already available capacity, so counting them as live bytes would
-        // make every later prune delete another slice of valid vectors even
-        // though the working set is below its quota.
-        let bytes = page_count
-            .saturating_sub(freelist_count)
-            .saturating_mul(page_size);
-        if bytes <= max_bytes {
-            return Ok(());
-        }
-        let keep = if bytes > 0 {
-            count
+        let mut bytes = live_bytes(&transaction)?;
+        // A deletion may leave partially occupied pages. Re-measure after
+        // each batch so one trim finishes the quota correction, rather than
+        // progressively evicting the working set on later calls. Concurrent
+        // inserts are excluded and each iteration removes at least one row.
+        // Keep the final entry when it or the schema exceeds a tiny budget.
+        while bytes > max_bytes && count > 1 {
+            let keep = (count
                 .saturating_mul(max_bytes)
                 .saturating_mul(TRIM_TARGET_NUMERATOR)
                 / bytes
-                / TRIM_TARGET_DENOMINATOR
-        } else {
-            count
-        }
-        .max(1);
-        self.conn
-            .execute(
-                "DELETE FROM document_embeddings WHERE rowid IN (
+                / TRIM_TARGET_DENOMINATOR)
+                .clamp(1, count - 1);
+            let removed = transaction
+                .execute(
+                    "DELETE FROM document_embeddings WHERE rowid IN (
                     SELECT rowid FROM document_embeddings
                     ORDER BY (vector IS NOT NULL) ASC, last_accessed ASC, rowid ASC LIMIT ?1
                  )",
-                params![count.saturating_sub(keep)],
-            )
-            .map_err(|error| Error::Store(format!("prune embedding cache: {error}")))?;
+                    params![count - keep],
+                )
+                .map_err(|error| Error::Store(format!("prune embedding cache: {error}")))?;
+            if removed == 0 {
+                return Err(Error::Store("embedding cache trim made no progress".into()));
+            }
+            count -= removed as i64;
+            bytes = live_bytes(&transaction)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| Error::Store(format!("commit embedding cache trim: {error}")))?;
         Ok(())
     }
 }
@@ -590,6 +603,14 @@ mod tests {
             .unwrap();
         let byte_budget = page_count.saturating_mul(page_size) / 2;
         cache.prune_to_byte_budget(byte_budget).unwrap();
+        let live_bytes: i64 = cache.conn.query_row(
+            "SELECT (page_count - freelist_count) * page_size FROM pragma_page_count, pragma_freelist_count, pragma_page_size",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            live_bytes <= byte_budget,
+            "first trim must satisfy its live-byte quota: {live_bytes} > {byte_budget}"
+        );
         for key in active {
             assert!(cache.get("m", "p", "t", &key).unwrap().is_some());
         }
