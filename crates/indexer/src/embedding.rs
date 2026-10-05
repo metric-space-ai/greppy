@@ -212,7 +212,11 @@ pub fn count_embedding_candidate_nodes(store: &Store, project: &str) -> Result<u
         "TypeAlias",
     ];
     LABELS.iter().try_fold(0usize, |total, label| {
-        let count = store.count_nodes_by_label(project, label)?;
+        let count = if store.is_overlay() {
+            store.count_private_nodes_by_label(project, label)?
+        } else {
+            store.count_nodes_by_label(project, label)?
+        };
         let count = usize::try_from(count)
             .map_err(|_| Error::Store(format!("negative embedding node count for {label}")))?;
         Ok(total.saturating_add(count))
@@ -1632,6 +1636,12 @@ mod tests {
                     root_path: root.to_string_lossy().into_owned(),
                 })
                 .unwrap();
+            assert_eq!(overlay.count_nodes("p", "", "").unwrap(), 2);
+            assert_eq!(
+                count_embedding_candidate_nodes(&overlay, "p").unwrap(),
+                0,
+                "immutable Base definitions are not pending Delta embedding work"
+            );
             let prefixes = vec!["src/scrape".to_owned()];
             let options = EmbeddingIndexOptions::for_generation(2);
             let total = count_code_embedding_documents_for_scope(

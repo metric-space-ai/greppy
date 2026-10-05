@@ -467,6 +467,17 @@ impl Store {
         Ok(n)
     }
 
+    /// Count private candidate work without including an attached immutable Base.
+    /// On a single store this is the same inventory as count_nodes_by_label.
+    pub fn count_private_nodes_by_label(&self, project: &str, label: &str) -> Result<i64> {
+        let n: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM main.nodes WHERE project = ?1 AND label = ?2",
+            params![project, label],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Repair ranges inside the caller's transaction without replacing IDs,
     /// graph relations or cached vectors. Exact vector-backed Base copies get
     /// the same guarded span override as negative-ID Base definitions.

@@ -5359,7 +5359,8 @@ mod patch_rollback_tests {
             })
             .unwrap();
         let record = edit_journal_read(&pending).unwrap();
-        edit_journal_restore(dir.path(), &record, false).unwrap();
+        edit_journal_restore(dir.path(), &record, false)
+            .unwrap_or_else(|refusal| panic!("{}", refusal.message));
         assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
         assert!(!added.exists());
         assert_eq!(std::fs::read(&deleted).unwrap(), b"original\n");
