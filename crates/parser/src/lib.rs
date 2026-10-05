@@ -248,7 +248,7 @@ fn c_va_arg_type_range(source: &[u8], mut at: usize) -> Option<std::ops::Range<u
         return None;
     }
     let mut stack = vec![b')'];
-    let mut comma = None;
+    let mut comma: Option<usize> = None;
     at += 1;
     while at < source.len() {
         match source[at] {
