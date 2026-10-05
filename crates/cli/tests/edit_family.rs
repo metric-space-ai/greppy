@@ -91,6 +91,228 @@ impl Drop for Fixture {
     }
 }
 
+fn concurrent_journal(fixture: &Fixture) -> PathBuf {
+    fixture
+        .store
+        .join("workspaces")
+        .join(format!("v{}", greppy_core::cache::STORE_FORMAT_VERSION))
+        .join(greppy_core::workspace::workspace_hash(&fixture.repo))
+        .join("edit-journal")
+}
+
+fn bounded_output(mut child: std::process::Child) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "owned concurrent edit exceeded test deadline: {}",
+                combined(&output)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn spawn_edit(fixture: &Fixture, args: &[&str]) -> std::process::Child {
+    fixture
+        .command()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_file_owner(fixture: &Fixture, file: &str) {
+    use sha2::{Digest, Sha256};
+    let identity = fixture.repo.join(file).canonicalize().unwrap();
+    let name = format!(
+        "file-{:x}",
+        Sha256::digest(identity.as_os_str().as_encoded_bytes())
+    );
+    let journal = concurrent_journal(fixture);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if journal.join("locks").join(&name).exists()
+            && greppy_core::cache::acquire_named_lock_in(
+                &journal,
+                &name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            )
+            .unwrap()
+            .is_none()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first edit did not acquire its file lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn release_stdin(mut child: std::process::Child, replacement: &[u8]) -> Output {
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(replacement).unwrap();
+    bounded_output(child)
+}
+
+#[test]
+fn concurrent_six_call_report_and_dozen_agents_preserve_every_edit_and_undo() {
+    for count in [6, 32] {
+        let fixture = Fixture::new("parallel-edit-round");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+        for i in 0..count {
+            std::fs::write(fixture.repo.join(format!("f{i}.txt")), "A B\n").unwrap();
+        }
+        let mut threads = Vec::new();
+        for i in 0..count {
+            // Six-call original report includes two edits to one file.
+            let (file, old, new) = if count == 6 && i == 5 {
+                ("f0.txt".to_string(), "B", "Y")
+            } else {
+                (format!("f{i}.txt"), "A", "X")
+            };
+            let mut command = fixture.command();
+            command
+                .args(["replace-text", &file, old, new])
+                .stdin(Stdio::null());
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                command.output().unwrap()
+            }));
+        }
+        for thread in threads {
+            let output = thread.join().unwrap();
+            assert!(output.status.success(), "{}", combined(&output));
+        }
+        for i in 0..count {
+            let expected = if count == 6 && i == 5 {
+                "A B\n"
+            } else if count == 6 && i == 0 {
+                "X Y\n"
+            } else {
+                "X B\n"
+            };
+            assert_file(&fixture.repo.join(format!("f{i}.txt")), expected);
+        }
+        let stack: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(concurrent_journal(&fixture).join("stack.json")).unwrap(),
+        )
+        .unwrap();
+        let transactions = stack["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), count);
+        let ids: std::collections::HashSet<_> = transactions
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), count);
+        for _ in 0..count {
+            let undo = fixture.run(&["undo"]);
+            assert!(undo.status.success(), "{}", combined(&undo));
+        }
+        for i in 0..count {
+            assert_file(&fixture.repo.join(format!("f{i}.txt")), "A B\n");
+        }
+    }
+}
+
+#[test]
+fn blocked_stdin_does_not_block_disjoint_edit_and_same_file_waiter_rereads() {
+    let fixture = Fixture::new("file-lock-wait");
+    std::fs::write(fixture.repo.join("a.txt"), "A B\n").unwrap();
+    std::fs::write(fixture.repo.join("b.txt"), "A\n").unwrap();
+    let first = spawn_edit(&fixture, &["replace-text", "a.txt", "A"]);
+    wait_for_file_owner(&fixture, "a.txt");
+    let unrelated = spawn_edit(&fixture, &["replace-text", "b.txt", "A", "X"]);
+    let output = bounded_output(unrelated);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("b.txt"), "X\n");
+    let mut same = spawn_edit(&fixture, &["replace-text", "a.txt", "B", "Y"]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        same.try_wait().unwrap().is_none(),
+        "same-file call refused instead of waiting"
+    );
+    let first_output = release_stdin(first, b"X");
+    assert!(first_output.status.success(), "{}", combined(&first_output));
+    let same_output = bounded_output(same);
+    assert!(same_output.status.success(), "{}", combined(&same_output));
+    assert_file(&fixture.repo.join("a.txt"), "X Y\n");
+}
+
+#[test]
+fn interrupted_edit_keeps_its_own_pending_evidence_when_another_edit_finishes() {
+    let fixture = Fixture::new("pending-isolation");
+    for file in ["a.txt", "b.txt"] {
+        std::fs::write(fixture.repo.join(file), "A\n").unwrap();
+    }
+    let interrupted = fixture
+        .command()
+        .env("GREPPY_TEST_CRASH_AFTER_JOURNAL", "1")
+        .args(["replace-text", "a.txt", "A", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        interrupted.status.code(),
+        Some(16),
+        "{}",
+        combined(&interrupted)
+    );
+    let journal = concurrent_journal(&fixture);
+    let pending: Vec<_> = std::fs::read_dir(&journal)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pending-")
+        })
+        .collect();
+    assert_eq!(pending.len(), 1);
+    let evidence = std::fs::read(&pending[0]).unwrap();
+    let good = fixture.run(&["replace-text", "b.txt", "A", "X"]);
+    assert!(good.status.success(), "{}", combined(&good));
+    assert_eq!(std::fs::read(&pending[0]).unwrap(), evidence);
+    assert_file(&fixture.repo.join("a.txt"), "A\n");
+    let undo = fixture.run(&["undo"]);
+    assert!(undo.status.success(), "{}", combined(&undo));
+    assert_file(&fixture.repo.join("b.txt"), "A\n");
+}
+
+#[test]
+fn journal_failure_after_publication_reports_that_source_was_written() {
+    let fixture = Fixture::new("journal-truth");
+    std::fs::write(fixture.repo.join("a.txt"), "A\n").unwrap();
+    let first = spawn_edit(&fixture, &["--json", "replace-text", "a.txt", "A"]);
+    wait_for_file_owner(&fixture, "a.txt");
+    std::fs::write(
+        concurrent_journal(&fixture).join("stack.json"),
+        b"broken journal",
+    )
+    .unwrap();
+    let output = release_stdin(first, b"X");
+    assert_eq!(output.status.code(), Some(16), "{}", combined(&output));
+    let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(record["published"], true);
+    assert_eq!(record["status"], "published_with_error");
+    assert!(record["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("pending evidence retained"));
+    assert_file(&fixture.repo.join("a.txt"), "X\n");
+}
+
 fn combined(output: &Output) -> String {
     format!(
         "{}{}",
