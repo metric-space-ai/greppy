@@ -599,12 +599,74 @@ fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow
 }
 /// First parser failure in the proposed content. Coordinates are one-based;
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
+// The JS/TS grammars accept raw line breaks in ordinary quoted strings
+// without an ERROR node. ECMAScript does not. JSX attribute strings have
+// different lexical rules and may contain raw line breaks.
+fn js_ts_string_line_breaks(
+    language: Language,
+    kind: &str,
+    jsx_attribute: bool,
+    bytes: &[u8],
+) -> (usize, Option<usize>) {
+    if !matches!(language, Language::JavaScript | Language::TypeScript { .. })
+        || kind != "string"
+        || jsx_attribute
+        || !matches!(bytes.first(), Some(b'\'' | b'"'))
+    {
+        return (0, None);
+    }
+    let mut count = 0;
+    let mut first = None;
+    let mut offset = 1;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\\' => {
+                offset += 1;
+                // A backslash followed by CRLF is one legal continuation.
+                if bytes.get(offset) == Some(&b'\r') && bytes.get(offset + 1) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            b'\r' | b'\n' => {
+                count += 1;
+                first.get_or_insert(offset);
+                if bytes[offset] == b'\r' && bytes.get(offset + 1) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            _ => {}
+        }
+        offset += 1;
+    }
+    (count, first)
+}
+
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
     let validation_content = syntax_validation_content(language, content);
     let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
+        let (_, line_break) = js_ts_string_line_breaks(
+            language,
+            node.kind(),
+            node.parent().is_some_and(|p| p.kind() == "jsx_attribute"),
+            &validation_content[node.byte_range()],
+        );
+        if let Some(relative) = line_break {
+            let offset = node.start_byte() + relative;
+            let prefix = &validation_content[..offset];
+            let row = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+            let column = offset
+                - prefix
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |i| i + 1)
+                + 1;
+            return Some(format!(
+                "{row}:{column} (unescaped line break in quoted JavaScript/TypeScript string; use an escaped newline or a template literal; column is a byte offset)"
+            ));
+        }
         if node.is_error() || node.is_missing() {
             let start = node.start_position();
             let reason = if node.is_missing() {
@@ -693,6 +755,13 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
     let mut reached_root = false;
     while !reached_root {
         let node = cursor.node();
+        errors += js_ts_string_line_breaks(
+            language,
+            node.kind(),
+            node.parent().is_some_and(|p| p.kind() == "jsx_attribute"),
+            &validation_content[node.byte_range()],
+        )
+        .0;
         if node.is_error() {
             errors += 1;
         }
@@ -717,6 +786,80 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn js_ts_quoted_strings_reject_unescaped_line_breaks() {
+        for language in [
+            Language::JavaScript,
+            Language::TypeScript { tsx: false },
+            Language::TypeScript { tsx: true },
+        ] {
+            for invalid in [
+                "const value = 'a\nb';\n",
+                "const value = \"a\r\nb\";\n",
+                "const value = 'a\rb';\n",
+                "const value = 'a\\\\\nb';\n",
+            ] {
+                assert!(syntax_counts(language, invalid.as_bytes()).unwrap().errors > 0);
+                assert!(first_syntax_diagnostic(language, invalid.as_bytes())
+                    .unwrap()
+                    .contains("unescaped line break"));
+            }
+            let invalid = "// π\nconst value = 'a\nb';\n";
+            assert!(first_syntax_diagnostic(language, invalid.as_bytes())
+                .unwrap()
+                .starts_with("2:17 "));
+            let two_breaks = "const value = 'a\nb\nc';\n";
+            assert_eq!(
+                syntax_counts(language, two_breaks.as_bytes())
+                    .unwrap()
+                    .errors,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn js_ts_string_guard_preserves_valid_lexical_contexts() {
+        for language in [
+            Language::JavaScript,
+            Language::TypeScript { tsx: false },
+            Language::TypeScript { tsx: true },
+        ] {
+            for valid in [
+                "const value = 'a\\nb';\n",
+                "const value = 'a\\\nb';\n",
+                "const value = \"a\\\r\nb\";\n",
+                "const value = 'a\\\rb';\n",
+                "const value = `a\nb`;\n",
+                "/* 'a\nb' */ const value = 1;\n",
+                "const value = /['\"]/;\n",
+                "const value = 'a\u{2028}b\u{2029}c';\n",
+            ] {
+                assert_eq!(
+                    syntax_counts(language, valid.as_bytes()).unwrap(),
+                    SyntaxCounts {
+                        errors: 0,
+                        missing: 0
+                    },
+                    "{valid:?}"
+                );
+                assert!(first_syntax_diagnostic(language, valid.as_bytes()).is_none());
+            }
+        }
+        for language in [Language::JavaScript, Language::TypeScript { tsx: true }] {
+            let valid = "const view = <div title=\"a\nb\" />;\n";
+            assert_eq!(
+                syntax_counts(language, valid.as_bytes()).unwrap(),
+                SyntaxCounts {
+                    errors: 0,
+                    missing: 0
+                }
+            );
+            let invalid = "const view = <div title={'a\nb'} />;\n";
+            assert!(syntax_counts(language, invalid.as_bytes()).unwrap().errors > 0);
+        }
+    }
+
     #[test]
     fn c_va_arg_type_operands_use_validation_view_only() {
         let valid = b"#include <stdarg.h>\nvoid *get(int key,...) {va_list ap;va_start(ap,key);void *p=va_arg(ap,void *);va_end(ap);return p;}\n";

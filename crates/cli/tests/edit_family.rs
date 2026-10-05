@@ -970,6 +970,60 @@ fn replace_text_accepts_raw_borrows_and_preserves_syntax_refusal_atomicity() {
 }
 
 #[test]
+fn replace_text_refuses_js_string_newlines_from_stdin_atomically() {
+    let fixture = Fixture::new("js-linebreak");
+    let source = "const x = document.querySelectorAll('ABC');\n";
+    for path in [
+        "example.js",
+        "example.mjs",
+        "example.cjs",
+        "example.ts",
+        "example.tsx",
+    ] {
+        std::fs::write(fixture.repo.join(path), source).unwrap();
+        for replacement in [b"XYZ\n".as_slice(), b"XYZ\r\n", b"XYZ\r"] {
+            for dry_run in [false, true] {
+                let mut args = vec!["replace-text", path, "ABC"];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let refused = fixture.run_with_stdin(&args, replacement);
+                assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
+                let output = combined(&refused);
+                assert!(output.contains("unescaped line break"), "{output}");
+                assert!(output.contains(&format!("{path}:1:")), "{output}");
+                assert!(output.contains("nothing written"), "{output}");
+                assert_file(&fixture.repo.join(path), source);
+            }
+        }
+        let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\\n");
+        assert!(accepted.status.success(), "{}", combined(&accepted));
+        assert_file(
+            &fixture.repo.join(path),
+            "const x = document.querySelectorAll('XYZ\\n');\n",
+        );
+    }
+}
+
+#[test]
+fn replace_text_preserves_multiline_jsx_attribute_strings() {
+    let fixture = Fixture::new("jsx-attribute");
+    for path in ["example.jsx", "example.tsx"] {
+        std::fs::write(
+            fixture.repo.join(path),
+            "const view = <div title=\"ABC\" />;\n",
+        )
+        .unwrap();
+        let accepted = fixture.run_with_stdin(&["replace-text", path, "ABC"], b"XYZ\n");
+        assert!(accepted.status.success(), "{}", combined(&accepted));
+        assert_file(
+            &fixture.repo.join(path),
+            "const view = <div title=\"XYZ\n\" />;\n",
+        );
+    }
+}
+
+#[test]
 fn replace_text_accepts_typescript_import_type_and_preserves_atomicity() {
     let fixture = Fixture::new("replace-text-typescript-import-type");
     let source = "import { vi } from \"vitest\";\nconst marker = 1;\n";
