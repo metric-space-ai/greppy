@@ -330,11 +330,21 @@ impl EmbeddingContentCache {
             .conn
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .unwrap_or(0);
+        let freelist_count: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap_or(0);
         let page_size: i64 = self
             .conn
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap_or(4096);
-        let bytes = page_count.saturating_mul(page_size);
+        // SQLite keeps deleted pages in the database freelist for reuse. They
+        // are already available capacity, so counting them as live bytes would
+        // make every later prune delete another slice of valid vectors even
+        // though the working set is below its quota.
+        let bytes = page_count
+            .saturating_sub(freelist_count)
+            .saturating_mul(page_size);
         if bytes <= max_bytes {
             return Ok(());
         }
@@ -578,18 +588,31 @@ mod tests {
             .conn
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap();
-        cache
-            .prune_to_byte_budget(page_count.saturating_mul(page_size) / 2)
-            .unwrap();
+        let byte_budget = page_count.saturating_mul(page_size) / 2;
+        cache.prune_to_byte_budget(byte_budget).unwrap();
         for key in active {
             assert!(cache.get("m", "p", "t", &key).unwrap().is_some());
         }
-        let retained: i64 = cache
+        let retained_after_first_trim: i64 = cache
             .conn
             .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert!(retained < 1024, "byte pressure must still enforce eviction");
+        assert!(
+            retained_after_first_trim < 1024,
+            "byte pressure must still enforce eviction"
+        );
+        cache.prune_to_byte_budget(byte_budget).unwrap();
+        let retained_after_second_trim: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            retained_after_second_trim, retained_after_first_trim,
+            "freelist pages must not cause progressive eviction below the live-byte budget"
+        );
     }
 }
