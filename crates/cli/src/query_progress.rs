@@ -32,7 +32,10 @@ impl LocalQueryProgress {
             worker_count: None,
         }));
         let observed = Arc::clone(&progress);
-        let mut reporter = ProgressReporter { compact: true, ..ProgressReporter::default() };
+        let mut reporter = ProgressReporter {
+            compact: true,
+            ..ProgressReporter::default()
+        };
         let thread = QueryProgress::start(INITIAL_DELAY, move |elapsed| {
             let snapshot = observed.lock().ok().map(|progress| progress.clone());
             if let Some(line) =
@@ -697,7 +700,9 @@ mod tests {
     #[test]
     fn missing_job_status_is_honest_and_emitted_once() {
         let mut reporter = ProgressReporter::default();
-        assert!(reporter.observe("search", None, Duration::from_secs(10)).is_none());
+        assert!(reporter
+            .observe("search", None, Duration::from_secs(10))
+            .is_none());
         let first = reporter.observe("search", None, STALL_AFTER).unwrap();
         assert!(
             first.contains("no live index progress is reported"),
@@ -743,25 +748,50 @@ mod tests {
 
     #[test]
     fn compact_progress_waits_for_a_useful_estimate_instead_of_phase_chatter() {
-        let mut reporter = ProgressReporter { compact: true, ..ProgressReporter::default() };
-        assert!(reporter.observe("read", Some(job("counting", 0, 0)), Duration::from_secs(10)).is_none());
-        assert!(reporter.observe("read", Some(job("embedding", 0, 197)), Duration::from_secs(12)).is_none());
+        let mut reporter = ProgressReporter {
+            compact: true,
+            ..ProgressReporter::default()
+        };
+        assert!(reporter
+            .observe("read", Some(job("counting", 0, 0)), Duration::from_secs(10))
+            .is_none());
+        assert!(reporter
+            .observe(
+                "read",
+                Some(job("embedding", 0, 197)),
+                Duration::from_secs(12)
+            )
+            .is_none());
         let mut measured = job("embedding", 100, 197);
         measured.rate_milli_spans_per_second = 10_000;
         measured.eta_unix_secs = Some(32);
-        let estimate = reporter.observe("read", Some(measured), Duration::from_secs(22)).unwrap();
+        let estimate = reporter
+            .observe("read", Some(measured), Duration::from_secs(22))
+            .unwrap();
         assert!(estimate.contains("phase ETA about"), "{estimate}");
-        assert!(reporter.observe("read", Some(job("completed", 197, 197)), Duration::from_secs(24)).is_none());
+        assert!(reporter
+            .observe(
+                "read",
+                Some(job("completed", 197, 197)),
+                Duration::from_secs(24)
+            )
+            .is_none());
     }
 
     #[test]
     fn completed_index_never_becomes_a_missing_progress_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("job.json");
-        std::fs::write(&path, r#"{"state":"completed","completed_spans":197,"total_spans":197}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"state":"completed","completed_spans":197,"total_spans":197}"#,
+        )
+        .unwrap();
         let completed = JobProgress::read(&path).expect("terminal snapshot is retained");
         let mut reporter = ProgressReporter::default();
-        assert!(reporter.observe("index", Some(completed), Duration::from_secs(120)).is_none());
+        assert!(reporter
+            .observe("index", Some(completed), Duration::from_secs(120))
+            .is_none());
     }
 
     #[test]
