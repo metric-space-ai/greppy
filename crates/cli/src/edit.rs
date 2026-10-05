@@ -1664,7 +1664,17 @@ pub(crate) fn edit_journal_open(
             }
             None => None,
         };
-        entries.push(serde_json::json!({ "path": item.rel, "blob": blob }));
+        let mut entry = serde_json::json!({ "path": item.rel, "blob": blob });
+        // Deletion followed by undo recreates the inode. Preserve its original
+        // permissions alongside the optional byte pre-image.
+        #[cfg(unix)]
+        if item.content.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(root_path.join(&item.rel)) {
+                entry["unix_mode"] = serde_json::json!(metadata.permissions().mode());
+            }
+        }
+        entries.push(entry);
     }
     edit_journal_write_checked(
         &edit_pending_path(&dir, &id),
@@ -1782,7 +1792,8 @@ pub(crate) fn edit_journal_restore(
                 (Ok(bytes), true) => {
                     edit_sha256_hex(bytes) == entry["after_sha256"].as_str().unwrap_or_default()
                 }
-                (Err(_), false) => true,
+                (Err(_), false) => std::fs::symlink_metadata(root_path.join(rel))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
                 _ => false,
             };
             if !unchanged {
@@ -1814,6 +1825,18 @@ pub(crate) fn edit_journal_restore(
                 std::fs::write(&abs, &bytes).map_err(|error| {
                     EditRefusal::new("publish_failed", format!("{rel}: {error}"), 16)
                 })?;
+                #[cfg(unix)]
+                if let Some(mode) = entry["unix_mode"].as_u64() {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(mode as u32))
+                        .map_err(|error| {
+                            EditRefusal::new(
+                                "publish_failed",
+                                format!("{rel}: restore permissions: {error}"),
+                                16,
+                            )
+                        })?;
+                }
                 restored.push(rel);
             }
             // The file was created by that edit, so putting it back means
@@ -2296,9 +2319,17 @@ struct TrainedPatchHunk {
 }
 
 #[derive(Debug)]
+enum TrainedPatchOperation {
+    Update,
+    Add(Vec<u8>),
+    Delete,
+}
+
+#[derive(Debug)]
 struct TrainedPatchFile {
     path: String,
     hunks: Vec<TrainedPatchHunk>,
+    operation: TrainedPatchOperation,
 }
 
 fn trained_patch_path(header: &str) -> Option<String> {
@@ -2314,9 +2345,8 @@ fn trained_patch_path(header: &str) -> Option<String> {
     )
 }
 
-/// Convert the explicit marker envelope into the existing atomic planner's
-/// text-only grammar. Never discard an unsupported operation or unknown marker.
-fn normalize_marker_patch(text: &str) -> EditResult<String> {
+/// Parse explicit file operations without dropping unknown markers or payload.
+fn parse_marker_patch(text: &str) -> EditResult<Vec<TrainedPatchFile>> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.last() != Some(&"*** End Patch") {
         return Err(EditRefusal::new(
@@ -2325,53 +2355,92 @@ fn normalize_marker_patch(text: &str) -> EditResult<String> {
             20,
         ));
     }
-    let mut output = String::new();
-    let mut in_file = false;
-    let mut in_hunk = false;
-    for line in &lines[1..lines.len() - 1] {
-        if let Some(path) = line.strip_prefix("*** Update File: ") {
-            if path.is_empty() || path.trim() != path || path.chars().any(char::is_whitespace) {
-                return Err(EditRefusal::new("invalid_patch", "marker Update File requires one nonempty path without whitespace; nothing written", 20));
-            }
-            output.push_str(&format!(
-                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
-            ));
-            in_file = true;
-            in_hunk = false;
-        } else if line.starts_with("*** Add File:")
-            || line.starts_with("*** Delete File:")
-            || line.starts_with("*** Move to:")
-        {
-            return Err(EditRefusal::new("invalid_patch", "marker Add File, Delete File and Move to operations are unsupported: patch atomically edits existing file contents only. Use greppy write for creation or handle deletion/rename separately; those operations are not atomic with this patch; nothing written", 20));
-        } else if line.starts_with("***") || !in_file {
-            return Err(EditRefusal::new("invalid_patch", format!("unexpected marker patch line `{line}`; expected *** Update File: PATH followed by @@ hunks; nothing written"), 20));
+    let mut files = Vec::new();
+    let mut index = 1;
+    while index < lines.len() - 1 {
+        let header = lines[index];
+        let (kind, path) = if let Some(path) = header.strip_prefix("*** Update File: ") {
+            (0, path)
+        } else if let Some(path) = header.strip_prefix("*** Add File: ") {
+            (1, path)
+        } else if let Some(path) = header.strip_prefix("*** Delete File: ") {
+            (2, path)
         } else {
-            // Symbol labels are advisory, just as unified-diff line numbers.
-            if line == &"@@" || line.starts_with("@@ ") {
-                output.push_str("@@\n");
-                in_hunk = true;
-            } else {
-                if !in_hunk || !matches!(line.as_bytes().first(), Some(b' ' | b'-' | b'+')) {
-                    return Err(EditRefusal::new("invalid_patch", format!("invalid marker hunk line `{line}`; use @@ and prefixed context/removal/addition lines; *** End of File is unsupported; nothing written"), 20));
-                }
-                output.push_str(line);
-                output.push('\n');
-            }
+            return Err(EditRefusal::new("invalid_patch", format!("unsupported marker `{header}`; expected Update File, Add File or Delete File; Move to and End of File are unsupported; nothing written"), 20));
+        };
+        if path.is_empty() || path.trim() != path || path.chars().any(char::is_whitespace) {
+            return Err(EditRefusal::new("invalid_patch", "marker file operation requires one nonempty path without whitespace; nothing written", 20));
         }
+        index += 1;
+        let start = index;
+        while index < lines.len() - 1 && !lines[index].starts_with("***") {
+            index += 1;
+        }
+        let body = &lines[start..index];
+        let (operation, hunks) = match kind {
+            0 => {
+                let mut diff = format!("--- a/{path}\n+++ b/{path}\n");
+                let mut in_hunk = false;
+                for line in body {
+                    if line == &"@@" || line.starts_with("@@ ") {
+                        diff.push_str("@@\n");
+                        in_hunk = true;
+                    } else {
+                        if !in_hunk || !matches!(line.as_bytes().first(), Some(b' ' | b'-' | b'+'))
+                        {
+                            return Err(EditRefusal::new("invalid_patch", format!("{path}: invalid marker hunk line `{line}`; use @@ and prefixed context/removal/addition lines; nothing written"), 20));
+                        }
+                        diff.push_str(line);
+                        diff.push('\n');
+                    }
+                }
+                let mut parsed = parse_trained_patch(diff.as_bytes())?;
+                (TrainedPatchOperation::Update, parsed.remove(0).hunks)
+            }
+            1 => {
+                let mut content = Vec::new();
+                for line in body {
+                    let Some(line) = line.strip_prefix('+') else {
+                        return Err(EditRefusal::new("invalid_patch", format!("{path}: each Add File content line must start with '+'; nothing written"), 20));
+                    };
+                    content.extend_from_slice(line.as_bytes());
+                    content.push(b'\n');
+                }
+                (TrainedPatchOperation::Add(content), Vec::new())
+            }
+            _ => {
+                if !body.is_empty() {
+                    return Err(EditRefusal::new(
+                        "invalid_patch",
+                        format!("{path}: Delete File takes no content or hunks; nothing written"),
+                        20,
+                    ));
+                }
+                (TrainedPatchOperation::Delete, Vec::new())
+            }
+        };
+        files.push(TrainedPatchFile {
+            path: path.to_string(),
+            hunks,
+            operation,
+        });
     }
-    Ok(output)
+    if files.is_empty() {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "marker patch carries no file operation; nothing written",
+            20,
+        ));
+    }
+    Ok(files)
 }
 
 fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
     let text = std::str::from_utf8(diff)
         .map_err(|_| EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20))?;
-    let normalized;
-    let text = if text.starts_with("*** Begin Patch\n") || text.starts_with("*** Begin Patch\r\n") {
-        normalized = normalize_marker_patch(text)?;
-        normalized.as_str()
-    } else {
-        text
-    };
+    if text.starts_with("*** Begin Patch\n") || text.starts_with("*** Begin Patch\r\n") {
+        return parse_marker_patch(text);
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
     let mut index = 0usize;
@@ -2567,7 +2636,11 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                 20,
             ));
         }
-        files.push(TrainedPatchFile { path, hunks });
+        files.push(TrainedPatchFile {
+            path,
+            hunks,
+            operation: TrainedPatchOperation::Update,
+        });
     }
     if files.is_empty() {
         return Err(EditRefusal::new(
@@ -2684,6 +2757,7 @@ fn apply_trained_patch_file(
 
 /// Undo only writes this invocation actually published. A failed CAS target
 /// belongs to another writer and must never be restored from our pre-image.
+#[cfg(test)]
 fn rollback_patch_file(
     root: &std::path::Path,
     path: &std::path::Path,
@@ -2705,6 +2779,38 @@ pub(crate) fn run_trained_patch(
     run_trained_patch_with_publish_hook(root_path, file_base, diff, dry_run, verify, |_| {})
 }
 
+struct PlannedPatchFile {
+    rel: String,
+    abs: std::path::PathBuf,
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+    changed: Vec<(usize, usize)>,
+}
+
+fn publish_patch_transition(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    permissions: Option<std::fs::Permissions>,
+) -> std::result::Result<(), String> {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            greppy_edit::publish::publish_atomic(root, path, after, &edit_sha256_hex(before))
+                .map(|_| ())
+        }
+        (None, Some(after)) => {
+            greppy_edit::publish::publish_create_atomic(root, path, after, permissions).map(|_| ())
+        }
+        (Some(before), None) => {
+            greppy_edit::publish::publish_delete_atomic(root, path, &edit_sha256_hex(before))
+        }
+        (None, None) => return Ok(()),
+    }
+    .map_err(|error| error.to_string())
+}
+
 fn run_trained_patch_with_publish_hook(
     root_path: &std::path::Path,
     file_base: &std::path::Path,
@@ -2717,59 +2823,107 @@ fn run_trained_patch_with_publish_hook(
     let mut targets = std::collections::HashSet::new();
     let mut planned = Vec::new();
     for file in parsed {
-        let (rel, abs, content) = edit_read_file(root_path, file_base, &file.path)?;
-        let target = std::fs::canonicalize(&abs).map_err(|error| {
-            EditRefusal::new(
-                "file_unreadable",
-                format!("resolve {}: {error}", file.path),
-                10,
-            )
-        })?;
+        let (rel, abs, before, after, changed) = match file.operation {
+            TrainedPatchOperation::Add(bytes) => {
+                let (rel, abs) = edit_resolve_new_path(root_path, file_base, &file.path)?;
+                let abs = greppy_edit::publish::require_new_inside_workspace(root_path, &abs)
+                    .map_err(|error| {
+                        EditRefusal::new(
+                            "invalid_patch",
+                            format!("{}: {error}; nothing written", file.path),
+                            20,
+                        )
+                    })?;
+                edit_validate_syntax(&rel, &[], &bytes)?;
+                let changed = vec![(0, bytes.len())];
+                (rel, abs, None, Some(bytes), changed)
+            }
+            operation => {
+                let (rel, abs, content) = edit_read_file(root_path, file_base, &file.path)?;
+                match operation {
+                    TrainedPatchOperation::Update => {
+                        let (after, changed) =
+                            apply_trained_patch_file(&rel, &content, &file.hunks)?;
+                        edit_validate_syntax(&rel, &content, &after)?;
+                        (rel, abs, Some(content), Some(after), changed)
+                    }
+                    TrainedPatchOperation::Delete => (rel, abs, Some(content), None, vec![(0, 0)]),
+                    TrainedPatchOperation::Add(_) => unreachable!(),
+                }
+            }
+        };
+        let target = edit_lock_identity(&abs);
         if !targets.insert(target) {
-            return Err(EditRefusal::new(
-                "invalid_patch",
-                format!(
-                    "{}: duplicate patch target; combine all hunks for this file under one ---/+++ header pair before retrying — nothing written",
-                    file.path
-                ),
-                20,
-            ));
+            return Err(EditRefusal::new("invalid_patch", format!("{}: duplicate patch target; combine all hunks for this file under one ---/+++ header pair or one marker operation before retrying — nothing written", file.path), 20));
         }
-        let (after, changed) = apply_trained_patch_file(&rel, &content, &file.hunks)?;
-        edit_validate_syntax(&rel, &content, &after)?;
-        planned.push((rel, abs, content, after, changed));
+        let permissions = if before.is_some() {
+            Some(
+                std::fs::metadata(&abs)
+                    .map_err(|error| {
+                        EditRefusal::new(
+                            "file_unreadable",
+                            format!("stat {}: {error}", file.path),
+                            10,
+                        )
+                    })?
+                    .permissions(),
+            )
+        } else {
+            None
+        };
+        planned.push(PlannedPatchFile {
+            rel,
+            abs,
+            before,
+            after,
+            permissions,
+            changed,
+        });
     }
-    let already = planned
-        .iter()
-        .all(|(_, _, before, after, _)| before == after);
+    let already = planned.iter().all(|file| file.before == file.after);
     let exact_required = planned.len() > 1
         || planned
             .iter()
-            .any(|(_, _, _, _, changed)| changed.len() > 1);
+            .any(|file| file.changed.len() > 1 || file.before.is_none() || file.after.is_none());
     let exact_addresses = planned
         .iter()
-        .map(|(rel, _, _, after, changed)| edit_exact_address(rel, after, changed))
+        .map(|file| {
+            if file.after.is_none() {
+                format!("{} (deleted)", file.rel)
+            } else {
+                edit_exact_address(
+                    &file.rel,
+                    file.after.as_deref().unwrap_or_default(),
+                    &file.changed,
+                )
+            }
+        })
         .collect::<Vec<_>>();
     let mut record = EditRecord {
-        files: planned
-            .iter()
-            .map(|(rel, _, _, _, _)| rel.clone())
-            .collect(),
-        span: planned.first().and_then(|(_, _, _, after, changed)| {
-            let (start, end) = changed.first().copied()?;
-            Some(edit_span_lines(after, start, end.saturating_sub(start)))
+        files: planned.iter().map(|file| file.rel.clone()).collect(),
+        span: planned.first().and_then(|file| {
+            let (start, end) = file.changed.first().copied()?;
+            Some(edit_span_lines(
+                file.after.as_deref().unwrap_or_default(),
+                start,
+                end.saturating_sub(start),
+            ))
         }),
         published: !dry_run,
         already_as_sent: already && !dry_run,
         ..EditRecord::default()
     };
-    for (rel, _, before, after, changed) in &planned {
+    for file in &planned {
         record.operations.push(EditOperation {
-            file: rel.clone(),
-            ranges: changed.clone(),
-            sha_before: Some(edit_sha256_hex(before)),
-            sha_after: Some(edit_sha256_hex(after)),
-            diff: Some(edit_unified_diff(rel, before, after)),
+            file: file.rel.clone(),
+            ranges: file.changed.clone(),
+            sha_before: file.before.as_deref().map(edit_sha256_hex),
+            sha_after: file.after.as_deref().map(edit_sha256_hex),
+            diff: Some(edit_unified_diff(
+                &file.rel,
+                file.before.as_deref().unwrap_or_default(),
+                file.after.as_deref().unwrap_or_default(),
+            )),
             ..EditOperation::default()
         });
     }
@@ -2777,24 +2931,36 @@ fn run_trained_patch_with_publish_hook(
         edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
         return Ok(record);
     }
-    let before: Vec<UndoBefore> = planned
+    let before = planned
         .iter()
-        .map(|(rel, _, content, _, _)| UndoBefore {
-            rel: rel.clone(),
-            content: Some(content.clone()),
+        .map(|file| UndoBefore {
+            rel: file.rel.clone(),
+            content: file.before.clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
     let transaction = edit_journal_open(root_path, &before)?;
     edit_journal_crash_hook()?;
-    for (published_count, (_, abs, content, after, _)) in planned.iter().enumerate() {
+    for (published_count, file) in planned.iter().enumerate() {
         before_publish(published_count);
-        if let Err(error) =
-            greppy_edit::publish::publish_atomic(root_path, abs, after, &edit_sha256_hex(content))
-        {
+        if let Err(error) = publish_patch_transition(
+            root_path,
+            &file.abs,
+            file.before.as_deref(),
+            file.after.as_deref(),
+            None,
+        ) {
             let mut conflicts = Vec::new();
-            for (rel, path, before, published, _) in planned[..published_count].iter().rev() {
-                if let Err(reason) = rollback_patch_file(root_path, path, before, published) {
-                    conflicts.push(format!("{rel}: {reason}"));
+            for file in planned[..published_count].iter().rev() {
+                // Reverse only a transition we actually published; CAS/absence
+                // guards refuse to overwrite an intervening writer.
+                if let Err(reason) = publish_patch_transition(
+                    root_path,
+                    &file.abs,
+                    file.after.as_deref(),
+                    file.before.as_deref(),
+                    file.permissions.clone(),
+                ) {
+                    conflicts.push(format!("{}: {reason}", file.rel));
                 }
             }
             let journal = edit_journal_dir(root_path);
@@ -2802,22 +2968,16 @@ fn run_trained_patch_with_publish_hook(
                 &journal,
                 transaction.as_deref().unwrap_or_default(),
             )) {
-                // Verify that this pending record belongs to our transaction. Never remove or
-                // restore its journal on behalf of this failed transaction.
                 if transaction
                     .as_deref()
                     .is_some_and(|id| pending["id"].as_str() == Some(id))
                 {
                     if !conflicts.is_empty() {
-                        // Keep evidence, but do not leave an unsafe automatic
-                        // recovery candidate that could overwrite the conflict.
                         let id = transaction.as_deref().unwrap_or_default();
                         edit_journal_write(
                             &journal.join(format!("rollback-conflict-{id}.json")),
                             &serde_json::json!({
-                                "transaction": pending,
-                                "published_count": published_count,
-                                "conflicts": conflicts,
+                                "transaction": pending, "published_count": published_count, "conflicts": conflicts,
                             }),
                         );
                     }
@@ -5080,6 +5240,153 @@ mod patch_rollback_tests {
             apply_trained_patch_file("example.txt", b"one\nkeep\ntwo\n", &grouped[0].hunks)
                 .unwrap_or_else(|refusal| panic!("{}", refusal.message));
         assert_eq!(after, b"ONE\nkeep\nTWO\n");
+    }
+
+    #[test]
+    fn mixed_marker_patch_rolls_back_existence_changes_after_late_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("nested/add.txt");
+        let deleted = dir.path().join("delete.txt");
+        let late = dir.path().join("late.txt");
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: nested/add.txt\n+created\n*** Delete File: delete.txt\n*** Update File: late.txt\n@@\n-late\n+LATE\n*** End Patch\n";
+        for conflict in [false, true] {
+            std::fs::write(&update, b"old\n").unwrap();
+            std::fs::write(&deleted, b"deleted original\n").unwrap();
+            std::fs::write(&late, b"late\n").unwrap();
+            if added.exists() {
+                std::fs::remove_file(&added).unwrap();
+            }
+            let result = run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                false,
+                false,
+                |index| {
+                    if index == 3 {
+                        std::fs::write(&late, b"other writer\n").unwrap();
+                        if conflict {
+                            std::fs::write(&added, b"other creator\n").unwrap();
+                            std::fs::write(&deleted, b"recreated by other writer\n").unwrap();
+                        }
+                    }
+                },
+            );
+            let refusal = result.err().expect("late stale plan must refuse");
+            assert_eq!(refusal.code, "publish_failed");
+            assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+            assert_eq!(std::fs::read(&late).unwrap(), b"other writer\n");
+            if conflict {
+                assert!(refusal.message.contains("Some patch writes may remain"));
+                assert_eq!(std::fs::read(&added).unwrap(), b"other creator\n");
+                assert_eq!(
+                    std::fs::read(&deleted).unwrap(),
+                    b"recreated by other writer\n"
+                );
+            } else {
+                assert!(refusal.message.contains("were rolled back"));
+                assert!(!added.exists());
+                assert_eq!(std::fs::read(&deleted).unwrap(), b"deleted original\n");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_marker_deletion_race_preserves_the_failed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        let deleted = dir.path().join("delete.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        std::fs::write(&deleted, b"original\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** End Patch\n";
+        let result = run_trained_patch_with_publish_hook(
+            dir.path(),
+            dir.path(),
+            diff.to_vec(),
+            false,
+            false,
+            |index| {
+                if index == 2 {
+                    std::fs::write(&deleted, b"other writer\n").unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap().code, "publish_failed");
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert!(!added.exists());
+        assert_eq!(std::fs::read(&deleted).unwrap(), b"other writer\n");
+    }
+
+    #[test]
+    fn mixed_marker_interrupted_publication_retains_recoverable_preimages() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        let deleted = dir.path().join("delete.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        std::fs::write(&deleted, b"original\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** Delete File: delete.txt\n*** Update File: update2.txt\n@@\n-old\n+new\n*** End Patch\n";
+        std::fs::write(dir.path().join("update2.txt"), b"old\n").unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                false,
+                false,
+                |index| {
+                    if index == 3 {
+                        panic!("simulate interruption after mixed publication");
+                    }
+                },
+            );
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(std::fs::read(&update).unwrap(), b"new\n");
+        assert!(added.exists());
+        assert!(!deleted.exists());
+        let journal = edit_journal_dir(dir.path());
+        let pending = std::fs::read_dir(&journal)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("pending-")
+            })
+            .unwrap();
+        let record = edit_journal_read(&pending).unwrap();
+        edit_journal_restore(dir.path(), &record, false).unwrap();
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert!(!added.exists());
+        assert_eq!(std::fs::read(&deleted).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn mixed_marker_creation_collision_rolls_back_only_published_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update.txt");
+        let added = dir.path().join("add.txt");
+        std::fs::write(&update, b"old\n").unwrap();
+        let diff = b"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Add File: add.txt\n+created\n*** End Patch\n";
+        let result = run_trained_patch_with_publish_hook(
+            dir.path(),
+            dir.path(),
+            diff.to_vec(),
+            false,
+            false,
+            |index| {
+                if index == 1 {
+                    std::fs::write(&added, b"racing creator\n").unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap().code, "publish_failed");
+        assert_eq!(std::fs::read(&update).unwrap(), b"old\n");
+        assert_eq!(std::fs::read(&added).unwrap(), b"racing creator\n");
     }
 
     #[test]
