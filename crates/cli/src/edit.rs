@@ -2314,9 +2314,64 @@ fn trained_patch_path(header: &str) -> Option<String> {
     )
 }
 
+/// Convert the explicit marker envelope into the existing atomic planner's
+/// text-only grammar. Never discard an unsupported operation or unknown marker.
+fn normalize_marker_patch(text: &str) -> EditResult<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.last() != Some(&"*** End Patch") {
+        return Err(EditRefusal::new(
+            "invalid_patch",
+            "marker patch requires a final *** End Patch; nothing written",
+            20,
+        ));
+    }
+    let mut output = String::new();
+    let mut in_file = false;
+    let mut in_hunk = false;
+    for line in &lines[1..lines.len() - 1] {
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            if path.is_empty() || path.trim() != path || path.chars().any(char::is_whitespace) {
+                return Err(EditRefusal::new("invalid_patch", "marker Update File requires one nonempty path without whitespace; nothing written", 20));
+            }
+            output.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            ));
+            in_file = true;
+            in_hunk = false;
+        } else if line.starts_with("*** Add File:")
+            || line.starts_with("*** Delete File:")
+            || line.starts_with("*** Move to:")
+        {
+            return Err(EditRefusal::new("invalid_patch", "marker Add File, Delete File and Move to operations are unsupported: patch atomically edits existing file contents only. Use greppy write for creation or handle deletion/rename separately; those operations are not atomic with this patch; nothing written", 20));
+        } else if line.starts_with("***") || !in_file {
+            return Err(EditRefusal::new("invalid_patch", format!("unexpected marker patch line `{line}`; expected *** Update File: PATH followed by @@ hunks; nothing written"), 20));
+        } else {
+            // Symbol labels are advisory, just as unified-diff line numbers.
+            if line == &"@@" || line.starts_with("@@ ") {
+                output.push_str("@@\n");
+                in_hunk = true;
+            } else {
+                if !in_hunk || !matches!(line.as_bytes().first(), Some(b' ' | b'-' | b'+')) {
+                    return Err(EditRefusal::new("invalid_patch", format!("invalid marker hunk line `{line}`; use @@ and prefixed context/removal/addition lines; *** End of File is unsupported; nothing written"), 20));
+                }
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
     let text = std::str::from_utf8(diff)
         .map_err(|_| EditRefusal::new("invalid_patch", "the unified diff is not UTF-8", 20))?;
+    let normalized;
+    let text = if text.starts_with("*** Begin Patch\n") || text.starts_with("*** Begin Patch\r\n") {
+        normalized = normalize_marker_patch(text)?;
+        normalized.as_str()
+    } else {
+        text
+    };
     let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
     let mut index = 0usize;
@@ -2389,8 +2444,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
             }
             input_hunk_number += 1;
             let input_line = index + 1;
-            // Positions remain advisory; counts disambiguate actual file
-            // headers from removed/added content beginning with ---/+++.
+            // Positions/counts remain advisory. Header pairs followed by a
+            // hunk introduce a file; otherwise header-shaped text is payload.
             let header_fields: Vec<&str> = lines[index].split_whitespace().collect();
             let declared_counts = (|| {
                 let count = |field: &str, prefix| {
@@ -2437,10 +2492,15 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                         .is_some_and(|next| next.starts_with("+++ "));
                 if header_pair {
                     match declared_counts {
-                        Some((old, new)) if old_lines.len() == old && new_lines.len() == new => {
+                        Some((old, new))
+                            if (old_lines.len() == old && new_lines.len() == new)
+                                || lines
+                                    .get(index + 2)
+                                    .is_some_and(|line| line.starts_with("@@")) =>
+                        {
                             break;
                         }
-                        Some(_) => {} // Still inside the declared hunk: these are payload lines.
+                        Some(_) => {} // No following hunk: these are payload lines.
                         None if old_lines.is_empty() && new_lines.is_empty() => {}
                         None => {
                             return Err(EditRefusal::new(
@@ -2490,19 +2550,8 @@ fn parse_trained_patch(diff: &[u8]) -> EditResult<Vec<TrainedPatchFile>> {
                     20,
                 ));
             }
-            if let Some((old, new)) = declared_counts {
-                if old_lines.len() != old || new_lines.len() != new {
-                    return Err(EditRefusal::new(
-                        "invalid_patch",
-                        format!(
-                            "{path}: hunk {input_hunk_number} at patch input line {input_line} declares {old} old and {new} new lines, but contains {} old and {} new lines; regenerate the unified diff with correct counts — nothing written",
-                            old_lines.len(),
-                            new_lines.len()
-                        ),
-                        20,
-                    ));
-                }
-            }
+            // Count the actual body. Both ranges and their counts are advisory;
+            // complete source-line matching still decides whether it can apply.
             hunks.push(TrainedPatchHunk {
                 input_hunk_number,
                 input_line,
@@ -2580,10 +2629,7 @@ fn apply_trained_patch_file(
                 ))
             }
             many => {
-                let declared = hunk.declared_old_line.saturating_sub(1);
-                if many.contains(&declared) {
-                    declared
-                } else {
+                {
                     const MAX_REPORTED_CANDIDATES: usize = 5;
                     let candidate_ranges = many
                         .iter()
