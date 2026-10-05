@@ -280,6 +280,27 @@ fn blocked_stdin_does_not_block_disjoint_edit_and_same_file_waiter_rereads() {
     assert_file(&fixture.repo.join("a.txt"), "X Y\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_parent_alias_serializes_with_the_real_file_and_preserves_both_edits() {
+    let fixture = Fixture::new("symlink-parent-lock");
+    std::fs::create_dir_all(fixture.repo.join("real/child")).unwrap();
+    std::fs::write(fixture.repo.join("real/a.txt"), "A B\n").unwrap();
+    std::fs::write(fixture.repo.join("a.txt"), "SENTINEL\n").unwrap();
+    std::os::unix::fs::symlink(fixture.repo.join("real/child"), fixture.repo.join("link")).unwrap();
+    let first = spawn_edit(&fixture, &["replace-text", "link/../a.txt", "A"]);
+    wait_for_file_owner(&fixture, "real/a.txt");
+    let mut same = spawn_edit(&fixture, &["replace-text", "real/a.txt", "B", "Y"]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(same.try_wait().unwrap().is_none());
+    let first = release_stdin(first, b"X");
+    assert!(first.status.success(), "{}", combined(&first));
+    let same = bounded_output(same);
+    assert!(same.status.success(), "{}", combined(&same));
+    assert_file(&fixture.repo.join("real/a.txt"), "X Y\n");
+    assert_file(&fixture.repo.join("a.txt"), "SENTINEL\n");
+}
+
 #[test]
 fn interrupted_edit_keeps_its_own_pending_evidence_when_another_edit_finishes() {
     let fixture = Fixture::new("pending-isolation");
