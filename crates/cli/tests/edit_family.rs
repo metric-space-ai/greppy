@@ -930,7 +930,11 @@ fn verify_timeout_is_bounded_actionable_and_keeps_the_applied_edit() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(17), "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(17),
+        "stdout={stdout}\nstderr={stderr}"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "elapsed={elapsed:?}; stdout={stdout}; stderr={stderr}"
@@ -1891,13 +1895,28 @@ fn rust_source_views_and_handles_own_outer_attributes_but_not_the_next_definitio
 #[test]
 fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
     for (tag, compiler, expected) in [
-        ("failed", "#!/bin/sh\nprintf 'error: intended verifier failure\\n' >&2\nexit 7\n", "failed"),
-        ("unavailable", "#!/greppy-test-missing-interpreter\n", "unavailable"),
+        (
+            "failed",
+            "#!/bin/sh\nprintf 'error: intended verifier failure\\n' >&2\nexit 7\n",
+            "failed",
+        ),
+        (
+            "unavailable",
+            "#!/greppy-test-missing-interpreter\n",
+            "unavailable",
+        ),
     ] {
         let fixture = Fixture::new(tag);
         std::fs::write(fixture.repo.join("ui.ts"), "const oldValue = 1;\n").unwrap();
         install_fake_tsc(&fixture, compiler);
-        let output = fixture.run(&["replace-text", "ui.ts", "oldValue", "newValue", "--verify", "--json"]);
+        let output = fixture.run(&[
+            "replace-text",
+            "ui.ts",
+            "oldValue",
+            "newValue",
+            "--verify",
+            "--json",
+        ]);
         assert_eq!(output.status.code(), Some(17), "{}", combined(&output));
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["published"], true);
@@ -1914,12 +1933,25 @@ fn python_body_indentation_is_checked_before_publication() {
     let fixture = Fixture::new("python-body-indentation");
     let before = "def clamp(value, lower, upper):\n    return min(lower, max(upper, value))\n";
     std::fs::write(fixture.repo.join("limits.py"), before).unwrap();
-    let refused = fixture.run(&["replace", "clamp", "--body", "return max(lower, min(upper, value))"]);
+    let refused = fixture.run(&[
+        "replace",
+        "clamp",
+        "--body",
+        "return max(lower, min(upper, value))",
+    ]);
     assert_eq!(refused.status.code(), Some(13), "{}", combined(&refused));
     assert!(combined(&refused).contains("indentation"));
     assert!(combined(&refused).contains("nothing written"));
     assert_file(&fixture.repo.join("limits.py"), before);
-    let applied = fixture.run(&["replace", "clamp", "--body", "    return max(lower, min(upper, value))"]);
+    let applied = fixture.run(&[
+        "replace",
+        "clamp",
+        "--body",
+        "    return max(lower, min(upper, value))",
+    ]);
     assert!(applied.status.success(), "{}", combined(&applied));
-    assert_file(&fixture.repo.join("limits.py"), "def clamp(value, lower, upper):\n    return max(lower, min(upper, value))\n");
+    assert_file(
+        &fixture.repo.join("limits.py"),
+        "def clamp(value, lower, upper):\n    return max(lower, min(upper, value))\n",
+    );
 }

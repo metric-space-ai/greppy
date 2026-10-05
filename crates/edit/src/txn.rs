@@ -669,12 +669,17 @@ fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)
             let mut in_function = false;
             while let Some(scope) = ancestor {
                 match scope.kind() {
-                    "function_definition" => { in_function = true; break; }
+                    "function_definition" => {
+                        in_function = true;
+                        break;
+                    }
                     "class_definition" | "module" => break,
                     _ => ancestor = scope.parent(),
                 }
             }
-            (!in_function).then_some("Python return must remain inside its function; preserve the body's indentation")
+            (!in_function).then_some(
+                "Python return must remain inside its function; preserve the body's indentation",
+            )
         } else {
             None
         };
@@ -692,7 +697,9 @@ fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
     if language == Language::Python {
         if let Some((row, column, reason)) = python_syntax_diagnostics(content).first() {
-            return Some(format!("{row}:{column} ({reason}; column is a byte offset)"));
+            return Some(format!(
+                "{row}:{column} ({reason}; column is a byte offset)"
+            ));
         }
     }
     let validation_content = syntax_validation_content(language, content);
@@ -854,8 +861,18 @@ mod tests {
             "def f():\n    pass\nreturn 1\n",
             "def f():\n    class C:\n        return 1\n",
         ] {
-            assert!(syntax_counts(Language::Python, invalid.as_bytes()).unwrap().errors > 0, "{invalid}");
-            assert!(first_syntax_diagnostic(Language::Python, invalid.as_bytes()).unwrap().contains("Python"));
+            assert!(
+                syntax_counts(Language::Python, invalid.as_bytes())
+                    .unwrap()
+                    .errors
+                    > 0,
+                "{invalid}"
+            );
+            assert!(
+                first_syntax_diagnostic(Language::Python, invalid.as_bytes())
+                    .unwrap()
+                    .contains("Python")
+            );
         }
         for valid in [
             "def f():\n    return 1\n",
@@ -868,8 +885,18 @@ mod tests {
             "def f():\n    class C:\n        def g(self):\n            return 1\n    return C\n",
             "def f():\n    if True:\n        return \"\"\"multiline\nreturn 2\n\"\"\"\n",
         ] {
-            assert_eq!(syntax_counts(Language::Python, valid.as_bytes()).unwrap().errors, 0, "{valid}");
-            assert_eq!(first_syntax_diagnostic(Language::Python, valid.as_bytes()), None, "{valid}");
+            assert_eq!(
+                syntax_counts(Language::Python, valid.as_bytes())
+                    .unwrap()
+                    .errors,
+                0,
+                "{valid}"
+            );
+            assert_eq!(
+                first_syntax_diagnostic(Language::Python, valid.as_bytes()),
+                None,
+                "{valid}"
+            );
         }
     }
 

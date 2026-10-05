@@ -1360,7 +1360,10 @@ pub(crate) struct EditVerification {
 
 impl EditVerification {
     fn new(status: EditVerificationStatus, diagnostics: Vec<String>) -> Self {
-        Self { status, diagnostics }
+        Self {
+            status,
+            diagnostics,
+        }
     }
 }
 
@@ -1406,18 +1409,24 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
     let stdout = match std::fs::File::create(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
-            return EditVerification::new(EditVerificationStatus::Unavailable, vec![format!(
-                "verify: unavailable — cannot capture stdout: {error}"
-            )])
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot capture stdout: {error}"
+                )],
+            )
         }
     };
     let stderr = match std::fs::File::create(&stderr_path) {
         Ok(file) => file,
         Err(error) => {
             let _ = std::fs::remove_file(&stdout_path);
-            return EditVerification::new(EditVerificationStatus::Unavailable, vec![format!(
-                "verify: unavailable — cannot capture stderr: {error}"
-            )]);
+            return EditVerification::new(
+                EditVerificationStatus::Unavailable,
+                vec![format!(
+                    "verify: unavailable — cannot capture stderr: {error}"
+                )],
+            );
         }
     };
     let command = std::iter::once(verifier.program.as_os_str())
@@ -1494,8 +1503,10 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
         return EditVerification::new(EditVerificationStatus::TimedOut, vec![message]);
     }
     let Some(status) = status else {
-        return EditVerification::new(EditVerificationStatus::Failed,
-            vec![format!("verify: failed — no exit status from {command}")]);
+        return EditVerification::new(
+            EditVerificationStatus::Failed,
+            vec![format!("verify: failed — no exit status from {command}")],
+        );
     };
     if status.success() {
         let message = format!("verify: passed — {}", verifier.label);
@@ -1527,10 +1538,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> E
 /// The compiler or linter for the touched file type, when the workspace has a
 /// local one. Verification is observable and bounded; it never downloads a
 /// tool and never silently switches to an unrelated language's workspace.
-pub(crate) fn edit_verify(
-    root_path: &std::path::Path,
-    files: &[String],
-) -> EditVerification {
+pub(crate) fn edit_verify(root_path: &std::path::Path, files: &[String]) -> EditVerification {
     let (verifiers, skipped) = edit_verifiers(root_path, files);
     if let Some(message) = skipped {
         eprintln!("{message}");
@@ -2028,8 +2036,13 @@ pub(crate) fn edit_record_json(
         }),
     );
     value.insert("published".into(), serde_json::json!(record.published));
-    value.insert("exit_code".into(), serde_json::json!(record.verification
-        .as_ref().map_or(0, |verification| verification.status.exit_code())));
+    value.insert(
+        "exit_code".into(),
+        serde_json::json!(record
+            .verification
+            .as_ref()
+            .map_or(0, |verification| verification.status.exit_code())),
+    );
     if let Some(first) = record.files.first() {
         value.insert("file".into(), serde_json::json!(first));
     }

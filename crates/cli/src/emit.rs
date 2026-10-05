@@ -395,7 +395,9 @@ pub(crate) fn emit_edit_outcome(
                     }
                 }
             }
-            Ok(record.verification.as_ref()
+            Ok(record
+                .verification
+                .as_ref()
                 .map_or(0, |verification| verification.status.exit_code()))
         }
         Err(refusal) => {
