@@ -2290,7 +2290,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn base_routing_rejects_unmounted_volume_without_fallback() {
-
         let base = tempdir("base-unmounted");
         let volume = base.join("volume");
         fs::create_dir_all(&volume).unwrap();
