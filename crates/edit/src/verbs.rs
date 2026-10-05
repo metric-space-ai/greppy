@@ -12,7 +12,7 @@ use crate::handle::EditHandle;
 use crate::hash::sha256_hex;
 use crate::publish::publish_atomic;
 use crate::txn::{apply_in_memory, outside_ranges_unchanged, syntax_counts, PlannedOp, Snapshot};
-use greppy_core::Result;
+use greppy_core::{Error, Result};
 use greppy_parser::Language;
 
 /// Formatter policy for an edit. `SelectedRange` pipes only the replaced
@@ -1837,6 +1837,11 @@ fn plan_semantic_file(
     };
     let applied = apply_in_memory(&snapshot, &ops)?;
     let syntax_before = syntax_counts(language, &snapshot.content);
+    if let Some(reason) = crate::txn::syntax_validation_limitation(language, &applied.content) {
+        return Err(Error::Invalid(format!(
+            "cannot validate proposed C edit: {reason}; nothing written"
+        )));
+    }
     let syntax_after = syntax_counts(language, &applied.content);
     let (syntax, applicable) = match (syntax_before, syntax_after) {
         (Some(before), Some(after)) => (
@@ -2489,6 +2494,13 @@ fn run_pipeline(
                 applied.content = formatted;
             }
         }
+    }
+    if let Some(reason) =
+        language.and_then(|l| crate::txn::syntax_validation_limitation(l, &applied.content))
+    {
+        return Err(Error::Invalid(format!(
+            "cannot validate proposed C edit: {reason}; nothing written"
+        )));
     }
     let syntax_after = language.and_then(|l| syntax_counts(l, &applied.content));
 

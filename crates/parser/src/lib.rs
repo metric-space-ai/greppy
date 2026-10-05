@@ -17,6 +17,7 @@
 #![allow(clippy::doc_overindented_list_items)]
 #![allow(clippy::doc_lazy_continuation)]
 
+pub mod c_preprocessor;
 pub mod extract;
 pub mod grounded_hint;
 pub mod langs;

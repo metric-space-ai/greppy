@@ -926,6 +926,11 @@ fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<(
     if !language.is_supported() {
         return Ok(());
     }
+    if let Some(reason) = greppy_edit::txn::syntax_validation_limitation(language, after) {
+        return Err(EditRefusal::new("validation_unavailable", format!(
+            "refused: cannot validate proposed {path}:{reason} — nothing written. Use supported local macro forms or validate a preprocessed translation unit with its compiler"
+        ), 13));
+    }
     if let (Some(before), Some(counts)) = (
         greppy_edit::txn::syntax_counts(language, before),
         greppy_edit::txn::syntax_counts(language, after),
