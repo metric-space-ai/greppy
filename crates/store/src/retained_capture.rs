@@ -336,6 +336,13 @@ fn publish_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,11 +420,4 @@ mod tests {
             assert!(publish_artifact(&path, b"correct").is_err());
         }
     }
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
