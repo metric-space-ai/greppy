@@ -95,38 +95,49 @@ fn node_error_codes_and_process_warnings_reach_the_cli_verdict() {
 fn rust_error_field_source_keeps_regex_output_and_child_exit_status() {
     let workspace = fresh_workspace("rust-error-field-source");
     let source = "error: ClaudeErrorDetail {\n";
-    for exit in [0, 7] {
-        let script = format!("printf '%s' \"$1\"; exit {exit}");
-        let output = run(
-            &workspace,
-            &[
-                "bash-smart",
-                "-e",
-                "^error:",
-                "--",
-                "sh",
-                "-c",
-                &script,
-                "rust-field-fixture",
-                source,
-            ],
-        );
-        assert_eq!(output.status.code(), Some(exit));
-        let shown = text(&output.stdout);
-        let verdict = if exit == 0 {
-            "ok — exit 0\n"
-        } else {
-            "FAILED — exit 7: 0 errors, 0 warnings\n"
-        };
-        assert!(shown.starts_with(verdict), "{shown}");
-        assert!(
-            shown.contains(source),
-            "source-review bytes missing: {shown}"
-        );
-        assert!(
-            shown.contains("1  error: ClaudeErrorDetail {"),
-            "regex lift missing: {shown}"
-        );
+    let folded = format!(
+        "{}{source}{}",
+        "ordinary output\n".repeat(100),
+        "ordinary tail\n".repeat(100)
+    );
+    for (payload, lifted) in [(source, false), (folded.as_str(), true)] {
+        for exit in [0, 7] {
+            let script = format!("printf '%s' \"$1\"; exit {exit}");
+            let output = run(
+                &workspace,
+                &[
+                    "bash-smart",
+                    "-e",
+                    "^error:",
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                    "rust-field-fixture",
+                    payload,
+                ],
+            );
+            assert_eq!(output.status.code(), Some(exit));
+            let shown = text(&output.stdout);
+            let verdict = if exit == 0 {
+                "ok — exit 0\n"
+            } else {
+                "FAILED — exit 7: 0 errors, 0 warnings\n"
+            };
+            assert!(shown.starts_with(verdict), "{shown}");
+            assert!(
+                shown.contains(source),
+                "source-review bytes missing: {shown}"
+            );
+            if lifted {
+                assert!(
+                    shown.contains("101  error: ClaudeErrorDetail {"),
+                    "regex lift missing from folded output: {shown}"
+                );
+            } else {
+                assert_eq!(shown, format!("{verdict}{source}"));
+            }
+        }
     }
     let output = run(
         &workspace,
