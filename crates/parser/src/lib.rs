@@ -43,6 +43,17 @@ use tree_sitter::{Parser, Tree};
 /// On any tree-sitter error, returns
 /// `greppy_core::Error::Store(format!("tree-sitter: ..."))`.
 pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
+    parse_impl(language, source, false)
+}
+
+/// Parse a compatibility view solely for edit syntax checks. This may replace
+/// validated standard C va_arg type operands with numeric expressions; never
+/// use its tree for extraction, graph identities, or source editing.
+pub fn parse_for_syntax_validation(language: Language, source: &[u8]) -> Result<Tree> {
+    parse_impl(language, source, true)
+}
+
+fn parse_impl(language: Language, source: &[u8], validation: bool) -> Result<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&language.grammar())
@@ -54,7 +65,7 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
         || !source.windows(13).any(|token| token == b"_Thread_local")
     {
         return if matches!(language, Language::C) {
-            parse_c_va_arg(&mut parser, source, tree)
+            parse_c_va_arg(&mut parser, source, tree, validation)
         } else {
             Ok(tree)
         };
@@ -75,7 +86,7 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
             })
         {
             drop(cursor);
-            return parse_c_va_arg(&mut parser, source, tree);
+            return parse_c_va_arg(&mut parser, source, tree, validation);
         }
         if matches!(node.kind(), "identifier" | "type_identifier")
             && source.get(node.byte_range()) == Some(b"_Thread_local".as_slice())
@@ -112,7 +123,7 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
             if !cursor.goto_parent() {
                 drop(cursor);
                 if replacements.is_empty() {
-                    return parse_c_va_arg(&mut parser, source, tree);
+                    return parse_c_va_arg(&mut parser, source, tree, validation);
                 }
                 let mut view = source.to_vec();
                 for range in replacements {
@@ -121,7 +132,7 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
                 let tree = parser.parse(&view, None).ok_or_else(|| {
                     greppy_core::Error::Parse("tree-sitter C11 parse returned None".into())
                 })?;
-                return parse_c_va_arg(&mut parser, &view, tree);
+                return parse_c_va_arg(&mut parser, &view, tree, validation);
             }
         }
     }
@@ -131,8 +142,13 @@ pub fn parse(language: Language, source: &[u8]) -> Result<Tree> {
 /// va_arg type operand with its type_descriptor rule before replacing just that
 /// operand in a same-width parse view. This is syntax validation, not C semantic
 /// checking (typedef resolution, completeness and promotions require a compiler).
-fn parse_c_va_arg(parser: &mut Parser, source: &[u8], tree: Tree) -> Result<Tree> {
-    if !source.windows(6).any(|s| s == b"va_arg") {
+fn parse_c_va_arg(
+    parser: &mut Parser,
+    source: &[u8],
+    tree: Tree,
+    validation: bool,
+) -> Result<Tree> {
+    if !validation || !source.windows(6).any(|s| s == b"va_arg") {
         return Ok(tree);
     }
     let mut names = Vec::new();
@@ -301,6 +317,42 @@ mod va_arg_tests {
     use super::*;
 
     #[test]
+    fn extraction_tree_retains_original_type_reference_nodes() {
+        let source = b"typedef struct item Item;\nItem *get(void){return va_arg(ap,Item *);}";
+        let mut raw = Parser::new();
+        raw.set_language(&Language::C.grammar()).unwrap();
+        let original = raw.parse(source, None).unwrap();
+        let extraction_tree = parse(Language::C, source).unwrap();
+        assert_eq!(
+            extraction_tree.root_node().to_sexp(),
+            original.root_node().to_sexp()
+        );
+        let at = source.windows(6).position(|s| s == b"Item *").unwrap();
+        // Pick the occurrence in the va_arg operand, rather than the return type.
+        let at = source[at + 1..]
+            .windows(6)
+            .position(|s| s == b"Item *")
+            .unwrap()
+            + at
+            + 1;
+        let node = extraction_tree
+            .root_node()
+            .descendant_for_byte_range(at, at + 4)
+            .unwrap();
+        assert!(
+            matches!(node.kind(), "identifier" | "type_identifier"),
+            "{}",
+            node.kind()
+        );
+        assert_eq!(node.utf8_text(source).unwrap(), "Item");
+        assert_eq!(node.start_byte(), at);
+        assert!(!parse_for_syntax_validation(Language::C, source)
+            .unwrap()
+            .root_node()
+            .has_error());
+    }
+
+    #[test]
     fn standard_type_operands_preserve_calls_and_source_locations() {
         for ty in [
             "void *",
@@ -313,7 +365,7 @@ mod va_arg_tests {
                 "#include <stdarg.h>\nstruct item {{ int value; }};\nvoid *get(int key,...) {{va_list ap;va_start(ap,key);void *p=va_arg(ap,{ty});va_end(ap);return p;}}\n"
             );
             let bytes = source.as_bytes().to_vec();
-            let tree = parse(Language::C, &bytes).unwrap();
+            let tree = parse_for_syntax_validation(Language::C, &bytes).unwrap();
             assert!(
                 !tree.root_node().has_error(),
                 "{ty}: {}",
@@ -351,7 +403,7 @@ mod va_arg_tests {
         ] {
             let source = format!("void *get(void){{return {call};}}");
             assert!(
-                parse(Language::C, source.as_bytes())
+                parse_for_syntax_validation(Language::C, source.as_bytes())
                     .unwrap()
                     .root_node()
                     .has_error(),
@@ -363,7 +415,7 @@ mod va_arg_tests {
             "void *get(void){return va_arg(ap,void *);",
         ] {
             assert!(
-                parse(Language::C, source.as_bytes())
+                parse_for_syntax_validation(Language::C, source.as_bytes())
                     .unwrap()
                     .root_node()
                     .has_error(),
@@ -382,7 +434,7 @@ mod va_arg_tests {
             let mut raw = Parser::new();
             raw.set_language(&Language::C.grammar()).unwrap();
             let original = raw.parse(source, None).unwrap();
-            let actual = parse(Language::C, source.as_bytes()).unwrap();
+            let actual = parse_for_syntax_validation(Language::C, source.as_bytes()).unwrap();
             assert_eq!(actual.root_node().to_sexp(), original.root_node().to_sexp());
         }
     }
@@ -390,7 +442,10 @@ mod va_arg_tests {
     #[test]
     fn thread_local_compatibility_composes_with_va_arg() {
         let source = b"_Thread_local int counter;\nvoid *get(void){return va_arg(ap,void *);}";
-        assert!(!parse(Language::C, source).unwrap().root_node().has_error());
+        assert!(!parse_for_syntax_validation(Language::C, source)
+            .unwrap()
+            .root_node()
+            .has_error());
     }
 }
 
@@ -405,7 +460,7 @@ mod c11_tests {
                 "/* _Thread_local */\n{qualifier}_Thread_local int counter=-1;\nconst char *text=\"_Thread_local\";\nint _Thread_local_suffix;\nint main(void){{return counter;}}\n"
             );
             let bytes = source.as_bytes().to_vec();
-            let tree = parse(Language::C, &bytes).unwrap();
+            let tree = parse_for_syntax_validation(Language::C, &bytes).unwrap();
             assert!(
                 !tree.root_node().has_error(),
                 "{}",
@@ -458,7 +513,7 @@ mod c11_tests {
             "static _Thread_local int counter=-1;\nint main(void){return counter;\n",
             "static _Thread_local int counter=-1\nint main(void){return counter;}\n",
         ] {
-            let tree = parse(Language::C, source.as_bytes()).unwrap();
+            let tree = parse_for_syntax_validation(Language::C, source.as_bytes()).unwrap();
             assert!(tree.root_node().has_error(), "{source}");
         }
     }
