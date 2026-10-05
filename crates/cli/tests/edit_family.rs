@@ -1072,6 +1072,63 @@ fn patch_refusal_leaves_every_file_untouched() {
 }
 
 #[test]
+fn patch_marker_updates_and_advisory_counts_roundtrip() {
+    let fixture = Fixture::new("patch-marker-counts");
+    std::fs::write(fixture.repo.join("one.txt"), "one\nkeep\n").unwrap();
+    std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
+    let marker = "*** Begin Patch\n*** Update File: one.txt\n@@ label\n-one\n+ONE\n keep\n*** Update File: two.txt\n@@\n-two\n+TWO\n*** End Patch\n";
+    let preview = fixture.run_with_stdin(&["patch", "--dry-run"], marker.as_bytes());
+    assert!(preview.status.success(), "{}", combined(&preview));
+    assert_file(&fixture.repo.join("one.txt"), "one\nkeep\n");
+    let output = fixture.run_with_stdin(&["patch"], marker.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("one.txt"), "ONE\nkeep\n");
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+    assert!(fixture.run(&["undo"]).status.success());
+    let diff = "--- a/one.txt\n+++ b/one.txt\n@@ -99,50 +99,0 @@\n-one\n+ONE\n keep\n--- a/two.txt\n+++ b/two.txt\n@@ -88,0 +88,200 @@\n-two\n+TWO\n";
+    let output = fixture.run_with_stdin(&["patch"], diff.as_bytes());
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&fixture.repo.join("one.txt"), "ONE\nkeep\n");
+    assert_file(&fixture.repo.join("two.txt"), "TWO\n");
+}
+
+#[test]
+fn patch_marker_refusals_preserve_the_entire_transaction() {
+    let fixture = Fixture::new("patch-marker-refusal");
+    std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
+    std::fs::write(fixture.repo.join("repeat.txt"), "repeat\nrepeat\n").unwrap();
+    let first = "*** Begin Patch\n*** Update File: one.txt\n@@\n-one\n+ONE\n";
+    for (suffix, status) in [
+        ("*** Add File: new.txt\n+new\n*** End Patch\n", 20),
+        ("*** Delete File: repeat.txt\n*** End Patch\n", 20),
+        (
+            "*** Update File: repeat.txt\n@@\n-repeat\n+REPEAT\n*** End Patch\n",
+            13,
+        ),
+        (
+            "*** Update File: one.txt\n@@\n-one\n+AGAIN\n*** End Patch\n",
+            20,
+        ),
+        ("*** Update File: repeat.txt\ninvalid\n*** End Patch\n", 20),
+        ("*** Unknown: repeat.txt\n*** End Patch\n", 20),
+        ("", 20),
+    ] {
+        for dry_run in [false, true] {
+            let args = if dry_run {
+                vec!["patch", "--dry-run"]
+            } else {
+                vec!["patch"]
+            };
+            let output = fixture.run_with_stdin(&args, format!("{first}{suffix}").as_bytes());
+            assert_eq!(output.status.code(), Some(status), "{}", combined(&output));
+            assert_file(&fixture.repo.join("one.txt"), "one\n");
+            assert_file(&fixture.repo.join("repeat.txt"), "repeat\nrepeat\n");
+            assert!(!fixture.repo.join("new.txt").exists());
+        }
+    }
+}
+
+#[test]
 fn patch_deleted_lua_comment_is_payload_and_roundtrips() {
     let fixture = Fixture::new("patch-lua-comment");
     let path = fixture.repo.join("comment.lua");
@@ -1110,16 +1167,13 @@ fn patch_header_shaped_payload_does_not_create_a_phantom_file() {
 }
 
 #[test]
-fn patch_bad_counts_and_count_free_header_ambiguity_are_atomic() {
+fn patch_malformed_ranges_and_count_free_header_ambiguity_are_atomic() {
     let fixture = Fixture::new("patch-header-atomic");
     std::fs::write(fixture.repo.join("one.txt"), "one\n").unwrap();
     std::fs::write(fixture.repo.join("two.txt"), "two\n").unwrap();
     let first = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
     for (suffix, diagnostic) in [
-        (
-            "--- a/two.txt\n+++ b/two.txt\n@@ -1,2 +1 @@\n-two\n+TWO\n",
-            "declares 2 old and 1 new lines",
-        ),
+
         (
             "--- a/two.txt\n+++ b/two.txt\n@@\n-two\n+TWO\n--- a/phantom.txt\n+++ b/phantom.txt\n@@\n-missing\n+new\n",
             "ambiguous in a count-free hunk",
