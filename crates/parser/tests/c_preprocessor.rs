@@ -1,0 +1,142 @@
+use greppy_parser::{
+    c_preprocessor::c_preprocessor_validation_view, parse, parse_for_syntax_validation, Language,
+};
+
+#[test]
+fn local_jni_qualifiers_and_xmacro_fields_validate_without_changing_source() {
+    for source in [
+        "#define JNIEXPORT __attribute__((visibility(\"default\")))\n#define JNICALL\nJNIEXPORT int JNICALL probe(void) { return 0; }\n",
+        "#define FIELDS(X) X(int, count) X(float, ratio)\n#define DECL(type, name) type name;\nstruct record { FIELDS(DECL) };\n",
+        "#define FIELDS(X) \\\n X(int, count) \\\n X(float, ratio)\n#define DECL(type, name) type name;\nstruct record { FIELDS(DECL) };\n",
+    ] {
+        let original = source.as_bytes().to_vec();
+        let view = c_preprocessor_validation_view(&original).unwrap();
+        let tree = parse_for_syntax_validation(Language::C, &view.bytes).unwrap();
+        assert!(!tree.root_node().has_error(), "{source}\n{}", tree.root_node().to_sexp());
+        assert_eq!(original, source.as_bytes());
+        // Extraction API receives the original source, never the expanded view.
+        let mut raw = tree_sitter::Parser::new();
+        raw.set_language(&Language::C.grammar()).unwrap();
+        let raw_tree = raw.parse(&original, None).unwrap();
+        assert_eq!(parse(Language::C, &original).unwrap().root_node().to_sexp(), raw_tree.root_node().to_sexp());
+    }
+}
+
+#[test]
+fn unsupported_used_macros_fail_at_the_invocation() {
+    for source in [
+        "#define JOIN(a,b) a ## b\nint JOIN(a,b);\n",
+        "#define STR(a) #a\nconst char *x = STR(a);\n",
+        "#define MANY(...) int x;\nMANY(x)\n",
+        "#define ALIAS BAD\n#define BAD(x) )\nint x = ALIAS(1);\n",
+        "#ifdef SOME_BUILD\n#define EXPORT\n#endif\nEXPORT int x;\n",
+    ] {
+        let error = match c_preprocessor_validation_view(source.as_bytes()) {
+            Ok(_) => panic!("unsupported used macro accepted: {source}"),
+            Err(error) => error,
+        };
+        let last_line = source.lines().last().unwrap();
+        let line_at = source.rfind(last_line).unwrap();
+        assert!(error.offset >= line_at && error.offset < line_at + last_line.len());
+        assert!(error.reason.contains("compiler preprocessing"));
+    }
+}
+
+#[test]
+fn expansion_keeps_literals_comments_numbers_and_source_mapping() {
+    let source =
+        b"#define NAME int\n#define u8 bad\nconst char *s = u8\"NAME\"; /* NAME */\nNAME value;\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    let text = std::str::from_utf8(&view.bytes).unwrap();
+    assert!(text.contains("u8\"NAME\"; /* NAME */"));
+    assert!(text.contains("int  value;"));
+    let source_at = source.windows(5).position(|s| s == b"value").unwrap();
+    let view_at = view.bytes.windows(5).position(|s| s == b"value").unwrap();
+    assert_eq!(view.source_offset(view_at), source_at);
+    assert_eq!(view.expanded_offset(source_at), view_at);
+    let number = b"#define ABC 1\nint x = 123ABC;";
+    assert!(c_preprocessor_validation_view(number)
+        .unwrap()
+        .bytes
+        .ends_with(b"123ABC;"));
+}
+
+#[test]
+fn broken_expansions_and_wrong_arity_do_not_become_valid() {
+    let source = b"#define DECL(t,n) t n\nstruct item { DECL(int,value) };";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let source = b"#define DECL(t,n) t n;\nstruct item { DECL(int,value,extra) };";
+    let error = c_preprocessor_validation_view(source).err().unwrap();
+    assert!(error.reason.contains("argument count"));
+}
+
+#[test]
+fn nested_arguments_and_source_ordered_redefinitions_are_respected() {
+    let source =
+        b"#define ID(x) x\nID(ID(int)) first;\n#undef ID\n#define ID(x) float\nID(int) second;\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+}
+
+#[test]
+fn macro_substitution_does_not_paste_distinct_operator_tokens() {
+    let source = b"#define PLUS(x) +x\nint f(int n){return PLUS(+n);}";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!std::str::from_utf8(&view.bytes).unwrap().contains("++"));
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+}
+
+#[test]
+fn ordinary_header_guards_allow_local_values_and_declaration_macros() {
+    for source in [
+        "#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE];\n#endif\n",
+        "/* header */\n#ifndef HEADER_H\n#define HEADER_H\n#define EXPORT __attribute__((visibility(\"default\")))\n#define CALL\nEXPORT int CALL probe(void) {return 0;}\n#endif /* HEADER_H */\n",
+    ] {
+        let view = c_preprocessor_validation_view(source.as_bytes()).unwrap();
+        assert!(!parse_for_syntax_validation(Language::C, &view.bytes).unwrap().root_node().has_error());
+    }
+    for source in [
+        "#ifndef HEADER_H\n#define HEADER_H\n#if PLATFORM\n#define EXPORT\n#endif\nEXPORT int x;\n#endif\n",
+        "#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\n#else\n#define SIZE 8\n#endif\nint values[SIZE];\n",
+    ] { assert!(c_preprocessor_validation_view(source.as_bytes()).is_err()); }
+}
+
+#[test]
+fn crlf_macro_continuations_expand_and_keep_broken_syntax_visible() {
+    let source = b"#define VALUE \\\r\n 4\r\nint value = VALUE;\r\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let source = b"#define FIELDS(X) \\\r\n X(int,count) \\\r\n X(float,ratio)\r\n#define DECL(t,n) t n;\r\nstruct record { FIELDS(DECL) };\r\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let broken = b"#define VALUE \\\r\n +\r\nint value = VALUE;\r\n";
+    let view = c_preprocessor_validation_view(broken).unwrap();
+    assert!(parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+}
+
+#[test]
+fn oversized_input_is_rejected_before_token_materialization() {
+    let source = vec![b' '; 16 * 1024 * 1024 + 1];
+    let error = c_preprocessor_validation_view(&source).err().unwrap();
+    assert_eq!(error.offset, 0);
+    assert!(error.reason.contains("input budget"));
+}

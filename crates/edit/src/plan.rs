@@ -871,6 +871,14 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             Ok(applied) => {
                 let language =
                     crate::txn::syntax_language_for_path(&snapshot.path, &snapshot.content);
+                if let Some(reason) =
+                    crate::txn::syntax_validation_limitation(language, &applied.content)
+                {
+                    projection_error = Some(format!(
+                        "cannot validate proposed C edit: {reason}; nothing written"
+                    ));
+                    break;
+                }
                 let syntax_before = language
                     .is_supported()
                     .then(|| syntax_counts(language, &snapshot.content))

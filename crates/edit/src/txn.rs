@@ -641,9 +641,83 @@ fn js_ts_string_line_breaks(
     (count, first)
 }
 
+struct ValidationContent<'a> {
+    content: Cow<'a, [u8]>,
+    c: Option<greppy_parser::c_preprocessor::CPreprocessorView>,
+}
+
+impl ValidationContent<'_> {
+    fn bytes(&self) -> &[u8] {
+        self.c
+            .as_ref()
+            .map_or(self.content.as_ref(), |view| view.bytes.as_slice())
+    }
+    fn source_offset(&self, offset: usize) -> usize {
+        self.c
+            .as_ref()
+            .map_or(offset, |view| view.source_offset(offset))
+    }
+    fn expanded_offset(&self, offset: usize) -> usize {
+        self.c
+            .as_ref()
+            .map_or(offset, |view| view.expanded_offset(offset))
+    }
+}
+
+fn validation_content(
+    language: Language,
+    content: &[u8],
+) -> std::result::Result<ValidationContent<'_>, greppy_parser::c_preprocessor::CPreprocessorError> {
+    let content = syntax_validation_content(language, content);
+    let c = if matches!(language, Language::C) {
+        Some(greppy_parser::c_preprocessor::c_preprocessor_validation_view(&content)?)
+    } else {
+        None
+    };
+    Ok(ValidationContent { content, c })
+}
+
+fn source_position(content: &[u8], offset: usize) -> (usize, usize) {
+    let offset = offset.min(content.len());
+    let prefix = &content[..offset];
+    let row = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+    let column = offset
+        - prefix
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    (row, column)
+}
+
+/// A validation capability failure must not become an error-count delta that
+/// permits another edit to equally unvalidated source. Callers refuse it before
+/// publication, while ordinary preexisting parser errors keep their old policy.
+pub fn syntax_validation_limitation(language: Language, content: &[u8]) -> Option<String> {
+    if !matches!(language, Language::C) {
+        return None;
+    }
+    let error = validation_content(language, content).err()?;
+    let (row, column) = source_position(content, error.offset);
+    Some(format!(
+        "{row}:{column} (C preprocessor validation: {}; column is a byte offset)",
+        error.reason
+    ))
+}
+
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
+    let view = match validation_content(language, content) {
+        Ok(view) => view,
+        Err(error) => {
+            let (row, column) = source_position(content, error.offset);
+            return Some(format!(
+                "{row}:{column} (C preprocessor validation: {}; column is a byte offset)",
+                error.reason
+            ));
+        }
+    };
+    let validation_content = view.bytes();
+    let tree = greppy_parser::parse_for_syntax_validation(language, validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -668,7 +742,7 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
             ));
         }
         if node.is_error() || node.is_missing() {
-            let start = node.start_position();
+            let (row, column) = source_position(content, view.source_offset(node.start_byte()));
             let reason = if node.is_missing() {
                 format!("missing `{}`", node.kind())
             } else {
@@ -676,8 +750,7 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
             };
             return Some(format!(
                 "{}:{} (tree-sitter: {reason}; column is a byte offset)",
-                start.row + 1,
-                start.column + 1
+                row, column
             ));
         }
         if cursor.goto_first_child() {
@@ -708,11 +781,11 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
 /// stays a top-level declaration. When the surrounding context's kind chain
 /// changes, the edit broke the grammar in a way tree-sitter recovered past.
 fn context_kinds(language: Language, content: &[u8], range: (usize, usize)) -> Option<Vec<String>> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
-    let leaf = tree
-        .root_node()
-        .descendant_for_byte_range(range.0, range.1.saturating_sub(1).max(range.0))?;
+    let view = validation_content(language, content).ok()?;
+    let tree = greppy_parser::parse_for_syntax_validation(language, view.bytes()).ok()?;
+    let start = view.expanded_offset(range.0);
+    let end = view.expanded_offset(range.1).saturating_sub(1).max(start);
+    let leaf = tree.root_node().descendant_for_byte_range(start, end)?;
     let mut kinds = Vec::new();
     let mut node = leaf.parent();
     while let Some(cur) = node {
@@ -747,8 +820,17 @@ pub fn structural_context_preserved(
 /// language is not tree-sitter-supported (postcondition then reports
 /// not-applicable rather than silently passing).
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
-    let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
+    let view = match validation_content(language, content) {
+        Ok(view) => view,
+        Err(_) => {
+            return Some(SyntaxCounts {
+                errors: 1,
+                missing: 0,
+            })
+        }
+    };
+    let validation_content = view.bytes();
+    let tree = greppy_parser::parse_for_syntax_validation(language, validation_content).ok()?;
     let mut errors = 0usize;
     let mut missing = 0usize;
     let mut cursor = tree.walk();
@@ -786,6 +868,63 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_c_macros_validate_without_hiding_broken_declarations() {
+        let guarded =
+            b"#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE];\n#endif\n";
+        assert_eq!(
+            syntax_counts(Language::C, guarded),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert!(syntax_validation_limitation(Language::C, guarded).is_none());
+        let broken_guarded =
+            b"#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE] = ;\n#endif\n";
+        let counts = syntax_counts(Language::C, broken_guarded).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0);
+        let valid = b"#define JNIEXPORT __attribute__((visibility(\"default\")))\n#define JNICALL\nJNIEXPORT int JNICALL probe(void) { return 0; }\n";
+        assert_eq!(
+            syntax_counts(Language::C, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert_eq!(first_syntax_diagnostic(Language::C, valid), None);
+        let fields = b"#define FIELDS(X) X(int, count) X(float, ratio)\n#define DECL(type,name) type name;\nstruct record { FIELDS(DECL) };\n";
+        assert_eq!(
+            syntax_counts(Language::C, fields),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        for invalid in [
+            "#define EXPORT __attribute__((visibility(\"default\")))\nEXPORT int probe(void) { return 0;\n",
+            "#define EXPORT\nEXPORT int value = ;\n",
+            "#define DECL(t,n) t n\nstruct item { DECL(int,value) };\n",
+        ] {
+            let counts = syntax_counts(Language::C, invalid.as_bytes()).unwrap();
+            assert!(counts.errors > 0 || counts.missing > 0, "{invalid}");
+            assert!(first_syntax_diagnostic(Language::C, invalid.as_bytes()).is_some());
+        }
+    }
+
+    #[test]
+    fn local_c_macro_diagnostics_use_original_source_coordinates() {
+        let invalid = b"#define JOIN(a,b) a ## b\nint JOIN(a,b);\n";
+        assert!(first_syntax_diagnostic(Language::C, invalid)
+            .unwrap()
+            .starts_with("2:5 (C preprocessor validation:"));
+        assert_eq!(syntax_counts(Language::C, invalid).unwrap().errors, 1);
+        let invalid = b"#define EXPORT __attribute__((visibility(\"default\")))\nEXPORT int okay(void) {return 0;}\nint broken = ;\n";
+        assert!(first_syntax_diagnostic(Language::C, invalid)
+            .unwrap()
+            .starts_with("3:"));
+    }
+
     #[test]
     fn js_ts_quoted_strings_reject_unescaped_line_breaks() {
         for language in [
