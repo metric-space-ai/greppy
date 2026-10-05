@@ -395,7 +395,8 @@ pub(crate) fn emit_edit_outcome(
                     }
                 }
             }
-            Ok(0)
+            Ok(record.verification.as_ref()
+                .map_or(0, |verification| verification.status.exit_code()))
         }
         Err(refusal) => {
             let value = edit_refusal_json(&refusal, report_path);

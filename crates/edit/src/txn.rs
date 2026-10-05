@@ -649,7 +649,52 @@ fn js_ts_string_line_breaks(
     (count, first)
 }
 
+// tree-sitter accepts empty Python suites and module/class-level returns
+// without ERROR nodes. Those recoveries must not certify a breaking edit.
+// Inspect scope boundaries rather than accepting any outer function ancestor:
+// a class declared inside a function is still not a return-capable scope.
+fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)> {
+    let Ok(tree) = greppy_parser::parse_for_syntax_validation(Language::Python, content) else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let reason = if node.kind() == "block" {
+            let mut cursor = node.walk();
+            (!node.named_children(&mut cursor).any(|child| child.kind() != "comment"))
+                .then_some("Python suite requires a statement; --body replacements must include indentation (for example, four spaces before return); use pass for an empty body")
+        } else if node.kind() == "return_statement" {
+            let mut ancestor = node.parent();
+            let mut in_function = false;
+            while let Some(scope) = ancestor {
+                match scope.kind() {
+                    "function_definition" => { in_function = true; break; }
+                    "class_definition" | "module" => break,
+                    _ => ancestor = scope.parent(),
+                }
+            }
+            (!in_function).then_some("Python return must remain inside its function; preserve the body's indentation")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let position = node.start_position();
+            issues.push((position.row + 1, position.column + 1, reason));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    issues.sort_by_key(|&(row, column, _)| (row, column));
+    issues
+}
+
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
+    if language == Language::Python {
+        if let Some((row, column, reason)) = python_syntax_diagnostics(content).first() {
+            return Some(format!("{row}:{column} ({reason}; column is a byte offset)"));
+        }
+    }
     let validation_content = syntax_validation_content(language, content);
     let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
@@ -757,7 +802,11 @@ pub fn structural_context_preserved(
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
     let validation_content = syntax_validation_content(language, content);
     let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
-    let mut errors = 0usize;
+    let mut errors = if language == Language::Python {
+        python_syntax_diagnostics(content).len()
+    } else {
+        0
+    };
     let mut missing = 0usize;
     let mut cursor = tree.walk();
     let mut reached_root = false;
@@ -794,6 +843,36 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn python_syntax_counts_reject_empty_suites_and_escaped_returns() {
+        for invalid in [
+            "def f():\nreturn 1\n",
+            "def f():\n    # no statement\n",
+            "if True:\nprint(1)\n",
+            "class Empty:\n# no statement\n",
+            "return 1\n",
+            "def f():\n    pass\nreturn 1\n",
+            "def f():\n    class C:\n        return 1\n",
+        ] {
+            assert!(syntax_counts(Language::Python, invalid.as_bytes()).unwrap().errors > 0, "{invalid}");
+            assert!(first_syntax_diagnostic(Language::Python, invalid.as_bytes()).unwrap().contains("Python"));
+        }
+        for valid in [
+            "def f():\n    return 1\n",
+            "def f(): return 1\n",
+            "def f():\n    pass\n",
+            "def f():\n    ...\n",
+            "def f():\n    \"docstring\"\n",
+            "def f():\r\n\treturn 1\r\n",
+            "@decorate\nasync def f():\n    return await g()\n",
+            "def f():\n    class C:\n        def g(self):\n            return 1\n    return C\n",
+            "def f():\n    if True:\n        return \"\"\"multiline\nreturn 2\n\"\"\"\n",
+        ] {
+            assert_eq!(syntax_counts(Language::Python, valid.as_bytes()).unwrap().errors, 0, "{valid}");
+            assert_eq!(first_syntax_diagnostic(Language::Python, valid.as_bytes()), None, "{valid}");
+        }
+    }
+
     #[test]
     fn js_ts_quoted_strings_reject_unescaped_line_breaks() {
         for language in [

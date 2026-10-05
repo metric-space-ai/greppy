@@ -6614,6 +6614,7 @@ struct EditRecord {
     text: Option<String>,
     handle: Option<String>,
     diagnostics: Option<Vec<String>>,
+    verification: Option<edit::EditVerification>,
     notes: Vec<String>,
     operations: Vec<EditOperation>,
     /// What this particular verb owes the caller beyond the common shape: the

@@ -1037,7 +1037,9 @@ pub(crate) fn edit_publish(
     record.handle = handle;
     record.operations = vec![operation];
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
     Ok(record)
@@ -1323,6 +1325,45 @@ fn edit_verifiers(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditVerificationStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    Unavailable,
+    Skipped,
+}
+
+impl EditVerificationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Unavailable => "unavailable",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Passed | Self::Skipped => 0,
+            _ => 17,
+        }
+    }
+}
+
+pub(crate) struct EditVerification {
+    pub(crate) status: EditVerificationStatus,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+impl EditVerification {
+    fn new(status: EditVerificationStatus, diagnostics: Vec<String>) -> Self {
+        Self { status, diagnostics }
+    }
+}
+
 fn edit_verify_timeout() -> std::time::Duration {
     let seconds = std::env::var("GREPPY_EDIT_VERIFY_TIMEOUT_SECS")
         .ok()
@@ -1354,7 +1395,7 @@ fn edit_kill_verifier_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> Vec<String> {
+fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> EditVerification {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
@@ -1365,18 +1406,18 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
     let stdout = match std::fs::File::create(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
-            return vec![format!(
+            return EditVerification::new(EditVerificationStatus::Unavailable, vec![format!(
                 "verify: unavailable — cannot capture stdout: {error}"
-            )]
+            )])
         }
     };
     let stderr = match std::fs::File::create(&stderr_path) {
         Ok(file) => file,
         Err(error) => {
             let _ = std::fs::remove_file(&stdout_path);
-            return vec![format!(
+            return EditVerification::new(EditVerificationStatus::Unavailable, vec![format!(
                 "verify: unavailable — cannot capture stderr: {error}"
-            )];
+            )]);
         }
     };
     let command = std::iter::once(verifier.program.as_os_str())
@@ -1408,7 +1449,7 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
             let _ = std::fs::remove_file(&stderr_path);
             let message = format!("verify: unavailable — cannot start {command}: {error}");
             eprintln!("{message}");
-            return vec![message];
+            return EditVerification::new(EditVerificationStatus::Unavailable, vec![message]);
         }
     };
     let started = std::time::Instant::now();
@@ -1450,15 +1491,16 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
             timeout.as_secs()
         );
         eprintln!("{message}");
-        return vec![message];
+        return EditVerification::new(EditVerificationStatus::TimedOut, vec![message]);
     }
     let Some(status) = status else {
-        return vec![format!("verify: failed — no exit status from {command}")];
+        return EditVerification::new(EditVerificationStatus::Failed,
+            vec![format!("verify: failed — no exit status from {command}")]);
     };
     if status.success() {
         let message = format!("verify: passed — {}", verifier.label);
         eprintln!("{message}");
-        return vec![message];
+        return EditVerification::new(EditVerificationStatus::Passed, vec![message]);
     }
     let mut diagnostics = vec![format!(
         "verify: failed (exit {}) — {}",
@@ -1479,26 +1521,36 @@ fn edit_run_verifier(verifier: &EditVerifier, timeout: std::time::Duration) -> V
             .map(str::to_string),
     );
     eprintln!("{}", diagnostics[0]);
-    diagnostics
+    EditVerification::new(EditVerificationStatus::Failed, diagnostics)
 }
 
 /// The compiler or linter for the touched file type, when the workspace has a
 /// local one. Verification is observable and bounded; it never downloads a
 /// tool and never silently switches to an unrelated language's workspace.
-pub(crate) fn edit_verify_diagnostics(
+pub(crate) fn edit_verify(
     root_path: &std::path::Path,
     files: &[String],
-) -> Vec<String> {
+) -> EditVerification {
     let (verifiers, skipped) = edit_verifiers(root_path, files);
     if let Some(message) = skipped {
         eprintln!("{message}");
-        return vec![message];
+        return EditVerification::new(EditVerificationStatus::Skipped, vec![message]);
     }
     let timeout = edit_verify_timeout();
-    verifiers
-        .iter()
-        .flat_map(|verifier| edit_run_verifier(verifier, timeout))
-        .collect()
+    let mut result = EditVerification::new(EditVerificationStatus::Passed, Vec::new());
+    for verifier in &verifiers {
+        let checked = edit_run_verifier(verifier, timeout);
+        if result.status.exit_code() == 0 && checked.status.exit_code() != 0 {
+            result.status = checked.status;
+        }
+        result.diagnostics.extend(checked.diagnostics);
+    }
+    if result.status.exit_code() != 0 {
+        result.diagnostics.push(
+            "verify: edit remains applied; repair it or use `greppy undo` to restore the previous edit".into(),
+        );
+    }
+    result
 }
 
 pub(crate) fn edit_journal_dir(root_path: &std::path::Path) -> std::path::PathBuf {
@@ -1848,7 +1900,9 @@ pub(crate) fn run_edit_undo(
     );
     record.extra.push(("restored", serde_json::json!(restored)));
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     Ok(record)
 }
@@ -1974,7 +2028,8 @@ pub(crate) fn edit_record_json(
         }),
     );
     value.insert("published".into(), serde_json::json!(record.published));
-    value.insert("exit_code".into(), serde_json::json!(0));
+    value.insert("exit_code".into(), serde_json::json!(record.verification
+        .as_ref().map_or(0, |verification| verification.status.exit_code())));
     if let Some(first) = record.files.first() {
         value.insert("file".into(), serde_json::json!(first));
     }
@@ -2029,7 +2084,11 @@ pub(crate) fn edit_record_json(
         value.insert("diagnostics".into(), serde_json::json!(diagnostics));
         value.insert(
             "verify".into(),
-            serde_json::json!({ "diagnostics": diagnostics }),
+            serde_json::json!({
+                "status": record.verification.as_ref().map(|verification| verification.status.as_str()),
+                "exit_code": record.verification.as_ref().map_or(0, |verification| verification.status.exit_code()),
+                "diagnostics": diagnostics,
+            }),
         );
     }
     if !record.notes.is_empty() {
@@ -2197,7 +2256,9 @@ pub(crate) fn run_trained_write(
         record.transaction_id = Some(id);
     }
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     Ok(record)
 }
@@ -2711,7 +2772,9 @@ fn run_trained_patch_with_publish_hook(
         record.transaction_id = Some(id);
     }
     if verify {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(record)
@@ -3640,7 +3703,9 @@ pub(crate) fn run_trained_rename(
         }
     }
     if verify && certificate.published {
-        record.diagnostics = Some(edit_verify_diagnostics(root_path, &record.files));
+        let verification = edit_verify(root_path, &record.files);
+        record.diagnostics = Some(verification.diagnostics.clone());
+        record.verification = Some(verification);
     }
     edit_set_exact_receipt(&mut record, exact_addresses, exact_required);
     Ok(Ok(record))
