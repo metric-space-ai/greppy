@@ -1485,12 +1485,15 @@ fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)>
             "read-file --lines expects 1 <= A <= B, got `{raw}`"
         )));
     }
-    if end > line_count {
+    if start > line_count {
         return Err(Error::Invalid(format!(
-            "read-file --lines ends at {end}, but the file has {line_count} lines"
+            "read-file --lines starts at {start}, but the file has {line_count} lines"
         )));
     }
-    Ok((start, end))
+    if end > line_count {
+        eprintln!("note: read-file --lines {raw} ends past EOF; clamped to {start}:{line_count}");
+    }
+    Ok((start, end.min(line_count)))
 }
 
 /// A plain explicit span needs neither the whole file nor a graph/handle.
@@ -1501,7 +1504,7 @@ fn read_bounded_file_range(
     raw: &str,
     path: &str,
 ) -> Result<(String, usize, usize)> {
-    let (start, end) = read_parse_file_range(raw, usize::MAX)?;
+    let (start, mut end) = read_parse_file_range(raw, usize::MAX)?;
     let mut selected = Vec::new();
     let mut line_count = 0usize;
     while line_count < end {
@@ -1512,9 +1515,16 @@ fn read_bounded_file_range(
         }
         .map_err(|error| Error::io(format!("read-file requested lines in {path}"), error))?;
         if count == 0 {
-            return Err(Error::Invalid(format!(
-                "read-file --lines ends at {end}, but the file has {line_count} lines"
-            )));
+            if line_count < start {
+                return Err(Error::Invalid(format!(
+                    "read-file --lines starts at {start}, but the file has {line_count} lines"
+                )));
+            }
+            eprintln!(
+                "note: read-file --lines {raw} ends past EOF; clamped to {start}:{line_count}"
+            );
+            end = line_count;
+            break;
         }
         line_count += 1;
     }

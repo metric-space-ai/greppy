@@ -3,6 +3,93 @@
 use std::path::{Path, PathBuf};
 
 #[test]
+fn read_file_clamps_past_eof_without_opening_a_graph() {
+    let (repo, store) = fresh_workspace("clamped-range");
+    std::fs::write(repo.join("sample.txt"), "first\nsecond\nthird").unwrap();
+    std::fs::write(&store, "not a graph directory").unwrap();
+    let (code, out, err) = run(
+        &repo,
+        &store,
+        &["read-file", "sample.txt", "--lines", "2:80"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(out, "sample.txt:2-3\nsecond\nthird");
+    assert_eq!(
+        err,
+        "note: read-file --lines 2:80 ends past EOF; clamped to 2:3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).unwrap(),
+        "not a graph directory"
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_clamped_json_and_handle_record_only_actual_lines() {
+    let (repo, store) = fresh_workspace("clamped-handle");
+    std::fs::write(repo.join("sample.txt"), "first\nsecond\nthird\n").unwrap();
+    for handle in [false, true] {
+        let mut args = vec!["--json", "read-file", "sample.txt", "--lines", "2:80"];
+        if handle {
+            args.push("--handle");
+        }
+        let (code, out, err) = run(&repo, &store, &args);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let file = &value["files"][0];
+        assert_eq!(file["start_line"], 2);
+        assert_eq!(file["end_line"], 3);
+        assert_eq!(file["content"], "second\nthird\n");
+        assert_eq!(
+            err,
+            "note: read-file --lines 2:80 ends past EOF; clamped to 2:3\n"
+        );
+        if handle {
+            let h = file["handle"].as_str().unwrap();
+            let (status, result, error) = run(
+                &repo,
+                &store,
+                &["replace-span", h, "REPLACED\n", "--dry-run"],
+            );
+            assert_eq!(status, 0, "{result}\n{error}");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("sample.txt")).unwrap(),
+                "first\nsecond\nthird\n"
+            );
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn read_file_still_rejects_missing_start_and_invalid_range() {
+    let (repo, store) = fresh_workspace("clamped-invalid");
+    std::fs::write(repo.join("sample.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(repo.join("empty.txt"), "").unwrap();
+    for (file, range) in [
+        ("sample.txt", "3:80"),
+        ("empty.txt", "1:80"),
+        ("sample.txt", "0:80"),
+        ("sample.txt", "2:1"),
+    ] {
+        for handle in [false, true] {
+            let mut args = vec!["read-file", file, "--lines", range];
+            if handle {
+                args.push("--handle");
+            }
+            let (code, out, err) = run(&repo, &store, &args);
+            assert_eq!(code, 64, "{range}: {out}\n{err}");
+            assert!(
+                !out.contains("handle:"),
+                "invalid range must not issue a handle"
+            );
+        }
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
     let (repo, store) = fresh_workspace("enum-variant-span");
     let original =
