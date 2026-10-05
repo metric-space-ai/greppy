@@ -45,8 +45,10 @@ pub struct NewRawEdge {
 }
 
 fn js_ts_repair_certificate_key(project: &str, path: &str) -> Result<String> {
-    Ok(format!("greppy.js_ts_reference_repair_certificate_v1.{}",
-        crate::file_state::sha256_hex(&serde_json::to_vec(&(project, path))?)))
+    Ok(format!(
+        "greppy.js_ts_reference_repair_certificate_v1.{}",
+        crate::file_state::sha256_hex(&serde_json::to_vec(&(project, path))?)
+    ))
 }
 
 impl Store {
@@ -62,11 +64,15 @@ impl Store {
         if !self.is_overlay() {
             return Ok(());
         }
-        let base_sha: Option<String> = self.conn().query_row(
-            "SELECT sha256 FROM greppy_base.file_state WHERE project=?1 AND rel_path=?2
+        let base_sha: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT sha256 FROM greppy_base.file_state WHERE project=?1 AND rel_path=?2
              AND NOT EXISTS(SELECT 1 FROM greppy_hidden_paths WHERE path=?2)",
-            params![project, path], |row| row.get(0),
-        ).optional()?;
+                params![project, path],
+                |row| row.get(0),
+            )
+            .optional()?;
         if base_sha.as_deref() != Some(source_sha256) {
             return Ok(());
         }
@@ -94,7 +100,8 @@ impl Store {
             "SELECT project FROM main.raw_edges WHERE file_path=?1
              UNION SELECT project FROM main.js_ts_reference_override_files WHERE file_path=?1",
         )?;
-        let projects = statement.query_map([path], |row| row.get::<_, String>(0))?
+        let projects = statement
+            .query_map([path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if projects.is_empty() {
             return Ok(false);
@@ -107,17 +114,26 @@ impl Store {
                  AND EXISTS(SELECT 1 FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.' || ?1 AND value='complete')",
                 params![project, path], |row| row.get(0),
             ).optional()?;
-            let Some(base_sha) = base_sha else { return Ok(false); };
-            let encoded: Option<String> = self.conn().query_row(
-                "SELECT value FROM main.schema_meta WHERE key=?1",
-                [js_ts_repair_certificate_key(&project, path)?], |row| row.get(0),
-            ).optional()?;
-            let Some(encoded) = encoded else { return Ok(false); };
+            let Some(base_sha) = base_sha else {
+                return Ok(false);
+            };
+            let encoded: Option<String> = self
+                .conn()
+                .query_row(
+                    "SELECT value FROM main.schema_meta WHERE key=?1",
+                    [js_ts_repair_certificate_key(&project, path)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(encoded) = encoded else {
+                return Ok(false);
+            };
             let certificate: serde_json::Value = serde_json::from_str(&encoded)?;
             if certificate.get("v").and_then(|v| v.as_u64()) != Some(1)
                 || certificate.get("project").and_then(|v| v.as_str()) != Some(project.as_str())
                 || certificate.get("file_path").and_then(|v| v.as_str()) != Some(path)
-                || certificate.get("base_sha256").and_then(|v| v.as_str()) != Some(base_sha.as_str())
+                || certificate.get("base_sha256").and_then(|v| v.as_str())
+                    != Some(base_sha.as_str())
                 || certificate.get("raw_sha256").and_then(|v| v.as_str())
                     != Some(self.private_raw_edge_fingerprint(&project, path)?.as_str())
             {
@@ -132,10 +148,16 @@ impl Store {
             "SELECT source_qname,target_qname,edge_type,properties FROM main.raw_edges
              WHERE project=?1 AND file_path=?2 ORDER BY source_qname,target_qname,edge_type,properties",
         )?;
-        let rows = statement.query_map(params![project, path], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = statement
+            .query_map(params![project, path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(crate::file_state::sha256_hex(&serde_json::to_vec(&rows)?))
     }
     /// Insert many raw edges inside a SINGLE transaction (one fsync for the

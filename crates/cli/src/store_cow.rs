@@ -511,7 +511,10 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
         ("SELECT rel_path FROM main.index_skips", false),
         (nodes, false),
         (raw_edges, true),
-        ("SELECT rel_path FROM main.file_content WHERE rel_path <> ''", false),
+        (
+            "SELECT rel_path FROM main.file_content WHERE rel_path <> ''",
+            false,
+        ),
         (vectors, false),
     ] {
         let mut statement = store
@@ -524,8 +527,12 @@ fn private_delta_paths(store: &greppy_store::Store) -> Result<std::collections::
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| Error::Store(format!("read Store-CoW Delta paths: {error}")))?;
         for path in paths {
-            if reference_repair && store.js_ts_reference_repair_path_is_certified(&path)
-                .map_err(|error| Error::Store(format!("verify JS/TS derived repair: {error}")))?
+            if reference_repair
+                && store
+                    .js_ts_reference_repair_path_is_certified(&path)
+                    .map_err(|error| {
+                        Error::Store(format!("verify JS/TS derived repair: {error}"))
+                    })?
             {
                 continue;
             }
@@ -1143,12 +1150,16 @@ pub(crate) fn persisted_v7_delta_needs_repair(
             || !greppy_indexer::js_ts_usages_repaired(delta)?
             || !greppy_indexer::anyhow_factory_edges_repaired(delta)?
             || !greppy_indexer::direct_self_field_edges_repaired(delta)?
-            || delta.conn().query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.js_ts_reference_override_files o
+            || delta
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.js_ts_reference_override_files o
                  WHERE NOT EXISTS(SELECT 1 FROM main.schema_meta m
                    WHERE m.key='greppy.effect_fn_repair_v9.' || o.project AND m.value='complete'))",
-                [], |row| row.get::<_, bool>(0),
-            ).map_err(|error| Error::Store(format!("read JS/TS repair version: {error}")))?))
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| Error::Store(format!("read JS/TS repair version: {error}")))?))
 }
 
 pub(crate) fn mark_rust_caller_edges_repaired(store: &greppy_store::Store) -> Result<()> {
@@ -5397,10 +5408,13 @@ mod tests {
     #[test]
     fn changed_clean_js_repair_is_certified_without_claiming_delta_ownership() {
         let repo = fixture();
-        std::fs::write(repo.path().join("src/plain.mjs"),
+        std::fs::write(
+            repo.path().join("src/plain.mjs"),
             "export function target() {}
 export function caller() { target(); }
-").unwrap();
+",
+        )
+        .unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let base_path = scratch.path().join("base.db");
         {
@@ -5413,17 +5427,34 @@ export function caller() { target(); }
         let base_bytes = std::fs::read(&base_path).unwrap();
         let visibility = VisibilityIndex::default();
         let delta_path = scratch.path().join("delta.db");
-        let mut overlay = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        overlay.conn().execute("INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete')", []).unwrap();
-        assert!(greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path()).unwrap());
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        overlay
+            .conn()
+            .execute(
+                "INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
         assert!(!overlay.list_delta_raw_edges("p").unwrap().is_empty());
         validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
         drop(overlay);
         // Reopening validates persisted proof, not an in-memory exemption.
-        let overlay = greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        let overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
         validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
-        overlay.conn().execute("UPDATE main.raw_edges SET target_qname='rogue' WHERE file_path='src/plain.mjs'", []).unwrap();
+        overlay
+            .conn()
+            .execute(
+                "UPDATE main.raw_edges SET target_qname='rogue' WHERE file_path='src/plain.mjs'",
+                [],
+            )
+            .unwrap();
         assert!(validate_overlay_delta_visibility(&overlay, &visibility).is_err());
     }
 
