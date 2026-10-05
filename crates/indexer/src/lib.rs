@@ -7651,6 +7651,60 @@ pub fn imported_alias_caller() { let selected = outer; selected(); }\n";
         assert_eq!(unchanged.files_skipped, 2);
         let _ = fs::remove_dir_all(repo);
     }
+    #[test]
+    fn js_ts_method_identity_upgrade_repairs_unchanged_sparse_graph_once() {
+        let repo = setup_repo("computed-method-upgrade", "pub fn keep() {}\n");
+        fs::write(repo.join("stream.ts"), "function tick() {}\nclass Stream { async *[Symbol.asyncIterator]() { await new Promise(resolve => resolve()); tick(); } }\n").unwrap();
+        fs::write(repo.join("outside.ts"), "function outside() {}\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let initial = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "src/lib.rs".into(),
+                "stream.ts".into(),
+            ])),
+            ..IndexOptions::default()
+        };
+        index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        let qname = "stream.ts::Stream::[Symbol.asyncIterator]";
+        let method = store
+            .list_nodes_by_label("test", "Method", 100)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.qualified_name == qname)
+            .expect("cold index must persist computed method");
+        // v9 retained source fingerprints, but never emitted this definition.
+        // Keep the file state unchanged so only the version upgrade can repair it.
+        store.delete_node(method.id).unwrap();
+        for mut state in store.list_workspace_states().unwrap() {
+            state.indexer_version =
+                state
+                    .indexer_version
+                    .replacen("greppy-indexer-v10", "greppy-indexer-v9", 1);
+            store.upsert_workspace_state(&state).unwrap();
+        }
+        let narrow = IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["src/lib.rs".into()])),
+            ..IndexOptions::default()
+        };
+        let upgraded = index_with_options(&mut store, &repo, "test", &narrow).unwrap();
+        assert_eq!(
+            upgraded.files_indexed, 2,
+            "retained TS file must migrate despite narrow request and identical bytes"
+        );
+        assert!(store
+            .list_nodes_by_label("test", "Method", 100)
+            .unwrap()
+            .iter()
+            .any(|node| node.qualified_name == qname));
+        assert!(store
+            .get_file_state("test", "outside.ts")
+            .unwrap()
+            .is_none());
+        let unchanged = index_with_options(&mut store, &repo, "test", &initial).unwrap();
+        assert_eq!(unchanged.files_indexed, 0, "migration must run only once");
+        assert_eq!(unchanged.files_skipped, 2);
+        let _ = fs::remove_dir_all(repo);
+    }
 
     #[test]
     fn index_with_options_honors_discovery_overrides() {

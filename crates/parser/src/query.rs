@@ -357,7 +357,7 @@ pub mod js_queries {
             name: (identifier) @name) @def
 
         (method_definition
-            name: (property_identifier) @name) @def
+            name: (_) @name) @def
 
         (variable_declarator
             name: (identifier) @name
@@ -418,7 +418,7 @@ pub mod ts_queries {
             name: (type_identifier) @name) @def
 
         (method_definition
-            name: (property_identifier) @name) @def
+            name: (_) @name) @def
 
         (variable_declarator
             name: (identifier) @name
