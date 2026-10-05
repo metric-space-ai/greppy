@@ -707,6 +707,31 @@ fn compiler_diagnostic_counts_preserve_child_exit_and_raw_bytes() {
 }
 
 #[test]
+fn cmake_diagnostic_verdict_preserves_child_exit_and_stream_bytes() {
+    let workspace = fresh_workspace("cmake-diagnostic");
+    let diagnostics = concat!(
+        "CMake Error in sample/CMakeLists.txt:\n  Imported target includes non-existent path\n\n",
+        "CMake Error at CMakeLists.txt:12 (find_package):\n  Missing package\n\n",
+        "CMake Error:\n  Configuration failed\n\n",
+        "CMake Error at CMakeLists.txt:20 (message):\n  Another failure\n\n",
+        "CMake Warning:\n  Manually-specified variables were not used\n",
+    );
+    for redirect in ["", " >&2"] {
+        let script = format!("printf '%s' '{diagnostics}'{redirect}; exit 1");
+        let output = run(&workspace, &["bash-smart", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(1));
+        let verdict = "FAILED — exit 1: 4 errors, 1 warning\n";
+        if redirect.is_empty() {
+            assert_eq!(text(&output.stdout), format!("{verdict}{diagnostics}"));
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(text(&output.stdout), verdict);
+            assert_eq!(output.stderr, diagnostics.as_bytes());
+        }
+    }
+}
+
+#[test]
 fn child_flags_after_delimiter_pass_through_unchanged() {
     let workspace = fresh_workspace("child-flag");
     let output = run(

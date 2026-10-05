@@ -101,6 +101,15 @@ static TYPESCRIPT_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|
     )
     .expect("bash-smart TypeScript diagnostic regex")
 });
+// CMake headers end in a colon, optionally with an at/in source location.
+// Requiring the terminator avoids counting prose mentioning CMake warnings.
+static CMAKE_DIAGNOSTIC_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(
+        r"(?-u)^[\t ]*CMake (Error|Warning)(?: \(dev\))?(?::| (?:at|in) [^\r\n]+:)[\t ]*$",
+    )
+    .expect("bash-smart CMake diagnostic regex")
+});
+
 // GCC/Clang put a numeric file location before the severity. Keep the
 // classifier byte-oriented (paths need not be UTF-8) and require the complete
 // location/severity syntax rather than promoting arbitrary stderr prose.
@@ -773,6 +782,7 @@ fn detect_blocks(
                 TYPESCRIPT_DIAGNOSTIC_RE
                     .captures(lines[index].content)
                     .or_else(|| SOURCE_DIAGNOSTIC_RE.captures(lines[index].content))
+                    .or_else(|| CMAKE_DIAGNOSTIC_RE.captures(lines[index].content))
                     .map(|captures| {
                         if captures[1].eq_ignore_ascii_case(b"warning") {
                             BlockKind::Warning
@@ -3104,6 +3114,20 @@ mod tests {
                 "FAILED — exit 1: 3 errors, 1 warning"
             );
         }
+    }
+
+    #[test]
+    fn cmake_diagnostics_keep_indented_details_and_reject_prose() {
+        let diagnostics = split_lines(b"CMake Error in sample/CMakeLists.txt:\n  Missing path\n\nCMake Warning (dev) at CMakeLists.txt:2 (project):\n  Developer warning\nCMake Warning:\n  Unused variables\n");
+        let blocks = detect_blocks(&diagnostics, &[]);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert_eq!(blocks[0].kind, BlockKind::Error);
+        assert_eq!(blocks[0].lines.len(), 3);
+        assert!(blocks[1..]
+            .iter()
+            .all(|block| block.kind == BlockKind::Warning));
+        let prose = split_lines(b"CMake Error handling documentation\nCMake Warning examples:\nCMake Error_count: 4\n");
+        assert!(detect_blocks(&prose, &[]).is_empty());
     }
 
     #[test]
