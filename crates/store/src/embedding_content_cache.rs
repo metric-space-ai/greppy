@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use crate::store_error::{Error, Result};
 
 const CACHE_DB_FILE: &str = "document-embeddings.db";
-const DEFAULT_MAX_ENTRIES: i64 = 100_000;
 const TRIM_TARGET_NUMERATOR: i64 = 9;
 const TRIM_TARGET_DENOMINATOR: i64 = 10;
 
@@ -305,6 +304,22 @@ impl EmbeddingContentCache {
         if previous / 256 == previous.saturating_add(writes) / 256 {
             return Ok(());
         }
+        let max_mib = std::env::var("GREPPY_EMBEDDING_CACHE_MAX_MIB")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(greppy_core::cache::DEFAULT_EMBEDDING_CACHE_MAX_MIB as i64);
+        self.prune_to_byte_budget(max_mib.saturating_mul(1024 * 1024))
+    }
+
+    /// Enforce the configured byte budget without imposing an unrelated row
+    /// ceiling. A large active multi-repository working set can contain well
+    /// over 100k compact rows while still fitting safely inside the existing
+    /// disk quota. LRU ordering continues to discard token-only rows first and
+    /// then the least recently accessed vectors when the byte quota is real.
+    fn prune_to_byte_budget(&self, max_bytes: i64) -> Result<()> {
+        if max_bytes <= 0 {
+            return Ok(());
+        }
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
@@ -315,30 +330,34 @@ impl EmbeddingContentCache {
             .conn
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .unwrap_or(0);
+        let freelist_count: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap_or(0);
         let page_size: i64 = self
             .conn
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap_or(4096);
-        let bytes = page_count.saturating_mul(page_size);
-        let max_mib = std::env::var("GREPPY_EMBEDDING_CACHE_MAX_MIB")
-            .ok()
-            .and_then(|value| value.trim().parse::<i64>().ok())
-            .unwrap_or(greppy_core::cache::DEFAULT_EMBEDDING_CACHE_MAX_MIB as i64);
-        let max_bytes = max_mib.saturating_mul(1024 * 1024);
-        if count <= DEFAULT_MAX_ENTRIES && (max_bytes <= 0 || bytes <= max_bytes) {
+        // SQLite keeps deleted pages in the database freelist for reuse. They
+        // are already available capacity, so counting them as live bytes would
+        // make every later prune delete another slice of valid vectors even
+        // though the working set is below its quota.
+        let bytes = page_count
+            .saturating_sub(freelist_count)
+            .saturating_mul(page_size);
+        if bytes <= max_bytes {
             return Ok(());
         }
-        let by_entries = DEFAULT_MAX_ENTRIES * TRIM_TARGET_NUMERATOR / TRIM_TARGET_DENOMINATOR;
-        let by_bytes = if bytes > 0 && max_bytes > 0 {
+        let keep = if bytes > 0 {
             count
                 .saturating_mul(max_bytes)
                 .saturating_mul(TRIM_TARGET_NUMERATOR)
                 / bytes
                 / TRIM_TARGET_DENOMINATOR
         } else {
-            by_entries
-        };
-        let keep = by_entries.min(by_bytes).max(1);
+            count
+        }
+        .max(1);
         self.conn
             .execute(
                 "DELETE FROM document_embeddings WHERE rowid IN (
@@ -508,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_discards_token_only_rows_before_vectors() {
+    fn byte_budget_does_not_evict_a_working_set_merely_for_exceeding_100k_rows() {
         let temp = tempfile::tempdir().unwrap();
         let cache = EmbeddingContentCache::open(temp.path()).unwrap();
         cache
@@ -525,25 +544,75 @@ mod tests {
                  FROM hundreds CROSS JOIN thousands;",
             )
             .unwrap();
-        let vectors = (0..256)
-            .map(|index| (format!("vector-{index}"), 8, vec![index as f32; 8]))
-            .collect::<Vec<_>>();
-        cache.put_vectors("m", "p", "t", &vectors).unwrap();
-        let retained_vectors: i64 = cache
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM document_embeddings WHERE vector IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
+        cache
+            .put_vector("m", "p", "t", "active-vector", 8, &[1.0, 2.0])
             .unwrap();
+        cache.prune_to_byte_budget(i64::MAX).unwrap();
         let total: i64 = cache
             .conn
             .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(retained_vectors, 256);
-        assert!(total <= 90_000);
+        assert_eq!(total, 100_001);
+        assert!(cache.get("m", "p", "t", "active-vector").unwrap().is_some());
+    }
+
+    #[test]
+    fn byte_pressure_retains_the_recently_used_vector_working_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = EmbeddingContentCache::open(temp.path()).unwrap();
+        let vectors = (0..1024)
+            .map(|index| (format!("vector-{index}"), 8, vec![index as f32; 8]))
+            .collect::<Vec<_>>();
+        cache.put_vectors("m", "p", "t", &vectors).unwrap();
+        cache
+            .conn
+            .execute("UPDATE document_embeddings SET last_accessed=1", [])
+            .unwrap();
+        let active = vec!["vector-0".to_owned(), "vector-1".to_owned()];
+        assert_eq!(
+            cache
+                .get_many("m", "p", "t", &active)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .count(),
+            active.len()
+        );
+        let page_count: i64 = cache
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let page_size: i64 = cache
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let byte_budget = page_count.saturating_mul(page_size) / 2;
+        cache.prune_to_byte_budget(byte_budget).unwrap();
+        for key in active {
+            assert!(cache.get("m", "p", "t", &key).unwrap().is_some());
+        }
+        let retained_after_first_trim: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            retained_after_first_trim < 1024,
+            "byte pressure must still enforce eviction"
+        );
+        cache.prune_to_byte_budget(byte_budget).unwrap();
+        let retained_after_second_trim: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            retained_after_second_trim, retained_after_first_trim,
+            "freelist pages must not cause progressive eviction below the live-byte budget"
+        );
     }
 }
