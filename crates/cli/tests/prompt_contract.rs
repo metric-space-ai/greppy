@@ -53,7 +53,10 @@ fn documented_command_rows_use_the_same_executable_prefix() {
             continue;
         }
         let row = line.trim_start();
-        if row.starts_with("--") || row.is_empty() {
+        if row.starts_with("--")
+            || row.is_empty()
+            || row == "NEW or DIFF absent: it is read from stdin."
+        {
             continue;
         }
         if row.starts_with("who-calls and callees answer") {
