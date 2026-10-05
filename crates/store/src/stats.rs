@@ -456,10 +456,7 @@ mod tests {
         }
         check(&overlay);
         drop(overlay);
-        let visibility: crate::VisibilityIndex = serde_json::from_value(
-            serde_json::json!({"base_commit":"fixture","dirty":[],"deleted":["b.rs"]}),
-        )
-        .unwrap();
+        let visibility = crate::VisibilityIndex::new([], ["b.rs".into()]).unwrap();
         let hidden = Store::open_overlay_read_only(
             &base_path,
             &scratch.path().join("delta.db"),
