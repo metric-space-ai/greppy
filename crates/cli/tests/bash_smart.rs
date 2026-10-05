@@ -722,6 +722,34 @@ fn quoted_pipeline_uses_pipefail_exit_status() {
 }
 
 #[test]
+fn expansion_survives_completed_command_temp_cleanup() {
+    let workspace = fresh_workspace("retention");
+    let scratch = workspace.base.join("command-tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let output = command(&workspace)
+        .env("TMPDIR", &scratch)
+        .args([
+            "bash-smart",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 200); do echo line $i; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let shown = text(&output.stdout);
+    let id = expand_id(&shown);
+    std::fs::remove_dir_all(&scratch).unwrap();
+    let expanded = run(&workspace, &["expand", id]);
+    assert!(expanded.status.success(), "{}", text(&expanded.stdout));
+    let expected = (22..=170)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    assert_eq!(expanded.stdout, expected.as_bytes());
+}
+
+#[test]
 fn long_output_has_head_gap_tail_and_expandable_raw_middle() {
     let workspace = fresh_workspace("long");
     let output = run(
