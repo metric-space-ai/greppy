@@ -3219,6 +3219,13 @@ fn recover_visible_effect_fn_bindings_inner(
         if previous.get(path).cloned().unwrap_or_default() != current {
             persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
             changed_paths.push((path, source_sha256));
+        } else if store.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.js_ts_reference_override_files WHERE project=?1 AND file_path=?2)",
+            rusqlite::params![project, path], |row| row.get::<_, bool>(0),
+        ).map_err(sqlite_err)? {
+            // An already-current legacy v8 contribution still needs a v9
+            // certificate. Do not create ownership/overrides for clean Base.
+            store.certify_js_ts_reference_repair(project, path, source_sha256)?;
         }
     }
     let changed_relations = !changed_paths.is_empty();

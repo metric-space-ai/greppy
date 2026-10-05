@@ -5406,7 +5406,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_clean_js_repair_is_certified_without_claiming_delta_ownership() {
+    fn changed_clean_js_repair_and_legacy_migration_are_certified_without_ownership() {
         let repo = fixture();
         std::fs::write(
             repo.path().join("src/plain.mjs"),
@@ -5441,6 +5441,18 @@ export function caller() { target(); }
                 .unwrap()
         );
         assert!(!overlay.list_delta_raw_edges("p").unwrap().is_empty());
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        // Already-current v8 private facts must gain a certificate even when
+        // extraction finds no changes. The ordinary clean Base stays private-free.
+        overlay.conn().execute_batch(
+            "DELETE FROM main.schema_meta WHERE key LIKE 'greppy.js_ts_reference_repair_certificate_v1.%';
+             DELETE FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.p';"
+        ).unwrap();
+        assert!(
+            greppy_indexer::recover_visible_effect_fn_bindings(&mut overlay, "p", repo.path())
+                .unwrap()
+        );
         validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
         assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
         drop(overlay);
