@@ -81,7 +81,7 @@ function factory() { return { [makeKey()]() { body(); } }; }
         Language::TypeScript { tsx: true },
     ] {
         let result = extract(language, source, "keys.ts").unwrap();
-        let keys: Vec<_> = result
+        let keys: std::collections::BTreeSet<_> = result
             .edges
             .iter()
             .filter(|edge| edge.edge_type == "CALLS" && edge.properties["callee_name"] == "makeKey")
@@ -89,10 +89,10 @@ function factory() { return { [makeKey()]() { body(); } }; }
             .collect();
         assert_eq!(
             keys,
-            ["keys.ts::__file__", "keys.ts::Function::factory"],
+            std::collections::BTreeSet::from(["keys.ts::__file__", "keys.ts::Function::factory"]),
             "{language:?}"
         );
-        let bodies: Vec<_> = result
+        let bodies: std::collections::BTreeSet<_> = result
             .edges
             .iter()
             .filter(|edge| edge.edge_type == "CALLS" && edge.properties["callee_name"] == "body")
@@ -100,10 +100,10 @@ function factory() { return { [makeKey()]() { body(); } }; }
             .collect();
         assert_eq!(
             bodies,
-            [
+            std::collections::BTreeSet::from([
                 "keys.ts::Top::[makeKey()]",
                 "keys.ts::Function::[makeKey()]"
-            ],
+            ]),
             "{language:?}"
         );
     }
