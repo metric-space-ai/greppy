@@ -601,7 +601,7 @@ fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow
 /// columns count bytes, as in tree-sitter, rather than displayed characters.
 pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
     let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
@@ -647,7 +647,7 @@ pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<Str
 /// changes, the edit broke the grammar in a way tree-sitter recovered past.
 fn context_kinds(language: Language, content: &[u8], range: (usize, usize)) -> Option<Vec<String>> {
     let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let leaf = tree
         .root_node()
         .descendant_for_byte_range(range.0, range.1.saturating_sub(1).max(range.0))?;
@@ -686,7 +686,7 @@ pub fn structural_context_preserved(
 /// not-applicable rather than silently passing).
 pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts> {
     let validation_content = syntax_validation_content(language, content);
-    let tree = greppy_parser::parse(language, &validation_content).ok()?;
+    let tree = greppy_parser::parse_for_syntax_validation(language, &validation_content).ok()?;
     let mut errors = 0usize;
     let mut missing = 0usize;
     let mut cursor = tree.walk();
@@ -717,6 +717,23 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c_va_arg_type_operands_use_validation_view_only() {
+        let valid = b"#include <stdarg.h>\nvoid *get(int key,...) {va_list ap;va_start(ap,key);void *p=va_arg(ap,void *);va_end(ap);return p;}\n";
+        assert_eq!(
+            syntax_counts(Language::C, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert_eq!(first_syntax_diagnostic(Language::C, valid), None);
+        let invalid = b"void *get(void){return va_arg(ap,void *+);}";
+        let counts = syntax_counts(Language::C, invalid).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0);
+        assert!(first_syntax_diagnostic(Language::C, invalid).is_some());
+    }
+
     #[test]
     fn guarded_linkage_lookalikes_keep_valid_comment_and_string_bytes() {
         let pair = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint value;\n#ifdef __cplusplus\n}\n#endif\n";
