@@ -5412,6 +5412,102 @@ mod tests {
     }
 
     #[test]
+    fn filtered_overlay_refresh_preserves_certified_unselected_base_relations() {
+        let repo = fixture();
+        let js_path = "src/clean.ts";
+        std::fs::write(
+            repo.path().join(js_path),
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base_path = scratch.path().join("base.db");
+        let source_sha;
+        {
+            let mut base = greppy_store::Store::open(&base_path).unwrap();
+            greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
+            source_sha = base
+                .list_file_states("p")
+                .unwrap()
+                .into_iter()
+                .find(|state| state.rel_path == js_path)
+                .unwrap()
+                .sha256;
+        }
+        let base_bytes = std::fs::read(&base_path).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        let visibility =
+            VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new()).unwrap();
+        let delta_path = scratch.path().join("delta.db");
+        let mut overlay =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        // A retained compatibility repair owns derived relations, not source.
+        // The next filtered structural refresh must not delete its contribution.
+        overlay.conn().execute_batch(
+            "INSERT INTO main.projects SELECT * FROM greppy_base.projects;
+             INSERT INTO main.file_state SELECT * FROM greppy_base.file_state WHERE rel_path='src/lib.rs';
+             INSERT INTO main.workspace_state SELECT * FROM greppy_base.workspace_state;
+             INSERT INTO main.raw_edges(project,file_path,source_qname,target_qname,edge_type,properties)
+             SELECT project,file_path,source_qname,target_qname,edge_type,properties
+             FROM greppy_base.raw_edges WHERE file_path='src/clean.ts';
+             INSERT INTO main.js_ts_reference_override_files VALUES('p','src/clean.ts');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v8.p','complete');
+             INSERT INTO main.schema_meta VALUES('greppy.effect_fn_repair_v9.p','complete');"
+        ).unwrap();
+        overlay
+            .certify_js_ts_reference_repair("p", js_path, &source_sha)
+            .unwrap();
+        let retained = overlay.list_delta_raw_edges("p").unwrap();
+        assert!(!retained.is_empty());
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(["src/lib.rs".to_string()].into_iter().collect()),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        let after = overlay
+            .list_delta_raw_edges("p")
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.file_path == js_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, retained,
+            "filtered inventory must not delete unselected Base repairs"
+        );
+        assert!(
+            overlay
+                .js_ts_reference_repair_path_is_certified(js_path)
+                .unwrap(),
+            "filtered inventory must not delete unselected Base repairs: certificate lost"
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        // A deletion inside the requested scope still removes its own rows.
+        std::fs::remove_file(repo.path().join("src/lib.rs")).unwrap();
+        greppy_indexer::index_with_options(&mut overlay, repo.path(), "p", &options).unwrap();
+        assert!(overlay
+            .list_file_states("p")
+            .unwrap()
+            .iter()
+            .all(|state| state.rel_path != "src/lib.rs"));
+        assert!(
+            overlay
+                .js_ts_reference_repair_path_is_certified(js_path)
+                .unwrap(),
+            "filtered inventory must not delete unselected Base repairs: certificate lost"
+        );
+        validate_overlay_delta_visibility(&overlay, &visibility).unwrap();
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+        drop(overlay);
+        let reopened =
+            greppy_store::Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
+        validate_overlay_delta_visibility(&reopened, &visibility).unwrap();
+        assert!(reopened
+            .js_ts_reference_repair_path_is_certified(js_path)
+            .unwrap());
+    }
+
+    #[test]
     fn changed_clean_js_repair_and_legacy_migration_are_certified_without_ownership() {
         let repo = fixture();
         std::fs::write(

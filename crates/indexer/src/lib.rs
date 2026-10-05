@@ -472,6 +472,7 @@ pub fn index_with_options_and_progress(
             store,
             project_name,
             &entries,
+            only_paths.as_ref(),
             generation,
             worker_count,
             &mut report,
@@ -519,6 +520,7 @@ pub fn index_with_options_and_progress(
             store,
             project_name,
             &entries,
+            only_paths.as_ref(),
             generation,
             worker_count,
             &mut report,
@@ -902,6 +904,7 @@ fn run_incremental(
     store: &mut Store,
     project_name: &str,
     entries: &[InventoryEntry],
+    only_paths: Option<&std::collections::BTreeSet<String>>,
     generation: u64,
     worker_count: usize,
     report: &mut IndexReport,
@@ -927,6 +930,12 @@ fn run_incremental(
                 report.files_skipped += 1;
             }
             greppy_freshness::FileDiff::Deleted(rel) => {
+                // A filtered inventory says nothing about unselected files.
+                // In an overlay these may own certified derived relations:
+                // treating them as deleted invalidates their retained proof.
+                if only_paths.is_some_and(|paths| !paths.contains(rel)) {
+                    continue;
+                }
                 // Remove the file's nodes (FK-cascades its edges), content,
                 // file_state, and its persisted raw edges.
                 let _ = store.delete_nodes_for_file(project_name, rel)?;
