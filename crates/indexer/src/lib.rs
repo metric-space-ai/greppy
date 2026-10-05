@@ -2822,7 +2822,7 @@ pub fn recover_persisted_rust_usages(
     Ok(changed + store.replace_validated_rust_calls(project, &files, &calls)?)
 }
 
-pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v3";
+pub const JS_TS_USAGE_REPAIR_KEY: &str = "greppy.js_ts_usage_repair_v4";
 
 pub fn js_ts_usages_repaired(store: &Store) -> Result<bool> {
     store
@@ -2996,7 +2996,10 @@ pub fn recover_persisted_js_ts_usages(
                 target,
                 edge.source_qualified_name.clone(),
                 index.qname_for_id(target).unwrap().to_owned(),
-                edge.properties.clone(),
+                // Extraction stores the reference address separately from
+                // properties. Recovery must publish it just as fresh indexing
+                // does, or navigation falls back to the owner's definition.
+                new_raw_edge_for(project, &edge.file_path, edge).properties,
                 edge.edge_type.clone(),
             ));
         }
@@ -8587,7 +8590,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                     [JS_TS_USAGE_REPAIR_KEY],
                 )
                 .unwrap();
-            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+            base.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         }
         let base_bytes = fs::read(&base_path).unwrap();
         let mut overlay = Store::open_overlay(
@@ -8596,7 +8599,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
             &greppy_store::VisibilityIndex::default(),
         )
         .unwrap();
-        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+        overlay.conn().execute_batch("INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO main.schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         let private_path = scratch.path().join("private.db");
         let mut private = Store::open(&private_path).unwrap();
         index(&mut private, repo.path(), "test").unwrap();
@@ -8607,7 +8610,7 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                 [JS_TS_USAGE_REPAIR_KEY],
             )
             .unwrap();
-        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete');").unwrap();
+        private.conn().execute_batch("DELETE FROM raw_edges WHERE edge_type IN ('USAGE','CALLS'); DELETE FROM edges WHERE edge_type IN ('USAGE','CALLS'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v2','complete'); INSERT OR REPLACE INTO schema_meta VALUES('greppy.js_ts_usage_repair_v3','complete');").unwrap();
         for store in [&mut overlay, &mut private] {
             let nodes = format!("{:?}", store.list_nodes("test", "", "", 0, 1000).unwrap());
             let states = format!("{:?}", store.list_file_states("test").unwrap());
@@ -8656,12 +8659,20 @@ module.exports = function ExportedInternal() { return helper() + Boundary; };
                 .unwrap();
             let callers = store.incoming_edges(helper.id, Some("CALLS"), 100).unwrap();
             assert_eq!(callers.len(), 3, "{callers:?}");
-            for suffix in ["Variable::make", "Function::exposed", "__file__"] {
+            for (suffix, line) in [
+                ("Variable::make", 4),
+                ("Function::exposed", 5),
+                ("__file__", 7),
+            ] {
                 let owner = store
                     .get_node_by_qname("test", &format!("app.ts::{suffix}"))
                     .unwrap()
                     .unwrap();
-                assert!(callers.iter().any(|edge| edge.source_id == owner.id));
+                let caller = callers
+                    .iter()
+                    .find(|edge| edge.source_id == owner.id)
+                    .unwrap();
+                assert_eq!(caller.properties["line"], line, "{caller:?}");
                 assert!(store
                     .outgoing_edges(owner.id, Some("CALLS"), 100)
                     .unwrap()
