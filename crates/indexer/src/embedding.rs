@@ -28,6 +28,18 @@ const EMBED_BATCH_ENV: &str = "GREPPY_EMBED_BATCH";
 const EMBED_SCHEDULE_BATCHES: usize = 16;
 const MAX_BATCH_PADDING_FRACTION_DENOMINATOR: usize = 8;
 
+/// Stable semantic title for one embedded definition.
+///
+/// Source coordinates are deliberately excluded: they are checkout state, not
+/// document meaning, and including them makes an unchanged definition miss the
+/// user-global exact-prompt cache whenever surrounding lines move. The
+/// qualified name remains part of the real model prompt, so definitions with
+/// different semantic identities never alias merely because their bodies are
+/// byte-identical.
+fn embedding_document_title(qualified_name: &str) -> String {
+    qualified_name.to_owned()
+}
+
 fn embed_batch_size() -> usize {
     parse_embed_batch_size(std::env::var(EMBED_BATCH_ENV).ok().as_deref())
 }
@@ -271,10 +283,7 @@ pub fn count_code_embedding_documents_for_scope(
             {
                 continue;
             }
-            let title = format!(
-                "{}:{}-{} {}",
-                node.file_path, node.start_line, node.end_line, node.qualified_name
-            );
+            let title = embedding_document_title(&node.qualified_name);
             let chunks = embedding_chunks(
                 source,
                 node.start_line,
@@ -428,10 +437,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 report.nodes_skipped_oversize += 1;
                 continue;
             }
-            let title = format!(
-                "{}:{}-{} {}",
-                node.file_path, node.start_line, node.end_line, node.qualified_name
-            );
+            let title = embedding_document_title(&node.qualified_name);
             let chunks = embedding_chunks(
                 source,
                 node.start_line,
@@ -1392,6 +1398,56 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ExactPromptCachingProvider {
+        cache: std::rc::Rc<std::cell::RefCell<HashMap<String, Vec<f32>>>>,
+        hits: usize,
+        misses: usize,
+    }
+
+    impl ExactPromptCachingProvider {
+        fn new() -> Self {
+            Self {
+                cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+                hits: 0,
+                misses: 0,
+            }
+        }
+    }
+
+    impl CodeEmbeddingProvider for ExactPromptCachingProvider {
+        fn model_id(&self) -> &str {
+            "stable-prompt-test-model"
+        }
+
+        fn prompt_version(&self) -> &str {
+            "stable-prompt-v1"
+        }
+
+        fn task_profile(&self) -> &str {
+            "embeddinggemma_code_retrieval"
+        }
+
+        fn embed_code_document(&mut self, title: Option<&str>, content: &str) -> Result<Vec<f32>> {
+            let input = EmbedTask::document_with_title(title, content);
+            if let Some(vector) = self.cache.borrow().get(&input).cloned() {
+                self.hits += 1;
+                return Ok(vector);
+            }
+            self.misses += 1;
+            let vector = test_vector_for_chunk(content);
+            self.cache.borrow_mut().insert(input, vector.clone());
+            Ok(vector)
+        }
+
+        fn content_cache_stats(&self) -> EmbeddingProviderCacheStats {
+            EmbeddingProviderCacheStats {
+                hits: self.hits,
+                misses: self.misses,
+            }
+        }
+    }
+
     struct TokenBudgetProvider {
         max_tokens: usize,
         docs: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
@@ -1547,6 +1603,88 @@ mod tests {
         })
         .unwrap();
         s
+    }
+
+    #[test]
+    fn exact_prompt_cache_reuses_unchanged_definition_across_roots_and_moved_lines() {
+        let first_root = tempdir_via_env();
+        let second_root = tempdir_via_env();
+        std::fs::create_dir_all(first_root.join("src")).unwrap();
+        std::fs::create_dir_all(second_root.join("src")).unwrap();
+        std::fs::write(first_root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+        std::fs::write(
+            second_root.join("src/lib.rs"),
+            "// moved by unrelated source\npub fn stable() {}\n",
+        )
+        .unwrap();
+
+        let mut first_store = store_with_project(&first_root);
+        let mut second_store = store_with_project(&second_root);
+        insert_node(
+            &mut first_store,
+            "p.stable",
+            "stable",
+            "Function",
+            "src/lib.rs",
+            1,
+            1,
+        );
+        insert_node(
+            &mut second_store,
+            "p.stable",
+            "stable",
+            "Function",
+            "src/lib.rs",
+            2,
+            2,
+        );
+        assert_eq!(
+            second_store
+                .count_vector_embeddings(
+                    "p",
+                    "stable-prompt-test-model",
+                    "stable-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    None,
+                )
+                .unwrap(),
+            0,
+            "the second checkout has no indexed primary to reuse"
+        );
+
+        let mut first_provider = ExactPromptCachingProvider::new();
+        index_code_embeddings_for_project(
+            &mut first_store,
+            &first_root,
+            "p",
+            &mut first_provider,
+            EmbeddingIndexOptions::for_generation(1),
+        )
+        .unwrap();
+        assert_eq!(first_provider.content_cache_stats().misses, 1);
+
+        let mut second_provider = first_provider.clone();
+        let before_hits = second_provider.content_cache_stats().hits;
+        let report = index_code_embeddings_for_project(
+            &mut second_store,
+            &second_root,
+            "p",
+            &mut second_provider,
+            EmbeddingIndexOptions::for_generation(1),
+        )
+        .unwrap();
+        assert_eq!(
+            report.nodes_reused, 0,
+            "no local Store vector was available"
+        );
+        assert_eq!(report.global_cache_hits - before_hits, 1);
+        assert_eq!(report.global_cache_misses, 1);
+        assert_eq!(embedding_document_title("p.stable"), "p.stable");
+        assert_ne!(
+            embedding_document_title("p.stable"),
+            embedding_document_title("other.stable"),
+            "semantic identities remain distinct exact model prompts"
+        );
     }
 
     fn insert_node(

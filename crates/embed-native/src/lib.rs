@@ -73,7 +73,11 @@ pub const HAS_GPU_BACKEND: bool = cfg!(any(
 pub const EMBEDDING_DIM: usize = 768;
 
 /// The prompt/weight contract used by greppy vector rows.
-pub const PROMPT_VERSION: &str = "embeddinggemma-code-retrieval-st-v2";
+///
+/// V3 makes document titles independent of source coordinates. Existing V2
+/// vectors and cache rows remain intact, but cannot be reused because their
+/// exact model input included the old `path:start-end qualified_name` title.
+pub const PROMPT_VERSION: &str = "embeddinggemma-code-retrieval-st-v3";
 
 /// greppy vector-store profile key for code retrieval.
 pub const CODE_RETRIEVAL_PROFILE: &str = "embeddinggemma_code_retrieval";
