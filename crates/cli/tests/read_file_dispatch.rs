@@ -110,7 +110,14 @@ fn enum_variant_read_repairs_legacy_span_and_handle_without_reindex() {
             row.get(0)
         })
         .unwrap();
-    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; DELETE FROM schema_meta WHERE key='greppy.rust_caller_edges_repair.v14'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v13','complete');").unwrap();
+    conn.execute_batch("UPDATE nodes SET end_line=start_line WHERE label='EnumVariant'; INSERT OR REPLACE INTO schema_meta VALUES('greppy.rust_caller_edges_repair.v14','complete');").unwrap();
+    // Simulate a real legacy store, not external corruption falsely certified
+    // by the currently complete repair version.
+    conn.execute(
+        "DELETE FROM schema_meta WHERE key=?1",
+        [greppy_indexer::RUST_CALLER_EDGES_REPAIR_META_KEY],
+    )
+    .unwrap();
     drop(conn);
     let (code, stdout, stderr) = run(
         &repo,
