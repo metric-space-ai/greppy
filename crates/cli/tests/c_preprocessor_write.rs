@@ -60,6 +60,8 @@ fn local_jni_and_xmacro_writes_preserve_exact_bytes() {
     for (path, source) in [
         ("jni.c", "#define JNIEXPORT __attribute__((visibility(\"default\")))\n#define JNICALL\nJNIEXPORT int JNICALL probe(void) { return 0; }\n"),
         ("fields.c", "#define FIELDS(X) X(int, count) X(float, ratio)\n#define DECL(type,name) type name;\nstruct record { FIELDS(DECL) };\n"),
+        ("guarded.h", "#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE];\n#endif\n"),
+        ("crlf.c", "#define VALUE \\\r\n 4\r\nint value = VALUE;\r\n"),
     ] {
         let output = write_source(&repo, &store, path, source.as_bytes());
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));

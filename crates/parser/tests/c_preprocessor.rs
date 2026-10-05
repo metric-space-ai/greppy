@@ -95,3 +95,40 @@ fn macro_substitution_does_not_paste_distinct_operator_tokens() {
         .root_node()
         .has_error());
 }
+
+#[test]
+fn ordinary_header_guards_allow_local_values_and_declaration_macros() {
+    for source in [
+        "#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE];\n#endif\n",
+        "/* header */\n#ifndef HEADER_H\n#define HEADER_H\n#define EXPORT __attribute__((visibility(\"default\")))\n#define CALL\nEXPORT int CALL probe(void) {return 0;}\n#endif /* HEADER_H */\n",
+    ] {
+        let view = c_preprocessor_validation_view(source.as_bytes()).unwrap();
+        assert!(!parse_for_syntax_validation(Language::C, &view.bytes).unwrap().root_node().has_error());
+    }
+    for source in [
+        "#ifndef HEADER_H\n#define HEADER_H\n#if PLATFORM\n#define EXPORT\n#endif\nEXPORT int x;\n#endif\n",
+        "#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\n#else\n#define SIZE 8\n#endif\nint values[SIZE];\n",
+    ] { assert!(c_preprocessor_validation_view(source.as_bytes()).is_err()); }
+}
+
+#[test]
+fn crlf_macro_continuations_expand_and_keep_broken_syntax_visible() {
+    let source = b"#define VALUE \\\r\n 4\r\nint value = VALUE;\r\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let source = b"#define FIELDS(X) \\\r\n X(int,count) \\\r\n X(float,ratio)\r\n#define DECL(t,n) t n;\r\nstruct record { FIELDS(DECL) };\r\n";
+    let view = c_preprocessor_validation_view(source).unwrap();
+    assert!(!parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let broken = b"#define VALUE \\\r\n +\r\nint value = VALUE;\r\n";
+    let view = c_preprocessor_validation_view(broken).unwrap();
+    assert!(parse_for_syntax_validation(Language::C, &view.bytes)
+        .unwrap()
+        .root_node()
+        .has_error());
+}

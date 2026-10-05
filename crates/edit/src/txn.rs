@@ -870,6 +870,20 @@ pub fn syntax_counts(language: Language, content: &[u8]) -> Option<SyntaxCounts>
 mod tests {
     #[test]
     fn local_c_macros_validate_without_hiding_broken_declarations() {
+        let guarded =
+            b"#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE];\n#endif\n";
+        assert_eq!(
+            syntax_counts(Language::C, guarded),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert!(syntax_validation_limitation(Language::C, guarded).is_none());
+        let broken_guarded =
+            b"#ifndef HEADER_H\n#define HEADER_H\n#define SIZE 4\nint values[SIZE] = ;\n#endif\n";
+        let counts = syntax_counts(Language::C, broken_guarded).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0);
         let valid = b"#define JNIEXPORT __attribute__((visibility(\"default\")))\n#define JNICALL\nJNIEXPORT int JNICALL probe(void) { return 0; }\n";
         assert_eq!(
             syntax_counts(Language::C, valid),

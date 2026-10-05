@@ -1,10 +1,45 @@
 //! Bounded local C macro expansion for edit validation, never extraction.
 //!
 //! This does not implement an include search path or conditional evaluation.
-//! Supported definitions are unconditional local object/function macros without
+//! Supported definitions are local object/function macros outside uncertain
+//! conditionals, including a conventional whole-file include guard, without
 //! stringification, token pasting, or variadics. Unsupported used definitions
 //! fail closed with an invocation coordinate rather than disabling syntax guards.
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const ALLOCATION_BUDGET: usize = 64 * 1024 * 1024;
+
+struct AllocationBudget {
+    remaining: usize,
+}
+impl AllocationBudget {
+    fn charge(&mut self, amount: usize, offset: usize) -> Result<(), CPreprocessorError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(amount)
+            .ok_or(CPreprocessorError {
+                offset,
+                reason: "local C macro validation exceeds its bounded allocation budget",
+            })?;
+        Ok(())
+    }
+    fn charge_tokens(&mut self, tokens: &[Token], offset: usize) -> Result<(), CPreprocessorError> {
+        let amount = tokens.iter().fold(0usize, |sum, t| {
+            sum.saturating_add(2 * std::mem::size_of::<Token>() + t.bytes.len() + 32)
+        });
+        self.charge(amount, offset)
+    }
+    fn clone_tokens(
+        &mut self,
+        tokens: &[Token],
+        offset: usize,
+    ) -> Result<Vec<Token>, CPreprocessorError> {
+        self.charge_tokens(tokens, offset)?;
+        Ok(tokens.to_vec())
+    }
+}
 
 #[derive(Clone)]
 struct Token {
@@ -56,7 +91,10 @@ fn ident_start(byte: u8) -> bool {
 fn ident_cont(byte: u8) -> bool {
     ident_start(byte) || byte.is_ascii_digit()
 }
-fn tokenize(source: &[u8]) -> Vec<Token> {
+fn tokenize(
+    source: &[u8],
+    budget: &mut AllocationBudget,
+) -> Result<Vec<Token>, CPreprocessorError> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < source.len() {
@@ -64,7 +102,15 @@ fn tokenize(source: &[u8]) -> Vec<Token> {
         let kind;
         if source[at].is_ascii_whitespace() {
             kind = Kind::Trivia;
-            at += 1; // Keep each newline separate for logical directive lines.
+            at += 1; // Keep CR/LF separate, aggregate horizontal trivia.
+            if !matches!(source[start], b'\n' | b'\r') {
+                while source
+                    .get(at)
+                    .is_some_and(|b| b.is_ascii_whitespace() && !matches!(*b, b'\n' | b'\r'))
+                {
+                    at += 1;
+                }
+            }
         } else if source[at..].starts_with(b"/*") {
             kind = Kind::Trivia;
             at += 2;
@@ -162,13 +208,14 @@ fn tokenize(source: &[u8]) -> Vec<Token> {
             .find(|operator| source[at..].starts_with(operator));
             at += operator.map_or(1, |operator| operator.len());
         }
+        budget.charge(2 * std::mem::size_of::<Token>() + at - start + 32, start)?;
         out.push(Token {
             bytes: source[start..at].to_vec(),
             origin: start,
             kind,
         });
     }
-    out
+    Ok(out)
 }
 fn significant(tokens: &[Token], mut at: usize) -> usize {
     while at < tokens.len() && tokens[at].kind == Kind::Trivia {
@@ -233,9 +280,10 @@ fn define(tokens: &[Token]) -> Option<(Vec<u8>, Macro)> {
 }
 
 struct Expander {
-    macros: BTreeMap<Vec<u8>, Macro>,
+    macros: BTreeMap<Vec<u8>, Arc<Macro>>,
     steps: usize,
     limit: usize,
+    budget: AllocationBudget,
 }
 impl Expander {
     fn expand(
@@ -259,7 +307,10 @@ impl Expander {
                 .then(|| self.macros.get(&token.bytes).cloned())
                 .flatten();
             let Some(definition) = definition else {
-                out.push(token.clone());
+                out.extend(
+                    self.budget
+                        .clone_tokens(std::slice::from_ref(token), token.origin)?,
+                );
                 at += 1;
                 continue;
             };
@@ -268,7 +319,10 @@ impl Expander {
             if let Some(parameters) = &definition.parameters {
                 let open = significant(input, after);
                 if !input.get(open).is_some_and(|t| t.bytes == b"(") {
-                    out.push(token.clone());
+                    out.extend(
+                        self.budget
+                            .clone_tokens(std::slice::from_ref(token), token.origin)?,
+                    );
                     at += 1;
                     continue;
                 }
@@ -290,7 +344,12 @@ impl Expander {
                             nesting -= 1;
                         }
                         if (next.bytes == b"," && nesting == 1) || nesting == 0 {
-                            arguments.push(input[start..after].to_vec());
+                            self.budget
+                                .charge(2 * std::mem::size_of::<Vec<Token>>(), token.origin)?;
+                            arguments.push(
+                                self.budget
+                                    .clone_tokens(&input[start..after], token.origin)?,
+                            );
                             start = after + 1;
                         }
                     }
@@ -324,6 +383,8 @@ impl Expander {
             for body_token in &definition.body {
                 // Preserve preprocessing-token boundaries after substitution.
                 // `+x` with argument `+value` must never become `++value`.
+                self.budget
+                    .charge(2 * std::mem::size_of::<Token>() + 33, token.origin)?;
                 replacement.push(Token {
                     bytes: vec![b' '],
                     origin: token.origin,
@@ -342,17 +403,28 @@ impl Expander {
                     });
                 }
                 if let Some(index) = parameter {
-                    replacement.extend(arguments[index].clone());
+                    replacement.extend(self.budget.clone_tokens(&arguments[index], token.origin)?);
                 } else {
-                    replacement.push(body_token.clone());
+                    replacement.extend(
+                        self.budget
+                            .clone_tokens(std::slice::from_ref(body_token), token.origin)?,
+                    );
                 }
             }
             for expanded in &mut replacement {
                 expanded.origin = token.origin;
             }
+            self.budget.charge(
+                disabled.iter().fold(token.bytes.len() + 64, |sum, name| {
+                    sum.saturating_add(name.len() + 64)
+                }),
+                token.origin,
+            )?;
             let mut disabled = disabled.clone();
             disabled.insert(token.bytes.clone());
             // Macro expansion cannot concatenate separate preprocessing tokens.
+            self.budget
+                .charge(4 * std::mem::size_of::<Token>() + 66, token.origin)?;
             out.push(Token {
                 bytes: vec![b' '],
                 origin: token.origin,
@@ -392,16 +464,118 @@ impl Expander {
     }
 }
 
-/// Expand supported local definitions in source order. Preprocessor directives
-/// are kept opaque and unchanged for tree-sitter. Conditional evaluation is not
-/// attempted; definitions/undefs under conditional groups are marked unsupported.
+// Recognize only a fresh-include envelope: leading #ifndef NAME, immediate
+// empty #define NAME, one matching final #endif and no outer alternative.
+// Its body must still parse; nested build conditionals remain unsupported.
+fn ordinary_header_guard(tokens: &[Token]) -> bool {
+    let first = significant(tokens, 0);
+    if !tokens.get(first).is_some_and(|t| t.bytes == b"#") {
+        return false;
+    }
+    let command = significant(tokens, first + 1);
+    if !tokens.get(command).is_some_and(|t| t.bytes == b"ifndef") {
+        return false;
+    }
+    let name = significant(tokens, command + 1);
+    if !tokens.get(name).is_some_and(|t| t.kind == Kind::Ident) {
+        return false;
+    }
+    let first_end = tokens[name..]
+        .iter()
+        .position(|t| t.bytes == b"\n")
+        .map_or(tokens.len(), |n| name + n);
+    if tokens[name + 1..first_end]
+        .iter()
+        .any(|t| t.kind != Kind::Trivia)
+    {
+        return false;
+    }
+    let define_at = significant(tokens, first_end + 1);
+    if !tokens.get(define_at).is_some_and(|t| t.bytes == b"#") {
+        return false;
+    }
+    let define_command = significant(tokens, define_at + 1);
+    let define_name = significant(tokens, define_command + 1);
+    if !tokens
+        .get(define_command)
+        .is_some_and(|t| t.bytes == b"define")
+        || !tokens
+            .get(define_name)
+            .is_some_and(|t| t.bytes == tokens[name].bytes)
+    {
+        return false;
+    }
+    let define_end = tokens[define_name..]
+        .iter()
+        .position(|t| t.bytes == b"\n")
+        .map_or(tokens.len(), |n| define_name + n);
+    if tokens[define_name + 1..define_end]
+        .iter()
+        .any(|t| t.kind != Kind::Trivia)
+    {
+        return false;
+    }
+    let mut depth = 0usize;
+    for at in first..tokens.len() {
+        if tokens[at].bytes != b"#" {
+            continue;
+        }
+        let command = significant(tokens, at + 1);
+        let Some(command) = tokens.get(command) else {
+            return false;
+        };
+        match command.bytes.as_slice() {
+            b"if" | b"ifdef" | b"ifndef" => depth += 1,
+            b"else" | b"elif" if depth == 1 => return false,
+            b"endif" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return significant(tokens, significant(tokens, at + 1) + 1) == tokens.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn splice_length(tokens: &[Token], at: usize) -> usize {
+    if !tokens.get(at).is_some_and(|t| t.bytes == b"\\") {
+        return 0;
+    }
+    if tokens.get(at + 1).is_some_and(|t| t.bytes == b"\n") {
+        return 2;
+    }
+    if tokens.get(at + 1).is_some_and(|t| t.bytes == b"\r")
+        && tokens.get(at + 2).is_some_and(|t| t.bytes == b"\n")
+    {
+        return 3;
+    }
+    0
+}
+
+/// Expand supported local definitions in source order, admitting input before
+/// tokenization and charging cumulative token/copy/map allocation before copies.
+/// Allocation accounting includes token/vector allowance and the usize origins;
+/// it bounds this helper's work, not the caller's input or whole-process memory.
 pub fn c_preprocessor_validation_view(
     source: &[u8],
 ) -> Result<CPreprocessorView, CPreprocessorError> {
-    let tokens = tokenize(source);
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(CPreprocessorError {
+            offset: 0,
+            reason: "C macro validation source exceeds its bounded input budget",
+        });
+    }
+    let mut budget = AllocationBudget {
+        remaining: ALLOCATION_BUDGET,
+    };
+    let tokens = tokenize(source, &mut budget)?;
+    let header_guard_depth = if ordinary_header_guard(&tokens) { 1 } else { 0 };
     let mut expander = Expander {
         macros: BTreeMap::new(),
         steps: 0,
+        budget,
         limit: source
             .len()
             .saturating_mul(16)
@@ -420,7 +594,9 @@ pub fn c_preprocessor_validation_view(
             let mut end = at + 1;
             while end < tokens.len() {
                 if tokens[end].bytes == b"\n" {
-                    if end > at && tokens[end - 1].bytes == b"\\" {
+                    if (end > at && splice_length(&tokens, end - 1) == 2)
+                        || (end > at + 1 && splice_length(&tokens, end - 2) == 3)
+                    {
                         end += 1;
                         continue;
                     }
@@ -435,9 +611,17 @@ pub fn c_preprocessor_validation_view(
                 .unwrap_or_default();
             let mut definition_tokens = Vec::new();
             let mut i = (directive_at + 1).min(end);
+            // Charge all definition/parameter/key copies before allocating.
+            // The immutable stored body is then shared via Arc during uses.
+            for _ in 0..3 {
+                expander
+                    .budget
+                    .charge_tokens(&tokens[i..end], token.origin)?;
+            }
             while i < end {
-                if tokens[i].bytes == b"\\" && tokens.get(i + 1).is_some_and(|t| t.bytes == b"\n") {
-                    i += 2;
+                let splice = splice_length(&tokens, i);
+                if splice != 0 {
+                    i += splice;
                 } else {
                     definition_tokens.push(tokens[i].clone());
                     i += 1;
@@ -446,17 +630,20 @@ pub fn c_preprocessor_validation_view(
             match directive {
                 b"define" => {
                     if let Some((name, mut definition)) = define(&definition_tokens) {
-                        definition.unsupported |= conditional > 0;
-                        expander.macros.insert(name, definition);
+                        definition.unsupported |= conditional > header_guard_depth;
+                        expander
+                            .budget
+                            .charge(std::mem::size_of::<Macro>() + 128, token.origin)?;
+                        expander.macros.insert(name, Arc::new(definition));
                     }
                 }
                 b"undef" => {
                     let name = definition_tokens.get(significant(&definition_tokens, 0));
                     if let Some(name) = name {
-                        if conditional == 0 {
+                        if conditional <= header_guard_depth {
                             expander.macros.remove(&name.bytes);
                         } else if let Some(definition) = expander.macros.get_mut(&name.bytes) {
-                            definition.unsupported = true;
+                            Arc::make_mut(definition).unsupported = true;
                         }
                     }
                 }
@@ -465,7 +652,11 @@ pub fn c_preprocessor_validation_view(
                 _ => {}
             }
             let after = (end + 1).min(tokens.len());
-            out.extend(tokens[at..after].iter().cloned());
+            out.extend(
+                expander
+                    .budget
+                    .clone_tokens(&tokens[at..after], token.origin)?,
+            );
             at = after;
             code_start = at;
             line_start = true;
@@ -481,8 +672,21 @@ pub fn c_preprocessor_validation_view(
         at += 1;
     }
     out.extend(expander.expand(&tokens[code_start..], &BTreeSet::new(), 0)?);
-    let mut bytes = Vec::new();
-    let mut origins = Vec::new();
+    let output_len = out
+        .iter()
+        .fold(0usize, |sum, token| sum.saturating_add(token.bytes.len()));
+    if output_len > expander.limit {
+        return Err(CPreprocessorError {
+            offset: 0,
+            reason: "local macro expansion exceeds its bounded validation byte budget",
+        });
+    }
+    expander.budget.charge(
+        output_len.saturating_mul(1 + std::mem::size_of::<usize>()),
+        0,
+    )?;
+    let mut bytes = Vec::with_capacity(output_len);
+    let mut origins = Vec::with_capacity(output_len);
     for token in out {
         if bytes.len().saturating_add(token.bytes.len()) > expander.limit {
             return Err(CPreprocessorError {
@@ -512,4 +716,28 @@ pub fn c_preprocessor_validation_view(
         origins,
         source_len: source.len(),
     })
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn trivia_materialization_and_copies_are_charged_before_allocation() {
+        let mut budget = AllocationBudget { remaining: 128 };
+        assert!(tokenize(&vec![b' '; 4096], &mut budget).is_err());
+        let token = Token {
+            bytes: vec![b'x'; 4096],
+            origin: 0,
+            kind: Kind::Ident,
+        };
+        let mut budget = AllocationBudget { remaining: 128 };
+        assert!(budget.clone_tokens(&[token], 0).is_err());
+        let mut budget = AllocationBudget { remaining: 8192 };
+        let tokens = tokenize(&vec![b' '; 4096], &mut budget).unwrap();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "horizontal trivia must not allocate one token per byte"
+        );
+    }
 }
