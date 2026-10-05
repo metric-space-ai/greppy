@@ -367,7 +367,7 @@ mod tests {
             assert_eq!(store.incoming_degrees("p").unwrap(), expected);
             assert!(store.incoming_degrees("absent").unwrap().is_empty());
         }
-        let (base, a, b, st) = seed("p");
+        let (mut base, a, b, st) = seed("p");
         for kind in ["USAGE", "TYPE_REF", "IMPORTS", "IGNORED"] {
             base.insert_edge(&NewEdge {
                 project: "p".into(), source_id: a, target_id: b,
@@ -380,7 +380,7 @@ mod tests {
         let base_path = scratch.path().join("base.db");
         base.conn().execute("VACUUM main INTO ?1", [base_path.to_str().unwrap()]).unwrap();
         let bytes = std::fs::read(&base_path).unwrap();
-        let overlay = Store::open_overlay(&base_path, &scratch.path().join("delta.db"), &crate::VisibilityIndex::default()).unwrap();
+        let mut overlay = Store::open_overlay(&base_path, &scratch.path().join("delta.db"), &crate::VisibilityIndex::default()).unwrap();
         check(&overlay);
         let replacement = overlay.insert_node(&NewNode {
             project: "p".into(), label: "Function".into(), name: "A".into(),
