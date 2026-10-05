@@ -3102,7 +3102,7 @@ fn recover_visible_effect_fn_bindings_inner(
     if !store.is_overlay() {
         return Ok(false);
     }
-    let marker = format!("greppy.effect_fn_repair_v8.{project}");
+    let marker = format!("greppy.effect_fn_repair_v9.{project}");
     let completed: i64 = store
         .conn()
         .query_row(
@@ -3157,7 +3157,7 @@ fn recover_visible_effect_fn_bindings_inner(
                 "Effect.fn extraction validation failed".into(),
             ));
         }
-        prepared.push((state.rel_path, extraction));
+        prepared.push((state.rel_path, extraction, state.sha256));
     }
     // Compare complete contributions, including duplicate counts, before
     // publishing overrides. Identical clean Base relations need no Delta copy.
@@ -3186,7 +3186,7 @@ fn recover_visible_effect_fn_bindings_inner(
     let mut changed_paths = Vec::new();
     let mut changed_identity = false;
     // Validate every visible source fingerprint before changing any identity.
-    for (path, extraction) in &prepared {
+    for (path, extraction, source_sha256) in &prepared {
         for node in extraction
             .nodes
             .iter()
@@ -3218,12 +3218,20 @@ fn recover_visible_effect_fn_bindings_inner(
         }
         if previous.get(path).cloned().unwrap_or_default() != current {
             persist_raw_edges_for_file(store, project, path, &extraction.edges)?;
-            changed_paths.push(path);
+            changed_paths.push((path, source_sha256));
+        } else if store.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.js_ts_reference_override_files WHERE project=?1 AND file_path=?2)",
+            rusqlite::params![project, path], |row| row.get::<_, bool>(0),
+        ).map_err(sqlite_err)? {
+            // An already-current legacy v8 contribution still needs a v9
+            // certificate. Do not create ownership/overrides for clean Base.
+            store.certify_js_ts_reference_repair(project, path, source_sha256)?;
         }
     }
     let changed_relations = !changed_paths.is_empty();
-    for path in changed_paths {
+    for (path, source_sha256) in changed_paths {
         store.conn().execute("INSERT OR IGNORE INTO main.js_ts_reference_override_files(project,file_path) VALUES(?1,?2)", rusqlite::params![project,path]).map_err(sqlite_err)?;
+        store.certify_js_ts_reference_repair(project, path, source_sha256)?;
     }
     // Current extraction already resolved clean Base relations. Rebuilding
     // them needlessly materializes and pins duplicate CALLS/USAGE rows in the

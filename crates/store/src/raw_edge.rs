@@ -44,7 +44,122 @@ pub struct NewRawEdge {
     pub properties: serde_json::Value,
 }
 
+fn js_ts_repair_certificate_key(project: &str, path: &str) -> Result<String> {
+    Ok(format!(
+        "greppy.js_ts_reference_repair_certificate_v1.{}",
+        crate::file_state::sha256_hex(&serde_json::to_vec(&(project, path))?)
+    ))
+}
+
 impl Store {
+    /// Pin the complete private contribution produced by a source-validated
+    /// JS/TS compatibility repair. This authorizes derived relations only,
+    /// never file ownership, node identities or a changed/hidden Base file.
+    pub fn certify_js_ts_reference_repair(
+        &self,
+        project: &str,
+        path: &str,
+        source_sha256: &str,
+    ) -> Result<()> {
+        if !self.is_overlay() {
+            return Ok(());
+        }
+        let base_sha: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT sha256 FROM greppy_base.file_state WHERE project=?1 AND rel_path=?2
+             AND NOT EXISTS(SELECT 1 FROM greppy_hidden_paths WHERE path=?2)",
+                params![project, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if base_sha.as_deref() != Some(source_sha256) {
+            return Ok(());
+        }
+        let key = js_ts_repair_certificate_key(project, path)?;
+        let certificate = serde_json::json!({
+            "v": 1, "project": project, "file_path": path,
+            "base_sha256": source_sha256,
+            "raw_sha256": self.private_raw_edge_fingerprint(project, path)?,
+        });
+        self.conn().execute(
+            "INSERT INTO main.schema_meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, serde_json::to_string(&certificate)?],
+        )?;
+        Ok(())
+    }
+
+    /// Every private project contributing this path must have a matching
+    /// certificate. A valid project cannot hide rogue rows in another one.
+    pub fn js_ts_reference_repair_path_is_certified(&self, path: &str) -> Result<bool> {
+        if !self.is_overlay() {
+            return Ok(false);
+        }
+        let mut statement = self.conn().prepare(
+            "SELECT project FROM main.raw_edges WHERE file_path=?1
+             UNION SELECT project FROM main.js_ts_reference_override_files WHERE file_path=?1",
+        )?;
+        let projects = statement
+            .query_map([path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if projects.is_empty() {
+            return Ok(false);
+        }
+        for project in projects {
+            let base_sha: Option<String> = self.conn().query_row(
+                "SELECT s.sha256 FROM greppy_base.file_state s WHERE s.project=?1 AND s.rel_path=?2
+                 AND NOT EXISTS(SELECT 1 FROM greppy_hidden_paths WHERE path=?2)
+                 AND EXISTS(SELECT 1 FROM main.js_ts_reference_override_files o WHERE o.project=?1 AND o.file_path=?2)
+                 AND EXISTS(SELECT 1 FROM main.schema_meta WHERE key='greppy.effect_fn_repair_v9.' || ?1 AND value='complete')",
+                params![project, path], |row| row.get(0),
+            ).optional()?;
+            let Some(base_sha) = base_sha else {
+                return Ok(false);
+            };
+            let encoded: Option<String> = self
+                .conn()
+                .query_row(
+                    "SELECT value FROM main.schema_meta WHERE key=?1",
+                    [js_ts_repair_certificate_key(&project, path)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(encoded) = encoded else {
+                return Ok(false);
+            };
+            let certificate: serde_json::Value = serde_json::from_str(&encoded)?;
+            if certificate.get("v").and_then(|v| v.as_u64()) != Some(1)
+                || certificate.get("project").and_then(|v| v.as_str()) != Some(project.as_str())
+                || certificate.get("file_path").and_then(|v| v.as_str()) != Some(path)
+                || certificate.get("base_sha256").and_then(|v| v.as_str())
+                    != Some(base_sha.as_str())
+                || certificate.get("raw_sha256").and_then(|v| v.as_str())
+                    != Some(self.private_raw_edge_fingerprint(&project, path)?.as_str())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn private_raw_edge_fingerprint(&self, project: &str, path: &str) -> Result<String> {
+        let mut statement = self.conn().prepare(
+            "SELECT source_qname,target_qname,edge_type,properties FROM main.raw_edges
+             WHERE project=?1 AND file_path=?2 ORDER BY source_qname,target_qname,edge_type,properties",
+        )?;
+        let rows = statement
+            .query_map(params![project, path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(crate::file_state::sha256_hex(&serde_json::to_vec(&rows)?))
+    }
     /// Insert many raw edges inside a SINGLE transaction (one fsync for the
     /// whole batch, mirroring [`Store::insert_nodes`]). Returns the assigned
     /// ids in input order. An empty slice is a no-op that returns an empty
