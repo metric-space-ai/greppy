@@ -149,6 +149,9 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
             libc::flock(probe.as_raw_fd(), libc::LOCK_UN);
             return false;
         }
+        if io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock {
+            return false;
+        }
     }
     let directory = if cfg!(target_os = "linux") {
         "/proc/self/fd"
@@ -195,7 +198,49 @@ fn inherited_lease_owned_by_ancestor(lock: &Path) -> bool {
             }
         }
     }
-    false
+    // Shell/Node/Bun subprocess APIs may close inherited descriptors. The
+    // admitted ancestor still waits for the child and holds the real lease.
+    // Require that ancestor to have this exact inode open; an environment flag
+    // or a stale lock record alone never authorizes work.
+    ancestor_has_open_lease(owner, lock, &metadata)
+}
+
+#[cfg(unix)]
+fn ancestor_has_open_lease(owner: u64, lock: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if cfg!(target_os = "linux") {
+        let Ok(entries) = fs::read_dir(format!("/proc/{owner}/fd")) else {
+            return false;
+        };
+        return entries.flatten().any(|entry| {
+            fs::metadata(entry.path()).is_ok_and(|candidate| {
+                candidate.dev() == metadata.dev() && candidate.ino() == metadata.ino()
+            })
+        });
+    }
+    // macOS does not expose another process's descriptors through /dev/fd.
+    // lsof is a read-only kernel descriptor inventory, not a lease acquisition.
+    let Ok(output) = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &owner.to_string(), "-Ffn"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(canonical) = lock.canonicalize() else {
+        return false;
+    };
+    let mut numeric_descriptor = false;
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        if let Some(fd) = line.strip_prefix('f') {
+            numeric_descriptor = fd.parse::<u32>().is_ok();
+            return false;
+        }
+        numeric_descriptor
+            && line.strip_prefix('n').is_some_and(|name| Path::new(name) == canonical)
+    })
 }
 
 #[cfg(unix)]
@@ -314,7 +359,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn live_ancestor_lease_requires_the_actual_inheritable_descriptor() {
+    fn live_ancestor_lease_survives_subprocess_descriptor_closure() {
         let tmp = tempfile::tempdir().unwrap();
         let python = if cfg!(target_os = "macos") {
             "/usr/bin/python3"
@@ -325,12 +370,13 @@ mod tests {
 with open(sys.argv[1], 'w+') as lease:
     fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
     json.dump({'pid':os.getpid()}, lease); lease.flush()
-    env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED=sys.argv[3])
-    inherited=(lease.fileno(),) if sys.argv[3]=='yes' else ()
+    env=dict(os.environ,GREPPY_TEST_ADMISSION_LEASE=sys.argv[1],GREPPY_TEST_ADMISSION_INHERITED='no' if sys.argv[3]=='released' else 'yes')
+    if sys.argv[3]=='released': fcntl.flock(lease, fcntl.LOCK_UN)
+    inherited=(lease.fileno(),) if sys.argv[3]=='inherited' else ()
     result=subprocess.run([sys.argv[2],'--exact','index_admission::tests::lease_probe_child','--nocapture'],env=env,pass_fds=inherited)
     sys.exit(result.returncode)
 "#;
-        for expected in ["yes", "no"] {
+        for expected in ["inherited", "closed", "released"] {
             let output = Command::new(python)
                 .arg("-c")
                 .arg(script)

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const INITIAL_DELAY: Duration = Duration::from_secs(2);
+const INITIAL_DELAY: Duration = Duration::from_secs(10);
 const STALL_AFTER: Duration = Duration::from_secs(60);
 const MIN_FORECAST_SHIFT: Duration = Duration::from_secs(30);
 
@@ -32,7 +32,7 @@ impl LocalQueryProgress {
             worker_count: None,
         }));
         let observed = Arc::clone(&progress);
-        let mut reporter = ProgressReporter::default();
+        let mut reporter = ProgressReporter { compact: true, ..ProgressReporter::default() };
         let thread = QueryProgress::start(INITIAL_DELAY, move |elapsed| {
             let snapshot = observed.lock().ok().map(|progress| progress.clone());
             if let Some(line) =
@@ -106,7 +106,7 @@ impl JobProgress {
         let value = crate::read_background_job(path)?;
         let progress = Self::from_value(&value)?;
         if is_terminal_state(&progress.state) {
-            return None;
+            return Some(progress);
         }
         let owner = progress.pid.and_then(|pid| u32::try_from(pid).ok())?;
         crate::process_is_alive(owner).then_some(progress)
@@ -215,6 +215,7 @@ struct ProgressReporter {
     stalled: bool,
     missing_reported: bool,
     diagnostics_command: Option<String>,
+    compact: bool,
 }
 
 impl ProgressReporter {
@@ -226,7 +227,7 @@ impl ProgressReporter {
         now_unix_secs: u64,
     ) -> Option<String> {
         let Some(job) = job else {
-            if self.missing_reported {
+            if elapsed < STALL_AFTER || self.missing_reported {
                 return None;
             }
             self.missing_reported = true;
@@ -238,6 +239,10 @@ impl ProgressReporter {
                 "greppy: {command} is still running; no live index progress is reported; this does not mean indexing is required; diagnostics: `{diagnostics}`"
             ));
         };
+
+        if is_terminal_state(&job.state) {
+            return None;
+        }
 
         let reset = self.state.as_deref() != Some(job.state.as_str())
             || self.pid != job.pid
@@ -323,7 +328,9 @@ impl ProgressReporter {
             self.stalled = stalled;
             should_report = true;
         }
-        if !should_report {
+        if !should_report
+            || (self.compact && self.prognosis.is_none() && !stalled && elapsed < STALL_AFTER)
+        {
             return None;
         }
 
@@ -434,6 +441,7 @@ pub(crate) fn for_command(
     let effective_root = crate::resolve_root(root_hint).ok();
     let job_path = effective_root.as_deref().map(crate::background_job_path);
     let mut reporter = ProgressReporter {
+        compact: true,
         diagnostics_command: effective_root
             .as_deref()
             .map(crate::index_status_command_for_root),
@@ -689,7 +697,8 @@ mod tests {
     #[test]
     fn missing_job_status_is_honest_and_emitted_once() {
         let mut reporter = ProgressReporter::default();
-        let first = reporter.observe("search", None, Duration::ZERO).unwrap();
+        assert!(reporter.observe("search", None, Duration::from_secs(10)).is_none());
+        let first = reporter.observe("search", None, STALL_AFTER).unwrap();
         assert!(
             first.contains("no live index progress is reported"),
             "{first}"
@@ -719,7 +728,7 @@ mod tests {
             diagnostics_command: Some(diagnostics.into()),
             ..ProgressReporter::default()
         };
-        let message = reporter.observe("search", None, Duration::ZERO).unwrap();
+        let message = reporter.observe("search", None, STALL_AFTER).unwrap();
         assert!(message.contains(diagnostics), "{message}");
         assert!(message.contains("is still running"), "{message}");
         assert!(!message.contains("is pending"), "{message}");
@@ -730,6 +739,26 @@ mod tests {
         assert!(reporter
             .observe("search", None, Duration::from_secs(30))
             .is_none());
+    }
+
+    #[test]
+    fn compact_progress_waits_for_a_useful_estimate_instead_of_phase_chatter() {
+        let mut reporter = ProgressReporter { compact: true, ..ProgressReporter::default() };
+        assert!(reporter.observe("read", Some(job("counting", 0, 0)), Duration::from_secs(10)).is_none());
+        assert!(reporter.observe("read", Some(job("embedding", 0, 197)), Duration::from_secs(12)).is_none());
+        let estimate = reporter.observe("read", Some(job("embedding", 100, 197)), Duration::from_secs(22)).unwrap();
+        assert!(estimate.contains("phase ETA about"), "{estimate}");
+        assert!(reporter.observe("read", Some(job("completed", 197, 197)), Duration::from_secs(24)).is_none());
+    }
+
+    #[test]
+    fn completed_index_never_becomes_a_missing_progress_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("job.json");
+        std::fs::write(&path, r#"{"state":"completed","completed_spans":197,"total_spans":197}"#).unwrap();
+        let completed = JobProgress::read(&path).expect("terminal snapshot is retained");
+        let mut reporter = ProgressReporter::default();
+        assert!(reporter.observe("index", Some(completed), Duration::from_secs(120)).is_none());
     }
 
     #[test]

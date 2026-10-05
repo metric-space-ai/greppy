@@ -35,7 +35,7 @@ pub(crate) fn embedding_backend_plan(cfg: &EmbeddingModelConfig) -> (String, Opt
         .as_ref()
         .and_then(|registry| registry.selected_backend)
         .map(greppy_embed_native::BackendKind::as_str)
-        .unwrap_or_else(|| cfg.device.as_str())
+        .unwrap_or("unavailable")
         .to_string();
     let device = registry
         .and_then(|registry| registry.selected_device_id)
@@ -166,7 +166,7 @@ pub(crate) fn embedding_progress_text(progress: &serde_json::Value) -> String {
     let backend = progress
         .get("backend")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("cpu");
+        .unwrap_or("unknown");
     let completed = progress
         .get("completed_spans")
         .and_then(serde_json::Value::as_u64)

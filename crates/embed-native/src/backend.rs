@@ -133,7 +133,7 @@ impl InferenceBackendRegistry {
     ) -> Self {
         let mut probes = vec![probe_cuda(), probe_metal(), probe_cpu()];
         apply_memory_requirement(&mut probes, required_gpu_memory);
-        let selected_backend = select_backend(&probes, &preference);
+        let selected_backend = select_backend(&probes, &platform_preference(&preference));
         let selected_device_id =
             selected_device(&probes, selected_backend).map(|device| device.id.clone());
         Self {
@@ -207,7 +207,9 @@ fn apply_memory_requirement(probes: &mut [BackendProbe], required: u64) {
         return;
     }
     for probe in probes.iter_mut().filter(|probe| {
-        matches!(probe.backend, BackendKind::Cuda | BackendKind::Metal) && probe.compiled
+        matches!(probe.backend, BackendKind::Cuda | BackendKind::Metal)
+            && probe.compiled
+            && probe.available
     }) {
         for device in &mut probe.devices {
             if device.rejection_reason.is_none() && !device_has_memory(device, required) {
@@ -283,6 +285,20 @@ pub fn preflight_explicit_model(
         "explicit inference backend `{}` is unavailable: {reason}",
         policy.selector
     )))
+}
+
+// Discovery must agree with native Auto loading: production platform GPU
+// failure is unavailable, never a planned CPU backend or a CPU-derived ETA.
+fn platform_preference(preference: &DevicePreference) -> DevicePreference {
+    if *preference == DevicePreference::Auto {
+        if cfg!(all(feature = "cuda", target_os = "linux")) {
+            return DevicePreference::Cuda;
+        }
+        if cfg!(all(feature = "metal", target_os = "macos")) {
+            return DevicePreference::Metal;
+        }
+    }
+    preference.clone()
 }
 
 fn select_backend(probes: &[BackendProbe], preference: &DevicePreference) -> Option<BackendKind> {
@@ -493,12 +509,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_is_always_a_valid_auto_fallback() {
+    fn auto_discovery_matches_platform_loading_policy() {
         let registry = InferenceBackendRegistry::probe(DevicePreference::Auto, false);
         assert!(registry.probes.iter().any(|probe| {
             probe.backend == BackendKind::Cpu && probe.compiled && probe.available
         }));
-        assert!(registry.is_satisfied());
+        assert_eq!(
+            registry.selected_backend,
+            select_backend(&registry.probes, &platform_preference(&DevicePreference::Auto))
+        );
+        if platform_preference(&DevicePreference::Auto) != DevicePreference::Auto {
+            assert_ne!(registry.selected_backend, Some(BackendKind::Cpu));
+        }
     }
 
     #[test]
@@ -539,6 +561,23 @@ mod tests {
         assert!(!probe.available);
         assert_eq!(probe.score, 0);
         assert!(probe.devices[0].rejection_reason.is_some());
+    }
+
+    #[test]
+    fn memory_qualification_preserves_runtime_and_compatibility_failures() {
+        for reason in ["dlopen: libcuda.so.1 missing", "CUDA runtime error 35", "no compatible CUDA device found"] {
+            let mut probe = unavailable_probe(BackendKind::Cuda, true, reason);
+            apply_memory_requirement(std::slice::from_mut(&mut probe), 1024);
+            assert!(!probe.available);
+            assert_eq!(probe.reason.as_deref(), Some(reason));
+        }
+        let mut incompatible = unavailable_probe(BackendKind::Cuda, true, "unsupported architecture");
+        let mut device = test_cuda_device("cuda:0");
+        device.rejection_reason = Some("unsupported architecture".into());
+        incompatible.devices.push(device);
+        apply_memory_requirement(std::slice::from_mut(&mut incompatible), 1024);
+        assert_eq!(incompatible.reason.as_deref(), Some("unsupported architecture"));
+        assert_eq!(incompatible.devices[0].rejection_reason.as_deref(), Some("unsupported architecture"));
     }
 
     #[test]
