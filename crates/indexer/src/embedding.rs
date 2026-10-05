@@ -157,6 +157,8 @@ pub struct EmbeddingIndexOptions {
     pub graph_generation: u64,
     pub max_span_bytes: usize,
     pub prune_before_generation: bool,
+    pub start_node_offset: usize,
+    pub max_candidate_nodes: Option<usize>,
 }
 
 impl EmbeddingIndexOptions {
@@ -165,6 +167,8 @@ impl EmbeddingIndexOptions {
             graph_generation,
             max_span_bytes: DEFAULT_MAX_SPAN_BYTES,
             prune_before_generation: true,
+            start_node_offset: 0,
+            max_candidate_nodes: None,
         }
     }
 }
@@ -187,12 +191,14 @@ pub struct EmbeddingIndexReport {
     /// of failing the build. `> 0` means the vector index is incomplete
     /// for this generation.
     pub nodes_failed: usize,
+    pub next_node_offset: usize,
+    pub budget_exhausted: bool,
 }
 
 impl EmbeddingIndexReport {
     /// True when every candidate document got a vector in this pass.
     pub fn is_complete(&self) -> bool {
-        self.nodes_failed == 0
+        self.nodes_failed == 0 && !self.budget_exhausted
     }
 }
 
@@ -254,8 +260,9 @@ pub fn count_code_embedding_documents_for_scope(
     prefixes: &[String],
 ) -> Result<usize> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
-    let mut offset = 0usize;
+    let mut offset = options.start_node_offset;
     let mut total = 0usize;
+    let mut candidate_nodes = 0usize;
 
     loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
@@ -274,6 +281,13 @@ pub fn count_code_embedding_documents_for_scope(
             {
                 continue;
             }
+            if options
+                .max_candidate_nodes
+                .is_some_and(|limit| candidate_nodes >= limit)
+            {
+                return Ok(total);
+            }
+            candidate_nodes = candidate_nodes.saturating_add(1);
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
                 Ok(Some(source)) => source,
                 Ok(None) | Err(_) => continue,
@@ -380,7 +394,9 @@ pub fn index_code_embeddings_for_scope_with_progress(
     } = progress_context;
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
-    let mut offset = 0usize;
+    let mut offset = options.start_node_offset;
+    report.next_node_offset = offset;
+    let mut candidate_nodes = 0usize;
 
     let batch_size = embed_batch_size();
     let schedule_window = embed_schedule_window(batch_size);
@@ -397,7 +413,7 @@ pub fn index_code_embeddings_for_scope_with_progress(
         current_symbol: None,
     });
 
-    loop {
+    'pages: loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
             store.list_private_nodes(project, offset, NODE_PAGE_SIZE)?
         } else {
@@ -406,9 +422,12 @@ pub fn index_code_embeddings_for_scope_with_progress(
         if nodes.is_empty() {
             break;
         }
+        let page_start = offset;
         offset += nodes.len();
 
-        for mut node in nodes {
+        for (page_index, mut node) in nodes.into_iter().enumerate() {
+            let node_offset = page_start.saturating_add(page_index);
+            report.next_node_offset = node_offset.saturating_add(1);
             if !embedding_path_matches(&node.file_path, prefixes) {
                 continue;
             }
@@ -417,6 +436,16 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 report.nodes_skipped_non_definition += 1;
                 continue;
             }
+            if options
+                .max_candidate_nodes
+                .is_some_and(|limit| candidate_nodes >= limit)
+            {
+                report.nodes_considered = report.nodes_considered.saturating_sub(1);
+                report.next_node_offset = node_offset;
+                report.budget_exhausted = true;
+                break 'pages;
+            }
+            candidate_nodes = candidate_nodes.saturating_add(1);
 
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
                 Ok(Some(source)) => source,
@@ -1684,6 +1713,71 @@ mod tests {
             embedding_document_title("p.stable"),
             embedding_document_title("other.stable"),
             "semantic identities remain distinct exact model prompts"
+        );
+    }
+
+    #[test]
+    fn bounded_embedding_pass_resumes_without_discarding_published_vectors() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        .unwrap();
+        let mut store = store_with_project(&root);
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            insert_node(
+                &mut store,
+                &format!("p.{name}"),
+                name,
+                "Function",
+                "src/lib.rs",
+                i64::try_from(index + 1).unwrap(),
+                i64::try_from(index + 1).unwrap(),
+            );
+        }
+        let mut provider = DeterministicProvider;
+        let mut options = EmbeddingIndexOptions::for_generation(4);
+        options.max_candidate_nodes = Some(1);
+        let first =
+            index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                .unwrap();
+        assert!(first.budget_exhausted);
+        assert!(!first.is_complete(), "a partial pass is never readiness");
+        assert_eq!(first.nodes_embedded, 1);
+
+        let replay =
+            index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                .unwrap();
+        assert_eq!(replay.nodes_reused, 1, "a lost cursor reuses its success");
+        assert_eq!(replay.nodes_embedded, 1);
+
+        options.start_node_offset = first.next_node_offset;
+        let second =
+            index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                .unwrap();
+        assert!(second.budget_exhausted);
+        assert_eq!(second.nodes_embedded, 1);
+
+        options.start_node_offset = second.next_node_offset;
+        let final_pass =
+            index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                .unwrap();
+        assert!(final_pass.is_complete());
+        assert!(!final_pass.budget_exhausted);
+        assert_eq!(final_pass.nodes_embedded, 1);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(4),
+                )
+                .unwrap(),
+            3
         );
     }
 

@@ -1854,6 +1854,13 @@ pub(crate) fn observe_background_embedding(
     if publication_complete {
         return BackgroundEmbeddingObservation::Published;
     }
+    if job
+        .and_then(|value| value.get("state"))
+        .and_then(serde_json::Value::as_str)
+        == Some("embedding_chunk_complete")
+    {
+        return BackgroundEmbeddingObservation::FollowIndex;
+    }
     if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
         return BackgroundEmbeddingObservation::Failed(detail);
     }

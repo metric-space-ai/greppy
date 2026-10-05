@@ -5497,6 +5497,19 @@ impl BackgroundJobGuard {
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
+
+    /// One bounded embedding child published useful vectors and exited so the
+    /// host admission lease can pass to another owner. The semantic waiter
+    /// treats this terminal state as a request to launch the next chunk; it is
+    /// neither readiness nor failure.
+    fn embedding_chunk_complete(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.write_state("embedding_chunk_complete", None);
+        self.complete = true;
+    }
 }
 
 #[cfg(test)]
@@ -10447,6 +10460,7 @@ struct IndexSnapshotReport {
 /// cannot be written cannot be published either.
 enum EmbeddingBuildOutcome {
     Complete(greppy_indexer::EmbeddingIndexReport),
+    Partial(greppy_indexer::EmbeddingIndexReport),
     Degraded {
         report: Option<greppy_indexer::EmbeddingIndexReport>,
         reason: String,

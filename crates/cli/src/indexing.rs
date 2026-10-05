@@ -1819,6 +1819,10 @@ pub(crate) fn dispatch_index(
                 background_job.complete();
                 return Ok(0);
             }
+            Ok(EmbeddingBuildOutcome::Partial(_)) => {
+                background_job.embedding_chunk_complete();
+                return Ok(0);
+            }
             Ok(EmbeddingBuildOutcome::Degraded { reason, .. }) => {
                 background_job.degraded(&reason);
                 return Ok(0);
@@ -2277,6 +2281,10 @@ pub(crate) fn index_atomic_snapshot_attempt(
                 background_job.as_deref_mut(),
             ) {
                 Ok(EmbeddingBuildOutcome::Complete(report)) => (Some(report), None),
+                Ok(EmbeddingBuildOutcome::Partial(report)) => (
+                    Some(report),
+                    Some("embedding pass stopped at a resumable boundary".into()),
+                ),
                 Ok(EmbeddingBuildOutcome::Degraded { report, reason }) => (report, Some(reason)),
                 Err(e) => {
                     drop(temp_store);
@@ -2485,6 +2493,165 @@ fn complete_embeddings_from_published_graph(
     Ok(outcome)
 }
 
+const BACKGROUND_EMBEDDING_CHUNK_NODES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct EmbeddingResumeCursor {
+    graph_generation: u64,
+    model_contract: String,
+    prompt_version: String,
+    task_profile: String,
+    prefixes: Vec<String>,
+    next_node_offset: usize,
+}
+
+fn embedding_resume_key(project: &str, prefixes: &[String]) -> String {
+    let mut prefixes = prefixes.to_vec();
+    prefixes.sort();
+    prefixes.dedup();
+    format!(
+        "embedding_resume:{project}:{}",
+        serde_json::to_string(&prefixes).expect("path prefixes serialize")
+    )
+}
+
+fn embedding_resume_contract(
+    cfg: &EmbeddingModelConfig,
+    graph_generation: u64,
+    prefixes: &[String],
+) -> EmbeddingResumeCursor {
+    let mut prefixes = prefixes.to_vec();
+    prefixes.sort();
+    prefixes.dedup();
+    EmbeddingResumeCursor {
+        graph_generation,
+        model_contract: embedding_query_cache_key(cfg),
+        prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
+        task_profile: greppy_embed_native::CODE_RETRIEVAL_PROFILE.into(),
+        prefixes,
+        next_node_offset: 0,
+    }
+}
+
+fn read_embedding_resume_cursor(
+    store: &greppy_store::Store,
+    key: &str,
+) -> Option<EmbeddingResumeCursor> {
+    store
+        .conn()
+        .query_row("SELECT value FROM schema_meta WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+}
+
+fn matching_embedding_resume_offset(
+    mut saved: EmbeddingResumeCursor,
+    expected: &EmbeddingResumeCursor,
+) -> Option<usize> {
+    let next_node_offset = saved.next_node_offset;
+    saved.next_node_offset = 0;
+    (saved == *expected).then_some(next_node_offset)
+}
+
+fn write_embedding_resume_cursor(
+    store: &greppy_store::Store,
+    key: &str,
+    cursor: &EmbeddingResumeCursor,
+) -> Result<()> {
+    let value = serde_json::to_string(cursor)?;
+    store
+        .conn()
+        .execute(
+            "INSERT INTO schema_meta(key,value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(|error| Error::Store(format!("record embedding resume cursor: {error}")))?;
+    Ok(())
+}
+
+fn clear_embedding_resume_cursor(store: &greppy_store::Store, key: &str) -> Result<()> {
+    store
+        .conn()
+        .execute("DELETE FROM schema_meta WHERE key=?1", [key])
+        .map_err(|error| Error::Store(format!("clear embedding resume cursor: {error}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod embedding_resume_cursor_tests {
+    use super::*;
+
+    fn contract() -> EmbeddingResumeCursor {
+        EmbeddingResumeCursor {
+            graph_generation: 7,
+            model_contract: "model|prompt|task|weights-a".into(),
+            prompt_version: "prompt-v3".into(),
+            task_profile: "task".into(),
+            prefixes: vec!["src".into()],
+            next_node_offset: 0,
+        }
+    }
+
+    #[test]
+    fn resume_cursor_requires_exact_source_model_prompt_task_and_scope_contract() {
+        let expected = contract();
+        let mut saved = expected.clone();
+        saved.next_node_offset = 41;
+        assert_eq!(
+            matching_embedding_resume_offset(saved.clone(), &expected),
+            Some(41)
+        );
+
+        for changed in [
+            EmbeddingResumeCursor {
+                graph_generation: 8,
+                ..saved.clone()
+            },
+            EmbeddingResumeCursor {
+                model_contract: "model|prompt|task|weights-b".into(),
+                ..saved.clone()
+            },
+            EmbeddingResumeCursor {
+                prompt_version: "prompt-v4".into(),
+                ..saved.clone()
+            },
+            EmbeddingResumeCursor {
+                task_profile: "other-task".into(),
+                ..saved.clone()
+            },
+            EmbeddingResumeCursor {
+                prefixes: vec!["tests".into()],
+                ..saved.clone()
+            },
+        ] {
+            assert_eq!(matching_embedding_resume_offset(changed, &expected), None);
+        }
+    }
+
+    #[test]
+    fn resume_cursor_round_trip_is_private_metadata_not_a_completion_stamp() {
+        let store = greppy_store::Store::open_memory().unwrap();
+        let key = embedding_resume_key("p", &["src".into()]);
+        let mut saved = contract();
+        saved.next_node_offset = 23;
+        write_embedding_resume_cursor(&store, &key, &saved).unwrap();
+        assert_eq!(read_embedding_resume_cursor(&store, &key), Some(saved));
+        assert!(store
+            .conn()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key=?1",
+                [embedding_complete_key("p")],
+                |row| row.get::<_, String>(0),
+            )
+            .is_err());
+        clear_embedding_resume_cursor(&store, &key).unwrap();
+        assert!(read_embedding_resume_cursor(&store, &key).is_none());
+    }
+}
+
 fn validate_overlay_snapshot_visibility(
     snapshot: &std::path::Path,
     overlay: Option<&crate::store_cow::OverlaySpec>,
@@ -2581,11 +2748,13 @@ fn index_embeddings_into_temp_store_scoped(
                 nodes_skipped_oversize: 0,
                 stale_rows_pruned: 0,
                 nodes_failed: 0,
+                next_node_offset: 0,
+                budget_exhausted: false,
             },
         ));
     }
     let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(cfg);
-    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
+    let mut options = greppy_indexer::EmbeddingIndexOptions::for_generation(graph_generation);
     // A structural-only Base may have no meanings yet. A later global query
     // must catch up every visible node before writing a global stamp, while
     // a complete Base retains the inexpensive Delta-only path.
@@ -2598,6 +2767,22 @@ fn index_embeddings_into_temp_store_scoped(
     } else {
         prefixes
     };
+    let bounded_background =
+        std::env::var("GREPPY_BACKGROUND_KIND").ok().as_deref() == Some("embedding");
+    let resume_key = embedding_resume_key(project, index_prefixes);
+    let mut resume_contract = embedding_resume_contract(cfg, graph_generation, index_prefixes);
+    if bounded_background {
+        if let Some(saved) = read_embedding_resume_cursor(store, &resume_key) {
+            if let Some(next_node_offset) =
+                matching_embedding_resume_offset(saved, &resume_contract)
+            {
+                options.start_node_offset = next_node_offset;
+            } else {
+                clear_embedding_resume_cursor(store, &resume_key)?;
+            }
+        }
+        options.max_candidate_nodes = Some(BACKGROUND_EMBEDDING_CHUNK_NODES);
+    }
     let mut embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
         // model weights and must remain observable instead of leaving status
@@ -2641,6 +2826,11 @@ fn index_embeddings_into_temp_store_scoped(
             index_prefixes,
         )?
     };
+    if embedding_report.budget_exhausted && embedding_report.nodes_failed == 0 {
+        resume_contract.next_node_offset = embedding_report.next_node_offset;
+        write_embedding_resume_cursor(store, &resume_key, &resume_contract)?;
+        return Ok(EmbeddingBuildOutcome::Partial(embedding_report));
+    }
     if !embedding_report.is_complete() {
         // The completeness stamp is deliberately withheld: the next
         // semantic query (or the spawned background job) re-runs the
@@ -2665,6 +2855,9 @@ fn index_embeddings_into_temp_store_scoped(
     if include_incomplete_base {
         embedding_report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, graph_generation)?;
+    }
+    if bounded_background {
+        clear_embedding_resume_cursor(store, &resume_key)?;
     }
     let key = if prefixes.is_empty() {
         embedding_complete_key(project)

@@ -1190,6 +1190,15 @@ fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
         observe_background_embedding(None, false, true, false),
         BackgroundEmbeddingObservation::Published
     );
+    let chunk = serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding_chunk_complete"
+    });
+    assert_eq!(
+        observe_background_embedding(Some(&chunk), false, false, false),
+        BackgroundEmbeddingObservation::FollowIndex,
+        "a bounded child exit requests another admitted child without claiming readiness"
+    );
 }
 
 #[test]
