@@ -2304,8 +2304,8 @@ fn apply_trained_patch_file(
                 return Err(EditRefusal::new(
                     "patch_context",
                     format!(
-                        "{path}: hunk context did not match (the @@ line {} is advisory) — nothing written",
-                        hunk.declared_old_line
+                        "{path}: input hunk {} at patch line {}: hunk context did not match (the @@ line {} is advisory). Removed and context lines must match complete source lines, not substrings; regenerate with `git diff --no-color -- PATH`, or use `greppy replace-text` for an intentional substring replacement — nothing written",
+                        hunk.input_hunk_number, hunk.input_line, hunk.declared_old_line
                     ),
                     13,
                 ))
@@ -4620,6 +4620,55 @@ mod patch_rollback_tests {
         .expect_err("live call omitted from graph plan must refuse");
         assert_eq!(refusal.code, "unresolved_reference_identity");
         assert!(refusal.message.contains("glob_call.rs"));
+    }
+
+    #[test]
+    fn partial_line_patch_refusal_identifies_hunk_and_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.txt");
+        let original = b"head\nlock();declare();\ntail\n";
+        std::fs::write(&path, original).unwrap();
+        let diff = b"--- a/example.txt\n+++ b/example.txt\n@@ -99,1 +99,2 @@\n-head\n+HEAD\n+extra\n@@ -88,1 +89,2 @@\n-lock();\n+timer();\n+lock();\n";
+        assert_eq!(
+            std::str::from_utf8(original)
+                .unwrap()
+                .matches("lock();")
+                .count(),
+            1
+        );
+        for dry_run in [false, true] {
+            let refusal = match run_trained_patch_with_publish_hook(
+                dir.path(),
+                dir.path(),
+                diff.to_vec(),
+                dry_run,
+                false,
+                |_| panic!("partial-line hunk must refuse before any publish"),
+            ) {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("partial source line was accepted as a complete diff line"),
+            };
+            assert_eq!(refusal.code, "patch_context");
+            assert_eq!(refusal.exit, 13);
+            assert!(refusal.message.contains("input hunk 2 at patch line 7"));
+            assert!(refusal.message.contains("@@ line 88 is advisory"));
+            assert!(refusal
+                .message
+                .contains("complete source lines, not substrings"));
+
+            assert!(refusal.message.contains("git diff --no-color -- PATH"));
+            assert!(refusal.message.contains("greppy replace-text"));
+            assert!(refusal.message.contains("nothing written"));
+            assert!(!refusal.message.contains("declare();"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        let corrected = parse_trained_patch(
+            b"--- a/example.txt\n+++ b/example.txt\n@@ -99,1 +99,2 @@\n-head\n+HEAD\n+extra\n@@ -88,1 +89,2 @@\n-lock();declare();\n+timer();\n+lock();declare();\n",
+        )
+        .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        let (after, _) = apply_trained_patch_file("example.txt", original, &corrected[0].hunks)
+            .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+        assert_eq!(after, b"HEAD\nextra\ntimer();\nlock();declare();\ntail\n");
     }
 
     #[test]
