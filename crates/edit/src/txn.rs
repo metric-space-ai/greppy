@@ -662,8 +662,8 @@ fn python_syntax_diagnostics(content: &[u8]) -> Vec<(usize, usize, &'static str)
     while let Some(node) = stack.pop() {
         let reason = if node.kind() == "block" {
             let mut cursor = node.walk();
-            (!node.named_children(&mut cursor).any(|child| child.kind() != "comment"))
-                .then_some("Python suite requires a statement; --body replacements must include indentation (for example, four spaces before return); use pass for an empty body")
+            let has_statement = node.named_children(&mut cursor).any(|child| child.kind() != "comment");
+            (!has_statement).then_some("Python suite requires a statement; --body replacements must include indentation (for example, four spaces before return); use pass for an empty body")
         } else if node.kind() == "return_statement" {
             let mut ancestor = node.parent();
             let mut in_function = false;

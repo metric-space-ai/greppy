@@ -993,6 +993,11 @@ pub(crate) fn edit_publish(
         record.already_as_sent = !dry_run;
         record.operations = vec![operation];
         edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
+        if verify && !dry_run {
+            let verification = edit_verify(root_path, &record.files);
+            record.diagnostics = Some(verification.diagnostics.clone());
+            record.verification = Some(verification);
+        }
         return Ok(record);
     }
     edit_validate_syntax(&located.rel, &located.content, &new_content)?;
@@ -2221,6 +2226,11 @@ pub(crate) fn run_trained_write(
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
+        if verify && !dry_run {
+            let verification = edit_verify(root_path, &record.files);
+            record.diagnostics = Some(verification.diagnostics.clone());
+            record.verification = Some(verification);
+        }
         return Ok(record);
     }
     if dry_run {

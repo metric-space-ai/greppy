@@ -1925,6 +1925,18 @@ fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
         assert_eq!(value["verify"]["exit_code"], 17);
         assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
         assert!(combined(&output).contains("edit remains applied"));
+        // Explicit verification must also run when the requested bytes already exist.
+        for args in [
+            vec!["replace-text", "ui.ts", "newValue", "newValue", "--verify", "--json"],
+            vec!["write", "ui.ts", "const newValue = 1;\n", "--verify", "--json"],
+        ] {
+            let repeated = fixture.run(&args);
+            assert_eq!(repeated.status.code(), Some(17), "{}", combined(&repeated));
+            let value: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+            assert_eq!(value["verify"]["status"], expected);
+            assert_eq!(value["exit_code"], 17);
+            assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+        }
     }
 }
 
