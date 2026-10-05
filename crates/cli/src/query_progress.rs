@@ -571,15 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn completed_phase_is_reported_once() {
+    fn completed_phase_is_silent_after_the_command_result() {
         let mut reporter = ProgressReporter::default();
         let completed = job("complete", 100, 100);
-        let first = reporter
-            .observe("search", Some(completed.clone()), Duration::from_secs(2))
-            .unwrap();
-        assert!(first.contains("phase ETA complete"), "{first}");
         assert!(reporter
-            .observe("search", Some(completed), Duration::from_secs(4))
+            .observe("search", Some(completed.clone()), Duration::from_secs(2))
+            .is_none());
+        assert!(reporter
+            .observe("search", Some(completed), Duration::from_secs(120))
             .is_none());
     }
 
@@ -921,7 +920,16 @@ mod tests {
             let mut terminal = value(std::process::id());
             terminal["state"] = state.into();
             crate::start_background_job_record(&path, &terminal).unwrap();
-            assert!(JobProgress::read(&path).is_none(), "{state}");
+            let snapshot = JobProgress::read(&path)
+                .expect("retain terminal state instead of treating it as missing");
+            assert_eq!(snapshot.state, state);
+            let mut reporter = ProgressReporter::default();
+            assert!(
+                reporter
+                    .observe("index", Some(snapshot), Duration::from_secs(120))
+                    .is_none(),
+                "{state}"
+            );
         }
 
         // u32::MAX is outside the process-id range supported by our target

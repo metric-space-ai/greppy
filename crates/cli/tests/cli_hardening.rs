@@ -295,6 +295,27 @@ fn run_with_env_and_inference(
 }
 
 #[test]
+fn fixed_literal_search_cannot_silently_run_semantic_search() {
+    let (repo, store, _scratch) = make_repo("fixed-search-routing", "marker");
+    let (code, out, err) = run(
+        &[
+            "search",
+            "Cannot filter a query once a slice has been taken",
+            "--fixed",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 64, "{out} {err}");
+    assert!(out.contains("greppy search-pattern TEXT --fixed"), "{out}");
+    assert!(!out.contains("ignoring unknown option"), "{out}");
+    assert!(
+        !store.exists(),
+        "a refused literal-search shape must not start semantic indexing"
+    );
+}
+
+#[test]
 fn browser_extra_url_is_refused_without_path_recovery_recursion() {
     let (repo, store, _scratch) = make_repo("web-extra-url", "marker");
     for args in [

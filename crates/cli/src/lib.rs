@@ -1041,6 +1041,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                     return 64;
                 }
             }
+            // A literal-search flag must never turn into a semantic query by
+            // being dropped: that returns plausible but unrelated definitions.
+            if sub == "search" && unknown_flag_name(first).as_deref() == Some("--fixed") {
+                println!(
+                    "`--fixed` requests literal text: use `greppy search-pattern TEXT --fixed` with the same text and path/root filters; no semantic search was performed"
+                );
+                return 64;
+            }
             if let Some((reduced, stray)) = argv_without_stray_positional(
                 &argv,
                 first,
