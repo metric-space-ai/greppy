@@ -848,9 +848,16 @@ mod tests {
     #[test]
     fn consume_truncated_parallel_tools_never_finalizes_unstopped_calls() {
         let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        // Preserve the captured wire bytes even when Git checks out CRLF.
+        let newline = if fixture.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+
         for (stop_index, expected_stops) in [(2, vec![]), (3, vec![2])] {
             let marker = format!(
-                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{stop_index}}}"
+                "event: content_block_stop{newline}data: {{\"type\":\"content_block_stop\",\"index\":{stop_index}}}"
             );
             let (truncated, _) = fixture.split_once(&marker).expect("captured stop marker");
             let mut events = Vec::new();
@@ -888,8 +895,15 @@ mod tests {
     #[test]
     fn consume_parallel_tool_events_after_terminal_are_stream_errors() {
         let fixture = include_str!("../tests/fixtures/glm-parallel-tools.sse");
+        // Preserve the captured wire bytes even when Git checks out CRLF.
+        let newline = if fixture.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+
         let (before_message_stop, _) = fixture
-            .split_once("event: message_stop\n")
+            .split_once(&format!("event: message_stop{newline}"))
             .expect("captured terminal trailer");
         let late_events = [
             (
