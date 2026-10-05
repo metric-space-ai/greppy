@@ -1927,8 +1927,21 @@ fn verify_failure_and_unavailable_are_nonzero_in_cli_and_json() {
         assert!(combined(&output).contains("edit remains applied"));
         // Explicit verification must also run when the requested bytes already exist.
         for args in [
-            vec!["replace-text", "ui.ts", "newValue", "newValue", "--verify", "--json"],
-            vec!["write", "ui.ts", "const newValue = 1;\n", "--verify", "--json"],
+            vec![
+                "replace-text",
+                "ui.ts",
+                "newValue",
+                "newValue",
+                "--verify",
+                "--json",
+            ],
+            vec![
+                "write",
+                "ui.ts",
+                "const newValue = 1;\n",
+                "--verify",
+                "--json",
+            ],
         ] {
             let repeated = fixture.run(&args);
             assert_eq!(repeated.status.code(), Some(17), "{}", combined(&repeated));
