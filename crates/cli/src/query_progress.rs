@@ -746,7 +746,10 @@ mod tests {
         let mut reporter = ProgressReporter { compact: true, ..ProgressReporter::default() };
         assert!(reporter.observe("read", Some(job("counting", 0, 0)), Duration::from_secs(10)).is_none());
         assert!(reporter.observe("read", Some(job("embedding", 0, 197)), Duration::from_secs(12)).is_none());
-        let estimate = reporter.observe("read", Some(job("embedding", 100, 197)), Duration::from_secs(22)).unwrap();
+        let mut measured = job("embedding", 100, 197);
+        measured.rate_milli_spans_per_second = 10_000;
+        measured.eta_unix_secs = Some(32);
+        let estimate = reporter.observe("read", Some(measured), Duration::from_secs(22)).unwrap();
         assert!(estimate.contains("phase ETA about"), "{estimate}");
         assert!(reporter.observe("read", Some(job("completed", 197, 197)), Duration::from_secs(24)).is_none());
     }

@@ -510,17 +510,14 @@ mod tests {
 
     #[test]
     fn auto_discovery_matches_platform_loading_policy() {
-        let registry = InferenceBackendRegistry::probe(DevicePreference::Auto, false);
-        assert!(registry.probes.iter().any(|probe| {
-            probe.backend == BackendKind::Cpu && probe.compiled && probe.available
-        }));
-        assert_eq!(
-            registry.selected_backend,
-            select_backend(&registry.probes, &platform_preference(&DevicePreference::Auto))
-        );
-        if platform_preference(&DevicePreference::Auto) != DevicePreference::Auto {
-            assert_ne!(registry.selected_backend, Some(BackendKind::Cpu));
+        let probes = vec![probe_cpu(), unavailable_probe(BackendKind::Cuda, true, "driver absent"), unavailable_probe(BackendKind::Metal, true, "device absent")];
+        let chosen = select_backend(&probes, &platform_preference(&DevicePreference::Auto));
+        if cfg!(all(feature = "cuda", target_os = "linux")) || cfg!(all(feature = "metal", target_os = "macos")) {
+            assert_eq!(chosen, None, "product GPU failure cannot select CPU");
+        } else {
+            assert_eq!(chosen, Some(BackendKind::Cpu), "debug backend remains supported");
         }
+        assert_eq!(select_backend(&probes, &DevicePreference::Cpu), Some(BackendKind::Cpu));
     }
 
     #[test]
