@@ -58,11 +58,11 @@ impl Store {
                 ));
             }
         }
-        greppy_core::workspace::ensure_store_dir(&dir)
-            .map_err(|e| Error::Store(format!("create retained capture namespace: {e}")))?;
         let root = dir
             .parent()
             .ok_or_else(|| Error::Store("retained namespace has no owner".into()))?;
+        greppy_core::workspace::ensure_store_dir(root)
+            .map_err(|e| Error::Store(format!("create retained capture namespace: {e}")))?;
         let _lease = acquire_named_lock_in(root, "capture", LockMode::Exclusive, true)
             .map_err(|e| Error::Store(format!("lease retained capture: {e}")))?
             .ok_or_else(|| Error::Store("retained capture namespace busy".into()))?;
