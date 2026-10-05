@@ -300,11 +300,7 @@ fn c_va_arg_type_range(source: &[u8], mut at: usize) -> Option<std::ops::Range<u
                     return (start < end).then_some(start..end);
                 }
             }
-            b',' if stack.len() == 1 => {
-                if comma.replace(at).is_some() {
-                    return None;
-                }
-            }
+            b',' if stack.len() == 1 && comma.replace(at).is_some() => return None,
             _ => {}
         }
         at += 1;
