@@ -5834,6 +5834,10 @@ fn spawn_background_job_handle(
     spawn_background_job_handle_scoped(root, cause, kind, embedding_cfg, &[])
 }
 
+fn automatic_job_is_structural_only(kind: &str) -> bool {
+    kind == "index"
+}
+
 fn spawn_background_job_handle_scoped(
     root: Option<&str>,
     cause: &str,
@@ -5976,11 +5980,11 @@ fn spawn_background_job_handle_scoped(
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     debug_assert_eq!(Some(configured_workers), worker_count);
-    if matches!(
-        cause,
-        "first-use" | "structural-workspace-drift" | "rust-graph-repair"
-    ) && kind == "index"
-    {
+    // Every automatically admitted index child publishes structural state
+    // only. Semantic preparation is a separate `embedding` child whose finite
+    // document window releases the physical host lease between invocations.
+    // Explicit foreground `greppy index` retains its complete-index policy.
+    if automatic_job_is_structural_only(kind) {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
     #[cfg(debug_assertions)]

@@ -58,7 +58,18 @@ pub(crate) fn embedding_generation_complete(
             |row| row.get::<_, String>(0),
         )
         .ok()
-        == Some(format!("{graph_generation}|{model_id}"))
+        == Some(embedding_readiness_value(graph_generation, model_id))
+}
+
+/// Versioned semantic-readiness receipt. Unlike the legacy
+/// `generation|model_id` value this cannot let vectors produced by an older
+/// prompt/task contract short-circuit preparation after a contract migration.
+pub(crate) fn embedding_readiness_value(graph_generation: u64, model_id: &str) -> String {
+    format!(
+        "v2|{graph_generation}|{model_id}|{}|{}",
+        greppy_embed_native::PROMPT_VERSION,
+        greppy_embed_native::CODE_RETRIEVAL_PROFILE
+    )
 }
 
 /// Delta-only global preparation is safe only with a complete immutable Base.
@@ -67,18 +78,21 @@ pub(crate) fn base_embedding_generation_complete(
     project: &str,
     model_id: &str,
 ) -> bool {
-    store.is_overlay()
-        && store
-            .conn()
-            .query_row(
-                "SELECT EXISTS (
-            SELECT 1 FROM greppy_base.workspace_state w, greppy_base.schema_meta m
-            WHERE m.key = ?1 AND m.value = CAST(w.graph_generation AS TEXT) || '|' || ?2
-        )",
-                rusqlite::params![embedding_complete_key(project), model_id],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
+    if !store.is_overlay() {
+        return false;
+    }
+    store
+        .conn()
+        .query_row(
+            "SELECT w.graph_generation, m.value
+             FROM greppy_base.workspace_state w, greppy_base.schema_meta m
+             WHERE m.key = ?1
+             ORDER BY w.graph_generation DESC LIMIT 1",
+            [embedding_complete_key(project)],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
+        .is_some_and(|(generation, value)| value == embedding_readiness_value(generation, model_id))
 }
 
 pub(crate) fn background_embedding_path_prefixes() -> Result<Vec<String>> {
@@ -120,7 +134,7 @@ pub(crate) fn embedding_scope_complete(
                     |row| row.get::<_, String>(0),
                 )
                 .ok()
-                == Some(format!("{generation}|{model_id}")))
+                == Some(embedding_readiness_value(generation, model_id)))
 }
 
 pub(crate) fn embedding_progress_value(
@@ -543,6 +557,20 @@ mod scoped_readiness_tests {
                 rusqlite::params![key, "7|model-a"],
             )
             .unwrap();
+        assert!(
+            !embedding_scope_complete(&store, "p", 7, "model-a", &paths),
+            "legacy scoped readiness cannot satisfy the current prompt/task contract"
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE schema_meta SET value=?2 WHERE key=?1",
+                rusqlite::params![
+                    embedding_scope_complete_key("p", &paths),
+                    embedding_readiness_value(7, "model-a")
+                ],
+            )
+            .unwrap();
         assert!(embedding_scope_complete(&store, "p", 7, "model-a", &paths));
         let reversed = vec![paths[1].clone(), paths[0].clone(), paths[0].clone()];
         assert!(embedding_scope_complete(
@@ -564,6 +592,20 @@ mod scoped_readiness_tests {
             .execute(
                 "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)",
                 rusqlite::params![embedding_complete_key("p"), "7|model-a"],
+            )
+            .unwrap();
+        assert!(
+            !embedding_generation_complete(&store, "p", 7, "model-a"),
+            "a legacy V2 readiness stamp cannot claim current prompt/task readiness"
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE schema_meta SET value=?2 WHERE key=?1",
+                rusqlite::params![
+                    embedding_complete_key("p"),
+                    embedding_readiness_value(7, "model-a")
+                ],
             )
             .unwrap();
         assert!(embedding_scope_complete(

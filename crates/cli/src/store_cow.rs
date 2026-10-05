@@ -2078,6 +2078,10 @@ struct BaseSourcePaths<'a> {
     base_commit: &'a str,
 }
 
+fn should_defer_base_embeddings(structural_first_use: bool, background_kind: Option<&str>) -> bool {
+    structural_first_use || background_kind == Some("embedding")
+}
+
 fn prepare_base_store_paths(
     source: BaseSourcePaths<'_>,
     shared_data_root: &Path,
@@ -2158,7 +2162,14 @@ fn prepare_base_store_paths(
         .join("graph.db");
     let seeded_summary_cache =
         seed_previous_indexer_base(shared_data_root, &identity, worktree_path, &staged_graph)?;
-    let defer_base_embeddings = structural_first_use;
+    // Cold semantic preparation of a linked worktree must publish the same
+    // immutable structural Base as first-use navigation, then let the outer
+    // embedding job fill the overlay in separately admitted bounded chunks.
+    // Running model inference inside this delegated Base child would retain
+    // the ancestor's physical host lease for the entire repository.
+    let background_kind = std::env::var("GREPPY_BACKGROUND_KIND").ok();
+    let defer_base_embeddings =
+        should_defer_base_embeddings(structural_first_use, background_kind.as_deref());
     if seeded_summary_cache.is_some() {
         report_base_phase(progress_path, "migrating_base_graph");
     }
@@ -2551,7 +2562,9 @@ fn validate_base_contents_for_project(
             |row| row.get(0),
         )
         .ok();
-    let expected_completion = format!("{generation}|{}", identity.embedding_model);
+    let expected_completion =
+        crate::embedding_readiness_value(generation, &identity.embedding_model);
+    let expected_deferred = format!("{generation}|{}", identity.embedding_model);
     // A structurally migrated Base is immutable and safe for graph queries
     // before semantic completion. Accept only the receipt written after that
     // controlled migration, bound to the same generation and model identity;
@@ -2574,10 +2587,11 @@ fn validate_base_contents_for_project(
             completion.as_deref(),
             deferred.as_deref(),
             &expected_completion,
+            &expected_deferred,
         )
     {
         return Err(Error::Invalid(format!(
-            "Base embedding generation is incomplete: expected completion or deferred receipt `{expected_completion}`, got completion={} deferred={}",
+            "Base embedding generation is incomplete: expected completion `{expected_completion}` or deferred receipt `{expected_deferred}`, got completion={} deferred={}",
             completion.as_deref().unwrap_or("missing"),
             deferred.as_deref().unwrap_or("missing")
         )));
@@ -2599,9 +2613,16 @@ fn validate_base_contents_for_project(
 fn base_embedding_receipt_valid(
     completion: Option<&str>,
     deferred: Option<&str>,
-    expected: &str,
+    expected_completion: &str,
+    expected_deferred: &str,
 ) -> bool {
-    completion == Some(expected) || deferred == Some(expected)
+    completion == Some(expected_completion)
+        || deferred == Some(expected_deferred)
+        // A legacy prompt-contract completion is still an exact structural
+        // Base receipt. Preserve that immutable graph and its old vectors, but
+        // current readiness checks reject the legacy value and run V3 semantic
+        // preparation through bounded children.
+        || completion == Some(expected_deferred)
 }
 
 fn prepared_base_with_reader(
@@ -4835,19 +4856,41 @@ mod tests {
 
     #[test]
     fn deferred_embedding_receipt_is_bound_to_generation_and_model() {
-        let expected = "7|model-a";
+        let expected_completion = crate::embedding_readiness_value(7, "model-a");
+        let expected_deferred = "7|model-a";
 
-        assert!(base_embedding_receipt_valid(None, Some(expected), expected));
+        assert!(base_embedding_receipt_valid(
+            None,
+            Some(expected_deferred),
+            &expected_completion,
+            expected_deferred,
+        ));
+        assert!(base_embedding_receipt_valid(
+            Some(expected_deferred),
+            None,
+            &expected_completion,
+            expected_deferred,
+        ));
         assert!(!base_embedding_receipt_valid(
             None,
             Some("8|model-a"),
-            expected
+            &expected_completion,
+            expected_deferred,
         ));
         assert!(!base_embedding_receipt_valid(
             None,
             Some("7|model-b"),
-            expected
+            &expected_completion,
+            expected_deferred,
         ));
+    }
+
+    #[test]
+    fn cold_semantic_base_build_defers_inference_to_bounded_embedding_children() {
+        assert!(should_defer_base_embeddings(false, Some("embedding")));
+        assert!(should_defer_base_embeddings(true, Some("index")));
+        assert!(!should_defer_base_embeddings(false, Some("index")));
+        assert!(!should_defer_base_embeddings(false, None));
     }
 
     #[test]

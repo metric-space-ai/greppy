@@ -158,7 +158,8 @@ pub struct EmbeddingIndexOptions {
     pub max_span_bytes: usize,
     pub prune_before_generation: bool,
     pub start_node_offset: usize,
-    pub max_candidate_nodes: Option<usize>,
+    pub start_chunk_idx: i64,
+    pub max_documents: Option<usize>,
 }
 
 impl EmbeddingIndexOptions {
@@ -168,7 +169,8 @@ impl EmbeddingIndexOptions {
             max_span_bytes: DEFAULT_MAX_SPAN_BYTES,
             prune_before_generation: true,
             start_node_offset: 0,
-            max_candidate_nodes: None,
+            start_chunk_idx: 0,
+            max_documents: None,
         }
     }
 }
@@ -192,6 +194,7 @@ pub struct EmbeddingIndexReport {
     /// for this generation.
     pub nodes_failed: usize,
     pub next_node_offset: usize,
+    pub next_chunk_idx: i64,
     pub budget_exhausted: bool,
 }
 
@@ -262,7 +265,7 @@ pub fn count_code_embedding_documents_for_scope(
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = options.start_node_offset;
     let mut total = 0usize;
-    let mut candidate_nodes = 0usize;
+    let mut documents = 0usize;
 
     loop {
         let nodes = if store.is_overlay() && prefixes.is_empty() {
@@ -273,21 +276,15 @@ pub fn count_code_embedding_documents_for_scope(
         if nodes.is_empty() {
             break;
         }
+        let page_start = offset;
         offset += nodes.len();
 
-        for node in nodes {
+        for (page_index, node) in nodes.into_iter().enumerate() {
             if !embedding_path_matches(&node.file_path, prefixes)
                 || !is_embedding_candidate_label(&node.label)
             {
                 continue;
             }
-            if options
-                .max_candidate_nodes
-                .is_some_and(|limit| candidate_nodes >= limit)
-            {
-                return Ok(total);
-            }
-            candidate_nodes = candidate_nodes.saturating_add(1);
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
                 Ok(Some(source)) => source,
                 Ok(None) | Err(_) => continue,
@@ -306,7 +303,25 @@ pub fn count_code_embedding_documents_for_scope(
                 provider,
                 options.max_span_bytes,
             )?;
-            total = total.saturating_add(chunks.len());
+            let node_offset = page_start.saturating_add(page_index);
+            let start_chunk = if node_offset == options.start_node_offset {
+                options.start_chunk_idx
+            } else {
+                0
+            };
+            for chunk in chunks {
+                if chunk.chunk_idx < start_chunk {
+                    continue;
+                }
+                if options
+                    .max_documents
+                    .is_some_and(|limit| documents >= limit)
+                {
+                    return Ok(total);
+                }
+                documents = documents.saturating_add(1);
+                total = total.saturating_add(1);
+            }
         }
     }
     Ok(total)
@@ -396,7 +411,8 @@ pub fn index_code_embeddings_for_scope_with_progress(
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut offset = options.start_node_offset;
     report.next_node_offset = offset;
-    let mut candidate_nodes = 0usize;
+    report.next_chunk_idx = options.start_chunk_idx;
+    let mut documents = 0usize;
 
     let batch_size = embed_batch_size();
     let schedule_window = embed_schedule_window(batch_size);
@@ -436,17 +452,6 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 report.nodes_skipped_non_definition += 1;
                 continue;
             }
-            if options
-                .max_candidate_nodes
-                .is_some_and(|limit| candidate_nodes >= limit)
-            {
-                report.nodes_considered = report.nodes_considered.saturating_sub(1);
-                report.next_node_offset = node_offset;
-                report.budget_exhausted = true;
-                break 'pages;
-            }
-            candidate_nodes = candidate_nodes.saturating_add(1);
-
             let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
                 Ok(Some(source)) => source,
                 Ok(None) => {
@@ -480,24 +485,53 @@ pub fn index_code_embeddings_for_scope_with_progress(
                 continue;
             }
 
-            // Base nodes have negative ids and cannot be FK targets in the
-            // writable Delta. Copy only this scoped definition, with identical
-            // graph identity/content, before adding its vectors to the Delta.
-            // The composed graph still exposes one definition and remaps edges
-            // through its qualified name; the immutable Base remains untouched.
-            if store.is_overlay() && node.id < 0 {
-                node.id = store.insert_writable_node(&greppy_store::NewNode {
-                    project: node.project.clone(),
-                    label: node.label.clone(),
-                    name: node.name.clone(),
-                    qualified_name: node.qualified_name.clone(),
-                    file_path: node.file_path.clone(),
-                    start_line: node.start_line,
-                    end_line: node.end_line,
-                    properties: node.properties.clone(),
-                })?;
+            let start_chunk = if node_offset == options.start_node_offset {
+                options.start_chunk_idx
+            } else {
+                0
+            };
+            if start_chunk < 0
+                || usize::try_from(start_chunk).map_or(true, |start| start > chunks.len())
+            {
+                return Err(Error::Store(format!(
+                    "embedding resume chunk {start_chunk} exceeds {} chunks for {}",
+                    chunks.len(),
+                    node.qualified_name
+                )));
             }
+            let mut writable_node_ready = node.id >= 0;
             for chunk in chunks {
+                if chunk.chunk_idx < start_chunk {
+                    continue;
+                }
+                if options
+                    .max_documents
+                    .is_some_and(|limit| documents >= limit)
+                {
+                    report.next_node_offset = node_offset;
+                    report.next_chunk_idx = chunk.chunk_idx;
+                    report.budget_exhausted = true;
+                    break 'pages;
+                }
+                documents = documents.saturating_add(1);
+                // Base nodes have negative ids and cannot be FK targets in the
+                // writable Delta. Do not flip the visible Base identity until
+                // this bounded invocation will actually publish a document.
+                if !writable_node_ready {
+                    node.id = store.insert_writable_node(&greppy_store::NewNode {
+                        project: node.project.clone(),
+                        label: node.label.clone(),
+                        name: node.name.clone(),
+                        qualified_name: node.qualified_name.clone(),
+                        file_path: node.file_path.clone(),
+                        start_line: node.start_line,
+                        end_line: node.end_line,
+                        properties: node.properties.clone(),
+                    })?;
+                    writable_node_ready = true;
+                }
+                report.next_node_offset = node_offset;
+                report.next_chunk_idx = chunk.chunk_idx.saturating_add(1);
                 let content_sha256 = sha256_hex(chunk.text.as_bytes());
                 if let Some(existing) =
                     store.find_reusable_vector_embedding(&ReusableVectorEmbeddingKey {
@@ -566,6 +600,8 @@ pub fn index_code_embeddings_for_scope_with_progress(
                     });
                 }
             }
+            report.next_node_offset = node_offset.saturating_add(1);
+            report.next_chunk_idx = 0;
         }
     }
 
@@ -1739,7 +1775,7 @@ mod tests {
         }
         let mut provider = DeterministicProvider;
         let mut options = EmbeddingIndexOptions::for_generation(4);
-        options.max_candidate_nodes = Some(1);
+        options.max_documents = Some(1);
         let first =
             index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
                 .unwrap();
@@ -1754,6 +1790,7 @@ mod tests {
         assert_eq!(replay.nodes_embedded, 1);
 
         options.start_node_offset = first.next_node_offset;
+        options.start_chunk_idx = first.next_chunk_idx;
         let second =
             index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
                 .unwrap();
@@ -1761,6 +1798,7 @@ mod tests {
         assert_eq!(second.nodes_embedded, 1);
 
         options.start_node_offset = second.next_node_offset;
+        options.start_chunk_idx = second.next_chunk_idx;
         let final_pass =
             index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
                 .unwrap();
@@ -1778,6 +1816,67 @@ mod tests {
                 )
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn one_large_definition_resumes_at_document_boundaries() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = long_function_source("large", 40, None);
+        std::fs::write(root.join("src/lib.rs"), &source).unwrap();
+        let mut store = store_with_project(&root);
+        insert_node(
+            &mut store,
+            "p.large",
+            "large",
+            "Function",
+            "src/lib.rs",
+            1,
+            i64::try_from(source.lines().count()).unwrap(),
+        );
+        let mut provider = TokenBudgetProvider::new(24);
+        let total = count_code_embedding_documents_for_project(
+            &store,
+            &root,
+            "p",
+            &provider,
+            EmbeddingIndexOptions::for_generation(12),
+        )
+        .unwrap();
+        assert!(total > 1);
+
+        let mut options = EmbeddingIndexOptions::for_generation(12);
+        options.max_documents = Some(1);
+        let mut passes = 0usize;
+        loop {
+            let report =
+                index_code_embeddings_for_project(&mut store, &root, "p", &mut provider, options)
+                    .unwrap();
+            passes += 1;
+            assert!(report.nodes_embedded <= 1);
+            if report.is_complete() {
+                break;
+            }
+            assert!(report.budget_exhausted);
+            assert_eq!(report.next_node_offset, 0);
+            assert!(report.next_chunk_idx > 0);
+            options.start_node_offset = report.next_node_offset;
+            options.start_chunk_idx = report.next_chunk_idx;
+            assert!(passes <= total, "resume cursor did not advance");
+        }
+        assert_eq!(passes, total);
+        assert_eq!(
+            store
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(12),
+                )
+                .unwrap(),
+            total
         );
     }
 
@@ -1957,6 +2056,95 @@ mod tests {
             overlay.integrity_check().unwrap();
             assert_eq!(std::fs::read(&base_path).unwrap(), immutable);
         }
+    }
+
+    #[test]
+    fn bounded_resume_survives_base_identity_copy_into_delta() {
+        let root = tempdir_via_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        let base_path = root.join("base.db");
+        let delta_path = root.join("delta.db");
+        let mut base = Store::open(&base_path).unwrap();
+        base.upsert_project(&Project {
+            name: "p".into(),
+            indexed_at: "x".into(),
+            root_path: root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        insert_node(&mut base, "p.a", "a", "Function", "src/a.rs", 1, 1);
+        insert_node(&mut base, "p.b", "b", "Function", "src/b.rs", 1, 1);
+        drop(base);
+        let immutable_base = std::fs::read(&base_path).unwrap();
+        let mut overlay = Store::open_overlay(
+            &base_path,
+            &delta_path,
+            &greppy_store::VisibilityIndex::default(),
+        )
+        .unwrap();
+        overlay
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let prefixes = vec![String::new()];
+        let mut options = EmbeddingIndexOptions::for_generation(9);
+        options.max_documents = Some(1);
+        let mut provider = DeterministicProvider;
+        let first = index_code_embeddings_for_scope_with_progress(
+            &mut overlay,
+            &root,
+            "p",
+            &mut provider,
+            options,
+            EmbeddingIndexProgressContext {
+                total_documents: 1,
+                callback: &mut |_| {},
+            },
+            &prefixes,
+        )
+        .unwrap();
+        assert!(first.budget_exhausted);
+        assert_eq!(first.next_node_offset, 1);
+        assert!(
+            overlay.get_node_by_qname("p", "p.a").unwrap().unwrap().id > 0,
+            "the first Base definition is now a vector-owning Delta copy"
+        );
+
+        options.start_node_offset = first.next_node_offset;
+        options.start_chunk_idx = first.next_chunk_idx;
+        let second = index_code_embeddings_for_scope_with_progress(
+            &mut overlay,
+            &root,
+            "p",
+            &mut provider,
+            options,
+            EmbeddingIndexProgressContext {
+                total_documents: 1,
+                callback: &mut |_| {},
+            },
+            &prefixes,
+        )
+        .unwrap();
+        assert!(second.is_complete());
+        assert_eq!(second.nodes_embedded, 1);
+        assert_eq!(
+            overlay
+                .count_vector_embeddings(
+                    "p",
+                    "test-code-embedder",
+                    "test-prompt-v1",
+                    "embeddinggemma_code_retrieval",
+                    Some(9),
+                )
+                .unwrap(),
+            2,
+            "the cursor must not skip the Base row after its identity flips to Delta"
+        );
+        assert_eq!(std::fs::read(&base_path).unwrap(), immutable_base);
     }
 
     #[test]

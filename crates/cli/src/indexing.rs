@@ -1339,7 +1339,7 @@ fn dispatch_index_health_with_detail(
                 |row| row.get::<_, String>(0),
             )
             .ok()
-            == Some(format!("{generation}|{}", model.model_id))
+            == Some(embedding_readiness_value(generation, &model.model_id))
     });
     // Robustness (problem dossier, systemic lesson 1&2): silent
     // under-indexing must be VISIBLE. Two independent-oracle checks:
@@ -2493,7 +2493,7 @@ fn complete_embeddings_from_published_graph(
     Ok(outcome)
 }
 
-const BACKGROUND_EMBEDDING_CHUNK_NODES: usize = 512;
+const BACKGROUND_EMBEDDING_CHUNK_DOCUMENTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct EmbeddingResumeCursor {
@@ -2504,6 +2504,7 @@ struct EmbeddingResumeCursor {
     max_input_tokens: Option<usize>,
     prefixes: Vec<String>,
     next_node_offset: usize,
+    next_chunk_idx: i64,
 }
 
 fn embedding_resume_key(project: &str, prefixes: &[String]) -> String {
@@ -2532,6 +2533,7 @@ fn embedding_resume_contract(
         max_input_tokens: cfg.max_length,
         prefixes,
         next_node_offset: 0,
+        next_chunk_idx: 0,
     }
 }
 
@@ -2551,10 +2553,15 @@ fn read_embedding_resume_cursor(
 fn matching_embedding_resume_offset(
     mut saved: EmbeddingResumeCursor,
     expected: &EmbeddingResumeCursor,
-) -> Option<usize> {
+) -> Option<(usize, i64)> {
     let next_node_offset = saved.next_node_offset;
+    let next_chunk_idx = saved.next_chunk_idx;
+    if next_chunk_idx < 0 {
+        return None;
+    }
     saved.next_node_offset = 0;
-    (saved == *expected).then_some(next_node_offset)
+    saved.next_chunk_idx = 0;
+    (saved == *expected).then_some((next_node_offset, next_chunk_idx))
 }
 
 fn write_embedding_resume_cursor(
@@ -2595,6 +2602,7 @@ mod embedding_resume_cursor_tests {
             max_input_tokens: Some(2048),
             prefixes: vec!["src".into()],
             next_node_offset: 0,
+            next_chunk_idx: 0,
         }
     }
 
@@ -2605,7 +2613,7 @@ mod embedding_resume_cursor_tests {
         saved.next_node_offset = 41;
         assert_eq!(
             matching_embedding_resume_offset(saved.clone(), &expected),
-            Some(41)
+            Some((41, 0))
         );
 
         for changed in [
@@ -2644,6 +2652,7 @@ mod embedding_resume_cursor_tests {
         let key = embedding_resume_key("p", &["src".into()]);
         let mut saved = contract();
         saved.next_node_offset = 23;
+        saved.next_chunk_idx = 2;
         write_embedding_resume_cursor(&store, &key, &saved).unwrap();
         assert_eq!(read_embedding_resume_cursor(&store, &key), Some(saved));
         assert!(store
@@ -2737,7 +2746,10 @@ fn index_embeddings_into_temp_store_scoped(
             .execute(
                 "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
+                rusqlite::params![
+                    key,
+                    embedding_readiness_value(graph_generation, &cfg.model_id)
+                ],
             )
             .map_err(|error| {
                 Error::Store(format!("record test embedding completeness: {error}"))
@@ -2756,6 +2768,7 @@ fn index_embeddings_into_temp_store_scoped(
                 stale_rows_pruned: 0,
                 nodes_failed: 0,
                 next_node_offset: 0,
+                next_chunk_idx: 0,
                 budget_exhausted: false,
             },
         ));
@@ -2780,15 +2793,16 @@ fn index_embeddings_into_temp_store_scoped(
     let mut resume_contract = embedding_resume_contract(cfg, graph_generation, index_prefixes);
     if bounded_background {
         if let Some(saved) = read_embedding_resume_cursor(store, &resume_key) {
-            if let Some(next_node_offset) =
+            if let Some((next_node_offset, next_chunk_idx)) =
                 matching_embedding_resume_offset(saved, &resume_contract)
             {
                 options.start_node_offset = next_node_offset;
+                options.start_chunk_idx = next_chunk_idx;
             } else {
                 clear_embedding_resume_cursor(store, &resume_key)?;
             }
         }
-        options.max_candidate_nodes = Some(BACKGROUND_EMBEDDING_CHUNK_NODES);
+        options.max_documents = Some(BACKGROUND_EMBEDDING_CHUNK_DOCUMENTS);
     }
     let mut embedding_report = if let Some(job) = background_job {
         // Exact document counting tokenizes candidate spans. It does not load
@@ -2835,6 +2849,7 @@ fn index_embeddings_into_temp_store_scoped(
     };
     if embedding_report.budget_exhausted && embedding_report.nodes_failed == 0 {
         resume_contract.next_node_offset = embedding_report.next_node_offset;
+        resume_contract.next_chunk_idx = embedding_report.next_chunk_idx;
         write_embedding_resume_cursor(store, &resume_key, &resume_contract)?;
         return Ok(EmbeddingBuildOutcome::Partial(embedding_report));
     }
@@ -2876,7 +2891,10 @@ fn index_embeddings_into_temp_store_scoped(
         .execute(
             "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, format!("{}|{}", graph_generation, cfg.model_id)],
+            rusqlite::params![
+                key,
+                embedding_readiness_value(graph_generation, &cfg.model_id)
+            ],
         )
         .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
     Ok(EmbeddingBuildOutcome::Complete(embedding_report))

@@ -1202,6 +1202,12 @@ fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
 }
 
 #[test]
+fn automatic_graph_jobs_never_run_unbounded_semantic_enrichment() {
+    assert!(automatic_job_is_structural_only("index"));
+    assert!(!automatic_job_is_structural_only("embedding"));
+}
+
+#[test]
 fn semantic_embedding_wait_propagates_failed_owner_after_release() {
     let failed = serde_json::json!({
         "kind": "embedding",
