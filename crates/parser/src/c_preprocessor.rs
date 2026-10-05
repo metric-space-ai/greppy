@@ -358,7 +358,29 @@ impl Expander {
                 origin: token.origin,
                 kind: Kind::Trivia,
             });
-            out.extend(self.expand(&replacement, &disabled, depth + 1)?);
+            let expanded = self.expand(&replacement, &disabled, depth + 1)?;
+            // The bounded recursive scanner does not rescan across the macro /
+            // remaining-input boundary. Never leave a callable local alias as
+            // an ordinary function call: its real expansion might be invalid.
+            if input
+                .get(significant(input, after))
+                .is_some_and(|t| t.bytes == b"(")
+                && expanded
+                    .iter()
+                    .rev()
+                    .find(|t| t.kind != Kind::Trivia)
+                    .is_some_and(|last| {
+                        last.kind == Kind::Ident
+                            && !disabled.contains(&last.bytes)
+                            && self
+                                .macros
+                                .get(&last.bytes)
+                                .is_some_and(|m| m.parameters.is_some())
+                    })
+            {
+                return Err(CPreprocessorError { offset: token.origin, reason: "local macro function alias across an expansion boundary requires compiler preprocessing" });
+            }
+            out.extend(expanded);
             out.push(Token {
                 bytes: vec![b' '],
                 origin: token.origin,

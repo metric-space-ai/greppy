@@ -28,6 +28,7 @@ fn unsupported_used_macros_fail_at_the_invocation() {
         "#define JOIN(a,b) a ## b\nint JOIN(a,b);\n",
         "#define STR(a) #a\nconst char *x = STR(a);\n",
         "#define MANY(...) int x;\nMANY(x)\n",
+        "#define ALIAS BAD\n#define BAD(x) )\nint x = ALIAS(1);\n",
         "#ifdef SOME_BUILD\n#define EXPORT\n#endif\nEXPORT int x;\n",
     ] {
         let error = match c_preprocessor_validation_view(source.as_bytes()) {
