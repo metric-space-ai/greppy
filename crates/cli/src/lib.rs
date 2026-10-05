@@ -5497,6 +5497,19 @@ impl BackgroundJobGuard {
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
+
+    /// One bounded embedding child published useful vectors and exited so the
+    /// host admission lease can pass to another owner. The semantic waiter
+    /// treats this terminal state as a request to launch the next chunk; it is
+    /// neither readiness nor failure.
+    fn embedding_chunk_complete(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.write_state("embedding_chunk_complete", None);
+        self.complete = true;
+    }
 }
 
 #[cfg(test)]
@@ -5821,6 +5834,10 @@ fn spawn_background_job_handle(
     spawn_background_job_handle_scoped(root, cause, kind, embedding_cfg, &[])
 }
 
+fn automatic_job_is_structural_only(kind: &str) -> bool {
+    kind == "index"
+}
+
 fn spawn_background_job_handle_scoped(
     root: Option<&str>,
     cause: &str,
@@ -5963,11 +5980,11 @@ fn spawn_background_job_handle_scoped(
     let configured_workers =
         configure_automatic_index_workers(&mut command, inherited_workers.as_deref());
     debug_assert_eq!(Some(configured_workers), worker_count);
-    if matches!(
-        cause,
-        "first-use" | "structural-workspace-drift" | "rust-graph-repair"
-    ) && kind == "index"
-    {
+    // Every automatically admitted index child publishes structural state
+    // only. Semantic preparation is a separate `embedding` child whose finite
+    // document window releases the physical host lease between invocations.
+    // Explicit foreground `greppy index` retains its complete-index policy.
+    if automatic_job_is_structural_only(kind) {
         command.env(ENV_STRUCTURAL_FIRST_USE, "1");
     }
     #[cfg(debug_assertions)]
@@ -10447,6 +10464,7 @@ struct IndexSnapshotReport {
 /// cannot be written cannot be published either.
 enum EmbeddingBuildOutcome {
     Complete(greppy_indexer::EmbeddingIndexReport),
+    Partial(greppy_indexer::EmbeddingIndexReport),
     Degraded {
         report: Option<greppy_indexer::EmbeddingIndexReport>,
         reason: String,

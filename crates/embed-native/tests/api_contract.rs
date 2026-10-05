@@ -7,7 +7,7 @@ use greppy_embed_native::{
 
 fn main() {
     assert_eq!(EMBEDDING_DIM, 768);
-    assert_eq!(PROMPT_VERSION, "embeddinggemma-code-retrieval-st-v2");
+    assert_eq!(PROMPT_VERSION, "embeddinggemma-code-retrieval-st-v3");
     assert_eq!(CODE_RETRIEVAL_PROFILE, "embeddinggemma_code_retrieval");
     assert_eq!(
         EmbedTask::CodeRetrievalQuery.prompt("find retry handler"),

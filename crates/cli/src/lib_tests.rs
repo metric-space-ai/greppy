@@ -1190,6 +1190,33 @@ fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
         observe_background_embedding(None, false, true, false),
         BackgroundEmbeddingObservation::Published
     );
+    let chunk = serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding_chunk_complete"
+    });
+    assert_eq!(
+        observe_background_embedding(Some(&chunk), false, false, false),
+        BackgroundEmbeddingObservation::FollowIndex,
+        "a bounded child exit requests a resumable handoff without claiming readiness"
+    );
+    assert_eq!(
+        embedding_chunk_handoff(true, true),
+        EmbeddingChunkHandoff::ReturnToInheritedLease
+    );
+    assert_eq!(
+        embedding_chunk_handoff(false, true),
+        EmbeddingChunkHandoff::Yield(std::time::Duration::from_secs(65))
+    );
+    assert_eq!(
+        embedding_chunk_handoff(false, false),
+        EmbeddingChunkHandoff::Continue
+    );
+}
+
+#[test]
+fn automatic_graph_jobs_never_run_unbounded_semantic_enrichment() {
+    assert!(automatic_job_is_structural_only("index"));
+    assert!(!automatic_job_is_structural_only("embedding"));
 }
 
 #[test]

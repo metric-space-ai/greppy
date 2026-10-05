@@ -1812,6 +1812,28 @@ fn wait_for_embedding_publication(
             }
             BackgroundEmbeddingObservation::FollowIndex => {
                 drop(store);
+                match embedding_chunk_handoff(
+                    crate::index_admission::inherited_default_gate_lease(),
+                    crate::index_admission::host_gate_is_configured(),
+                ) {
+                    EmbeddingChunkHandoff::ReturnToInheritedLease => {
+                        return Err(Error::AdmissionDeferred {
+                            root: effective_root.to_path_buf(),
+                            detail: "a bounded semantic chunk was published, but the current command is inside an inherited host admission lease; return from that lease owner, then retry the original command to resume from the durable cursor".into(),
+                        });
+                    }
+                    EmbeddingChunkHandoff::Yield(duration) => {
+                        // The completed child has released the physical gate.
+                        // Leave a real handoff window before this waiter
+                        // competes for it again; external retries run once/minute.
+                        eprintln!(
+                            "semantic-search: bounded chunk published; yielding host admission for {} seconds before resuming",
+                            duration.as_secs()
+                        );
+                        std::thread::sleep(duration);
+                    }
+                    EmbeddingChunkHandoff::Continue => {}
+                }
                 continue;
             }
             BackgroundEmbeddingObservation::Failed(detail) => {
@@ -1830,6 +1852,26 @@ fn wait_for_embedding_publication(
             effective_root.display(),
             cfg.model_id
         )));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingChunkHandoff {
+    ReturnToInheritedLease,
+    Yield(std::time::Duration),
+    Continue,
+}
+
+fn embedding_chunk_handoff(
+    inherited_host_lease: bool,
+    host_gate_configured: bool,
+) -> EmbeddingChunkHandoff {
+    if inherited_host_lease {
+        EmbeddingChunkHandoff::ReturnToInheritedLease
+    } else if host_gate_configured {
+        EmbeddingChunkHandoff::Yield(std::time::Duration::from_secs(65))
+    } else {
+        EmbeddingChunkHandoff::Continue
     }
 }
 
@@ -1853,6 +1895,13 @@ pub(crate) fn observe_background_embedding(
     }
     if publication_complete {
         return BackgroundEmbeddingObservation::Published;
+    }
+    if job
+        .and_then(|value| value.get("state"))
+        .and_then(serde_json::Value::as_str)
+        == Some("embedding_chunk_complete")
+    {
+        return BackgroundEmbeddingObservation::FollowIndex;
     }
     if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
         return BackgroundEmbeddingObservation::Failed(detail);

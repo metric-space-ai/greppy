@@ -45,6 +45,21 @@ pub(crate) fn inline_refresh_is_admitted() -> bool {
     }
 }
 
+/// True only when this process is running beneath the authenticated default
+/// host-gate owner. A bounded child cannot release that ancestor's lease, so
+/// callers that publish resumable partial work must return control instead of
+/// pretending that restarting another child creates a fairness boundary.
+pub(crate) fn inherited_default_gate_lease() -> bool {
+    configured_gate()
+        .ok()
+        .flatten()
+        .is_some_and(|gate| default_gate_lease_is_inherited(&gate))
+}
+
+pub(crate) fn host_gate_is_configured() -> bool {
+    configured_gate().ok().flatten().is_some()
+}
+
 fn inline_refresh_allowed_for_gate(gate: Option<&Path>) -> bool {
     match gate {
         Some(gate) => default_gate_lease_is_inherited(gate),
