@@ -3129,6 +3129,19 @@ fn js_ts_enclosing_qname(
     let mut p = node.parent();
     while let Some(cur) = p {
         if JS_TS_FUNC_KINDS.contains(&cur.kind()) {
+            // A computed key is evaluated when the method is created, outside
+            // its body. Keep walking to the containing scope for key usages
+            // and calls, while body references retain the method's identity.
+            if cur.kind() == "method_definition"
+                && cur.child_by_field_name("name").is_some_and(|name| {
+                    name.kind() == "computed_property_name"
+                        && node.start_byte() >= name.start_byte()
+                        && node.end_byte() <= name.end_byte()
+                })
+            {
+                p = cur.parent();
+                continue;
+            }
             if let Some((name, node_for_owner)) = js_ts_func_name(cur, source) {
                 // `function_declaration` is never class-owned by the def pass.
                 let owner = if cur.kind() == "function_declaration" {
