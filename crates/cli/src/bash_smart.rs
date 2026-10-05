@@ -1386,52 +1386,41 @@ fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
-// Retain bounded, byte-exact capture in the same TTL-managed row as its handle.
-// The capture paths remain provenance only for new packs: a gate or sandbox can
-// clean its TMPDIR as soon as the command completes, before expansion runs.
-fn encode_capture_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 15) as usize] as char);
-    }
-    encoded
-}
-
+// New packs retain their disk backing outside the command's run-specific TMPDIR.
+// Pack rows stay small and continuations share the same verified artifacts.
 fn decode_capture_stream(stream: &serde_json::Value) -> std::result::Result<Vec<u8>, String> {
-    if let Some(encoded) = stream.get("bytes_hex") {
-        let encoded = encoded
-            .as_str()
-            .ok_or("invalid retained capture encoding")?;
-        // Capture is already capped to head + tail + the small gap marker.
-        // Reject oversized/corrupt payloads before allocating decoded bytes.
-        let max_bytes = PACK_HEAD_BYTES + PACK_TAIL_BYTES + 256;
-        if encoded.len() % 2 != 0 || encoded.len() as u64 > max_bytes * 2 {
-            return Err("invalid retained capture length".into());
-        }
-        let nibble = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            _ => None,
-        };
-        return encoded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let high = nibble(pair[0]).ok_or("invalid retained capture hex")?;
-                let low = nibble(pair[1]).ok_or("invalid retained capture hex")?;
-                Ok((high << 4) | low)
-            })
-            .collect();
-    }
-    // Compatibility for existing path-only packs. Never fall back to a spool
-    // if retained bytes exist but are invalid: that would mask tampering.
     let path = stream
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .ok_or("capture path missing from legacy pack")?;
-    std::fs::read(path).map_err(|error| format!("legacy capture unavailable at {path}: {error}; rerun the command with a retained-output Greppy"))
+        .ok_or("capture path missing from pack")?;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("capture unavailable at {path}: {error}; rerun the command"))?;
+    if !meta.is_file() || meta.len() > PACK_HEAD_BYTES + PACK_TAIL_BYTES + 256 {
+        return Err(format!(
+            "capture is not a bounded regular file at {path}; rerun the command"
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("capture unavailable at {path}: {error}; rerun the command"))?;
+    let limit = PACK_HEAD_BYTES + PACK_TAIL_BYTES + 256;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read capture at {path}: {error}; rerun the command"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "capture exceeds byte bound at {path}; rerun the command"
+        ));
+    }
+    Ok(bytes)
 }
 
 impl StoredRaw {
@@ -1447,9 +1436,9 @@ impl StoredRaw {
             "schema_version": PACK_SCHEMA_VERSION,
             "kind": "bash-smart",
             "content_sha256": content_sha256,
+            "retained_until": unix_now_secs().saturating_add(expand_ttl_secs()).saturating_add(60),
             "stdout": {
                 "sha256": stdout.sha256,
-                "bytes_hex": encode_capture_bytes(&stdout_bytes),
                 "byte_len": stdout.byte_len,
                 "line_count": stdout.line_count,
                 "path": stdout.path,
@@ -1458,7 +1447,6 @@ impl StoredRaw {
             },
             "stderr": {
                 "sha256": stderr.sha256,
-                "bytes_hex": encode_capture_bytes(&stderr_bytes),
                 "byte_len": stderr.byte_len,
                 "line_count": stderr.line_count,
                 "path": stderr.path,
@@ -1481,6 +1469,29 @@ impl StoredRaw {
         {
             return None;
         }
+        let _lease = if let Some(root) = payload.get("retained_artifact_dir") {
+            let root = Path::new(root.as_str()?);
+            if !std::fs::symlink_metadata(root).ok()?.is_dir() {
+                return None;
+            }
+            for name in ["stdout", "stderr"] {
+                let path = Path::new(payload.get(name)?.get("path")?.as_str()?);
+                if path.parent()?.parent()? != root {
+                    return None;
+                }
+            }
+            Some(
+                greppy_core::cache::acquire_named_lock_in(
+                    root,
+                    "capture",
+                    greppy_core::cache::LockMode::Shared,
+                    false,
+                )
+                .ok()??,
+            )
+        } else {
+            None
+        };
         let stdout = decode_capture_stream(payload.get("stdout")?).ok()?;
         let stderr = decode_capture_stream(payload.get("stderr")?).ok()?;
         let content_sha256 = combined_sha256(&stdout, &stderr);
@@ -1527,6 +1538,24 @@ fn insert_pack(
     stream: &str,
     line_ranges: &[(usize, usize)],
 ) -> std::result::Result<String, greppy_store::Error> {
+    let ttl = raw
+        .payload
+        .get("retained_until")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_sub(unix_now_secs().saturating_add(60))
+        .min(expand_ttl_secs());
+    if ttl == 0 {
+        return Err(greppy_store::Error::Store(
+            "retained capture deadline elapsed; no expansion handle published".into(),
+        ));
+    }
+    let retained = store.retain_bash_smart_capture(&raw.payload, &raw.stdout, &raw.stderr)?;
+    if StoredRaw::decode(&retained).is_none() {
+        return Err(greppy_store::Error::Store(
+            "retained capture failed integrity verification; no expansion handle published".into(),
+        ));
+    }
     let start_line = line_ranges.first().map(|(start, _)| *start).unwrap_or(1);
     let summary = serde_json::json!({
         "text": format!("bash-smart {stream} raw output"),
@@ -1546,8 +1575,8 @@ fn insert_pack(
             "bash-smart {stream} raw output sha256:{} starts at {start_line}\n",
             raw.content_sha256
         ),
-        payload_json: Some(raw.payload.clone()),
-        ttl_secs: expand_ttl_secs(),
+        payload_json: Some(retained),
+        ttl_secs: ttl,
     })
 }
 
@@ -1597,10 +1626,11 @@ fn pack_decode_failure(pack: &greppy_store::ExpandPack) -> String {
         let Some(stream) = payload.get(name) else {
             return format!("{name} metadata missing; rerun the command");
         };
-        if stream.get("bytes_hex").is_none() {
-            if let Err(error) = decode_capture_stream(stream) {
-                return format!("{name} {error}");
-            }
+        let Some(path) = stream.get("path").and_then(serde_json::Value::as_str) else {
+            return format!("{name} capture path missing; rerun the command");
+        };
+        if let Err(error) = std::fs::symlink_metadata(path) {
+            return format!("{name} capture unavailable at {path}: {error}; rerun the command");
         }
     }
     "hash drift or malformed retained bytes/hash metadata; rerun the command".into()
@@ -2429,49 +2459,132 @@ mod tests {
             capture("stderr", b"error[E0308]: mismatch\n"),
         )
         .unwrap();
-        let payload: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&raw.payload).unwrap()).unwrap();
-        let mut legacy = payload.clone();
-        legacy["stdout"]
-            .as_object_mut()
-            .unwrap()
-            .remove("bytes_hex");
-        legacy["stderr"]
-            .as_object_mut()
-            .unwrap()
-            .remove("bytes_hex");
+        let legacy = raw.payload.clone();
+        let store = greppy_store::Store::open(&dir.join("graph.db")).unwrap();
+        let payload = store
+            .retain_bash_smart_capture(&raw.payload, &raw.stdout, &raw.stderr)
+            .unwrap();
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            serialized.len() < 4096,
+            "rows contain metadata, never captured bytes"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert!(StoredRaw::decode(&legacy).is_some());
         std::fs::write(dir.join("stdout"), b"changed spool").unwrap();
         assert!(
             StoredRaw::decode(&legacy).is_none(),
-            "legacy drift must remain refused"
+            "legacy drift remains refused"
         );
-        std::fs::write(dir.join("stdout"), b"\0\xff\r\n").unwrap();
-        let mut invalid_retained = payload.clone();
-        invalid_retained["stdout"]["bytes_hex"] = serde_json::json!("not hex");
-        assert!(
-            StoredRaw::decode(&invalid_retained).is_none(),
-            "invalid retained bytes must not fall back to valid spool"
-        );
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
-        let decoded = StoredRaw::decode(&payload).expect("retained bytes outlive capture TMPDIR");
+        let decoded =
+            StoredRaw::decode(&payload).expect("retained artifacts outlive capture TMPDIR");
         assert_eq!(decoded.stdout, b"\0\xff\r\n");
         assert_eq!(decoded.stderr, b"error[E0308]: mismatch\n");
         assert!(StoredRaw::decode(&legacy).is_none());
         assert!(decode_capture_stream(&legacy["stderr"])
             .unwrap_err()
-            .contains("legacy capture unavailable"));
-        let mut tampered = payload.clone();
-        tampered["stdout"]["bytes_hex"] = serde_json::json!("00ff0a0a");
+            .contains("capture unavailable"));
+        let retained_stdout = Path::new(payload["stdout"]["path"].as_str().unwrap());
+        std::fs::write(retained_stdout, b"\0\xff\n\n").unwrap();
         assert!(
-            StoredRaw::decode(&tampered).is_none(),
-            "same-length retained tamper must fail hashes"
+            StoredRaw::decode(&payload).is_none(),
+            "same-length artifact tamper fails hashes"
         );
-        tampered["stdout"]["bytes_hex"] = serde_json::json!("not hex");
-        assert!(StoredRaw::decode(&tampered).is_none());
-        tampered = payload;
+        std::fs::write(retained_stdout, b"\0\xff\r\n").unwrap();
+        let mut tampered = payload.clone();
         tampered["content_sha256"] = serde_json::json!("wrong combined hash");
         assert!(StoredRaw::decode(&tampered).is_none());
+        let root = Path::new(payload["retained_artifact_dir"].as_str().unwrap());
+        let _lease = greppy_core::cache::acquire_named_lock_in(
+            root,
+            "capture",
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        for name in ["stdout", "stderr"] {
+            std::fs::remove_file(payload[name]["path"].as_str().unwrap()).unwrap();
+        }
+        std::fs::remove_dir(retained_stdout.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn large_capture_keeps_continuation_rows_small_and_shared() {
+        let dir = std::env::temp_dir().join(format!("greppy-retention-rows-{}", spool_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stdout = vec![b'x'; 1024 * 1024];
+        let stderr = Vec::new();
+        let content_sha256 = combined_sha256(&stdout, &stderr);
+        let payload = serde_json::json!({
+            "schema_version": PACK_SCHEMA_VERSION, "kind": "bash-smart",
+            "content_sha256": content_sha256, "retained_until": unix_now_secs() + 300,
+            "stdout": {"sha256": sha256(&stdout), "path": dir.join("original.stdout")},
+            "stderr": {"sha256": sha256(&stderr), "path": dir.join("original.stderr")},
+        });
+        let raw = StoredRaw {
+            stdout,
+            stderr,
+            content_sha256,
+            payload,
+        };
+        let unavailable = greppy_store::Store::open_memory().unwrap();
+        assert!(insert_pack(&unavailable, "test", "test", &raw, "stdout", &[(1, 1)]).is_err());
+        let count: i64 = unavailable
+            .conn()
+            .query_row("SELECT count(*) FROM expand_packs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "failed persistence must not advertise a handle");
+        let store = greppy_store::Store::open(&dir.join("graph.db")).unwrap();
+        let id = insert_pack(&store, "test", "test", &raw, "stdout", &[(1, 1)]).unwrap();
+        let initial = store.get_expand_pack(&id).unwrap().unwrap();
+        let retained = initial.payload_json.as_ref().unwrap();
+        let decoded = StoredRaw::decode(retained).unwrap();
+        for _ in 0..3 {
+            let next =
+                insert_continuation_pack(&store, &initial, &decoded, "stdout", &[(1, 1)]).unwrap();
+            let next = store.get_expand_pack(&next).unwrap().unwrap();
+            assert_eq!(
+                next.payload_json.as_ref().unwrap()["stdout"]["path"],
+                retained["stdout"]["path"]
+            );
+            assert_eq!(next.expires_at, initial.expires_at);
+        }
+        let largest: i64 = store
+            .conn()
+            .query_row(
+                "SELECT max(length(payload_json)) FROM expand_packs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            largest < 4096,
+            "megabyte capture and continuations keep rows small: {largest}"
+        );
+        let path = Path::new(retained["stdout"]["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            2,
+            "one shared artifact pair"
+        );
+        let root = Path::new(retained["retained_artifact_dir"].as_str().unwrap());
+        let _lease = greppy_core::cache::acquire_named_lock_in(
+            root,
+            "capture",
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        for name in ["stdout", "stderr"] {
+            std::fs::remove_file(retained[name]["path"].as_str().unwrap()).unwrap();
+        }
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
