@@ -132,3 +132,11 @@ fn crlf_macro_continuations_expand_and_keep_broken_syntax_visible() {
         .root_node()
         .has_error());
 }
+
+#[test]
+fn oversized_input_is_rejected_before_token_materialization() {
+    let source = vec![b' '; 16 * 1024 * 1024 + 1];
+    let error = c_preprocessor_validation_view(&source).err().unwrap();
+    assert_eq!(error.offset, 0);
+    assert!(error.reason.contains("input budget"));
+}
