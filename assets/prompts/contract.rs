@@ -9,15 +9,19 @@ use std::path::Path;
 // section 29: "ok, freigabe erteilt"; section 32: "ok, erlaubnis erteilt".
 // Those approvals cover the READING CODE block, any-line and fallback rows.
 // 8a70292ca5 incorrectly removed them as unapproved; do not discard this record.
-// This historical signature does NOT approve the later callees wording,
-// prompt-export documentation, new layout or argv adapter: their complete
-// proposed diff still requires the owner's signature before building.
+// Historical SHA256: f5336832865582bcfe0dd851309085e8fa265dbf0138c387a446176664a8a9d1.
+// 2026-10-05: Owner answered "ja" to the complete ec914aec3 proposal and BOTH
+// guard hashes in prompt-source-truth-owner-review.md (this parent thread).
+// This new approval covers the full shared contract, restored reading rules,
+// callees wording, export documentation, uniform layout and argv adapter.
+// Later prose changes require a new complete diff and explicit owner approval.
 pub const APPROVED_SHA256: &str =
-    "f5336832865582bcfe0dd851309085e8fa265dbf0138c387a446176664a8a9d1";
+    "a1def1aec84c130aa407eba3b53548c0b8f61dd504696e29718e86b5c889195d";
 // The former short built-in prompt was signed as
 // ade467bb75c46e16a56a66009738818eb1126581091c04c0d05daac8ce8d10f1.
-// That signature does not approve this new adapter. Await the owner's signature.
-pub const APPROVED_AGENT_ADAPTER_SHA256: &str = "UNSIGNED_REQUIRES_OWNER_SIGNATURE";
+// The new argv adapter is approved by the same 2026-10-05 "ja" above.
+pub const APPROVED_AGENT_ADAPTER_SHA256: &str =
+    "4f9ced0d5090909add2734f695a22ad8539e038090046e0b66c46d02016673ba";
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
