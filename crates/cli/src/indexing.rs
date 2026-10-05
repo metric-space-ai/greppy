@@ -289,7 +289,7 @@ mod rust_repair_recovery_tests {
         let options = greppy_indexer::IndexOptions::default();
         validate_standalone_embedding_store(&store, &active, &root, "p", &options).unwrap();
         let generation = store
-            .get_workspace_state(root.to_str().unwrap())
+            .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
             .unwrap()
             .unwrap()
             .graph_generation;
@@ -300,7 +300,7 @@ mod rust_repair_recovery_tests {
         );
         assert_eq!(
             store
-                .get_workspace_state(root.to_str().unwrap())
+                .get_workspace_state(root.canonicalize().unwrap().to_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .graph_generation,

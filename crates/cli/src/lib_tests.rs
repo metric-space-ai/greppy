@@ -415,7 +415,7 @@ fn semantic_refusal_preserves_admission_reason_and_selected_root() {
     assert!(
         diagnostics.contains(&format!(
             "--root {}",
-            shell_quote_cli(&root.to_string_lossy())
+            shell_quote_cli(&root.canonicalize().unwrap().to_string_lossy())
         )),
         "{diagnostics}"
     );
@@ -1129,16 +1129,20 @@ fn embedding_job_eta_tracks_cached_work_without_claiming_inference_throughput() 
     assert!(finished["rate_milli_spans_per_second"].is_null());
 
     job.embedding_started("metal", 20);
-    job.embedding_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(2_001));
+    let started = std::time::Instant::now();
+    job.embedding_started = Some(started);
     job.last_progress_write = None;
-    job.embedding_progress(greppy_indexer::EmbeddingIndexProgress {
-        completed_documents: 1,
-        total_documents: 20,
-        local_store_reuse: 0,
-        global_cache_hits: 0,
-        global_cache_misses: 1,
-        current_symbol: None,
-    });
+    job.embedding_progress_at(
+        greppy_indexer::EmbeddingIndexProgress {
+            completed_documents: 1,
+            total_documents: 20,
+            local_store_reuse: 0,
+            global_cache_hits: 0,
+            global_cache_misses: 1,
+            current_symbol: None,
+        },
+        started + std::time::Duration::from_secs(2_001),
+    );
     let slow = read_background_job(&path).unwrap();
     assert_eq!(slow["rate_milli_spans_per_second"], 0);
     assert_eq!(slow["eta_basis"], "observed_inference");

@@ -55,7 +55,11 @@ fn durable_import_rename(source: &Path, destination: &Path) -> io::Result<()> {
         )
     };
     if moved == 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        Err(io::Error::new(
+            error.kind(),
+            format!("write-through import replacement failed: {error}"),
+        ))
     } else {
         Ok(())
     }
@@ -340,6 +344,9 @@ impl SessionStore {
             created = true;
             greppy_core::cache::secure_private_file(&temporary)?;
             io::copy(&mut source, &mut target)?;
+            // Publication no longer needs the old log handle. Close it before
+            // replacement, including the Windows write-through move.
+            drop(source);
             if needs_newline {
                 target.write_all(b"\n")?;
             }
@@ -470,6 +477,9 @@ impl SessionStore {
             created = true;
             greppy_core::cache::secure_private_file(&temporary)?;
             io::copy(&mut source, &mut target)?;
+            // Publication no longer needs the old log handle. Close it before
+            // replacement, including the Windows write-through move.
+            drop(source);
             if needs_newline {
                 target.write_all(b"\n")?;
             }

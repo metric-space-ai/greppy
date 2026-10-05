@@ -5516,7 +5516,7 @@ export function caller() { target(); }
             let mut base = greppy_store::Store::open(&base_path).unwrap();
             greppy_indexer::index(&mut base, repo.path(), "p").unwrap();
             state = base
-                .get_workspace_state(repo.path().to_str().unwrap())
+                .get_workspace_state(repo.path().canonicalize().unwrap().to_str().unwrap())
                 .unwrap()
                 .unwrap();
             base.conn().execute_batch("DELETE FROM raw_edges WHERE json_extract(properties,'$.jsx_component')=1; DELETE FROM edges WHERE edge_type='USAGE';").unwrap();

@@ -5351,6 +5351,14 @@ impl BackgroundJobGuard {
     }
 
     fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
+        self.embedding_progress_at(progress, std::time::Instant::now());
+    }
+
+    fn embedding_progress_at(
+        &mut self,
+        progress: greppy_indexer::EmbeddingIndexProgress,
+        now: std::time::Instant,
+    ) {
         self.completed_documents = progress.completed_documents;
         self.total_documents = progress.total_documents;
         self.local_store_reuse = progress.local_store_reuse;
@@ -5358,7 +5366,7 @@ impl BackgroundJobGuard {
         self.global_cache_misses = progress.global_cache_misses;
         self.current_detail = progress.current_symbol;
         if let Some(started) = self.embedding_started {
-            let elapsed_ms = u64::try_from(started.elapsed().as_millis())
+            let elapsed_ms = u64::try_from(now.saturating_duration_since(started).as_millis())
                 .unwrap_or(u64::MAX)
                 .max(1);
             // Cache copies are not measurements of GPU inference throughput.
@@ -5384,7 +5392,6 @@ impl BackgroundJobGuard {
             self.rate_milli_documents_per_second =
                 observed_embedding_rate_milli(inferred, elapsed_ms);
         }
-        let now = std::time::Instant::now();
         let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
         let publish = finished
             || self.last_progress_write.is_none_or(|last| {

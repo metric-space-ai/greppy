@@ -516,20 +516,28 @@ fn json_validation_content(content: &[u8]) -> Cow<'_, [u8]> {
 fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow<'_, [u8]> {
     const OPEN: &[u8] = b"#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     const CLOSE: &[u8] = b"#ifdef __cplusplus\n}\n#endif\n";
-    let unique_line = |needle: &[u8]| {
-        let mut matches = content
-            .windows(needle.len())
-            .enumerate()
-            .filter_map(|(i, bytes)| {
-                (bytes == needle && (i == 0 || content[i - 1] == b'\n')).then_some(i)
-            });
+    const OPEN_CRLF: &[u8] = b"#ifdef __cplusplus\r\nextern \"C\" {\r\n#endif\r\n";
+    const CLOSE_CRLF: &[u8] = b"#ifdef __cplusplus\r\n}\r\n#endif\r\n";
+    let unique_line = |variants: [&[u8]; 2]| {
+        let mut matches = variants.into_iter().flat_map(|needle| {
+            content
+                .windows(needle.len())
+                .enumerate()
+                .filter_map(move |(i, bytes)| {
+                    (bytes == needle && (i == 0 || content[i - 1] == b'\n'))
+                        .then_some((i, needle.len()))
+                })
+        });
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     };
-    let (Some(open), Some(close)) = (unique_line(OPEN), unique_line(CLOSE)) else {
+    let (Some((open, open_len)), Some((close, close_len))) = (
+        unique_line([OPEN, OPEN_CRLF]),
+        unique_line([CLOSE, CLOSE_CRLF]),
+    ) else {
         return Cow::Borrowed(content);
     };
-    if open + OPEN.len() > close {
+    if open + open_len > close {
         return Cow::Borrowed(content);
     }
     let Ok(tree) = greppy_parser::parse(language, content) else {
@@ -554,9 +562,9 @@ fn guarded_linkage_validation_content(language: Language, content: &[u8]) -> Cow
         }
     }
     let mut normalized = content.to_vec();
-    for (start, len) in [(open, OPEN.len()), (close, CLOSE.len())] {
+    for (start, len) in [(open, open_len), (close, close_len)] {
         for byte in &mut normalized[start..start + len] {
-            if *byte != b'\n' {
+            if !matches!(*byte, b'\r' | b'\n') {
                 *byte = b' ';
             }
         }
@@ -875,6 +883,36 @@ mod tests {
         let counts = syntax_counts(Language::C, invalid).unwrap();
         assert!(counts.errors > 0 || counts.missing > 0);
         assert!(first_syntax_diagnostic(Language::C, invalid).is_some());
+    }
+
+    #[test]
+    fn guarded_linkage_crlf_keeps_offsets_and_rejects_malformed_source() {
+        let source = b"#ifdef __cplusplus\r\nextern \"C\" {\r\n#endif\r\nint value;\r\n#ifdef __cplusplus\r\n}\r\n#endif\r\n";
+        let view = guarded_linkage_validation_content(Language::C, source);
+        assert!(matches!(view, Cow::Owned(_)));
+        assert_eq!(view.len(), source.len());
+        for (before, after) in source.iter().zip(view.iter()) {
+            if matches!(*before, b'\r' | b'\n') {
+                assert_eq!(before, after);
+            }
+        }
+        assert_eq!(
+            syntax_counts(Language::C, source).unwrap(),
+            SyntaxCounts {
+                errors: 0,
+                missing: 0
+            }
+        );
+        let invalid = String::from_utf8(source.to_vec())
+            .unwrap()
+            .replace("int value;", "int value(");
+        let counts = syntax_counts(Language::C, invalid.as_bytes()).unwrap();
+        assert!(counts.errors > 0 || counts.missing > 0);
+        let lookalike = format!("/*\r\n{}*/\r\n", String::from_utf8_lossy(source));
+        assert!(matches!(
+            guarded_linkage_validation_content(Language::C, lookalike.as_bytes()),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
