@@ -2901,6 +2901,12 @@ pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<Visib
         )));
     }
     dirty.extend(nul_fields(&untracked.stdout)?);
+    // A Base path may be removed from Git's index (or renamed) and then
+    // recreated as an untracked working-tree file. Git reports both the old
+    // deletion and the current file. Current content replaces the Base at
+    // that path; it must not also retain a deletion tombstone.
+    let present = dirty.iter().collect::<std::collections::BTreeSet<_>>();
+    deleted.retain(|path| !present.contains(path));
     VisibilityIndex::new(dirty, deleted)
         .map_err(|error| Error::io("validate Store Delta visibility", error))
 }
@@ -5745,6 +5751,37 @@ export function caller() { target(); }
         let reverted = visibility_against(repo.path(), &base).unwrap();
         assert!(!reverted.hides_base_path("src/a.rs"));
         assert_eq!(reverted.changed_count(), 2);
+    }
+
+    #[test]
+    fn visibility_recreated_untracked_base_path_is_dirty_not_deleted() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["rm", "--cached", "src/a.rs"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn replacement() {}\n").unwrap();
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("src/a.rs"));
+        assert!(!visibility.is_deleted_path("src/a.rs"));
+        assert!(!visibility.hides_base_path("src/b.rs"));
+        assert_eq!(visibility.changed_count(), 1);
+    }
+
+    #[test]
+    fn visibility_renamed_and_recreated_base_path_retains_both_current_files() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["mv", "src/a.rs", "src/renamed.rs"]);
+        std::fs::write(repo.path().join("src/a.rs"), "fn replacement() {}\n").unwrap();
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("src/a.rs"));
+        assert!(visibility.is_dirty_path("src/renamed.rs"));
+        assert!(!visibility.is_deleted_path("src/a.rs"));
+        assert_eq!(visibility.changed_count(), 2);
+        std::fs::remove_file(repo.path().join("src/a.rs")).unwrap();
+        let removed_again = visibility_against(repo.path(), &base).unwrap();
+        assert!(removed_again.is_deleted_path("src/a.rs"));
+        assert!(!removed_again.is_dirty_path("src/a.rs"));
+        assert!(removed_again.is_dirty_path("src/renamed.rs"));
     }
 
     #[test]
